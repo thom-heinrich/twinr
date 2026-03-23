@@ -438,7 +438,7 @@ def _continuity_items(snapshot: PersonalitySnapshot | None) -> tuple[CompanionMi
         items.append(
             CompanionMindshareItem(
                 title=thread.title,
-                summary=f"Twinr has been keeping an eye on this thread. {thread.summary}",
+                summary=thread.summary,
                 salience=thread.salience,
                 source="continuity",
             )
@@ -465,7 +465,7 @@ def _relationship_items(snapshot: PersonalitySnapshot | None) -> tuple[Companion
         items.append(
             CompanionMindshareItem(
                 title=signal.topic,
-                summary=f"This is part of Twinr's durable attention. {signal.summary}",
+                summary=signal.summary,
                 salience=signal.salience,
                 source="relationship",
             )

@@ -412,21 +412,34 @@ class LongTermSensorMemoryCompilerTests(unittest.TestCase):
 
         profile = items["environment_profile:home_main:day:2026-03-18"]
         baseline = items["environment_baseline:home_main:weekday:rolling_7d"]
+        long_baseline = items["environment_baseline:home_main:long:weekday:rolling_56d"]
         deviation = items["environment_deviation:home_main:daily_activity_drop:2026-03-18"]
+        deviation_event = items["environment_deviation_event:home_main:acute_deviation:2026-03-18"]
+        quality_state = items["environment_quality_state:home_main:2026-03-18"]
 
         profile_attrs = dict(profile.attributes or {})
         baseline_attrs = dict(baseline.attributes or {})
+        long_baseline_attrs = dict(long_baseline.attributes or {})
         deviation_attrs = dict(deviation.attributes or {})
+        deviation_event_attrs = dict(deviation_event.attributes or {})
+        quality_attrs = dict(quality_state.attributes or {})
 
         self.assertEqual(profile_attrs["summary_type"], "environment_day_profile")
         self.assertEqual(profile_attrs["markers"]["active_epoch_count_day"], 1)
         self.assertEqual(profile_attrs["markers"]["unique_active_node_count_day"], 1)
         self.assertIn("device_offline_present", profile_attrs["quality_flags"])
         self.assertEqual(baseline_attrs["pattern_type"], "environment_baseline")
+        self.assertEqual(baseline_attrs["baseline_kind"], "short")
+        self.assertEqual(long_baseline_attrs["baseline_kind"], "long")
         self.assertEqual(baseline_attrs["sample_count"], 4)
         self.assertIn("active_epoch_count_day", baseline_attrs["marker_stats"])
+        self.assertIn("mad", baseline_attrs["marker_stats"]["active_epoch_count_day"])
         self.assertEqual(deviation_attrs["deviation_type"], "daily_activity_drop")
         self.assertEqual(deviation_attrs["markers"][0]["name"], "active_epoch_count_day")
+        self.assertEqual(deviation_event_attrs["summary_type"], "environment_deviation_event")
+        self.assertEqual(deviation_event_attrs["classification"], "acute_deviation")
+        self.assertEqual(quality_attrs["summary_type"], "environment_quality_state")
+        self.assertEqual(quality_attrs["classification"], "blocked")
 
     def test_sensor_memory_compiler_merges_environment_profile_outputs(self) -> None:
         compiler = LongTermSensorMemoryCompiler(
@@ -450,6 +463,49 @@ class LongTermSensorMemoryCompilerTests(unittest.TestCase):
 
         self.assertIn("environment_profile:home_main:day:2026-03-18", items)
         self.assertIn("environment_baseline:home_main:weekday:rolling_7d", items)
+
+    def test_environment_profile_compiler_detects_change_point_and_regime(self) -> None:
+        compiler = LongTermEnvironmentProfileCompiler(
+            enabled=True,
+            baseline_days=14,
+            short_baseline_days=14,
+            long_baseline_days=56,
+            history_days=56,
+            min_baseline_days=7,
+            drift_min_days=5,
+            regime_accept_days=8,
+        )
+        reference = datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc)
+        high_days = tuple(date(2026, 3, day) for day in range(1, 21))
+        low_days = tuple(date(2026, 3, day) for day in range(21, 31))
+        history = tuple(
+            _smart_home_motion_pattern(
+                day=day,
+                node_id="route:192.168.178.22:node-a",
+                event_hours=(7, 8, 12, 13, 18, 19),
+            )
+            for day in high_days
+        ) + tuple(
+            _smart_home_motion_pattern(
+                day=day,
+                node_id="route:192.168.178.22:node-a",
+                event_hours=(7, 18),
+            )
+            for day in low_days
+        )
+
+        result = compiler.compile(objects=history, now=reference)
+        items = {item.memory_id: item for item in result.created_summaries}
+
+        change_point = items["environment_change_point:home_main:2026-03-30"]
+        regime = items["environment_regime:home_main:2026-03-21"]
+        change_attrs = dict(change_point.attributes or {})
+        regime_attrs = dict(regime.attributes or {})
+
+        self.assertEqual(change_attrs["summary_type"], "environment_change_point")
+        self.assertIn("active_epoch_count_day", {marker["name"] for marker in change_attrs["markers"]})
+        self.assertEqual(regime_attrs["pattern_type"], "environment_regime")
+        self.assertEqual(regime_attrs["regime_started_on"], "2026-03-21")
 
 
 class LongTermSensorMemoryServiceTests(unittest.TestCase):

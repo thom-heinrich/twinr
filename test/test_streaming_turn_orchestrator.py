@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -8,6 +9,7 @@ from twinr.agent.base_agent.contracts import FirstWordReply
 from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 from twinr.agent.workflows.streaming_turn_orchestrator import (
+    FinalLaneTimeoutError,
     StreamingTurnOrchestrator,
     StreamingTurnTimeoutPolicy,
 )
@@ -59,9 +61,8 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
             ],
         )
 
-    def test_final_lane_error_uses_recovery_callback(self) -> None:
+    def test_final_lane_error_raises_instead_of_recovering(self) -> None:
         lane_events: list[SpeechLaneDelta] = []
-        recovery_calls: list[str] = []
         orchestrator = StreamingTurnOrchestrator(
             timeout_policy=StreamingTurnTimeoutPolicy(
                 bridge_reply_timeout_ms=10,
@@ -77,38 +78,182 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
         def _failing_final_lane() -> StreamingToolLoopResult:
             raise RuntimeError("boom")
 
-        outcome = orchestrator.execute(
-            prefetched_first_word=None,
-            prefetched_first_word_source="none",
-            generate_first_word=None,
-            bridge_fallback_reply=None,
-            run_final_lane=_failing_final_lane,
-            recover_final_lane_response=lambda failure_reason: recovery_calls.append(failure_reason) or StreamingToolLoopResult(
-                text="Ich antworte dir darauf jetzt direkt.",
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            orchestrator.execute(
+                prefetched_first_word=None,
+                prefetched_first_word_source="none",
+                generate_first_word=None,
+                bridge_fallback_reply=None,
+                run_final_lane=_failing_final_lane,
+                recover_final_lane_response=None,
+            )
+
+        self.assertEqual(lane_events, [])
+
+    def test_final_lane_error_can_bypass_recovery_for_fatal_errors(self) -> None:
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=50,
+                final_lane_hard_timeout_ms=200,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lambda delta: None,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            ensure_processing_feedback=lambda: None,
+        )
+
+        class _FatalRemoteError(RuntimeError):
+            pass
+
+        def _failing_final_lane() -> StreamingToolLoopResult:
+            raise _FatalRemoteError("remote down")
+
+        with self.assertRaises(_FatalRemoteError):
+            orchestrator.execute(
+                prefetched_first_word=None,
+                prefetched_first_word_source="none",
+                generate_first_word=None,
+                bridge_fallback_reply=None,
+                run_final_lane=_failing_final_lane,
+                recover_final_lane_response=lambda failure_reason: StreamingToolLoopResult(
+                    text=failure_reason,
+                    rounds=1,
+                    tool_calls=(),
+                    tool_results=(),
+                    response_id="resp_recovery",
+                    request_id="req_recovery",
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                    used_web_search=False,
+                ),
+                should_recover_final_lane_error=lambda exc: not isinstance(exc, _FatalRemoteError),
+            )
+
+    def test_bridge_filler_completion_resumes_processing_while_final_lane_waits(self) -> None:
+        lane_events: list[SpeechLaneDelta] = []
+        resumed: list[str] = []
+        idle_after = [False]
+
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=200,
+                final_lane_hard_timeout_ms=1000,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lane_events.append,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            wait_until_idle=lambda *, timeout_s=None: True,
+            is_output_idle=lambda: idle_after[0],
+            ensure_processing_feedback=lambda: None,
+            resume_processing_after_bridge=lambda: resumed.append("processing"),
+        )
+
+        def _slow_final_lane() -> StreamingToolLoopResult:
+            idle_after[0] = True
+            time.sleep(0.05)
+            return StreamingToolLoopResult(
+                text="Hier ist die finale Antwort.",
                 rounds=1,
                 tool_calls=(),
                 tool_results=(),
-                response_id="resp_recovery",
-                request_id="req_recovery",
+                response_id="resp_final",
+                request_id="req_final",
                 model="gpt-4o-mini",
                 token_usage=None,
-                used_web_search=False,
-            ),
+                used_web_search=True,
+            )
+
+        outcome = orchestrator.execute(
+            prefetched_first_word=FirstWordReply(mode="filler", spoken_text="Ich schaue kurz nach."),
+            prefetched_first_word_source="prefetched",
+            generate_first_word=None,
+            bridge_fallback_reply=None,
+            run_final_lane=_slow_final_lane,
+            recover_final_lane_response=None,
         )
 
-        self.assertEqual(recovery_calls, ["final_lane_error"])
-        self.assertEqual(outcome.response.text, "Ich antworte dir darauf jetzt direkt.")
-        self.assertEqual(
-            lane_events,
-            [
-                SpeechLaneDelta(
-                    text="Ich antworte dir darauf jetzt direkt.",
-                    lane="direct",
-                    replace_current=False,
-                    atomic=True,
-                )
-            ],
+        self.assertEqual(resumed, ["processing"])
+        self.assertEqual(outcome.response.text, "Hier ist die finale Antwort.")
+
+    def test_final_lane_timeout_raises_error_instead_of_recovery_reply(self) -> None:
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=20,
+                final_lane_hard_timeout_ms=40,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lambda delta: None,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            ensure_processing_feedback=lambda: None,
         )
+
+        def _blocking_final_lane() -> StreamingToolLoopResult:
+            time.sleep(0.2)
+            return StreamingToolLoopResult(
+                text="Zu spät.",
+                rounds=1,
+                tool_calls=(),
+                tool_results=(),
+                response_id="resp_final",
+                request_id="req_final",
+                model="gpt-4o-mini",
+                token_usage=None,
+                used_web_search=True,
+            )
+
+        with self.assertRaises(FinalLaneTimeoutError):
+            orchestrator.execute(
+                prefetched_first_word=None,
+                prefetched_first_word_source="none",
+                generate_first_word=None,
+                bridge_fallback_reply=None,
+                run_final_lane=_blocking_final_lane,
+                recover_final_lane_response=None,
+            )
+
+    def test_final_lane_timeout_requests_cooperative_stop_signal(self) -> None:
+        requested: list[str] = []
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=20,
+                final_lane_hard_timeout_ms=40,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lambda delta: None,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            ensure_processing_feedback=lambda: None,
+            request_final_lane_stop=requested.append,
+        )
+
+        def _blocking_final_lane() -> StreamingToolLoopResult:
+            time.sleep(0.2)
+            return StreamingToolLoopResult(
+                text="Zu spät.",
+                rounds=1,
+                tool_calls=(),
+                tool_results=(),
+                response_id="resp_final",
+                request_id="req_final",
+                model="gpt-4o-mini",
+                token_usage=None,
+                used_web_search=True,
+            )
+
+        with self.assertRaises(FinalLaneTimeoutError):
+            orchestrator.execute(
+                prefetched_first_word=None,
+                prefetched_first_word_source="none",
+                generate_first_word=None,
+                bridge_fallback_reply=None,
+                run_final_lane=_blocking_final_lane,
+                recover_final_lane_response=None,
+            )
+
+        self.assertEqual(requested, ["timeout"])
 
 
 if __name__ == "__main__":

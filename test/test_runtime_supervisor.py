@@ -471,6 +471,119 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
         self.assertGreaterEqual(factory.calls[0]["started_at"], 5.0)
 
+    def test_run_attempts_external_watchdog_recovery_when_external_owner_is_dead(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            recovery_calls: list[dict[str, object]] = []
+
+            def _starter(start_config: TwinrConfig, env_file: str, emit) -> int | None:
+                recovery_calls.append(
+                    {
+                        "project_root": start_config.project_root,
+                        "env_file": env_file,
+                    }
+                )
+                emit("remote_memory_watchdog=spawned")
+                return 9876
+
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(
+                    ready=False,
+                    detail="Remote memory watchdog process 485052 is not alive.",
+                    pid_alive=False,
+                    sample_ready=False,
+                    watchdog_pid=485052,
+                ),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+                manage_watchdog=False,
+                external_watchdog_starter=_starter,
+            )
+
+            exit_code = supervisor.run(duration_s=0.0)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(factory.calls, [])
+        self.assertEqual(
+            recovery_calls,
+            [{"project_root": str(root), "env_file": str(root / ".env")}],
+        )
+
+    def test_run_starts_streaming_after_external_watchdog_recovery_restores_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            recovery_calls: list[dict[str, object]] = []
+            assessments = [
+                _build_assessment(
+                    ready=False,
+                    detail="Remote memory watchdog process 485052 is not alive.",
+                    pid_alive=False,
+                    sample_ready=False,
+                    watchdog_pid=485052,
+                ),
+                _build_assessment(
+                    ready=True,
+                    detail="ok",
+                    pid_alive=True,
+                    watchdog_pid=9876,
+                ),
+            ]
+
+            def _assessor(_config: TwinrConfig) -> RequiredRemoteWatchdogAssessment:
+                if assessments:
+                    return assessments.pop(0)
+                return _build_assessment(ready=True, detail="ok", pid_alive=True, watchdog_pid=9876)
+
+            def _starter(start_config: TwinrConfig, env_file: str, emit) -> int | None:
+                recovery_calls.append(
+                    {
+                        "project_root": start_config.project_root,
+                        "env_file": env_file,
+                    }
+                )
+                emit("remote_memory_watchdog=spawned")
+                return 9876
+
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=_assessor,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+                manage_watchdog=False,
+                external_watchdog_starter=_starter,
+            )
+
+            exit_code = supervisor.run(duration_s=1.0)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            recovery_calls,
+            [{"project_root": str(root), "env_file": str(root / ".env")}],
+        )
+        self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
+        self.assertGreaterEqual(factory.calls[0]["started_at"], 1.0)
+
     def test_run_does_not_restart_streaming_for_persistent_missing_display_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

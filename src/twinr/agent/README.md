@@ -8,11 +8,12 @@ that own core runtime, tool, and workflow behavior.
 
 `agent` owns:
 - expose the thin `twinr.agent` import surface for `TwinrConfig`, `TwinrRuntime`, and `TwinrStatus`
-- define the package boundary between `base_agent`, `tools`, and `workflows`
-- direct changes toward the correct child package for runtime, tool, or workflow work
+- define the package boundary between `base_agent`, `routing`, `tools`, and `workflows`
+- direct changes toward the correct child package for runtime, routing, tool, or workflow work
 
 `agent` does **not** own:
 - base-agent implementation details in [`base_agent`](./base_agent/README.md)
+- local semantic transcript routing details in [`routing`](./routing/README.md)
 - structured evolving-personality state, background learning, and prompt-layer planning inside [`personality`](./personality/README.md)
 - tool prompt, schema, handler, or tool-runtime logic in [`tools`](./tools/README.md)
 - workflow-loop orchestration details in [`workflows`](./workflows/README.md)
@@ -25,6 +26,7 @@ that own core runtime, tool, and workflow behavior.
 | [__init__.py](./__init__.py) | Lazy root export surface |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [base_agent/README.md](./base_agent/README.md) | Core runtime package |
+| [routing/README.md](./routing/README.md) | Local semantic transcript routing package |
 | [personality/README.md](./personality/README.md) | Evolving companion-state package |
 | [tools/README.md](./tools/README.md) | Tool stack package |
 | [workflows/README.md](./workflows/README.md) | Workflow package |
@@ -46,6 +48,7 @@ runtime = TwinrRuntime(config=config)
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
 - [base_agent](./base_agent/README.md)
+- [routing](./routing/README.md)
 - [personality](./personality/README.md)
 - [tools](./tools/README.md)
 - [workflows](./workflows/README.md)

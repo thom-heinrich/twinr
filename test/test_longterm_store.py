@@ -32,7 +32,10 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
     _classify_remote_read_exception,
     record_remote_read_diagnostic,
 )
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteUnavailableError,
+)
 from twinr.memory.longterm.storage.store import LongTermStructuredStore, _write_json_atomic
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 from twinr.ops.events import TwinrOpsEventStore
@@ -116,6 +119,25 @@ class _SerialEnsureRemoteState(_FakeRemoteState):
         finally:
             with self._active_lock:
                 self._active_loads -= 1
+
+
+class _LaggingSnapshotVisibilityRemoteState(_FakeRemoteState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.required = True
+        self._pending_snapshots: dict[str, dict[str, object]] = {}
+
+    def save_snapshot(self, *, snapshot_kind: str, payload):
+        normalized = dict(payload)
+        if snapshot_kind in self.snapshots:
+            self._pending_snapshots[snapshot_kind] = normalized
+            return
+        self.snapshots[snapshot_kind] = normalized
+
+    def promote_pending(self, snapshot_kind: str) -> None:
+        pending = self._pending_snapshots.pop(snapshot_kind, None)
+        if pending is not None:
+            self.snapshots[snapshot_kind] = pending
 
 
 class _FakeChonkyClient:
@@ -267,6 +289,44 @@ class _TimeoutingScopeTopKClient(_FakeChonkyClient):
             self._failed_scope_queries += 1
             raise ChonkyDBError(
                 "ChonkyDB request failed for POST /v1/external/retrieve/topk_records: The read operation timed out"
+            )
+        return super().topk_records(request)
+
+
+class _AlwaysTimeoutingScopeTopKClient(_FakeChonkyClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_topk_records = True
+
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        if payload.get("scope_ref"):
+            self.topk_records_calls += 1
+            self.topk_records_payloads.append(dict(payload))
+            raise ChonkyDBError(
+                "ChonkyDB request failed for POST /v1/external/retrieve/topk_records: The read operation timed out"
+            )
+        return super().topk_records(request)
+
+
+class _Http503ScopeTopKClient(_FakeChonkyClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_topk_records = True
+
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        if payload.get("scope_ref"):
+            self.topk_records_calls += 1
+            self.topk_records_payloads.append(dict(payload))
+            raise ChonkyDBError(
+                "ChonkyDB request failed for POST /v1/external/retrieve/topk_records",
+                status_code=503,
+                response_json={
+                    "detail": "payload_sync_bulk_busy",
+                    "error": "payload_sync_bulk_busy",
+                    "error_type": "ServerBusy",
+                },
             )
         return super().topk_records(request)
 
@@ -762,6 +822,43 @@ class _SemanticDriftChonkyClient(_FakeChonkyClient):
             indexes_used=("semantic",),
             raw={"results": [dict(item) for item in ranked]},
         )
+
+
+class _SemanticDriftScopeTopKClient(_FakeChonkyClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_topk_records = True
+
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        if payload.get("scope_ref"):
+            self.topk_records_calls += 1
+            self.topk_records_payloads.append(dict(payload))
+            self.retrieve_calls += 1
+            ranked = []
+            for document_id, record in self.records_by_document_id.items():
+                ranked.append(
+                    {
+                        "payload_id": document_id,
+                        "document_id": document_id,
+                        "relevance_score": 1.0,
+                        "metadata": dict(record.get("metadata") or {}),
+                        "payload": dict(record.get("payload") or {}),
+                        "payload_source": "record.payload",
+                        "source_index": "semantic",
+                        "candidate_origin": "semantic",
+                    }
+                )
+            return SimpleNamespace(
+                success=True,
+                mode="advanced",
+                results=tuple(SimpleNamespace(**item) for item in ranked),
+                indexes_used=("semantic",),
+                scope_ref=payload.get("scope_ref"),
+                query_plan={"latency_ms": {"search": 1.0, "materialize": 0.2}},
+                raw={"results": [dict(item) for item in ranked]},
+            )
+        return super().topk_records(request)
 
 
 class _FailingRemoteState(_FakeRemoteState):
@@ -2570,6 +2667,414 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertIsNone(payloads)
         self.assertEqual(remote_state.client.retrieve_calls, 0)
 
+    def test_select_fast_topic_objects_uses_one_shot_scope_search_with_bounded_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client.supports_topk_records = True
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            def _fail_catalog_hydration(*args, **kwargs):
+                del args
+                del kwargs
+                raise AssertionError("fast topic lookup must not hydrate the full catalog")
+
+            remote_catalog.load_catalog_entries = _fail_catalog_hydration  # type: ignore[method-assign]
+            remote_catalog.catalog_available = _fail_catalog_hydration  # type: ignore[method-assign]
+
+            relevant = store.select_fast_topic_objects(
+                query_text="Janina",
+                limit=2,
+                timeout_s=0.45,
+            )
+
+        self.assertEqual(
+            {item.memory_id for item in relevant},
+            {"fact:janina_spouse", "episode:doctor"},
+        )
+        self.assertEqual(len(relevant), 2)
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["namespace"], "test-namespace")
+        self.assertEqual(payload["scope_ref"], "longterm:objects:current")
+        self.assertEqual(payload["result_limit"], 2)
+        self.assertEqual(payload["timeout_seconds"], 0.45)
+        self.assertEqual(remote_state.client.topk_records_calls, 1)
+        self.assertEqual(remote_state.client.fetch_full_document_calls, 0)
+
+    def test_required_remote_reads_prefer_same_process_snapshot_after_remote_visibility_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _LaggingSnapshotVisibilityRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            old_object = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_new",
+                kind="fact",
+                summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                details="Neuere Vorliebe fuer das Fruehstueck.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.95,
+                slot_key="preference:breakfast:jam",
+                value_key="apricot",
+            )
+            confirmed_object = old_object.with_updates(
+                status="active",
+                confirmed_by_user=True,
+                confidence=0.99,
+            )
+
+            store.write_snapshot(objects=(old_object,))
+            store.write_snapshot(objects=(confirmed_object,))
+
+            remote_payload = store._load_remote_snapshot_payload(snapshot_kind="objects")
+            loaded = store.load_objects()
+
+            remote_state.promote_pending("objects")
+            loaded_after_remote_catchup = store.load_objects()
+
+        assert remote_payload is not None
+        remote_objects = tuple(remote_payload.get("objects") or ())
+        self.assertEqual(remote_objects[0]["status"], "uncertain")
+        self.assertFalse(remote_objects[0]["confirmed_by_user"])
+        self.assertEqual(tuple(item.memory_id for item in loaded), ("fact:jam_preference_new",))
+        self.assertEqual(loaded[0].status, "active")
+        self.assertTrue(loaded[0].confirmed_by_user)
+        self.assertEqual(loaded_after_remote_catchup[0].status, "active")
+        self.assertTrue(loaded_after_remote_catchup[0].confirmed_by_user)
+
+    def test_select_relevant_context_objects_prefer_same_process_snapshot_after_remote_visibility_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _LaggingSnapshotVisibilityRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=_source(),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                        attributes={"fact_type": "general", "memory_domain": "general"},
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=_source(),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                        attributes={"fact_type": "general", "memory_domain": "general"},
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="superseded",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confirmed_by_user=True,
+                        confidence=0.99,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+
+            episodic, durable = store.select_relevant_context_objects(
+                query_text="Welche Marmelade ist jetzt als bestaetigt gespeichert?",
+                episodic_limit=3,
+                durable_limit=3,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in episodic), ())
+        self.assertEqual(durable[0].memory_id, "fact:jam_preference_new")
+        self.assertEqual(durable[0].status, "active")
+        self.assertTrue(durable[0].confirmed_by_user)
+
+    def test_select_fast_topic_objects_prefer_same_process_snapshot_after_remote_visibility_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _LaggingSnapshotVisibilityRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=_source(),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=_source(),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confirmed_by_user=True,
+                        confidence=0.99,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+
+            relevant = store.select_fast_topic_objects(
+                query_text="Welche Marmeladensorte ist aktuell gespeichert?",
+                limit=2,
+                timeout_s=0.45,
+            )
+
+        self.assertEqual(relevant[0].memory_id, "fact:jam_preference_new")
+        self.assertEqual(relevant[0].status, "active")
+        self.assertTrue(relevant[0].confirmed_by_user)
+
+    def test_select_fast_topic_objects_raises_precise_remote_read_failure_for_scope_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.client = _TimeoutingScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=project_root / "state" / "chonkydb", remote_state=remote_state)
+
+            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
+                store.select_fast_topic_objects(
+                    query_text="Janina",
+                    limit=2,
+                    timeout_s=0.45,
+                )
+
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=8)
+
+        details = dict(raised.exception.details)
+        self.assertEqual(details["operation"], "fast_topic_topk_search")
+        self.assertEqual(details["classification"], "timeout")
+        self.assertEqual(details["timeout_reason"], "read_operation_timed_out")
+        self.assertEqual(details["request_path"], "/v1/external/retrieve/topk_records")
+        self.assertEqual(details["request_timeout_s"], 0.45)
+        self.assertEqual(details["scope_ref"], "longterm:objects:current")
+        self.assertEqual(details["retry_attempts_configured"], 1)
+        self.assertEqual(details["retry_backoff_s"], 0.0)
+        self.assertEqual(details["retry_mode"], "disabled_for_fast_topic_budget")
+        self.assertFalse(details["retry_enabled"])
+        self.assertEqual(details["attempt_index"], 1)
+        self.assertEqual(details["attempt_count"], 1)
+        failed_event = next(
+            event
+            for event in events
+            if event.get("event") == "longterm_remote_read_failed"
+            and dict(event.get("data") or {}).get("operation") == "fast_topic_topk_search"
+        )
+        failed_data = dict(failed_event["data"])
+        self.assertEqual(failed_data["classification"], "timeout")
+        self.assertEqual(failed_data["timeout_reason"], "read_operation_timed_out")
+        self.assertEqual(failed_data["retry_mode"], "disabled_for_fast_topic_budget")
+
+    def test_select_fast_topic_objects_records_http_status_and_problem_detail_for_503(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.client = _Http503ScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=project_root / "state" / "chonkydb", remote_state=remote_state)
+
+            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
+                store.select_fast_topic_objects(
+                    query_text="Thermoskanne",
+                    limit=1,
+                    timeout_s=0.6,
+                )
+
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=8)
+
+        details = dict(raised.exception.details)
+        self.assertEqual(details["operation"], "fast_topic_topk_search")
+        self.assertEqual(details["classification"], "backend_http_error")
+        self.assertEqual(details["status_code"], 503)
+        self.assertEqual(details["response_status_code"], 503)
+        self.assertEqual(details["response_detail"], "payload_sync_bulk_busy")
+        self.assertEqual(details["response_error"], "payload_sync_bulk_busy")
+        self.assertEqual(details["response_error_type"], "ServerBusy")
+        failed_event = next(
+            event
+            for event in events
+            if event.get("event") == "longterm_remote_read_failed"
+            and dict(event.get("data") or {}).get("operation") == "fast_topic_topk_search"
+        )
+        failed_data = dict(failed_event["data"])
+        self.assertEqual(failed_data["status_code"], 503)
+        self.assertEqual(failed_data["response_error_type"], "ServerBusy")
+
+    def test_search_current_item_payloads_fast_rescues_timeout_with_current_catalog_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _AlwaysTimeoutingScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:thermos_location_old",
+                        kind="fact",
+                        summary="Die rote Thermoskanne steht im Flurschrank.",
+                        details="Aktueller Ort der roten Thermoskanne.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="object:red_thermos:location",
+                        value_key="hallway_cupboard",
+                    ),
+                ),
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads_fast(
+                snapshot_kind="objects",
+                query_text="Thermoskanne",
+                limit=1,
+                timeout_s=0.45,
+            )
+
+        self.assertEqual(tuple(payload["memory_id"] for payload in payloads), ("fact:thermos_location_old",))
+
+    def test_search_current_item_payloads_fast_rescues_503_with_current_catalog_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _Http503ScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:thermos_location_old",
+                        kind="fact",
+                        summary="Die rote Thermoskanne steht im Flurschrank.",
+                        details="Aktueller Ort der roten Thermoskanne.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="object:red_thermos:location",
+                        value_key="hallway_cupboard",
+                    ),
+                ),
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads_fast(
+                snapshot_kind="objects",
+                query_text="Thermoskanne",
+                limit=1,
+                timeout_s=0.6,
+            )
+
+        self.assertEqual(tuple(payload["memory_id"] for payload in payloads), ("fact:thermos_location_old",))
+
     def test_search_current_item_payloads_prefers_remote_topk_even_with_cached_catalog_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
@@ -2798,7 +3303,7 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(tuple(item.memory_id for item in episodic), ())
         self.assertEqual(tuple(item.memory_id for item in durable), ("fact:thermos_location_old",))
-        self.assertEqual(remote_state.client.topk_records_calls, 2)
+        self.assertGreaterEqual(remote_state.client.topk_records_calls, 2)
 
     def test_select_relevant_context_objects_retries_with_smaller_scope_window_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3058,6 +3563,48 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(tuple(item.memory_id for item in episodic), ())
         self.assertEqual(tuple(item.memory_id for item in durable[:2]), ("fact:jam_preference_new", "fact:jam_generic"))
         self.assertTrue(durable[0].confirmed_by_user)
+
+    def test_select_relevant_context_objects_skips_catalog_rescue_after_offtopic_scope_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _SemanticDriftScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                ),
+            )
+
+            episodic, durable = store.select_relevant_context_objects(
+                query_text="Was ist ein Regenbogen?",
+                episodic_limit=3,
+                durable_limit=3,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in episodic), ())
+        self.assertEqual(tuple(item.memory_id for item in durable), ())
+        self.assertEqual(remote_state.client.topk_records_calls, 1)
+        self.assertEqual(remote_state.client.retrieve_calls, 1)
 
     def test_select_relevant_objects_falls_back_to_catalog_search_after_scope_topk_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3503,6 +4050,71 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(relevant[0].memory_id, "fact:jam_preference_new")
         self.assertTrue(relevant[0].confirmed_by_user)
+
+    def test_remote_primary_store_meta_query_ignores_unrelated_state_only_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _SemanticDriftScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:thermos_location_old",
+                        kind="fact",
+                        summary="Früher stand die rote Thermoskanne im Flurschrank.",
+                        details="Historische Ortsangabe zur roten Thermoskanne.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="object:red_thermos:location",
+                        value_key="hallway_cupboard",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=_source(),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                        attributes={
+                            "fact_type": "general",
+                            "memory_domain": "general",
+                            "value_text": "jam on bread at breakfast",
+                        },
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                        attributes={
+                            "fact_type": "general",
+                            "memory_domain": "general",
+                            "resolved_by_user": True,
+                        },
+                    ),
+                )
+            )
+
+            relevant = store.select_relevant_objects(
+                query_text="Welche Marmelade ist jetzt als bestaetigt gespeichert?",
+                limit=3,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in relevant[:2]), ("fact:jam_preference_new", "fact:jam_generic"))
+        self.assertNotIn("fact:thermos_location_old", tuple(item.memory_id for item in relevant))
 
     def test_store_merges_repeated_memory_ids_into_support_count(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

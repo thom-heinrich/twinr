@@ -770,7 +770,7 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
         },
         "spoken_ack": {
             "type": ["string", "null"],
-            "description": "Short immediate acknowledgement only for handoff. Must stay null for direct replies.",
+            "description": "Optional short immediate acknowledgement for handoff. Use null when no bridge line should be spoken. Must stay null for direct replies.",
         },
         "spoken_reply": {
             "type": ["string", "null"],
@@ -1282,14 +1282,21 @@ def _create_response_with_reasoning_fallback(
     """Create a response and retry once without reasoning if unsupported."""
 
     # AUDIT-FIX(#1,#3): Centralize create-path status validation and unsupported-reasoning retry logic.
-    try:
-        response = backend._client.responses.create(**request)
-    except Exception as exc:
-        if not _is_reasoning_unsupported_error(exc) or "reasoning" not in request:
-            raise
+    def _create_once(request_payload: dict[str, Any]) -> Any:
+        try:
+            return backend._client.responses.create(**request_payload)
+        except Exception as exc:
+            if not _is_reasoning_unsupported_error(exc) or "reasoning" not in request_payload:
+                raise
+            retry_request = dict(request_payload)
+            retry_request.pop("reasoning", None)
+            return backend._client.responses.create(**retry_request)
+
+    response = _create_once(request)
+    if _should_retry_incomplete_max_output_tokens(response, request=request):
         retry_request = dict(request)
-        retry_request.pop("reasoning", None)
-        response = backend._client.responses.create(**retry_request)
+        retry_request["max_output_tokens"] = _expanded_max_output_tokens(request.get("max_output_tokens"))
+        response = _create_once(retry_request)
     _validate_response_status(response, context=context)
     return response
 
@@ -1333,6 +1340,32 @@ def _extract_detail_message(detail: Any) -> str | None:
     if parts:
         return ": ".join(parts)
     return _optional_text(detail)
+
+
+def _should_retry_incomplete_max_output_tokens(
+    response: Any,
+    *,
+    request: dict[str, Any],
+) -> bool:
+    """Return whether one larger-token retry should be attempted."""
+
+    if "max_output_tokens" not in request:
+        return False
+    status = str(getattr(response, "status", "") or "").strip().lower()
+    if status != "incomplete":
+        return False
+    incomplete_detail = _extract_detail_message(getattr(response, "incomplete_details", None)) or ""
+    return "max_output_tokens" in incomplete_detail.lower()
+
+
+def _expanded_max_output_tokens(value: Any) -> int:
+    """Compute one bounded larger max-output-tokens retry budget."""
+
+    try:
+        current = max(16, int(value))
+    except (TypeError, ValueError):
+        current = 64
+    return min(512, max(current + 64, current * 2))
 
 
 def _provider_bundle_field_names(bundle_cls: type[Any]) -> set[str]:

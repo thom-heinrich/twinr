@@ -1,10 +1,10 @@
-"""Build question-first ambient display copy from Twinr's companion state.
+"""Build personality-shaped ambient display copy from Twinr's companion state.
 
 The display reserve should feel like a living conversational opening, not like
 an internal topic label. This module therefore turns structured mindshare items
-plus positive-engagement policy into short, readable prompts that can either
-invite the user's opinion or ask for a little more context so Twinr can
-remember a personal thread better.
+plus positive-engagement policy into short, readable prompts that carry a clear
+topic anchor and at least a little of Twinr's own tone. The output should stay
+calm and legible, but it should not read like a blank notification template.
 
 The logic stays generic and policy-driven:
 
@@ -118,23 +118,23 @@ def _memory_question(
 
     if policy.action == "hint":
         variants = (
-            f"Soll ich mir zu {topic} etwas genauer merken?",
-            f"Ist {topic} etwas, das ich weiter gut im Kopf behalten soll?",
+            f"Soll ich bei {topic} weiter hinschauen?",
+            f"Bei {topic} ist fuer mich noch etwas offen. Soll ich dranbleiben?",
         )
     elif policy.action == "brief_update":
         variants = (
-            f"Willst du mir zu {topic} noch ein kleines Update geben?",
-            f"Magst du mir kurz sagen, wie es bei {topic} steht?",
+            f"Sollen wir bei {topic} spaeter kurz anknuepfen?",
+            f"Zu {topic} wuerde ich spaeter gern noch einmal kurz zurueckkommen.",
         )
     elif policy.action == "ask_one":
         variants = (
-            f"Magst du mir zu {topic} noch etwas erzählen?",
             f"Wie ist es bei {topic} weitergegangen?",
+            f"Zu {topic} fehlt mir noch etwas. Magst du mich kurz auf Stand bringen?",
         )
     else:
         variants = (
-            f"Wie ist es bei {topic} inzwischen weitergegangen?",
-            f"Magst du mir zu {topic} noch etwas mehr erzählen?",
+            f"Bei {topic} habe ich noch ein Fragezeichen. Wie ging es weiter?",
+            f"Zu {topic} fehlt mir noch ein Stueck. Magst du mich kurz auf Stand bringen?",
         )
     return variants[1 if seed >= 0.5 else 0]
 
@@ -150,23 +150,23 @@ def _world_question(
 
     if policy.action == "hint":
         variants = (
-            f"Soll ich {topic} weiter im Blick behalten?",
-            f"Willst du, dass ich bei {topic} weiter aufpasse?",
+            f"Soll ich {topic} heute weiter im Blick behalten?",
+            f"Bei {topic} schaue ich gerade noch einmal hin. Soll ich dranbleiben?",
         )
     elif policy.action == "brief_update":
         variants = (
-            f"Soll ich dir spaeter kurz sagen, was sich bei {topic} getan hat?",
-            f"Willst du spaeter ein kleines Update zu {topic}?",
+            f"Bei {topic} tut sich gerade etwas. Soll ich spaeter kurz updaten?",
+            f"Zu {topic} koennte ich spaeter ein kurzes Update geben. Waere das gut?",
         )
     elif source_family == "world":
         variants = (
-            f"Ich habe zu {topic} heute etwas gelesen. Was meinst du?",
             f"Bei {topic} ist gerade wieder Bewegung drin. Wie siehst du das?",
+            f"{topic} laesst mich heute nicht ganz los. Wie schaust du darauf?",
         )
     else:
         variants = (
-            f"Was meinst du zu {topic}?",
-            f"Wie siehst du {topic} gerade?",
+            f"Rund um {topic} ist gerade etwas in Bewegung. Wie siehst du das?",
+            f"Bei {topic} lohnt heute ein zweiter Blick. Was meinst du?",
         )
     return variants[1 if seed >= 0.5 else 0]
 
@@ -181,18 +181,19 @@ def _general_question(
 
     if policy.action == "brief_update":
         variants = (
-            f"Willst du spaeter kurz auf {topic} schauen?",
-            f"Soll ich zu {topic} spaeter kurz nachhaken?",
+            f"Soll ich bei {topic} spaeter noch einmal kurz nachfassen?",
+            f"Zu {topic} waere spaeter ein kleiner zweiter Blick gut. Passt das?",
         )
     else:
         variants = (
-            f"Was meinst du zu {topic}?",
-            f"Wie siehst du {topic} gerade?",
+            f"Bei {topic} habe ich noch ein kleines Fragezeichen. Wie siehst du das?",
+            f"Zu {topic} wuerde ich gern kurz deine Sicht hoeren. Was meinst du?",
         )
     return variants[1 if seed >= 0.5 else 0]
 
 
 def _helper_text(
+    topic: str,
     *,
     policy: PositiveEngagementTopicPolicy,
     source_family: str,
@@ -202,25 +203,25 @@ def _helper_text(
 
     if source_family == "memory":
         variants = (
-            "Dann kann ich mir den Faden besser merken.",
-            "Dann halte ich mir das genauer fest.",
+            "Da fehlt mir noch ein klares Bild.",
+            "Da habe ich noch ein kleines Fragezeichen.",
         )
         return variants[1 if seed >= 0.5 else 0]
     if policy.action == "hint":
         variants = (
-            "Ein kurzes Ja oder Nein reicht mir schon.",
-            "Ein kleiner Hinweis genuegt mir.",
+            "Ein kurzer Hinweis reicht mir da schon.",
+            "Ein kleiner Kompass waere dafuer schon genug.",
         )
         return variants[1 if seed >= 0.5 else 0]
     if policy.attention_state == "shared_thread":
         variants = (
-            "Dann halte ich den Faden fuer uns warm.",
-            "Dann weiss ich besser, ob ich dranbleiben soll.",
+            "Das ist gerade so ein kleiner Faden zwischen uns.",
+            "Da bleibe ich ruhig, aber ziemlich wach dran.",
         )
         return variants[1 if seed >= 0.5 else 0]
     variants = (
-        "Dann weiss ich, ob ich weiter darauf achten soll.",
-        "Dann kann ich mich daran besser orientieren.",
+        "Dein Blick darauf interessiert mich mehr als die Schlagzeile.",
+        "Da wuerde ich gern kurz deine Sicht hoeren.",
     )
     return variants[1 if seed >= 0.5 else 0]
 
@@ -257,7 +258,7 @@ def build_ambient_display_impulse_copy(
         eyebrow="",
         headline=_truncate_text(headline, max_len=112),
         body=_truncate_text(
-            _helper_text(policy=policy, source_family=source_family, seed=seed),
+            _helper_text(topic, policy=policy, source_family=source_family, seed=seed),
             max_len=96,
         ),
         symbol=_symbol_for_policy(policy, source_family=source_family),

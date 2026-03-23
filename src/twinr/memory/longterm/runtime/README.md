@@ -10,6 +10,8 @@ bounded background writers into the APIs used by agent runtime loops.
 `runtime` owns:
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
+- Inject the bounded fast-topic quick-memory lane into the normal provider context so ordinary answer turns receive a few compact personalized topic hints before the heavier recall sections
+- Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
 - Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
@@ -59,7 +61,8 @@ from twinr.memory.longterm import LongTermMemoryService
 service = LongTermMemoryService.from_config(config)
 service.ensure_remote_ready()
 steady_state = service.probe_remote_ready(bootstrap=False, include_archive=False)
-context = service.build_provider_context(query_text)
+context = service.build_provider_context(query_text)  # includes quick-memory topic hints when enabled
+fast_context = service.build_fast_provider_context(query_text)  # compact quick-memory-only context
 service.enqueue_conversation_turn(
     transcript=user_text,
     response=assistant_text,

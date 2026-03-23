@@ -27,8 +27,13 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - expose explicit payload-cache prewarm hooks so text-channel startup can front-load the first-hit object/conflict document fetches instead of making the user's first real message pay that network cost
 - clear or refresh those read caches on local writes so remote-only truth stays authoritative even while warmed reads remain fast
 - prefer ChonkyDB `topk_records(scope_ref=...)` for current-scope object/conflict/archive retrieval even when a local catalog projection is already cached, so Twinr keeps exercising the authoritative remote one-shot retrieval path and only falls back to the cached selector when that path is temporarily unavailable
+- keep required fast-topic reads fail-closed on real remote loss, but allow one bounded rescue through the current remote catalog projection when only the narrower `topk_records(scope_ref=...)` endpoint flakes; the local fast-topic selector remains valid only in explicit non-required local-first mode
+- preserve same-process read-after-write consistency for required remote snapshots and object-query selectors by reusing the just-written local snapshot only until remote reads catch up to the same `written_at`, so `confirm_memory()` does not immediately reread stale remote state or stale current-scope object hits
 - treat false-empty durable-object current-scope hits as recoverable and continue into catalog-backed selection, so inflected queries like `früher ... Thermoskanne` or `aktuell gespeichert` do not disappear just because the remote one-shot path under-matches one wording
 - keep catalog-backed rescue alive when current-scope object payloads collapse away during status/kind partitioning, so newly confirmed facts are not hidden just because a stale scope hit now deserializes as `superseded`
+- stop shared context-object selection early when active current-scope payloads are still semantically off-topic after partitioning, so no-hit semantic questions do not pay redundant catalog rescue and hydration work only to return an empty context
+- treat direct semantic query matches as topic anchors and keep only topic-related sibling facts around them, so meta-memory questions keep the confirmed current fact without leaking unrelated `confirmed/gespeichert` memories such as an old thermos location
+- keep store-level object/conflict fallback ownership single-layered, so `search_current_item_payloads()` does not first do its own scope rescue and then make the caller repeat a second remote catalog fallback for the same miss
 - fall back from a false-empty current-scope conflict `topk_records` hit set to the current remote catalog instead of double-filtering the same conflict away, so open conflicts remain visible when the remote one-shot search under-matches inflected wording
 - fall back from false-empty durable-object catalog top-k results to the already loaded local catalog selector, but keep empty episodic scope misses authoritative so off-topic episode queries do not rehydrate the whole episodic catalog into the hot path
 - top up underfilled durable sections with one bounded durable-only rescue when the shared episodic/durable query pool is dominated by episodes, so multimodal print/button facts are not starved by recent distractor turns
@@ -44,11 +49,14 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - reject ChonkyDB bulk responses that return item-level store failures inside an HTTP-success envelope, so Twinr never treats a fast backend rejection as a durable snapshot write
 - stamp each remote `records/bulk` failure with a bounded request correlation id, batch coordinates, and request bytes, then propagate that same context into watchdog/runtime failure surfaces for Pi incident tracing
 - persist structured retrieve-search/retrieve-batch latency histograms plus explicit timeout/slow-read alert events so `/twinr` operators can see ChonkyDB read spikes without replaying raw logs
+- preserve separate semantics for "required remote backend unavailable" versus "specific required remote read failed", and stamp fast `topk_records(scope_ref=...)` incidents with status/detail/timeout/retry evidence for Pi forensics
 - preserve restart-recall midterm packets while reflection refreshes the rest of the midterm snapshot, so confirmed/stable durable facts can survive fresh runtime roots as explicit policy context
+- preserve a small bounded set of the newest immediate turn-continuity packets across reflection refreshes, so nightly/next-day continuity prompts do not disappear just because a slower reflection pass rewrote the midterm snapshot
 - match midterm packet queries on content-bearing terms, including compound-word containment, and fail closed when no real topic overlap exists so restart-recall packets do not leak into control questions
 - project structured memory-state semantics such as `confirmed`, `aktuell`, `gespeichert`, and `superseded` into durable-object search text so meta-memory queries can retrieve the right fact instead of a generic sibling
 - rank selected durable objects by combined query overlap, confirmation state, and recency before returning them to retrieval/runtime callers
 - gate durable-object and conflict recall on content-bearing query terms so control questions do not pull in off-topic memory just because they share auxiliary words like `ist`
+- gate quick-memory fast-topic hints on the same content-bearing overlap checks after the remote one-shot hit set is loaded, so neutral control questions like `Was ist ein Regenbogen?` do not leak unrelated favorites just because one weak current-scope hit happened to rank first
 - keep raw storage identifiers such as `slot_key` and `value_key` out of retrieval text so dates and internal IDs do not make unrelated math/control questions match durable memory
 - keep fine-grained remote bulk writes bounded by item count and request bytes before they hit ChonkyDB
 - bootstrap fresh required remote namespaces with empty structured snapshots instead of failing before the first live write
@@ -70,8 +78,8 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | `midterm_store.py` | Midterm packet store |
 | `remote_catalog.py` | Fine-grained remote object/conflict/archive catalog adapter |
 | `remote_read_diagnostics.py` | Structured ops-event diagnostics for remote long-term I/O failures and fallbacks |
-| `remote_read_observability.py` | Persisted retrieve histogram + alert helper for remote read spikes |
-| `remote_state.py` | Small remote snapshot/catalog adapter |
+| `remote_read_observability.py` | Persisted retrieve/top-k histogram + alert helper for remote read spikes |
+| `remote_state.py` | Small remote snapshot/catalog adapter plus shared remote-read exception types |
 | `component.yaml` | Structured ownership metadata |
 | `AGENTS.md` | Local editing rules |
 

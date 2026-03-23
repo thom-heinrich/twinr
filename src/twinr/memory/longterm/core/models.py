@@ -514,6 +514,7 @@ class LongTermMemoryContext:
     """Hold memory-derived context fragments for provider prompting."""
 
     subtext_context: str | None = None
+    topic_context: str | None = None
     midterm_context: str | None = None
     durable_context: str | None = None
     episodic_context: str | None = None
@@ -526,6 +527,8 @@ class LongTermMemoryContext:
         messages: list[str] = []
         if self.subtext_context:
             messages.append(self.subtext_context)
+        if self.topic_context:
+            messages.append(self.topic_context)
         if self.midterm_context:
             messages.append(self.midterm_context)
         if self.durable_context:

@@ -38,11 +38,17 @@ from twinr.providers.openai import (
     OpenAIToolCallingAgentProvider,
 )
 
-_SEARCH_FEEDBACK_TONE_PATTERN: tuple[tuple[int, int], ...] = (
-    (784, 90),
-    (1175, 70),
-    (988, 80),
-    (1318, 60),
+_SEARCH_FEEDBACK_TONE_PATTERNS: tuple[tuple[tuple[int, int], ...], ...] = (
+    (
+        (698, 55),
+        (932, 45),
+        (784, 60),
+    ),
+    (
+        (988, 40),
+        (740, 50),
+        (880, 55),
+    ),
 )
 _ALLOWED_REFERENCE_IMAGE_SUFFIXES: frozenset[str] = frozenset(
     {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
@@ -1095,9 +1101,12 @@ class TwinrRealtimeSupportMixin:
         def worker() -> None:
             if stop_event.wait(delay_seconds):
                 return
+            pattern_index = 0
             while not stop_event.is_set():
                 try:
-                    for frequency_hz, duration_ms in _SEARCH_FEEDBACK_TONE_PATTERN:
+                    pattern = _SEARCH_FEEDBACK_TONE_PATTERNS[pattern_index % len(_SEARCH_FEEDBACK_TONE_PATTERNS)]
+                    pattern_index += 1
+                    for frequency_hz, duration_ms in pattern:
                         if stop_event.is_set():
                             return
                         self._get_playback_coordinator().play_tone(
@@ -1109,7 +1118,7 @@ class TwinrRealtimeSupportMixin:
                             sample_rate=config.openai_realtime_input_sample_rate,
                             should_stop=stop_event.is_set,
                         )
-                        if stop_event.wait(0.03):
+                        if stop_event.wait(0.05):
                             return
                 except Exception as exc:
                     self._try_emit(f"search_feedback_error={self._safe_error_text(exc)}")
@@ -1137,6 +1146,19 @@ class TwinrRealtimeSupportMixin:
             self._search_feedback_stop = stop
 
         return stop
+
+    def _stop_search_feedback(self) -> None:
+        """Stop the active search-progress tones, even if the producer is still blocked."""
+
+        feedback_lock = self._get_lock("_feedback_lock")
+        with feedback_lock:
+            active_stop = getattr(self, "_search_feedback_stop", None)
+            self._search_feedback_stop = None
+        if callable(active_stop):
+            try:
+                active_stop()
+            except Exception as exc:
+                self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
 
     def _play_streaming_tts_with_feedback(
         self,

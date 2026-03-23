@@ -1,8 +1,9 @@
-"""Fetch and cache HDMI news-ticker headlines from RSS or Atom feeds.
+"""Fetch and cache HDMI news-ticker headlines from Twinr's source pool.
 
 The HDMI renderer only needs one calm, readable ticker line. This module keeps
-network access, XML parsing, caching, and headline rotation separate from the
-display loop so the visible screen can stay responsive on the Raspberry Pi.
+network access, XML parsing, source resolution, caching, and headline rotation
+separate from the display loop so the visible screen can stay responsive on the
+Raspberry Pi while the ticker still reflects sources Twinr actually follows.
 """
 
 from __future__ import annotations
@@ -21,7 +22,11 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
+
+from twinr.display.news_ticker_sources import (
+    DisplayWorldIntelligenceTickerFeedResolver,
+)
 
 if TYPE_CHECKING:
     from twinr.agent.base_agent.config import TwinrConfig
@@ -31,6 +36,13 @@ _DEFAULT_STORE_PATH = "artifacts/stores/ops/display_news_ticker.json"
 _DEFAULT_USER_AGENT = "TwinrNewsTicker/1.0"
 _MAX_FEED_BYTES = 512 * 1024
 _MAX_TITLE_CHARS = 220
+
+
+class DisplayNewsTickerSource(Protocol):
+    """Describe one bounded source that can build ticker snapshots."""
+
+    def fetch(self, *, now: datetime | None = None) -> "DisplayNewsTickerSnapshot":
+        """Return one freshly fetched headline snapshot."""
 
 
 def _utc_now() -> datetime:
@@ -338,12 +350,40 @@ class DisplayNewsTickerFetcher:
 
 
 @dataclass(slots=True)
+class DisplayWorldIntelligenceNewsTickerSource:
+    """Fetch ticker snapshots from Twinr's persisted world-intelligence feeds."""
+
+    resolver: DisplayWorldIntelligenceTickerFeedResolver
+    timeout_s: float = 4.0
+    max_items: int = 12
+    user_agent: str = _DEFAULT_USER_AGENT
+
+    def fetch(self, *, now: datetime | None = None) -> DisplayNewsTickerSnapshot:
+        """Fetch one headline snapshot from the active world-intelligence pool."""
+
+        feed_urls = self.resolver.resolve_feed_urls()
+        if not feed_urls:
+            return DisplayNewsTickerSnapshot(
+                captured_at=_normalize_now(now).isoformat(),
+                items=(),
+                feed_urls=(),
+                last_error=None,
+            )
+        return DisplayNewsTickerFetcher(
+            feed_urls=feed_urls,
+            timeout_s=self.timeout_s,
+            max_items=self.max_items,
+            user_agent=self.user_agent,
+        ).fetch(now=now)
+
+
+@dataclass(slots=True)
 class DisplayNewsTickerRuntime:
     """Serve calm, readable HDMI ticker text from cached headline bundles."""
 
     enabled: bool
     store: DisplayNewsTickerStore
-    fetcher: DisplayNewsTickerFetcher | None = None
+    fetcher: DisplayNewsTickerSource | None = None
     refresh_interval_s: float = 600.0
     rotation_interval_s: float = 12.0
     emit: Callable[[str], None] | None = None
@@ -360,16 +400,15 @@ class DisplayNewsTickerRuntime:
     ) -> "DisplayNewsTickerRuntime":
         """Build one ticker runtime from Twinr configuration."""
 
-        feed_urls = tuple(url for url in config.display_news_ticker_feed_urls if str(url).strip())
         return cls(
-            enabled=bool(config.display_news_ticker_enabled and feed_urls),
+            enabled=bool(config.display_news_ticker_enabled),
             store=DisplayNewsTickerStore.from_config(config),
-            fetcher=DisplayNewsTickerFetcher(
-                feed_urls=feed_urls,
+            fetcher=DisplayWorldIntelligenceNewsTickerSource(
+                resolver=DisplayWorldIntelligenceTickerFeedResolver.from_config(config),
                 timeout_s=config.display_news_ticker_timeout_s,
                 max_items=config.display_news_ticker_max_items,
             )
-            if feed_urls
+            if config.display_news_ticker_enabled
             else None,
             refresh_interval_s=config.display_news_ticker_refresh_interval_s,
             rotation_interval_s=config.display_news_ticker_rotation_interval_s,

@@ -8,7 +8,6 @@ from queue import Empty, Full
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from twinr.display import DisplayPresentationController
 from twinr.agent.tools.handlers.automations import normalize_delivery
 from twinr.agent.tools.runtime.broker_policy import AutomationToolBrokerPolicy, default_automation_tool_broker_policy
 from twinr.automations import AutomationAction, AutomationDefinition
@@ -30,6 +29,8 @@ from twinr.proactive.runtime.ambiguous_room_guard import (
     AmbiguousRoomGuardSnapshot,
     derive_ambiguous_room_guard,
 )
+from twinr.proactive.runtime.display_social_reserve import DisplaySocialReservePublisher
+from twinr.proactive.runtime.display_reserve_companion_planner import DisplayReserveCompanionPlanner
 from twinr.proactive.runtime.governor_inputs import ReSpeakerGovernorInputs, build_respeaker_governor_inputs
 from twinr.proactive.runtime.multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
 from twinr.proactive.runtime.smart_home_context import SmartHomeContextTracker
@@ -133,18 +134,25 @@ class TwinrRealtimeBackgroundMixin:
         setattr(self, "_proactive_delivery_policy_instance", policy)
         return policy
 
-    def _display_presentation_controller(self) -> DisplayPresentationController:
-        """Return the cached display presentation controller."""
+    def _display_social_reserve_publisher(self) -> DisplaySocialReservePublisher:
+        """Return the cached reserve-lane publisher for display-first social prompts."""
 
-        controller = getattr(self, "_display_presentation_controller_instance", None)
-        if isinstance(controller, DisplayPresentationController):
-            return controller
-        controller = DisplayPresentationController.from_config(
-            self.config,
-            default_source="proactive_social",
-        )
-        setattr(self, "_display_presentation_controller_instance", controller)
-        return controller
+        publisher = getattr(self, "_display_social_reserve_publisher_instance", None)
+        if isinstance(publisher, DisplaySocialReservePublisher):
+            return publisher
+        publisher = DisplaySocialReservePublisher.from_config(self.config)
+        setattr(self, "_display_social_reserve_publisher_instance", publisher)
+        return publisher
+
+    def _display_reserve_companion_planner(self) -> DisplayReserveCompanionPlanner:
+        """Return the cached nightly companion planner for the reserve lane."""
+
+        planner = getattr(self, "_display_reserve_companion_planner_instance", None)
+        if isinstance(planner, DisplayReserveCompanionPlanner):
+            return planner
+        planner = DisplayReserveCompanionPlanner.from_config(self.config)
+        setattr(self, "_display_reserve_companion_planner_instance", planner)
+        return planner
     # AUDIT-FIX(#8): Cleanup paths must survive secondary exceptions, otherwise the device can get stuck in answering state.
     def _finalize_speaking_output(self) -> None:
         self.runtime.finish_speaking()
@@ -1296,13 +1304,14 @@ class TwinrRealtimeBackgroundMixin:
     ) -> None:
         """Render one visual-first proactive cue on the display layer."""
 
-        controller = self._display_presentation_controller()
-        controller.show_rich_card(
-            key=f"social_{trigger_id}",
-            title=self._require_non_empty_text(prompt_text, context=f"social trigger {trigger_id} display prompt"),
-            accent="warm",
-            priority=80,
-            source="proactive_social",
+        publisher = self._display_social_reserve_publisher()
+        publisher.publish(
+            trigger_id=trigger_id,
+            prompt_text=self._require_non_empty_text(
+                prompt_text,
+                context=f"social trigger {trigger_id} display prompt",
+            ),
+            display_reason=reason,
             hold_seconds=cue_hold_seconds,
             now=datetime.now(timezone.utc),
         )
@@ -1386,7 +1395,10 @@ class TwinrRealtimeBackgroundMixin:
                     source_kind="longterm",
                     source_id=candidate_id,
                     summary=self._coerce_text(getattr(preview, "summary", None)),
-                    priority=self._confidence_to_priority(getattr(preview, "confidence", None), default=50),
+                    priority=self._confidence_to_priority(
+                        getattr(preview, "confidence", None),
+                        default=50,
+                    ),
                     presence_session_id=governor_inputs.presence_session_id,
                     safety_exempt=False,
                     counts_toward_presence_budget=True,
@@ -1400,7 +1412,11 @@ class TwinrRealtimeBackgroundMixin:
                 preview,
                 now=current_time,
             )
-            if reservation is None or reservation.candidate.candidate_id != getattr(preview, "candidate_id", None):
+            if reservation is None or reservation.candidate.candidate_id != getattr(
+                preview,
+                "candidate_id",
+                None,
+            ):
                 self._safe_cancel_governor_reservation(governor_reservation)
                 return False
 
@@ -1416,7 +1432,10 @@ class TwinrRealtimeBackgroundMixin:
                         trigger_id=trigger_id,
                         reason=self._coerce_text(getattr(candidate, "rationale", None)),
                         default_prompt=prompt_text,
-                        priority=self._confidence_to_priority(getattr(candidate, "confidence", None), default=50),
+                        priority=self._confidence_to_priority(
+                            getattr(candidate, "confidence", None),
+                            default=50,
+                        ),
                         conversation=self.runtime.conversation_context(),
                         recent_prompts=self._recent_proactive_prompts(trigger_id=trigger_id),
                         observation_facts=self._longterm_proactive_observation_facts(
@@ -1448,7 +1467,10 @@ class TwinrRealtimeBackgroundMixin:
             spoken_prompt = self.runtime.begin_proactive_prompt(
                 self._require_non_empty_text(
                     prompt_text,
-                    context=f"long-term proactive candidate {self._coerce_text(getattr(candidate, 'candidate_id', None)) or 'unknown'} prompt",
+                    context=(
+                        "long-term proactive candidate "
+                        f"{self._coerce_text(getattr(candidate, 'candidate_id', None)) or 'unknown'} prompt"
+                    ),
                 )
             )
             self._safe_emit_status(force=True)
@@ -1463,7 +1485,9 @@ class TwinrRealtimeBackgroundMixin:
                 prompt_text=spoken_prompt,
             )
             self._safe_mark_governor_delivered(governor_reservation)
-            self._safe_emit(f"longterm_proactive_candidate={self._coerce_text(getattr(candidate, 'candidate_id', None))}")
+            self._safe_emit(
+                f"longterm_proactive_candidate={self._coerce_text(getattr(candidate, 'candidate_id', None))}"
+            )
             self._safe_emit(f"longterm_proactive_kind={self._coerce_text(getattr(candidate, 'kind', None))}")
             self._safe_emit(f"longterm_proactive_prompt_mode={prompt_mode}")
             self._safe_emit(f"longterm_proactive_prompt={spoken_prompt}")
@@ -1516,6 +1540,54 @@ class TwinrRealtimeBackgroundMixin:
                 error=str(exc),
             )
             return False
+
+    def _maybe_run_display_reserve_nightly_maintenance(self) -> bool:
+        """Prepare the next reserve-lane day plan during quiet idle windows.
+
+        The nightly reserve planner is intentionally slower than the live
+        publish path. It runs at most once per poll interval, only while the
+        background runtime is otherwise allowed to work, and prepares the next
+        day ahead of time so the morning lane can start from one reviewed plan
+        instead of rebuilding ad hoc.
+        """
+
+        now_monotonic = time.monotonic()
+        if now_monotonic < self._monotonic_deadline("_next_display_reserve_nightly_check_at"):
+            return False
+        self._next_display_reserve_nightly_check_at = (
+            now_monotonic
+            + self._config_interval_seconds("display_reserve_bus_nightly_poll_interval_s", 300.0)
+        )
+        if not self._background_work_allowed():
+            return False
+        planner = self._display_reserve_companion_planner()
+        result = planner.maybe_run_nightly_maintenance(
+            config=self.config,
+            local_now=datetime.now(self._local_timezone()),
+            search_backend=self.print_backend,
+        )
+        if result.action != "prepared":
+            return False
+        state = result.state
+        plan = result.plan
+        self._safe_emit(f"display_reserve_nightly_prepared={result.target_local_day}")
+        self._safe_record_event(
+            "display_reserve_nightly_prepared",
+            "Prepared the next local-day HDMI reserve plan after nightly reflection.",
+            level="info",
+            target_local_day=result.target_local_day,
+            prepared_item_count=(len(plan.items) if plan is not None else 0),
+            prepared_candidate_count=(plan.candidate_count if plan is not None else 0),
+            reflection_reflected_object_count=(
+                state.reflection_reflected_object_count if state is not None else 0
+            ),
+            reflection_created_summary_count=(
+                state.reflection_created_summary_count if state is not None else 0
+            ),
+            positive_topics=list(state.positive_topics if state is not None else ()),
+            cooling_topics=list(state.cooling_topics if state is not None else ()),
+        )
+        return True
 
     def _deliver_due_reminder(
         self,

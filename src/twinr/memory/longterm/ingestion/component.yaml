@@ -10,7 +10,7 @@ owned_concerns:
   - Normalize structured ReSpeaker audio-policy facts and per-claim metadata into bounded audio routine seeds and observed preference candidates
   - Replay persisted ops history into multimodal evidence for bounded backfill and recovery
   - Compile sensor-derived routines and deviations from previously consolidated pattern objects
-  - Compile room-agnostic smart-home day profiles, rolling baselines, and typed deviations from smart-home motion and health pattern history
+  - Compile room-agnostic smart-home day profiles, rolling baselines, grouped acute deviations, quality states, and drift/regime signals from smart-home motion and health pattern history
 out_of_scope:
   - Persist or archive long-term memory objects and remote state
   - Resolve conflicts, truth state, retention, or reflection policy
@@ -42,6 +42,8 @@ files:
     role: Room-agnostic smart-home environment-profile compilation
     exports:
       - LongTermEnvironmentProfileCompiler
+  - path: environment_stats.py
+    role: Shared robust statistics and divergence helpers for environment profiling
   - path: respeaker_audio.py
     role: Structured ReSpeaker audio routine-seed extraction from automation facts
   - path: respeaker_contract.py

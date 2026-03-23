@@ -6,6 +6,7 @@ visibility: internal
 summary: Provide wakeword matching, local KWS/openWakeWord spotting, optional local verifier support, sequence-aware cascade verification, verification policy, calibration profiles, streaming detection, runtime-faithful promotion replay, and offline evaluation/training helpers for proactive runtime.
 owned_concerns:
   - Normalize wakeword transcripts, configured phrases, and detector labels
+  - Extract continuation text from confirmed-wake captures even when the tail STT omits the already-confirmed wake phrase
   - Run local openWakeWord, sherpa-onnx KWS, or WeKws clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
   - Provision official sherpa-onnx KWS bundle assets and generate Twinr keyword files reproducibly from the leading repo
   - Persist and apply per-device wakeword calibration overrides
@@ -83,11 +84,12 @@ files:
     exports:
       - build_configured_sequence_capture_verifier
   - path: matching.py
-    role: Transcript normalization and phrase matching
+    role: Transcript normalization, confirmed-tail extraction, and phrase matching
     exports:
       - DEFAULT_WAKEWORD_PHRASES
       - WakewordMatch
       - WakewordPhraseSpotter
+      - WakewordTailTranscriptExtractor
       - match_wakeword_transcript
       - normalize_detector_label
       - phrase_from_detector_label

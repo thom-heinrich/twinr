@@ -115,6 +115,12 @@ class StreamingCaptureController:
         )
         self._begin_listening(request)
         capture_started = time.monotonic()
+        loop._notify_voice_orchestrator_state(
+            "listening",
+            detail=request.listen_source,
+            follow_up_allowed=request.follow_up,
+        )
+        loop._pause_voice_orchestrator_capture(reason=request.listen_source)
         try:
             capture_result, transcript, capture_ms, stt_ms = self._capture_audio(
                 request=request,
@@ -129,6 +135,8 @@ class StreamingCaptureController:
                 raise
             self._handle_no_speech_timeout(request=request, exc=exc)
             return False
+        finally:
+            loop._resume_voice_orchestrator_capture(reason=request.listen_source)
 
         audio_pcm = capture_result.pcm_bytes
         loop.runtime.remember_listen_capture(
@@ -315,6 +323,7 @@ class StreamingCaptureController:
         )
         loop.runtime.cancel_listening()
         loop._emit_status(force=True)
+        loop._notify_voice_orchestrator_state("waiting", detail="listen_timeout")
         loop.emit(f"{request.timeout_emit_key}=true")
         loop._record_event("listen_timeout", request.timeout_message, request_source=request.listen_source)
         loop._trace_event(

@@ -4,7 +4,8 @@
 streaming hardware paths plus the compatibility import surfaces that still
 point older callers at legacy code. It also contains the workflow-local
 helpers that keep capture, speech output, print delivery, and background work
-bounded.
+bounded, including the edge-side audio bridge for the new server-backed voice
+orchestrator path.
 
 ## Responsibility
 
@@ -23,24 +24,36 @@ bounded.
 - treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
-- route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts
+- keep the runtime snapshot fresh during long spoken playback so the Pi supervisor does not false-kill an active answer as stale
+- route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts, with display-first prompts landing in the right-hand reserve lane instead of taking over the fullscreen presentation surface
+- let the idle housekeeping worker trigger one bounded overnight reserve-lane maintenance pass so the next local day starts from a reviewed/prepared ambient companion plan instead of an ad-hoc rebuild
 - package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
+- keep the post-playback join against the closure guard bounded so a stalled steering, remote-memory, or closure-provider path cannot leave the runtime stuck in `answering` after speech has ended
 - translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
+- let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
+- when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
+- when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall straight through to the generic supervisor loop instead of starting another structured-decision roundtrip
 - downgrade fast-lane decisions that declare `full_context` needs into a filler-plus-final-lane handoff so conversation-recall turns do not get answered from a memory-blind bridge lane
 - route memory/general dual-lane fallbacks through full tool-provider context while keeping pure search handoffs on the bounded search-only context
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
 - wait briefly for active filler playback to drain before replacing it with the final lane so the fast acknowledgement is not cut off mid-sentence
-- recover dual-lane final-lane errors and hard timeouts through an explicit LLM-only recovery callback instead of any canned runtime reply string
+- move the runtime back from `answering` to `processing` once a spoken bridge acknowledgement has finished but the final lane is still running, so status and feedback reflect real waiting/search work instead of stale speech
+- fail closed for dual-lane final-lane timeout/error and specialist handoff failure paths instead of speaking a synthetic recovery sentence that was never backed by the real search/tool result
 - emit bounded pre-speech capture diagnostics on listen timeouts so Pi no-speech failures can be proven from first-run logs instead of guessed
 - emit a forensic run pack for live-runtime debugging when `TWINR_WORKFLOW_TRACE_ENABLED=1`
 - include redacted transcript, context-selection, and final-lane answer provenance in that forensic run pack so semantic answer failures can be proven from one Pi run
+- stream bounded edge audio and runtime-state updates to the remote voice orchestrator while keeping the realtime loop as the single owner of physical runtime state changes
+- wait briefly for proven transient XVF3800 re-enumeration on the shared live-capture paths so a short USB drop does not instantly flip a listen turn into `error`
+- reconnect the edge voice websocket after transient server or network closures and replay the last known runtime state so hands-free wake detection does not stay dead until the Pi service restarts
+- only keep the remote voice gateway in `follow_up_open` when the live gateway is really running transcript-first `local_stt`; backend-led rescue paths must drop back to `waiting` or reopen one explicit beep-backed local follow-up capture so short re-wakes stay reliable after the first answer
+- treat required remote-memory failures in the streaming final lane as fatal runtime blockers instead of masking them behind dual-lane fallback speech
 - share workflow-local helpers for feedback tones, reference images, and safe background delivery
 - expose compatibility workflow imports for the top-level package without eager runner imports that can create runtime/ops import cycles
 
@@ -49,6 +62,7 @@ bounded.
 - hardware driver internals for audio, printer, camera, buttons, or display
 - provider transport adapters, prompt text, or tool schema definitions
 - web dashboard logic or Pi/bootstrap scripts
+- websocket transport contracts or server-side wake/follow-up decision policy; those stay in `src/twinr/orchestrator`
 
 ## Key files
 
@@ -56,6 +70,7 @@ bounded.
 |---|---|
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
 | [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy while also running the smart-home sensor worker |
+| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery and startup-time reconnect recovery when the gateway appears late |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
 | [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
@@ -64,10 +79,11 @@ bounded.
 | [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, timeout handling, and batch-STT fallback |
 | [streaming_speculation.py](./streaming_speculation.py) | Speculative first-word and supervisor warmup controller |
 | [streaming_lane_planner.py](./streaming_lane_planner.py) | Streaming lane-plan and final-lane path selection |
+| [streaming_semantic_router.py](./streaming_semantic_router.py) | Workflow bridge from local semantic-router bundles, including optional two-stage user-intent routing, into supervisor-style handoffs |
 | [streaming_turn_coordinator.py](./streaming_turn_coordinator.py) | Authoritative streaming turn state machine and completion coordinator |
 | [streaming_turn_orchestrator.py](./streaming_turn_orchestrator.py) | Low-level parallel bridge/final lane watchdog executor used by the coordinator |
 | [playback_coordinator.py](./playback_coordinator.py) | Single-owner speaker queue with priority-aware, request-bound preemption for beep, feedback, and TTS |
-| [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop |
+| [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop, including routing display-first proactive prompts into the reserve lane and triggering the overnight reserve-lane maintenance hook |
 | [realtime_runtime/proactive_delivery.py](./realtime_runtime/proactive_delivery.py) | Display-first versus speech delivery policy for proactive background prompts |
 | [realtime_runtime/support.py](./realtime_runtime/support.py) | Active emit/media/config helpers used by the realtime loop |
 | [realtime_runner_background.py](./realtime_runner_background.py) | Compatibility shim for background helpers |
@@ -119,6 +135,7 @@ streaming_loop.run(duration_s=15)
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
 - [runtime](../base_agent/runtime/README.md)
+- [routing](../routing/README.md)
 - [conversation](../base_agent/conversation/README.md)
 - [agent tools runtime](../tools/runtime/README.md)
 
@@ -126,3 +143,9 @@ The classic press-to-talk implementation itself now lives outside the active
 workflow package under `src/twinr/agent/legacy/classic_hardware_loop.py`; the
 `workflows.runner` module remains only as a compatibility import shim and
 should not be used for new internal references.
+
+The remote/server voice path intentionally keeps a strict split:
+
+- `voice_orchestrator.py` owns edge microphone streaming and server-event dispatch
+- `realtime_runner.py` owns runtime-state transitions, beep/TTS orchestration, and local capture pausing
+- `src/twinr/orchestrator/voice_session.py` owns server-side wake, follow-up, and barge-in decisions

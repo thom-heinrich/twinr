@@ -383,6 +383,23 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertTrue(derived.speech_overlap_likely)
         self.assertTrue(derived.barge_in_detected)
 
+    def test_derive_signal_state_uses_first_valid_selected_azimuth_slot(self) -> None:
+        direction = ReSpeakerDirectionSnapshot(
+            captured_at=10.0,
+            speech_detected=True,
+            room_quiet=False,
+            doa_degrees=88,
+            beam_azimuth_degrees=(90.0, 270.0, 180.0, 90.0),
+            beam_speech_energies=(0.5, 0.0, 0.0, 0.5),
+            selected_azimuth_degrees=(None, 92.0),
+        )
+
+        derived = derive_respeaker_signal_state(direction, assistant_output_active=False)
+
+        self.assertIsNotNone(derived.direction_confidence)
+        assert derived.direction_confidence is not None
+        self.assertGreater(derived.direction_confidence, 0.95)
+
     def test_classify_respeaker_ambient_audio_marks_background_media_without_speech(self) -> None:
         classification = classify_respeaker_ambient_audio(
             signal_snapshot=type(

@@ -17,7 +17,7 @@ Selection and wording stay generic:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -65,6 +65,12 @@ class AmbientDisplayImpulseCandidate:
         symbol: Emoji symbol token suitable for display rendering.
         accent: Visual accent token suitable for display rendering.
         reason: Short auditable explanation for selection/debugging.
+        candidate_family: Generic reserve-bus family used for planning mix,
+            such as ``world``, ``memory_follow_up``, or ``social``.
+        generation_context: Optional extra structured context for the bounded
+            reserve-lane LLM rewrite step. This should stay generic and
+            storage-safe, for example a topic summary or a memory-follow-up
+            rationale, never a hidden prompt string.
     """
 
     topic_key: str
@@ -79,6 +85,8 @@ class AmbientDisplayImpulseCandidate:
     symbol: str
     accent: str
     reason: str
+    candidate_family: str = "general"
+    generation_context: Mapping[str, object] | None = None
 
 
 def _normalized_text(value: object | None) -> str:
@@ -133,6 +141,19 @@ def _candidate_score(
     )
 
 
+def _candidate_family_for_source(source: object | None) -> str:
+    """Map one generic mindshare source onto a reserve-planning family."""
+
+    normalized = _normalized_text(source).casefold()
+    if normalized in {"continuity", "relationship"}:
+        return "memory_thread"
+    if normalized == "place":
+        return "place"
+    if normalized in {"situational_awareness", "regional_news", "local_news", "world"}:
+        return "world"
+    return "general"
+
+
 def _candidate_for_item(
     item: CompanionMindshareItem,
     policy: PositiveEngagementTopicPolicy,
@@ -143,6 +164,8 @@ def _candidate_for_item(
 
     if policy.action == "silent":
         return None
+    if _normalized_text(item.source).casefold() == "live_search":
+        return None
     topic_key = _topic_key(item.title)
     if not topic_key:
         return None
@@ -151,6 +174,7 @@ def _candidate_for_item(
         policy,
         local_now=local_now,
     )
+    summary = _truncate_text(item.summary, max_len=160)
     return AmbientDisplayImpulseCandidate(
         topic_key=topic_key,
         title=item.title,
@@ -164,6 +188,22 @@ def _candidate_for_item(
         symbol=copy.symbol,
         accent=copy.accent,
         reason=policy.reason,
+        candidate_family=_candidate_family_for_source(item.source),
+        generation_context={
+            "candidate_family": "mindshare",
+            "display_anchor": item.title,
+            "hook_hint": summary,
+            "topic_summary": summary,
+            "topic_title": item.title,
+            "conversation_depth": item.appetite.depth,
+            "follow_up": item.appetite.follow_up,
+            "proactivity": item.appetite.proactivity,
+            "ongoing_interest": item.appetite.interest,
+            "engagement_state": item.appetite.state,
+            "attention_state": policy.attention_state,
+            "display_personality_goal": "show_twinr_voice",
+            "display_goal": "open_positive_conversation",
+        },
     )
 
 

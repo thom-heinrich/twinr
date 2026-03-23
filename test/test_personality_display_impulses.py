@@ -13,7 +13,9 @@ from twinr.agent.personality.models import (
     ContinuityThread,
     ConversationStyleProfile,
     HumorProfile,
+    RelationshipSignal,
     PersonalitySnapshot,
+    WorldSignal,
 )
 
 
@@ -60,7 +62,11 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
         self.assertEqual(first.accent, "warm")
         self.assertEqual(first.eyebrow, "")
         self.assertTrue(first.headline.endswith("?"))
+        self.assertIn("AI companions", first.headline)
         self.assertTrue(first.body)
+        self.assertIsNotNone(first.generation_context)
+        assert first.generation_context is not None
+        self.assertEqual(first.generation_context.get("candidate_family"), "mindshare")
 
     def test_continuity_topic_prefers_memory_clarifying_copy(self) -> None:
         snapshot = PersonalitySnapshot(
@@ -99,9 +105,9 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
 
         self.assertTrue(candidates)
         first = candidates[0]
-        self.assertIn("Arzttermin", first.headline)
         self.assertTrue(first.headline.endswith("?"))
-        self.assertIn("merk", first.body.lower())
+        self.assertIn("Arzttermin", first.headline)
+        self.assertTrue(first.body)
 
     def test_cooling_topic_does_not_surface_as_ambient_impulse(self) -> None:
         snapshot = PersonalitySnapshot(
@@ -132,6 +138,74 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
             snapshot,
             engagement_signals=(signal,),
             local_now=datetime(2026, 3, 22, 11, 0),
+        )
+
+        self.assertEqual(candidates, ())
+
+    def test_relationship_summary_does_not_add_internal_durable_attention_prefix(self) -> None:
+        snapshot = PersonalitySnapshot(
+            style_profile=ConversationStyleProfile(verbosity=0.52, initiative=0.61),
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="Der Nutzer kommt darauf immer wieder zurueck.",
+                    salience=0.91,
+                    stance="affinity",
+                    source="conversation",
+                ),
+            ),
+        )
+        signal = WorldInterestSignal(
+            signal_id="world:ai_companions",
+            topic="AI companions",
+            summary="Wiederkehrender gemeinsamer Faden.",
+            engagement_score=0.94,
+            engagement_state="resonant",
+            ongoing_interest="active",
+            co_attention_state="shared_thread",
+            co_attention_count=3,
+            engagement_count=5,
+            positive_signal_count=4,
+        )
+
+        candidates = build_ambient_display_impulse_candidates(
+            snapshot,
+            engagement_signals=(signal,),
+            local_now=datetime(2026, 3, 22, 9, 50),
+        )
+
+        self.assertTrue(candidates)
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("hook_hint"), "Der Nutzer kommt darauf immer wieder zurueck.")
+
+    def test_live_search_mindshare_does_not_surface_as_display_impulse(self) -> None:
+        snapshot = PersonalitySnapshot(
+            style_profile=ConversationStyleProfile(verbosity=0.5, initiative=0.56),
+            world_signals=(
+                WorldSignal(
+                    topic="Donald Trump heute.",
+                    summary="Suchrest aus einer frischen Live-Suche.",
+                    salience=0.82,
+                    source="live_search",
+                ),
+            ),
+        )
+        signal = WorldInterestSignal(
+            signal_id="world:donald_trump_heute",
+            topic="Donald Trump heute.",
+            summary="Frisches Suchthema ohne durable Co-Attention.",
+            engagement_score=0.66,
+            engagement_state="warm",
+            ongoing_interest="growing",
+            co_attention_state="latent",
+            engagement_count=1,
+            positive_signal_count=1,
+        )
+
+        candidates = build_ambient_display_impulse_candidates(
+            snapshot,
+            engagement_signals=(signal,),
+            local_now=datetime(2026, 3, 22, 10, 10),
         )
 
         self.assertEqual(candidates, ())

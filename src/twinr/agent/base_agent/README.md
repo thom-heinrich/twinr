@@ -8,7 +8,7 @@ root imports together while pushing behavior into focused subpackages.
 
 `base_agent` owns:
 - expose stable imports for config, runtime, state, prompting, and conversation helpers
-- define `TwinrConfig` and the shared env-loading path, including smart-home background-worker tuning
+- define `TwinrConfig` and the shared env-loading path, including smart-home background-worker tuning, calibrated attention-servo driver selection, and calm-motion safety knobs such as exit-trajectory extrapolation when a tracked user leaves the frame
 - define provider protocols, bundles, and composite provider glue, including the structured supervisor decision contract used by the fast voice lane
 - preserve thin compatibility wrappers during the package split
 
@@ -23,7 +23,7 @@ root imports together while pushing behavior into focused subpackages.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Lazy root export surface |
-| [config.py](./config.py) | Canonical runtime config, including bounded HDMI attention-refresh cadence, session-focus hold tuning for gaze-follow, and smart-home background-worker tuning |
+| [config.py](./config.py) | Canonical runtime config, including bounded HDMI attention-refresh cadence, session-focus hold tuning for gaze-follow, calibrated attention-servo driver selection and calm-motion safety knobs such as exit-trajectory extrapolation, and smart-home background-worker tuning |
 | [contracts.py](./contracts.py) | Provider/runtime contracts |
 | [conversation/](./conversation/README.md) | Conversation micro-policies |
 | [prompting/](./prompting/README.md) | Hidden instruction assembly |

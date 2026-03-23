@@ -22,6 +22,7 @@ from twinr.proactive import (
     normalize_detector_label,
     wakeword_primary_prompt,
 )
+from twinr.proactive.wakeword.matching import WakewordTailTranscriptExtractor
 from twinr.runtime import TwinrRuntime
 
 
@@ -301,6 +302,60 @@ class WakewordTests(unittest.TestCase):
         self.assertTrue(match.detected)
         self.assertEqual(match.matched_phrase, "hallo twina")
         self.assertEqual(match.remaining_text, "bist du da")
+        self.assertEqual(len(backend.calls), 1)
+
+    def test_wakeword_tail_transcript_extractor_uses_full_tail_when_stt_omits_wakeword(self) -> None:
+        backend = FakeBackend("Schau mal im Web nach dem Wetter in Berlin.")
+        extractor = WakewordTailTranscriptExtractor(
+            backend=backend,
+            phrases=("hey twinna", "twinna", "twinr"),
+            language="de",
+        )
+
+        remaining_text = extractor.extract(
+            AmbientAudioCaptureWindow(
+                sample=AmbientAudioLevelSample(
+                    duration_ms=2400,
+                    chunk_count=12,
+                    active_chunk_count=8,
+                    average_rms=920,
+                    peak_rms=1600,
+                    active_ratio=0.66,
+                ),
+                pcm_bytes=b"\x01\x02" * 1200,
+                sample_rate=16000,
+                channels=1,
+            )
+        )
+
+        self.assertEqual(remaining_text, "Schau mal im Web nach dem Wetter in Berlin.")
+        self.assertEqual(len(backend.calls), 1)
+
+    def test_wakeword_tail_transcript_extractor_strips_wakeword_when_transcript_keeps_anchor(self) -> None:
+        backend = FakeBackend("Twinna schau mal im Web nach dem Wetter in Berlin.")
+        extractor = WakewordTailTranscriptExtractor(
+            backend=backend,
+            phrases=("hey twinna", "twinna", "twinr"),
+            language="de",
+        )
+
+        remaining_text = extractor.extract(
+            AmbientAudioCaptureWindow(
+                sample=AmbientAudioLevelSample(
+                    duration_ms=2400,
+                    chunk_count=12,
+                    active_chunk_count=8,
+                    average_rms=920,
+                    peak_rms=1600,
+                    active_ratio=0.66,
+                ),
+                pcm_bytes=b"\x01\x02" * 1200,
+                sample_rate=16000,
+                channels=1,
+            )
+        )
+
+        self.assertEqual(remaining_text, "schau mal im Web nach dem Wetter in Berlin")
         self.assertEqual(len(backend.calls), 1)
 
     def test_wakeword_phrase_spotter_retries_after_prompt_contamination(self) -> None:

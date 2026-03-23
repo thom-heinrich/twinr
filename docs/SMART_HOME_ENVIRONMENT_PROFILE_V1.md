@@ -138,6 +138,15 @@ Persist only compact derived objects:
 
 This keeps the system privacy-bounded and avoids an ever-growing event dump.
 
+Current implementation status in Twinr:
+
+- daily marker profiles
+- short and long rolling baselines
+- grouped acute deviation events
+- explicit quality-state summaries
+- change-point summaries
+- accepted regime or `new normal` summaries
+
 ## V1 Schema
 
 The profile should be built from five object families.
@@ -560,4 +569,3 @@ Relevant sources:
 - Fritz and Cook, 2025, interrupted time-series detection of behavior changes
   during external events
 - recent motion-complexity and frailty work using longitudinal ambient sensing
-

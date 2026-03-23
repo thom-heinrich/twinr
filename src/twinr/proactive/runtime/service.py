@@ -27,6 +27,7 @@ from twinr.hardware.audio import (
     AudioCaptureReadinessProbe,
     pcm16_to_wav_bytes,
 )
+from twinr.hardware.servo_follow import AttentionServoController
 from twinr.hardware.respeaker import (
     build_respeaker_claim_payloads,
     config_targets_respeaker,
@@ -84,6 +85,7 @@ from .display_gesture_emoji import (
 )
 from .gesture_ack_lane import GestureAckLane
 from .gesture_debug_stream import GestureDebugStream
+from .gesture_wakeup_priority import decide_gesture_wakeup_priority
 from .gesture_wakeup_dispatcher import GestureWakeupDispatcher
 from .gesture_wakeup_lane import GestureWakeupDecision, GestureWakeupLane
 from .identity_fusion import (
@@ -190,6 +192,45 @@ def _normalize_optional_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _proactive_audio_capture_device(config: TwinrConfig) -> str:
+    """Return the device used by proactive ambient PCM sampling."""
+
+    return (
+        _normalize_optional_text(
+            getattr(config, "proactive_audio_input_device", None),
+            getattr(config, "audio_input_device", None),
+        )
+        or "default"
+    )
+
+
+def _voice_orchestrator_capture_device(config: TwinrConfig) -> str:
+    """Return the device used by the long-lived voice-orchestrator capture."""
+
+    return (
+        _normalize_optional_text(
+            getattr(config, "voice_orchestrator_audio_device", None),
+            getattr(config, "proactive_audio_input_device", None),
+            getattr(config, "audio_input_device", None),
+        )
+        or "default"
+    )
+
+
+def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+    config: TwinrConfig,
+    *,
+    wakeword_stream: object | None,
+) -> bool:
+    """Return whether proactive PCM fallback would fight a shared voice capture."""
+
+    if wakeword_stream is not None:
+        return False
+    if not bool(getattr(config, "voice_orchestrator_enabled", False)):
+        return False
+    return _proactive_audio_capture_device(config) == _voice_orchestrator_capture_device(config)
 
 
 # AUDIT-FIX(#8): Normalize sequence-like config inputs from older env schemas before using them.
@@ -520,6 +561,7 @@ class ProactiveCoordinator:
         display_attention_publisher: DisplayAttentionCuePublisher | None = None,
         display_gesture_emoji_publisher: DisplayGestureEmojiPublisher | None = None,
         display_ambient_impulse_publisher: DisplayAmbientImpulsePublisher | None = None,
+        attention_servo_controller: AttentionServoController | None = None,
         display_attention_debug_stream: AttentionDebugStream | None = None,
         display_gesture_debug_stream: GestureDebugStream | None = None,
         emit: Callable[[str], None] | None = None,
@@ -556,6 +598,7 @@ class ProactiveCoordinator:
         self.display_ambient_impulse_publisher = (
             display_ambient_impulse_publisher or DisplayAmbientImpulsePublisher.from_config(config)
         )
+        self.attention_servo_controller = attention_servo_controller or AttentionServoController.from_config(config)
         self.display_attention_debug_stream = display_attention_debug_stream or AttentionDebugStream.from_config(
             config
         )
@@ -1984,6 +2027,23 @@ class ProactiveCoordinator:
             observation=snapshot.observation,
         )
         stage_ms["wakeup_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        if wakeup_decision.active:
+            stage_started_ns = time.monotonic_ns()
+            wakeup_priority = decide_gesture_wakeup_priority(
+                runtime_status_value=runtime_status_value,
+                voice_path_enabled=bool(
+                    getattr(self.config, "voice_orchestrator_enabled", False) or self.wakeword_stream is not None
+                ),
+                presence_snapshot=self.latest_presence_snapshot,
+                recent_speech_guard_s=_ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S,
+            )
+            if not wakeup_priority.allow:
+                wakeup_decision = replace(
+                    wakeup_decision,
+                    active=False,
+                    reason=wakeup_priority.reason,
+                )
+            stage_ms["wakeup_priority"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
         stage_started_ns = time.monotonic_ns()
         publish_result = self._publish_display_gesture_decision(decision)
         stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
@@ -2830,11 +2890,8 @@ class ProactiveCoordinator:
         audio_observation,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
     ) -> DisplayAttentionCuePublishResult | None:
-        """Update the HDMI face so it calmly follows the most relevant person."""
+        """Update the HDMI face and body-follow servo from the current attention target."""
 
-        publisher = self.display_attention_publisher
-        if publisher is None:
-            return None
         presence_snapshot = self.latest_presence_snapshot
         presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         live_facts = {
@@ -2868,6 +2925,13 @@ class ProactiveCoordinator:
         self.latest_attention_target_snapshot = attention_target
         live_facts["speaker_association"] = speaker_association.to_automation_facts()
         live_facts["attention_target"] = attention_target.to_automation_facts()
+        self._update_attention_servo_follow(
+            observed_at=observed_at,
+            attention_target=attention_target,
+        )
+        publisher = self.display_attention_publisher
+        if publisher is None:
+            return None
         try:
             return publisher.publish_from_facts(
                 config=self.config,
@@ -2881,6 +2945,32 @@ class ProactiveCoordinator:
                 data={"observed_at": observed_at},
             )
             return None
+
+    def _update_attention_servo_follow(
+        self,
+        *,
+        observed_at: float,
+        attention_target: MultimodalAttentionTargetSnapshot | None,
+    ) -> None:
+        """Update the optional body-orientation servo from the current attention target."""
+
+        controller = self.attention_servo_controller
+        if controller is None:
+            return
+        try:
+            controller.update(
+                observed_at=observed_at,
+                active=False if attention_target is None else attention_target.active,
+                target_center_x=None if attention_target is None else attention_target.target_center_x,
+                confidence=0.0 if attention_target is None else attention_target.confidence,
+            )
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_attention_servo_follow_failed",
+                message="Failed to update the attention-follow servo output.",
+                error=exc,
+                data={"observed_at": observed_at},
+            )
 
     def _update_display_gesture_emoji_ack(
         self,
@@ -3793,6 +3883,10 @@ class ProactiveMonitorService:
         if not self._resources_open:
             return
         self._safe_close_resource(self.coordinator.audio_observer, name="audio_observer")
+        self._safe_close_resource(
+            self.coordinator.attention_servo_controller,
+            name="attention_servo_controller",
+        )
         self._safe_close_resource(self.wakeword_stream, name="wakeword_stream")
         self._safe_close_resource(self.coordinator.pir_monitor, name="pir_monitor")
         self._resources_open = False
@@ -4102,6 +4196,21 @@ def build_default_proactive_monitor(
     distress_enabled = bool(
         config.proactive_enabled and config.proactive_audio_distress_enabled
     )  # AUDIT-FIX(#5): do not run proactive distress classification when proactive mode is disabled.
+    shared_voice_capture_conflict = _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+        config,
+        wakeword_stream=wakeword_stream,
+    )
+    if shared_voice_capture_conflict and config.proactive_audio_enabled:
+        _record_component_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="proactive_audio_shared_capture_disabled",
+            detail=(
+                "Proactive PCM fallback is disabled because the voice orchestrator owns "
+                "the same capture device. ReSpeaker host-control monitoring remains active "
+                "when that hardware is targeted."
+            ),
+        )
     if config.proactive_audio_enabled or config.wakeword_enabled:
         if wakeword_stream is not None:
             try:
@@ -4131,6 +4240,8 @@ def build_default_proactive_monitor(
                 )
 
             audio_observer_fallback_factory = _fallback_audio_observer_factory
+        elif shared_voice_capture_conflict:
+            audio_observer = NullAudioObservationProvider()
         else:
             try:
                 sampler = AmbientAudioSampler.from_config(config)
@@ -4200,10 +4311,11 @@ def build_default_proactive_monitor(
                     detail=detail,
                 )
             try:
-                require_stable_respeaker_capture(
-                    sampler=AmbientAudioSampler.from_config(config),
-                    duration_ms=_respeaker_capture_probe_duration_ms(config),
-                )
+                if not shared_voice_capture_conflict:
+                    require_stable_respeaker_capture(
+                        sampler=AmbientAudioSampler.from_config(config),
+                        duration_ms=_respeaker_capture_probe_duration_ms(config),
+                    )
             except AudioCaptureReadinessError as exc:
                 detail = _record_respeaker_dead_capture_blocker(
                     runtime=runtime,

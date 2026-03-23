@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field  # AUDIT-FIX(#10): keep 3.11-safe dataclass field support for bounded defaults and locks.
+from dataclasses import dataclass, field, replace  # AUDIT-FIX(#10): keep 3.11-safe dataclass field support for bounded defaults and locks.
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -26,13 +26,14 @@ import time
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_event, workflow_span
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.ingestion.backfill import (
     LongTermOpsBackfillRunResult,
     LongTermOpsEventBackfiller,
 )
 from twinr.memory.context_store import ManagedContextEntry, PersistentMemoryEntry, PromptContextStore
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
-from twinr.memory.query_normalization import LongTermQueryRewriter
+from twinr.memory.query_normalization import LongTermQueryProfile, LongTermQueryRewriter
 from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.ingestion.extract import LongTermTurnExtractor
@@ -58,11 +59,16 @@ from twinr.memory.longterm.proactive.planner import LongTermProactivePlanner
 from twinr.memory.longterm.proactive.state import LongTermProactivePolicy, LongTermProactiveReservationV1, LongTermProactiveStateStore
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
+from twinr.memory.longterm.retrieval.fast_topic import LongTermFastTopicContextBuilder
 from twinr.memory.longterm.retrieval.restart_recall_policy import LongTermRestartRecallPolicyCompiler
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
 from twinr.memory.longterm.reasoning.turn_continuity import LongTermTurnContinuityCompiler
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteStatus,
+    LongTermRemoteUnavailableError,
+)
 from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
@@ -161,6 +167,7 @@ def _context_details(context: LongTermMemoryContext) -> dict[str, object]:
 
     return {
         "has_subtext_context": bool(getattr(context, "subtext_context", None)),
+        "has_topic_context": bool(getattr(context, "topic_context", None)),
         "has_midterm_context": bool(getattr(context, "midterm_context", None)),
         "has_durable_context": bool(getattr(context, "durable_context", None)),
         "has_episodic_context": bool(getattr(context, "episodic_context", None)),
@@ -371,6 +378,7 @@ class LongTermMemoryService:
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
+    fast_topic_builder: LongTermFastTopicContextBuilder | None = None
     turn_continuity_compiler: LongTermTurnContinuityCompiler = field(default_factory=LongTermTurnContinuityCompiler)
     restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None
     personality_learning: PersonalityLearningService | None = None
@@ -448,6 +456,10 @@ class LongTermMemoryService:
                 proactive_state_store=proactive_state_store,
             ),
         )
+        fast_topic_builder = LongTermFastTopicContextBuilder(
+            config=config,
+            object_store=object_store,
+        )
         store_lock = threading.RLock()  # AUDIT-FIX(#1): share one re-entrant mutation lock with both background writers.
         # AUDIT-FIX(#10): guard startup against zero/negative queue sizes from configuration.
         queue_size = _coerce_positive_int(
@@ -500,6 +512,7 @@ class LongTermMemoryService:
             object_store=object_store,
             midterm_store=midterm_store,
             query_rewriter=LongTermQueryRewriter.from_config(config),
+            fast_topic_builder=fast_topic_builder,
             retriever=retriever,
             extractor=extractor,
             multimodal_extractor=multimodal_extractor,
@@ -733,8 +746,9 @@ class LongTermMemoryService:
             query_text: User query text used for retrieval profiling.
 
         Returns:
-            The best-effort long-term context for provider prompts. Returns an
-            empty context if non-remote retrieval fails unexpectedly.
+            The best-effort long-term context for provider prompts, including
+            the compact quick-memory topic lane when enabled. Returns an empty
+            context if non-remote retrieval fails unexpectedly.
 
         Raises:
             LongTermRemoteUnavailableError: If required remote-primary state is
@@ -763,6 +777,10 @@ class LongTermMemoryService:
                         "multimodal_writer": multimodal_writer_details,
                     },
                 )
+                topic_context = self._build_quick_topic_context(
+                    query_text=query_text,
+                    workflow_event_name="longterm_provider_context_quick_memory_remote_read_failed",
+                )
                 with self._temporary_remote_probe_cache():
                     with workflow_span(
                         name="longterm_service_provider_context_retrieval",
@@ -773,6 +791,8 @@ class LongTermMemoryService:
                             query=query,
                             original_query_text=query_text,
                         )
+                if topic_context:
+                    context = replace(context, topic_context=topic_context)
                 workflow_event(
                     kind="retrieval",
                     msg="longterm_provider_context_built",
@@ -784,6 +804,105 @@ class LongTermMemoryService:
         except Exception:
             logger.exception("Failed to build long-term provider context.")  # AUDIT-FIX(#11): degrade to empty context instead of crashing the turn.
             return LongTermMemoryContext()
+
+    def build_fast_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+        """Build a tiny topic-memory context for latency-sensitive answer paths.
+
+        Args:
+            query_text: User query text used for one fast topic recall.
+
+        Returns:
+            A bounded context containing only a compact topic-hint section.
+
+        Raises:
+            LongTermRemoteReadFailedError: If the required remote fast-topic
+                read fails while the configured backend is otherwise reachable.
+            LongTermRemoteUnavailableError: If the required remote memory path
+                is unavailable before the fast-topic read can run.
+        """
+
+        if not self.config.long_term_memory_enabled or not self.config.long_term_memory_fast_topic_enabled:
+            return LongTermMemoryContext()
+        try:
+            query = LongTermQueryProfile.from_text(query_text)
+            writer_details = _writer_state_details(getattr(self, "writer", None))
+            multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
+            with workflow_span(
+                name="longterm_service_build_fast_provider_context",
+                kind="retrieval",
+                details={
+                    "query_present": bool(str(query_text or "").strip()),
+                    "conversation_writer": writer_details,
+                    "multimodal_writer": multimodal_writer_details,
+                },
+            ):
+                topic_context = self._build_quick_topic_context(
+                    query_text=query.original_text or query.retrieval_text,
+                    workflow_event_name="longterm_fast_provider_context_remote_read_failed",
+                )
+                context = LongTermMemoryContext(topic_context=topic_context)
+                workflow_event(
+                    kind="retrieval",
+                    msg="longterm_fast_provider_context_built",
+                    details=_context_details(context),
+                )
+                return context
+        except LongTermRemoteUnavailableError:
+            raise
+        except Exception:
+            logger.exception("Failed to build fast long-term provider context.")
+            return LongTermMemoryContext()
+
+    def _build_quick_topic_context(
+        self,
+        *,
+        query_text: str | None,
+        workflow_event_name: str,
+    ) -> str | None:
+        """Build the compact quick-memory topic block for one answer turn."""
+
+        if (
+            not self.config.long_term_memory_enabled
+            or not self.config.long_term_memory_fast_topic_enabled
+            or self.fast_topic_builder is None
+        ):
+            return None
+        try:
+            query = LongTermQueryProfile.from_text(query_text)
+            return self.fast_topic_builder.build(query_profile=query)
+        except LongTermRemoteReadFailedError as exc:
+            workflow_event(
+                kind="warning",
+                msg=workflow_event_name,
+                details=dict(exc.details),
+            )
+            raise
+        except LongTermRemoteUnavailableError:
+            raise
+        except ChonkyDBError as exc:
+            details = {
+                "operation": "fast_provider_context",
+                "request_kind": "read",
+                "outcome": "failed",
+                "classification": "unexpected_error",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+            workflow_event(
+                kind="warning",
+                msg=workflow_event_name,
+                details=details,
+            )
+            raise LongTermRemoteReadFailedError(
+                "Required remote long-term fast-topic retrieval failed.",
+                details=details,
+            ) from exc
+        except Exception as exc:
+            logger.warning(
+                "Failed to build fast-topic memory hints inside the quick-memory path. error_type=%s",
+                type(exc).__name__,
+            )
+            return None
 
     def build_tool_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build a tool-facing context with sensitive details redacted.

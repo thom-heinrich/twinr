@@ -197,6 +197,42 @@ def _call_best_effort(
         return default
 
 
+def _start_best_effort_background(
+    owner: Any,
+    callback: Callable[[], None],
+    *,
+    event_name: str,
+    message: str,
+    **data: object,
+) -> None:
+    """Run one non-critical side effect in the background so answers stay hot-path safe."""
+
+    def worker() -> None:
+        _call_best_effort(
+            owner,
+            callback,
+            event_name=event_name,
+            message=message,
+            default=None,
+            **data,
+        )
+
+    try:
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"twinr-{event_name}",
+        ).start()
+    except Exception as exc:
+        _record_event_safe(
+            owner,
+            f"{event_name}_dispatch_failed",
+            message,
+            error_type=type(exc).__name__,
+            **data,
+        )
+
+
 # AUDIT-FIX(#2): Emit bounded, generic failure metadata without leaking raw exception text or secrets into telemetry.
 def _emit_tool_failure(owner: Any, tool_name: str, message: str, exc: Exception, **data: object) -> None:
     _emit_kv_safe(owner, f"{tool_name}_status", "failed")
@@ -466,42 +502,51 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
     if request_id:
         # AUDIT-FIX(#4): Request identifiers may come from external providers and still need sanitized emission.
         _emit_kv_safe(owner, "search_request_id", request_id)
-    # AUDIT-FIX(#5): Analytics persistence is non-critical and must remain best-effort.
-    _record_usage_safe(
-        owner,
-        request_kind="search",
-        source="realtime_tool",
-        model=getattr(result, "model", None),
-        response_id=response_id or None,
-        request_id=request_id or None,
-        used_web_search=used_web_search,
-        token_usage=getattr(result, "token_usage", None),
-        question=question,
-    )
     for index, source in enumerate(sources, start=1):
         # AUDIT-FIX(#4): Sanitize each emitted source string before writing it to the event stream.
         _emit_kv_safe(owner, f"search_source_{index}", source)
-    # AUDIT-FIX(#5): Completion auditing is best-effort; the answer is already available at this point.
-    _record_event_safe(
+    _start_best_effort_background(
         owner,
-        "search_finished",
-        "Live web search completed.",
-        sources=len(sources),
-        used_web_search=used_web_search,
+        lambda: _record_usage_safe(
+            owner,
+            request_kind="search",
+            source="realtime_tool",
+            model=getattr(result, "model", None),
+            response_id=response_id or None,
+            request_id=request_id or None,
+            used_web_search=used_web_search,
+            token_usage=getattr(result, "token_usage", None),
+            question=question,
+        ),
+        event_name="search_usage_store_failed",
+        message="Search usage metrics could not be persisted.",
+        question=question,
     )
-    # AUDIT-FIX(#5): Remembering search results should not fail the live answer path if persistence is temporarily down.
-    _call_best_effort(
+    _start_best_effort_background(
+        owner,
+        lambda: _record_event_safe(
+            owner,
+            "search_finished",
+            "Live web search completed.",
+            sources=len(sources),
+            used_web_search=used_web_search,
+        ),
+        event_name="search_finished_event_failed",
+        message="Search completion event could not be recorded.",
+        question=question,
+    )
+    # AUDIT-FIX(#10): Search completion memory is non-critical and must never keep a finished live answer off the wire.
+    _start_best_effort_background(
         owner,
         lambda: owner.runtime.remember_search_result(
             question=question,
             answer=answer,
-            sources=sources,
+            sources=tuple(sources),
             location_hint=location_hint or None,
             date_context=date_context or None,
         ),
         event_name="search_memory_store_failed",
         message="Search result could not be persisted.",
-        default=None,
         question=question,
     )
     return {

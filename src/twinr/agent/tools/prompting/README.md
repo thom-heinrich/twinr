@@ -7,9 +7,10 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 ## Responsibility
 
 `prompting` owns:
-- define the canonical tool-lane instruction constants and fast ack phrases
+- define the canonical tool-lane instruction constants and optional model-authored progress-line policy
 - encode when the fast supervisor must carry structured `location_hint` / `date_context` fields and when it must escalate memory-dependent turns to fuller context
 - merge time and simple-setting context into tool-lane instruction bundles
+- build route-aware first-word overlays for authoritative local semantic-router handoffs so the instant spoken bridge stays LLM-generated and provisional
 - encode the learned-skill tool policy for self-coding activation, rollback, pause, and reactivation
 - encode when the model should discover, filter, aggregate, control, or inspect smart-home state through the dedicated tool surface
 - encode the generic multi-query planning policy for broad smart-home and house-status questions so agents compose live status from multiple tool reads instead of a special-case summary path

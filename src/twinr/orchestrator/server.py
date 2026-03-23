@@ -19,6 +19,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.orchestrator.contracts import (
     OrchestratorErrorEvent,
     OrchestratorToolResponse,
@@ -30,6 +31,9 @@ from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceHelloRequest,
     OrchestratorVoiceRuntimeStateEvent,
+)
+from twinr.orchestrator.voice_gateway_policy import (
+    assert_transcript_first_voice_gateway_contract,
 )
 from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
 
@@ -80,12 +84,20 @@ class EdgeOrchestratorServer:
         self.config = config
         self._session_factory = session_factory or EdgeOrchestratorSession
         self._voice_session_factory = voice_session_factory or EdgeOrchestratorVoiceSession
+        self._voice_forensics = WorkflowForensics.from_env(
+            project_root=Path(self.config.project_root),
+            service="EdgeOrchestratorVoiceServer",
+        )
 
     def create_app(self) -> FastAPI:
         """Build the FastAPI application that exposes the orchestrator socket."""
 
         app = FastAPI(title="Twinr Orchestrator", version="0.1.0")
         server = self
+
+        @app.on_event("shutdown")
+        async def _shutdown_forensics() -> None:
+            server._voice_forensics.close()
 
         @app.websocket("/ws/orchestrator")
         async def orchestrator_socket(websocket: WebSocket) -> None:
@@ -234,6 +246,9 @@ class EdgeOrchestratorServer:
             try:
                 try:
                     voice_session = server._voice_session_factory(server.config)
+                    configure_forensics = getattr(voice_session, "set_forensics", None)
+                    if callable(configure_forensics):
+                        configure_forensics(server._voice_forensics)
                 except Exception:
                     logger.exception("Failed to initialize voice orchestrator websocket session")
                     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
@@ -380,6 +395,7 @@ def create_app(env_file: str | Path) -> FastAPI:
     """Load Twinr config from disk and build the orchestrator FastAPI app."""
 
     config = TwinrConfig.from_env(Path(env_file))
+    assert_transcript_first_voice_gateway_contract(config)
     return EdgeOrchestratorServer(config).create_app()
 
 

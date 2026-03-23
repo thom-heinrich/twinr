@@ -29,6 +29,9 @@ from twinr.agent.workflows.streaming_turn_orchestrator import (
     StreamingTurnOrchestrator,
     StreamingTurnTimeoutPolicy,
 )
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+
+_ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S = 5.0
 
 
 class RuntimeStatusLike(Protocol):
@@ -48,6 +51,9 @@ class StreamingTurnRuntimeLike(Protocol):
     def begin_answering(self) -> None:
         ...
 
+    def resume_processing(self) -> None:
+        ...
+
     def resume_answering_after_print(self) -> None:
         ...
 
@@ -58,6 +64,9 @@ class StreamingTurnRuntimeLike(Protocol):
         ...
 
     def rearm_follow_up(self, *, request_source: str = "follow_up") -> None:
+        ...
+
+    def refresh_snapshot_activity(self) -> None:
         ...
 
 
@@ -174,7 +183,10 @@ class StreamingTurnCoordinatorHooks:
     trace_event: Callable[..., None]
     trace_decision: Callable[..., None]
     start_processing_feedback_loop: Callable[[str], Callable[[], None]]
+    is_search_feedback_active: Callable[[], bool]
+    stop_search_feedback: Callable[[], None]
     should_stop: Callable[[], bool]
+    request_turn_stop: Callable[[str], None]
     cancel_interrupted_turn: Callable[[], None]
     record_usage: Callable[..., None]
     evaluate_follow_up_closure: Callable[..., ConversationClosureEvaluation]
@@ -261,7 +273,12 @@ class _ProcessingFeedbackController:
     def stop(self) -> None:
         """Stop the processing feedback loop if it is active."""
 
-        self._stop()
+        if not self._started:
+            return
+        stop = self._stop
+        self._stop = lambda: None
+        self._started = False
+        stop()
 
 
 @dataclass(slots=True)
@@ -276,6 +293,9 @@ class _SpeechLifecycle:
     turn_started: float
     answer_started: bool = False
     first_audio_at: float | None = None
+    snapshot_refresh_interval_s: float = _ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S
+    _snapshot_refresh_stop: Event = field(default_factory=Event)
+    _snapshot_refresh_thread: Thread | None = None
 
     def on_speaking_started(self) -> None:
         """Start `answering` exactly when real audio begins."""
@@ -287,6 +307,7 @@ class _SpeechLifecycle:
             self.runtime.begin_answering()
             self.emit_status()
         self.answer_started = True
+        self._start_snapshot_heartbeat()
         self.trace_event("streaming_answering_started", kind="mutation", details={})
 
     def on_first_audio(self) -> None:
@@ -310,7 +331,74 @@ class _SpeechLifecycle:
         self.runtime.begin_answering()
         self.emit_status()
         self.answer_started = True
+        self._start_snapshot_heartbeat()
         self.trace_event("streaming_answering_started_late", kind="mutation", details={})
+
+    def resume_processing(self) -> None:
+        """Return from a spoken bridge acknowledgement back to processing."""
+
+        if not self.answer_started:
+            return
+        self.stop_snapshot_heartbeat()
+        if self.runtime.status.value != "processing":
+            self.runtime.resume_processing()
+            self.emit_status()
+        self.answer_started = False
+        self.trace_event("streaming_processing_resumed", kind="mutation", details={})
+
+    def stop_snapshot_heartbeat(self) -> None:
+        """Stop the bounded snapshot refresh loop for an active spoken reply."""
+
+        thread = self._snapshot_refresh_thread
+        if thread is None:
+            return
+        self._snapshot_refresh_stop.set()
+        thread.join(timeout=max(0.1, min(0.5, self.snapshot_refresh_interval_s)))
+        stopped = not thread.is_alive()
+        if stopped:
+            self._snapshot_refresh_thread = None
+        self.trace_event(
+            "streaming_answering_snapshot_refresh_stopped",
+            kind="span_end",
+            details={"stopped": stopped},
+        )
+
+    def _start_snapshot_heartbeat(self) -> None:
+        """Keep the runtime snapshot fresh while long speech is still audible."""
+
+        refresh_snapshot = getattr(self.runtime, "refresh_snapshot_activity", None)
+        if not callable(refresh_snapshot):
+            return
+        thread = self._snapshot_refresh_thread
+        if thread is not None and thread.is_alive():
+            return
+        stop = Event()
+        self._snapshot_refresh_stop = stop
+
+        def _worker() -> None:
+            while not stop.wait(self.snapshot_refresh_interval_s):
+                try:
+                    refresh_snapshot()
+                except Exception as exc:  # pragma: no cover - defensive runtime guard
+                    self.trace_event(
+                        "streaming_answering_snapshot_refresh_failed",
+                        kind="warning",
+                        level="WARN",
+                        details={"error_type": type(exc).__name__},
+                    )
+                    return
+
+        self._snapshot_refresh_thread = Thread(
+            target=_worker,
+            daemon=True,
+            name="twinr-streaming-answering-snapshot-refresh",
+        )
+        self._snapshot_refresh_thread.start()
+        self.trace_event(
+            "streaming_answering_snapshot_refresh_started",
+            kind="span_start",
+            details={"interval_s": self.snapshot_refresh_interval_s},
+        )
 
 
 @dataclass(slots=True)
@@ -364,17 +452,27 @@ class _DeferredFollowUpClosureEvaluation:
             name="twinr-streaming-follow-up-closure",
         ).start()
 
-    def result(self) -> ConversationClosureEvaluation:
-        """Return the finished closure evaluation, waiting only if still in flight."""
+    def result(self, *, timeout_s: float | None = None) -> ConversationClosureEvaluation:
+        """Return the finished closure evaluation without waiting indefinitely."""
 
         wait_started = time.monotonic()
-        self._ready.wait()
+        ready = self._ready.wait(timeout=timeout_s)
+        wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
+        if not ready:
+            self.trace_event(
+                "streaming_follow_up_closure_eval_join_timeout",
+                kind="warning",
+                level="WARN",
+                details={"timeout_s": timeout_s},
+                kpi={"wait_ms": wait_ms},
+            )
+            return ConversationClosureEvaluation(error_type="closure_eval_timeout")
         evaluation = self._evaluation or ConversationClosureEvaluation(error_type="closure_eval_missing")
         self.trace_event(
             "streaming_follow_up_closure_eval_joined",
             kind="metric",
             details={"error_type": evaluation.error_type},
-            kpi={"wait_ms": round((time.monotonic() - wait_started) * 1000.0, 3)},
+            kpi={"wait_ms": wait_ms},
         )
         return evaluation
 
@@ -605,9 +703,13 @@ class StreamingTurnCoordinator:
             queue_lane_delta=self._queue_lane_segments,
             wait_for_first_audio=self._speech_output.wait_for_first_audio,
             wait_until_idle=self._speech_output.wait_until_idle,
+            is_output_idle=lambda: self._speech_output.wait_until_idle(timeout_s=0.0),
             ensure_processing_feedback=self.processing_feedback.ensure_started,
+            resume_processing_after_bridge=self._resume_processing_after_bridge_wait,
+            stop_final_lane_feedback=self.hooks.stop_search_feedback,
             emit=self.hooks.emit,
             should_stop=self.hooks.should_stop,
+            request_final_lane_stop=self.hooks.request_turn_stop,
         )
         return orchestrator.execute(
             prefetched_first_word=lane_plan.prefetched_first_word,
@@ -616,7 +718,44 @@ class StreamingTurnCoordinator:
             bridge_fallback_reply=lane_plan.bridge_fallback_reply,
             run_final_lane=lane_plan.run_final_lane,
             recover_final_lane_response=lane_plan.recover_final_lane_response,
+            should_recover_final_lane_error=self._should_recover_final_lane_error,
         )
+
+    def _resume_processing_after_bridge_wait(self) -> None:
+        """Move the runtime back to processing once the bridge audio is done."""
+
+        self.speech_lifecycle.resume_processing()
+        if self.hooks.is_search_feedback_active():
+            return
+        self.processing_feedback.ensure_started()
+
+    def _should_recover_final_lane_error(self, exc: BaseException) -> bool:
+        """Classify fatal required-remote errors before propagating them.
+
+        The streaming final lane now fails closed for every error. This helper
+        only keeps the required-remote classification and telemetry so the
+        runtime can distinguish explicit remote blockers from ordinary turn
+        failures in the emitted evidence.
+        """
+
+        if not isinstance(exc, LongTermRemoteUnavailableError):
+            return True
+        remote_required = (
+            getattr(self.config, "long_term_memory_enabled", False)
+            and str(getattr(self.config, "long_term_memory_mode", "") or "").strip().lower()
+            == "remote_primary"
+            and getattr(self.config, "long_term_memory_remote_required", False)
+        )
+        if not remote_required:
+            return True
+        self.hooks.emit(f"final_lane_fatal={type(exc).__name__}")
+        self.hooks.trace_event(
+            "streaming_final_lane_fatal_remote_error",
+            kind="exception",
+            level="ERROR",
+            details={"error_type": type(exc).__name__},
+        )
+        return False
 
     def _require_lane_plan(self) -> StreamingTurnLanePlan:
         """Return the submitted-turn lane plan once it has been built."""
@@ -683,6 +822,7 @@ class StreamingTurnCoordinator:
         """Close or abort the speech worker and always stop processing feedback."""
 
         if self._speech_output is None:
+            self.hooks.stop_search_feedback()
             self.processing_feedback.stop()
             return
         close_timeout_s = self._speech_output_close_timeout()
@@ -705,7 +845,9 @@ class StreamingTurnCoordinator:
                     details={"close_timeout_s": close_timeout_s},
                 )
         finally:
+            self.hooks.stop_search_feedback()
             self.processing_feedback.stop()
+            self.speech_lifecycle.stop_snapshot_heartbeat()
 
     def _speech_output_close_timeout(self) -> float:
         """Normalize the speech worker shutdown timeout from config."""
@@ -781,13 +923,26 @@ class StreamingTurnCoordinator:
         if end_conversation:
             return ConversationClosureEvaluation()
         if deferred_closure_evaluation is not None:
-            return deferred_closure_evaluation.result()
+            return deferred_closure_evaluation.result(
+                timeout_s=self._closure_evaluation_join_timeout_s(),
+            )
         return self.hooks.evaluate_follow_up_closure(
             user_transcript=self.request.transcript,
             assistant_response=answer,
             request_source=self.request.listen_source,
             proactive_trigger=self.request.proactive_trigger,
         )
+
+    def _closure_evaluation_join_timeout_s(self) -> float:
+        """Bound the post-playback closure join so turns cannot stall in `answering`."""
+
+        try:
+            provider_timeout_s = float(
+                getattr(self.config, "conversation_closure_provider_timeout_seconds", 2.0)
+            )
+        except (TypeError, ValueError):
+            provider_timeout_s = 2.0
+        return min(15.0, max(0.25, provider_timeout_s) + 0.25)
 
     def _finish_turn(
         self,
@@ -824,6 +979,7 @@ class StreamingTurnCoordinator:
             request_source=self.request.listen_source,
             proactive_trigger=self.request.proactive_trigger,
         )
+        self.speech_lifecycle.stop_snapshot_heartbeat()
         if not force_close and self.request.allow_follow_up_rearm:
             self.runtime.rearm_follow_up(request_source="follow_up")
         else:

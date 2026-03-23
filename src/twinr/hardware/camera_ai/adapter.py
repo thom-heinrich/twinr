@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 import logging
@@ -13,11 +13,12 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 from .config import AICameraAdapterConfig, MediaPipeVisionConfig
 from .detection import DetectionResult, capture_detection
-from .face_anchors import OpenCVFaceAnchorDetector, merge_detection_with_face_anchors
+from .face_anchors import OpenCVFaceAnchorDetector, SupplementalFaceAnchorResult, merge_detection_with_face_anchors
 from .imx500_runtime import IMX500RuntimeSessionManager
 from .live_gesture_pipeline import LiveGesturePipeline
 from .mediapipe_pipeline import MediaPipeVisionPipeline
 from .models import (
+    AICameraBox,
     AICameraBodyPose,
     AICameraFineHandGesture,
     AICameraGestureEvent,
@@ -48,6 +49,19 @@ class PoseResult:
     gesture_confidence: float | None
     fine_hand_gesture: AICameraFineHandGesture = AICameraFineHandGesture.NONE
     fine_hand_gesture_confidence: float | None = None
+    sparse_keypoints: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class GesturePersonTargets:
+    """Describe the bounded person boxes that the gesture lane should trust."""
+
+    primary_person_box: AICameraBox | None
+    visible_person_boxes: tuple[AICameraBox, ...] = ()
+    person_count: int = 0
+    source: str = "imx500"
+    face_anchor_state: str = "disabled"
+    face_anchor_count: int = 0
 
 
 class LocalAICameraAdapter:
@@ -78,6 +92,10 @@ class LocalAICameraAdapter:
         self._last_pose_monotonic: float | None = None  # AUDIT-FIX(#4): Cache freshness must be independent of wall-clock jumps.
         self._last_pose_result: PoseResult | None = None
         self._last_pose_box_metrics: dict[str, float] | None = None  # AUDIT-FIX(#3): Reuse cached pose only for the same tracked person.
+        self._last_pose_hint_keypoints: dict[int, tuple[float, float, float]] = {}
+        self._last_pose_hint_confidence: float | None = None
+        self._last_pose_hint_monotonic: float | None = None
+        self._last_pose_hint_box_metrics: dict[str, float] | None = None
         self._mediapipe_pipeline: MediaPipeVisionPipeline | None = None
         self._live_gesture_pipeline: LiveGesturePipeline | None = None
         self._last_motion_box = None
@@ -310,6 +328,7 @@ class LocalAICameraAdapter:
                 error="camera_lock_timeout",
             )
         observed_at = self._now()
+        observed_monotonic = self._monotonic_now()
         try:
             try:
                 runtime = self._load_detection_runtime()
@@ -345,26 +364,87 @@ class LocalAICameraAdapter:
                     self._capture_detection(runtime, observed_at=observed_at)
                 )
                 frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+                face_anchors = self._detect_face_anchors_for_gesture(
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                )
+                gesture_targets = self._resolve_gesture_person_targets(
+                    detection=detection,
+                    face_anchors=face_anchors,
+                )
+                gesture_detection = self._gesture_detection_result(
+                    detection=detection,
+                    targets=gesture_targets,
+                )
+                sparse_keypoints, pose_hint_source, pose_hint_confidence = self._resolve_gesture_pose_hints(
+                    runtime=runtime,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=gesture_detection,
+                    frame_rgb=frame_rgb,
+                )
                 gesture_pipeline = self._ensure_live_gesture_pipeline()
                 gesture_observation = gesture_pipeline.observe(
                     frame_rgb=frame_rgb,
                     observed_at=observed_at,
-                    primary_person_box=detection.primary_person_box,
-                    visible_person_boxes=tuple(
-                        person.box
-                        for person in detection.visible_persons
-                        if getattr(person, "box", None) is not None
-                    ),
-                    person_count=detection.person_count,
+                    primary_person_box=gesture_targets.primary_person_box,
+                    visible_person_boxes=gesture_targets.visible_person_boxes,
+                    person_count=gesture_targets.person_count,
+                    sparse_keypoints=sparse_keypoints,
                 )
                 gesture_debug = gesture_pipeline.debug_snapshot()
+                pose_fallback, pose_fallback_error = self._resolve_gesture_pose_fallback(
+                    runtime,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=gesture_detection,
+                    frame_rgb=frame_rgb,
+                    gesture_observation=gesture_observation,
+                )
+                final_resolved_source = str(gesture_debug.get("resolved_source", "none") or "none")
+                if pose_fallback is not None and final_resolved_source == "none":
+                    if pose_fallback.fine_hand_gesture != AICameraFineHandGesture.NONE:
+                        final_resolved_source = "mediapipe_pose_fallback"
+                    elif pose_fallback.gesture_event != AICameraGestureEvent.NONE:
+                        final_resolved_source = "mediapipe_pose_event_fallback"
                 self._last_gesture_debug_details = {
                     **gesture_debug,
+                    "pose_hint_source": pose_hint_source,
+                    "pose_hint_confidence": (
+                        None if pose_hint_confidence is None else round(float(pose_hint_confidence), 3)
+                    ),
+                    "pose_fallback_used": pose_fallback is not None,
+                    "pose_fallback_error": pose_fallback_error,
+                    "pose_fallback_fine_hand_gesture": (
+                        None if pose_fallback is None else pose_fallback.fine_hand_gesture.value
+                    ),
+                    "pose_fallback_fine_hand_gesture_confidence": (
+                        None
+                        if pose_fallback is None or pose_fallback.fine_hand_gesture_confidence is None
+                        else round(float(pose_fallback.fine_hand_gesture_confidence), 3)
+                    ),
+                    "pose_fallback_gesture_event": (
+                        None if pose_fallback is None else pose_fallback.gesture_event.value
+                    ),
+                    "pose_fallback_gesture_confidence": (
+                        None
+                        if pose_fallback is None or pose_fallback.gesture_confidence is None
+                        else round(float(pose_fallback.gesture_confidence), 3)
+                    ),
+                    "final_resolved_source": final_resolved_source,
                     "detection_person_count": detection.person_count,
                     "detection_primary_person_zone": detection.primary_person_zone.value,
                     "detection_visible_person_count": len(detection.visible_persons),
                     "detection_primary_person_box_available": detection.primary_person_box is not None,
+                    "gesture_target_source": gesture_targets.source,
+                    "gesture_target_face_anchor_state": gesture_targets.face_anchor_state,
+                    "gesture_target_face_anchor_count": gesture_targets.face_anchor_count,
+                    "gesture_target_person_count": gesture_targets.person_count,
+                    "gesture_target_primary_person_box_available": gesture_targets.primary_person_box is not None,
                 }
+                camera_metrics = self._runtime_manager.last_camera_metrics()
+                if camera_metrics:
+                    self._last_gesture_debug_details.update(camera_metrics)
             except Exception as exc:  # pragma: no cover - hardware-dependent path.
                 code = self._classify_error(exc)
                 logger.warning("Local AI camera live gesture observation failed with %s.", code)
@@ -383,6 +463,32 @@ class LocalAICameraAdapter:
                     error=code,
                 )
 
+            fine_hand_gesture = gesture_observation.fine_hand_gesture
+            fine_hand_gesture_confidence = gesture_observation.fine_hand_gesture_confidence
+            gesture_event = gesture_observation.gesture_event
+            gesture_confidence = gesture_observation.gesture_confidence
+            hand_or_object_near_camera = gesture_observation.hand_count > 0
+            showing_intent_likely = (
+                True
+                if gesture_observation.hand_count > 0
+                or fine_hand_gesture != AICameraFineHandGesture.NONE
+                or gesture_event != AICameraGestureEvent.NONE
+                else None
+            )
+            model_name = "local-imx500+mediapipe-live-gesture"
+            if pose_fallback is not None:
+                if fine_hand_gesture == AICameraFineHandGesture.NONE and pose_fallback.fine_hand_gesture != AICameraFineHandGesture.NONE:
+                    fine_hand_gesture = pose_fallback.fine_hand_gesture
+                    fine_hand_gesture_confidence = pose_fallback.fine_hand_gesture_confidence
+                    model_name = "local-imx500+mediapipe-live-gesture+pose-fallback"
+                if gesture_event == AICameraGestureEvent.NONE and pose_fallback.gesture_event != AICameraGestureEvent.NONE:
+                    gesture_event = pose_fallback.gesture_event
+                    gesture_confidence = pose_fallback.gesture_confidence
+                    model_name = "local-imx500+mediapipe-live-gesture+pose-fallback"
+                hand_or_object_near_camera = hand_or_object_near_camera or bool(pose_fallback.hand_near_camera)
+                if showing_intent_likely is None and pose_fallback.showing_intent_likely is not None:
+                    showing_intent_likely = pose_fallback.showing_intent_likely
+
             observation = AICameraObservation(
                 observed_at=observed_at,
                 camera_online=True,
@@ -392,19 +498,13 @@ class LocalAICameraAdapter:
                 primary_person_box=detection.primary_person_box,
                 primary_person_zone=detection.primary_person_zone,
                 visible_persons=detection.visible_persons,
-                hand_or_object_near_camera=gesture_observation.hand_count > 0,
-                showing_intent_likely=(
-                    True
-                    if gesture_observation.hand_count > 0
-                    or gesture_observation.fine_hand_gesture != AICameraFineHandGesture.NONE
-                    or gesture_observation.gesture_event != AICameraGestureEvent.NONE
-                    else None
-                ),
-                gesture_event=gesture_observation.gesture_event,
-                gesture_confidence=gesture_observation.gesture_confidence,
-                fine_hand_gesture=gesture_observation.fine_hand_gesture,
-                fine_hand_gesture_confidence=gesture_observation.fine_hand_gesture_confidence,
-                model="local-imx500+mediapipe-live-gesture",
+                hand_or_object_near_camera=hand_or_object_near_camera,
+                showing_intent_likely=showing_intent_likely,
+                gesture_event=gesture_event,
+                gesture_confidence=gesture_confidence,
+                fine_hand_gesture=fine_hand_gesture,
+                fine_hand_gesture_confidence=fine_hand_gesture_confidence,
+                model=model_name,
             )
             return self._with_health(
                 observation,
@@ -423,6 +523,35 @@ class LocalAICameraAdapter:
         if self._last_gesture_debug_details is None:
             return None
         return dict(self._last_gesture_debug_details)
+
+    def _resolve_gesture_pose_fallback(
+        self,
+        runtime: dict[str, Any],
+        *,
+        observed_at: float,
+        observed_monotonic: float,
+        detection: DetectionResult,
+        frame_rgb: Any,
+        gesture_observation: object,
+    ) -> tuple[PoseResult | None, str | None]:
+        """Run the full MediaPipe gesture stack when the fast lane produced no concrete result."""
+
+        live_fine_hand_gesture = getattr(gesture_observation, "fine_hand_gesture", AICameraFineHandGesture.NONE)
+        live_gesture_event = getattr(gesture_observation, "gesture_event", AICameraGestureEvent.NONE)
+        if live_fine_hand_gesture != AICameraFineHandGesture.NONE or live_gesture_event != AICameraGestureEvent.NONE:
+            return None, None
+        if detection.person_count <= 0 or detection.primary_person_box is None:
+            return None, None
+        if self.config.pose_backend != "mediapipe":
+            return None, None
+        return self._resolve_mediapipe_pose(
+            runtime,
+            observed_at=observed_at,
+            observed_monotonic=observed_monotonic,
+            detection=detection,
+            frame_rgb=frame_rgb,
+            frame_error=None,
+        )
 
     def _resolve_pose(
         self,
@@ -538,6 +667,7 @@ class LocalAICameraAdapter:
             gesture_confidence=result.gesture_confidence,
             fine_hand_gesture=result.fine_hand_gesture,
             fine_hand_gesture_confidence=result.fine_hand_gesture_confidence,
+            sparse_keypoints=dict(result.sparse_keypoints),
         )
         self._store_pose_result(
             pose,
@@ -624,7 +754,56 @@ class LocalAICameraAdapter:
             showing_intent_likely=hand_near and looking_toward_device,
             gesture_event=gesture_event,
             gesture_confidence=gesture_confidence,
+            sparse_keypoints=dict(parsed_keypoints),
         )
+
+    def _resolve_gesture_pose_hints(
+        self,
+        runtime: dict[str, Any],
+        *,
+        observed_at: float,
+        observed_monotonic: float,
+        detection: DetectionResult,
+        frame_rgb: Any,
+    ) -> tuple[dict[int, tuple[float, float, float]], str, float | None]:
+        """Return fresh or cached sparse pose hints for the dedicated gesture lane."""
+
+        if detection.person_count <= 0 or detection.primary_person_box is None:
+            self._clear_pose_hint_cache()
+            return {}, "none", None
+        if self._should_reuse_pose_hint_cache(
+            observed_monotonic=observed_monotonic,
+            primary_person_box=detection.primary_person_box,
+        ):
+            return (
+                dict(self._last_pose_hint_keypoints),
+                "cache",
+                self._last_pose_hint_confidence,
+            )
+        if self.config.pose_backend != "mediapipe":
+            return {}, "unsupported_backend", None
+        try:
+            pose_hints = self._ensure_mediapipe_pipeline().analyze_pose_hints(
+                frame_rgb=frame_rgb,
+                observed_at=observed_at,
+            )
+        except Exception as exc:  # pragma: no cover - depends on Pi runtime and model assets.
+            code = self._classify_error(exc)
+            logger.warning("Local AI camera gesture pose-hint inference failed with %s.", code)
+            logger.debug("Local AI camera gesture pose-hint exception details.", exc_info=True)
+            self._safe_close_mediapipe_pipeline_locked()
+            self._clear_pose_hint_cache()
+            return {}, "error", None
+        if not pose_hints.sparse_keypoints:
+            self._clear_pose_hint_cache()
+            return {}, "empty", pose_hints.pose_confidence
+        self._store_pose_hint_cache(
+            sparse_keypoints=pose_hints.sparse_keypoints,
+            pose_confidence=pose_hints.pose_confidence,
+            observed_monotonic=observed_monotonic,
+            primary_person_box=detection.primary_person_box,
+        )
+        return dict(pose_hints.sparse_keypoints), "fresh_mediapipe", pose_hints.pose_confidence
 
     def _ensure_mediapipe_pipeline(self) -> MediaPipeVisionPipeline:
         """Reuse or create the Pi-side MediaPipe inference pipeline lazily."""
@@ -856,6 +1035,176 @@ class LocalAICameraAdapter:
             logger.debug("Local AI camera face-anchor exception details.", exc_info=True)
             return detection
 
+    def _detect_face_anchors_for_gesture(
+        self,
+        *,
+        detection: DetectionResult,
+        frame_rgb: Any | None,
+    ) -> SupplementalFaceAnchorResult:
+        """Return bounded face anchors for the gesture lane when the detector is available."""
+
+        if self._face_anchor_detector is None or frame_rgb is None or detection.person_count >= 2:
+            return SupplementalFaceAnchorResult(
+                state=("disabled" if self._face_anchor_detector is None else "skipped"),
+                detail="gesture_face_anchors_unused",
+            )
+        try:
+            return self._face_anchor_detector.detect(frame_rgb)
+        except Exception:
+            logger.warning("Local AI camera gesture face-anchor detection failed.")
+            logger.debug("Local AI camera gesture face-anchor exception details.", exc_info=True)
+            return SupplementalFaceAnchorResult(
+                state="backend_unavailable",
+                detail="gesture_face_anchor_detection_failed",
+            )
+
+    def _resolve_gesture_person_targets(
+        self,
+        *,
+        detection: DetectionResult,
+        face_anchors: SupplementalFaceAnchorResult,
+    ) -> GesturePersonTargets:
+        """Choose the body ROIs that the gesture lane should search first.
+
+        The IMX500 SSD path can occasionally lock onto chair backs or similar
+        furniture. When YuNet sees a real face outside that primary body box,
+        promote one bounded face-expanded body ROI so the gesture lane follows
+        the human instead of the furniture-shaped false positive.
+        """
+
+        base_boxes = tuple(
+            person.box
+            for person in detection.visible_persons
+            if getattr(person, "box", None) is not None
+        )
+        if not base_boxes and detection.primary_person_box is not None:
+            base_boxes = (detection.primary_person_box,)
+        candidate_boxes = list(base_boxes)
+        promoted_boxes: list[AICameraBox] = []
+        face_boxes = tuple(
+            face_person.box
+            for face_person in face_anchors.visible_persons
+            if getattr(face_person, "box", None) is not None
+        )
+        primary_matches_face = (
+            detection.primary_person_box is not None
+            and any(
+                self._box_contains_point(
+                    detection.primary_person_box,
+                    x=face_box.center_x,
+                    y=face_box.center_y,
+                )
+                for face_box in face_boxes
+            )
+        )
+        for face_box in face_boxes:
+            if any(
+                self._box_contains_point(body_box, x=face_box.center_x, y=face_box.center_y)
+                for body_box in base_boxes
+            ):
+                continue
+            promoted_boxes.append(self._expand_face_box_to_gesture_person_box(face_box))
+        candidate_boxes.extend(promoted_boxes)
+
+        primary_person_box = detection.primary_person_box
+        source = "imx500"
+        if promoted_boxes and (primary_person_box is None or not primary_matches_face):
+            primary_person_box = promoted_boxes[0]
+            source = "face_anchor_promoted"
+
+        ordered_boxes = self._ordered_unique_gesture_boxes(
+            primary_person_box=primary_person_box,
+            candidate_boxes=tuple(candidate_boxes),
+        )
+        return GesturePersonTargets(
+            primary_person_box=primary_person_box,
+            visible_person_boxes=ordered_boxes,
+            person_count=len(ordered_boxes),
+            source=source,
+            face_anchor_state=face_anchors.state,
+            face_anchor_count=len(face_boxes),
+        )
+
+    def _gesture_detection_result(
+        self,
+        *,
+        detection: DetectionResult,
+        targets: GesturePersonTargets,
+    ) -> DetectionResult:
+        """Return one gesture-lane detection view with promoted person targets applied."""
+
+        return DetectionResult(
+            person_count=targets.person_count,
+            primary_person_box=targets.primary_person_box,
+            primary_person_zone=(
+                detection.primary_person_zone
+                if targets.primary_person_box is None
+                else self._gesture_zone_from_box(targets.primary_person_box)
+            ),
+            visible_persons=detection.visible_persons,
+            person_near_device=detection.person_near_device,
+            hand_or_object_near_camera=detection.hand_or_object_near_camera,
+            objects=detection.objects,
+        )
+
+    def _expand_face_box_to_gesture_person_box(self, face_box: AICameraBox) -> AICameraBox:
+        """Return one bounded upper-body gesture-search ROI around a detected face."""
+
+        face_width = max(0.01, face_box.width)
+        face_height = max(0.01, face_box.height)
+        body_height = min(0.92, max(face_height * 5.4, face_width * 4.2))
+        body_width = min(0.74, max(face_width * 3.2, body_height * 0.55))
+        top = max(0.0, face_box.top - (face_height * 0.65))
+        left = max(0.0, face_box.center_x - (body_width / 2.0))
+        return AICameraBox(
+            top=top,
+            left=left,
+            bottom=min(1.0, top + body_height),
+            right=min(1.0, left + body_width),
+        )
+
+    def _ordered_unique_gesture_boxes(
+        self,
+        *,
+        primary_person_box: AICameraBox | None,
+        candidate_boxes: tuple[AICameraBox, ...],
+    ) -> tuple[AICameraBox, ...]:
+        """Return candidate gesture person boxes with duplicates collapsed."""
+
+        ordered: list[AICameraBox] = []
+        if primary_person_box is not None:
+            ordered.append(primary_person_box)
+        ordered.extend(candidate_boxes)
+        unique: list[AICameraBox] = []
+        for box in ordered:
+            if any(self._gesture_boxes_similar(box, existing) for existing in unique):
+                continue
+            unique.append(box)
+        return tuple(unique)
+
+    def _gesture_boxes_similar(self, first: AICameraBox, second: AICameraBox) -> bool:
+        """Return whether two candidate gesture boxes likely describe the same target."""
+
+        first_metrics = self._extract_box_metrics(first)
+        second_metrics = self._extract_box_metrics(second)
+        if first_metrics is None or second_metrics is None:
+            return False
+        return self._box_metrics_similar(first_metrics, second_metrics)
+
+    def _box_contains_point(self, box: AICameraBox, *, x: float, y: float) -> bool:
+        """Return whether one normalized point sits inside one normalized box."""
+
+        return box.left <= x <= box.right and box.top <= y <= box.bottom
+
+    def _gesture_zone_from_box(self, box: AICameraBox) -> AICameraZone:
+        """Return the coarse horizontal zone for one gesture target box."""
+
+        if box.center_x <= 0.36:
+            return AICameraZone.LEFT
+        if box.center_x >= 0.64:
+            return AICameraZone.RIGHT
+        return AICameraZone.CENTER
+
     def _health_only_observation(
         self,
         *,
@@ -1023,6 +1372,7 @@ class LocalAICameraAdapter:
         self._last_pose_at = None
         self._last_pose_monotonic = None
         self._last_pose_box_metrics = None
+        self._clear_pose_hint_cache()
 
     def _store_pose_result(
         self,
@@ -1038,6 +1388,15 @@ class LocalAICameraAdapter:
         self._last_pose_at = observed_at
         self._last_pose_monotonic = observed_monotonic
         self._last_pose_box_metrics = self._extract_box_metrics(primary_person_box)
+        if pose.sparse_keypoints:
+            self._store_pose_hint_cache(
+                sparse_keypoints=pose.sparse_keypoints,
+                pose_confidence=pose.pose_confidence,
+                observed_monotonic=observed_monotonic,
+                primary_person_box=primary_person_box,
+            )
+        else:
+            self._clear_pose_hint_cache()
 
     def _clear_motion_state(self) -> None:
         """Clear motion history."""
@@ -1048,6 +1407,29 @@ class LocalAICameraAdapter:
         self._last_motion_monotonic = None
         self._last_motion_state = AICameraMotionState.UNKNOWN
         self._last_motion_confidence = None
+
+    def _clear_pose_hint_cache(self) -> None:
+        """Clear gesture-lane sparse pose hints."""
+
+        self._last_pose_hint_keypoints = {}
+        self._last_pose_hint_confidence = None
+        self._last_pose_hint_monotonic = None
+        self._last_pose_hint_box_metrics = None
+
+    def _store_pose_hint_cache(
+        self,
+        *,
+        sparse_keypoints: dict[int, tuple[float, float, float]],
+        pose_confidence: float | None,
+        observed_monotonic: float,
+        primary_person_box: Any,
+    ) -> None:
+        """Store sparse pose hints for the dedicated gesture lane."""
+
+        self._last_pose_hint_keypoints = dict(sparse_keypoints)
+        self._last_pose_hint_confidence = pose_confidence
+        self._last_pose_hint_monotonic = observed_monotonic
+        self._last_pose_hint_box_metrics = self._extract_box_metrics(primary_person_box)
 
     def _should_reuse_pose_cache(
         self,
@@ -1069,6 +1451,29 @@ class LocalAICameraAdapter:
         if current_box_metrics is None:
             return False
         return self._box_metrics_similar(self._last_pose_box_metrics, current_box_metrics)
+
+    def _should_reuse_pose_hint_cache(
+        self,
+        *,
+        observed_monotonic: float,
+        primary_person_box: Any,
+    ) -> bool:
+        """Return whether cached sparse pose hints still match the tracked person."""
+
+        refresh_s = self._pose_refresh_s()
+        if refresh_s <= 0.0:
+            return False
+        if not self._last_pose_hint_keypoints or self._last_pose_hint_monotonic is None:
+            return False
+        if self._last_pose_hint_box_metrics is None:
+            return False
+        age_s = observed_monotonic - self._last_pose_hint_monotonic
+        if age_s < 0.0 or age_s > refresh_s:
+            return False
+        current_box_metrics = self._extract_box_metrics(primary_person_box)
+        if current_box_metrics is None:
+            return False
+        return self._box_metrics_similar(self._last_pose_hint_box_metrics, current_box_metrics)
 
     def _box_center_x(self, box: Any) -> float | None:
         """Return one finite center-x value for a box when available."""

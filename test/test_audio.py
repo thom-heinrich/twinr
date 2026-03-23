@@ -281,6 +281,53 @@ class WaveAudioPlayerTests(unittest.TestCase):
 
 
 class SilenceDetectedRecorderTests(unittest.TestCase):
+    def test_retries_transient_respeaker_capture_loss_before_speech(self) -> None:
+        recorder = SilenceDetectedRecorder(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            speech_threshold=700,
+            speech_start_chunks=1,
+            start_timeout_s=1.0,
+        )
+        failed_process = _FakeCaptureProcess()
+        failed_process.returncode = 1
+        recovered_process = _FakeCaptureProcess()
+        speech_chunk = b"\xff\x7f" * 1600
+        silence_chunk = b"\x00\x00" * 1600
+
+        class _AdvancingMonotonic:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                current = self.value
+                self.value += 0.11
+                return current
+
+        with (
+            mock.patch(
+                "twinr.hardware.audio._spawn_audio_process",
+                side_effect=[failed_process, recovered_process],
+            ) as spawn_process,
+            mock.patch(
+                "twinr.hardware.audio.wait_for_transient_respeaker_capture_ready",
+                return_value=True,
+            ) as recover_capture,
+            mock.patch("twinr.hardware.audio._wait_for_readable", side_effect=[True, True]),
+            mock.patch("twinr.hardware.audio.os.read", side_effect=[speech_chunk, silence_chunk]),
+            mock.patch("twinr.hardware.audio.time.monotonic", side_effect=_AdvancingMonotonic()),
+        ):
+            result = recorder.capture_pcm_until_pause_with_options(
+                pause_ms=0,
+                speech_start_chunks=1,
+            )
+
+        recover_capture.assert_called_once()
+        self.assertEqual(spawn_process.call_count, 2)
+        self.assertGreater(len(result.pcm_bytes), 0)
+
     def test_start_timeout_carries_pre_speech_capture_diagnostics(self) -> None:
         recorder = SilenceDetectedRecorder(
             device="default",

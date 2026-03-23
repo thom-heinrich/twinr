@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import importlib
 import logging
+import math
 import os
 import threading
 import time
+
+from twinr.runtime_paths import prime_raspberry_pi_system_site_packages
 
 from .config import AICameraAdapterConfig
 
@@ -29,6 +33,23 @@ class NetworkSession:
     picam2: Any
     imx500: Any
     input_size: tuple[int, int]
+    configured_frame_rate: float
+    manual_low_light_mode: bool = False
+
+
+@dataclass(slots=True)
+class CameraRuntimeMetrics:
+    """Describe the latest bounded IMX500 camera telemetry for operators/debug."""
+
+    lux: float | None = None
+    exposure_time_us: int | None = None
+    analogue_gain: float | None = None
+    frame_duration_us: int | None = None
+    configured_frame_rate: float | None = None
+    low_light_mode: bool = False
+    manual_low_light_mode: bool = False
+    exposure_saturated: bool = False
+    auto_exposure_capped: bool = False
 
 
 class IMX500RuntimeSessionManager:
@@ -41,6 +62,7 @@ class IMX500RuntimeSessionManager:
         self._sleep = sleep_fn
         self._session: NetworkSession | None = None
         self._lock = threading.RLock()  # AUDIT-FIX(#1): Serialize session lifecycle changes to prevent concurrent open/close races.
+        self._last_camera_metrics: CameraRuntimeMetrics | None = None
 
     def _close_component(self, label: str, component: Any, method_name: str) -> None:
         """Best-effort close helper for camera-related resources."""
@@ -176,9 +198,29 @@ class IMX500RuntimeSessionManager:
             self._session = None
             self._safe_close_session(session)  # AUDIT-FIX(#1): Keep teardown inside the lock so a new session cannot start while the old one is still shutting down.
 
+    def last_camera_metrics(self) -> dict[str, object] | None:
+        """Return the newest bounded camera telemetry snapshot for debug surfaces."""
+
+        with self._lock:
+            if self._last_camera_metrics is None:
+                return None
+            metrics = asdict(self._last_camera_metrics)
+        return {
+            "camera_lux": metrics["lux"],
+            "camera_exposure_time_us": metrics["exposure_time_us"],
+            "camera_analogue_gain": metrics["analogue_gain"],
+            "camera_frame_duration_us": metrics["frame_duration_us"],
+            "camera_configured_frame_rate": metrics["configured_frame_rate"],
+            "camera_low_light_mode": metrics["low_light_mode"],
+            "camera_manual_low_light_mode": metrics["manual_low_light_mode"],
+            "camera_exposure_saturated": metrics["exposure_saturated"],
+            "camera_auto_exposure_capped": metrics["auto_exposure_capped"],
+        }
+
     def load_detection_runtime(self) -> dict[str, Any]:
         """Import the minimum Picamera2 runtime needed for SSD detection."""
 
+        prime_raspberry_pi_system_site_packages()
         try:
             picamera2_module = importlib.import_module("picamera2")
             imx500_module = importlib.import_module("picamera2.devices.imx500")
@@ -194,6 +236,7 @@ class IMX500RuntimeSessionManager:
     def load_pose_postprocess(self) -> Any:
         """Import the HigherHRNet postprocess helper when available."""
 
+        prime_raspberry_pi_system_site_packages()
         try:
             module = importlib.import_module("picamera2.devices.imx500.postprocess_highernet")
             return getattr(module, "postprocess_higherhrnet")
@@ -265,6 +308,7 @@ class IMX500RuntimeSessionManager:
                 picam2=picam2,
                 imx500=imx500,
                 input_size=input_size,
+                configured_frame_rate=float(self.config.frame_rate),
             )
             return self._session
 
@@ -286,6 +330,8 @@ class IMX500RuntimeSessionManager:
                 if isinstance(metadata, dict):
                     has_tensor = bool(metadata.get("CnnOutputTensor"))
                     if has_tensor and self._metadata_is_fresh(metadata, observed_at):
+                        self._maybe_update_low_light_camera_controls(session, metadata=metadata)
+                        self._update_last_camera_metrics(session, metadata=metadata)
                         return metadata  # AUDIT-FIX(#8): Do not accept stale metadata when a comparable timestamp is available.
 
                 self._sleep(_METADATA_POLL_INTERVAL_S)
@@ -323,6 +369,187 @@ class IMX500RuntimeSessionManager:
                 self._session = None
                 raise RuntimeError("rgb_frame_missing")
             return frame
+
+    def _maybe_update_low_light_camera_controls(
+        self,
+        session: NetworkSession,
+        *,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Lower frame-rate first, then force manual long exposure only when AE remains capped."""
+
+        configured_frame_rate = float(max(1.0, self.config.frame_rate))
+        low_light_frame_rate = float(max(1.0, min(self.config.frame_rate, self.config.low_light_frame_rate)))
+        lux = _coerce_optional_float(metadata.get("Lux"))
+        if lux is None:
+            return
+        if low_light_frame_rate >= configured_frame_rate:
+            if session.manual_low_light_mode and lux >= float(self.config.low_light_recover_lux_threshold):
+                self._restore_auto_low_light_controls(session, frame_rate=configured_frame_rate)
+            return
+
+        should_recover = lux >= float(self.config.low_light_recover_lux_threshold)
+        if should_recover:
+            if session.manual_low_light_mode:
+                self._restore_auto_low_light_controls(session, frame_rate=configured_frame_rate)
+            elif abs(session.configured_frame_rate - configured_frame_rate) > 1e-6:
+                self._set_frame_rate_controls(session, frame_rate=configured_frame_rate)
+            return
+
+        should_lower_frame_rate = lux <= float(self.config.low_light_lux_threshold)
+        if should_lower_frame_rate and abs(session.configured_frame_rate - low_light_frame_rate) > 1e-6:
+            self._set_frame_rate_controls(session, frame_rate=low_light_frame_rate)
+
+        if session.manual_low_light_mode:
+            return
+        if not should_lower_frame_rate:
+            return
+        if abs(session.configured_frame_rate - low_light_frame_rate) > 1e-6:
+            return
+        if not self._auto_exposure_is_capped(metadata):
+            return
+        self._enable_manual_low_light_exposure(session, frame_rate=low_light_frame_rate)
+
+    def _set_frame_rate_controls(self, session: NetworkSession, *, frame_rate: float) -> None:
+        """Apply one deterministic frame-rate plus matching frame-duration window."""
+
+        target_frame_duration_us = _frame_duration_us_for_rate(frame_rate)
+        try:
+            session.picam2.set_controls(
+                {
+                    "FrameRate": float(frame_rate),
+                    "FrameDurationLimits": (target_frame_duration_us, target_frame_duration_us),
+                }
+            )
+        except Exception:  # pragma: no cover - depends on camera runtime.
+            logger.warning(
+                "Failed to change IMX500 FrameRate to %.2f for low-light adaptation.",
+                frame_rate,
+                exc_info=True,
+            )
+            return
+        session.configured_frame_rate = float(frame_rate)
+
+    def _enable_manual_low_light_exposure(self, session: NetworkSession, *, frame_rate: float) -> None:
+        """Force a longer fixed exposure only after AE proved it will not use the added frame budget."""
+
+        frame_duration_us = _frame_duration_us_for_rate(frame_rate)
+        target_exposure_us = max(
+            1,
+            min(
+                frame_duration_us,
+                int(round(frame_duration_us * float(self.config.low_light_manual_exposure_ratio))),
+            ),
+        )
+        target_gain = float(max(1.0, self.config.low_light_manual_analogue_gain))
+        try:
+            session.picam2.set_controls(
+                {
+                    "AeEnable": False,
+                    "FrameRate": float(frame_rate),
+                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                    "ExposureTime": target_exposure_us,
+                    "AnalogueGain": target_gain,
+                }
+            )
+        except Exception:  # pragma: no cover - depends on camera runtime.
+            logger.warning(
+                "Failed to enable manual IMX500 low-light exposure at %.2f fps.",
+                frame_rate,
+                exc_info=True,
+            )
+            return
+        session.configured_frame_rate = float(frame_rate)
+        session.manual_low_light_mode = True
+
+    def _restore_auto_low_light_controls(self, session: NetworkSession, *, frame_rate: float) -> None:
+        """Return the camera to auto-exposure once the room is bright enough again."""
+
+        frame_duration_us = _frame_duration_us_for_rate(frame_rate)
+        try:
+            session.picam2.set_controls(
+                {
+                    "AeEnable": True,
+                    "FrameRate": float(frame_rate),
+                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                }
+            )
+        except Exception:  # pragma: no cover - depends on camera runtime.
+            logger.warning(
+                "Failed to restore IMX500 auto exposure at %.2f fps.",
+                frame_rate,
+                exc_info=True,
+            )
+            return
+        session.configured_frame_rate = float(frame_rate)
+        session.manual_low_light_mode = False
+
+    def _auto_exposure_is_capped(self, metadata: dict[str, Any]) -> bool:
+        """Detect the IMX500 preview case where AE stays short despite a slower frame budget."""
+
+        exposure_time_us = _coerce_optional_int(metadata.get("ExposureTime"))
+        frame_duration_us = _coerce_optional_int(metadata.get("FrameDuration"))
+        analogue_gain = _coerce_optional_float(metadata.get("AnalogueGain"))
+        if exposure_time_us is None or frame_duration_us is None or analogue_gain is None:
+            return False
+        if frame_duration_us <= 0:
+            return False
+        required_gain = float(self.config.low_light_manual_analogue_gain) * 0.95
+        cap_ratio = float(self.config.low_light_auto_exposure_cap_ratio)
+        return analogue_gain >= required_gain and exposure_time_us <= int(frame_duration_us * cap_ratio)
+
+    def _update_last_camera_metrics(
+        self,
+        session: NetworkSession,
+        *,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Persist one bounded camera telemetry snapshot from fresh metadata."""
+
+        exposure_time_us = _coerce_optional_int(metadata.get("ExposureTime"))
+        frame_duration_us = _coerce_optional_int(metadata.get("FrameDuration"))
+        exposure_saturated = False
+        if exposure_time_us is not None and frame_duration_us is not None and frame_duration_us > 0:
+            exposure_saturated = exposure_time_us >= int(frame_duration_us * 0.95)
+        auto_exposure_capped = self._auto_exposure_is_capped(metadata)
+        self._last_camera_metrics = CameraRuntimeMetrics(
+            lux=_coerce_optional_float(metadata.get("Lux")),
+            exposure_time_us=exposure_time_us,
+            analogue_gain=_coerce_optional_float(metadata.get("AnalogueGain")),
+            frame_duration_us=frame_duration_us,
+            configured_frame_rate=round(float(session.configured_frame_rate), 3),
+            low_light_mode=session.configured_frame_rate < (float(self.config.frame_rate) - 1e-6),
+            manual_low_light_mode=session.manual_low_light_mode,
+            exposure_saturated=exposure_saturated,
+            auto_exposure_capped=auto_exposure_capped,
+        )
+
+
+def _coerce_optional_float(value: object) -> float | None:
+    """Convert one optional runtime-metadata value into a bounded float."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, 3)
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    """Convert one optional runtime-metadata value into an integer."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _frame_duration_us_for_rate(frame_rate: float) -> int:
+    """Convert one positive frame-rate into a deterministic frame duration."""
+
+    return max(1, int(round(1_000_000.0 / max(1.0, float(frame_rate)))))
 
 
 __all__ = ["IMX500RuntimeSessionManager", "NetworkSession"]

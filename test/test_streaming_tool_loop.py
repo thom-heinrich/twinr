@@ -123,6 +123,35 @@ class ToolCallingStreamingLoopTests(unittest.TestCase):
 
         self.assertEqual(seen_call_ids, ["call_search_1"])
 
+    def test_should_stop_prevents_tool_execution_after_provider_return(self) -> None:
+        provider = FakeToolCallingProvider()
+        seen_arguments: list[dict[str, object]] = []
+        stop_requested = {"value": False}
+
+        class _StoppingProvider(FakeToolCallingProvider):
+            def start_turn_streaming(self, prompt: str, **kwargs) -> ToolCallingTurnResponse:
+                response = super().start_turn_streaming(prompt, **kwargs)
+                stop_requested["value"] = True
+                return response
+
+        provider = _StoppingProvider()
+        loop = ToolCallingStreamingLoop(
+            provider,
+            tool_handlers={
+                "search_live_info": lambda arguments: seen_arguments.append(arguments)
+                or {"status": "ok", "answer": "Bus 24 fährt um 07:30 Uhr."}
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+        )
+
+        with self.assertRaises(InterruptedError):
+            loop.run(
+                "Wann fährt der Bus?",
+                should_stop=lambda: stop_requested["value"],
+            )
+
+        self.assertEqual(seen_arguments, [])
+
 
 if __name__ == "__main__":
     unittest.main()

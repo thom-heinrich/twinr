@@ -25,6 +25,7 @@ threads.
 - refresh due feeds on a calm cadence and translate fresh items into world signals, continuity threads, and condensed awareness threads
 - only let `co-attention` grow on genuinely new shared evidence such as fresh unseen feed items or new awareness-thread updates, not on every successful stale refresh
 - decay stale engagement, ongoing interest, and co-attention so boosted feed priority/cadence falls back to baseline when the topic stops pulling the user in
+- provide the shared persisted RSS source pool that Twinr's HDMI bottom ticker may read so display headlines stay aligned with the same feeds Twinr actually follows
 
 `intelligence` does **not** own:
 - prompt-layer rendering

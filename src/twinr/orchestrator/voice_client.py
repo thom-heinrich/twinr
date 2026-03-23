@@ -88,6 +88,7 @@ class OrchestratorVoiceWebSocketClient:
         self._socket = None
         self._socket_lock = Lock()
         self._receiver_stop = Event()
+        self._receiver_started = Event()
         self._receiver_thread: Thread | None = None
         self._opened = False
 
@@ -110,18 +111,25 @@ class OrchestratorVoiceWebSocketClient:
                 "max_queue": self.max_queue,
             }
             try:
-                self._socket = self._connector(self.url, **connector_kwargs)
-                self._socket.__enter__()
+                socket = self._connector(self.url, **connector_kwargs)
+                entered_socket = socket.__enter__()
+                self._socket = entered_socket if entered_socket is not None else socket
             except (InvalidURI, InvalidHandshake, OSError) as exc:
                 raise ConnectionError("Failed to connect to voice orchestrator websocket") from exc
             self._receiver_stop.clear()
+            self._receiver_started.clear()
+            socket = self._socket
             self._receiver_thread = Thread(
                 target=self._receiver_loop,
+                args=(socket,),
                 daemon=True,
                 name="twinr-voice-orchestrator-recv",
             )
-            self._receiver_thread.start()
             self._opened = True
+            self._receiver_thread.start()
+        if not self._receiver_started.wait(timeout=self.open_timeout_seconds):
+            self.close()
+            raise ConnectionError("Voice orchestrator receiver thread did not start")
         return self
 
     def close(self) -> None:
@@ -134,6 +142,7 @@ class OrchestratorVoiceWebSocketClient:
             self._socket = None
             self._receiver_thread = None
             self._opened = False
+            self._receiver_started.clear()
         if thread is not None and thread is not current_thread():
             thread.join(timeout=self.close_timeout_seconds)
         if socket is not None:
@@ -170,17 +179,21 @@ class OrchestratorVoiceWebSocketClient:
                 raise RuntimeError("Voice orchestrator websocket is not open")
             return self._socket
 
-    def _receiver_loop(self) -> None:
-        socket = self._require_socket()
+    def _receiver_loop(self, socket) -> None:
+        self._receiver_started.set()
         while not self._receiver_stop.is_set():
             try:
                 raw_message = socket.recv(timeout=self.recv_timeout_seconds)
             except TimeoutError:
                 continue
             except ConnectionClosed:
+                if self._receiver_stop.is_set():
+                    return
                 self._emit_error("Voice orchestrator websocket closed unexpectedly.")
                 return
             except Exception as exc:
+                if self._receiver_stop.is_set():
+                    return
                 self._emit_error(f"Voice orchestrator receive failed: {type(exc).__name__}")
                 return
             if isinstance(raw_message, bytes):

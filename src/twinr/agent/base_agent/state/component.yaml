@@ -1,0 +1,61 @@
+schema_version: 1
+name: state
+path: src/twinr/agent/base_agent/state
+kind: python-package
+visibility: internal
+summary: Deterministic runtime status transitions and durable runtime snapshot persistence for the base agent.
+owned_concerns:
+  - Canonical runtime statuses, events, and transition rules
+  - Bounded error/history tracking for the long-running runtime process
+  - Runtime snapshot dataclasses and safe JSON load/save/backup behavior
+  - Normalization of persisted timestamps, memory structures, and voice-status fields
+out_of_scope:
+  - Runtime orchestration in `src/twinr/agent/base_agent/runtime`
+  - Memory summarization and long-term memory behavior
+  - Display rendering and web-facing formatting of snapshot data
+  - Generic config/env persistence outside the runtime snapshot store
+files:
+  - path: __init__.py
+    role: Package marker with package-level summary only
+  - path: machine.py
+    role: Canonical statuses, events, transitions, and transition errors
+    exports:
+      - TwinrStatus
+      - TwinrEvent
+      - InvalidTransitionError
+      - TwinrStateMachine
+  - path: snapshot.py
+    role: Snapshot dataclasses and durable JSON store
+    exports:
+      - RuntimeSnapshotStoreError
+      - RuntimeSnapshotTurn
+      - RuntimeSnapshotLedgerItem
+      - RuntimeSnapshotSearchEntry
+      - RuntimeSnapshotMemoryState
+      - RuntimeSnapshot
+      - RuntimeSnapshotStore
+root_exports:
+  path: src/twinr/agent/base_agent/__init__.py
+  names:
+    - InvalidTransitionError
+    - RuntimeSnapshot
+    - RuntimeSnapshotStore
+    - TwinrEvent
+    - TwinrStateMachine
+    - TwinrStatus
+compatibility_reexports:
+  - path: src/twinr/state_machine.py
+    mode: star
+tests:
+  - path: test/test_state_machine.py
+  - path: test/test_display_service.py
+  - path: test/test_runtime_context.py
+  - path: test/test_ops.py
+  - path: test/test_web_app.py
+consumers:
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/flow.py
+  - path: src/twinr/display/service.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/web/viewmodels_voice.py
+  - path: src/twinr/ops/health.py

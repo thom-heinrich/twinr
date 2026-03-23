@@ -27,6 +27,7 @@ from threading import Lock
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio_env import build_audio_subprocess_env
+from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
 
 _SAMPLE_WIDTH_BYTES = 2
 # AUDIT-FIX(#3): Bound blocking device I/O so broken ALSA devices cannot wedge the process forever.
@@ -629,6 +630,7 @@ class SilenceDetectedRecorder:
             chunk_ms=self.chunk_ms,
         )
         read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
+        respeaker_recovery_attempted = False
 
         def _listen_timeout_diagnostics(*, listened_ms: int) -> ListenTimeoutCaptureDiagnostics:
             average_rms = 0
@@ -671,6 +673,34 @@ class SilenceDetectedRecorder:
                 ):
                     break
                 if process.poll() is not None:
+                    if (
+                        not heard_speech
+                        and not captured
+                        and not respeaker_recovery_attempted
+                    ):
+                        respeaker_recovery_attempted = True
+                        recovered = wait_for_transient_respeaker_capture_ready(
+                            device=self.device,
+                            sample_rate=self.sample_rate,
+                            channels=self.channels,
+                            chunk_ms=self.chunk_ms,
+                            should_stop=should_stop,
+                        )
+                        if recovered:
+                            self._stop_process(process)
+                            process = _spawn_audio_process(
+                                command,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                purpose="Audio capture",
+                            )
+                            preroll.clear()
+                            consecutive_speech_chunks = 0
+                            consecutive_resume_chunks = 0
+                            last_chunk_at = time.monotonic()
+                            continue
+                        if should_stop is not None and should_stop():
+                            raise RuntimeError("Audio capture stopped before speech started")
                     self._raise_process_error(process)
                 if process.stdout is None:
                     raise RuntimeError("arecord did not expose stdout")

@@ -164,6 +164,45 @@ class LongTermProactiveIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(reservation)
         self.assertEqual(reservation.candidate.kind, "gentle_follow_up")
 
+    def test_recent_past_event_generates_gentle_follow_up_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = LongTermMemoryService.from_config(_config(temp_dir))
+            service.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:doctor",
+                    occurred_at=datetime(2026, 3, 15, 8, 0, tzinfo=timezone.utc),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="event:doctor_yesterday",
+                            kind="event",
+                            summary="The user had a doctor appointment yesterday.",
+                            details="A recent appointment may deserve a soft follow-up about how it went.",
+                            source=_source("turn:doctor"),
+                            status="active",
+                            confidence=0.79,
+                            sensitivity="normal",
+                            valid_from="2026-03-14",
+                            valid_to="2026-03-14",
+                            slot_key="event:user:doctor:2026-03-14",
+                            value_key="event:doctor_yesterday",
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            plan = service.plan_proactive_candidates(
+                now=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc)
+            )
+            service.shutdown()
+
+        follow_up_candidates = [item for item in plan.candidates if item.kind == "gentle_follow_up"]
+        self.assertEqual(len(follow_up_candidates), 1)
+        self.assertIn("doctor appointment yesterday", follow_up_candidates[0].summary.lower())
+
     def test_skip_history_temporarily_suppresses_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = LongTermMemoryService.from_config(_config(temp_dir))

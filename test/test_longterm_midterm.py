@@ -17,6 +17,7 @@ from twinr.memory.longterm import (
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
     LongTermMidtermStore,
+    LongTermReflectionResultV1,
     LongTermSourceRefV1,
 )
 from twinr.memory.longterm.reasoning.midterm import (
@@ -274,6 +275,8 @@ class LongTermMidtermTests(unittest.TestCase):
             packet.query_hints,
         )
         self.assertEqual(packet.attributes["persistence_scope"], "turn_continuity")
+        self.assertIn("Thermoskanne", packet.attributes["transcript_excerpt"])
+        self.assertIn("Lea", packet.attributes["response_excerpt"])
 
     def test_midterm_store_selects_query_relevant_packets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -456,6 +459,65 @@ class LongTermMidtermTests(unittest.TestCase):
         self.assertEqual(
             [item.packet_id for item in loaded],
             ["adaptive:restart:new", "midterm:reflection"],
+        )
+
+    def test_apply_reflection_preserves_restart_recall_and_recent_turn_continuity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            store = LongTermMidtermStore.from_config(config)
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:reflection:old",
+                        kind="conversation_context",
+                        summary="Old reflection packet",
+                        source_memory_ids=("fact:old_reflection",),
+                        query_hints=("reflection",),
+                        sensitivity="normal",
+                    ),
+                    store.packet_type(
+                        packet_id="midterm:restart",
+                        kind="adaptive_restart_recall_policy",
+                        summary="Stable restart recall packet",
+                        source_memory_ids=("fact:stable",),
+                        query_hints=("stable",),
+                        sensitivity="normal",
+                        attributes={"persistence_scope": "restart_recall"},
+                    ),
+                    store.packet_type(
+                        packet_id="midterm:turn:latest",
+                        kind="recent_turn_continuity",
+                        summary="The last turn was about the doctor visit.",
+                        source_memory_ids=("turn:latest",),
+                        query_hints=("doctor visit",),
+                        sensitivity="normal",
+                        updated_at=datetime(2026, 3, 22, 8, 30, tzinfo=ZoneInfo("UTC")),
+                        attributes={"persistence_scope": "turn_continuity"},
+                    ),
+                )
+            )
+
+            store.apply_reflection(
+                LongTermReflectionResultV1(
+                    reflected_objects=(),
+                    created_summaries=(),
+                    midterm_packets=(
+                        store.packet_type(
+                            packet_id="midterm:reflection:new",
+                            kind="conversation_context",
+                            summary="Fresh reflection packet",
+                            source_memory_ids=("fact:new_reflection",),
+                            query_hints=("fresh reflection",),
+                            sensitivity="normal",
+                        ),
+                    ),
+                )
+            )
+            loaded = store.load_packets()
+
+        self.assertEqual(
+            [item.packet_id for item in loaded],
+            ["midterm:reflection:new", "midterm:restart", "midterm:turn:latest"],
         )
 
     def test_retriever_includes_midterm_context(self) -> None:

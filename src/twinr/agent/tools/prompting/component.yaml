@@ -25,6 +25,7 @@ files:
       - SUPERVISOR_TOOL_AGENT_INSTRUCTIONS
       - build_compact_tool_agent_instructions
       - build_first_word_instructions
+      - build_local_route_first_word_instructions
       - build_specialist_tool_agent_instructions
       - build_supervisor_decision_instructions
       - build_supervisor_tool_agent_instructions
@@ -41,6 +42,7 @@ files:
       - SUPERVISOR_TOOL_AGENT_INSTRUCTIONS
       - build_compact_tool_agent_instructions
       - build_first_word_instructions
+      - build_local_route_first_word_instructions
       - build_specialist_tool_agent_instructions
       - build_supervisor_decision_instructions
       - build_supervisor_tool_agent_instructions
@@ -54,6 +56,7 @@ public_api:
     - build_supervisor_tool_agent_instructions
     - build_supervisor_decision_instructions
     - build_first_word_instructions
+    - build_local_route_first_word_instructions
     - build_specialist_tool_agent_instructions
     - tool_agent_time_context
 compatibility_reexports:
@@ -64,6 +67,7 @@ compatibility_reexports:
       - FIRST_WORD_AGENT_INSTRUCTIONS
       - build_compact_tool_agent_instructions
       - build_first_word_instructions
+      - build_local_route_first_word_instructions
       - build_specialist_tool_agent_instructions
       - build_supervisor_decision_instructions
       - build_supervisor_tool_agent_instructions

@@ -29,9 +29,84 @@ from twinr.display.hdmi_fbdev import (
     HdmiFramebufferDisplay,
 )
 from twinr.display.hdmi_default_scene import HdmiDefaultSceneRenderer
+from twinr.display.hdmi_default_scene import HdmiStatusPanelModel
 from twinr.display.hdmi_wayland import HdmiWaylandDisplay
 from twinr.display.presentation_cues import DisplayPresentationCardCue, DisplayPresentationCue
 from twinr.display.wayland_env import apply_wayland_environment, resolve_wayland_socket
+
+
+class _FakeFont:
+    def __init__(self, size: int, *, bold: bool) -> None:
+        self.size = size
+        self.bold = bold
+
+
+class _FakeSceneTools:
+    def _font(self, size: int, *, bold: bool) -> _FakeFont:
+        return _FakeFont(size, bold=bold)
+
+    def _text_width(self, draw, text: str, *, font=None) -> int:
+        del draw
+        size = getattr(font, "size", 16)
+        return len(text) * max(8, size // 2)
+
+    def _text_height(self, draw, *, font=None) -> int:
+        del draw
+        return getattr(font, "size", 16)
+
+    def _truncate_text(self, draw, text: str, *, max_width: int, font=None) -> str:
+        del draw, max_width, font
+        return text
+
+    def _wrapped_lines(self, draw, lines, *, max_width: int, font, max_lines: int):
+        del draw, max_width, font
+        wrapped: list[str] = []
+        for line in lines:
+            if not line:
+                continue
+            parts = [part.strip() for part in str(line).split("|") if part.strip()]
+            if not parts:
+                parts = [str(line)]
+            for part in parts:
+                wrapped.append(part)
+                if len(wrapped) >= max_lines:
+                    return tuple(wrapped[:max_lines])
+        return tuple(wrapped[:max_lines])
+
+    def _normalise_text(self, value, *, fallback: str) -> str:
+        compact = " ".join(str(value or "").split()).strip()
+        return compact or fallback
+
+    def _render_emoji_glyph(self, emoji: str, *, target_size: int):
+        del emoji, target_size
+        return None
+
+
+class _RecordingDraw:
+    def __init__(self) -> None:
+        self.rounded_rectangles: list[dict[str, object]] = []
+        self.text_calls: list[dict[str, object]] = []
+
+    def rounded_rectangle(self, box, *, radius, fill, outline=None, width=1) -> None:
+        self.rounded_rectangles.append(
+            {
+                "box": box,
+                "radius": radius,
+                "fill": fill,
+                "outline": outline,
+                "width": width,
+            }
+        )
+
+    def text(self, position, text, *, fill, font) -> None:
+        self.text_calls.append(
+            {
+                "position": position,
+                "text": text,
+                "fill": fill,
+                "font": font,
+            }
+        )
 
 
 def _rgb565_geometry(*, width: int = 800, height: int = 480) -> FramebufferGeometry:
@@ -131,6 +206,64 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertGreater(face_bright, 9000)
         self.assertLess(panel_bright, 2000)
 
+    def test_prompt_mode_panel_has_no_left_accent_bar_and_uses_one_large_text_scale(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+        draw = _RecordingDraw()
+        panel = renderer._build_panel_model(
+            reserve_bus=types.SimpleNamespace(
+                ambient_impulse_cue=DisplayAmbientImpulseCue(
+                    topic_key="ai companions",
+                    headline="Denkst du, dass das heute kippt?",
+                    body="Ich wuerde da gern kurz mit dir draufschauen.",
+                    eyebrow="",
+                    symbol="question",
+                    accent="warm",
+                    action="invite_follow_up",
+                    attention_state="shared_thread",
+                    source="test",
+                    updated_at="2026-03-22T10:00:00+00:00",
+                    expires_at="2026-03-22T10:20:00+00:00",
+                ),
+                owner="ambient_impulse",
+            )
+        )
+
+        renderer._draw_status_panel(
+            draw,
+            box=(400, 80, 780, 430),
+            panel=panel,
+            compact=False,
+        )
+
+        self.assertTrue(panel.prompt_mode)
+        self.assertEqual(len(draw.rounded_rectangles), 1)
+        text_sizes = {call["font"].size for call in draw.text_calls}
+        self.assertEqual(text_sizes, {36})
+        self.assertTrue(any("Denkst du" in call["text"] for call in draw.text_calls))
+        self.assertTrue(any("draufschauen" in call["text"] for call in draw.text_calls))
+
+    def test_prompt_mode_panel_uses_available_height_for_long_copy(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+        draw = _RecordingDraw()
+        panel = HdmiStatusPanelModel(
+            eyebrow="",
+            headline="H1|H2|H3|H4",
+            helper_text="B1|B2|B3|B4",
+            cards=(),
+            prompt_mode=True,
+        )
+
+        renderer._draw_status_panel(
+            draw,
+            box=(400, 80, 780, 430),
+            panel=panel,
+            compact=False,
+        )
+
+        rendered_lines = tuple(call["text"] for call in draw.text_calls)
+        self.assertEqual(rendered_lines, ("H1", "H2", "H3", "H4", "B1", "B2", "B3"))
+        self.assertGreater(len(rendered_lines), 5)
+
     def test_render_status_image_draws_bottom_news_ticker(self) -> None:
         display = self.make_display()
         base = display.render_status_image(
@@ -180,7 +313,13 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             ticker_text="Tagesschau · Calm readable headline for seniors",
         )
         ticker_diff = ImageChops.difference(base.crop(scene.layout.ticker_box), ticked.crop(scene.layout.ticker_box))
-        panel_diff = ImageChops.difference(base.crop(scene.layout.panel_box), ticked.crop(scene.layout.panel_box))
+        panel_inner_box = (
+            scene.layout.panel_box[0] + 10,
+            scene.layout.panel_box[1] + 10,
+            scene.layout.panel_box[2] - 10,
+            scene.layout.panel_box[3] - 10,
+        )
+        panel_diff = ImageChops.difference(base.crop(panel_inner_box), ticked.crop(panel_inner_box))
 
         self.assertIsNotNone(ticker_diff.getbbox())
         self.assertGreater(sum(1 for pixel in ticker_diff.getdata() if max(pixel) >= 24), 2000)
@@ -652,7 +791,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertIsNone(ImageChops.difference(first, second).getbbox())
 
-    def test_default_scene_leaves_right_hand_area_visibly_free(self) -> None:
+    def test_default_scene_keeps_right_hand_area_visibly_reserved_when_idle(self) -> None:
         display = self.make_display()
         scene = display._scene_renderer().build_scene(
             width=800,
@@ -685,7 +824,11 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         )
 
         panel_crop = image.crop(scene.layout.panel_box)
-        self.assertIsNone(panel_crop.getbbox())
+        self.assertIsNotNone(panel_crop.getbbox())
+        dim_pixels = sum(1 for pixel in panel_crop.getdata() if max(pixel) >= 72)
+        bright_pixels = sum(1 for pixel in panel_crop.getdata() if min(pixel) >= 220)
+        self.assertGreater(dim_pixels, 200)
+        self.assertLess(bright_pixels, 200)
 
     def test_default_scene_renders_real_emoji_into_reserved_right_hand_area(self) -> None:
         display = self.make_display()
@@ -773,8 +916,8 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             animation_frame=0,
             ambient_impulse_cue=DisplayAmbientImpulseCue(
                 topic_key="ai companions",
-                headline="Ich habe zu AI companions heute etwas gelesen. Was meinst du?",
-                body="Dann weiss ich besser, ob ich dranbleiben soll.",
+                headline="Ich habe dazu heute etwas gelesen. Was meinst du?",
+                body="Es geht um AI companions. Dann weiss ich besser, ob ich dranbleiben soll.",
                 symbol="question",
                 accent="warm",
                 action="ask_one",
@@ -809,8 +952,8 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             animation_frame=0,
             ambient_impulse_cue=DisplayAmbientImpulseCue(
                 topic_key="ai companions",
-                headline="Ich habe zu AI companions heute etwas gelesen. Was meinst du?",
-                body="Dann weiss ich besser, ob ich dranbleiben soll.",
+                headline="Ich habe dazu heute etwas gelesen. Was meinst du?",
+                body="Es geht um AI companions. Dann weiss ich besser, ob ich dranbleiben soll.",
                 symbol="question",
                 accent="warm",
                 action="ask_one",

@@ -135,6 +135,79 @@ class MediaPipeVisionTests(unittest.TestCase):
         self.assertEqual(gesture, AICameraFineHandGesture.NONE)
         self.assertIsNone(confidence)
 
+    def test_runtime_configures_official_gesture_classifier_filters_for_none_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "gesture.task"
+            model_path.write_bytes(b"gesture")
+            runtime = MediaPipeTaskRuntime(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path="hand.task",
+                    gesture_model_path=str(model_path),
+                    builtin_gesture_min_score=0.41,
+                    custom_gesture_min_score=0.52,
+                )
+            )
+            captured: dict[str, object] = {}
+
+            def _create_from_options(options):
+                captured["options"] = options
+                return SimpleNamespace()
+
+            recognizer = runtime.ensure_roi_gesture_recognizer(
+                {
+                    "vision": SimpleNamespace(
+                        RunningMode=SimpleNamespace(IMAGE="image"),
+                        GestureRecognizerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                        GestureRecognizer=SimpleNamespace(create_from_options=_create_from_options),
+                    ),
+                    "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                    "ClassifierOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                }
+            )
+
+        self.assertIsNotNone(recognizer)
+        options = captured["options"]
+        self.assertEqual(options.canned_gesture_classifier_options.category_denylist, ["None"])
+        self.assertAlmostEqual(options.canned_gesture_classifier_options.score_threshold, 0.41, places=3)
+        self.assertIsNone(getattr(options, "custom_gesture_classifier_options", None))
+
+    def test_runtime_skips_classifier_options_for_custom_gesture_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_model_path = Path(temp_dir) / "custom.task"
+            custom_model_path.write_bytes(b"custom")
+            runtime = MediaPipeTaskRuntime(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path="hand.task",
+                    gesture_model_path="gesture.task",
+                    custom_gesture_model_path=str(custom_model_path),
+                    custom_gesture_min_score=0.52,
+                )
+            )
+            captured: dict[str, object] = {}
+
+            def _create_from_options(options):
+                captured["options"] = options
+                return SimpleNamespace()
+
+            recognizer = runtime.ensure_custom_roi_gesture_recognizer(
+                {
+                    "vision": SimpleNamespace(
+                        RunningMode=SimpleNamespace(IMAGE="image"),
+                        GestureRecognizerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                        GestureRecognizer=SimpleNamespace(create_from_options=_create_from_options),
+                    ),
+                    "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                    "ClassifierOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                }
+            )
+
+        self.assertIsNotNone(recognizer)
+        options = captured["options"]
+        self.assertIsNone(getattr(options, "canned_gesture_classifier_options", None))
+        self.assertIsNone(getattr(options, "custom_gesture_classifier_options", None))
+
     def test_temporal_classifier_detects_wave_from_lateral_raised_hand_motion(self) -> None:
         frames = (
             _Frame(

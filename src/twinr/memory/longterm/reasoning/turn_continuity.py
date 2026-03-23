@@ -22,6 +22,7 @@ _MAX_SUMMARY_CHARS = 160
 _MAX_DETAILS_CHARS = 1100
 _MAX_DETAIL_TEXT_CHARS = 480
 _MAX_QUERY_HINTS = 16
+_MAX_EXCERPT_CHARS = 120
 
 
 def _normalize_text(value: object | None, *, limit: int) -> str:
@@ -112,6 +113,11 @@ class LongTermTurnContinuityCompiler:
                 "persistence_scope": _TURN_CONTINUITY_SCOPE,
                 "source_type": turn.source,
                 "source_created_at": turn.created_at.isoformat(),
+                # Preserve short raw-turn anchors so downstream display code can
+                # ask natural follow-up questions without parsing English
+                # internal summary/details text.
+                "transcript_excerpt": _normalize_text(turn.transcript, limit=_MAX_EXCERPT_CHARS),
+                "response_excerpt": _normalize_text(turn.response, limit=_MAX_EXCERPT_CHARS),
             },
         )
 

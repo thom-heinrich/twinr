@@ -151,6 +151,36 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_search_provider_context_does_not_use_fast_topic_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    long_term_memory_enabled=True,
+                    long_term_memory_fast_topic_enabled=True,
+                    long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                    runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                )
+            )
+            try:
+                runtime.memory.remember("user", "Erster Turn")
+                runtime.memory.remember("assistant", "Zweiter Turn")
+                runtime.last_transcript = "Was weisst du ueber Janina?"
+
+                class _FastLongTermMemory:
+                    def build_fast_provider_context(self, query_text):
+                        raise AssertionError("search context must not query fast topic memory")
+
+                runtime.long_term_memory = _FastLongTermMemory()
+
+                context = runtime.search_provider_conversation_context()
+
+                self.assertNotIn(("system", "Fast topic hint."), context)
+                self.assertIn(("user", "Erster Turn"), context)
+                self.assertIn(("assistant", "Zweiter Turn"), context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_provider_context_degrades_when_remote_long_term_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -270,22 +300,27 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
-    def test_supervisor_direct_context_uses_full_provider_memory_for_current_query(self) -> None:
+    def test_supervisor_direct_context_uses_fast_topic_memory_for_current_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            runtime = TwinrRuntime(config=self._config(temp_dir))
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    long_term_memory_enabled=True,
+                    long_term_memory_fast_topic_enabled=True,
+                    long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                    runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                )
+            )
             try:
                 runtime.memory.remember("user", "Wir haben über Medikamente gesprochen.")
                 recorded_queries: list[str] = []
 
                 class _RecordingLongTermMemory:
-                    def build_provider_context(self, query_text):
+                    def build_fast_provider_context(self, query_text):
                         recorded_queries.append(str(query_text))
                         return SimpleNamespace(
-                            system_messages=lambda: ("Structured memory for direct supervisor reply.",)
+                            system_messages=lambda: ("Fast topic memory for direct supervisor reply.",)
                         )
-
-                    def build_tool_provider_context(self, query_text):
-                        raise AssertionError("direct supervisor context must use normal provider memory")
 
                 runtime.long_term_memory = _RecordingLongTermMemory()
 
@@ -295,7 +330,7 @@ class RuntimeContextTests(unittest.TestCase):
 
                 self.assertEqual(recorded_queries, ["Worüber haben wir heute gesprochen?"])
                 self.assertIn(
-                    ("system", "Structured memory for direct supervisor reply."),
+                    ("system", "Fast topic memory for direct supervisor reply."),
                     context,
                 )
                 self.assertIn(("user", "Wir haben über Medikamente gesprochen."), context)

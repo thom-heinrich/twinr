@@ -14,6 +14,8 @@ Pi-side operating-system service definitions plus leading-repo mirror helpers.
 `hardware/ops` does **not** own:
 - the watchdog implementation itself; that lives in `src/twinr/ops`
 - Twinr runtime orchestration or product logic
+- wakeword logic, transcript matching, or websocket semantics; transport-only
+  bridges here must stay byte-for-byte
 
 ## Files
 
@@ -24,6 +26,7 @@ Pi-side operating-system service definitions plus leading-repo mirror helpers.
 | [twinr-web.service](./twinr-web.service) | Productive unit: keep the Twinr web control portal running with managed sign-in |
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
+| [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
 
 The runtime supervisor intentionally runs as `root` so the productive
@@ -73,4 +76,6 @@ Exact-content drift detection is the default on every cycle; `--metadata-only`
 is an explicit throughput tradeoff that falls back to periodic checksum audits.
 Protected Pi-local paths use perishable rsync filters so stale nested repo
 copies can still be deleted instead of being pinned by an inner `.env` or
-similar runtime-only file.
+similar runtime-only file. The mirror also excludes local devices, FIFOs, and
+other special files so transient tooling artefacts in the leading repo cannot
+break Pi sync cycles.

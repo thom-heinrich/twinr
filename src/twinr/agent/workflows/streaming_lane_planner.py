@@ -21,41 +21,42 @@ class StreamingLanePlanner:
     def __init__(self, loop) -> None:
         self._loop = loop
 
-    def streaming_turn_timeout_policy(self) -> StreamingTurnTimeoutPolicy:
-        """Build the bounded timeout policy for one parallel dual-lane turn."""
+    def streaming_turn_timeout_policy(
+        self,
+        *,
+        decision_hint=None,
+    ) -> StreamingTurnTimeoutPolicy:
+        """Build the bounded timeout policy for one parallel dual-lane turn.
+
+        Search handoffs can legitimately take longer than parametric direct
+        replies because they still need to reach the search tool path and wait
+        for live results. Keep those turns bounded, but give them a dedicated
+        wider envelope instead of reusing the generic 15s final-lane deadline.
+        """
 
         loop = self._loop
-        watchdog_ms = max(25, int(loop.config.streaming_final_lane_watchdog_timeout_ms))
-        hard_timeout_ms = max(watchdog_ms, int(loop.config.streaming_final_lane_hard_timeout_ms))
+        use_search_budget = _decision_requires_search_timeout(decision_hint)
+        watchdog_ms = max(
+            25,
+            int(
+                loop.config.streaming_search_final_lane_watchdog_timeout_ms
+                if use_search_budget
+                else loop.config.streaming_final_lane_watchdog_timeout_ms
+            ),
+        )
+        hard_timeout_ms = max(
+            watchdog_ms,
+            int(
+                loop.config.streaming_search_final_lane_hard_timeout_ms
+                if use_search_budget
+                else loop.config.streaming_final_lane_hard_timeout_ms
+            ),
+        )
         return StreamingTurnTimeoutPolicy(
             bridge_reply_timeout_ms=max(0, int(loop.config.streaming_bridge_reply_timeout_ms)),
             final_lane_watchdog_timeout_ms=watchdog_ms,
             final_lane_hard_timeout_ms=hard_timeout_ms,
             first_audio_gate_ms=max(0, int(loop.config.streaming_first_word_final_lane_wait_ms)),
-        )
-
-    def _recover_dual_lane_response(
-        self,
-        transcript: str,
-        *,
-        turn_instructions: str | None,
-        failure_reason: str,
-    ):
-        """Resolve a final spoken recovery reply through the dual-lane LLM path."""
-
-        loop = self._loop
-        if not isinstance(loop.streaming_turn_loop, DualLaneToolLoop):
-            raise RuntimeError("dual-lane recovery requested without a dual-lane loop")
-        loop._trace_event(
-            "dual_lane_recovery_requested",
-            kind="branch",
-            details={"failure_reason": failure_reason, "transcript_len": len(transcript)},
-        )
-        return loop.streaming_turn_loop.recover_with_llm(
-            transcript,
-            conversation=loop.runtime.supervisor_direct_provider_conversation_context(transcript),
-            instructions=turn_instructions,
-            failure_reason=failure_reason,
         )
 
     def build_turn_lane_plan(self, transcript: str) -> StreamingTurnLanePlan:
@@ -74,9 +75,27 @@ class StreamingLanePlanner:
                 turn_instructions = None
                 loop._maybe_start_speculative_first_word(transcript)
                 loop._maybe_start_speculative_supervisor_decision(transcript)
-                prefetched_decision = loop._consume_speculative_supervisor_decision(transcript)
-                first_word_reply = loop._dual_lane_bridge_reply_from_decision(prefetched_decision)
-                first_word_source = "supervisor_prefetched" if first_word_reply is not None else "none"
+                local_route_resolution = loop._resolve_local_semantic_route(transcript)
+                prefetched_decision = (
+                    getattr(local_route_resolution, "supervisor_decision", None)
+                    if local_route_resolution is not None
+                    else None
+                )
+                if prefetched_decision is None:
+                    prefetched_decision = loop._consume_speculative_supervisor_decision(transcript)
+                first_word_reply = (
+                    getattr(local_route_resolution, "bridge_reply", None)
+                    if local_route_resolution is not None
+                    else None
+                )
+                first_word_source = "local_semantic_router" if first_word_reply is not None else "none"
+                if first_word_reply is None:
+                    first_word_reply = loop._dual_lane_bridge_reply_from_decision(prefetched_decision)
+                    first_word_source = "supervisor_prefetched" if first_word_reply is not None else "none"
+                local_authoritative = bool(
+                    local_route_resolution is not None
+                    and getattr(local_route_resolution, "supervisor_decision", None) is not None
+                )
                 if (
                     first_word_reply is None
                     and loop.config.streaming_first_word_enabled
@@ -89,6 +108,7 @@ class StreamingLanePlanner:
                     "streaming_dual_lane_starting",
                     kind="decision",
                     details={
+                        "local_authoritative": local_authoritative,
                         "prefetched_decision": getattr(prefetched_decision, "action", None)
                         if prefetched_decision is not None
                         else None,
@@ -111,7 +131,11 @@ class StreamingLanePlanner:
                                 instructions=turn_instructions,
                             )
                         )
-                        if first_word_reply is None and loop._dual_lane_prefers_supervisor_bridge()
+                        if (
+                            first_word_reply is None
+                            and loop._dual_lane_prefers_supervisor_bridge()
+                            and not local_authoritative
+                        )
                         else (
                             (lambda: loop._generate_first_word_reply(transcript))
                             if first_word_reply is None and loop.first_word_provider is not None
@@ -119,14 +143,10 @@ class StreamingLanePlanner:
                         )
                     ),
                     bridge_fallback_reply=None,
-                    timeout_policy=loop._streaming_turn_timeout_policy(),
-                    recover_final_lane_response=(
-                        lambda failure_reason: self._recover_dual_lane_response(
-                            transcript,
-                            turn_instructions=turn_instructions,
-                            failure_reason=failure_reason,
-                        )
+                    timeout_policy=loop._streaming_turn_timeout_policy(
+                        decision_hint=prefetched_decision,
                     ),
+                    recover_final_lane_response=None,
                 )
 
             turn_instructions = (
@@ -148,6 +168,7 @@ class StreamingLanePlanner:
                     instructions=turn_instructions,
                     allow_web_search=False,
                     on_text_delta=on_text_delta,
+                    should_stop=loop._active_turn_stop_requested,
                 ),
             )
 
@@ -162,12 +183,27 @@ class StreamingLanePlanner:
 
         loop = self._loop
         if prefetched_decision is None:
-            prefetched_decision = loop._consume_speculative_supervisor_decision(transcript)
+            local_route_resolution = loop._resolve_local_semantic_route(transcript)
+            if local_route_resolution is not None:
+                prefetched_decision = getattr(local_route_resolution, "supervisor_decision", None)
+            if prefetched_decision is None:
+                prefetched_decision = loop._consume_speculative_supervisor_decision(transcript)
         resolved_decision = prefetched_decision
         search_context = None
         supervisor_context = None
         supervisor_direct_context = None
         tool_context = None
+        skip_structured_supervisor_decision = False
+
+        def _raise_if_turn_stopped(stage: str) -> None:
+            if not loop._active_turn_stop_requested():
+                return
+            loop._trace_event(
+                "dual_lane_final_path_aborted",
+                kind="branch",
+                details={"stage": stage, "transcript": _text_summary(transcript)},
+            )
+            raise InterruptedError(f"dual-lane final path stopped during {stage}")
 
         def _materialize_context(source: str, value):
             loop._trace_event(
@@ -221,6 +257,20 @@ class StreamingLanePlanner:
             kind = str(getattr(decision, "kind", "") or "").strip().lower()
             return _search_context() if kind == "search" else _tool_context()
 
+        def _run_with_search_feedback(decision, callback):
+            stop_search_feedback = lambda: None
+            if _decision_wants_search_feedback(decision):
+                stop_working_feedback = getattr(loop, "_stop_working_feedback", None)
+                if callable(stop_working_feedback):
+                    stop_working_feedback()
+                stop_search_feedback = loop._start_search_feedback_loop()
+            try:
+                _raise_if_turn_stopped("search_feedback_start")
+                return callback()
+            finally:
+                stop_search_feedback()
+
+        _raise_if_turn_stopped("final_path_start")
         if prefetched_decision is not None and getattr(prefetched_decision, "action", None) == "handoff":
             handoff_kind = str(getattr(prefetched_decision, "kind", "") or "").strip().lower() or "general"
             handoff_context = _handoff_context(prefetched_decision)
@@ -243,26 +293,53 @@ class StreamingLanePlanner:
                 },
                 guardrails=["single_search_execution"],
             )
-            return loop.streaming_turn_loop.run_handoff_only(
-                transcript,
-                conversation=handoff_context,
-                specialist_conversation=handoff_context,
-                handoff=prefetched_decision,
-                instructions=turn_instructions,
-                allow_web_search=False,
-                on_text_delta=None,
-                on_lane_text_delta=None,
-                emit_filler=False,
+            return _run_with_search_feedback(
+                prefetched_decision,
+                lambda: loop.streaming_turn_loop.run_handoff_only(
+                    transcript,
+                    conversation=handoff_context,
+                    specialist_conversation=handoff_context,
+                    handoff=prefetched_decision,
+                    instructions=turn_instructions,
+                    allow_web_search=False,
+                    on_text_delta=None,
+                    on_lane_text_delta=None,
+                    emit_filler=False,
+                    should_stop=loop._active_turn_stop_requested,
+                ),
             )
         if getattr(loop.streaming_turn_loop, "supervisor_decision_provider", None) is not None:
-            resolved_decision = prefetched_decision or loop.streaming_turn_loop.resolve_supervisor_decision(
-                transcript,
-                conversation=_supervisor_context(),
-                instructions=turn_instructions,
+            shared_supervisor_decision = (
+                prefetched_decision is None
+                and loop._has_shared_speculative_supervisor_decision(transcript)
             )
+            if shared_supervisor_decision:
+                prefetched_decision = loop._wait_for_speculative_supervisor_decision(
+                    transcript,
+                    wait_ms=_shared_supervisor_decision_wait_ms(loop),
+                )
+                if prefetched_decision is None:
+                    loop._trace_event(
+                        "dual_lane_shared_supervisor_decision_unavailable",
+                        kind="branch",
+                        details={
+                            "transcript": _text_summary(transcript),
+                            "fallback_to_sync_resolve": True,
+                        },
+                    )
+            _raise_if_turn_stopped("supervisor_decision_initial")
+            resolved_decision = prefetched_decision
+            if resolved_decision is None and not skip_structured_supervisor_decision:
+                resolved_decision = loop.streaming_turn_loop.resolve_supervisor_decision(
+                    transcript,
+                    conversation=_supervisor_context(),
+                    instructions=turn_instructions,
+                    should_stop=loop._active_turn_stop_requested,
+                )
             if resolved_decision is not None:
                 action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
                 if action == "direct":
+                    _raise_if_turn_stopped("supervisor_decision_reresolve")
                     loop._trace_event(
                         "dual_lane_direct_reply_reresolved_with_memory_context",
                         kind="branch",
@@ -272,6 +349,7 @@ class StreamingLanePlanner:
                         transcript,
                         conversation=_supervisor_direct_context(),
                         instructions=turn_instructions,
+                        should_stop=loop._active_turn_stop_requested,
                     )
                     action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
                 if action == "handoff" and str(getattr(resolved_decision, "kind", "") or "").strip().lower() == "search":
@@ -293,16 +371,20 @@ class StreamingLanePlanner:
                         },
                         guardrails=["search_handoff_short_path"],
                     )
-                    return loop.streaming_turn_loop.run_handoff_only(
-                        transcript,
-                        conversation=_search_context(),
-                        specialist_conversation=_search_context(),
-                        handoff=resolved_decision,
-                        instructions=turn_instructions,
-                        allow_web_search=False,
-                        on_text_delta=None,
-                        on_lane_text_delta=None,
-                        emit_filler=False,
+                    return _run_with_search_feedback(
+                        resolved_decision,
+                        lambda: loop.streaming_turn_loop.run_handoff_only(
+                            transcript,
+                            conversation=_search_context(),
+                            specialist_conversation=_search_context(),
+                            handoff=resolved_decision,
+                            instructions=turn_instructions,
+                            allow_web_search=False,
+                            on_text_delta=None,
+                            on_lane_text_delta=None,
+                            emit_filler=False,
+                            should_stop=loop._active_turn_stop_requested,
+                        ),
                     )
                 if action in {"direct", "end_conversation"}:
                     loop._trace_decision(
@@ -341,6 +423,23 @@ class StreamingLanePlanner:
                         allow_web_search=False,
                         on_text_delta=None,
                         on_lane_text_delta=None,
+                        should_stop=loop._active_turn_stop_requested,
+                    )
+                if _decision_wants_search_feedback(resolved_decision):
+                    return _run_with_search_feedback(
+                        resolved_decision,
+                        lambda: loop.streaming_turn_loop.run(
+                            transcript,
+                            conversation=_tool_context(),
+                            supervisor_conversation=_supervisor_context(),
+                            prefetched_decision=resolved_decision,
+                            skip_supervisor_decision=skip_structured_supervisor_decision,
+                            instructions=turn_instructions,
+                            allow_web_search=False,
+                            on_text_delta=None,
+                            on_lane_text_delta=None,
+                            should_stop=loop._active_turn_stop_requested,
+                        ),
                     )
         loop._trace_decision(
             "dual_lane_final_path_selected",
@@ -364,10 +463,12 @@ class StreamingLanePlanner:
             conversation=_tool_context(),
             supervisor_conversation=_supervisor_context(),
             prefetched_decision=resolved_decision,
+            skip_supervisor_decision=skip_structured_supervisor_decision,
             instructions=turn_instructions,
             allow_web_search=False,
             on_text_delta=None,
             on_lane_text_delta=None,
+            should_stop=loop._active_turn_stop_requested,
         )
 
 
@@ -426,3 +527,39 @@ def _decision_summary(decision) -> dict[str, Any]:
         "location_hint": _text_summary(getattr(decision, "location_hint", None)),
         "date_context": _text_summary(getattr(decision, "date_context", None)),
     }
+
+
+def _decision_wants_search_feedback(decision) -> bool:
+    """Return whether a supervisor handoff should play search progress tones."""
+
+    if decision is None:
+        return False
+    action = str(getattr(decision, "action", "") or "").strip().lower()
+    if action != "handoff":
+        return False
+    kind = str(getattr(decision, "kind", "") or "").strip().lower()
+    if kind == "search":
+        return True
+    return bool(getattr(decision, "allow_web_search", False))
+
+
+def _decision_requires_search_timeout(decision) -> bool:
+    """Return whether the final lane should use the wider search timeout budget."""
+
+    if decision is None:
+        return False
+    action = str(getattr(decision, "action", "") or "").strip().lower()
+    if action != "handoff":
+        return False
+    kind = str(getattr(decision, "kind", "") or "").strip().lower()
+    if kind == "search":
+        return True
+    return bool(getattr(decision, "allow_web_search", False))
+
+
+def _shared_supervisor_decision_wait_ms(loop) -> int:
+    """Bound how long the final lane waits for the shared supervisor-decision worker."""
+
+    prefetch_wait_ms = max(0, int(getattr(loop.config, "streaming_supervisor_prefetch_wait_ms", 0)))
+    bridge_wait_ms = max(0, int(getattr(loop.config, "streaming_bridge_reply_timeout_ms", 0)))
+    return max(prefetch_wait_ms, bridge_wait_ms)

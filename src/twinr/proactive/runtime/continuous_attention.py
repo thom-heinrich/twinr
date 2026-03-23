@@ -33,6 +33,7 @@ _DEFAULT_DIRECTION_MIN_CONFIDENCE = 0.72
 _DEFAULT_DIRECTION_MIN_TRACKS = 2
 _DEFAULT_AUDIO_MIRROR_MIN_SAMPLES = 3
 _DEFAULT_AUDIO_MIRROR_MARGIN = 0.08
+_SINGLE_SPEAKER_AUDIO_BLEND = 0.2
 _VALID_HORIZONTAL = frozenset({"left", "center", "right"})
 
 
@@ -231,6 +232,11 @@ class ContinuousAttentionTracker:
                 speaker_locked=True,
                 visible_track_count=len(active_tracks),
                 audio_target_x=audio_target_x,
+                target_center_x_override=self._speaker_target_center_x(
+                    track=speaker_track,
+                    visible_track_count=len(active_tracks),
+                    audio_target_x=audio_target_x,
+                ),
                 confidence=_mean_confidence((speaker_track.confidence, direction_confidence)) or 0.82,
             )
 
@@ -422,10 +428,15 @@ class ContinuousAttentionTracker:
         confidence: float,
         speaker_locked: bool = False,
         motion_locked: bool = False,
+        target_center_x_override: float | None = None,
     ) -> ContinuousAttentionTargetSnapshot:
         self._last_selected_track_id = track.track_id
         self._last_selected_at = 0.0 if observed_at is None else float(observed_at)
-        predicted_center_x = track.predicted_center_x(horizon_s=self.config.prediction_horizon_s)
+        predicted_center_x = (
+            track.predicted_center_x(horizon_s=self.config.prediction_horizon_s)
+            if target_center_x_override is None
+            else _clamp_ratio(target_center_x_override)
+        )
         return ContinuousAttentionTargetSnapshot(
             observed_at=observed_at,
             state=state,
@@ -443,6 +454,37 @@ class ContinuousAttentionTracker:
             audio_target_x=audio_target_x,
             audio_mirror_applied=self._audio_mirror_enabled(),
             confidence=round(max(0.0, min(1.0, confidence)), 4),
+        )
+
+    def _speaker_target_center_x(
+        self,
+        *,
+        track: _TrackState,
+        visible_track_count: int,
+        audio_target_x: float | None,
+    ) -> float:
+        """Return one conservative target x for the current visible speaker.
+
+        In simple one-person scenes, speech should do more than flip an
+        internal state label. Blend the visible track with the currently folded
+        audio direction so the servo and HDMI follow path can react to the
+        speaker's current bearing, but clamp the audio pull to the existing
+        speaker-match window so audio noise cannot yank the target far away
+        from the confirmed visible person.
+        """
+
+        predicted_center_x = track.predicted_center_x(horizon_s=self.config.prediction_horizon_s)
+        if visible_track_count != 1 or audio_target_x is None:
+            return predicted_center_x
+        bounded_audio_target_x = _clamp_ratio(
+            max(
+                track.center_x - self.config.speaker_max_distance,
+                min(track.center_x + self.config.speaker_max_distance, audio_target_x),
+            )
+        )
+        return _clamp_ratio(
+            predicted_center_x
+            + ((bounded_audio_target_x - predicted_center_x) * _SINGLE_SPEAKER_AUDIO_BLEND)
         )
 
     def _update_audio_mirror_calibration(

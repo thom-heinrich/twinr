@@ -40,9 +40,15 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   `👍` or `👋` without pushing emoji-only semantics into the generic runtime
   snapshot schema
 - allow optional external HDMI ambient-impulse cues so personality-driven
-  capabilities can claim that same reserve area with one tiny bounded
-  text-plus-emoji card that stays positive, glanceable, and clearly separate
-  from the generic runtime snapshot schema
+  capabilities can claim that same reserve area with one bounded, readable,
+  question-first reserve card that stays positive, glanceable, and clearly
+  separate from the generic runtime snapshot schema
+- persist a bounded reserve-card exposure history so later learning code can
+  correlate which right-lane prompts Twinr actually showed with later
+  structured user reactions
+- persist one short-lived reserve-bus feedback hint so strong immediate pickup
+  or pushback on a shown card can reshape the remaining day plan faster than
+  the slower long-term learning loop alone
 - arbitrate that right-hand HDMI reserve area through one explicit reserve-bus
   helper so emoji acknowledgements, calm ambient cards, and future reserve-only
   cue families do not compete through inline renderer conditionals
@@ -191,9 +197,22 @@ halo over dense text or extra chrome so the surface stays readable at a glance.
 Gesture acknowledgements should mirror clear symbols like `👍`, `👎`, `👋`,
 `✌️`, `👌`, or `👉` directly instead of inventing extra text, while still
 keeping face emotions in the face channel and not in emoji-only surrogates.
-Calm companion impulses may use a tiny bounded text card there too, but that
-card must stay short, positive, and subordinate to stronger reserve-surface
-owners such as gesture acknowledgements or fullscreen presentations.
+Calm companion impulses may use a bounded question-first reserve card there
+too, but that card must stay short, positive, and subordinate to stronger
+reserve-surface owners such as gesture acknowledgements or fullscreen
+presentations. On the 800x480 Pi surface that means readable main text first,
+minimal chrome, and a prompt-mode reserve card that reads like one large
+conversation opener instead of a small label plus helper text.
+The reserve card should also read like Twinr, not like a static template bank:
+the visible copy may be generated ahead of time from Twinr's current
+personality state plus structured reserve context such as a shared thread, a
+gentle follow-up, or a memory clarification need, but it must still stay
+bounded, readable, and calm. On the real Pi surface that means no left accent
+rail in prompt mode, one large text scale for the full reserve message, and
+wording that sounds like a natural conversation opener rather than a tiny
+topic label with helper chrome. Prompt-mode cards should also consume the
+actual visible card height instead of stopping after a fixed two-line budget,
+so longer right-lane prompts do not appear cut off halfway down the box.
 
 That waiting surface may also show very rare ambient moments: tiny sparkles,
 hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown
@@ -410,19 +429,31 @@ The optional HDMI news ticker flows through `news_ticker.py`. That path stays
 separate from face and presentation cues because headline fetch, cache, and
 rotation are display-surface concerns, not generic runtime-snapshot state. It
 uses a runtime-writable cache artifact and refreshes asynchronously so the
-display loop never blocks on remote feed downloads.
+display loop never blocks on remote feed downloads, but the ticker now draws
+its sources from Twinr's persisted world-intelligence subscriptions instead of
+from a second static feed list.
 
 Configure it with:
 
 ```dotenv
 TWINR_DISPLAY_NEWS_TICKER_ENABLED=true
-TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml
 TWINR_DISPLAY_NEWS_TICKER_STORE_PATH=artifacts/stores/ops/display_news_ticker.json
 TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S=900
 TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S=12
 TWINR_DISPLAY_NEWS_TICKER_MAX_ITEMS=12
 TWINR_DISPLAY_NEWS_TICKER_TIMEOUT_S=4
 ```
+
+The actual feed pool comes from Twinr's active world-intelligence
+subscriptions. That keeps the bottom ticker, the right-hand ambient lane, and
+Twinr's own place/world awareness aligned to the same RSS source universe
+instead of maintaining separate news lists.
+
+For older Pi environments that still carry the legacy
+`TWINR_DISPLAY_NEWS_TICKER_FEED_URLS` variable, the ticker performs a one-way
+compatibility import into the world-intelligence subscription snapshot the
+first time it sees an otherwise empty source pool. After that, the shared
+world-intelligence pool remains the authoritative source.
 
 Behavior contract:
 - when disabled, the bottom ticker bar is omitted entirely
@@ -466,7 +497,8 @@ The current default scene set covers:
 | [hdmi_presentation_graph.py](./hdmi_presentation_graph.py) | Resolve prioritized HDMI presentation cards into eased morph stages and face-sync reactions |
 | [hdmi_wayland.py](./hdmi_wayland.py) | Visible fullscreen HDMI Wayland adapter |
 | [hdmi_fbdev.py](./hdmi_fbdev.py) | HDMI framebuffer fallback adapter and scene host/transport layer |
-| [news_ticker.py](./news_ticker.py) | Bounded RSS/Atom fetch, cache, and headline rotation for the HDMI ticker bar |
+| [news_ticker.py](./news_ticker.py) | Bounded HDMI ticker runtime, cache, and headline rotation driven by Twinr's world-intelligence subscription pool |
+| [news_ticker_sources.py](./news_ticker_sources.py) | Resolve the active persisted world-intelligence feed URLs that the HDMI ticker is allowed to read |
 | [presentation_cues.py](./presentation_cues.py) | Optional fullscreen HDMI presentation-cue contract, store, and producer-facing controller |
 | [wayland_env.py](./wayland_env.py) | Resolve and export Wayland socket/runtime details |
 | [wayland_surface_host.py](./wayland_surface_host.py) | Native Wayland/Qt surface host kept separate from rendering and scene composition |

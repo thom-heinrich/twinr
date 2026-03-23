@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -72,9 +73,39 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--checksum", joined)
         self.assertIn("--delete", joined)
         self.assertIn("--itemize-changes", joined)
-        self.assertIn("--filter=-p .env", joined)
+        self.assertIn("--no-specials", joined)
+        self.assertIn("--no-devices", joined)
+        self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])
         self.assertEqual(envs[0]["SSHPASS"], "chaos")
+
+    def test_probe_once_excludes_local_special_files_from_rsync_args(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            os.mkfifo(root / ".lgd-nfy0")
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                return _completed(command, stdout="")
+
+            watchdog = PiRepoMirrorWatchdog(
+                project_root=root,
+                connection_settings=PiConnectionSettings(
+                    host="192.168.1.95",
+                    user="thh",
+                    password="chaos",
+                ),
+                subprocess_runner=_runner,
+            )
+
+            watchdog.probe_once()
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--exclude=/.lgd-nfy0", commands[0])
 
     def test_probe_once_heals_drift_and_runs_checksum_verification(self) -> None:
         commands: list[list[str]] = []
@@ -235,6 +266,42 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             self.assertTrue((destination / ".env").exists())
             self.assertFalse((destination / "home").exists())
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync required")
+    def test_rsync_contract_excludes_transient_special_files_from_repo_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as dest_dir:
+            source = Path(source_dir)
+            destination = Path(dest_dir)
+            fifo_path = source / ".lgd-nfy0"
+            (source / "README.md").write_text("Twinr\n", encoding="utf-8")
+            fifo_path.unlink(missing_ok=True)
+            fifo_path.parent.mkdir(parents=True, exist_ok=True)
+            fifo_path.touch(exist_ok=True)
+            fifo_path.unlink()
+            fifo_path.parent.mkdir(parents=True, exist_ok=True)
+            import os
+
+            os.mkfifo(fifo_path)
+            try:
+                subprocess.run(
+                    [
+                        "rsync",
+                        "-ai",
+                        "--delete",
+                        "--no-specials",
+                        "--no-devices",
+                        f"{source}/",
+                        f"{destination}/",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                fifo_path.unlink(missing_ok=True)
+
+            self.assertTrue((destination / "README.md").exists())
+            self.assertFalse((destination / ".lgd-nfy0").exists())
 
 
 if __name__ == "__main__":

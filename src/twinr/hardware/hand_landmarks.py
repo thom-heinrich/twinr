@@ -26,12 +26,15 @@ DEFAULT_MEDIAPIPE_HAND_LANDMARKER_MODEL_URL = (
 _WRIST_SCORE_THRESHOLD = 0.35
 _ELBOW_SCORE_THRESHOLD = 0.30
 _SHOULDER_SCORE_THRESHOLD = 0.30
-_LOCAL_HAND_CROP_PADDING = 0.10
+_LOCAL_HAND_CROP_PADDING = 0.14
+_LOCAL_HAND_MIN_CONTEXT_RATIO = 0.30
 
 
 class HandRoiSource(StrEnum):
     """Describe how one hand ROI candidate was derived."""
 
+    FULL_FRAME = "full_frame"
+    PRIMARY_PERSON_FULL_BODY = "primary_person_full_body"
     PRIMARY_PERSON_UPPER_BODY = "primary_person_upper_body"
     LEFT_WRIST = "left_wrist"
     RIGHT_WRIST = "right_wrist"
@@ -193,6 +196,51 @@ class MediaPipeHandLandmarkWorker:
         if not candidates:
             return HandLandmarkResult()
 
+        return self._analyze_candidates(
+            runtime=runtime,
+            frame_rgb=frame_rgb,
+            timestamp_ms=timestamp_ms,
+            candidates=candidates,
+        )
+
+    def analyze_full_frame(
+        self,
+        *,
+        runtime: dict[str, Any],
+        frame_rgb: Any,
+        timestamp_ms: int,
+    ) -> HandLandmarkResult:
+        """Run one bounded whole-frame hand-landmark pass.
+
+        The gesture fast path normally prefers person-conditioned ROIs, but a
+        visible hand can still matter when IMX500 loses the person box or only
+        a hand is visible above an occluder. Keep this rescue explicit and
+        bounded to one full-frame IMAGE-mode pass.
+        """
+
+        return self._analyze_candidates(
+            runtime=runtime,
+            frame_rgb=frame_rgb,
+            timestamp_ms=timestamp_ms,
+            candidates=(
+                _HandRoiCandidate(
+                    box=AICameraBox(top=0.0, left=0.0, bottom=1.0, right=1.0),
+                    source=HandRoiSource.FULL_FRAME,
+                    priority=0,
+                ),
+            ),
+        )
+
+    def _analyze_candidates(
+        self,
+        *,
+        runtime: dict[str, Any],
+        frame_rgb: Any,
+        timestamp_ms: int,
+        candidates: tuple[_HandRoiCandidate, ...],
+    ) -> HandLandmarkResult:
+        """Run one IMAGE-mode hand-landmarker pass across explicit ROI candidates."""
+
         hand_landmarker = self._ensure_hand_landmarker(runtime)
         detections: list[HandLandmarkDetection] = []
         final_timestamp_ms = None
@@ -253,7 +301,14 @@ def _build_hand_roi_candidates(
     sparse_keypoints: dict[int, tuple[float, float, float]],
     config: HandLandmarkWorkerConfig,
 ) -> tuple[_HandRoiCandidate, ...]:
-    """Return bounded ROI candidates for one primary person."""
+    """Return bounded ROI candidates for one primary person.
+
+    Weak or stale pose wrists are common on the Pi when the user keeps a hand
+    close to the torso. Keep the focused wrist crops first for efficiency, but
+    always retain the broader person rescue crops as bounded second chances so
+    a noisy wrist hint does not disable the only ROIs that still contain the
+    real hand.
+    """
 
     candidates: list[_HandRoiCandidate] = []
     left_wrist_candidate = _build_wrist_roi_candidate(
@@ -278,21 +333,30 @@ def _build_hand_roi_candidates(
     )
     if right_wrist_candidate is not None:
         candidates.append(right_wrist_candidate)
-    if not candidates:
-        candidates.append(
-            _HandRoiCandidate(
-                box=_build_primary_person_upper_body_roi(
-                    primary_person_box=primary_person_box,
-                    config=config,
-                ),
-                source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
-                priority=2,
-            )
+    candidates.append(
+        _HandRoiCandidate(
+            box=_build_primary_person_upper_body_roi(
+                primary_person_box=primary_person_box,
+                config=config,
+            ),
+            source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
+            priority=2,
         )
+    )
+    candidates.append(
+        _HandRoiCandidate(
+            box=_build_primary_person_full_body_roi(
+                primary_person_box=primary_person_box,
+                config=config,
+            ),
+            source=HandRoiSource.PRIMARY_PERSON_FULL_BODY,
+            priority=3,
+        )
+    )
     candidates.sort(key=lambda item: (item.priority, -item.box.area))
     deduped: list[_HandRoiCandidate] = []
     for candidate in candidates:
-        if any(_box_iou(candidate.box, existing.box) >= 0.78 for existing in deduped):
+        if any(_should_dedupe_candidate(candidate, existing) for existing in deduped):
             continue
         deduped.append(candidate)
         if len(deduped) >= config.max_roi_candidates:
@@ -317,6 +381,29 @@ def _build_primary_person_upper_body_roi(
             + (primary_person_box.height * config.primary_person_upper_body_ratio)
             + vertical_padding
         ),
+        right=primary_person_box.right + horizontal_padding,
+    )
+
+
+def _build_primary_person_full_body_roi(
+    *,
+    primary_person_box: AICameraBox,
+    config: HandLandmarkWorkerConfig,
+) -> AICameraBox:
+    """Expand the primary person box into one full-body rescue ROI.
+
+    When pose wrists are missing, some seated or low-hand postures leave the
+    hand just below the upper-body crop. Keep that focused upper-body search
+    first, but add one broader bounded retry so a visible person can still
+    produce a hand landmark result before the gesture lane gives up.
+    """
+
+    horizontal_padding = primary_person_box.width * config.primary_person_roi_padding
+    vertical_padding = primary_person_box.height * config.primary_person_roi_padding
+    return AICameraBox(
+        top=primary_person_box.top - vertical_padding,
+        left=primary_person_box.left - horizontal_padding,
+        bottom=primary_person_box.bottom + vertical_padding,
         right=primary_person_box.right + horizontal_padding,
     )
 
@@ -429,10 +516,34 @@ def _crop_local_hand_from_roi_frame(
         ys.append(y)
     if not xs or not ys:
         return roi_frame_rgb
-    left = max(0.0, min(xs) - _LOCAL_HAND_CROP_PADDING)
-    right = min(1.0, max(xs) + _LOCAL_HAND_CROP_PADDING)
-    top = max(0.0, min(ys) - _LOCAL_HAND_CROP_PADDING)
-    bottom = min(1.0, max(ys) + _LOCAL_HAND_CROP_PADDING)
+    raw_left = max(0.0, min(xs) - _LOCAL_HAND_CROP_PADDING)
+    raw_right = min(1.0, max(xs) + _LOCAL_HAND_CROP_PADDING)
+    raw_top = max(0.0, min(ys) - _LOCAL_HAND_CROP_PADDING)
+    raw_bottom = min(1.0, max(ys) + _LOCAL_HAND_CROP_PADDING)
+    if raw_right <= raw_left or raw_bottom <= raw_top:
+        return roi_frame_rgb
+    crop_width = raw_right - raw_left
+    crop_height = raw_bottom - raw_top
+    side = max(crop_width, crop_height, _LOCAL_HAND_MIN_CONTEXT_RATIO)
+    center_x = (raw_left + raw_right) / 2.0
+    center_y = (raw_top + raw_bottom) / 2.0
+    half_side = side / 2.0
+    left = center_x - half_side
+    right = center_x + half_side
+    top = center_y - half_side
+    bottom = center_y + half_side
+    if left < 0.0:
+        right = min(1.0, right - left)
+        left = 0.0
+    if right > 1.0:
+        left = max(0.0, left - (right - 1.0))
+        right = 1.0
+    if top < 0.0:
+        bottom = min(1.0, bottom - top)
+        top = 0.0
+    if bottom > 1.0:
+        top = max(0.0, top - (bottom - 1.0))
+        bottom = 1.0
     if right <= left or bottom <= top:
         return roi_frame_rgb
     try:
@@ -523,6 +634,26 @@ def _box_iou(first: AICameraBox, second: AICameraBox) -> float:
     if union_area <= 0.0:
         return 0.0
     return overlap_area / union_area
+
+
+def _should_dedupe_candidate(candidate: _HandRoiCandidate, existing: _HandRoiCandidate) -> bool:
+    """Return whether two ROI candidates are redundant enough to collapse.
+
+    Keep the upper-body/full-body pair even when they overlap heavily. That
+    broader rescue crop is intentionally the second chance for seated or low
+    hand positions that fall just outside the tighter upper-body window.
+    """
+
+    if _box_iou(candidate.box, existing.box) < 0.78:
+        return False
+    allowed_pair = {
+        candidate.source,
+        existing.source,
+    } == {
+        HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
+        HandRoiSource.PRIMARY_PERSON_FULL_BODY,
+    }
+    return not allowed_pair
 
 
 def _normalize_label(value: object) -> str:

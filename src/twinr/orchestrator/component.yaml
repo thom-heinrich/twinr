@@ -3,11 +3,14 @@ name: orchestrator
 path: src/twinr/orchestrator
 kind: python-package
 visibility: internal
-summary: Expose Twinr's provider-neutral websocket orchestrator surface for remote turns, ack events, and remote tool bridging.
+summary: Expose Twinr's provider-neutral websocket orchestrator surface for remote turns, streaming voice sessions, ack events, and remote tool bridging.
 owned_concerns:
   - Define websocket transport contracts for turn requests, ack events, tool exchange, text deltas, and turn completion
   - Expose the websocket client, FastAPI server, and local session bridge used by edge-orchestrator deployments
   - Correlate remote tool calls and results while keeping fast ack phrases mapped to stable transport IDs
+  - Define bounded streaming voice contracts for edge audio frames, runtime-state updates, wake confirmations, follow-up windows, and barge-in interrupts
+  - Host the server-side voice session that evaluates wakeword candidates and emits follow-up or barge-in decisions
+  - Adapt colocated local STT HTTP services into bounded transcript calls for the server-side voice session
 out_of_scope:
   - Tool prompt authoring, schema construction, or concrete tool-side business logic in src/twinr/agent/tools
   - Runtime loop selection or CLI orchestration in src/twinr/__main__.py and src/twinr/agent/workflows
@@ -51,8 +54,25 @@ files:
     role: Blocking and asyncio-safe websocket client
     exports:
       - OrchestratorWebSocketClient
+  - path: voice_contracts.py
+    role: Streaming voice websocket dataclasses and payload coercion
+    exports:
+      - OrchestratorVoiceAudioFrame
+      - OrchestratorVoiceBargeInInterruptEvent
+      - OrchestratorVoiceErrorEvent
+      - OrchestratorVoiceFollowUpCaptureRequestedEvent
+      - OrchestratorVoiceFollowUpClosedEvent
+      - OrchestratorVoiceHelloRequest
+      - OrchestratorVoiceReadyEvent
+      - OrchestratorVoiceRuntimeStateEvent
+      - OrchestratorVoiceWakeConfirmedEvent
+      - decode_voice_server_event
+  - path: voice_client.py
+    role: Blocking websocket client for streaming edge-audio sessions
+    exports:
+      - OrchestratorVoiceWebSocketClient
   - path: server.py
-    role: FastAPI websocket server and transport gatekeeping
+    role: FastAPI websocket server and transport gatekeeping for turn and streaming voice sessions
     exports:
       - EdgeOrchestratorServer
       - create_app
@@ -61,24 +81,47 @@ files:
     exports:
       - EdgeOrchestratorSession
       - RemoteToolBridge
+  - path: local_stt.py
+    role: Bounded HTTP client for colocated local STT services used by the voice session
+    exports:
+      - LocalSttBackendAdapter
+      - LocalSttServiceError
+      - LocalSttTranscript
+  - path: voice_session.py
+    role: Server-side wakeword, follow-up, and barge-in decision session for streaming edge audio
+    exports:
+      - EdgeOrchestratorVoiceSession
 public_api:
   module: twinr.orchestrator
   exports:
     - ACK_ID_TO_TEXT
     - EdgeOrchestratorServer
     - EdgeOrchestratorSession
+    - EdgeOrchestratorVoiceSession
     - OrchestratorAckEvent
     - OrchestratorClientTurnResult
     - OrchestratorToolRequest
     - OrchestratorToolResponse
     - OrchestratorTurnCompleteEvent
     - OrchestratorTurnRequest
+    - OrchestratorVoiceAudioFrame
+    - OrchestratorVoiceBargeInInterruptEvent
+    - OrchestratorVoiceErrorEvent
+    - OrchestratorVoiceFollowUpCaptureRequestedEvent
+    - OrchestratorVoiceFollowUpClosedEvent
+    - OrchestratorVoiceHelloRequest
+    - OrchestratorVoiceReadyEvent
+    - OrchestratorVoiceRuntimeStateEvent
+    - OrchestratorVoiceWakeConfirmedEvent
+    - OrchestratorVoiceWebSocketClient
     - OrchestratorWebSocketClient
     - RemoteToolBridge
     - ack_id_for_text
     - ack_text_for_id
     - create_app
+    - decode_voice_server_event
 primary_callers:
   - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/voice_orchestrator.py
 tests:
   - path: test/test_orchestrator.py

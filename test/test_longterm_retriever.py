@@ -263,6 +263,65 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("recent_environment_pattern", context.midterm_context or "")
         self.assertIn("sensor_quality_limited", context.midterm_context or "")
 
+    def test_durable_context_serializes_environment_change_and_quality_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            change_point = LongTermMemoryObjectV1(
+                memory_id="environment_change_point:home_main:2026-03-22",
+                kind="summary",
+                summary="Smart-home environment transition detected.",
+                details="Recent room-agnostic smart-home markers suggest an ongoing transition away from the older behavior regime.",
+                source=_source("turn:cp"),
+                status="candidate",
+                confidence=0.81,
+                slot_key="environment_change_point:home:main",
+                value_key="2026-03-22",
+                valid_from="2026-03-18",
+                valid_to="2026-03-22",
+                attributes={
+                    "memory_domain": "smart_home_environment",
+                    "summary_type": "environment_change_point",
+                    "environment_id": "home:main",
+                    "change_started_on": "2026-03-18",
+                    "severity": "moderate",
+                    "markers": (
+                        {"name": "active_epoch_count_day", "observed": 3.2, "baseline_median": 6.0, "delta_ratio": -0.46},
+                    ),
+                    "quality_flags": (),
+                    "blocked_by": (),
+                },
+            )
+            quality_state = LongTermMemoryObjectV1(
+                memory_id="environment_quality_state:home_main:2026-03-22",
+                kind="summary",
+                summary="Smart-home environment quality state for 2026-03-22: caution.",
+                details="Environment quality is usable with caution.",
+                source=_source("turn:quality"),
+                status="active",
+                confidence=0.84,
+                slot_key="environment_quality_state:home:main",
+                value_key="2026-03-22",
+                valid_from="2026-03-22",
+                valid_to="2026-03-22",
+                attributes={
+                    "memory_domain": "smart_home_environment",
+                    "summary_type": "environment_quality_state",
+                    "environment_id": "home:main",
+                    "classification": "caution",
+                    "quality_flags": ("possible_visitor_or_multi_person_activity",),
+                    "blocked_by": (),
+                    "evidence_markers": ("active_epoch_count_day", "node_entropy_day"),
+                },
+            )
+
+            change_record = retriever._durable_context_record(change_point)
+            quality_record = retriever._durable_context_record(quality_state)
+
+        self.assertEqual(change_record["smart_home_environment"]["summary_type"], "environment_change_point")
+        self.assertEqual(change_record["smart_home_environment"]["change_started_on"], "2026-03-18")
+        self.assertEqual(quality_record["smart_home_environment"]["summary_type"], "environment_quality_state")
+        self.assertEqual(quality_record["smart_home_environment"]["classification"], "caution")
+
     def test_build_context_ignores_local_markdown_when_no_structured_episode_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)

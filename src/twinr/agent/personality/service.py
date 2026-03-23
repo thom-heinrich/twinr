@@ -112,6 +112,19 @@ class PersonalityContextService:
             max_items=max_items,
         )
 
+    def load_engagement_signals(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+    ) -> tuple[WorldInterestSignal, ...]:
+        """Load durable world-interest signals for display and turn shaping."""
+
+        return self._load_engagement_signals(
+            config=config,
+            remote_state=remote_state,
+        )
+
     def load_positive_engagement_policies(
         self,
         *,
@@ -122,7 +135,7 @@ class PersonalityContextService:
         """Load the current bounded positive-engagement topic actions."""
 
         snapshot = self.load_snapshot(config=config, remote_state=remote_state)
-        engagement_signals = self._load_engagement_signals(
+        engagement_signals = self.load_engagement_signals(
             config=config,
             remote_state=remote_state,
         )

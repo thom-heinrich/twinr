@@ -1,10 +1,10 @@
 """Coordinate parallel bridge and final lanes for streaming turns.
 
 This helper keeps the streaming hardware loop thin by owning the concurrency,
-deadline handling, and LLM-only recovery behavior for the dual-lane speech
+deadline handling, and bridge/final-lane coordination for the dual-lane speech
 path. It runs the short bridge lane and the slower final tool/search lane in
-parallel, emits a watchdog fallback when the bridge lane stalls, and triggers a
-recovery callback when the final lane fails or exceeds its hard deadline.
+parallel, emits a watchdog fallback when the bridge lane stalls, and fails
+closed when the final lane errors or exceeds its hard deadline.
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 
 
 T = TypeVar("T")
+
+
+class FinalLaneTimeoutError(RuntimeError):
+    """Raise when the dual-lane final path misses its hard deadline."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +118,7 @@ class StreamingTurnOrchestrator:
     in parallel when available, and emits a fallback filler if the bridge lane
     misses its deadline. It preserves the existing speech-lane contract by
     emitting filler deltas first and replacing them atomically with the final
-    lane answer or an LLM-generated recovery reply.
+    lane answer once the slower path completes.
     """
 
     def __init__(
@@ -124,17 +128,25 @@ class StreamingTurnOrchestrator:
         queue_lane_delta: Callable[[SpeechLaneDelta], None],
         wait_for_first_audio: Callable[..., bool],
         wait_until_idle: Callable[..., bool] | None = None,
+        is_output_idle: Callable[[], bool] | None = None,
         ensure_processing_feedback: Callable[[], None],
+        resume_processing_after_bridge: Callable[[], None] | None = None,
+        stop_final_lane_feedback: Callable[[], None] | None = None,
         emit: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        request_final_lane_stop: Callable[[str], None] | None = None,
     ) -> None:
         self.timeout_policy = timeout_policy
         self.queue_lane_delta = queue_lane_delta
         self.wait_for_first_audio = wait_for_first_audio
         self.wait_until_idle = wait_until_idle
+        self.is_output_idle = is_output_idle
         self.ensure_processing_feedback = ensure_processing_feedback
+        self.resume_processing_after_bridge = resume_processing_after_bridge
+        self.stop_final_lane_feedback = stop_final_lane_feedback
         self.emit = emit
         self.should_stop = should_stop
+        self.request_final_lane_stop = request_final_lane_stop
 
     def execute(
         self,
@@ -145,6 +157,7 @@ class StreamingTurnOrchestrator:
         bridge_fallback_reply: FirstWordReply | None,
         run_final_lane: Callable[[], StreamingToolLoopResult],
         recover_final_lane_response: Callable[[str], StreamingToolLoopResult] | None,
+        should_recover_final_lane_error: Callable[[BaseException], bool] | None = None,
     ) -> StreamingTurnLaneOutcome:
         """Run one streaming turn with a parallel bridge and final lane.
 
@@ -157,8 +170,7 @@ class StreamingTurnOrchestrator:
             bridge_fallback_reply: Fallback reply emitted when the bridge lane
                 misses its deadline.
             run_final_lane: Callable that computes the final lane result.
-            recover_final_lane_response: Callback that must return an
-                LLM-generated recovery result for final-lane error or timeout.
+            recover_final_lane_response: Unused legacy compatibility parameter.
 
         Returns:
             The coordinated turn result, including the chosen bridge reply.
@@ -167,6 +179,8 @@ class StreamingTurnOrchestrator:
             InterruptedError: If the active turn is interrupted while waiting.
         """
 
+        del recover_final_lane_response
+
         bridge_reply = prefetched_first_word
         bridge_source = prefetched_first_word_source if prefetched_first_word is not None else "none"
         bridge_emitted = False
@@ -174,6 +188,7 @@ class StreamingTurnOrchestrator:
         bridge_timeout_triggered = False
         final_lane_watchdog_triggered = False
         first_audio_gate_required = False
+        bridge_wait_feedback_resumed = False
 
         if bridge_reply is not None and bridge_reply.mode == "direct":
             self._emit_lane_delta(
@@ -231,7 +246,18 @@ class StreamingTurnOrchestrator:
                         first_word_reply=bridge_reply,
                         first_word_source=bridge_source,
                         bridge_watchdog_triggered=bridge_watchdog_triggered,
-                    )
+                        )
+
+            if (
+                bridge_emitted
+                and first_audio_gate_required
+                and not bridge_wait_feedback_resumed
+                and not final_task.done
+                and self._is_output_idle()
+            ):
+                bridge_wait_feedback_resumed = True
+                self._emit("bridge_ack_completed_while_final_lane_running=true")
+                self._resume_processing_after_bridge()
 
             if (
                 not bridge_timeout_triggered
@@ -282,11 +308,12 @@ class StreamingTurnOrchestrator:
                 try:
                     response = final_task.result()
                 except Exception as exc:
+                    if should_recover_final_lane_error is not None and not should_recover_final_lane_error(exc):
+                        self._stop_final_lane_feedback()
+                        raise
                     self._emit(f"final_lane_failed={type(exc).__name__}")
-                    response = self._recover_final_response(
-                        recover_final_lane_response,
-                        failure_reason="final_lane_error",
-                    )
+                    self._stop_final_lane_feedback()
+                    raise
                 self._queue_final_response(
                     response,
                     bridge_reply=bridge_reply if bridge_emitted else None,
@@ -308,23 +335,9 @@ class StreamingTurnOrchestrator:
 
             if now >= final_hard_deadline:
                 self._emit("final_lane_timeout=true")
-                timeout_response = self._recover_final_response(
-                    recover_final_lane_response,
-                    failure_reason="final_lane_timeout",
-                )
-                self._queue_final_response(
-                    timeout_response,
-                    bridge_reply=bridge_reply if bridge_emitted else None,
-                    wait_for_bridge_audio=first_audio_gate_required,
-                )
-                return StreamingTurnLaneOutcome(
-                    response=timeout_response,
-                    first_word_reply=bridge_reply if bridge_emitted else None,
-                    first_word_source=bridge_source,
-                    bridge_watchdog_triggered=bridge_watchdog_triggered,
-                    final_lane_watchdog_triggered=final_lane_watchdog_triggered,
-                    final_lane_timed_out=True,
-                )
+                self._request_final_lane_stop("timeout")
+                self._stop_final_lane_feedback()
+                raise FinalLaneTimeoutError("streaming final lane exceeded its hard deadline")
 
             time.sleep(poll_sleep_s)
 
@@ -378,25 +391,37 @@ class StreamingTurnOrchestrator:
         if self.emit is not None:
             self.emit(message)
 
-    def _recover_final_response(
-        self,
-        recover_final_lane_response: Callable[[str], StreamingToolLoopResult] | None,
-        *,
-        failure_reason: str,
-    ) -> StreamingToolLoopResult:
-        """Resolve one recovery result for a failed final lane."""
+    def _stop_final_lane_feedback(self) -> None:
+        if self.stop_final_lane_feedback is None:
+            return
+        self.stop_final_lane_feedback()
 
-        if recover_final_lane_response is None:
-            raise RuntimeError(
-                f"final lane {failure_reason} without an LLM recovery callback"
-            )
-        return recover_final_lane_response(failure_reason)
+    def _resume_processing_after_bridge(self) -> None:
+        if self.resume_processing_after_bridge is None:
+            self.ensure_processing_feedback()
+            return
+        self.resume_processing_after_bridge()
+
+    def _is_output_idle(self) -> bool:
+        if self.is_output_idle is not None:
+            return bool(self.is_output_idle())
+        if self.wait_until_idle is None:
+            return False
+        return bool(self.wait_until_idle(timeout_s=0.0))
 
     def _raise_if_interrupted(self) -> None:
         if self.should_stop is None:
             return
         if self.should_stop():
             raise InterruptedError("streaming turn interrupted")
+
+    def _request_final_lane_stop(self, reason: str) -> None:
+        if self.request_final_lane_stop is None:
+            return
+        try:
+            self.request_final_lane_stop(reason)
+        except Exception:
+            pass
 
 
 def _direct_reply_result(reply: FirstWordReply) -> StreamingToolLoopResult:

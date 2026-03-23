@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
 
@@ -107,6 +107,7 @@ class MediaPipeVisionResult:
     gesture_confidence: float | None = None
     fine_hand_gesture: AICameraFineHandGesture = AICameraFineHandGesture.NONE
     fine_hand_gesture_confidence: float | None = None
+    sparse_keypoints: dict[int, tuple[float, float, float]] = field(default_factory=dict)
 
 
 class MediaPipeVisionPipeline:
@@ -181,9 +182,11 @@ class MediaPipeVisionPipeline:
             sparse_keypoints: dict[int, tuple[float, float, float]] = {}
             pose_confidence: float | None = None
             try:
-                pose_landmarker = self._ensure_pose_landmarker(runtime)
-                pose_result = pose_landmarker.detect_for_video(image, timestamp_ms)
-                sparse_keypoints, pose_confidence = extract_sparse_keypoints(pose_result)
+                sparse_keypoints, pose_confidence = self._extract_pose_hints_locked(
+                    runtime=runtime,
+                    image=image,
+                    timestamp_ms=timestamp_ms,
+                )
             except Exception:
                 logger.exception("Pose inference failed")
                 self._sequence.clear()  # AUDIT-FIX(#3): Drop stale temporal history when pose disappears or fails.
@@ -226,6 +229,7 @@ class MediaPipeVisionPipeline:
                     showing_intent_likely=(True if fine_gesture != AICameraFineHandGesture.NONE else None),
                     fine_hand_gesture=fine_gesture,
                     fine_hand_gesture_confidence=_coerce_confidence(fine_confidence),
+                    sparse_keypoints=dict(sparse_keypoints),
                 )
 
             body_pose = AICameraBodyPose.UNKNOWN
@@ -276,6 +280,38 @@ class MediaPipeVisionPipeline:
                 gesture_confidence=_coerce_confidence(coarse_confidence),
                 fine_hand_gesture=fine_gesture,
                 fine_hand_gesture_confidence=_coerce_confidence(fine_confidence),
+                sparse_keypoints=dict(sparse_keypoints),
+            )
+
+    def analyze_pose_hints(
+        self,
+        *,
+        frame_rgb: Any,
+        observed_at: float,
+    ) -> MediaPipeVisionResult:
+        """Return only bounded pose hints for ROI seeding without gesture work."""
+
+        with self._lock:
+            try:
+                runtime = self._load_runtime()
+                image = self._build_image(runtime, frame_rgb=frame_rgb)
+                timestamp_ms = self._timestamp_ms(observed_at)
+            except Exception:
+                logger.exception("Failed to prepare MediaPipe pose-hint inputs")
+                return MediaPipeVisionResult()
+
+            try:
+                sparse_keypoints, pose_confidence = self._extract_pose_hints_locked(
+                    runtime=runtime,
+                    image=image,
+                    timestamp_ms=timestamp_ms,
+                )
+            except Exception:
+                logger.exception("Pose-hint inference failed")
+                return MediaPipeVisionResult()
+            return MediaPipeVisionResult(
+                pose_confidence=_coerce_confidence(pose_confidence),
+                sparse_keypoints=dict(sparse_keypoints),
             )
 
     def _recognize_fine_gesture(
@@ -448,6 +484,20 @@ class MediaPipeVisionPipeline:
             config=HandLandmarkWorkerConfig.from_config(self.config),
         )
         return self._hand_landmark_worker
+
+    def _extract_pose_hints_locked(
+        self,
+        *,
+        runtime: dict[str, Any],
+        image: Any,
+        timestamp_ms: int,
+    ) -> tuple[dict[int, tuple[float, float, float]], float | None]:
+        """Run pose inference and return sparse keypoints for downstream ROI seeding."""
+
+        pose_landmarker = self._ensure_pose_landmarker(runtime)
+        pose_result = pose_landmarker.detect_for_video(image, timestamp_ms)
+        sparse_keypoints, pose_confidence = extract_sparse_keypoints(pose_result)
+        return dict(sparse_keypoints), pose_confidence
 
     def _load_runtime(self) -> dict[str, Any]:
         """Preserve the historic runtime-loader override point for tests."""

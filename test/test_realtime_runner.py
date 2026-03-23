@@ -26,6 +26,7 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingTurnResponse,
 )
 from twinr.config import TwinrConfig
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
 from twinr.hardware import VoiceAssessment
 from twinr.hardware.buttons import ButtonAction, ButtonEvent
 from twinr.memory.longterm.core.models import (
@@ -49,6 +50,7 @@ from twinr.state_machine import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.personality.intelligence import WorldFeedItem
 from twinr.agent.personality.steering import ConversationTurnSteeringCue
+from twinr.agent.tools.handlers.output import handle_search_live_info
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileTarget,
@@ -710,6 +712,26 @@ class FakeAmbientAudioSampler:
             sample_rate=16000,
             channels=1,
         )
+
+
+class FakeVoiceOrchestrator:
+    def __init__(self, *, ready_backend: str = "local_stt") -> None:
+        self.states: list[tuple[str, str | None, bool]] = []
+        self.paused: list[str] = []
+        self.resumed: list[str] = []
+        self.ready_backend = ready_backend
+
+    def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False) -> None:
+        self.states.append((state, detail, follow_up_allowed))
+
+    def pause_capture(self, *, reason: str) -> None:
+        self.paused.append(reason)
+
+    def resume_capture(self, *, reason: str) -> None:
+        self.resumed.append(reason)
+
+    def supports_remote_follow_up(self) -> bool:
+        return str(self.ready_backend or "").strip().lower() == "local_stt"
 
 
 class FakeConversationClosureEvaluator:
@@ -1673,6 +1695,111 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop._acknowledge_wakeword()
 
         self.assertEqual(player.played, [normalize_wav_playback_level(quiet_wav)])
+
+    def test_voice_orchestrator_wakeword_ack_uses_earcon_only(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(wakeword_enabled=True)
+        )
+        loop.voice_orchestrator = FakeVoiceOrchestrator()
+
+        loop._acknowledge_wakeword()
+
+        self.assertEqual(print_backend.synthesize_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertGreaterEqual(len(player.tones), 1)
+        self.assertIn("wakeword_ack=earcon", lines)
+
+    def test_voice_orchestrator_handles_follow_up_remotely_after_answer(self) -> None:
+        config = TwinrConfig(conversation_follow_up_enabled=True)
+        loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config
+        )
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie spaet ist es?",
+                response_text="Es ist zehn Uhr.",
+                response_id="resp_rt_123",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_single_text_turn(
+            transcript="wie spaet ist es",
+            listen_source="wakeword",
+            proactive_trigger=None,
+        )
+
+        self.assertTrue(handled)
+        self.assertIn(("thinking", "wakeword", False), fake_voice.states)
+        self.assertIn(("speaking", "wakeword", True), fake_voice.states)
+        self.assertIn(("follow_up_open", "wakeword", True), fake_voice.states)
+        self.assertNotIn("conversation_follow_up_vetoed=closure", lines)
+
+    def test_voice_orchestrator_backend_follow_up_reopens_local_beep_listening_after_answer(self) -> None:
+        config = TwinrConfig(
+            conversation_follow_up_enabled=True,
+            conversation_follow_up_timeout_s=3.5,
+            audio_follow_up_speech_start_chunks=5,
+            audio_follow_up_ignore_ms=420,
+        )
+        recorder = FakeRecorder(
+            recordings=[
+                RuntimeError("No speech detected before timeout"),
+            ]
+        )
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
+            config=config,
+            recorder=recorder,
+        )
+        fake_voice = FakeVoiceOrchestrator(ready_backend="openwakeword")
+        loop.voice_orchestrator = fake_voice
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie spaet ist es?",
+                response_text="Es ist zehn Uhr.",
+                response_id="resp_rt_123",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_conversation_session(
+            initial_source="wakeword",
+            seed_transcript="wie spaet ist es",
+            play_initial_beep=False,
+        )
+
+        self.assertTrue(handled)
+        self.assertIn(("thinking", "wakeword", False), fake_voice.states)
+        self.assertIn(("speaking", "wakeword", True), fake_voice.states)
+        self.assertNotIn(("follow_up_open", "wakeword", True), fake_voice.states)
+        self.assertIn(("waiting", "wakeword", False), fake_voice.states)
+        self.assertIn(("listening", "follow_up", True), fake_voice.states)
+        self.assertEqual(recorder.start_timeouts, [3.5])
+        self.assertEqual(recorder.speech_start_chunks, [5])
+        self.assertEqual(recorder.ignore_initial_ms, [420])
+        self.assertGreaterEqual(len(player.tones), 1)
+        self.assertIn("voice_orchestrator_follow_up_mode=local_beep", lines)
+        self.assertIn("follow_up_timeout=true", lines)
+
+    def test_remote_follow_up_capture_request_reopens_local_listening_with_beep(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(conversation_follow_up_enabled=True)
+        )
+        captured_kwargs: dict[str, object] = {}
+
+        def fake_run_conversation_session(**kwargs):
+            captured_kwargs.update(kwargs)
+            return True
+
+        loop._run_conversation_session = fake_run_conversation_session  # type: ignore[method-assign]
+
+        handled = loop.handle_remote_follow_up_capture_request()
+
+        self.assertTrue(handled)
+        self.assertEqual(captured_kwargs["initial_source"], "follow_up")
+        self.assertTrue(captured_kwargs["play_initial_beep"])
 
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
@@ -4054,6 +4181,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(date_context, "Friday, 2026-03-13 10:00 (Europe/Berlin)")
         self.assertEqual(result["answer"], "Bus 24 faehrt um 07:30 Uhr.")
         self.assertEqual(result["sources"], ["https://example.com/fahrplan"])
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not loop.runtime.memory.search_results:
+            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=20))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
         self.assertEqual(loop.runtime.memory.search_results[0].question, "Wann faehrt der Bus nach Hamburg?")
         self.assertEqual(loop.runtime.memory.search_results[0].sources, ("https://example.com/fahrplan",))
@@ -4080,6 +4215,56 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         _question, _conversation, _location_hint, date_context = print_backend.search_calls[0]
         expected_date = (datetime.now(ZoneInfo(config.local_timezone_name)).date() + timedelta(days=1)).isoformat()
         self.assertIn(expected_date, date_context)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not loop.runtime.memory.search_results:
+            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=20))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
+
+    def test_search_tool_call_returns_without_waiting_for_search_memory_store(self) -> None:
+        config = TwinrConfig(
+            search_feedback_delay_ms=0,
+            search_feedback_pause_ms=0,
+        )
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+        remember_started = Event()
+        release_remember = Event()
+        original_remember = loop.runtime.remember_search_result
+
+        def blocking_remember_search_result(**kwargs):
+            remember_started.set()
+            if not release_remember.wait(1.0):
+                raise TimeoutError("test search memory store remained blocked")
+            return original_remember(**kwargs)
+
+        loop.runtime.remember_search_result = blocking_remember_search_result  # type: ignore[method-assign]
+        started_at = time.monotonic()
+        try:
+            result = handle_search_live_info(
+                loop,
+                {
+                    "question": "Wann faehrt der Bus nach Hamburg?",
+                    "location_hint": "Schwarzenbek",
+                },
+            )
+            elapsed_s = time.monotonic() - started_at
+            self.assertLess(elapsed_s, 0.25)
+            self.assertTrue(remember_started.wait(0.2))
+            self.assertEqual(result["answer"], "Bus 24 faehrt um 07:30 Uhr.")
+        finally:
+            release_remember.set()
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not loop.runtime.memory.search_results:
+            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=20))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(loop.runtime.memory.search_results), 1)
 
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
@@ -4261,15 +4446,17 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             )
         )
 
-        presentation_path = Path(loop.config.display_presentation_path)
-        payload = json.loads(presentation_path.read_text(encoding="utf-8"))
+        reserve_path = DisplayAmbientImpulseCueStore.from_config(loop.config).path
+        payload = json.loads(reserve_path.read_text(encoding="utf-8"))
 
         self.assertTrue(spoke)
         self.assertEqual(print_backend.proactive_calls, [])
         self.assertEqual(player.played, [])
         self.assertIn("social_prompt_mode=display_first", lines)
         self.assertIn("social_display_reason=background_media_active", lines)
-        self.assertEqual(payload["title"], "Soll ich dir helfen?")
+        self.assertEqual(payload["headline"], "Soll ich dir helfen?")
+        self.assertEqual(payload["body"], "")
+        self.assertEqual(payload["source"], "proactive_social")
         social_events = [
             entry
             for entry in loop.runtime.ops_events.tail(limit=20)
@@ -4303,15 +4490,17 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             )
         )
 
-        presentation_path = Path(loop.config.display_presentation_path)
-        payload = json.loads(presentation_path.read_text(encoding="utf-8"))
+        reserve_path = DisplayAmbientImpulseCueStore.from_config(loop.config).path
+        payload = json.loads(reserve_path.read_text(encoding="utf-8"))
 
         self.assertTrue(spoke)
         self.assertEqual(print_backend.proactive_calls, [])
         self.assertEqual(player.played, [])
         self.assertIn("social_prompt_mode=display_first", lines)
         self.assertIn("social_display_reason=low_confidence_speaker_association", lines)
-        self.assertEqual(payload["title"], "Soll ich dir helfen?")
+        self.assertEqual(payload["headline"], "Soll ich dir helfen?")
+        self.assertEqual(payload["body"], "")
+        self.assertEqual(payload["source"], "proactive_social")
         social_events = [
             entry
             for entry in loop.runtime.ops_events.tail(limit=20)
@@ -4920,6 +5109,22 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(printer.printed), 1)
         self.assertIn("button=yellow", lines)
+
+    def test_idle_housekeeping_runs_reserve_nightly_maintenance_after_longterm_proactive(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        calls: list[str] = []
+        loop._required_remote_dependency_current_ready = lambda: True
+        loop.print_lane = SimpleNamespace(is_busy=lambda: False)
+        loop._maybe_deliver_due_reminder = lambda: calls.append("reminder") or False
+        loop._maybe_run_due_automation = lambda: calls.append("automation") or False
+        loop._maybe_run_sensor_automation = lambda: calls.append("sensor") or False
+        loop._maybe_run_long_term_memory_proactive = lambda: calls.append("longterm") or False
+        loop._maybe_run_display_reserve_nightly_maintenance = lambda: calls.append("reserve") or True
+
+        did_work = loop._run_idle_housekeeping_cycle()
+
+        self.assertTrue(did_work)
+        self.assertEqual(calls, ["reminder", "automation", "sensor", "longterm", "reserve"])
 
     def test_button_dispatcher_interrupts_busy_green_turn(self) -> None:
         handled: list[str] = []

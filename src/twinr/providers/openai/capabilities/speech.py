@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 import logging
 import mimetypes
@@ -56,10 +57,16 @@ class _ClosableIterator(Iterator[bytes]):
     """Wrap an iterator so callers can close the underlying stream explicitly."""
 
     # AUDIT-FIX(#6): Wrap the generator so consumers can close the stream explicitly and abandoned iterators do not keep sockets open until arbitrary GC.
-    def __init__(self, iterator: Iterator[bytes]) -> None:
+    def __init__(
+        self,
+        iterator: Iterator[bytes],
+        *,
+        close_callback: callable | None = None,
+    ) -> None:
         """Store the wrapped byte iterator."""
 
         self._iterator = iterator
+        self._close_callback = close_callback
 
     def __iter__(self) -> _ClosableIterator:
         """Return the iterator itself."""
@@ -74,6 +81,9 @@ class _ClosableIterator(Iterator[bytes]):
     def close(self) -> None:
         """Close the wrapped iterator when it exposes ``close()``."""
 
+        if callable(self._close_callback):
+            self._close_callback()
+            return
         close = getattr(self._iterator, "close", None)
         if callable(close):
             close()
@@ -266,6 +276,17 @@ class OpenAISpeechMixin:
         )
         # AUDIT-FIX(#4): Bind STT/TTS calls to explicit per-request client options so voice requests do not inherit the SDK's long default timeout implicitly.
         request_client = self._get_audio_client()
+        stop_requested = Event()
+        response_lock = Lock()
+        response_holder: dict[str, Any | None] = {"response": None}
+
+        def request_close() -> None:
+            stop_requested.set()
+            with response_lock:
+                response = response_holder["response"]
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
 
         def iterator() -> Iterator[bytes]:
             attempted_models: list[str] = []
@@ -274,6 +295,7 @@ class OpenAISpeechMixin:
                 if not model or model in attempted_models:
                     continue
                 attempted_models.append(model)
+                response = None
                 try:
                     with request_client.audio.speech.with_streaming_response.create(
                         **self._build_tts_request(
@@ -284,14 +306,24 @@ class OpenAISpeechMixin:
                             instructions=tts_instructions,
                         )
                     ) as response:
+                        with response_lock:
+                            response_holder["response"] = response
                         for chunk in response.iter_bytes(chunk_size):
+                            if stop_requested.is_set():
+                                return
                             if chunk:
                                 yield bytes(chunk)
                     return
                 except Exception as exc:
+                    if stop_requested.is_set():
+                        return
                     if not self._is_model_access_error(exc):
                         raise
                     last_error = exc
+                finally:
+                    with response_lock:
+                        if response_holder["response"] is response:
+                            response_holder["response"] = None
             if last_error is not None:
                 candidate_list = ", ".join(attempted_models)
                 raise RuntimeError(
@@ -300,7 +332,7 @@ class OpenAISpeechMixin:
             raise RuntimeError("No model candidates were available for the OpenAI request")
 
         # AUDIT-FIX(#6): Return a closable wrapper so callers can abort mid-stream without leaking the underlying response context.
-        return _ClosableIterator(iterator())
+        return _ClosableIterator(iterator(), close_callback=request_close)
 
     def _build_transcription_request(
         self,

@@ -6,6 +6,7 @@ Plan, gate, and persist long-term proactive suggestions for the memory runtime.
 
 `proactive` owns:
 - Rank bounded proactive candidates from active long-term memory objects
+- Turn recent past events/plans into calm generic follow-ups when they have just happened and could benefit from an outcome/continuity check-in
 - Combine durable memory cues with live sensor facts for routine offers
 - Persist reservation, delivery, and skip history for proactive candidates
 - Apply confidence, sensitivity, and cooldown policy before reservation

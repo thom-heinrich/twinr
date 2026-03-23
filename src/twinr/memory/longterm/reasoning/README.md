@@ -12,7 +12,7 @@ compilation, immediate turn-continuity packets, and retention.
 - Consolidate extracted turn outputs into episodic, durable, deferred, and conflict results
 - Maintain slot-level truth and build user-facing conflict choices
 - Reflect over recent memory windows, including room-agnostic smart-home environment reflections, and compile bounded midterm packets
-- Compile deterministic immediate turn-continuity packets from raw conversation turns so fresh follow-up recall does not wait on slower durable enrichment
+- Compile deterministic immediate turn-continuity packets from raw conversation turns so fresh follow-up recall does not wait on slower durable enrichment, while preserving short structured excerpts that downstream display/proactive code can reuse without parsing internal English packet text
 - Apply retention, expiry, and archival policy to stored objects
 
 Reflection must treat canonical proposition payloads as first-class evidence:
@@ -22,13 +22,16 @@ pipeline only grounded a person via `subject_ref`, `object_ref`, and
 `predicate`.
 
 When the ingestion layer has already compiled `smart_home_environment` day
-profiles, baselines, deviations, and node summaries, reflection also produces a
-bounded ambient-behavior summary for the latest environment/day without
-assuming stable room labels.
+profiles, baselines, grouped deviations, quality states, change points, regime
+shifts, and node summaries, reflection also produces a bounded ambient-behavior
+summary for the latest environment/day without assuming stable room labels.
 
 Midterm packets keep canonical-English summaries/details for stable internal
 reasoning, but their normalized `query_hints` must also preserve source-memory
 phrases so first-turn retrieval does not depend on asynchronous query rewrites.
+Immediate turn-continuity packets additionally preserve short structured raw
+turn excerpts in `attributes` so display surfaces can build user-facing copy
+without leaking those internal summary/details strings.
 Retention also needs to treat raw multimodal `pattern` seeds differently from
 day-scoped events: their `valid_to` marks the last observed day, not a next-day
 expiry boundary.

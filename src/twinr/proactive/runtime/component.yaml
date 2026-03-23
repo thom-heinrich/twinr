@@ -25,12 +25,19 @@ owned_concerns:
   - Derive a bounded continuous visible-person target from multi-person camera anchors, motion recency, short-horizon prediction, conservative audio-to-vision speaker handoff, and short stale-track bridging across brief detector misses
   - Derive a bounded multimodal attention-target surface from camera anchor, visible-person tracks, speaker association, showing-intent cues, and short-lived session focus memory, with speaker and last-motion priority preserved in multi-person scenes
   - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while mirroring camera-space anchors into user-facing gaze, adding small near-center head turns before full side gaze commits, reserving stronger up/down body-language poses for explicit semantic cues, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
+  - Fan that same conservative attention target out to an optional bounded body-follow servo so physical turning reuses the HDMI attention policy instead of inventing a second targeting path
   - Persist a bounded continuous HDMI attention debug stream with per-refresh outcome codes, stage timings, and camera/target/cue state so transient eye-follow dropouts leave first-run evidence
   - Keep a dedicated live-gesture acknowledgement lane separate from the broader social camera-surface path so user-facing symbol latency does not regress eye-follow or depend on full proactive observation cadence
   - Derive a bounded visual wakeup decision from one configured fine-hand symbol without coupling it to HDMI emoji acknowledgement or workflow orchestration
   - Dispatch accepted visual wakeups through a dedicated single-flight background worker so Peace-sign listening sessions do not block HDMI attention refresh ticks
   - Mirror clear stabilized user camera gestures into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
   - Publish sparse personality-driven HDMI reserve impulses only when quiet-hours, cadence, presence, and reserve-surface ownership all allow it
+  - Blend right-lane ambient companion candidates from personality, durable memory hooks, slower reflection summaries, and long-horizon shown-card outcome learning through one modular orchestration path
+  - Blend reserve-lane candidates from personality state plus durable memory follow-up and clarification hooks so ambient prompts can also strengthen Twinr's long-term memory
+  - Derive direct reserve-lane world candidates from active RSS subscriptions and condensed awareness threads so seeded world breadth still reaches the right-hand lane when other sources are temporarily sparse
+  - Rewrite reserve-lane wording through one bounded structured LLM pass at plan-build time so the visible text can reflect Twinr's current personality and structured shared-thread or memory-follow-up context without templated phrasing
+  - Record shown reserve cards into a bounded exposure history so later learning code can tell which visual prompts were actually seen before it scores user reactions
+  - Run one explicit overnight reserve-lane maintenance step that reviews recent shown-card outcomes, triggers long-term reflection/world refresh, and prepares the next local-day plan before morning adoption
   - Persist a bounded continuous HDMI gesture debug stream with raw observations, ack-lane decisions, publish outcomes, and stage timings so Pi-side symbol latency and missed acknowledgements leave first-run evidence
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
@@ -171,13 +178,68 @@ files:
       - derive_display_gesture_emoji
       - display_gesture_refresh_supported
       - resolve_display_gesture_refresh_interval
+  - path: display_reserve_candidates.py
+    role: Compatibility wrapper that keeps the historic reserve-candidate loader stable while delegating real sourcing to the modular ambient companion flow
+  - path: display_reserve_flow.py
+    role: Shared ambient companion orchestration that blends personality, memory, reflection, and long-horizon reserve-lane learning into one bounded candidate pool
+    exports:
+      - DisplayReserveCompanionFlow
+      - DisplayReserveCompanionFlowContext
+  - path: display_reserve_learning.py
+    role: Long-horizon reserve-lane learning profile derived from durable shown-card outcomes so future plans can reward welcome openers and cool repetitive ones generically
+    exports:
+      - DisplayReserveLearningProfile
+      - DisplayReserveLearningProfileBuilder
+      - DisplayReserveLearningSignal
+  - path: display_reserve_memory.py
+    role: Focused conversion of durable clarification conflicts and gentle follow-ups into reserve-lane candidate families
+    exports:
+      - DisplayReserveMemoryCandidateSet
+      - build_memory_conflict_candidate
+      - build_memory_follow_up_candidate
+      - load_display_reserve_memory_candidates
+  - path: display_reserve_reflection.py
+    role: Reflection-derived reserve-candidate loader for summaries and midterm packets that should inform the ambient lane without reflection-specific coupling elsewhere
+    exports:
+      - DisplayReserveReflectionConfig
+      - load_display_reserve_reflection_candidates
+  - path: display_reserve_world.py
+    role: Direct world-intelligence reserve-candidate loader that turns active RSS subscriptions and condensed awareness threads into calm topic-breadth candidates for the right-hand lane
+    exports:
+      - load_display_reserve_world_candidates
+  - path: display_reserve_prompting.py
+    role: Compact prompt-payload and anchor-shaping layer for reserve-card rewriting so the LLM sees explicit topical anchors and short context summaries instead of raw nested candidate payloads
+    exports:
+      - build_candidate_prompt_payload
+      - build_generation_prompt
+  - path: display_reserve_generation.py
+    role: Rewrite reserve-card wording through small bounded structured LLM batches without changing topic ranking or live publish cadence, using compact prompt payloads so slow calls and weak raw anchors do not dominate the right-lane UX
+  - path: display_reserve_companion_planner.py
+    role: Explicit overnight reserve-lane planner that runs nightly reflection/world refresh, summarizes recent shown-card outcomes, and stores the prepared next-day plan for morning adoption
+    exports:
+      - DisplayReserveCompanionPlanner
+      - DisplayReserveNightlyMaintenanceResult
+      - DisplayReserveNightlyMaintenanceState
+      - DisplayReserveNightlyMaintenanceStateStore
+      - DisplayReserveNightlyOutcomeSummary
+  - path: display_reserve_runtime.py
+    role: Shared right-lane reserve publisher that all text-card producers reuse so cue persistence and exposure history stay on one common runtime path
+    exports:
+      - DisplayReserveRuntimePublishResult
+      - DisplayReserveRuntimePublisher
+      - DisplayReserveRuntimeRequest
   - path: display_ambient_impulses.py
-    role: Conservative live publisher that shows the next planned positive personality-driven HDMI reserve impulse only when quiet-hours, presence, runtime state, and surface ownership all allow it
+    role: Conservative live publisher that shows the next planned positive personality-driven HDMI reserve impulse only when quiet-hours, presence, runtime state, and surface ownership all allow it, adopting prepared next-day plans when morning rollover starts and otherwise delegating the actual reserve publish to the shared runtime path
     exports:
       - DisplayAmbientImpulsePublishResult
       - DisplayAmbientImpulsePublisher
+  - path: display_social_reserve.py
+    role: Route visual-first proactive social prompts into the same right-hand reserve lane and shared reserve publish path instead of the fullscreen presentation surface
+    exports:
+      - DisplaySocialReservePublishResult
+      - DisplaySocialReservePublisher
   - path: display_reserve_day_plan.py
-    role: Build and persist one calm local-day sequence of reserve impulses from personality-driven candidate state
+    role: Build and persist one calm current-day reserve rotation from personality-driven candidate state, including short-lived feedback-driven replanning, generic source-family spacing, and answer-based same-day retirement instead of one-shot card exhaustion
     exports:
       - DisplayReserveDayPlan
       - DisplayReserveDayPlanStore
@@ -234,7 +296,7 @@ files:
       - PresenceSessionController
       - PresenceSessionSnapshot
   - path: service.py
-    role: Proactive monitor orchestration, lifecycle, and assembly
+    role: Proactive monitor orchestration, lifecycle, assembly, and shared attention-target fanout to HDMI plus optional body-follow servo
     exports:
       - ProactiveCoordinator
       - ProactiveMonitorService
@@ -278,7 +340,17 @@ primary_callers:
 tests:
   - path: test/test_display_attention.py
   - path: test/test_display_ambient_impulses.py
+  - path: test/test_display_social_reserve.py
+  - path: test/test_display_reserve_generation.py
+  - path: test/test_display_reserve_prompting.py
+  - path: test/test_display_reserve_learning.py
+  - path: test/test_display_reserve_reflection.py
+  - path: test/test_display_reserve_world.py
+  - path: test/test_display_reserve_flow.py
+  - path: test/test_display_reserve_runtime.py
   - path: test/test_display_reserve_day_plan.py
+  - path: test/test_display_reserve_companion_planner.py
+  - path: test/test_display_reserve_bus_feedback.py
   - path: test/test_attention_targeting.py
   - path: test/test_person_state.py
   - path: test/test_pir_open_gate.py

@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -19,6 +20,7 @@ from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.context_store import PromptContextStore
 from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
@@ -32,6 +34,10 @@ from twinr.memory.longterm import (
     LongTermMidtermStore,
     LongTermSourceRefV1,
     LongTermStructuredStore,
+)
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteUnavailableError,
 )
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -834,15 +840,262 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             service.shutdown()
 
         messages = context.system_messages()
-        self.assertEqual(len(messages), 4)
+        self.assertEqual(len(messages), 5)
         self.assertIn("Silent personalization background for this turn.", messages[0])
         self.assertIn("twinr_silent_personalization_context_v1", messages[0])
-        self.assertIn("twinr_long_term_midterm_context_v1", messages[1])
-        self.assertIn("Heute wollte ich spazieren gehen", messages[1])
-        self.assertIn("Structured long-term episodic memory for this turn.", messages[2])
+        self.assertIn("twinr_fast_topic_context_v1", messages[1])
+        self.assertIn("current thread hint", messages[1])
+        self.assertIn("twinr_long_term_midterm_context_v1", messages[2])
         self.assertIn("Heute wollte ich spazieren gehen", messages[2])
-        self.assertIn("twinr_graph_memory_context_v1", messages[3])
-        self.assertIn("Melitta", messages[3])
+        self.assertIn("Structured long-term episodic memory for this turn.", messages[3])
+        self.assertIn("Heute wollte ich spazieren gehen", messages[3])
+        self.assertIn("twinr_graph_memory_context_v1", messages[4])
+        self.assertIn("Melitta", messages[4])
+
+    def test_fast_provider_context_builds_compact_topic_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_fast_topic_limit=2,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=self._source("turn:fast:1"),
+                        status="active",
+                        confidence=0.98,
+                        confirmed_by_user=True,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:janina_doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=self._source("turn:fast:2"),
+                        status="active",
+                        confidence=0.94,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=self._source("turn:fast:3"),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            service.query_rewriter = _StaticQueryRewriter({})  # type: ignore[assignment]
+
+            context = service.build_fast_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.topic_context)
+        self.assertIn("twinr_fast_topic_context_v1", context.topic_context or "")
+        self.assertIn("confirmed relationship hint", context.topic_context or "")
+        self.assertIn("current thread hint", context.topic_context or "")
+        self.assertIn("Janina is the user's wife.", context.topic_context or "")
+        self.assertIn("Janina had an eye doctor appointment yesterday.", context.topic_context or "")
+        self.assertNotIn("black tea", context.topic_context or "")
+
+    def test_provider_context_includes_quick_memory_topic_hints_before_main_recall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_fast_topic_limit=2,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=self._source("turn:provider-fast:1"),
+                        status="active",
+                        confidence=0.98,
+                        confirmed_by_user=True,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:janina_doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=self._source("turn:provider-fast:2"),
+                        status="active",
+                        confidence=0.94,
+                    ),
+                )
+            )
+            service.query_rewriter = _StaticQueryRewriter({})  # type: ignore[assignment]
+
+            context = service.build_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.topic_context)
+        self.assertIn("Janina is the user's wife.", context.topic_context or "")
+        self.assertIn("Janina had an eye doctor appointment yesterday.", context.topic_context or "")
+        messages = context.system_messages()
+        self.assertGreaterEqual(len(messages), 2)
+        self.assertEqual(messages[0], context.topic_context)
+        self.assertIn("twinr_long_term_midterm_context_v1", messages[1])
+        self.assertTrue(any(message is not context.topic_context for message in messages[1:]))
+
+    def test_fast_provider_context_skips_query_rewrite_network_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=self._source("turn:fast:no-rewrite"),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+
+            class _ExplodingRewriter:
+                def profile(self, query_text):
+                    del query_text
+                    raise AssertionError("fast provider context must not invoke the normal query rewriter")
+
+            service.query_rewriter = _ExplodingRewriter()  # type: ignore[assignment]
+            context = service.build_fast_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.topic_context)
+        self.assertIn("Janina is the user's wife.", context.topic_context or "")
+
+    def test_fast_provider_context_skips_probe_read_cache_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=self._source("turn:fast:no-probe-cache"),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+
+            @contextmanager
+            def _fail_probe_cache():
+                raise AssertionError("fast provider context must not wrap the hot path in probe-read caching")
+                yield
+
+            with patch.object(
+                LongTermMemoryService,
+                "_temporary_remote_probe_cache",
+                _fail_probe_cache,
+            ):
+                context = service.build_fast_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.topic_context)
+        self.assertIn("Janina is the user's wife.", context.topic_context or "")
+
+    def test_fast_provider_context_raises_remote_read_failed_when_fast_topic_builder_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+
+            class _TimeoutingFastTopicBuilder:
+                def build(self, *, query_profile):
+                    del query_profile
+                    raise ChonkyDBError("timed out")
+
+            service.fast_topic_builder = _TimeoutingFastTopicBuilder()  # type: ignore[assignment]
+            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
+                service.build_fast_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertEqual(dict(raised.exception.details), {
+            "operation": "fast_provider_context",
+            "request_kind": "read",
+            "outcome": "failed",
+            "classification": "unexpected_error",
+            "error_type": "ChonkyDBError",
+            "error_message": "timed out",
+        })
+
+    def test_provider_context_raises_remote_read_failed_when_quick_memory_builder_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_fast_topic_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+
+            class _TimeoutingFastTopicBuilder:
+                def build(self, *, query_profile):
+                    del query_profile
+                    raise ChonkyDBError("timed out")
+
+            service.fast_topic_builder = _TimeoutingFastTopicBuilder()  # type: ignore[assignment]
+            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
+                service.build_provider_context("Was weisst du ueber Janina?")
+            service.shutdown()
+
+        self.assertEqual(dict(raised.exception.details), {
+            "operation": "fast_provider_context",
+            "request_kind": "read",
+            "outcome": "failed",
+            "classification": "unexpected_error",
+            "error_type": "ChonkyDBError",
+            "error_message": "timed out",
+        })
 
     def test_provider_context_does_not_fallback_to_irrelevant_episodes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1047,6 +1300,8 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIsNotNone(context.durable_context)
         self.assertIn("Aprikosenmarmelade", context.durable_context or "")
         self.assertIn('"confirmed_by_user": true', context.durable_context or "")
+        self.assertIn('"confirmation_state": "explicitly_confirmed_by_user"', context.durable_context or "")
+        self.assertIn("prefer active user-confirmed facts", context.durable_context or "")
         self.assertIsNotNone(tool_context.durable_context)
         self.assertIn("Aprikosenmarmelade", tool_context.durable_context or "")
         self.assertIn('"slot_key": "preference:breakfast:jam"', tool_context.durable_context or "")
@@ -1203,6 +1458,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             context = service.build_provider_context("Was ist ein Regenbogen?")
             service.shutdown()
 
+        self.assertIsNone(context.topic_context)
         self.assertIsNone(context.durable_context)
         self.assertIsNone(context.conflict_context)
 

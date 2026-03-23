@@ -9,6 +9,7 @@ from __future__ import annotations
 ##REFACTOR: 2026-03-16##
 
 from datetime import date, datetime, timedelta, timezone
+import json
 import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -75,6 +76,24 @@ _VALID_SEARCH_CONTEXT_SIZES = frozenset({"low", "medium", "high"})
 _DEFAULT_SEARCH_MAX_OUTPUT_TOKENS = 512
 _DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS = 768
 _FALLBACK_SEARCH_MODEL = "gpt-5"
+_SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS = 160
+_SEARCH_SPOKEN_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "spoken_answer": {
+            "type": "string",
+            "maxLength": 320,
+            "description": (
+                "Short natural spoken answer for a voice assistant. "
+                "Everything in this field is read aloud exactly as written. "
+                "Use plain sentences only. Do not include markdown, URLs, citations, "
+                "source names, brackets, bullets, headings, or meta commentary."
+            ),
+        }
+    },
+    "required": ["spoken_answer"],
+    "additionalProperties": False,
+}
 
 
 def _collapse_whitespace(value: str | None) -> str:
@@ -110,6 +129,32 @@ def _normalize_search_context_size(value: Any) -> str | None:
     if normalized in _VALID_SEARCH_CONTEXT_SIZES:
         return normalized
     return None
+
+
+def _search_responses_text_format() -> dict[str, Any]:
+    """Return the Responses API structured-output contract for spoken search."""
+
+    return {
+        "type": "json_schema",
+        "name": "twinr_live_search_spoken_answer",
+        "schema": _SEARCH_SPOKEN_ANSWER_SCHEMA,
+        "strict": True,
+    }
+
+
+def _extract_structured_search_answer(text: str) -> str:
+    """Parse and normalize the structured spoken-answer payload returned by search."""
+
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        raise ValueError("search returned empty structured output")
+    payload = json.loads(raw_text)
+    if not isinstance(payload, dict):
+        raise ValueError("search structured output must be a JSON object")
+    spoken_answer = _collapse_whitespace(payload.get("spoken_answer"))
+    if not spoken_answer:
+        raise ValueError("search structured output is missing spoken_answer")
+    return spoken_answer
 
 
 def _parse_context_reference_date(date_context: str | None) -> date | None:
@@ -241,7 +286,7 @@ class OpenAISearchMixin:
             date_context=date_context,
         )
         instructions = SEARCH_AGENT_INSTRUCTIONS
-        search_conversation = self._prepare_search_conversation(conversation)
+        search_conversation = None
         last_error: Exception | None = None
         output_token_candidates = self._search_output_token_candidates()
 
@@ -264,7 +309,10 @@ class OpenAISearchMixin:
                         last_error = exc
                         continue
                     if candidate.answer and is_complete:
-                        return candidate
+                        return self._rewrite_search_result_for_voice(
+                            question=normalized_question,
+                            candidate=candidate,
+                        )
                 continue
 
             for max_output_tokens in output_token_candidates:
@@ -284,21 +332,23 @@ class OpenAISearchMixin:
                     self._ensure_web_search_sources_included(request)
                     # AUDIT-FIX(#3): Keep trying remaining models/attempts on transient Responses API failures.
                     response = self._client.responses.create(**request)
+                    candidate = OpenAISearchResult(
+                        answer=_collapse_whitespace(self._extract_output_text(response).replace("\r", " ").replace("\n", " ")),
+                        sources=self._extract_web_search_sources(response),
+                        response_id=getattr(response, "id", None),
+                        request_id=getattr(response, "_request_id", None),
+                        model=extract_model_name(response, model),
+                        token_usage=extract_token_usage(response),
+                        used_web_search=self._used_web_search(response),
+                    )
                 except Exception as exc:  # pragma: no cover - defensive runtime fallback
                     last_error = exc
                     continue
-
-                candidate = OpenAISearchResult(
-                    answer=self._sanitize_search_answer(self._extract_output_text(response)),
-                    sources=self._extract_web_search_sources(response),
-                    response_id=getattr(response, "id", None),
-                    request_id=getattr(response, "_request_id", None),
-                    model=extract_model_name(response, model),
-                    token_usage=extract_token_usage(response),
-                    used_web_search=self._used_web_search(response),
-                )
                 if candidate.answer and self._response_is_complete(response):
-                    return candidate
+                    return self._rewrite_search_result_for_voice(
+                        question=normalized_question,
+                        candidate=candidate,
+                    )
 
         if last_error is not None:
             raise RuntimeError(
@@ -339,7 +389,7 @@ class OpenAISearchMixin:
             messages=messages,
         )
         message = response.choices[0].message if getattr(response, "choices", None) else None
-        answer = self._sanitize_search_answer(getattr(message, "content", "") or "")
+        answer = _collapse_whitespace((getattr(message, "content", "") or "").replace("\r", " ").replace("\n", " "))
         result = OpenAISearchResult(
             answer=answer,
             sources=self._extract_preview_search_sources(message),
@@ -352,6 +402,68 @@ class OpenAISearchMixin:
         # AUDIT-FIX(#7): Reject truncated/filtered preview answers instead of returning potentially partial output.
         return result, self._preview_response_is_complete(response)
 
+    def _rewrite_search_result_for_voice(
+        self,
+        *,
+        question: str,
+        candidate: OpenAISearchResult,
+    ) -> OpenAISearchResult:
+        """Rewrite a verified search answer into clean spoken output.
+
+        Web-search models tend to keep inline citations or web-style phrasing
+        even under strict instructions. Twinr therefore runs one bounded
+        non-search voice rewrite that preserves only the verified facts already
+        present in the search answer.
+        """
+
+        preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None)) or "gpt-4o-mini"
+        prompt = (
+            f"Original user question: {question}\n"
+            f"Verified live-search answer: {candidate.answer}\n"
+            "Rewrite the verified answer as what Twinr should say aloud now."
+        )
+        instructions = (
+            "You are Twinr preparing a spoken answer for a voice assistant. "
+            "Everything you write will be read aloud exactly as written. "
+            "Use only facts already present in the verified live-search answer. "
+            "Do not add facts, do not ask a follow-up question unless the verified answer itself lacks a key fact, "
+            "and do not mention sources, URLs, markdown, citations, brackets, or reference phrases. "
+            "Keep the reply short, natural, senior-friendly, and usually to one or two short sentences. "
+            "Return only the spoken answer text."
+        )
+        last_error: Exception | None = None
+        for model in (preferred_model, "gpt-4o-mini"):
+            try:
+                request = self._build_response_request(
+                    prompt,
+                    conversation=None,
+                    instructions=instructions,
+                    allow_web_search=False,
+                    model=model,
+                    reasoning_effort="low",
+                    max_output_tokens=_SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS,
+                    prompt_cache_scope="search_voice",
+                )
+                request["text"] = {"format": _search_responses_text_format()}
+                response = self._client.responses.create(**request)
+                spoken_answer = _extract_structured_search_answer(self._extract_output_text(response))
+                if spoken_answer:
+                    return OpenAISearchResult(
+                        answer=spoken_answer,
+                        sources=candidate.sources,
+                        response_id=candidate.response_id,
+                        request_id=candidate.request_id,
+                        model=candidate.model,
+                        token_usage=candidate.token_usage,
+                        used_web_search=candidate.used_web_search,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive runtime fallback
+                last_error = exc
+                continue
+        if last_error is not None:
+            return candidate
+        return candidate
+
     def _build_search_prompt(
         self,
         question: str,
@@ -359,37 +471,16 @@ class OpenAISearchMixin:
         location_hint: str | None,
         date_context: str | None,
     ) -> str:
-        """Build the final search prompt with date and location grounding."""
+        """Return the literal user query for web search.
 
-        parts = [f"User question: {question}"]
-        # Keep configured geography in the structured web-search request only.
-        # The free-text prompt must not override an explicit place already named
-        # in the user's question with the runtime's default city.
-        resolved_location = _collapse_whitespace(location_hint)
-        if resolved_location:
-            parts.append(f"Location hint: {resolved_location}")
-        resolved_date_context = _collapse_whitespace(date_context) or self._relative_date_context()
-        explicit_query = _resolved_explicit_search_query(question, resolved_date_context)
-        resolved_date = None
-        match = _DATE_CONTEXT_ISO_RE.search(resolved_date_context)
-        if match is not None:
-            resolved_date = match.group(1)
-        if resolved_date_context:
-            parts.append(f"Local date/time context: {resolved_date_context}")
-            parts.append(
-                "Treat that date/time context as the exact target reference for this search. "
-                "If the user asked about a relative day like today, tomorrow, heute, morgen, or next Monday, "
-                "answer only for the resolved absolute date that matches this reference. "
-                "Do not answer for adjacent dates. If the live sources only mention another date or remain contradictory, "
-                "say that the exact date could not be verified."
-            )
-        if resolved_date:
-            parts.append(f"Target date (must match): {resolved_date}")
-        if explicit_query:
-            parts.append(f"Equivalent explicit-date query: {explicit_query}")
-            parts.append("Use that explicit-date query internally for retrieval and answer only for that exact date.")
-        parts.append("Answer now with the best live information you can verify from web search.")
-        return "\n".join(parts)
+        Search turns should reach the provider as the user's exact request,
+        without extra conversational framing, memory hints, or implicit local
+        rewrites. Structured hints such as explicit ``location_hint`` stay on
+        the tool payload instead of being injected into the text query.
+        """
+
+        del location_hint, date_context
+        return _collapse_whitespace(question)
 
     def _extract_web_search_sources(self, response: Any) -> tuple[str, ...]:
         """Extract and deduplicate source URLs from a Responses search result."""
@@ -518,11 +609,6 @@ class OpenAISearchMixin:
                 return True
         return False
 
-    def _sanitize_search_answer(self, text: str) -> str:
-        """Compact search answer text into a single readable line."""
-
-        return _collapse_whitespace(text.replace("\r", " ").replace("\n", " "))
-
     def _prepare_search_conversation(
         self,
         conversation: ConversationLike | None,
@@ -613,8 +699,11 @@ class OpenAISearchMixin:
                 continue
             if search_context_size is not None:
                 tool["search_context_size"] = search_context_size
-            if user_location is not None and tool_type == "web_search":
-                tool["user_location"] = user_location
+            if tool_type == "web_search":
+                if user_location is not None:
+                    tool["user_location"] = user_location
+                else:
+                    tool.pop("user_location", None)
             break
 
     def _ensure_web_search_sources_included(self, request: dict[str, Any]) -> None:
@@ -633,9 +722,9 @@ class OpenAISearchMixin:
     def _build_responses_web_search_user_location(self, *, location_hint: str | None) -> dict[str, str] | None:
         """Build a Responses API ``user_location`` payload when possible."""
 
-        city = _collapse_whitespace(location_hint) or _collapse_whitespace(
-            getattr(self.config, "openai_web_search_city", None)
-        )
+        city = _collapse_whitespace(location_hint)
+        if not city:
+            return None
         region = _collapse_whitespace(getattr(self.config, "openai_web_search_region", None))
         country = _collapse_whitespace(getattr(self.config, "openai_web_search_country", None)).upper()
         timezone_name = self._configured_timezone_name()
@@ -661,9 +750,7 @@ class OpenAISearchMixin:
         if search_context_size is not None:
             options["search_context_size"] = search_context_size
 
-        city = _collapse_whitespace(location_hint) or _collapse_whitespace(
-            getattr(self.config, "openai_web_search_city", None)
-        )
+        city = _collapse_whitespace(location_hint)
         region = _collapse_whitespace(getattr(self.config, "openai_web_search_region", None))
         country = _collapse_whitespace(getattr(self.config, "openai_web_search_country", None)).upper()
         timezone_name = self._configured_timezone_name()

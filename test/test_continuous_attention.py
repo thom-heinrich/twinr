@@ -114,6 +114,54 @@ class ContinuousAttentionTrackerTests(unittest.TestCase):
         self.assertEqual(snapshot.focus_source, "last_motion_track")
         self.assertFalse(snapshot.speaker_locked)
 
+    def test_single_visible_speaker_blends_audio_direction_into_target_center(self) -> None:
+        tracker = ContinuousAttentionTracker.from_config(TwinrConfig())
+
+        tracker.observe(
+            observed_at=0.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.7, "bottom": 0.9, "right": 0.9},
+                            "zone": "right",
+                            "confidence": 0.92,
+                        },
+                    ],
+                },
+                "vad": {"speech_detected": False},
+            },
+        )
+
+        snapshot = tracker.observe(
+            observed_at=0.5,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.7, "bottom": 0.9, "right": 0.9},
+                            "zone": "right",
+                            "confidence": 0.92,
+                        },
+                    ],
+                },
+                "vad": {"speech_detected": True},
+                "respeaker": {
+                    "azimuth_deg": 74,
+                    "direction_confidence": None,
+                },
+                "audio_policy": {"speaker_direction_stable": None},
+            },
+        )
+
+        self.assertEqual(snapshot.state, "active_visible_speaker_track")
+        self.assertTrue(snapshot.speaker_locked)
+        self.assertAlmostEqual(snapshot.target_center_x or 0.0, 0.748, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

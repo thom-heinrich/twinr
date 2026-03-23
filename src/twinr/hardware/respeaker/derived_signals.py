@@ -226,9 +226,15 @@ def _processed_selected_azimuth(
 
     if selected_azimuth_degrees is None or not selected_azimuth_degrees:
         return None
-    # AUDIT-FIX(#1): Normalize the selected azimuth with the same guarded parser
-    # used for all other angle primitives.
-    return _normalize_optional_azimuth(selected_azimuth_degrees[0])
+    # The productive XVF3800 runtime on the Pi often exposes the currently
+    # useful selected azimuth in the later slot while leaving index 0 empty.
+    # Consume the first valid normalized reading instead of discarding that
+    # evidence outright when the leading placeholder is None.
+    for value in selected_azimuth_degrees:
+        normalized = _normalize_optional_azimuth(value)
+        if normalized is not None:
+            return normalized
+    return None
 
 
 # AUDIT-FIX(#4): Use float typing here because the confidence path operates on

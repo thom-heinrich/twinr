@@ -3,13 +3,14 @@ name: agent
 path: src/twinr/agent
 kind: python-package
 visibility: internal
-summary: Top-level package boundary for Twinr's core agent stack and the thin `twinr.agent` compatibility imports.
+summary: Top-level package boundary for Twinr's core agent stack, local routing package, and the thin `twinr.agent` compatibility imports.
 owned_concerns:
   - Expose the minimal `twinr.agent` import surface for `TwinrConfig`, `TwinrRuntime`, and `TwinrStatus`
-  - Define the package boundary between the core runtime, personality, tool, and workflow child packages
+  - Define the package boundary between the core runtime, routing, personality, tool, and workflow child packages
   - Keep root imports lazy so callers do not eagerly load runtime-heavy dependencies
 out_of_scope:
   - Base-agent implementation details inside src/twinr/agent/base_agent
+  - Local semantic transcript routing details inside src/twinr/agent/routing
   - Detailed evolving-personality state modeling, background learning, and prompt-layer planning inside src/twinr/agent/personality
   - Tool prompting, schema, handler, and runtime execution details inside src/twinr/agent/tools
   - Workflow-loop orchestration details inside src/twinr/agent/workflows
@@ -24,6 +25,8 @@ files:
 subpackages:
   - path: base_agent
     role: Core runtime config, contracts, state, prompting, and runtime composition
+  - path: routing
+    role: Local semantic transcript routing bundles, inference, and calibration helpers
   - path: personality
     role: Structured evolving-personality models, background learning, and remote snapshot seams
   - path: tools

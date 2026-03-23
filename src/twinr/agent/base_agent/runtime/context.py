@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow, AdaptiveTimingProfile
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
 from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError, LongTermRemoteUnavailableError
 from twinr.proactive import ProactiveGovernor
 
 
@@ -331,6 +331,46 @@ class TwinrRuntimeContextMixin:
             messages.extend(self._conversation_context_unlocked())
             return tuple(messages)
 
+    def _fast_topic_system_messages_unlocked(
+        self,
+        *,
+        query_text: str | None,
+        event_prefix: str,
+    ) -> tuple[str, ...]:
+        retrieval_query = str(
+            query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
+        )
+        if not retrieval_query.strip():
+            return ()
+        if not (
+            getattr(getattr(self, "config", None), "long_term_memory_enabled", False)
+            and getattr(getattr(self, "config", None), "long_term_memory_fast_topic_enabled", True)
+        ):
+            return ()
+        try:
+            context = self.long_term_memory.build_fast_provider_context(retrieval_query)
+            return tuple(str(message) for message in context.system_messages())
+        except LongTermRemoteUnavailableError as exc:
+            if self._remote_long_term_failure_is_fatal():
+                raise
+            message = (
+                "Twinr skipped fast topic memory hints for this turn because the required remote fast-topic read failed."
+                if isinstance(exc, LongTermRemoteReadFailedError)
+                else "Twinr skipped fast topic memory hints for this turn because the remote snapshot is unavailable."
+            )
+            self._safe_append_ops_event(
+                event=f"{event_prefix}_memory_failed",
+                message=message,
+                data={"error_type": type(exc).__name__},
+            )
+        except Exception as exc:
+            self._safe_append_ops_event(
+                event=f"{event_prefix}_memory_failed",
+                message="Twinr skipped fast topic memory hints for this turn after a runtime error.",
+                data={"error_type": type(exc).__name__},
+            )
+        return ()
+
     def provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
         """Return full provider context with durable memory and guidance."""
 
@@ -345,21 +385,42 @@ class TwinrRuntimeContextMixin:
         self,
         query_text: str | None = None,
     ) -> tuple[tuple[str, str], ...]:
-        """Return a memory-aware supervisor context for final direct replies.
+        """Return a bounded direct-reply context with fast topic memory hints."""
 
-        The speculative supervisor path stays latency-optimized and remote-free.
-        This dedicated final-answer path intentionally includes the broader
-        provider memory context so a direct supervisor reply is never generated
-        from the reduced fast-lane context alone.
-        """
+        with self._runtime_context_lock():
+            messages: list[tuple[str, str]] = []
+            try:
+                contract = memory_and_response_contract(self.config.openai_realtime_language)
+            except Exception as exc:
+                self._safe_append_ops_event(
+                    event="supervisor_direct_context_contract_failed",
+                    message="Twinr could not build the direct-reply language contract and continued with reduced context.",
+                    data={"error_type": type(exc).__name__},
+                )
+            else:
+                messages.append(("system", contract))
 
-        return self._provider_context_messages(
-            tool_context=False,
-            query_text=query_text,
-        )
+            guidance = self._voice_guidance_message()
+            if guidance:
+                messages.append(("system", guidance))
+
+            for context_message in self._fast_topic_system_messages_unlocked(
+                query_text=query_text,
+                event_prefix="supervisor_direct_context_fast_topic",
+            ):
+                messages.append(("system", context_message))
+
+            messages.extend(self._conversation_context_unlocked())
+            return tuple(messages)
 
     def search_provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
-        """Return a bounded search context without remote long-term memory."""
+        """Return a bounded search context without speculative memory hints.
+
+        Live web search must stay anchored to the explicit search question.
+        Reusing fast-topic long-term-memory hints here can skew retrieval
+        toward merely salient remembered subjects instead of the user's actual
+        freshness-sensitive request.
+        """
 
         with self._runtime_context_lock():
             messages: list[tuple[str, str]] = []

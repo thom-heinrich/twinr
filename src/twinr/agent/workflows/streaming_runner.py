@@ -33,6 +33,7 @@ from twinr.agent.workflows.streaming_capture import (
     StreamingCaptureController,
 )
 from twinr.agent.workflows.streaming_lane_planner import StreamingLanePlanner
+from twinr.agent.workflows.streaming_semantic_router import StreamingSemanticRouterRuntime
 from twinr.agent.workflows.streaming_speculation import StreamingSpeculationController
 from twinr.agent.workflows.streaming_turn_coordinator import (
     StreamingTurnCoordinator,
@@ -152,6 +153,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._streaming_capture = StreamingCaptureController(self)
         self._streaming_speculation = StreamingSpeculationController(self)
         self._streaming_lane_planner = StreamingLanePlanner(self)
+        self._streaming_semantic_router = StreamingSemanticRouterRuntime(self)
         self._prime_supervisor_decision_cache()
         self._prime_first_word_cache()
         self._trace_event(
@@ -298,6 +300,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self.streaming_turn_loop = self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
         )
+        self._streaming_semantic_router.reload()
         self._reset_speculative_supervisor_decision()
         self._supervisor_cache_prewarmed = False
         self._first_word_cache_prewarmed = False
@@ -338,14 +341,36 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
     def _consume_speculative_supervisor_decision(self, transcript: str) -> SupervisorDecision | None:
         return self._streaming_speculation.consume_supervisor_decision(transcript)
 
+    def _wait_for_speculative_supervisor_decision(
+        self,
+        transcript: str,
+        *,
+        wait_ms: int | None = None,
+    ) -> SupervisorDecision | None:
+        return self._streaming_speculation.wait_for_supervisor_decision(
+            transcript,
+            wait_ms=wait_ms,
+        )
+
+    def _has_shared_speculative_supervisor_decision(self, transcript: str) -> bool:
+        return self._streaming_speculation.has_shared_supervisor_decision(transcript)
+
     def _prime_supervisor_decision_cache(self) -> None:
         self._streaming_speculation.prime_supervisor_decision_cache()
 
     def _prime_first_word_cache(self) -> None:
         self._streaming_speculation.prime_first_word_cache()
 
-    def _generate_first_word_reply(self, transcript: str) -> FirstWordReply | None:
-        return self._streaming_speculation.generate_first_word_reply(transcript)
+    def _generate_first_word_reply(
+        self,
+        transcript: str,
+        *,
+        instructions: str | None = None,
+    ) -> FirstWordReply | None:
+        return self._streaming_speculation.generate_first_word_reply(
+            transcript,
+            instructions=instructions,
+        )
 
     def _dual_lane_prefers_supervisor_bridge(self) -> bool:
         return self._streaming_speculation.dual_lane_prefers_supervisor_bridge()
@@ -372,14 +397,29 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             instructions=instructions,
         )
 
-    def _streaming_turn_timeout_policy(self) -> StreamingTurnTimeoutPolicy:
-        return self._streaming_lane_planner.streaming_turn_timeout_policy()
+    def _streaming_turn_timeout_policy(
+        self,
+        *,
+        decision_hint=None,
+    ) -> StreamingTurnTimeoutPolicy:
+        return self._streaming_lane_planner.streaming_turn_timeout_policy(
+            decision_hint=decision_hint,
+        )
 
     def _dual_lane_bridge_reply_from_decision(
         self,
         prefetched_decision: SupervisorDecision | None,
     ) -> FirstWordReply | None:
         return self._streaming_speculation.dual_lane_bridge_reply_from_decision(prefetched_decision)
+
+    def _resolve_local_semantic_route(self, transcript: str):
+        resolution = self._streaming_semantic_router.resolve_transcript(transcript)
+        if resolution is not None and resolution.supervisor_decision is not None:
+            self._store_supervisor_decision(
+                transcript=transcript,
+                decision=resolution.supervisor_decision,
+            )
+        return resolution
 
     def _build_streaming_turn_lane_plan(self, transcript: str) -> StreamingTurnLanePlan:
         return self._streaming_lane_planner.build_turn_lane_plan(transcript)
@@ -503,7 +543,10 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 trace_event=self._trace_event,
                 trace_decision=self._trace_decision,
                 start_processing_feedback_loop=self._start_working_feedback_loop,
+                is_search_feedback_active=lambda: callable(getattr(self, "_search_feedback_stop", None)),
+                stop_search_feedback=self._stop_search_feedback,
                 should_stop=self._active_turn_stop_requested,
+                request_turn_stop=self._signal_active_turn_stop,
                 cancel_interrupted_turn=self._cancel_interrupted_turn,
                 record_usage=self._record_usage,
                 evaluate_follow_up_closure=self._evaluate_follow_up_closure,

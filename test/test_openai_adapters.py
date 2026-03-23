@@ -533,8 +533,81 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(request["max_output_tokens"], 80)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertIn("location_hint", request["text"]["format"]["schema"]["properties"])
+        self.assertNotIn("spoken_ack", request["text"]["format"]["schema"]["required"])
+
+    def test_decide_accepts_handoff_without_spoken_ack(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_2",
+                _request_id="req_decide_2",
+                model="gpt-4o-mini",
+                output_text=(
+                    '{"action":"handoff","spoken_ack":null,"spoken_reply":null,'
+                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true,'
+                    '"location_hint":"Schwarzenbek","date_context":"Tuesday, 2026-03-17 (Europe/Berlin)",'
+                    '"context_scope":"full_context"}'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-4o-mini",
+        )
+
+        decision = provider.decide("Wie wird das Wetter morgen?")
+        request = backend._client.responses.create_requests[0]
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertIsNone(decision.spoken_ack)
+        self.assertEqual(decision.kind, "search")
         self.assertIn("date_context", request["text"]["format"]["schema"]["properties"])
         self.assertIn("context_scope", request["text"]["format"]["schema"]["properties"])
+
+    def test_decide_retries_once_when_structured_response_hits_max_output_tokens(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.extend(
+            [
+                SimpleNamespace(
+                    id="resp_decide_incomplete",
+                    _request_id="req_decide_incomplete",
+                    model="gpt-4o-mini",
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    output_text="",
+                    output=[],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    id="resp_decide_retry",
+                    _request_id="req_decide_retry",
+                    model="gpt-4o-mini",
+                    status="completed",
+                    output_text=(
+                        '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                        '"kind":"search","goal":"latest headlines","allow_web_search":true,'
+                        '"location_hint":null,"date_context":null,"context_scope":"tiny_recent"}'
+                    ),
+                    output=[],
+                    usage=None,
+                ),
+            ]
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-4o-mini",
+            reasoning_effort_override="low",
+        )
+
+        decision = provider.decide("Was sind die Nachrichten heute?")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "search")
+        self.assertEqual(len(backend._client.responses.create_requests), 2)
+        self.assertEqual(backend._client.responses.create_requests[0]["max_output_tokens"], 80)
+        self.assertEqual(backend._client.responses.create_requests[1]["max_output_tokens"], 160)
 
 
 class OpenAIConversationClosureDecisionProviderTests(unittest.TestCase):

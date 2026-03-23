@@ -131,6 +131,7 @@ class ToolCallingStreamingLoop:
         instructions: str | None = None,
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StreamingToolLoopResult:
         """Run a full provider/tool round-trip until the turn completes.
 
@@ -160,8 +161,10 @@ class ToolCallingStreamingLoop:
         used_web_search = False
         # AUDIT-FIX(#3): Disable a broken streaming callback after the first failure so the turn can still complete.
         safe_on_text_delta = _build_safe_text_delta_callback(on_text_delta)
+        _raise_if_should_stop(should_stop, context="tool_loop_start")
 
         for round_index in range(1, self.max_rounds + 1):
+            _raise_if_should_stop(should_stop, context=f"provider_round_{round_index}_start")
             round_on_text_delta = None if self.stream_final_only else safe_on_text_delta
             response = self._request_turn(
                 prompt,
@@ -173,6 +176,7 @@ class ToolCallingStreamingLoop:
                 tool_results=next_tool_results,
                 round_index=round_index,
             )
+            _raise_if_should_stop(should_stop, context=f"provider_round_{round_index}_complete")
 
             try:
                 # AUDIT-FIX(#3): Guard against malformed provider responses before they can crash the loop.
@@ -213,7 +217,12 @@ class ToolCallingStreamingLoop:
                     "Agent provider returned tool calls without a continuation token or response_id"
                 )
                 raise RuntimeError(_PROVIDER_FAILURE_CODE)
-            next_tool_results = tuple(self._execute_tool_call(call) for call in tool_calls)
+            next_tool_results_list: list[AgentToolResult] = []
+            for call in tool_calls:
+                _raise_if_should_stop(should_stop, context=f"tool_execution_{call.name}")
+                next_tool_results_list.append(self._execute_tool_call(call))
+            _raise_if_should_stop(should_stop, context=f"tool_round_{round_index}_complete")
+            next_tool_results = tuple(next_tool_results_list)
             all_tool_results.extend(next_tool_results)
 
         LOGGER.error("Agent tool loop exceeded max_rounds=%s", self.max_rounds)
@@ -318,6 +327,19 @@ def _append_round_text(existing: str, addition: str) -> str:
     if existing[-1] in ".!?:":
         return f"{existing}\n{addition}"
     return f"{existing} {addition}"
+
+
+def _raise_if_should_stop(
+    should_stop: Callable[[], bool] | None,
+    *,
+    context: str,
+) -> None:
+    """Abort cooperative tool-loop work once the owning turn was stopped."""
+
+    if should_stop is None:
+        return
+    if should_stop():
+        raise InterruptedError(f"tool loop stopped during {context}")
 
 
 def _serialize_tool_output(output: Any) -> str:

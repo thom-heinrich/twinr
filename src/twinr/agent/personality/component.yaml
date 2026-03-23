@@ -8,12 +8,15 @@ responsibilities:
   - Render a bounded conversational self-expression and current-mindshare layer so Twinr can speak naturally from ongoing themes.
   - Derive bounded per-topic conversation appetite cues so surfaced themes carry explicit depth, follow-up, and proactivity guidance.
   - Derive explicit positive-engagement actions from appetite, ongoing interest, and co-attention so Twinr can foster welcomed interaction without hardcoded topic logic.
-  - Derive calm ambient display-impulse candidates from the same structured state so Twinr's evolving tone and shared topics can surface visually without speech.
+  - Derive calm ambient display-impulse candidates and question-first reserve-card copy from the same structured state so Twinr's evolving tone, shared topics, and memory-follow-up needs can surface visually without speech.
+  - Correlate shown reserve-card exposures with later structured turn evidence so visual prompts feed back into the same bounded engagement and personality-learning loop.
+  - Distinguish immediate reserve-card pickup or pushback from slower reactions so Twinr can remember how directly a shown card landed and optionally bias the same-day reserve plan faster.
   - Derive authoritative per-turn steering cues from co-attention and appetite so shared-thread topics can shape brief updates, follow-ups, and observation behavior.
   - Serialize turn-steering cues for tool evaluators and resolve matched topics back into bounded follow-up runtime behavior.
   - Reuse persisted ongoing-interest cues from repeated user returns so some themes can become more alive in Twinr's mindshare without becoming addictive or pushy.
   - Reuse persisted co-attention state so shared user/Twinr themes can surface as calm running threads instead of isolated hints.
   - Provide clean persistence seams for remote snapshot state that can later be backed directly by ChonkyDB-derived personality objects.
+  - Expose a narrow public read seam for persisted engagement signals so downstream runtime features can adapt from the same durable state as prompting.
   - Extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history.
   - Promote explicit structured topic follow-up reactions into stronger engagement evidence for mindshare and world-intelligence calibration.
   - Track bounded engagement states so resonant topics surface more often while cooling or avoided topics back off without one-turn overreaction.
@@ -33,8 +36,12 @@ files:
     role: Ordered prompt-layer assembly.
   - path: self_expression.py
     role: Conversational self-expression policy and prompt-facing current-mindshare rendering.
+  - path: display_impulse_copy.py
+    role: Question-first reserve-card copy builder that keeps topic context and memory-follow-up helper text generic and policy-driven.
   - path: display_impulses.py
     role: Generic ambient display-impulse candidate generation from mindshare and positive-engagement state.
+  - path: ambient_feedback.py
+    role: Generic reserve-card feedback extraction that correlates shown-card exposure history with later structured turn evidence.
   - path: positive_engagement.py
     role: Explicit positive-engagement actions that convert generic appetite/co-attention state into bounded turn actions.
   - path: steering.py
@@ -50,7 +57,7 @@ files:
   - path: intelligence
     role: RSS/world-intelligence subscription, discovery, refresh, and remote-state helpers.
   - path: service.py
-    role: Prompting-facing service.
+    role: Prompting-facing service plus the public read seam for persisted engagement signals used by downstream runtime consumers such as the ambient reserve bus.
 public_api:
   module: twinr.agent.personality
   exports:
@@ -86,3 +93,4 @@ tests:
   - path: test/test_agent_personality.py
   - path: test/test_personality.py
   - path: test/test_personality_display_impulses.py
+  - path: test/test_display_ambient_feedback.py

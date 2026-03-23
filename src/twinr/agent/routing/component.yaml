@@ -1,0 +1,156 @@
+schema_version: 1
+name: routing
+path: src/twinr/agent/routing
+kind: python-package
+visibility: internal
+summary: Local two-stage transcript router bundle formats, ONNX inference runtime, labeling handbook, and offline calibration helpers for Twinr's streaming path.
+owned_concerns:
+  - Define the canonical parametric/web/memory/tool routing label set and scored decision contract
+  - Define the canonical user-centered wissen/nachschauen/persoenlich/machen_oder_pruefen label set and two-stage mapping contract
+  - Load and validate versioned local router bundles from disk
+  - Load and validate versioned local user-intent bundles from disk
+  - Run lazy ONNX sentence-encoder inference plus centroid or linear-head scoring on local hardware
+  - Run a shared-embedding user-intent stage plus constrained backend route stage when both bundles are configured
+  - Apply calibrated confidence and margin gates before a route may bypass the supervisor lane
+  - Evaluate labeled transcript datasets and tune safe local authority thresholds
+  - Build reproducible centroid-based or linear-head backend-route bundles from labeled transcript corpora
+  - Build reproducible centroid-based or linear-head user-intent bundles from labeled transcript corpora
+  - Generate dual-labeled synthetic bootstrap transcript corpora with duplicate/leakage/style-collapse filtering
+  - Orchestrate backend-only and two-stage synthetic-bootstrap bundle training and split-wise offline evaluation reports
+out_of_scope:
+  - Workflow-loop orchestration or speech-lane timing in src/twinr/agent/workflows
+  - Provider transport adapters, prompt text, or tool schema definitions
+  - Memory/search/tool execution after a route has been selected
+  - Operator setup automation or Pi repo mirroring
+files:
+  - path: __init__.py
+    role: Package export surface for local routing contracts and helpers
+    exports:
+      - LocalSemanticRouter
+      - LocalUserIntentRouter
+      - RouteLabel
+      - SemanticRouteDecision
+      - SemanticRouterBundle
+      - SemanticRouterBundleMetadata
+      - SemanticRouterPolicy
+      - UserIntentBundle
+      - UserIntentBundleMetadata
+      - UserIntentDecision
+      - UserIntentLabel
+      - TwoStageLocalSemanticRouter
+      - TwoStageSemanticRouteDecision
+      - load_semantic_router_bundle
+      - load_user_intent_bundle
+      - score_semantic_router
+      - score_user_intent_router
+      - tune_policy_thresholds
+  - path: contracts.py
+    role: Canonical route labels and scored route-decision dataclass
+    exports:
+      - RouteLabel
+      - SemanticRouteDecision
+      - normalize_route_label
+  - path: user_intent.py
+    role: Canonical user-centered labels and two-stage routing contracts
+    exports:
+      - UserIntentLabel
+      - UserIntentDecision
+      - TwoStageSemanticRouteDecision
+      - allowed_route_labels_for_user_intent
+      - default_user_intent_for_route_label
+      - normalize_user_intent_label
+  - path: bundle.py
+    role: Versioned bundle metadata plus required-file validation
+    exports:
+      - SemanticRouterBundle
+      - SemanticRouterBundleMetadata
+      - load_semantic_router_bundle
+  - path: user_intent_bundle.py
+    role: Versioned user-intent bundle metadata plus required-file validation
+    exports:
+      - UserIntentBundle
+      - UserIntentBundleMetadata
+      - load_user_intent_bundle
+  - path: policy.py
+    role: Confidence and margin authority-gating policy
+    exports:
+      - SemanticRouterPolicy
+  - path: service.py
+    role: Lazy ONNX/tokenizer sentence encoder and local routing runtime
+    exports:
+      - LocalSemanticRouter
+      - OnnxSentenceEncoder
+  - path: two_stage.py
+    role: Shared-embedding first-stage user intent router plus constrained backend route runtime
+    exports:
+      - LocalUserIntentRouter
+      - TwoStageLocalSemanticRouter
+  - path: evaluation.py
+    role: Labeled transcript dataset loading, metrics, and threshold tuning
+    exports:
+      - LabeledRouteSample
+      - ScoredRouteRecord
+      - SemanticRouterEvaluation
+      - evaluate_route_records
+      - load_labeled_route_samples
+      - score_semantic_router
+      - split_labeled_route_samples
+      - tune_policy_thresholds
+  - path: user_intent_evaluation.py
+    role: Labeled user-intent dataset loading and metrics
+    exports:
+      - LabeledUserIntentSample
+      - ScoredUserIntentRecord
+      - UserIntentRouterEvaluation
+      - evaluate_user_intent_records
+      - load_labeled_user_intent_samples
+      - score_user_intent_router
+      - split_labeled_user_intent_samples
+  - path: bootstrap.py
+    role: Baseline centroid or linear-head backend-route bundle builder from labeled JSONL
+    exports:
+      - build_centroid_router_bundle
+      - build_centroid_router_bundle_from_jsonl
+      - build_linear_router_bundle
+      - build_linear_router_bundle_from_jsonl
+      - compute_label_centroids
+  - path: linear_head.py
+    role: Offline multinomial linear-head fitting over frozen sentence embeddings
+    exports:
+      - LinearHeadTrainingResult
+      - fit_multiclass_linear_head
+  - path: user_intent_bootstrap.py
+    role: Baseline centroid or linear-head user-intent bundle builder from labeled JSONL
+    exports:
+      - build_centroid_user_intent_bundle
+      - build_centroid_user_intent_bundle_from_jsonl
+      - build_linear_user_intent_bundle
+      - build_linear_user_intent_bundle_from_jsonl
+  - path: synthetic_corpus.py
+    role: Deterministic dual-labeled synthetic transcript generator and curation filters for router bootstrap datasets
+    exports:
+      - SyntheticRouteSample
+      - SyntheticRouteCurationReport
+      - generate_synthetic_route_samples
+      - generate_synthetic_user_intent_samples
+      - write_synthetic_route_samples_jsonl
+      - write_synthetic_user_intent_samples_jsonl
+  - path: training.py
+    role: Backend-only and two-stage synthetic-bootstrap bundle training orchestration and split-wise reporting
+    exports:
+      - SemanticRouterTrainingReport
+      - UserIntentTrainingReport
+      - TwoStageSemanticRouterTrainingReport
+      - bootstrap_synthetic_router_bundle
+      - bootstrap_two_stage_synthetic_router_bundle
+      - train_router_bundle_from_jsonl
+      - train_user_intent_bundle_from_jsonl
+  - path: LABELING_HANDBOOK.md
+    role: User-centered labeling rubric, precedence rules, and example bank for annotation and synthetic-data review
+primary_callers:
+  - path: src/twinr/agent/workflows/streaming_semantic_router.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+tests:
+  - path: test/test_semantic_router.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_config.py

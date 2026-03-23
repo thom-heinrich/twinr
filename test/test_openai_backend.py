@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai.api.adapters import _SUPERVISOR_DECISION_SCHEMA
 from twinr.providers.openai.core.client import _default_client_factory
 
 
@@ -32,6 +34,7 @@ def _fake_usage(
 class FakeBinaryResponse:
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
+        self.closed = False
 
     def read(self) -> bytes:
         return self._payload
@@ -39,7 +42,12 @@ class FakeBinaryResponse:
     def iter_bytes(self, _chunk_size: int | None = None):
         midpoint = max(1, len(self._payload) // 2)
         yield self._payload[:midpoint]
+        if self.closed:
+            return
         yield self._payload[midpoint:]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeResponsesAPI:
@@ -53,6 +61,9 @@ class FakeResponsesAPI:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         output_text = self.queued_output_texts.pop(0) if self.queued_output_texts else self.output_text
+        response_format = ((kwargs.get("text") or {}).get("format") or {})
+        if response_format.get("name") == "twinr_live_search_spoken_answer":
+            output_text = json.dumps({"spoken_answer": output_text})
         return SimpleNamespace(
             id="resp_123",
             _request_id="req_123",
@@ -109,6 +120,7 @@ class FakeSpeechAPI:
     def __init__(self, fail_first: bool = False) -> None:
         self.calls: list[dict] = []
         self.fail_first = fail_first
+        self.streaming_responses: list[FakeBinaryResponse] = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -128,7 +140,9 @@ class FakeSpeechAPI:
 
                 class _Manager:
                     def __enter__(self_nonlocal):
-                        return FakeBinaryResponse(b"AUDIO")
+                        response = FakeBinaryResponse(b"AUDIO")
+                        parent.streaming_responses.append(response)
+                        return response
 
                     def __exit__(self_nonlocal, exc_type, exc, tb):
                         return None
@@ -150,6 +164,11 @@ class FakeChatCompletionsAPI:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        content = self.content
+        response_format = kwargs.get("response_format") or {}
+        schema_name = (response_format.get("json_schema") or {}).get("name")
+        if schema_name == "twinr_live_search_spoken_answer":
+            content = json.dumps({"spoken_answer": content})
         return SimpleNamespace(
             id="chatcmpl_123",
             _request_id="req_chat_123",
@@ -165,7 +184,7 @@ class FakeChatCompletionsAPI:
                 SimpleNamespace(
                     finish_reason="stop",
                     message=SimpleNamespace(
-                        content=self.content,
+                        content=content,
                         annotations=self.annotations,
                     ),
                 )
@@ -420,6 +439,18 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(self.speech.calls[0]["speed"], 0.9)
         self.assertEqual(self.speech.calls[0]["instructions"], "Speak in natural German.")
 
+    def test_synthesize_stream_close_stops_remaining_chunks_and_closes_response(self) -> None:
+        stream = self.backend.synthesize_stream("Hello from Twinr")
+
+        first_chunk = next(stream)
+        stream.close()
+        remaining_chunks = list(stream)
+
+        self.assertEqual(first_chunk, b"AU")
+        self.assertEqual(remaining_chunks, [])
+        self.assertTrue(self.speech.streaming_responses)
+        self.assertTrue(self.speech.streaming_responses[0].closed)
+
     def test_phrase_due_reminder_builds_short_reminder_request(self) -> None:
         from twinr.memory.reminders import ReminderEntry, now_in_timezone
 
@@ -535,11 +566,12 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertLessEqual(len(request["prompt_cache_key"]), 64)
         self.assertEqual(request["reasoning"], {"effort": "low"})
         self.assertEqual(request["max_output_tokens"], 160)
-        self.assertIn("Location hint: Schwarzenbek", request["input"][-1]["content"][0]["text"])
-        self.assertIn("Local date/time context: Friday, 2026-03-13 10:00", request["input"][-1]["content"][0]["text"])
-        self.assertIn("exact target reference for this search", request["input"][-1]["content"][0]["text"])
+        self.assertEqual(request["input"][-1]["content"][0]["text"], "Wie wird das Wetter morgen?")
+        self.assertEqual(request["tools"][0]["user_location"]["city"], "Schwarzenbek")
+        self.assertEqual(self.responses.calls[-1]["text"]["format"]["name"], "twinr_live_search_spoken_answer")
+        self.assertNotIn("tools", self.responses.calls[-1])
 
-    def test_search_live_info_uses_only_trimmed_non_system_follow_up_context(self) -> None:
+    def test_search_live_info_uses_only_literal_user_query(self) -> None:
         self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
 
         backend = OpenAIBackend(
@@ -570,23 +602,11 @@ class OpenAIBackendTests(unittest.TestCase):
 
         request = self.responses.calls[0]
         self.assertNotIn("THIS SHOULD NOT REACH THE SEARCH HELPER", request["instructions"])
-        self.assertEqual(
-            [message["role"] for message in request["input"][:-1]],
-            ["user", "assistant", "user"],
-        )
-        self.assertTrue(
-            all(message["role"] != "system" for message in request["input"][:-1])
-        )
-        self.assertEqual(
-            request["input"][:-1][0]["content"][0]["text"],
-            "Und morgen?",
-        )
-        self.assertEqual(
-            request["input"][:-1][-1]["content"][0]["text"],
-            "Bitte mit Temperatur und Regen.",
-        )
+        self.assertEqual(len(request["input"]), 1)
+        self.assertEqual(request["input"][0]["role"], "user")
+        self.assertEqual(request["input"][0]["content"][0]["text"], "Und morgen?")
 
-    def test_search_live_info_does_not_inject_default_city_prompt_hint_when_location_hint_is_missing(self) -> None:
+    def test_search_live_info_does_not_inject_default_city_when_location_hint_is_missing(self) -> None:
         self.responses.output_text = "In Schwarzenbek 9 Grad, trocken."
 
         backend = OpenAIBackend(
@@ -600,8 +620,31 @@ class OpenAIBackendTests(unittest.TestCase):
 
         request = self.responses.calls[0]
         prompt = request["input"][-1]["content"][0]["text"]
-        self.assertNotIn("Location hint: Berlin", prompt)
-        self.assertEqual(request["tools"][0]["user_location"]["city"], "Berlin")
+        self.assertEqual(prompt, "Wie ist das Wetter in Schwarzenbek?")
+        self.assertNotIn("user_location", request["tools"][0])
+
+    def test_search_live_info_passes_news_query_literally(self) -> None:
+        self.responses.output_text = "Heute dominieren zwei Schlagzeilen die Nachrichtenlage."
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.2-chat-latest"),
+            client=self.client,
+        )
+
+        backend.search_live_info_with_metadata("Was sind die neuesten Nachrichten?")
+
+        request = self.responses.calls[0]
+        prompt = request["input"][-1]["content"][0]["text"]
+        self.assertEqual(prompt, "Was sind die neuesten Nachrichten?")
+        self.assertNotIn("user_location", request["tools"][0])
+        self.assertIn("Interpret the user's request semantically", request["instructions"])
+        self.assertIn("prefer major national or international headlines", request["instructions"])
+
+    def test_supervisor_decision_schema_requires_every_property_key(self) -> None:
+        self.assertEqual(
+            set(_SUPERVISOR_DECISION_SCHEMA["required"]),
+            set(_SUPERVISOR_DECISION_SCHEMA["properties"]),
+        )
 
     def test_search_live_info_falls_back_to_chat_latest_when_primary_search_model_returns_blank(self) -> None:
         class BlankThenAnswerResponses:
@@ -611,6 +654,8 @@ class OpenAIBackendTests(unittest.TestCase):
             def create(self, **kwargs):
                 self.calls.append(kwargs)
                 model = kwargs["model"]
+                response_format = ((kwargs.get("text") or {}).get("format") or {})
+                wrap_structured = response_format.get("name") == "twinr_live_search_spoken_answer"
                 if model == "gpt-5.2":
                     return SimpleNamespace(
                         id="resp_blank",
@@ -618,10 +663,13 @@ class OpenAIBackendTests(unittest.TestCase):
                         output_text="",
                         output=[SimpleNamespace(type="web_search_call")],
                     )
+                output_text = "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen."
+                if wrap_structured:
+                    output_text = json.dumps({"spoken_answer": output_text})
                 return SimpleNamespace(
                     id="resp_chat",
                     _request_id="req_chat",
-                    output_text="Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.",
+                    output_text=output_text,
                     output=[
                         SimpleNamespace(type="web_search_call"),
                         SimpleNamespace(
@@ -648,10 +696,10 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(result.answer, "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.")
         self.assertEqual(
             [call["model"] for call in backend._client.responses.calls],
-            ["gpt-5.2", "gpt-5.2", "gpt-4o-mini"],
+            ["gpt-5.2", "gpt-5.2", "gpt-4o-mini", "gpt-5.2", "gpt-4o-mini"],
         )
         self.assertEqual(
-            [call["max_output_tokens"] for call in backend._client.responses.calls],
+            [call["max_output_tokens"] for call in backend._client.responses.calls[:3]],
             [160, 240, 160],
         )
 
@@ -660,6 +708,7 @@ class OpenAIBackendTests(unittest.TestCase):
             config=replace(self.config, openai_search_model="gpt-4o-mini-search-preview"),
             client=self.client,
         )
+        self.responses.output_text = self.client.chat.completions.content
 
         result = backend.search_live_info_with_metadata(
             "Wie wird das Wetter morgen?",
@@ -689,12 +738,11 @@ class OpenAIBackendTests(unittest.TestCase):
         )
         self.assertEqual(self.client.chat.completions.calls[0]["messages"][0]["role"], "system")
         prompt = self.client.chat.completions.calls[0]["messages"][-1]["content"]
-        self.assertIn("Target date (must match): 2026-03-16", prompt)
-        self.assertIn("Equivalent explicit-date query:", prompt)
-        self.assertIn("2026-03-16", prompt)
-        self.assertEqual(self.responses.calls, [])
+        self.assertEqual(prompt, "Wie wird das Wetter morgen?")
+        self.assertEqual(len(self.responses.calls), 1)
+        self.assertEqual(self.responses.calls[0]["text"]["format"]["name"], "twinr_live_search_spoken_answer")
 
-    def test_search_live_info_keeps_target_date_for_explicit_date_questions(self) -> None:
+    def test_search_live_info_preview_path_passes_literal_explicit_date_question(self) -> None:
         backend = OpenAIBackend(
             config=replace(self.config, openai_search_model="gpt-4o-mini-search-preview"),
             client=self.client,
@@ -707,8 +755,7 @@ class OpenAIBackendTests(unittest.TestCase):
         )
 
         prompt = self.client.chat.completions.calls[-1]["messages"][-1]["content"]
-        self.assertIn("Target date (must match): 2026-03-16", prompt)
-        self.assertNotIn("Equivalent explicit-date query:", prompt)
+        self.assertEqual(prompt, "Wettervorhersage für Schwarzenbek am 16. März 2026")
 
     def test_compose_print_job_uses_context_and_request_source(self) -> None:
         self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"

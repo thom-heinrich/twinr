@@ -13,10 +13,12 @@ import select
 import shutil
 import subprocess
 from threading import Event, Lock, Thread, current_thread
+import time
 from typing import Callable
 from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
 from twinr.proactive import WakewordMatch
 from twinr.orchestrator import (
     OrchestratorVoiceAudioFrame,
@@ -38,6 +40,7 @@ class EdgeVoiceOrchestrator:
     _STOP_WAIT_TIMEOUT_S = 1.0
     _STOP_JOIN_TIMEOUT_S = 3.0
     _MAX_STDERR_BYTES = 8_192
+    _RECONNECT_RETRY_DELAY_S = 1.0
 
     def __init__(
         self,
@@ -78,9 +81,19 @@ class EdgeVoiceOrchestrator:
         self._sequence = 0
         self._stderr_tail = bytearray()
         self._connected = False
+        self._next_reconnect_at = 0.0
+        self._last_runtime_state: OrchestratorVoiceRuntimeStateEvent | None = None
+        self._ready_backend: str | None = None
 
     def open(self) -> "EdgeVoiceOrchestrator":
-        """Connect the websocket and start the bounded capture worker."""
+        """Connect the websocket and start the bounded capture worker.
+
+        The edge capture worker must still start when the first websocket dial
+        fails. Otherwise Twinr loses the long-lived microphone stream entirely
+        and can only reconnect if some unrelated local path later pokes the
+        orchestrator. Starting the worker anyway lets frame sends drive the
+        bounded reconnect loop as soon as the remote gateway becomes reachable.
+        """
 
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
@@ -89,12 +102,13 @@ class EdgeVoiceOrchestrator:
             self._paused.clear()
             self._sequence = 0
             self._stderr_tail.clear()
+            self._next_reconnect_at = 0.0
+            self._ready_backend = None
             try:
                 self._connect_client()
             except Exception as exc:
                 self._connected = False
                 self.emit(f"voice_orchestrator_unavailable={type(exc).__name__}")
-                return self
             thread = Thread(target=self._capture_loop, daemon=True, name="twinr-voice-orchestrator")
             self._thread = thread
             thread.start()
@@ -116,6 +130,8 @@ class EdgeVoiceOrchestrator:
             self._thread = None
             self._process = None
             self._connected = False
+            self._next_reconnect_at = 0.0
+            self._ready_backend = None
 
     def __enter__(self) -> "EdgeVoiceOrchestrator":
         return self.open()
@@ -141,19 +157,48 @@ class EdgeVoiceOrchestrator:
     def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False) -> None:
         """Send the current edge runtime state to the server."""
 
-        if not self._connected:
+        event = OrchestratorVoiceRuntimeStateEvent(
+            state=state,
+            detail=detail,
+            follow_up_allowed=follow_up_allowed,
+        )
+        with self._state_lock:
+            self._last_runtime_state = event
+        if not self._ensure_connected():
             return
         try:
-            self._client.send_runtime_state(
-                OrchestratorVoiceRuntimeStateEvent(
-                    state=state,
-                    detail=detail,
-                    follow_up_allowed=follow_up_allowed,
-                )
-            )
+            self._client.send_runtime_state(event)
         except Exception as exc:
-            self.emit(f"voice_orchestrator_state_failed={type(exc).__name__}")
-            self._connected = False
+            self._mark_disconnected(
+                emit_message=f"voice_orchestrator_state_failed={type(exc).__name__}",
+                retry_delay_s=0.0,
+            )
+
+    @property
+    def ready_backend(self) -> str | None:
+        """Return the last backend label confirmed by the live gateway."""
+
+        normalized = str(self._ready_backend or "").strip().lower()
+        return normalized or None
+
+    def supports_remote_follow_up(self) -> bool:
+        """Return whether the live gateway can keep continuation on the server.
+
+        Transcript-first `local_stt` sessions can safely hold `follow_up_open`
+        server-side because the same rolling transcript path can keep wake and
+        continuation decisions coherent. Backend-led rescue paths such as
+        `openwakeword` do better when Twinr reopens a bounded local follow-up
+        capture with an explicit beep instead of silently holding the server in
+        `follow_up_open`.
+        """
+
+        backend = self.ready_backend
+        if backend is not None:
+            return backend == "local_stt"
+        stage1_mode = str(
+            getattr(self.config, "voice_orchestrator_wake_stage1_mode", "backend") or "backend"
+        ).strip().lower()
+        return stage1_mode == "local_stt"
 
     def _connect_client(self) -> None:
         self._client.open()
@@ -167,11 +212,57 @@ class EdgeVoiceOrchestrator:
             )
         )
         self._connected = True
+        self._next_reconnect_at = 0.0
+        with self._state_lock:
+            last_runtime_state = self._last_runtime_state
+        if last_runtime_state is not None:
+            self._client.send_runtime_state(last_runtime_state)
+
+    def _ensure_connected(self) -> bool:
+        """Reconnect the websocket after transient closures without restarting Twinr."""
+
+        if self._connected:
+            return True
+        if self._stop_event.is_set():
+            return False
+        now = time.monotonic()
+        with self._lifecycle_lock:
+            if self._connected:
+                return True
+            if now < self._next_reconnect_at:
+                return False
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            try:
+                self._connect_client()
+            except Exception as exc:
+                self._connected = False
+                self._next_reconnect_at = now + self._RECONNECT_RETRY_DELAY_S
+                self.emit(f"voice_orchestrator_reconnect_failed={type(exc).__name__}")
+                return False
+        self.emit("voice_orchestrator_reconnected=true")
+        return True
+
+    def _mark_disconnected(self, *, emit_message: str, retry_delay_s: float) -> None:
+        """Drop the current websocket and allow a bounded reconnect attempt later."""
+
+        with self._lifecycle_lock:
+            self._connected = False
+            self._next_reconnect_at = time.monotonic() + max(0.0, float(retry_delay_s))
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        self.emit(emit_message)
 
     def _capture_loop(self) -> None:
         process: subprocess.Popen[bytes] | None = None
         pending_pcm = bytearray()
         started = False
+        sent_any_frame = False
+        capture_recovery_attempted = False
         try:
             while not self._stop_event.is_set():
                 if self._paused.is_set():
@@ -187,6 +278,8 @@ class EdgeVoiceOrchestrator:
                     process = self._start_process()
                     started = True
                     pending_pcm.clear()
+                    sent_any_frame = False
+                    capture_recovery_attempted = False
                 if process.stdout is None or process.stderr is None:
                     raise RuntimeError("Voice orchestrator capture did not expose stdout/stderr")
                 stdout_fd = process.stdout.fileno()
@@ -201,11 +294,29 @@ class EdgeVoiceOrchestrator:
                     self._drain_stderr(process)
                 if stdout_fd not in ready:
                     if process.poll() is not None:
+                        recovered = False
+                        if not sent_any_frame and not capture_recovery_attempted:
+                            capture_recovery_attempted = True
+                            recovered = self._recover_transient_respeaker_capture()
+                        if recovered:
+                            self._stop_process(process)
+                            process = self._start_process()
+                            pending_pcm.clear()
+                            continue
                         raise RuntimeError(self._process_error_message(process))
                     continue
                 pcm_chunk = self._read_stdout_chunk(stdout_fd, self._frame_bytes - len(pending_pcm))
                 if not pcm_chunk:
                     if process.poll() is not None:
+                        recovered = False
+                        if not sent_any_frame and not capture_recovery_attempted:
+                            capture_recovery_attempted = True
+                            recovered = self._recover_transient_respeaker_capture()
+                        if recovered:
+                            self._stop_process(process)
+                            process = self._start_process()
+                            pending_pcm.clear()
+                            continue
                         raise RuntimeError(self._process_error_message(process))
                     continue
                 pending_pcm.extend(pcm_chunk)
@@ -213,6 +324,7 @@ class EdgeVoiceOrchestrator:
                     frame_bytes = bytes(pending_pcm[: self._frame_bytes])
                     del pending_pcm[: self._frame_bytes]
                     self._send_frame(frame_bytes)
+                    sent_any_frame = True
             self._drain_stderr(process)
         except Exception as exc:
             if not self._stop_event.is_set():
@@ -229,7 +341,9 @@ class EdgeVoiceOrchestrator:
                 self.emit("voice_orchestrator_capture=stopped")
 
     def _send_frame(self, pcm_bytes: bytes) -> None:
-        if not self._connected or not pcm_bytes:
+        if not pcm_bytes:
+            return
+        if not self._ensure_connected():
             return
         try:
             self._client.send_audio_frame(
@@ -237,13 +351,17 @@ class EdgeVoiceOrchestrator:
             )
             self._sequence += 1
         except Exception as exc:
-            self._connected = False
-            self.emit(f"voice_orchestrator_send_failed={type(exc).__name__}")
+            self._mark_disconnected(
+                emit_message=f"voice_orchestrator_send_failed={type(exc).__name__}",
+                retry_delay_s=0.0,
+            )
 
     def _handle_server_event(self, event) -> None:
         if isinstance(event, OrchestratorVoiceReadyEvent):
+            self._ready_backend = str(event.backend or "").strip().lower() or None
             self.emit(f"voice_orchestrator_ready={event.backend}")
             self._connected = True
+            self._next_reconnect_at = 0.0
             return
         if isinstance(event, OrchestratorVoiceWakeConfirmedEvent):
             self.emit(f"voice_orchestrator_wake_confirmed={event.matched_phrase or 'unknown'}")
@@ -269,8 +387,10 @@ class EdgeVoiceOrchestrator:
             self._on_barge_in_interrupt()
             return
         if isinstance(event, OrchestratorVoiceErrorEvent):
-            self.emit(f"voice_orchestrator_error={event.error}")
-            self._connected = False
+            self._mark_disconnected(
+                emit_message=f"voice_orchestrator_error={event.error}",
+                retry_delay_s=0.0,
+            )
             return
         self.emit(f"voice_orchestrator_event={type(event).__name__}")
 
@@ -333,6 +453,20 @@ class EdgeVoiceOrchestrator:
         if stderr:
             return stderr.decode("utf-8", errors="ignore")
         return f"Voice orchestrator capture exited with code {process.returncode}"
+
+    def _recover_transient_respeaker_capture(self) -> bool:
+        """Wait briefly for a transient XVF3800 re-enumeration before failing."""
+
+        recovered = wait_for_transient_respeaker_capture_ready(
+            device=self._device,
+            sample_rate=self._sample_rate,
+            channels=self._channels,
+            chunk_ms=self._chunk_ms,
+            should_stop=lambda: self._stop_event.is_set() or self._paused.is_set(),
+        )
+        if recovered:
+            self.emit("voice_orchestrator_capture_recovered=respeaker_reenumeration")
+        return recovered
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
         try:

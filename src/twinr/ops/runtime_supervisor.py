@@ -85,6 +85,7 @@ LoopOwnerFn = Callable[[TwinrConfig, str], int | None]
 PidAliveFn = Callable[[int], bool]
 PidSignalFn = Callable[[int, int], None]
 PidCmdlineFn = Callable[[int], tuple[str, ...]]
+ExternalWatchdogStarterFn = Callable[[TwinrConfig, str, EmitFn], int | None]
 
 
 @dataclass(slots=True)
@@ -279,6 +280,18 @@ def _prepend_pythonpath(existing: str | None) -> str:
     return os.pathsep.join(parts)
 
 
+def _default_external_watchdog_starter(
+    config: TwinrConfig,
+    env_file: str,
+    emit: EmitFn,
+) -> int | None:
+    """Best-effort self-heal for externally managed watchdog ownership."""
+
+    from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+    return ensure_remote_memory_watchdog_process(config, env_file=env_file, emit=emit)
+
+
 class TwinrRuntimeSupervisor:
     """Own the productive streaming loop plus remote watchdog.
 
@@ -348,6 +361,7 @@ class TwinrRuntimeSupervisor:
         restart_backoff_s: float = _DEFAULT_RESTART_BACKOFF_S,
         stop_timeout_s: float = _DEFAULT_STOP_TIMEOUT_S,
         manage_watchdog: bool | None = None,
+        external_watchdog_starter: ExternalWatchdogStarterFn = _default_external_watchdog_starter,
     ) -> None:
         self.config = config
         self.env_file = str(env_file)
@@ -377,6 +391,7 @@ class TwinrRuntimeSupervisor:
             if manage_watchdog is None
             else bool(manage_watchdog)
         )
+        self.external_watchdog_starter = external_watchdog_starter
         self.project_root = Path(config.project_root).expanduser().resolve()
         self.remote_watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
         self._watchdog = _ManagedChild(
@@ -389,6 +404,7 @@ class TwinrRuntimeSupervisor:
         )
         self._last_streaming_gate_reason: str | None = None
         self._run_started_at_monotonic: float = -1.0
+        self._last_external_watchdog_recovery_at_monotonic: float = -1.0
 
     def run(self, *, duration_s: float | None = None) -> int:
         """Run the authoritative supervisor loop."""
@@ -422,6 +438,11 @@ class TwinrRuntimeSupervisor:
                 assessment = self._assess_watchdog()
                 if self.manage_watchdog:
                     self._maybe_restart_watchdog_for_health(
+                        now_monotonic=now_monotonic,
+                        assessment=assessment,
+                    )
+                else:
+                    self._maybe_recover_external_watchdog(
                         now_monotonic=now_monotonic,
                         assessment=assessment,
                     )
@@ -727,6 +748,62 @@ class TwinrRuntimeSupervisor:
             return
         if assessment.snapshot_stale:
             self._restart_child(self._watchdog, now_monotonic, reason="watchdog_snapshot_stale")
+
+    def _maybe_recover_external_watchdog(
+        self,
+        *,
+        now_monotonic: float,
+        assessment: RequiredRemoteWatchdogAssessment,
+    ) -> None:
+        """Start a replacement watchdog when the external owner is clearly absent."""
+
+        if self.manage_watchdog or assessment.ready or assessment.pid_alive:
+            return
+        if (now_monotonic - self._last_external_watchdog_recovery_at_monotonic) < self.restart_backoff_s:
+            return
+        self._last_external_watchdog_recovery_at_monotonic = now_monotonic
+        self._emit_payload(
+            "runtime_supervisor_external_watchdog_recovery_requested",
+            detail=assessment.detail,
+            watchdog_pid=assessment.watchdog_pid,
+            sample_status=assessment.sample_status,
+            snapshot_stale=assessment.snapshot_stale,
+        )
+        self._append_event(
+            event="runtime_supervisor_external_watchdog_recovery_requested",
+            message="Supervisor requested external remote-memory watchdog recovery.",
+            level="warn",
+            data={
+                "detail": assessment.detail,
+                "watchdog_pid": assessment.watchdog_pid,
+                "sample_status": assessment.sample_status,
+                "snapshot_stale": assessment.snapshot_stale,
+            },
+        )
+        try:
+            owner_pid = self.external_watchdog_starter(self.config, self.env_file, self.emit)
+        except Exception as exc:
+            detail = compact_text(f"{type(exc).__name__}: {exc}", limit=200)
+            self._emit_payload(
+                "runtime_supervisor_external_watchdog_recovery_failed",
+                detail=detail,
+            )
+            self._append_event(
+                event="runtime_supervisor_external_watchdog_recovery_failed",
+                message="Supervisor failed to recover the external remote-memory watchdog.",
+                level="error",
+                data={"detail": detail},
+            )
+            return
+        self._emit_payload(
+            "runtime_supervisor_external_watchdog_recovery_started",
+            owner_pid=owner_pid,
+        )
+        self._append_event(
+            event="runtime_supervisor_external_watchdog_recovery_started",
+            message="Supervisor started or adopted an external remote-memory watchdog.",
+            data={"owner_pid": owner_pid},
+        )
 
     def _enforce_streaming_health(
         self,

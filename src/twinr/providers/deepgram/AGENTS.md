@@ -23,6 +23,7 @@ Out of scope:
 - Batch transcription must fail with explicit runtime errors; do not hide transport or decode failures behind empty transcripts.
 - `transcribe_path()` must keep safe file handling: regular files only, no symlink traversal, deterministic descriptor cleanup.
 - Streaming sessions must stay bounded: backpressure, finalize waits, and keepalive behavior must not become unbounded.
+- `speech_final` remains only an endpoint hint for turn control; `finalize()` must not treat a bare `speech_final` as the stable final transcript and must keep waiting for an actual final segment or timeout.
 - Interim and endpoint callbacks must stay isolated from transport failures; callback exceptions must not tear down the stream.
 
 ## Verification

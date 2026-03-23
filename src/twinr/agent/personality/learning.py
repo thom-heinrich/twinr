@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
+from twinr.agent.personality.ambient_feedback import AmbientImpulseFeedbackExtractor
 from twinr.agent.personality.evolution import (
     BackgroundPersonalityEvolutionLoop,
     PersonalityEvolutionResult,
@@ -44,6 +45,7 @@ class PersonalityLearningService:
     """Record structured learning evidence and evolve the personality snapshot."""
 
     extractor: PersonalitySignalExtractor = field(default_factory=PersonalitySignalExtractor)
+    ambient_feedback_extractor: AmbientImpulseFeedbackExtractor | None = None
     world_interest_extractor: WorldInterestSignalExtractor = field(default_factory=WorldInterestSignalExtractor)
     background_loop: BackgroundPersonalityEvolutionLoop = field(
         default_factory=lambda: BackgroundPersonalityEvolutionLoop(config=TwinrConfig(project_root="."))
@@ -66,6 +68,7 @@ class PersonalityLearningService:
 
         return cls(
             extractor=PersonalitySignalExtractor(),
+            ambient_feedback_extractor=AmbientImpulseFeedbackExtractor.from_config(config),
             world_interest_extractor=WorldInterestSignalExtractor(),
             background_loop=BackgroundPersonalityEvolutionLoop(
                 config=config,
@@ -89,6 +92,14 @@ class PersonalityLearningService:
             turn=turn,
             consolidation=consolidation,
         )
+        if self.ambient_feedback_extractor is not None:
+            batch = batch.merged(
+                self.ambient_feedback_extractor.extract_from_consolidation(
+                    turn=turn,
+                    consolidation=consolidation,
+                    extracted_batch=batch,
+                )
+            )
         existing_interest_signals = ()
         if self.world_intelligence is not None:
             existing_interest_signals = self.world_intelligence.store.load_state(

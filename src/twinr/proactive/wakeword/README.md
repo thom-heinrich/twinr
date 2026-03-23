@@ -20,6 +20,8 @@ orchestration and above raw audio/hardware adapters.
 
 `wakeword` owns:
 - Normalize wakeword phrases, transcripts, and detector labels
+- Extract continuation text from a confirmed wake capture even when the tail STT
+  omits the already-confirmed wake phrase and only returns the spoken command
 - Separate canonical wakeword phrases from STT-specific recognition phrases
 - Run local clip/frame wakeword spotting via openWakeWord or sherpa-onnx KWS plus optional verifier and STT confirmation
 - Run a Twinr-specific sequence-aware verifier as a second local stage on localized wakeword captures, regardless of whether stage 1 is `openwakeword`, `kws`, or `wekws`
@@ -56,7 +58,7 @@ orchestration and above raw audio/hardware adapters.
 | `__init__.py` | Package export surface |
 | `cascade.py` | Twinr-specific second-stage DTW-aligned sequence verifier assets and runtime gate |
 | `local_verifier.py` | Backend-agnostic config bridge for attaching the sequence verifier to local stage-1 detectors |
-| `matching.py` | Transcript and label matching |
+| `matching.py` | Transcript, confirmed-tail, and detector-label matching |
 | `kws.py` | sherpa-onnx KWS clip and frame spotting |
 | `kws_assets.py` | Official sherpa-onnx bundle provisioning, optional phone-lexicon overlays, and Twinr keyword-file generation |
 | `spotter.py` | openWakeWord clip and frame spotting plus optional local verifier loading |

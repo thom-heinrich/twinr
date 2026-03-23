@@ -12,6 +12,7 @@ import stat
 import threading
 
 from .config import MediaPipeVisionConfig
+from .fine_hand_gestures import builtin_gesture_category_denylist
 
 _MEDIAPIPE_IMAGE_DTYPES = {"uint8", "uint16", "float32"}
 
@@ -113,17 +114,22 @@ class MediaPipeTaskRuntime:
         try:
             mp = importlib.import_module("mediapipe")
             tasks_python = importlib.import_module("mediapipe.tasks.python")
+            classifier_options = importlib.import_module(
+                "mediapipe.tasks.python.components.processors.classifier_options"
+            )
             vision = importlib.import_module("mediapipe.tasks.python.vision")
             base_options = getattr(tasks_python, "BaseOptions")  # AUDIT-FIX(#4): Validate required runtime symbols during import.
             getattr(mp, "Image")
             image_format = getattr(mp, "ImageFormat")
             getattr(image_format, "SRGB")
             getattr(vision, "RunningMode")
+            getattr(classifier_options, "ClassifierOptions")
         except Exception as exc:  # pragma: no cover - depends on local environment.
             raise RuntimeError("mediapipe_unavailable") from exc
         return {
             "mp": mp,
             "BaseOptions": base_options,
+            "ClassifierOptions": classifier_options.ClassifierOptions,
             "vision": vision,
         }
 
@@ -221,6 +227,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.gesture_model_path,
                 missing_code="mediapipe_gesture_model_missing",
                 running_mode_name="VIDEO",
+                model_family="builtin",
             )
             return self._gesture_recognizer
 
@@ -235,6 +242,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.gesture_model_path,
                 missing_code="mediapipe_gesture_model_missing",
                 running_mode_name="IMAGE",
+                model_family="builtin",
             )
             return self._roi_gesture_recognizer
 
@@ -249,6 +257,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.custom_gesture_model_path,
                 missing_code="mediapipe_custom_gesture_model_missing",
                 running_mode_name="VIDEO",
+                model_family="custom",
             )
             return self._custom_gesture_recognizer
 
@@ -263,6 +272,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.custom_gesture_model_path,
                 missing_code="mediapipe_custom_gesture_model_missing",
                 running_mode_name="IMAGE",
+                model_family="custom",
             )
             return self._custom_roi_gesture_recognizer
 
@@ -283,6 +293,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.gesture_model_path,
                 missing_code="mediapipe_gesture_model_missing",
                 running_mode_name="LIVE_STREAM",
+                model_family="builtin",
                 result_callback=result_callback,
                 num_hands_override=num_hands_override,
             )
@@ -304,6 +315,7 @@ class MediaPipeTaskRuntime:
                 model_path=self.config.custom_gesture_model_path,
                 missing_code="mediapipe_custom_gesture_model_missing",
                 running_mode_name="LIVE_STREAM",
+                model_family="custom",
                 result_callback=result_callback,
             )
             return self._live_custom_gesture_recognizer
@@ -315,6 +327,7 @@ class MediaPipeTaskRuntime:
         model_path: str | None,
         missing_code: str,
         running_mode_name: str,
+        model_family: str,
         result_callback: Any | None = None,
         num_hands_override: int | None = None,
     ) -> Any:
@@ -336,35 +349,45 @@ class MediaPipeTaskRuntime:
             "GestureRecognizer",
             error_code="mediapipe_runtime_incomplete",
         )
+        classifier_options = self._require_runtime_entry(runtime, "ClassifierOptions")
         selected_running_mode = self._require_attribute(
             running_mode,
             running_mode_name,
             error_code="mediapipe_runtime_incomplete",
         )
-        options = gesture_recognizer_options(
-            base_options=self._build_base_options(
+        options_kwargs: dict[str, Any] = {
+            "base_options": self._build_base_options(
                 runtime,
                 model_path=resolved_model_path,
                 model_bytes=model_bytes,
             ),
-            running_mode=selected_running_mode,
-            num_hands=self._validate_num_hands(
+            "running_mode": selected_running_mode,
+            "num_hands": self._validate_num_hands(
                 self.config.num_hands if num_hands_override is None else num_hands_override
             ),
-            min_hand_detection_confidence=self._validate_probability(
+            "min_hand_detection_confidence": self._validate_probability(
                 self.config.min_hand_detection_confidence,
                 name="min_hand_detection_confidence",
             ),
-            min_hand_presence_confidence=self._validate_probability(
+            "min_hand_presence_confidence": self._validate_probability(
                 self.config.min_hand_presence_confidence,
                 name="min_hand_presence_confidence",
             ),
-            min_tracking_confidence=self._validate_probability(
+            "min_tracking_confidence": self._validate_probability(
                 self.config.min_hand_tracking_confidence,
                 name="min_hand_tracking_confidence",
             ),
-            result_callback=result_callback,
-        )
+            "result_callback": result_callback,
+        }
+        if model_family == "builtin":
+            options_kwargs["canned_gesture_classifier_options"] = classifier_options(
+                score_threshold=self._validate_probability(
+                    self.config.builtin_gesture_min_score,
+                    name="builtin_gesture_min_score",
+                ),
+                category_denylist=list(builtin_gesture_category_denylist()),
+            )
+        options = gesture_recognizer_options(**options_kwargs)
         return gesture_recognizer.create_from_options(options)
 
     def _require_runtime_entry(self, runtime: dict[str, Any], key: str) -> Any:

@@ -15,6 +15,10 @@ import sys
 from threading import Lock
 from typing import Any
 
+from twinr.runtime_paths import prime_raspberry_pi_system_site_packages
+
+prime_raspberry_pi_system_site_packages()
+
 from twinr.agent.base_agent import TwinrConfig
 from twinr.ops.locks import TwinrInstanceAlreadyRunningError
 from twinr.ops.runtime_env import prime_user_session_audio_env

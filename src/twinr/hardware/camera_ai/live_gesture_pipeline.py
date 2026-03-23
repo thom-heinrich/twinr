@@ -27,6 +27,7 @@ from .fine_hand_gestures import (
     prefer_gesture_choice,
     resolve_fine_hand_gesture,
 )
+from .geometry import iou
 from .mediapipe_runtime import MediaPipeTaskRuntime
 from .models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
@@ -41,6 +42,9 @@ _RECENT_PRIMARY_PERSON_BOX_TTL_S = 0.45
 _RECENT_VISIBLE_PERSON_BOXES_TTL_S = 0.45
 _RECENT_HAND_BOXES_TTL_S = 0.45
 _LIVE_GESTURE_NUM_HANDS = 1
+_PRIMARY_PERSON_HINT_MIN_IOU = 0.6
+_LIVE_HAND_CROP_PADDING = 0.14
+_LIVE_HAND_MIN_CONTEXT_RATIO = 0.18
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,7 @@ class LiveGesturePipeline:
         primary_person_box: AICameraBox | None = None,
         visible_person_boxes: tuple[AICameraBox, ...] = (),
         person_count: int = 0,
+        sparse_keypoints: dict[int, tuple[float, float, float]] | None = None,
     ) -> LiveGestureFrameObservation:
         """Submit one RGB frame and return the freshest bounded live result."""
 
@@ -200,6 +205,12 @@ class LiveGesturePipeline:
             num_hands_override=_LIVE_GESTURE_NUM_HANDS,
         )
         builtin_recognizer.recognize_async(image, timestamp_ms)
+        if self.config.custom_gesture_model_path:
+            custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
+                runtime,
+                result_callback=self._handle_custom_result,
+            )
+            custom_recognizer.recognize_async(image, timestamp_ms)
         return self._build_observation(
             runtime=runtime,
             frame_rgb=frame_rgb,
@@ -208,6 +219,7 @@ class LiveGesturePipeline:
             primary_person_box=primary_person_box,
             visible_person_boxes=visible_person_boxes,
             person_count=person_count,
+            sparse_keypoints=dict(sparse_keypoints or {}),
         )
 
     def _build_observation(
@@ -220,23 +232,32 @@ class LiveGesturePipeline:
         primary_person_box: AICameraBox | None,
         visible_person_boxes: tuple[AICameraBox, ...],
         person_count: int,
+        sparse_keypoints: dict[int, tuple[float, float, float]],
     ) -> LiveGestureFrameObservation:
         """Materialize one bounded observation from the newest callback results."""
 
         with self._lock:
             builtin = self._fresh_snapshot(self._latest_builtin, observed_at=observed_at)
-            custom = None
+            custom = self._fresh_snapshot(self._latest_custom, observed_at=observed_at)
             builtin_choice = (
                 (AICameraFineHandGesture.NONE, None)
                 if builtin is None
                 else (builtin.gesture, builtin.confidence)
             )
-            custom_choice = (AICameraFineHandGesture.NONE, None)
+            custom_choice = (
+                (AICameraFineHandGesture.NONE, None)
+                if custom is None
+                else (custom.gesture, custom.confidence)
+            )
             fine_hand_gesture, fine_hand_confidence = combine_builtin_and_custom_gesture_choice(
                 builtin_choice,
                 custom_choice,
             )
-            hand_count = max(0, 0 if builtin is None else builtin.hand_count)
+            hand_count = max(
+                0,
+                0 if builtin is None else builtin.hand_count,
+                0 if custom is None else custom.hand_count,
+            )
             open_palm_center_x = None
             if builtin is not None and builtin.gesture == AICameraFineHandGesture.OPEN_PALM:
                 open_palm_center_x = builtin.open_palm_center_x
@@ -244,8 +265,14 @@ class LiveGesturePipeline:
                 observed_at=observed_at,
                 open_palm_center_x=open_palm_center_x,
             )
-            freshest_timestamp_ms = 0 if builtin is None else builtin.timestamp_ms
-            current_hand_boxes = builtin.hand_boxes if builtin is not None and builtin.hand_boxes else ()
+            freshest_timestamp_ms = max(
+                0 if builtin is None else builtin.timestamp_ms,
+                0 if custom is None else custom.timestamp_ms,
+            )
+            current_hand_boxes = _merge_hand_boxes(
+                () if builtin is None else builtin.hand_boxes,
+                () if custom is None else custom.hand_boxes,
+            )
             live_visible_person_boxes = tuple(box for box in visible_person_boxes if box is not None)
             if primary_person_box is not None and person_count > 0:
                 self._recent_primary_person_box = primary_person_box
@@ -286,7 +313,7 @@ class LiveGesturePipeline:
                 "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
                 "live_custom_gesture": custom_choice[0].value,
                 "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
-                "live_custom_enabled": False,
+                "live_custom_enabled": bool(self.config.custom_gesture_model_path),
                 "live_hand_count": hand_count,
                 "live_hand_box_count": len(current_hand_boxes),
                 "effective_live_hand_box_count": len(effective_hand_boxes),
@@ -296,6 +323,7 @@ class LiveGesturePipeline:
                 "primary_person_box_available": primary_person_box is not None,
                 "effective_primary_person_box_available": effective_primary_person_box is not None,
                 "primary_person_box_source": primary_person_box_source,
+                "pose_hint_keypoint_count": len(sparse_keypoints),
                 "visible_person_box_count": len(live_visible_person_boxes),
                 "effective_visible_person_box_count": len(effective_visible_person_boxes),
                 "visible_person_box_source": visible_person_box_source,
@@ -306,7 +334,9 @@ class LiveGesturePipeline:
                     runtime=runtime,
                     frame_rgb=frame_rgb,
                     timestamp_ms=timestamp_ms,
+                    primary_person_box=effective_primary_person_box,
                     person_boxes=effective_visible_person_boxes,
+                    sparse_keypoints=sparse_keypoints,
                 )
                 debug_snapshot.update(person_roi_debug)
                 if person_roi_choice[0] != AICameraFineHandGesture.NONE:
@@ -334,6 +364,21 @@ class LiveGesturePipeline:
                     debug_snapshot["resolved_source"] = (
                         "live_hand_roi" if hand_box_source == "live" else "recent_live_hand_roi"
                     )
+            if (
+                fine_hand_gesture == AICameraFineHandGesture.NONE
+                and not effective_visible_person_boxes
+                and not effective_hand_boxes
+            ):
+                full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                    runtime=runtime,
+                    frame_rgb=frame_rgb,
+                    timestamp_ms=timestamp_ms,
+                )
+                debug_snapshot.update(full_frame_debug)
+                hand_count = max(hand_count, int(debug_snapshot["full_frame_hand_detection_count"]))
+                if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                    fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                    debug_snapshot["resolved_source"] = "full_frame_hand_roi"
         else:
             debug_snapshot = {
                 "resolved_source": "live_stream",
@@ -341,7 +386,7 @@ class LiveGesturePipeline:
                 "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
                 "live_custom_gesture": custom_choice[0].value,
                 "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
-                "live_custom_enabled": False,
+                "live_custom_enabled": bool(self.config.custom_gesture_model_path),
                 "live_hand_count": hand_count,
                 "live_hand_box_count": len(current_hand_boxes),
                 "live_result_age_s": _round_optional_confidence(result_age_s),
@@ -349,6 +394,7 @@ class LiveGesturePipeline:
                 "primary_person_box_available": primary_person_box is not None,
                 "effective_primary_person_box_available": effective_primary_person_box is not None,
                 "primary_person_box_source": primary_person_box_source,
+                "pose_hint_keypoint_count": len(sparse_keypoints),
                 "visible_person_box_count": len(live_visible_person_boxes),
                 "effective_visible_person_box_count": len(effective_visible_person_boxes),
                 "visible_person_box_source": visible_person_box_source,
@@ -371,7 +417,9 @@ class LiveGesturePipeline:
         runtime: dict[str, Any],
         frame_rgb: Any,
         timestamp_ms: int,
+        primary_person_box: AICameraBox | None,
         person_boxes: tuple[AICameraBox, ...],
+        sparse_keypoints: dict[int, tuple[float, float, float]],
     ) -> tuple[tuple[AICameraFineHandGesture, float | None], dict[str, object]]:
         """Recover concrete symbols from bounded visible-person upper-body ROIs."""
 
@@ -385,18 +433,27 @@ class LiveGesturePipeline:
             "person_roi_custom_confidence": None,
             "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
             "person_roi_combined_confidence": None,
+            "person_roi_pose_hint_match_index": None,
         }
         best_builtin_choice = (AICameraFineHandGesture.NONE, None)
         best_custom_choice = (AICameraFineHandGesture.NONE, None)
         best_combined_choice = (AICameraFineHandGesture.NONE, None)
         best_match_index: int | None = None
+        pose_hint_match_index: int | None = None
         for index, person_box in enumerate(person_boxes):
+            candidate_sparse_keypoints = self._person_roi_sparse_keypoints(
+                person_box=person_box,
+                primary_person_box=primary_person_box,
+                sparse_keypoints=sparse_keypoints,
+            )
+            if candidate_sparse_keypoints and pose_hint_match_index is None:
+                pose_hint_match_index = index
             hand_landmark_result = self._ensure_hand_landmark_worker().analyze(
                 runtime=runtime,
                 frame_rgb=frame_rgb,
                 timestamp_ms=timestamp_ms + index,
                 primary_person_box=person_box,
-                sparse_keypoints={},
+                sparse_keypoints=candidate_sparse_keypoints,
             )
             detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
             debug["person_roi_detection_count"] = int(debug["person_roi_detection_count"]) + len(detections)
@@ -419,9 +476,30 @@ class LiveGesturePipeline:
                 "person_roi_custom_confidence": _round_optional_confidence(best_custom_choice[1]),
                 "person_roi_combined_gesture": best_combined_choice[0].value,
                 "person_roi_combined_confidence": _round_optional_confidence(best_combined_choice[1]),
+                "person_roi_pose_hint_match_index": pose_hint_match_index,
             }
         )
         return best_combined_choice, debug
+
+    def _person_roi_sparse_keypoints(
+        self,
+        *,
+        person_box: AICameraBox,
+        primary_person_box: AICameraBox | None,
+        sparse_keypoints: dict[int, tuple[float, float, float]],
+    ) -> dict[int, tuple[float, float, float]]:
+        """Attach pose hints only to the ROI that still matches the tracked primary person."""
+
+        if not sparse_keypoints or primary_person_box is None:
+            return {}
+        if person_box == primary_person_box:
+            return dict(sparse_keypoints)
+        try:
+            if iou(person_box, primary_person_box) >= _PRIMARY_PERSON_HINT_MIN_IOU:
+                return dict(sparse_keypoints)
+        except Exception:
+            return {}
+        return {}
 
     def _recognize_from_hand_landmark_result(
         self,
@@ -595,6 +673,48 @@ class LiveGesturePipeline:
         )
         return combined, debug
 
+    def _recognize_from_full_frame_hand_landmarks(
+        self,
+        *,
+        runtime: dict[str, Any],
+        frame_rgb: Any,
+        timestamp_ms: int,
+    ) -> tuple[tuple[AICameraFineHandGesture, float | None], dict[str, object]]:
+        """Recover one symbol from a final bounded whole-frame hand pass."""
+
+        debug = {
+            "full_frame_hand_detection_count": 0,
+            "full_frame_hand_builtin_gesture": AICameraFineHandGesture.NONE.value,
+            "full_frame_hand_builtin_confidence": None,
+            "full_frame_hand_custom_gesture": AICameraFineHandGesture.NONE.value,
+            "full_frame_hand_custom_confidence": None,
+            "full_frame_hand_combined_gesture": AICameraFineHandGesture.NONE.value,
+            "full_frame_hand_combined_confidence": None,
+        }
+        hand_landmark_result = self._ensure_hand_landmark_worker().analyze_full_frame(
+            runtime=runtime,
+            frame_rgb=frame_rgb,
+            timestamp_ms=timestamp_ms,
+        )
+        detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
+        debug["full_frame_hand_detection_count"] = len(detections)
+        builtin_choice, custom_choice = self._recognize_from_hand_landmark_result(
+            runtime=runtime,
+            hand_landmark_result=hand_landmark_result,
+        )
+        combined = combine_builtin_and_custom_gesture_choice(builtin_choice, custom_choice)
+        debug.update(
+            {
+                "full_frame_hand_builtin_gesture": builtin_choice[0].value,
+                "full_frame_hand_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
+                "full_frame_hand_custom_gesture": custom_choice[0].value,
+                "full_frame_hand_custom_confidence": _round_optional_confidence(custom_choice[1]),
+                "full_frame_hand_combined_gesture": combined[0].value,
+                "full_frame_hand_combined_confidence": _round_optional_confidence(combined[1]),
+            }
+        )
+        return combined, debug
+
     def _fresh_recent_primary_person_box(
         self,
         observed_at: float,
@@ -757,6 +877,34 @@ def _crop_hand_box(
     if frame_height <= 1 or frame_width <= 1:
         return None
     top, left, bottom, right = hand_box
+    crop_width = max(0.0, right - left)
+    crop_height = max(0.0, bottom - top)
+    if crop_width <= 0.0 or crop_height <= 0.0:
+        return None
+    center_x = (left + right) / 2.0
+    center_y = (top + bottom) / 2.0
+    side = max(
+        crop_width + (_LIVE_HAND_CROP_PADDING * 2.0),
+        crop_height + (_LIVE_HAND_CROP_PADDING * 2.0),
+        _LIVE_HAND_MIN_CONTEXT_RATIO,
+    )
+    half_side = side / 2.0
+    left = center_x - half_side
+    right = center_x + half_side
+    top = center_y - half_side
+    bottom = center_y + half_side
+    if left < 0.0:
+        right = min(1.0, right - left)
+        left = 0.0
+    if right > 1.0:
+        left = max(0.0, left - (right - 1.0))
+        right = 1.0
+    if top < 0.0:
+        bottom = min(1.0, bottom - top)
+        top = 0.0
+    if bottom > 1.0:
+        top = max(0.0, top - (bottom - 1.0))
+        bottom = 1.0
     y0 = max(0, min(frame_height - 1, int(math.floor(top * frame_height))))
     x0 = max(0, min(frame_width - 1, int(math.floor(left * frame_width))))
     y1 = max(y0 + 1, min(frame_height, int(math.ceil(bottom * frame_height))))
@@ -829,6 +977,23 @@ def _round_optional_confidence(value: float | None) -> float | None:
     if value is None or not math.isfinite(value):
         return None
     return round(max(0.0, min(1.0, float(value))), 3)
+
+
+def _merge_hand_boxes(
+    builtin_boxes: tuple[tuple[float, float, float, float], ...],
+    custom_boxes: tuple[tuple[float, float, float, float], ...],
+) -> tuple[tuple[float, float, float, float], ...]:
+    """Merge built-in/custom hand boxes while collapsing exact duplicates."""
+
+    merged: list[tuple[float, float, float, float]] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    for box in tuple(builtin_boxes or ()) + tuple(custom_boxes or ()):
+        normalized = tuple(round(float(value), 4) for value in box)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(box)
+    return tuple(merged)
 
 
 __all__ = [

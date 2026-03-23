@@ -7,7 +7,7 @@ this module or via ``twinr.memory.longterm``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping  # AUDIT-FIX(#10): Import Mapping explicitly for Python 3.11 type-introspection safety.
+from collections.abc import Callable, Iterable, Mapping  # AUDIT-FIX(#10): Import Mapping explicitly for Python 3.11 type-introspection safety.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -16,8 +16,10 @@ import os
 from pathlib import Path
 import tempfile
 from threading import Lock, RLock
+import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import (
@@ -32,7 +34,11 @@ from twinr.memory.longterm.core.models import (
     LongTermReflectionResultV1,
 )
 from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogStore
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteStateStore,
+    LongTermRemoteUnavailableError,
+)
 from twinr.text_utils import retrieval_terms
 
 
@@ -49,6 +55,36 @@ _ARCHIVE_STORE_SHARD_SCHEMA = "twinr_memory_archive_store_shard"
 _SNAPSHOT_WRITTEN_AT_KEY = "written_at"
 _MIN_AWARE_DATETIME = datetime.min.replace(tzinfo=timezone.utc)
 _CROSS_SERVICE_READ_MODE = 0o644
+_OBJECT_STATE_QUERY_TERMS = frozenset(
+    {
+        "active",
+        "aktuell",
+        "available",
+        "bestaetigt",
+        "candidate",
+        "confirmed",
+        "confirmed_by_user",
+        "current",
+        "discarded",
+        "expired",
+        "former",
+        "frueher",
+        "gespeichert",
+        "invalid",
+        "outdated",
+        "pending",
+        "previous",
+        "stored",
+        "superseded",
+        "unbestaetigt",
+        "unclear",
+        "uncertain",
+        "unklar",
+        "unconfirmed",
+        "user_confirmed",
+        "vorher",
+    }
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -57,6 +93,70 @@ def _normalize_text(value: str | None) -> str:
     """Collapse arbitrary text-like input to normalized single-spaced text."""
 
     return " ".join(str(value or "").split()).strip()
+
+
+def _retrieval_trace_details(
+    query_text: str | None,
+    *,
+    episodic_limit: int | None = None,
+    durable_limit: int | None = None,
+    candidate_limit: int | None = None,
+    payload_count: int | None = None,
+    entry_count: int | None = None,
+) -> dict[str, object]:
+    """Summarize retrieval inputs for trace-safe latency diagnostics."""
+
+    clean_query = _normalize_text(query_text)
+    details: dict[str, object] = {
+        "query_chars": len(clean_query),
+        "query_terms": len(tuple(term for term in retrieval_terms(clean_query) if isinstance(term, str))),
+    }
+    if episodic_limit is not None:
+        details["episodic_limit"] = max(0, int(episodic_limit))
+    if durable_limit is not None:
+        details["durable_limit"] = max(0, int(durable_limit))
+    if candidate_limit is not None:
+        details["candidate_limit"] = max(0, int(candidate_limit))
+    if payload_count is not None:
+        details["payload_count"] = max(0, int(payload_count))
+    if entry_count is not None:
+        details["entry_count"] = max(0, int(entry_count))
+    return details
+
+
+def _run_timed_workflow_step(
+    *,
+    name: str,
+    kind: str,
+    details: dict[str, object],
+    operation: Callable[[], object],
+) -> object:
+    """Emit bounded timing events for one retrieval step without span rethrow bugs."""
+
+    workflow_event(kind="span_start", msg=name, details={"kind": kind, **details})
+    started = time.perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        workflow_event(
+            kind="exception",
+            msg=f"{name}_exception",
+            level="ERROR",
+            details={
+                "span": name,
+                "kind": kind,
+                "exception": {"type": type(exc).__name__},
+            },
+            kpi={"duration_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+        )
+        raise
+    workflow_event(
+        kind="span_end",
+        msg=name,
+        details={"kind": kind, **details},
+        kpi={"duration_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+    )
+    return result
 
 
 def _utcnow() -> datetime:
@@ -161,6 +261,7 @@ class LongTermStructuredStore:
     remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=RLock, repr=False)  # AUDIT-FIX(#3): Reentrant lock allows read/write serialization without deadlocking nested calls.
     _remote_catalog: LongTermRemoteCatalogStore | None = field(init=False, repr=False, default=None)
+    _recent_local_snapshot_payloads: dict[str, dict[str, object]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the configured base path once during construction."""
@@ -476,9 +577,13 @@ class LongTermStructuredStore:
         local_path = self._validated_local_path(local_path)
         remote_payload = self._load_remote_snapshot_payload(snapshot_kind=snapshot_kind)
         local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+        recent_local_payload = self._same_process_snapshot_bridge_payload(
+            snapshot_kind=snapshot_kind,
+            remote_payload=remote_payload,
+        )
 
         if self._remote_is_required():
-            return remote_payload
+            return recent_local_payload or remote_payload
 
         if remote_payload is not None and local_payload is not None:
             local_written_at = _parse_snapshot_written_at(local_payload)
@@ -495,6 +600,48 @@ class LongTermStructuredStore:
                 self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
             return local_payload
         return None
+
+    def _same_process_snapshot_bridge_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        remote_payload: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        """Return one fresher local snapshot while remote visibility catches up."""
+
+        if not self._remote_is_required():
+            return None
+        recent_local_payload = self._recent_local_snapshot_payloads.get(snapshot_kind)
+        if recent_local_payload is None:
+            return None
+        effective_remote_payload = (
+            dict(remote_payload)
+            if isinstance(remote_payload, Mapping)
+            else self._load_remote_snapshot_payload(snapshot_kind=snapshot_kind)
+        )
+        if effective_remote_payload is None:
+            return dict(recent_local_payload)
+        if _parse_snapshot_written_at(recent_local_payload) > _parse_snapshot_written_at(effective_remote_payload):
+            return dict(recent_local_payload)
+        self._recent_local_snapshot_payloads.pop(snapshot_kind, None)
+        return None
+
+    def _same_process_snapshot_bridge_objects(self) -> tuple[LongTermMemoryObjectV1, ...] | None:
+        """Load the latest same-process object snapshot for bounded query coherence.
+
+        Current-scope `topk_records(scope_ref=...)` can lag behind the already
+        visible remote snapshot head because the fine-grained object documents
+        and their scope index update asynchronously. Keep query selectors on
+        the last in-process object snapshot until a later snapshot read clears
+        the bridge after the remote head has caught up.
+        """
+
+        if not self._remote_is_required():
+            return None
+        bridge_payload = self._recent_local_snapshot_payloads.get("objects")
+        if bridge_payload is None:
+            return None
+        return self._load_memory_objects_from_payload(dict(bridge_payload), snapshot_kind="objects")
 
     def _ensure_remote_snapshot_payload(
         self,
@@ -913,7 +1060,7 @@ class LongTermStructuredStore:
                 query_text=clean_query,
                 limit=bounded_limit,
                 eligible=eligible,
-                allow_catalog_fallback=not include_episodes,
+                allow_catalog_fallback=False,
             )
         except Exception:
             if self._remote_is_required():
@@ -969,6 +1116,54 @@ class LongTermStructuredStore:
         )
         return self._load_remote_objects_from_entries(entries=fallback_entries, snapshot_kind="objects")
 
+    def _select_relevant_objects_from_loaded(
+        self,
+        *,
+        objects: Iterable[LongTermMemoryObjectV1],
+        query_text: str | None,
+        include_episodes: bool,
+        limit: int,
+        require_query_match: bool,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Search one already-loaded object pool without re-entering remote scope lookup."""
+
+        bounded_limit = max(1, limit)
+        eligible_objects = tuple(
+            sorted(
+                (
+                    item
+                    for item in objects
+                    if item.status in {"active", "candidate", "uncertain"}
+                    and ((item.kind == "episode") if include_episodes else (item.kind != "episode"))
+                ),
+                key=lambda item: (
+                    _coerce_aware_utc(item.updated_at),
+                    _coerce_aware_utc(item.created_at),
+                    item.memory_id,
+                ),
+                reverse=True,
+            )
+        )
+        if not eligible_objects:
+            return ()
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            if require_query_match:
+                return ()
+            return eligible_objects[:bounded_limit]
+        selector = self._object_selector(eligible_objects)
+        selected_ids = selector.search(clean_query, limit=bounded_limit)
+        by_id = {item.memory_id: item for item in eligible_objects}
+        selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
+        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+        if not filtered:
+            return ()
+        return self.rank_selected_objects(
+            query_texts=(clean_query,),
+            objects=filtered,
+            limit=bounded_limit,
+        )
+
     def _remote_select_conflicts(
         self,
         *,
@@ -1010,6 +1205,7 @@ class LongTermStructuredStore:
                     snapshot_kind="conflicts",
                     query_text=clean_query,
                     limit=bounded_limit,
+                    allow_catalog_fallback=False,
                 )
             except Exception:
                 if self._remote_is_required():
@@ -1157,6 +1353,7 @@ class LongTermStructuredStore:
         stamped_payload = self._stamp_snapshot_payload(payload)
         _write_json_atomic(local_path, stamped_payload)  # AUDIT-FIX(#6): Always persist a local recovery copy before any remote mirror attempt.
         self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=stamped_payload)
+        self._recent_local_snapshot_payloads[snapshot_kind] = dict(stamped_payload)
 
     def apply_consolidation(self, result: LongTermConsolidationResultV1) -> None:
         """Persist a consolidation result into object and conflict snapshots."""
@@ -1572,6 +1769,23 @@ class LongTermStructuredStore:
             A tuple of active, candidate, or uncertain non-episodic objects.
         """
 
+        bridge_objects = self._same_process_snapshot_bridge_objects()
+        if bridge_objects is not None:
+            workflow_event(
+                kind="branch",
+                msg="longterm_objects_same_process_snapshot_bridge",
+                details={
+                    "query_present": bool(_normalize_text(query_text)),
+                    "limit": max(1, limit),
+                },
+            )
+            return self._select_relevant_objects_from_loaded(
+                objects=bridge_objects,
+                query_text=query_text,
+                include_episodes=False,
+                limit=limit,
+                require_query_match=False,
+            )
         remote_selected = self._remote_select_objects(
             query_text=query_text,
             limit=limit,
@@ -1582,36 +1796,100 @@ class LongTermStructuredStore:
         if remote_selected is not None:
             return remote_selected
         with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
-            bounded_limit = max(1, limit)  # AUDIT-FIX(#9): Prevent negative/zero slicing quirks.
-            objects = tuple(
-                sorted(
-                    (
-                        item
-                        for item in self.load_objects()
-                        if item.kind != "episode" and item.status in {"active", "candidate", "uncertain"}
-                    ),
-                    key=lambda item: (
-                        _coerce_aware_utc(item.updated_at),
-                        _coerce_aware_utc(item.created_at),
-                        item.memory_id,
-                    ),
-                    reverse=True,
-                )
+            return self._select_relevant_objects_from_loaded(
+                objects=self.load_objects(),
+                query_text=query_text,
+                include_episodes=False,
+                limit=limit,
+                require_query_match=False,
             )
-            if not objects:
-                return ()
-            clean_query = _normalize_text(query_text)
-            if not clean_query:
-                return objects[:bounded_limit]
-            selector = self._object_selector(objects)
-            selected_ids = selector.search(clean_query, limit=bounded_limit)
-            by_id = {item.memory_id: item for item in objects}
-            selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
-            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
-            return self.rank_selected_objects(
-                query_texts=(clean_query,),
-                objects=filtered,
+
+    def select_fast_topic_objects(
+        self,
+        *,
+        query_text: str | None,
+        limit: int = 3,
+        timeout_s: float | None = None,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Select a tiny live object set for one bounded fast-topic hint block."""
+
+        bounded_limit = max(1, int(limit))
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            return ()
+        bridge_objects = self._same_process_snapshot_bridge_objects()
+        if bridge_objects is not None:
+            workflow_event(
+                kind="branch",
+                msg="longterm_fast_topic_same_process_snapshot_bridge",
+                details={
+                    "query_present": True,
+                    "limit": bounded_limit,
+                },
+            )
+            return self._select_fast_topic_objects_from_objects(
+                clean_query=clean_query,
+                objects=bridge_objects,
                 limit=bounded_limit,
+            )
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                direct_payloads = _run_timed_workflow_step(
+                    name="longterm_fast_topic_scope_payload_search",
+                    kind="retrieval",
+                    details=_retrieval_trace_details(
+                        clean_query,
+                        durable_limit=bounded_limit,
+                        candidate_limit=bounded_limit,
+                    ),
+                    operation=lambda: remote_catalog.search_current_item_payloads_fast(
+                        snapshot_kind="objects",
+                        query_text=clean_query,
+                        limit=bounded_limit,
+                        timeout_s=timeout_s,
+                    ),
+                )
+                return self._filter_fast_topic_objects_for_query(
+                    clean_query=clean_query,
+                    objects=self._load_remote_objects_from_payloads(payloads=direct_payloads),
+                    limit=bounded_limit,
+                )
+            except LongTermRemoteReadFailedError:
+                if self._remote_is_required():
+                    raise
+                local_selected = self._select_fast_topic_objects_from_local_snapshot(
+                    clean_query=clean_query,
+                    limit=bounded_limit,
+                )
+                return local_selected or ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                local_selected = self._select_fast_topic_objects_from_local_snapshot(
+                    clean_query=clean_query,
+                    limit=bounded_limit,
+                )
+                return local_selected or ()
+        local_selected = self._select_fast_topic_objects_from_local_snapshot(
+            clean_query=clean_query,
+            limit=bounded_limit,
+        )
+        return local_selected or ()
+
+    def _select_fast_topic_objects_from_local_snapshot(
+        self,
+        *,
+        clean_query: str,
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Search the local object snapshot when remote fast-topic retrieval is not required."""
+
+        with self._lock:  # AUDIT-FIX(#3): Keep local snapshot retrieval consistent with concurrent writes.
+            return self._select_fast_topic_objects_from_objects(
+                clean_query=clean_query,
+                objects=self.load_objects(),
+                limit=limit,
             )
 
     def select_open_conflicts(
@@ -1689,6 +1967,27 @@ class LongTermStructuredStore:
         clean_query = _normalize_text(query_text)
         if not clean_query:
             return (), ()
+        bridge_objects = self._same_process_snapshot_bridge_objects()
+        if bridge_objects is not None:
+            workflow_event(
+                kind="branch",
+                msg="longterm_context_objects_same_process_snapshot_bridge",
+                details=_retrieval_trace_details(
+                    clean_query,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                ),
+            )
+            return self._rescue_underfilled_context_sections(
+                query_text=clean_query,
+                partitioned=self._partition_context_objects(
+                    query_text=clean_query,
+                    objects=bridge_objects,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                ),
+                durable_limit=resolved_durable_limit,
+            )
 
         remote_catalog = self._remote_catalog
         shared_limit = self._shared_context_object_limit(
@@ -1696,6 +1995,53 @@ class LongTermStructuredStore:
             durable_limit=resolved_durable_limit,
         )
         retry_limit = max(resolved_episodic_limit, resolved_durable_limit, 1)
+        workflow_decision(
+            msg="longterm_context_objects_selection_strategy",
+            question="Which retrieval route should build the shared episodic and durable object context?",
+            selected={
+                "id": "remote_scope_then_catalog" if self._remote_catalog_enabled() and remote_catalog is not None else "local_selector",
+                "summary": (
+                    "Prefer current-scope remote retrieval, then catalog rescue."
+                    if self._remote_catalog_enabled() and remote_catalog is not None
+                    else "Use the local selector over already loaded object snapshots."
+                ),
+            },
+            options=[
+                {
+                    "id": "remote_scope_then_catalog",
+                    "summary": "Use ChonkyDB current-scope retrieval first and fall back to catalog-backed selection only when needed.",
+                    "score_components": {
+                        "remote_catalog_enabled": bool(self._remote_catalog_enabled() and remote_catalog is not None),
+                        "shared_limit": shared_limit,
+                        "retry_limit": retry_limit,
+                    },
+                    "constraints_violated": [] if self._remote_catalog_enabled() and remote_catalog is not None else ["remote_catalog_disabled"],
+                },
+                {
+                    "id": "local_selector",
+                    "summary": "Search the already loaded local object snapshot directly.",
+                    "score_components": {
+                        "remote_catalog_enabled": bool(self._remote_catalog_enabled() and remote_catalog is not None),
+                        "shared_limit": shared_limit,
+                    },
+                    "constraints_violated": [] if not (self._remote_catalog_enabled() and remote_catalog is not None) else ["not_preferred_when_remote_catalog_available"],
+                },
+            ],
+            context=_retrieval_trace_details(
+                clean_query,
+                episodic_limit=resolved_episodic_limit,
+                durable_limit=resolved_durable_limit,
+            ),
+            confidence="high",
+            guardrails=[
+                "Use one shared object search so the Pi does not pay the same remote roundtrip twice.",
+                "Keep current-scope retrieval authoritative before falling back to catalog hydration.",
+            ],
+            kpi_impact_estimate={
+                "shared_limit": shared_limit,
+                "retry_limit": retry_limit,
+            },
+        )
         if self._remote_catalog_enabled() and remote_catalog is not None:
             attempted_limits: list[int] = []
             for candidate_limit in (shared_limit, retry_limit):
@@ -1703,37 +2049,138 @@ class LongTermStructuredStore:
                     continue
                 attempted_limits.append(candidate_limit)
                 try:
-                    direct_payloads = remote_catalog.search_current_item_payloads(
-                        snapshot_kind="objects",
-                        query_text=clean_query,
-                        limit=candidate_limit,
-                        allow_catalog_fallback=True,
+                    direct_payloads = _run_timed_workflow_step(
+                        name="longterm_context_objects_scope_payload_search",
+                        kind="retrieval",
+                        details=_retrieval_trace_details(
+                            clean_query,
+                            episodic_limit=resolved_episodic_limit,
+                            durable_limit=resolved_durable_limit,
+                            candidate_limit=candidate_limit,
+                        ),
+                        operation=lambda: remote_catalog.search_current_item_payloads(
+                            snapshot_kind="objects",
+                            query_text=clean_query,
+                            limit=candidate_limit,
+                            allow_catalog_fallback=False,
+                        ),
                     )
                 except Exception:
                     if self._remote_is_required():
                         raise
                     direct_payloads = None
                 if direct_payloads is None:
+                    workflow_event(
+                        kind="branch",
+                        msg="longterm_context_objects_scope_unavailable",
+                        details=_retrieval_trace_details(
+                            clean_query,
+                            episodic_limit=resolved_episodic_limit,
+                            durable_limit=resolved_durable_limit,
+                            candidate_limit=candidate_limit,
+                        ),
+                        reason={
+                            "selected": {"id": "catalog_rescue", "summary": "Current-scope retrieval was unavailable; continue into catalog-backed selection."},
+                            "options": [
+                                {"id": "catalog_rescue", "summary": "Continue into catalog-backed selection.", "constraints_violated": []},
+                                {"id": "abort_scope_retry", "summary": "Abort shared context lookup entirely.", "constraints_violated": ["would_hide_relevant_memory"]},
+                            ],
+                        },
+                    )
                     continue
-                shared_objects = self._load_remote_objects_from_payloads(payloads=direct_payloads)
-                partitioned = self._partition_context_objects(
-                    query_text=clean_query,
-                    objects=shared_objects,
-                    episodic_limit=resolved_episodic_limit,
-                    durable_limit=resolved_durable_limit,
-                )
+                with workflow_span(
+                    name="longterm_context_objects_partition_shared_pool",
+                    kind="retrieval",
+                    details=_retrieval_trace_details(
+                        clean_query,
+                        episodic_limit=resolved_episodic_limit,
+                        durable_limit=resolved_durable_limit,
+                        candidate_limit=candidate_limit,
+                        payload_count=len(direct_payloads),
+                    ),
+                ):
+                    shared_objects = self._load_remote_objects_from_payloads(payloads=direct_payloads)
+                    partitioned = self._partition_context_objects(
+                        query_text=clean_query,
+                        objects=shared_objects,
+                        episodic_limit=resolved_episodic_limit,
+                        durable_limit=resolved_durable_limit,
+                    )
                 # Current-scope hits can briefly deserialize into payloads that
                 # no longer survive the active/candidate/uncertain partition
                 # after a fresh confirmation or supersede write. In that case,
                 # keep going into catalog-backed rescue instead of returning an
                 # empty provider-context durable section.
                 if direct_payloads and not partitioned[0] and not partitioned[1]:
+                    if not self._collapsed_scope_partition_needs_catalog_rescue(
+                        query_text=clean_query,
+                        objects=shared_objects,
+                    ):
+                        workflow_event(
+                            kind="branch",
+                            msg="longterm_context_objects_scope_authoritative_miss",
+                            details=_retrieval_trace_details(
+                                clean_query,
+                                episodic_limit=resolved_episodic_limit,
+                                durable_limit=resolved_durable_limit,
+                                candidate_limit=candidate_limit,
+                                payload_count=len(direct_payloads),
+                            ),
+                            reason={
+                                "selected": {
+                                    "id": "return_empty_partition",
+                                    "summary": "Current-scope hits stayed off-topic after active-status filtering, so broader catalog rescue would only repeat the same miss work.",
+                                },
+                                "options": [
+                                    {
+                                        "id": "return_empty_partition",
+                                        "summary": "Treat the active scope payloads as an authoritative semantic miss.",
+                                        "constraints_violated": [],
+                                    },
+                                    {
+                                        "id": "retry_or_catalog_rescue",
+                                        "summary": "Continue into the next candidate window or catalog rescue.",
+                                        "constraints_violated": ["would_repeat_off_topic_remote_work"],
+                                    },
+                                ],
+                            },
+                        )
+                        return (), ()
+                    workflow_event(
+                        kind="branch",
+                        msg="longterm_context_objects_scope_partition_empty",
+                        details=_retrieval_trace_details(
+                            clean_query,
+                            episodic_limit=resolved_episodic_limit,
+                            durable_limit=resolved_durable_limit,
+                            candidate_limit=candidate_limit,
+                            payload_count=len(direct_payloads),
+                        ),
+                        reason={
+                            "selected": {"id": "retry_or_catalog_rescue", "summary": "Scope hits collapsed after partitioning; keep searching instead of returning empty context."},
+                            "options": [
+                                {"id": "retry_or_catalog_rescue", "summary": "Continue into the next candidate window or catalog rescue.", "constraints_violated": []},
+                                {"id": "return_empty_partition", "summary": "Return no shared context objects.", "constraints_violated": ["would_hide_fresh_current_facts"]},
+                            ],
+                        },
+                    )
                     continue
-                return self._rescue_underfilled_context_sections(
-                    query_text=clean_query,
-                    partitioned=partitioned,
-                    durable_limit=resolved_durable_limit,
-                )
+                with workflow_span(
+                    name="longterm_context_objects_rescue_underfilled_sections",
+                    kind="retrieval",
+                    details=_retrieval_trace_details(
+                        clean_query,
+                        episodic_limit=resolved_episodic_limit,
+                        durable_limit=resolved_durable_limit,
+                        candidate_limit=candidate_limit,
+                        payload_count=len(direct_payloads),
+                    ),
+                ):
+                    return self._rescue_underfilled_context_sections(
+                        query_text=clean_query,
+                        partitioned=partitioned,
+                        durable_limit=resolved_durable_limit,
+                    )
             try:
                 if not remote_catalog.catalog_available(snapshot_kind="objects"):
                     return (), ()
@@ -1741,25 +2188,56 @@ class LongTermStructuredStore:
                 if self._remote_is_required():
                     raise
                 return (), ()
-            entries = remote_catalog.search_catalog_entries(
-                snapshot_kind="objects",
-                query_text=clean_query,
-                limit=shared_limit,
+            entries = _run_timed_workflow_step(
+                name="longterm_context_objects_catalog_search",
+                kind="retrieval",
+                details=_retrieval_trace_details(
+                    clean_query,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                    candidate_limit=shared_limit,
+                ),
+                operation=lambda: remote_catalog.search_catalog_entries(
+                    snapshot_kind="objects",
+                    query_text=clean_query,
+                    limit=shared_limit,
+                ),
             )
-            shared_objects = self._load_remote_objects_from_entries(
-                entries=entries,
-                snapshot_kind="objects",
-            )
-            return self._rescue_underfilled_context_sections(
-                query_text=clean_query,
-                partitioned=self._partition_context_objects(
+            with workflow_span(
+                name="longterm_context_objects_catalog_hydrate",
+                kind="retrieval",
+                details=_retrieval_trace_details(
+                    clean_query,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                    entry_count=len(entries),
+                ),
+            ):
+                shared_objects = self._load_remote_objects_from_entries(
+                    entries=entries,
+                    snapshot_kind="objects",
+                )
+                partitioned = self._partition_context_objects(
                     query_text=clean_query,
                     objects=shared_objects,
                     episodic_limit=resolved_episodic_limit,
                     durable_limit=resolved_durable_limit,
+                )
+            with workflow_span(
+                name="longterm_context_objects_rescue_underfilled_sections",
+                kind="retrieval",
+                details=_retrieval_trace_details(
+                    clean_query,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                    entry_count=len(entries),
                 ),
-                durable_limit=resolved_durable_limit,
-            )
+            ):
+                return self._rescue_underfilled_context_sections(
+                    query_text=clean_query,
+                    partitioned=partitioned,
+                    durable_limit=resolved_durable_limit,
+                )
 
         with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
             objects = tuple(
@@ -1987,6 +2465,83 @@ class LongTermStructuredStore:
         )
         return tuple(item for _index, item in ranked[:bounded_limit])
 
+    def _select_fast_topic_objects_from_loaded(
+        self,
+        *,
+        objects: Iterable[LongTermMemoryObjectV1],
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Keep fast-topic recall tiny and limited to current live objects."""
+
+        selected: list[LongTermMemoryObjectV1] = []
+        seen_memory_ids: set[str] = set()
+        bounded_limit = max(1, int(limit))
+        for item in objects:
+            if item.memory_id in seen_memory_ids:
+                continue
+            if item.status not in {"active", "candidate", "uncertain"}:
+                continue
+            seen_memory_ids.add(item.memory_id)
+            selected.append(item)
+            if len(selected) >= bounded_limit:
+                break
+        return tuple(selected)
+
+    def _filter_fast_topic_objects_for_query(
+        self,
+        *,
+        clean_query: str,
+        objects: Iterable[LongTermMemoryObjectV1],
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Keep quick-memory hints topic-anchored for the current query.
+
+        Fast topic reads are intentionally tiny and latency-first, but they
+        still need the same content-bearing overlap gate that the wider durable
+        recall path already applies. Without that second-stage filter, a weak
+        semantic hit such as an old jam preference can leak into control
+        questions like ``Was ist ein Regenbogen?`` simply because it was the
+        best object available in a tiny current-scope top-k result set.
+        """
+
+        eligible_objects = list(self._select_fast_topic_objects_from_loaded(objects=objects, limit=max(1, int(limit))))
+        if not eligible_objects:
+            return ()
+        filtered = self._filter_query_relevant_objects(
+            clean_query,
+            selected=eligible_objects,
+            limit=max(1, int(limit)),
+        )
+        if not filtered:
+            return ()
+        return self._select_fast_topic_objects_from_loaded(objects=filtered, limit=max(1, int(limit)))
+
+    def _select_fast_topic_objects_from_objects(
+        self,
+        *,
+        clean_query: str,
+        objects: Iterable[LongTermMemoryObjectV1],
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Run the bounded fast-topic selector over one already-loaded object pool."""
+
+        eligible_objects = tuple(
+            item
+            for item in objects
+            if item.status in {"active", "candidate", "uncertain"}
+        )
+        if not eligible_objects:
+            return ()
+        selector = self._object_selector(eligible_objects)
+        selected_ids = selector.search(clean_query, limit=limit)
+        by_id = {item.memory_id: item for item in eligible_objects}
+        selected = tuple(by_id[memory_id] for memory_id in selected_ids if memory_id in by_id)
+        return self._filter_fast_topic_objects_for_query(
+            clean_query=clean_query,
+            objects=selected,
+            limit=limit,
+        )
+
     def _shared_context_object_limit(
         self,
         *,
@@ -2044,6 +2599,41 @@ class LongTermStructuredStore:
             else ()
         )
         return episodic_ranked, durable_ranked
+
+    def _collapsed_scope_partition_needs_catalog_rescue(
+        self,
+        *,
+        query_text: str,
+        objects: Iterable[LongTermMemoryObjectV1],
+    ) -> bool:
+        """Return whether an empty scope partition may still hide current facts.
+
+        Current-scope `topk_records(scope_ref=...)` can return stale payloads
+        right after a confirmation/supersede write. When the candidate objects
+        still overlap the query semantically, the broader catalog path can
+        recover the fresh record and must stay available. Pure off-topic drift,
+        however, should stop here instead of paying the same remote catalog
+        rescue/hydration cost only to return an empty context again.
+        """
+
+        eligible_objects = tuple(
+            item
+            for item in objects
+            if item.status in {"active", "candidate", "uncertain"}
+        )
+        if not eligible_objects:
+            return True
+        query_terms = self._query_match_terms(retrieval_terms(query_text))
+        if not query_terms:
+            return False
+        semantic_query_terms = self._semantic_query_terms(query_terms)
+        for item in eligible_objects:
+            if self._has_query_overlap(
+                query_terms=semantic_query_terms or query_terms,
+                document_terms=retrieval_terms(self._object_semantic_search_text(item)),
+            ):
+                return True
+        return False
 
     def _rescue_underfilled_context_sections(
         self,
@@ -2147,6 +2737,35 @@ class LongTermStructuredStore:
         }
         return informative or normalized
 
+    def _semantic_query_terms(self, query_terms: Iterable[str]) -> set[str]:
+        """Return topic-bearing terms after removing memory-state-only vocabulary."""
+
+        return {
+            term
+            for term in self._query_match_terms(query_terms)
+            if term not in _OBJECT_STATE_QUERY_TERMS
+        }
+
+    def _has_query_overlap(
+        self,
+        *,
+        query_terms: Iterable[str],
+        document_terms: Iterable[str],
+    ) -> bool:
+        """Return whether document terms overlap one query through exact or compound matches."""
+
+        informative_query_terms = self._query_match_terms(query_terms)
+        informative_document_terms = self._query_match_terms(document_terms)
+        if not informative_query_terms or not informative_document_terms:
+            return False
+        if informative_query_terms.intersection(informative_document_terms):
+            return True
+        for query_term in informative_query_terms:
+            for document_term in informative_document_terms:
+                if query_term in document_term or document_term in query_term:
+                    return True
+        return False
+
     def _object_query_overlap_score(
         self,
         *,
@@ -2197,12 +2816,49 @@ class LongTermStructuredStore:
         query_terms = self._query_match_terms(retrieval_terms(query_text))
         if not query_terms:
             return tuple(selected[: max(1, limit)])
+        semantic_query_terms = self._semantic_query_terms(query_terms)
+        topic_terms_by_id = {
+            item.memory_id: tuple(retrieval_terms(self._object_semantic_search_text(item)))
+            for item in selected
+        }
+        if semantic_query_terms:
+            semantic_matches = [
+                item
+                for item in selected
+                if self._has_query_overlap(
+                    query_terms=semantic_query_terms,
+                    document_terms=topic_terms_by_id.get(item.memory_id, ()),
+                )
+            ]
+            if semantic_matches:
+                anchor_terms: list[str] = []
+                for item in semantic_matches:
+                    anchor_terms.extend(topic_terms_by_id.get(item.memory_id, ()))
+                expanded_matches = [
+                    item
+                    for item in selected
+                    if self._has_query_overlap(
+                        query_terms=anchor_terms,
+                        document_terms=topic_terms_by_id.get(item.memory_id, ()),
+                    )
+                ]
+                if expanded_matches:
+                    return tuple(expanded_matches[: max(1, limit)])
+                return tuple(semantic_matches[: max(1, limit)])
         filtered = [
             item
             for item in selected
-            if query_terms.intersection(retrieval_terms(self._object_search_text(item)))
+            if self._has_query_overlap(
+                query_terms=query_terms,
+                document_terms=retrieval_terms(self._object_search_text(item)),
+            )
         ]
         return tuple(filtered[: max(1, limit)])
+
+    def _object_semantic_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        """Return one retrieval text stripped of synthetic state-only terms."""
+
+        return _normalize_text(" ".join(part for part in (item.summary, item.details or "") if part))
 
     def _filter_query_relevant_conflicts(
         self,

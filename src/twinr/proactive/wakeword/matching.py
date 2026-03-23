@@ -168,6 +168,49 @@ class WakewordPhraseSpotter:
         return _clean_text(transcript)  # AUDIT-FIX(#2): Coerce non-string backend results safely before downstream normalization.
 
 
+class WakewordTailTranscriptExtractor:
+    """Extract continuation text after stage one already confirmed the wakeword.
+
+    Some low-latency STT paths omit the leading wake phrase and return only the
+    spoken tail, even when the capture still begins with the wakeword. For the
+    backend-led orchestrator path, stage one has already confirmed the wake hit,
+    so the remaining-text extractor must accept either:
+
+    - a transcript that still contains the wake phrase, or
+    - an already-trimmed continuation transcript that starts after the wake.
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: OpenAIBackend,
+        phrases: tuple[str, ...] | list[str],
+        language: str | None = None,
+        min_prefix_ratio: float = _DEFAULT_MIN_PREFIX_RATIO,
+    ) -> None:
+        self._phrase_spotter = WakewordPhraseSpotter(
+            backend=backend,
+            phrases=phrases,
+            language=language,
+            min_prefix_ratio=min_prefix_ratio,
+        )
+        self.phrases = self._phrase_spotter.phrases
+
+    def extract(self, capture: AmbientAudioCaptureWindow) -> str:
+        """Return the spoken continuation text from one confirmed-wake capture."""
+
+        match = self._phrase_spotter.detect(capture)
+        if match.detected:
+            return _clean_text(match.remaining_text)
+        transcript = _clean_text(match.transcript)
+        if not transcript:
+            return ""
+        normalized_transcript = _normalize_text(transcript)
+        if normalized_transcript in self.phrases:
+            return ""
+        return transcript
+
+
 def wakeword_primary_prompt(phrases: tuple[str, ...] | list[str]) -> str | None:
     """Build a transcription prompt from the configured wakeword names."""
 
@@ -391,6 +434,7 @@ __all__ = [
     "DEFAULT_WAKEWORD_PHRASES",
     "WakewordMatch",
     "WakewordPhraseSpotter",
+    "WakewordTailTranscriptExtractor",
     "match_wakeword_transcript",
     "normalize_detector_label",
     "phrase_from_detector_label",

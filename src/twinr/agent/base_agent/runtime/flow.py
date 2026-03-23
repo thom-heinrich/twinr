@@ -98,6 +98,17 @@ class TwinrRuntimeFlowMixin:
             raise RuntimeError("No transcript is available for response generation")
         return transcript.strip()
 
+    def refresh_snapshot_activity(self) -> None:
+        """Refresh the runtime snapshot timestamp without changing state.
+
+        Long-running playback can legitimately outlive the supervisor snapshot
+        age budget. This keeps the current runtime state visible without
+        pretending that a new state transition happened.
+        """
+
+        with self._runtime_flow_lock():
+            self._persist_snapshot_safe()
+
     def _store_agent_turn(self, cleaned_answer: str, *, transition_to_answering: bool) -> str:
         with self._runtime_flow_lock():  # AUDIT-FIX(#7): Keep transition-to-answering and response storage atomic.
             transcript = self._validated_last_transcript()
@@ -206,6 +217,20 @@ class TwinrRuntimeFlowMixin:
         with self._runtime_flow_lock():  # AUDIT-FIX(#5): Serialize state transitions with transcript/print operations.
             status = self.state_machine.transition(TwinrEvent.RESPONSE_READY)
             self._persist_snapshot_safe()
+        return status
+
+    def resume_processing(self) -> TwinrStatus:
+        """Return from a spoken bridge acknowledgement back to processing."""
+
+        with self._runtime_flow_lock():
+            status = self.state_machine.transition(TwinrEvent.PROCESSING_RESUMED)
+            self._persist_snapshot_safe()
+
+        self._append_ops_event(
+            event="processing_resumed",
+            message="Twinr resumed processing after the spoken acknowledgement.",
+            data={"status": status.value},
+        )
         return status
 
     def begin_proactive_prompt(self, prompt: str) -> str:

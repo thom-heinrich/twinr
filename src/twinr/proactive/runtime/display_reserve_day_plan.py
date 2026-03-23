@@ -21,30 +21,37 @@ from pathlib import Path
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
-from twinr.agent.personality.service import PersonalityContextService
+from twinr.display.reserve_bus_feedback import (
+    DisplayReserveBusFeedbackSignal,
+    DisplayReserveBusFeedbackStore,
+)
+
+from .display_reserve_candidates import load_display_reserve_candidates
 
 _DEFAULT_PLAN_PATH = "artifacts/stores/ops/display_reserve_bus_plan.json"
 _DEFAULT_REFRESH_AFTER_LOCAL = "05:30"
 _DEFAULT_CANDIDATE_LIMIT = 8
 _DEFAULT_ITEMS_PER_DAY = 30
 _DEFAULT_TOPIC_GAP = 2
+_DEFAULT_SOURCE_GAP = 1
+_DEFAULT_FAMILY_GAP = 1
 _EMPTY_PLAN_RETRY_S = 60.0
-_DEFAULT_MIN_HOLD_S = 12.0 * 60.0
-_DEFAULT_BASE_HOLD_S = 26.0 * 60.0
-_DEFAULT_MAX_HOLD_S = 45.0 * 60.0
+_DEFAULT_MIN_HOLD_S = 4.0 * 60.0
+_DEFAULT_BASE_HOLD_S = 8.0 * 60.0
+_DEFAULT_MAX_HOLD_S = 12.0 * 60.0
 
 _ACTION_BONUS_S = {
-    "silent": -4.0 * 60.0,
+    "silent": -2.0 * 60.0,
     "hint": 0.0,
-    "brief_update": 3.0 * 60.0,
-    "ask_one": 5.0 * 60.0,
-    "invite_follow_up": 7.0 * 60.0,
+    "brief_update": 1.0 * 60.0,
+    "ask_one": 2.0 * 60.0,
+    "invite_follow_up": 3.0 * 60.0,
 }
 _ATTENTION_BONUS_S = {
     "background": 0.0,
-    "growing": 2.0 * 60.0,
-    "forming": 4.0 * 60.0,
-    "shared_thread": 6.0 * 60.0,
+    "growing": 1.0 * 60.0,
+    "forming": 2.0 * 60.0,
+    "shared_thread": 3.0 * 60.0,
 }
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,6 +144,22 @@ def _bounded_seconds(value: object, *, default: float, minimum: float, maximum: 
     return max(minimum, min(maximum, number))
 
 
+def _normalize_topic_keys(values: Sequence[object] | None) -> tuple[str, ...]:
+    """Normalize one ordered set of retired topic keys."""
+
+    if not values:
+        return ()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        compact = _compact_text(value, max_len=96).casefold()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        ordered.append(compact)
+    return tuple(ordered)
+
+
 def _stable_fraction(*parts: object) -> float:
     """Return one deterministic fraction in the inclusive 0..1 range."""
 
@@ -154,9 +177,8 @@ def _default_candidate_loader(
 ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
     """Load the current reserve candidates from structured personality state."""
 
-    service = PersonalityContextService()
-    return service.load_display_impulse_candidates(
-        config=config,
+    return load_display_reserve_candidates(
+        config,
         local_now=local_now,
         max_items=max_items,
     )
@@ -177,6 +199,7 @@ class DisplayReservePlannedItem:
     symbol: str
     accent: str
     reason: str
+    candidate_family: str
     salience: float
     hold_seconds: float
 
@@ -191,11 +214,12 @@ class DisplayReservePlannedItem:
             action=_compact_text(payload.get("action"), max_len=24).lower() or "hint",
             attention_state=_compact_text(payload.get("attention_state"), max_len=24).lower() or "background",
             eyebrow=_compact_text(payload.get("eyebrow"), max_len=36),
-            headline=_compact_text(payload.get("headline"), max_len=64),
-            body=_compact_text(payload.get("body"), max_len=132),
+            headline=_compact_text(payload.get("headline"), max_len=128),
+            body=_compact_text(payload.get("body"), max_len=128),
             symbol=_compact_text(payload.get("symbol"), max_len=24) or "sparkles",
             accent=_compact_text(payload.get("accent"), max_len=24).lower() or "info",
             reason=_compact_text(payload.get("reason"), max_len=120),
+            candidate_family=_compact_text(payload.get("candidate_family"), max_len=40).casefold() or "general",
             salience=float(payload.get("salience", 0.0) or 0.0),
             hold_seconds=_bounded_seconds(
                 payload.get("hold_seconds"),
@@ -222,11 +246,12 @@ class DisplayReservePlannedItem:
             action=_compact_text(candidate.action, max_len=24).lower() or "hint",
             attention_state=_compact_text(candidate.attention_state, max_len=24).lower() or "background",
             eyebrow=_compact_text(candidate.eyebrow, max_len=36),
-            headline=_compact_text(candidate.headline, max_len=64),
-            body=_compact_text(candidate.body, max_len=132),
+            headline=_compact_text(candidate.headline, max_len=128),
+            body=_compact_text(candidate.body, max_len=128),
             symbol=_compact_text(candidate.symbol, max_len=24) or "sparkles",
             accent=_compact_text(candidate.accent, max_len=24).lower() or "info",
             reason=_compact_text(reason, max_len=120),
+            candidate_family=_compact_text(candidate.candidate_family, max_len=40).casefold() or "general",
             salience=max(0.0, float(candidate.salience)),
             hold_seconds=_bounded_seconds(
                 hold_seconds,
@@ -251,6 +276,7 @@ class DisplayReserveDayPlan:
     cursor: int
     items: tuple[DisplayReservePlannedItem, ...]
     candidate_count: int = 0
+    retired_topic_keys: tuple[str, ...] = ()
 
     @classmethod
     def empty(cls, *, local_day: LocalDate, generated_at: datetime | None = None) -> "DisplayReserveDayPlan":
@@ -262,6 +288,7 @@ class DisplayReserveDayPlan:
             cursor=0,
             items=(),
             candidate_count=0,
+            retired_topic_keys=(),
         )
 
     @classmethod
@@ -287,6 +314,7 @@ class DisplayReserveDayPlan:
             cursor=cursor,
             items=items,
             candidate_count=max(0, int(payload.get("candidate_count", len(items)) or len(items))),
+            retired_topic_keys=_normalize_topic_keys(payload.get("retired_topic_keys")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -297,20 +325,43 @@ class DisplayReserveDayPlan:
             "generated_at": self.generated_at,
             "cursor": self.cursor,
             "candidate_count": self.candidate_count,
+            "retired_topic_keys": list(self.retired_topic_keys),
             "items": [item.to_dict() for item in self.items],
         }
 
-    def current_item(self) -> DisplayReservePlannedItem | None:
-        """Return the current item at the plan cursor, if any exist."""
+    def active_items(self) -> tuple[DisplayReservePlannedItem, ...]:
+        """Return the current same-day rotation after answered topics are retired."""
 
-        if not self.items:
+        if not self.retired_topic_keys:
+            return self.items
+        retired = set(self.retired_topic_keys)
+        return tuple(item for item in self.items if item.topic_key not in retired)
+
+    def current_item(self) -> DisplayReservePlannedItem | None:
+        """Return the current rotating item for the local day."""
+
+        active_items = self.active_items()
+        if not active_items:
             return None
-        return self.items[self.cursor % len(self.items)]
+        return active_items[self.cursor % len(active_items)]
+
+    def last_shown_item(self) -> DisplayReservePlannedItem | None:
+        """Return the most recently shown item for the current local day."""
+
+        active_items = self.active_items()
+        if not active_items or self.cursor <= 0:
+            return None
+        return active_items[(self.cursor - 1) % len(active_items)]
+
+    def is_exhausted(self) -> bool:
+        """Return whether no active same-day rotation items remain."""
+
+        return not bool(self.active_items())
 
     def advance(self) -> "DisplayReserveDayPlan":
         """Return one copy of the plan with the cursor advanced by one slot."""
 
-        if not self.items:
+        if not self.active_items():
             return self
         return DisplayReserveDayPlan(
             local_day=self.local_day,
@@ -318,6 +369,22 @@ class DisplayReserveDayPlan:
             cursor=self.cursor + 1,
             items=self.items,
             candidate_count=self.candidate_count,
+            retired_topic_keys=self.retired_topic_keys,
+        )
+
+    def retire_topics(self, topic_keys: Sequence[object]) -> "DisplayReserveDayPlan":
+        """Return one copy with additional answered same-day topics retired."""
+
+        retired_topic_keys = _normalize_topic_keys((*self.retired_topic_keys, *topic_keys))
+        if retired_topic_keys == self.retired_topic_keys:
+            return self
+        return DisplayReserveDayPlan(
+            local_day=self.local_day,
+            generated_at=self.generated_at,
+            cursor=self.cursor,
+            items=self.items,
+            candidate_count=self.candidate_count,
+            retired_topic_keys=retired_topic_keys,
         )
 
 
@@ -384,6 +451,7 @@ class DisplayReserveDayPlanner:
     """Build and persist one deterministic local-day reserve publication plan."""
 
     store: DisplayReserveDayPlanStore
+    feedback_store: DisplayReserveBusFeedbackStore | None = None
     candidate_loader: Callable[..., tuple[AmbientDisplayImpulseCandidate, ...]] = _default_candidate_loader
     local_now: Callable[[], datetime] = _default_local_now
 
@@ -391,7 +459,10 @@ class DisplayReserveDayPlanner:
     def from_config(cls, config: TwinrConfig) -> "DisplayReserveDayPlanner":
         """Build the planner and its persistent store from configuration."""
 
-        return cls(store=DisplayReserveDayPlanStore.from_config(config))
+        return cls(
+            store=DisplayReserveDayPlanStore.from_config(config),
+            feedback_store=DisplayReserveBusFeedbackStore.from_config(config),
+        )
 
     def ensure_plan(
         self,
@@ -408,15 +479,55 @@ class DisplayReserveDayPlanner:
             fallback=_DEFAULT_REFRESH_AFTER_LOCAL,
         )
         existing = self.store.load()
+        feedback_signal = self._load_active_feedback(local_now=effective_now)
         if self._plan_is_current(existing, current_day=current_day, local_now=effective_now, refresh_after=refresh_after):
+            if self._feedback_requires_rebuild(existing, feedback_signal=feedback_signal):
+                rebuilt = self._build_plan(
+                    config=config,
+                    local_now=effective_now,
+                    local_day=current_day,
+                    feedback_signal=feedback_signal,
+                    retired_topic_keys=self._retired_topic_keys(
+                        existing,
+                        feedback_signal=feedback_signal,
+                    ),
+                )
+                return self.store.save(rebuilt)
             if not self._should_retry_empty_current_plan(existing, local_now=effective_now):
                 return existing
         rebuilt = self._build_plan(
             config=config,
             local_now=effective_now,
             local_day=current_day,
+            feedback_signal=feedback_signal,
         )
         return self.store.save(rebuilt)
+
+    def build_plan_for_day(
+        self,
+        *,
+        config: TwinrConfig,
+        local_day: LocalDate,
+        local_now: datetime | None = None,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None = None,
+        retired_topic_keys: frozenset[str] = frozenset(),
+    ) -> DisplayReserveDayPlan:
+        """Build one unsaved plan for the requested local day.
+
+        The explicit nightly companion planner uses this method to prepare the
+        next day ahead of time without replacing the active current-day plan
+        immediately. Runtime publication still persists the adopted plan only
+        when the next local day actually starts.
+        """
+
+        effective_now = (local_now or self.local_now()).astimezone()
+        return self._build_plan(
+            config=config,
+            local_now=effective_now,
+            local_day=local_day,
+            feedback_signal=feedback_signal,
+            retired_topic_keys=retired_topic_keys,
+        )
 
     def peek_next_item(
         self,
@@ -427,6 +538,19 @@ class DisplayReserveDayPlanner:
         """Return the next planned reserve item for the current local day."""
 
         return self.ensure_plan(config=config, local_now=local_now).current_item()
+
+    def peek_idle_fill_item(
+        self,
+        *,
+        config: TwinrConfig,
+        local_now: datetime | None = None,
+    ) -> DisplayReservePlannedItem | None:
+        """Return one passive same-day fill item when no active topics remain."""
+
+        plan = self.ensure_plan(config=config, local_now=local_now)
+        if not plan.is_exhausted():
+            return None
+        return plan.last_shown_item()
 
     def mark_published(
         self,
@@ -489,6 +613,8 @@ class DisplayReserveDayPlanner:
         config: TwinrConfig,
         local_now: datetime,
         local_day: LocalDate,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+        retired_topic_keys: frozenset[str] = frozenset(),
     ) -> DisplayReserveDayPlan:
         """Build one fresh local-day plan from current reserve candidates."""
 
@@ -510,6 +636,8 @@ class DisplayReserveDayPlanner:
             minimum=0,
             maximum=8,
         )
+        source_gap = _DEFAULT_SOURCE_GAP
+        family_gap = _DEFAULT_FAMILY_GAP
         candidates = tuple(
             self.candidate_loader(
                 config,
@@ -517,17 +645,35 @@ class DisplayReserveDayPlanner:
                 max_items=candidate_limit,
             )
         )
+        if retired_topic_keys:
+            candidates = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.topic_key not in retired_topic_keys
+            )
         if not candidates:
             return DisplayReserveDayPlan.empty(
                 local_day=local_day,
                 generated_at=local_now.astimezone(timezone.utc),
             )
-        counts = self._allocate_counts(candidates, slots=items_per_day, local_day=local_day)
+        cycle_slots = self._cycle_slots(
+            candidates=candidates,
+            configured_slots=items_per_day,
+        )
+        counts = self._allocate_counts(
+            candidates,
+            slots=cycle_slots,
+            local_day=local_day,
+            feedback_signal=feedback_signal,
+        )
         ordered = self._schedule_candidates(
             candidates,
             counts=counts,
             local_day=local_day,
             topic_gap=topic_gap,
+            source_gap=source_gap,
+            family_gap=family_gap,
+            feedback_signal=feedback_signal,
         )
         items = tuple(
             DisplayReservePlannedItem.from_candidate(
@@ -543,7 +689,26 @@ class DisplayReserveDayPlanner:
             cursor=0,
             items=items,
             candidate_count=len(candidates),
+            retired_topic_keys=_normalize_topic_keys(retired_topic_keys),
         )
+
+    def _cycle_slots(
+        self,
+        *,
+        candidates: Sequence[AmbientDisplayImpulseCandidate],
+        configured_slots: int,
+    ) -> int:
+        """Return the unique rotation length for the current candidate pool.
+
+        The planner stores one bounded unique cycle and reuses that cycle
+        throughout the same local day. Cards do not disappear merely because
+        they were shown once; they stay in rotation until real user feedback
+        retires them or the next nightly plan replaces the whole day.
+        """
+
+        if not candidates:
+            return 0
+        return min(max(1, int(configured_slots)), len(candidates))
 
     def _allocate_counts(
         self,
@@ -551,6 +716,7 @@ class DisplayReserveDayPlanner:
         *,
         slots: int,
         local_day: LocalDate,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
     ) -> dict[str, int]:
         """Allocate a bounded number of daily plan slots across candidates."""
 
@@ -560,7 +726,7 @@ class DisplayReserveDayPlanner:
             selected = sorted(
                 candidates,
                 key=lambda item: (
-                    self._candidate_weight(item),
+                    self._candidate_weight(item, feedback_signal=feedback_signal),
                     _stable_fraction(local_day.isoformat(), item.topic_key, "select"),
                 ),
                 reverse=True,
@@ -571,7 +737,7 @@ class DisplayReserveDayPlanner:
                 for candidate in candidates
             }
         weights = {
-            candidate.topic_key: self._candidate_weight(candidate)
+            candidate.topic_key: self._candidate_weight(candidate, feedback_signal=feedback_signal)
             for candidate in candidates
         }
         total = sum(weights.values()) or float(len(candidates))
@@ -620,6 +786,9 @@ class DisplayReserveDayPlanner:
         counts: Mapping[str, int],
         local_day: LocalDate,
         topic_gap: int,
+        source_gap: int,
+        family_gap: int,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
     ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
         """Spread repeated candidates across the day without topic clustering."""
 
@@ -627,18 +796,34 @@ class DisplayReserveDayPlanner:
         ordered: list[AmbientDisplayImpulseCandidate] = []
         while any(remaining.values()):
             recent_topics = tuple(item.topic_key for item in ordered[-topic_gap:]) if topic_gap > 0 else ()
+            recent_sources = tuple(item.source for item in ordered[-source_gap:]) if source_gap > 0 else ()
+            recent_families = (
+                tuple(self._candidate_family(item) for item in ordered[-family_gap:])
+                if family_gap > 0
+                else ()
+            )
             eligible = [
                 candidate
                 for candidate in candidates
-                if remaining.get(candidate.topic_key, 0) > 0 and candidate.topic_key not in recent_topics
+                if remaining.get(candidate.topic_key, 0) > 0
+                and candidate.topic_key not in recent_topics
+                and candidate.source not in recent_sources
+                and self._candidate_family(candidate) not in recent_families
             ]
+            if not eligible:
+                eligible = [
+                    candidate
+                    for candidate in candidates
+                    if remaining.get(candidate.topic_key, 0) > 0 and candidate.topic_key not in recent_topics
+                    and self._candidate_family(candidate) not in recent_families
+                ]
             if not eligible:
                 eligible = [candidate for candidate in candidates if remaining.get(candidate.topic_key, 0) > 0]
             candidate = max(
                 eligible,
                 key=lambda item: (
                     remaining[item.topic_key],
-                    self._candidate_weight(item),
+                    self._candidate_weight(item, feedback_signal=feedback_signal),
                     _stable_fraction(local_day.isoformat(), item.topic_key, len(ordered)),
                 ),
             )
@@ -646,7 +831,20 @@ class DisplayReserveDayPlanner:
             remaining[candidate.topic_key] -= 1
         return tuple(ordered)
 
-    def _candidate_weight(self, candidate: AmbientDisplayImpulseCandidate) -> float:
+    def _candidate_family(self, candidate: AmbientDisplayImpulseCandidate) -> str:
+        """Return one generic family token for reserve-plan mixing."""
+
+        family = _compact_text(getattr(candidate, "candidate_family", None), max_len=40).casefold()
+        if family:
+            return family
+        return _compact_text(candidate.source, max_len=40).casefold() or "general"
+
+    def _candidate_weight(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> float:
         """Return the relative planning weight for one reserve candidate."""
 
         action_bonus = {
@@ -661,7 +859,89 @@ class DisplayReserveDayPlanner:
             "forming": 0.16,
             "shared_thread": 0.24,
         }.get(candidate.attention_state, 0.00)
-        return 1.0 + max(0.0, float(candidate.salience)) + action_bonus + attention_bonus
+        return (
+            1.0
+            + max(0.0, float(candidate.salience))
+            + action_bonus
+            + attention_bonus
+            + self._feedback_weight_adjustment(candidate, feedback_signal=feedback_signal)
+        )
+
+    def _feedback_weight_adjustment(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> float:
+        """Return one short-lived planning bias from recent reserve feedback."""
+
+        if feedback_signal is None:
+            return 0.0
+        if candidate.topic_key != feedback_signal.topic_key:
+            return 0.0
+        intensity = max(0.0, min(1.0, float(feedback_signal.intensity)))
+        if feedback_signal.reaction == "immediate_engagement":
+            return 0.62 * intensity
+        if feedback_signal.reaction == "engaged":
+            return 0.38 * intensity
+        if feedback_signal.reaction == "cooled":
+            return -(0.26 * intensity)
+        if feedback_signal.reaction == "avoided":
+            return -(0.46 * intensity)
+        if feedback_signal.reaction == "ignored":
+            return -(0.18 * intensity)
+        return 0.0
+
+    def _load_active_feedback(
+        self,
+        *,
+        local_now: datetime,
+    ) -> DisplayReserveBusFeedbackSignal | None:
+        """Load the current active reserve-bus feedback hint, if any."""
+
+        if self.feedback_store is None:
+            return None
+        return self.feedback_store.load_active(now=local_now.astimezone(timezone.utc))
+
+    def _feedback_requires_rebuild(
+        self,
+        plan: DisplayReserveDayPlan | None,
+        *,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> bool:
+        """Return whether fresh bus feedback should rebuild today's plan."""
+
+        if plan is None or feedback_signal is None:
+            return False
+        if plan.is_exhausted():
+            return False
+        generated_at = _parse_timestamp(plan.generated_at)
+        if generated_at is None:
+            return True
+        return feedback_signal.requested_at_datetime() > generated_at
+
+    def _retired_topic_keys(
+        self,
+        plan: DisplayReserveDayPlan | None,
+        *,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> frozenset[str]:
+        """Return the same-day topic keys that should leave rotation now.
+
+        Cards stay in the same-day loop until the user actually responds to
+        them. Immediate/delayed engagement and explicit cooling/avoidance count
+        as answered. Merely being shown once, or later being weakly ignored,
+        does not retire the card from today's rotation.
+        """
+
+        retired = set(plan.retired_topic_keys if plan is not None else ())
+        if feedback_signal is None:
+            return frozenset(retired)
+        if not feedback_signal.topic_key:
+            return frozenset(retired)
+        if feedback_signal.reaction in {"immediate_engagement", "engaged", "cooled", "avoided"}:
+            retired.add(feedback_signal.topic_key)
+        return frozenset(retired)
 
     def _hold_seconds_for_candidate(
         self,

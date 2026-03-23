@@ -9,7 +9,7 @@ the provider bundle consumed by runtime loops and factories.
 `api` owns:
 - compose the canonical `OpenAIBackend` from shared mixins
 - bridge Twinr speech, text, tool-calling, supervisor, closure-decision, and first-word contracts onto the backend
-- validate structured supervisor decisions that now carry explicit `location_hint`, `date_context`, and `context_scope` fields for safer fast-lane routing
+- validate structured supervisor decisions that now carry explicit `location_hint`, `date_context`, and `context_scope` fields for safer fast-lane routing, while allowing handoff `spoken_ack` to stay null when no immediate bridge speech should be spoken
 - assemble the OpenAI provider bundle used by runtime callers
 
 `api` does **not** own:

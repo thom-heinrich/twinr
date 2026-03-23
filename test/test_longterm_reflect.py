@@ -285,6 +285,123 @@ class LongTermMemoryReflectorTests(unittest.TestCase):
         self.assertIn("home activity", packet.query_hints)
         self.assertEqual(packet.valid_from, "2026-03-16")
 
+    def test_reflector_classifies_environment_transition_and_quality_state(self) -> None:
+        reflector = LongTermMemoryReflector()
+        profile = LongTermMemoryObjectV1(
+            memory_id="environment_profile:home_main:day:2026-03-22",
+            kind="summary",
+            summary="Room-agnostic smart-home environment profile compiled for one day.",
+            details="Daily motion-derived smart-home markers for longitudinal routine learning and deviation detection.",
+            source=_source(),
+            status="active",
+            confidence=0.78,
+            slot_key="environment_profile:home:main:2026-03-22",
+            value_key="environment_day_profile",
+            valid_from="2026-03-22",
+            valid_to="2026-03-22",
+            attributes={
+                "memory_domain": "smart_home_environment",
+                "summary_type": "environment_day_profile",
+                "environment_id": "home:main",
+                "date": "2026-03-22",
+                "weekday_class": "weekend",
+                "markers": {
+                    "active_epoch_count_day": 3,
+                    "first_activity_minute_local": 680,
+                    "last_activity_minute_local": 1110,
+                    "unique_active_node_count_day": 2,
+                    "sensor_coverage_ratio_day": 0.95,
+                },
+                "quality_flags": [],
+            },
+        )
+        baseline = LongTermMemoryObjectV1(
+            memory_id="environment_baseline:home_main:weekend:rolling_14d",
+            kind="pattern",
+            summary="Rolling short smart-home environment baseline for weekend days.",
+            details="Robust baseline built from prior daily room-agnostic motion markers.",
+            source=_source(),
+            status="active",
+            confidence=0.84,
+            slot_key="environment_baseline:home:main:short:weekend",
+            value_key="environment_baseline",
+            valid_from="2026-03-08",
+            valid_to="2026-03-22",
+            attributes={
+                "memory_domain": "smart_home_environment",
+                "pattern_type": "environment_baseline",
+                "environment_id": "home:main",
+                "baseline_kind": "short",
+                "weekday_class": "weekend",
+                "window_days": 14,
+                "sample_count": 6,
+                "marker_stats": {
+                    "active_epoch_count_day": {"median": 6.0, "iqr": 1.0, "ewma": 5.5, "mad": 0.5},
+                    "unique_active_node_count_day": {"median": 3.0, "iqr": 1.0, "ewma": 3.0, "mad": 0.5},
+                },
+            },
+        )
+        quality_state = LongTermMemoryObjectV1(
+            memory_id="environment_quality_state:home_main:2026-03-22",
+            kind="summary",
+            summary="Smart-home environment quality state for 2026-03-22: caution.",
+            details="Environment quality is usable with caution. Flags: possible_visitor_or_multi_person_activity.",
+            source=_source(),
+            status="active",
+            confidence=0.84,
+            slot_key="environment_quality_state:home:main",
+            value_key="2026-03-22",
+            valid_from="2026-03-22",
+            valid_to="2026-03-22",
+            attributes={
+                "memory_domain": "smart_home_environment",
+                "summary_type": "environment_quality_state",
+                "environment_id": "home:main",
+                "observed_at": "2026-03-22T12:00:00+00:00",
+                "classification": "caution",
+                "quality_flags": ("possible_visitor_or_multi_person_activity",),
+                "blocked_by": (),
+                "evidence_markers": ("active_epoch_count_day", "node_entropy_day"),
+            },
+        )
+        change_point = LongTermMemoryObjectV1(
+            memory_id="environment_change_point:home_main:2026-03-22",
+            kind="summary",
+            summary="Smart-home environment transition detected.",
+            details="Recent room-agnostic smart-home markers suggest an ongoing transition away from the older behavior regime.",
+            source=_source(),
+            status="candidate",
+            confidence=0.81,
+            slot_key="environment_change_point:home:main",
+            value_key="2026-03-22",
+            valid_from="2026-03-18",
+            valid_to="2026-03-22",
+            attributes={
+                "memory_domain": "smart_home_environment",
+                "summary_type": "environment_change_point",
+                "environment_id": "home:main",
+                "observed_at": "2026-03-22T12:00:00+00:00",
+                "change_started_on": "2026-03-18",
+                "severity": "moderate",
+                "markers": (
+                    {"name": "active_epoch_count_day", "observed": 3.2, "baseline_median": 6.0, "delta_ratio": -0.46},
+                ),
+                "quality_flags": (),
+                "blocked_by": (),
+            },
+        )
+
+        result = reflector.reflect(objects=(profile, baseline, quality_state, change_point))
+
+        summary = next(
+            item
+            for item in result.created_summaries
+            if (item.attributes or {}).get("summary_type") == "environment_reflection"
+        )
+        self.assertEqual((summary.attributes or {}).get("classification"), "transition")
+        self.assertEqual((summary.attributes or {}).get("quality_classification"), "caution")
+        self.assertIn("ongoing transition", summary.summary.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

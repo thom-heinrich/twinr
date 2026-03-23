@@ -27,6 +27,7 @@ dependencies = [
     "sentencepiece>=0.2,<1",
     "sherpa-onnx>=1.12,<2",
     "sherpa-onnx-bin>=1.12,<2",
+    "tokenizers>=0.20,<1",
     "uvicorn>=0.32,<1",
     "websockets>=13,<16",
 ]

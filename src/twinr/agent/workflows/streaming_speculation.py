@@ -16,7 +16,6 @@ from twinr.agent.base_agent.contracts import (
     supervisor_decision_requires_full_context,
 )
 from twinr.agent.base_agent.conversation.turn_controller import _normalize_turn_text
-from twinr.agent.base_agent.prompting.personality import merge_instructions
 from twinr.agent.tools import DualLaneToolLoop
 
 
@@ -283,41 +282,45 @@ class StreamingSpeculationController:
         loop = self._loop
         if not loop.config.streaming_supervisor_prefetch_enabled:
             return None
-        with loop._speculative_supervisor_lock:
-            if not loop._speculative_supervisor_started:
-                return None
-            done_event = loop._speculative_supervisor_done
-            seeded_transcript = loop._speculative_supervisor_transcript
-        wait_ms = max(0, int(loop.config.streaming_supervisor_prefetch_wait_ms))
-        if wait_ms > 0 and not done_event.is_set():
-            done_event.wait(wait_ms / 1000.0)
-        with loop._speculative_supervisor_lock:
-            decision = loop._speculative_supervisor_decision
+        decision = self._matching_supervisor_decision(
+            transcript,
+            wait_ms=max(0, int(loop.config.streaming_supervisor_prefetch_wait_ms)),
+        )
         if decision is None:
-            return None
-        action = str(getattr(decision, "action", "") or "").strip().lower()
-        if action not in {"direct", "handoff", "end_conversation"}:
-            return None
-        normalized_seed = _normalize_turn_text(seeded_transcript)
-        normalized_final = _normalize_turn_text(transcript)
-        if not normalized_seed or not normalized_final:
-            return None
-        if not (
-            normalized_final.startswith(normalized_seed)
-            or normalized_seed.startswith(normalized_final)
-        ):
             return None
         loop.emit("speculative_supervisor_hit=true")
         loop._trace_event(
             "speculative_supervisor_consumed",
             kind="cache",
             details={
-                "action": action,
-                "seed_len": len(seeded_transcript),
+                "action": str(getattr(decision, "action", "") or "").strip().lower(),
+                "seed_len": len(getattr(loop, "_speculative_supervisor_transcript", "") or ""),
                 "final_len": len(transcript),
             },
         )
         return decision
+
+    def wait_for_supervisor_decision(
+        self,
+        transcript: str,
+        *,
+        wait_ms: int | None = None,
+    ) -> SupervisorDecision | None:
+        """Wait for the shared speculative supervisor decision without re-calling the provider."""
+
+        cleaned = str(transcript or "").strip()
+        if not cleaned:
+            return None
+        self.maybe_start_supervisor_decision(cleaned)
+        return self._matching_supervisor_decision(cleaned, wait_ms=wait_ms)
+
+    def has_shared_supervisor_decision(self, transcript: str) -> bool:
+        """Return whether a matching shared supervisor-decision worker already exists."""
+
+        cleaned = str(transcript or "").strip()
+        if not cleaned:
+            return False
+        return self._matching_supervisor_transcript(cleaned)
 
     def prime_supervisor_decision_cache(self) -> None:
         """Prewarm the supervisor cache once so the first live turn is not cold."""
@@ -376,7 +379,12 @@ class StreamingSpeculationController:
                 details={"error_type": type(exc).__name__},
             )
 
-    def generate_first_word_reply(self, transcript: str) -> FirstWordReply | None:
+    def generate_first_word_reply(
+        self,
+        transcript: str,
+        *,
+        instructions: str | None = None,
+    ) -> FirstWordReply | None:
         """Synchronously build a first-word reply when speculation missed."""
 
         loop = self._loop
@@ -395,12 +403,16 @@ class StreamingSpeculationController:
             reply = provider.reply(
                 transcript,
                 conversation=conversation,
-                instructions=None,
+                instructions=instructions,
             )
             loop._trace_event(
                 "first_word_reply_generated",
                 kind="llm_call",
-                details={"text_len": len(transcript), "mode": getattr(reply, "mode", None)},
+                details={
+                    "text_len": len(transcript),
+                    "mode": getattr(reply, "mode", None),
+                    "route_overlay": bool(str(instructions or "").strip()),
+                },
             )
             return reply
         except Exception as exc:
@@ -409,7 +421,11 @@ class StreamingSpeculationController:
                 "first_word_reply_failed",
                 kind="exception",
                 level="WARN",
-                details={"error_type": type(exc).__name__, "text_len": len(transcript)},
+                details={
+                    "error_type": type(exc).__name__,
+                    "text_len": len(transcript),
+                    "route_overlay": bool(str(instructions or "").strip()),
+                },
             )
             return None
 
@@ -456,31 +472,15 @@ class StreamingSpeculationController:
         cleaned = str(transcript or "").strip()
         if not cleaned:
             return None
-        try:
-            with loop._trace_span(
-                name="supervisor_bridge_context_build_sync",
-                kind="span",
-                details={"text_len": len(cleaned)},
-            ):
-                conversation = loop.runtime.supervisor_provider_conversation_context()
-            decision = provider.decide(
-                cleaned,
-                conversation=conversation,
-                instructions=merge_instructions(
-                    getattr(loop.streaming_turn_loop, "supervisor_instructions", None),
-                    instructions,
-                ),
-            )
-        except Exception as exc:
-            loop.emit(f"supervisor_bridge_failed={type(exc).__name__}")
+        self.maybe_start_supervisor_decision(cleaned)
+        decision = self.wait_for_supervisor_decision(cleaned, wait_ms=None)
+        if decision is None:
             loop._trace_event(
-                "supervisor_bridge_reply_failed",
-                kind="exception",
-                level="WARN",
-                details={"error_type": type(exc).__name__, "text_len": len(cleaned)},
+                "supervisor_bridge_reply_unavailable",
+                kind="branch",
+                details={"text_len": len(cleaned), "route_overlay": bool(str(instructions or "").strip())},
             )
             return None
-        self.store_supervisor_decision(transcript=cleaned, decision=decision)
         reply = self.dual_lane_bridge_reply_from_decision(decision)
         loop._trace_event(
             "supervisor_bridge_reply_generated",
@@ -492,6 +492,60 @@ class StreamingSpeculationController:
             },
         )
         return reply
+
+    def _matching_supervisor_decision(
+        self,
+        transcript: str,
+        *,
+        wait_ms: int | None,
+    ) -> SupervisorDecision | None:
+        """Return the shared speculative decision when the transcript still matches it."""
+
+        loop = self._loop
+        with loop._speculative_supervisor_lock:
+            if not loop._speculative_supervisor_started:
+                return None
+            done_event = loop._speculative_supervisor_done
+            seeded_transcript = loop._speculative_supervisor_transcript
+        if wait_ms is None:
+            if not done_event.is_set():
+                done_event.wait()
+        elif wait_ms > 0 and not done_event.is_set():
+            done_event.wait(wait_ms / 1000.0)
+        with loop._speculative_supervisor_lock:
+            decision = loop._speculative_supervisor_decision
+        if decision is None:
+            return None
+        action = str(getattr(decision, "action", "") or "").strip().lower()
+        if action not in {"direct", "handoff", "end_conversation"}:
+            return None
+        normalized_seed = _normalize_turn_text(seeded_transcript)
+        normalized_final = _normalize_turn_text(transcript)
+        if not normalized_seed or not normalized_final:
+            return None
+        if not (
+            normalized_final.startswith(normalized_seed)
+            or normalized_seed.startswith(normalized_final)
+        ):
+            return None
+        return decision
+
+    def _matching_supervisor_transcript(self, transcript: str) -> bool:
+        """Return whether the stored speculative transcript still matches the active transcript."""
+
+        loop = self._loop
+        with loop._speculative_supervisor_lock:
+            if not loop._speculative_supervisor_started:
+                return False
+            seeded_transcript = loop._speculative_supervisor_transcript
+        normalized_seed = _normalize_turn_text(seeded_transcript)
+        normalized_final = _normalize_turn_text(transcript)
+        if not normalized_seed or not normalized_final:
+            return False
+        return (
+            normalized_final.startswith(normalized_seed)
+            or normalized_seed.startswith(normalized_final)
+        )
 
     def dual_lane_bridge_reply_from_decision(
         self,

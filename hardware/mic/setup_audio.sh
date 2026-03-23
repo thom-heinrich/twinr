@@ -14,6 +14,8 @@ PYTHON_BIN=""
 DEVICE_MATCH="${TWINR_AUDIO_OUTPUT_DEVICE_MATCH:-${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}}"
 CARD_INDEX=""
 DEVICE_INDEX=0
+PLAYBACK_DEVICE=""
+OUTPUT_DEVICE=""
 CAPTURE_DEVICE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-}"
 CAPTURE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}}"
 CAPTURE_CARD_INDEX=""
@@ -28,6 +30,7 @@ CARD_PLAYBACK_VOLUME_PERCENT="${TWINR_AUDIO_CARD_PLAYBACK_VOLUME_PERCENT:-100}"
 SOFTVOL_MAX_DB="${TWINR_AUDIO_OUTPUT_SOFTVOL_MAX_DB:-0}"
 SOFTVOL_MAX_DB_RENDERED="0.0"
 SOFTVOL_CONTROL_NAME="Twinr Playback"
+SOFTVOL_PCM_NAME="twinr_playback_softvol"
 SKIP_ALSA=0
 SKIP_PULSE=0
 SKIP_PLAYBACK_VOLUME=0
@@ -201,9 +204,10 @@ set_softvol_control_percent() {
 
 prime_softvol_control() {
   # ALSA only exposes the new softvol mixer control after the routed playback
-  # PCM is opened once. Feed one tiny block of silence through `default` so the
-  # control materializes without producing an audible setup tone.
-  head -c 3200 /dev/zero | aplay -q -D default -t raw -f S16_LE -c 1 -r 16000 - >/dev/null 2>&1 || true
+  # PCM is opened once. Feed one tiny block of silence through the dedicated
+  # softvol PCM so the control materializes without bouncing through a generic
+  # desktop default alias.
+  head -c 3200 /dev/zero | aplay -q -D "$SOFTVOL_PCM_NAME" -t raw -f S16_LE -c 1 -r 16000 - >/dev/null 2>&1 || true
 }
 
 detect_wpctl_id() {
@@ -413,10 +417,11 @@ fi
 CAPTURE_CARD_INDEX="${CAPTURE_CARD_INDEX:-$CARD_INDEX}"
 [[ "$CAPTURE_CARD_INDEX" =~ ^[0-9]+$ ]] || fail "Resolved capture card index is not numeric: $CAPTURE_CARD_INDEX"
 
-detect_plughw_capture_device() {
-  local match="$1"
-  local device_index="$2"
-  arecord -l | awk -v needle="$match" -v wanted_idx="$device_index" '
+detect_plughw_device() {
+  local command_name="$1"
+  local match="$2"
+  local device_index="$3"
+  "$command_name" -l | awk -v needle="$match" -v wanted_idx="$device_index" '
     BEGIN { IGNORECASE=1 }
     $0 ~ needle && $1 == "card" {
       card_name = $3
@@ -436,15 +441,32 @@ detect_plughw_capture_device() {
   '
 }
 
+if [[ -n "$DEVICE_MATCH" ]]; then
+  PLAYBACK_DEVICE="$(detect_plughw_device aplay "$DEVICE_MATCH" "$DEVICE_INDEX")"
+fi
+PLAYBACK_DEVICE="${PLAYBACK_DEVICE:-plughw:${CARD_INDEX},${DEVICE_INDEX}}"
+
 if [[ -z "$PROACTIVE_DEVICE" && -n "$PROACTIVE_DEVICE_MATCH" ]]; then
-  PROACTIVE_DEVICE="$(detect_plughw_capture_device "$PROACTIVE_DEVICE_MATCH" "$PROACTIVE_DEVICE_INDEX")"
+  PROACTIVE_DEVICE="$(detect_plughw_device arecord "$PROACTIVE_DEVICE_MATCH" "$PROACTIVE_DEVICE_INDEX")"
 fi
 
 if [[ -n "$CAPTURE_MATCH" ]]; then
-  CAPTURE_DEVICE="$(detect_plughw_capture_device "$CAPTURE_MATCH" "$CAPTURE_DEVICE_INDEX")"
+  CAPTURE_DEVICE="$(detect_plughw_device arecord "$CAPTURE_MATCH" "$CAPTURE_DEVICE_INDEX")"
 fi
 
-if [[ -n "$CAPTURE_DEVICE" || -n "$PROACTIVE_DEVICE" ]]; then
+if python3 - <<PY
+import math
+value = float(r'''$SOFTVOL_MAX_DB''')
+skip_alsa = int(r'''$SKIP_ALSA''')
+raise SystemExit(0 if value > 0.0 and skip_alsa == 0 else 1)
+PY
+then
+  OUTPUT_DEVICE="$SOFTVOL_PCM_NAME"
+else
+  OUTPUT_DEVICE="$PLAYBACK_DEVICE"
+fi
+
+if [[ -n "$OUTPUT_DEVICE" || -n "$CAPTURE_DEVICE" || -n "$PROACTIVE_DEVICE" ]]; then
   mkdir -p "$(dirname "$ENV_FILE")"
   touch "$ENV_FILE"
   "$PYTHON_BIN" - <<PY
@@ -452,6 +474,9 @@ from pathlib import Path
 
 path = Path(r'''$ENV_FILE''')
 updates = {}
+output_device = r'''$OUTPUT_DEVICE'''.strip()
+if output_device:
+    updates["TWINR_AUDIO_OUTPUT_DEVICE"] = output_device
 capture_device = r'''$CAPTURE_DEVICE'''.strip()
 if capture_device:
     updates["TWINR_AUDIO_INPUT_DEVICE"] = capture_device
@@ -601,6 +626,7 @@ printf 'playback_card=%s\n' "$CARD_INDEX"
 printf 'capture_card=%s\n' "$CAPTURE_CARD_INDEX"
 printf 'playback_device=%s\n' "$DEVICE_INDEX"
 printf 'capture_device=%s\n' "$CAPTURE_DEVICE_INDEX"
+printf 'explicit_playback_device=%s\n' "$OUTPUT_DEVICE"
 printf 'sink_volume_percent=%s\n' "$SINK_VOLUME_PERCENT"
 printf 'card_playback_volume_percent=%s\n' "$CARD_PLAYBACK_VOLUME_PERCENT"
 printf 'softvol_max_db=%s\n' "$SOFTVOL_MAX_DB"
@@ -643,7 +669,7 @@ with wave.open(sys.stdout.buffer, 'wb') as wav:
         sample = int(12000 * math.sin(2 * math.pi * 440 * (idx / 16000)))
         wav.writeframesraw(struct.pack('<h', sample))
 PY
-  aplay -D default /tmp/twinr_audio_test.wav >/dev/null 2>&1 || fail "Playback smoke test failed"
+  aplay -D "$OUTPUT_DEVICE" /tmp/twinr_audio_test.wav >/dev/null 2>&1 || fail "Playback smoke test failed"
   timeout 3 arecord -D default -f S16_LE -r 16000 -c 1 /tmp/twinr_audio_capture.wav >/dev/null 2>&1 || true
   if [[ -n "$PROACTIVE_DEVICE" ]]; then
     arecord -D "$PROACTIVE_DEVICE" -f S16_LE -r 16000 -c 1 -d 2 /tmp/twinr_proactive_audio_capture.wav >/dev/null 2>&1 \

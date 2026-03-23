@@ -485,7 +485,7 @@ class HdmiDefaultSceneRenderer:
                 )
             elif compact_hdmi:
                 panel_width = (
-                    min(388, max(356, int(content_width * 0.48)))
+                    min(430, max(388, int(content_width * 0.52)))
                     if reserve_card_active
                     else min(336, max(316, int(content_width * 0.43)))
                 )
@@ -753,14 +753,21 @@ class HdmiDefaultSceneRenderer:
     ) -> None:
         """Draw one small calm reserve card for an active ambient impulse cue."""
 
-        if not panel.headline and not panel.helper_text and not panel.symbol:
-            return
         left, top, right, bottom = box
         width = max(0, right - left)
         height = max(0, bottom - top)
         if width <= 0 or height <= 0:
             return
         radius = 24 if not compact else 18
+        if not panel.headline and not panel.helper_text and not panel.symbol:
+            draw.rounded_rectangle(
+                box,
+                radius=radius,
+                fill=(0, 0, 0),
+                outline=(94, 100, 112),
+                width=2,
+            )
+            return
         draw.rounded_rectangle(
             box,
             radius=radius,
@@ -770,26 +777,24 @@ class HdmiDefaultSceneRenderer:
         )
         accent_fill = self._panel_accent_fill(panel.accent)
         prompt_mode = panel.prompt_mode
-        if prompt_mode:
-            draw.rounded_rectangle(
-                (left + 12, top + 16, left + 18, bottom - 16),
-                radius=3,
-                fill=accent_fill,
-            )
-        else:
+        if not prompt_mode:
             draw.rounded_rectangle(
                 (left + 12, top + 12, left + 20, top + 20),
                 radius=4,
                 fill=accent_fill,
             )
         eyebrow_font = self.tools._font(13 if compact else 15, bold=True)
-        headline_font = self.tools._font(25 if compact else 34, bold=True) if prompt_mode else self.tools._font(
+        prompt_text_size = 30 if compact else 36
+        headline_font = self.tools._font(prompt_text_size, bold=True) if prompt_mode else self.tools._font(
             22 if compact else 28,
             bold=True,
         )
-        body_font = self.tools._font(15 if compact else 18, bold=False)
-        padding_x = 20 if compact else 24
-        padding_y = 18 if compact else 22
+        body_font = self.tools._font(prompt_text_size, bold=False) if prompt_mode else self.tools._font(
+            15 if compact else 18,
+            bold=False,
+        )
+        padding_x = 16 if compact else 20
+        padding_y = 16 if compact else 18
         text_left = left + padding_x
         text_top = top + padding_y
         inner_width = max(56, width - (padding_x * 2))
@@ -803,28 +808,71 @@ class HdmiDefaultSceneRenderer:
         if panel.eyebrow:
             draw.text((eyebrow_x, text_top), panel.eyebrow, fill=(182, 182, 182), font=eyebrow_font)
             text_top += self.tools._text_height(draw, font=eyebrow_font) + (12 if compact else 14)
+        if prompt_mode:
+            prompt_total_lines = self._prompt_mode_total_lines(
+                draw,
+                available_top=text_top,
+                available_bottom=bottom - padding_y,
+                headline_font=headline_font,
+            )
+            if panel.helper_text:
+                prompt_total_lines = max(2, prompt_total_lines)
+            headline_max_lines = max(1, prompt_total_lines - (1 if panel.helper_text else 0))
+        else:
+            headline_max_lines = 2
+            body_max_lines = 3 if not compact else 2
         headline_lines = self.tools._wrapped_lines(
             draw,
             (panel.headline,),
             max_width=inner_width,
             font=headline_font,
-            max_lines=4 if prompt_mode and not panel.helper_text else 3 if prompt_mode else 2,
+            max_lines=headline_max_lines,
         )
+        if prompt_mode:
+            body_max_lines = 0 if not panel.helper_text else max(1, prompt_total_lines - len(headline_lines))
         for line in headline_lines:
             draw.text((text_left, text_top), line, fill=(255, 255, 255), font=headline_font)
-            text_top += self.tools._text_height(draw, font=headline_font) + (3 if prompt_mode else 2)
+            text_top += self.tools._text_height(draw, font=headline_font) + (6 if prompt_mode else 2)
         body_lines = self.tools._wrapped_lines(
             draw,
             (panel.helper_text,),
             max_width=inner_width,
             font=body_font,
-            max_lines=2 if prompt_mode else 3 if not compact else 2,
+            max_lines=body_max_lines,
         )
         if body_lines:
             text_top += 8 if prompt_mode else 6
         for line in body_lines:
-            draw.text((text_left, text_top), line, fill=(214, 214, 214), font=body_font)
-            text_top += self.tools._text_height(draw, font=body_font) + 2
+            draw.text(
+                (text_left, text_top),
+                line,
+                fill=(255, 255, 255) if prompt_mode else (214, 214, 214),
+                font=body_font,
+            )
+            text_top += self.tools._text_height(draw, font=body_font) + (6 if prompt_mode else 2)
+
+    def _prompt_mode_total_lines(
+        self,
+        draw: object,
+        *,
+        available_top: int,
+        available_bottom: int,
+        headline_font: object,
+    ) -> int:
+        """Return prompt-mode line budgets from the actual visible panel height.
+
+        Prompt-mode reserve cards intentionally use one large text scale across
+        the whole message. Fixed two-line budgets waste half the card on the
+        real 800x480 display and make longer prompts appear cut off in the
+        middle. This helper derives a bounded line budget from the actual panel
+        height so the right-hand lane stays readable without shrinking the type.
+        """
+
+        line_gap = 6
+        line_height = max(1, self.tools._text_height(draw, font=headline_font))
+        line_step = line_height + line_gap
+        available_height = max(0, available_bottom - available_top)
+        return max(1, (available_height + line_gap) // line_step)
 
     def _panel_accent_fill(self, accent: str) -> tuple[int, int, int]:
         """Return a calm accent color for the ambient reserve card."""

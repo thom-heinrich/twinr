@@ -54,10 +54,11 @@ _HANDOFF_TOOL_SCHEMA: dict[str, Any] = {
                 "description": "Short description of what the specialist should achieve for this turn.",
             },
             "spoken_ack": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
-                    "A short user-facing acknowledgement in the configured language that can be spoken immediately "
-                    "before the specialist work starts, for example that Twinr is checking something now."
+                    "Optional short user-facing acknowledgement in the configured language that can be spoken "
+                    "immediately before the specialist work starts. Use null when no immediate progress line "
+                    "should be spoken."
                 ),
             },
             "prompt": {
@@ -83,7 +84,7 @@ _HANDOFF_TOOL_SCHEMA: dict[str, Any] = {
                 ),
             },
         },
-        "required": ["kind", "goal", "spoken_ack"],
+        "required": ["kind", "goal"],
         "additionalProperties": False,
     },
 }
@@ -223,8 +224,10 @@ class DualLaneToolLoop:
         conversation: ConversationLike | None = None,
         prefetched_decision: Any | None = None,
         instructions: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Any | None:
         """Resolve the supervisor decision, preferring prefetched state when present."""
+        _raise_if_should_stop(should_stop, context="supervisor_decision_start")
         if prefetched_decision is not None:
             if _supervisor_decision_has_required_user_reply(prefetched_decision):
                 self._trace_decision(
@@ -264,11 +267,13 @@ class DualLaneToolLoop:
         if self.supervisor_decision_provider is None:
             return None
         try:
+            _raise_if_should_stop(should_stop, context="supervisor_decision_provider_call")
             decision = self.supervisor_decision_provider.decide(
                 prompt,
                 conversation=conversation,
                 instructions=self.supervisor_instructions,
             )
+            _raise_if_should_stop(should_stop, context="supervisor_decision_provider_return")
             if not _supervisor_decision_has_required_user_reply(decision):
                 raise ValueError("Supervisor decision omitted the required user-facing reply field.")
             self._trace_decision(
@@ -291,6 +296,8 @@ class DualLaneToolLoop:
                 },
             )
             return decision
+        except InterruptedError:
+            raise
         except Exception as exc:
             logger.exception(
                 "Supervisor decision provider failed; falling back to the supervisor loop."
@@ -343,8 +350,11 @@ class DualLaneToolLoop:
         self,
         prompt: str,
         arguments: dict[str, Any],
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StreamingToolLoopResult:
         """Run the search handoff through the direct search handler shortcut."""
+        _raise_if_should_stop(should_stop, context="direct_search_handoff_start")
         search_handler = self.tool_handlers.get("search_live_info")
         if search_handler is None:
             raise RuntimeError("search_live_info handler is not configured")
@@ -368,6 +378,7 @@ class DualLaneToolLoop:
             )
         else:
             output = search_handler(tool_arguments)
+        _raise_if_should_stop(should_stop, context="direct_search_handoff_after_handler")
         answer_text = _strip_text(
             output.get("answer")
             or output.get("spoken_answer")
@@ -409,11 +420,17 @@ class DualLaneToolLoop:
         specialist_conversation: ConversationLike | None,
         instructions: str | None,
         allow_web_search: bool | None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StreamingToolLoopResult:
         """Resolve the specialist result through either direct search or the worker loop."""
+        _raise_if_should_stop(should_stop, context="specialist_resolution_start")
         specialist_prompt = _strip_text(normalized_arguments.get("prompt")) or prompt
         if normalized_arguments["kind"] == "search":
-            return self._run_direct_search_handoff(prompt, normalized_arguments)
+            return self._run_direct_search_handoff(
+                prompt,
+                normalized_arguments,
+                should_stop=should_stop,
+            )
         return ToolCallingStreamingLoop(
             provider=self.specialist_provider,
             tool_handlers=self.tool_handlers,
@@ -432,6 +449,7 @@ class DualLaneToolLoop:
                 allow_web_search,
             ),
             on_text_delta=None,
+            should_stop=should_stop,
         )
 
     def run_handoff_only(
@@ -446,6 +464,7 @@ class DualLaneToolLoop:
         on_text_delta: Callable[[str], None] | None = None,
         on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None = None,
         emit_filler: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StreamingToolLoopResult:
         """Run only the specialist side of a handoff.
 
@@ -456,6 +475,7 @@ class DualLaneToolLoop:
         resolved_specialist_conversation = (
             specialist_conversation if specialist_conversation is not None else conversation
         )
+        _raise_if_should_stop(should_stop, context="handoff_only_start")
         if isinstance(handoff, dict):
             raw_arguments = dict(handoff)
             response_id = raw_arguments.get("response_id")
@@ -525,29 +545,26 @@ class DualLaneToolLoop:
                 specialist_conversation=resolved_specialist_conversation,
                 instructions=instructions,
                 allow_web_search=allow_web_search,
+                should_stop=should_stop,
             )
-            status = "ok"
-            error_code: str | None = None
+        except InterruptedError:
+            raise
         except Exception as exc:
             logger.exception("Specialist handoff failed.")
             self._trace_event(
                 "dual_lane_handoff_only_specialist_failed",
                 kind="exception",
-                level="WARN",
+                level="ERROR",
                 details={
                     "error_type": type(exc).__name__,
                     "handoff": _handoff_summary(normalized_arguments),
                     "specialist_conversation": _conversation_summary(resolved_specialist_conversation),
                 },
             )
-            specialist_result = self.recover_with_llm(
-                prompt,
-                conversation=resolved_specialist_conversation,
-                instructions=instructions,
-                failure_reason="handoff_only_specialist_failed",
-            )
-            status = "error"
-            error_code = "specialist_worker_failed"
+            raise
+        _raise_if_should_stop(should_stop, context="handoff_only_after_specialist")
+        status = "ok"
+        error_code: str | None = None
 
         handoff_output = {
             "status": status,
@@ -622,10 +639,12 @@ class DualLaneToolLoop:
         supervisor_conversation: ConversationLike | None = None,
         specialist_conversation: ConversationLike | None = None,
         prefetched_decision: Any | None = None,
+        skip_supervisor_decision: bool = False,
         instructions: str | None = None,
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
         on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> StreamingToolLoopResult:
         """Run the full supervisor/specialist loop for one turn.
 
@@ -638,6 +657,7 @@ class DualLaneToolLoop:
         supervisor_text_emitted = False  # AUDIT-FIX(#15): Track supervisor output with a boolean sentinel instead of storing and re-joining the full stream.
         resolved_supervisor_conversation = supervisor_conversation if supervisor_conversation is not None else conversation
         resolved_specialist_conversation = specialist_conversation if specialist_conversation is not None else conversation
+        _raise_if_should_stop(should_stop, context="dual_lane_run_start")
 
         def _emit_user_text(
             text: str,
@@ -658,6 +678,7 @@ class DualLaneToolLoop:
             )  # AUDIT-FIX(#1): Guard TTS/UI callback failures so they cannot abort the turn.
 
         def handoff_specialist_worker(arguments: dict[str, Any]) -> dict[str, Any]:
+            _raise_if_should_stop(should_stop, context="handoff_worker_start")
             normalized_arguments = _normalize_handoff_arguments(
                 arguments,
                 fallback_prompt=prompt,
@@ -676,19 +697,25 @@ class DualLaneToolLoop:
                     specialist_conversation=resolved_specialist_conversation,
                     instructions=instructions,
                     allow_web_search=allow_web_search,
+                    should_stop=should_stop,
                 )
-                status = "ok"
-                error_code: str | None = None
-            except Exception:
-                logger.exception("Specialist handoff failed.")  # AUDIT-FIX(#1): Convert provider/tool failures into safe handoff error results.
-                specialist_result = self.recover_with_llm(
-                    prompt,
-                    conversation=resolved_supervisor_conversation,
-                    instructions=instructions,
-                    failure_reason="supervisor_handoff_specialist_failed",
-                )  # AUDIT-FIX(#2): Always materialize a specialist result so downstream code never indexes an empty record list.
-                status = "error"
-                error_code = "specialist_worker_failed"
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                logger.exception("Specialist handoff failed.")
+                self._trace_event(
+                    "dual_lane_supervisor_handoff_specialist_failed",
+                    kind="exception",
+                    level="ERROR",
+                    details={
+                        "error_type": type(exc).__name__,
+                        "handoff": _handoff_summary(normalized_arguments),
+                        "specialist_conversation": _conversation_summary(resolved_specialist_conversation),
+                    },
+                )
+                raise
+            status = "ok"
+            error_code: str | None = None
 
             specialist_records.append(_SpecialistRecord(result=specialist_result))
             output = {
@@ -705,12 +732,16 @@ class DualLaneToolLoop:
                 output["error"] = error_code
             return output
 
-        decision = self.resolve_supervisor_decision(
-            prompt,
-            conversation=resolved_supervisor_conversation,
-            prefetched_decision=prefetched_decision,
-            instructions=instructions,
-        )
+        decision = None
+        if not skip_supervisor_decision:
+            decision = self.resolve_supervisor_decision(
+                prompt,
+                conversation=resolved_supervisor_conversation,
+                prefetched_decision=prefetched_decision,
+                instructions=instructions,
+                should_stop=should_stop,
+            )
+        _raise_if_should_stop(should_stop, context="dual_lane_post_decision")
 
         if decision is not None:
             action = _normalize_decision_action(getattr(decision, "action", None))
@@ -748,6 +779,7 @@ class DualLaneToolLoop:
                     on_text_delta=on_text_delta,
                     on_lane_text_delta=on_lane_text_delta,
                     emit_filler=True,
+                    should_stop=should_stop,
                 )
             if action == "direct":
                 reply = _strip_text(getattr(decision, "spoken_reply", None))
@@ -779,7 +811,6 @@ class DualLaneToolLoop:
                     end_handler = self.tool_handlers.get("end_conversation")  # AUDIT-FIX(#3): Do not silently re-enable shared handlers when an empty supervisor override was intentional.
                 end_result: Any = {"status": "ok"}
                 reply = _strip_text(getattr(decision, "spoken_reply", None))
-                recovery_result = None
                 try:
                     if end_handler is not None:
                         end_result = end_handler({})
@@ -788,21 +819,14 @@ class DualLaneToolLoop:
                     self._trace_event(
                         "dual_lane_end_conversation_handler_failed",
                         kind="exception",
-                        level="WARN",
+                        level="ERROR",
                         details={
                             "error_type": type(exc).__name__,
                             "decision": _decision_summary(decision),
                             "conversation": _conversation_summary(resolved_supervisor_conversation),
                         },
                     )
-                    end_result = {"status": "error", "error": "end_conversation_failed"}
-                    recovery_result = self.recover_with_llm(
-                        prompt,
-                        conversation=resolved_supervisor_conversation,
-                        instructions=instructions,
-                        failure_reason="end_conversation_handler_failed",
-                    )
-                    reply = recovery_result.text
+                    raise
                 call_id = _first_non_none(
                     getattr(decision, "response_id", None),
                     _make_call_id("end_conversation"),
@@ -827,22 +851,10 @@ class DualLaneToolLoop:
                             serialized_output=_safe_json_dumps(end_result),
                         ),
                     ),  # AUDIT-FIX(#7): Serialize arbitrary handler outputs safely.
-                    response_id=_first_non_none(
-                        getattr(recovery_result, "response_id", None) if recovery_result is not None else None,
-                        getattr(decision, "response_id", None),
-                    ),
-                    request_id=_first_non_none(
-                        getattr(recovery_result, "request_id", None) if recovery_result is not None else None,
-                        getattr(decision, "request_id", None),
-                    ),
-                    model=_first_non_none(
-                        getattr(recovery_result, "model", None) if recovery_result is not None else None,
-                        getattr(decision, "model", None),
-                    ),
-                    token_usage=_merge_token_usage(
-                        getattr(decision, "token_usage", None),
-                        getattr(recovery_result, "token_usage", None) if recovery_result is not None else None,
-                    ),
+                    response_id=getattr(decision, "response_id", None),
+                    request_id=getattr(decision, "request_id", None),
+                    model=getattr(decision, "model", None),
+                    token_usage=getattr(decision, "token_usage", None),
                     used_web_search=False,
                 )
 
@@ -856,6 +868,7 @@ class DualLaneToolLoop:
                 on_text_delta=on_text_delta,
                 on_lane_text_delta=on_lane_text_delta,
                 emit_filler=True,
+                should_stop=should_stop,
             )
 
         supervisor_handlers = dict(self.supervisor_tool_handlers)
@@ -883,71 +896,26 @@ class DualLaneToolLoop:
                 instructions=merge_instructions(self.supervisor_instructions, instructions),
                 allow_web_search=allow_web_search,
                 on_text_delta=_forward_supervisor_delta,
+                should_stop=should_stop,
             )
+            _raise_if_should_stop(should_stop, context="dual_lane_supervisor_loop_complete")
+        except InterruptedError:
+            raise
         except Exception as exc:
-            logger.exception("Supervisor loop failed.")  # AUDIT-FIX(#1): Return the best available fallback instead of crashing the request.
-            fallback_text = ""
-            used_web_search = False
-            token_usage = None
-            if specialist_records:
-                latest_specialist_result = specialist_records[-1].result
-                fallback_text = _strip_text(latest_specialist_result.text) or fallback_text
-                used_web_search = bool(latest_specialist_result.used_web_search)
-                token_usage = latest_specialist_result.token_usage
-            recovery_result = None
-            if not fallback_text:
-                recovery_result = self.recover_with_llm(
-                    prompt,
-                    conversation=resolved_supervisor_conversation,
-                    instructions=instructions,
-                    failure_reason="supervisor_loop_failed",
-                    rounds=1,
-                    tool_calls=tuple(_merge_handoff_items((), specialist_records, "tool_calls")),
-                    tool_results=tuple(_merge_handoff_items((), specialist_records, "tool_results")),
-                    used_web_search=used_web_search,
-                )
-                fallback_text = recovery_result.text
-                token_usage = _merge_token_usage(token_usage, recovery_result.token_usage)
+            logger.exception("Supervisor loop failed.")
             self._trace_event(
                 "dual_lane_supervisor_loop_failed",
                 kind="exception",
-                level="WARN",
+                level="ERROR",
                 details={
                     "error_type": type(exc).__name__,
                     "conversation": _conversation_summary(resolved_supervisor_conversation),
                     "prompt": _text_summary(prompt),
                     "specialist_count": len(specialist_records),
                     "specialist_tail": [_loop_result_summary(record.result) for record in specialist_records[-2:]],
-                    "fallback_text": _text_summary(fallback_text),
-                    "used_recovery_llm": recovery_result is not None,
                 },
             )
-            if not supervisor_text_emitted:
-                _emit_user_text(fallback_text)
-            return _make_loop_result(
-                text=fallback_text,
-                rounds=1 + sum(record.result.rounds for record in specialist_records),
-                tool_calls=tuple(
-                    _merge_handoff_items((), specialist_records, "tool_calls")
-                ),
-                tool_results=tuple(
-                    _merge_handoff_items((), specialist_records, "tool_results")
-                ),
-                response_id=_first_non_none(
-                    getattr(recovery_result, "response_id", None) if recovery_result is not None else None,
-                    *[record.result.response_id for record in specialist_records],
-                ),
-                request_id=_first_non_none(
-                    getattr(recovery_result, "request_id", None) if recovery_result is not None else None,
-                    *[record.result.request_id for record in specialist_records],
-                ),
-                model=_first_non_none(
-                    getattr(recovery_result, "model", None) if recovery_result is not None else None,
-                    *[record.result.model for record in specialist_records],
-                ),
-                token_usage=token_usage,
-                used_web_search=used_web_search,
-            )
+            raise
 
         merged_tool_calls = _merge_handoff_items(
             supervisor_result.tool_calls,
@@ -985,7 +953,7 @@ class DualLaneToolLoop:
             self._trace_event(
                 "dual_lane_supervisor_result_empty",
                 kind="exception",
-                level="WARN",
+                level="ERROR",
                 details={
                     "supervisor_result": _loop_result_summary(supervisor_result),
                     "specialist_count": len(specialist_records),
@@ -993,21 +961,7 @@ class DualLaneToolLoop:
                     "merged_tool_results": len(merged_tool_results),
                 },
             )
-            recovery_result = self.recover_with_llm(
-                prompt,
-                conversation=resolved_supervisor_conversation,
-                instructions=instructions,
-                failure_reason="supervisor_result_empty",
-                rounds=1,
-                tool_calls=tuple(merged_tool_calls),
-                tool_results=tuple(merged_tool_results),
-                used_web_search=used_web_search,
-            )
-            final_text = recovery_result.text
-            response_id = _first_non_none(response_id, recovery_result.response_id)
-            request_id = _first_non_none(request_id, recovery_result.request_id)
-            model = _first_non_none(model, recovery_result.model)
-            token_usage = _merge_token_usage(token_usage, recovery_result.token_usage)
+            raise RuntimeError("dual-lane supervisor returned no final text")
         if final_text and not supervisor_text_emitted:
             _emit_user_text(final_text)
         self._trace_event(
@@ -1060,6 +1014,19 @@ def _make_loop_result(
         token_usage=token_usage,
         used_web_search=used_web_search,
     )
+
+
+def _raise_if_should_stop(
+    should_stop: Callable[[], bool] | None,
+    *,
+    context: str,
+) -> None:
+    """Abort cooperative dual-lane work once the owning turn was stopped."""
+
+    if should_stop is None:
+        return
+    if should_stop():
+        raise InterruptedError(f"dual-lane work stopped during {context}")
 
 
 def _safe_emit_text_delta(
@@ -1418,5 +1385,5 @@ def _supervisor_decision_has_required_user_reply(decision: Any) -> bool:
 
     action = _normalize_decision_action(getattr(decision, "action", None))
     if action == "handoff":
-        return bool(_strip_text(getattr(decision, "spoken_ack", None)))
+        return True
     return bool(_strip_text(getattr(decision, "spoken_reply", None)))

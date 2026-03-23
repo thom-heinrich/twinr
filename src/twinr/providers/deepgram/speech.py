@@ -346,8 +346,12 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                             ),
                         )
 
-                    # AUDIT-FIX(#10): Track actual speech_final separately from finalize completion so result flags remain semantically correct.
-                    if speech_final or (self._finalize_requested.is_set() and is_final):
+                    # AUDIT-FIX(#11): A bare speech_final callback is only an
+                    # endpoint hint for the turn controller, not a stable final
+                    # transcript. finalize() must keep waiting until Deepgram
+                    # delivers an actual final segment, otherwise Twinr can
+                    # return and close on a truncated fragment.
+                    if is_final:
                         self._done.set()
 
                 elif event_type == "UtteranceEnd":

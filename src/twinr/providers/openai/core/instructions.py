@@ -141,11 +141,14 @@ _SEARCH_AGENT_INSTRUCTIONS_DEFAULT: Final[str] = (
     "Use the user's language when known; otherwise use the system locale. "
     "Keep the answer easy for a senior user to understand. "
     "Use plain text only, with no markdown, tables, or bullet lists. "
+    "Interpret the user's request semantically, not as a title or brand keyword match. "
+    "If the request asks for a current-information category such as news, weather, traffic, prices, or opening hours, answer that category instead of latching onto a source whose title merely contains the same words. "
+    "If a broad news request does not specify a place, prefer major national or international headlines over a single inferred local-city bulletin. "
     "Prefer concrete facts, names, phone numbers, times, weather values, and exact dates when available from recent and reliable sources. "
     "Resolve relative dates like today, tomorrow, heute, morgen, this afternoon, and next Monday against the provided local date and time context. "
     "If sources conflict, are weak, or current verification is unavailable, say so briefly and do not guess. "
     "Answer in at most two short sentences whenever possible. "
-    "Keep the spoken answer concise, practical, and trustworthy."
+    "Keep the answer concise, practical, and trustworthy."
 )
 SEARCH_AGENT_INSTRUCTIONS = _validate_instruction(
     "SEARCH_AGENT_INSTRUCTIONS",

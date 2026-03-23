@@ -1,29 +1,31 @@
 """Publish planned calm reserve-card impulses for the HDMI waiting surface.
 
 This module keeps the live publication path very small. Daily sequencing,
-candidate weighting, and persistence live in ``display_reserve_day_plan.py``.
-The publisher here only decides whether the current runtime context may expose
-the next planned reserve-card item right now.
+nightly preparation, candidate weighting, and persistence live in the reserve
+planner modules. The publisher here only decides whether the current runtime
+context may expose the next planned reserve-card item right now.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time as LocalTime
+from datetime import datetime, time as LocalTime, timedelta, timezone
 import inspect
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.display.ambient_impulse_cues import (
-    DisplayAmbientImpulseController,
     DisplayAmbientImpulseCue,
     DisplayAmbientImpulseCueStore,
 )
+from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
 from twinr.display.emoji_cues import DisplayEmojiCueStore
 from twinr.display.presentation_cues import DisplayPresentationStore
 
-from .display_reserve_day_plan import DisplayReserveDayPlanner
+from .display_reserve_companion_planner import DisplayReserveCompanionPlanner
+from .display_reserve_day_plan import _DEFAULT_REFRESH_AFTER_LOCAL
+from .display_reserve_runtime import DisplayReserveRuntimePublisher, DisplayReserveRuntimeRequest
 
 _DEFAULT_ENABLED = True
 _DEFAULT_QUIET_HOURS_START = "21:00"
@@ -65,6 +67,20 @@ def _supports_ambient_impulses(config: TwinrConfig) -> bool:
     return driver.startswith("hdmi")
 
 
+def _next_local_boundary(*, local_now: datetime, at_time: LocalTime) -> datetime:
+    """Return the next local datetime for one wall-clock boundary."""
+
+    candidate = local_now.replace(
+        hour=at_time.hour,
+        minute=at_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    if candidate <= local_now:
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class DisplayAmbientImpulsePublishResult:
     """Summarize one ambient-impulse publish attempt."""
@@ -79,11 +95,11 @@ class DisplayAmbientImpulsePublishResult:
 class DisplayAmbientImpulsePublisher:
     """Publish the next planned reserve impulse when the runtime is ready."""
 
-    controller: DisplayAmbientImpulseController
+    runtime_publisher: DisplayReserveRuntimePublisher
     active_store: DisplayAmbientImpulseCueStore
     emoji_store: DisplayEmojiCueStore
     presentation_store: DisplayPresentationStore
-    planner: DisplayReserveDayPlanner
+    planner: DisplayReserveCompanionPlanner
     source: str = _SOURCE
     local_now: Callable[[], datetime] = _default_local_now
 
@@ -91,16 +107,16 @@ class DisplayAmbientImpulsePublisher:
     def from_config(cls, config: TwinrConfig) -> "DisplayAmbientImpulsePublisher":
         """Build one publisher from the configured display cue stores."""
 
-        controller = DisplayAmbientImpulseController.from_config(
+        runtime_publisher = DisplayReserveRuntimePublisher.from_config(
             config,
             default_source=_SOURCE,
         )
         return cls(
-            controller=controller,
-            active_store=controller.store,
+            runtime_publisher=runtime_publisher,
+            active_store=runtime_publisher.active_store,
             emoji_store=DisplayEmojiCueStore.from_config(config),
             presentation_store=DisplayPresentationStore.from_config(config),
-            planner=DisplayReserveDayPlanner.from_config(config),
+            planner=DisplayReserveCompanionPlanner.from_config(config),
         )
 
     @property
@@ -108,6 +124,12 @@ class DisplayAmbientImpulsePublisher:
         """Expose the planner candidate loader for tests and dependency injection."""
 
         return self.planner.candidate_loader
+
+    @property
+    def history_store(self) -> DisplayAmbientImpulseHistoryStore:
+        """Expose the shared reserve history store for tests and observability."""
+
+        return self.runtime_publisher.history_store
 
     @candidate_loader.setter
     def candidate_loader(self, value: Callable[..., tuple[AmbientDisplayImpulseCandidate, ...]]) -> None:
@@ -153,36 +175,103 @@ class DisplayAmbientImpulsePublisher:
             return DisplayAmbientImpulsePublishResult(action="inactive", reason="unsupported")
         if runtime_status != "waiting":
             return DisplayAmbientImpulsePublishResult(action="blocked", reason="runtime_not_waiting")
-        if not presence_active:
-            return DisplayAmbientImpulsePublishResult(action="blocked", reason="no_active_presence")
         effective_local_now = (local_now or self.local_now()).astimezone()
-        if self._quiet_hours_active(config=config, local_now=effective_local_now):
-            return DisplayAmbientImpulsePublishResult(action="blocked", reason="quiet_hours")
         if self.emoji_store.load_active(now=effective_local_now) is not None:
             return DisplayAmbientImpulsePublishResult(action="blocked", reason="emoji_surface_owned")
         if self.presentation_store.load_active(now=effective_local_now) is not None:
             return DisplayAmbientImpulsePublishResult(action="blocked", reason="presentation_surface_owned")
         if self.active_store.load_active(now=effective_local_now) is not None:
             return DisplayAmbientImpulsePublishResult(action="blocked", reason="ambient_impulse_active")
+        if self._quiet_hours_active(config=config, local_now=effective_local_now):
+            restored = self._restore_passive_fill(
+                config=config,
+                local_now=effective_local_now,
+                reason="quiet_hours_passive_fill",
+            )
+            if restored is not None:
+                return restored
+            return DisplayAmbientImpulsePublishResult(action="blocked", reason="quiet_hours")
+        if not presence_active:
+            restored = self._restore_passive_fill(
+                config=config,
+                local_now=effective_local_now,
+                reason="no_active_presence_passive_fill",
+            )
+            if restored is not None:
+                return restored
+            return DisplayAmbientImpulsePublishResult(action="blocked", reason="no_active_presence")
 
         item = self.planner.peek_next_item(
             config=config,
             local_now=effective_local_now,
         )
         if item is None:
-            return DisplayAmbientImpulsePublishResult(action="inactive", reason="no_planned_item")
+            fallback_item = self.planner.peek_idle_fill_item(
+                config=config,
+                local_now=effective_local_now,
+            )
+            if fallback_item is None:
+                return DisplayAmbientImpulsePublishResult(action="inactive", reason="no_planned_item")
+            restored = self.runtime_publisher.show_visible_only(
+                DisplayReserveRuntimeRequest(
+                    topic_key=fallback_item.topic_key,
+                    title=fallback_item.title,
+                    cue_source=self.source,
+                    history_source=fallback_item.source,
+                    action=fallback_item.action,
+                    attention_state=fallback_item.attention_state,
+                    eyebrow=fallback_item.eyebrow,
+                    headline=fallback_item.headline,
+                    body=fallback_item.body,
+                    symbol=fallback_item.symbol,
+                    accent=fallback_item.accent,
+                    hold_seconds=self._idle_fill_hold_seconds(
+                        config=config,
+                        local_now=effective_local_now,
+                        fallback_item=fallback_item,
+                    ),
+                    reason=f"{fallback_item.reason}; idle_fill",
+                    candidate_family=fallback_item.candidate_family,
+                    match_anchors=(fallback_item.title, fallback_item.headline, fallback_item.body),
+                    metadata={
+                        "eyebrow": fallback_item.eyebrow,
+                        "accent": fallback_item.accent,
+                        "symbol": fallback_item.symbol,
+                        "idle_fill": True,
+                    },
+                ),
+                now=effective_local_now,
+            )
+            return DisplayAmbientImpulsePublishResult(
+                action="restored_fill",
+                reason="plan_exhausted_idle_fill",
+                topic_key=fallback_item.topic_key,
+                cue=restored.cue,
+            )
 
-        cue = self.controller.show_impulse(
-            topic_key=item.topic_key,
-            eyebrow=item.eyebrow,
-            headline=item.headline,
-            body=item.body,
-            symbol=item.symbol,
-            accent=item.accent,
-            action=item.action,
-            attention_state=item.attention_state,
-            hold_seconds=item.hold_seconds,
-            source=self.source,
+        published = self.runtime_publisher.publish(
+            DisplayReserveRuntimeRequest(
+                topic_key=item.topic_key,
+                title=item.title,
+                cue_source=self.source,
+                history_source=item.source,
+                action=item.action,
+                attention_state=item.attention_state,
+                eyebrow=item.eyebrow,
+                headline=item.headline,
+                body=item.body,
+                symbol=item.symbol,
+                accent=item.accent,
+                hold_seconds=item.hold_seconds,
+                reason=item.reason,
+                candidate_family=item.candidate_family,
+                match_anchors=(item.title, item.headline, item.body),
+                metadata={
+                    "eyebrow": item.eyebrow,
+                    "accent": item.accent,
+                    "symbol": item.symbol,
+                },
+            ),
             now=effective_local_now,
         )
         self.planner.mark_published(
@@ -193,7 +282,70 @@ class DisplayAmbientImpulsePublisher:
             action="published",
             reason=item.reason,
             topic_key=item.topic_key,
-            cue=cue,
+            cue=published.cue,
+        )
+
+    def _restore_passive_fill(
+        self,
+        *,
+        config: TwinrConfig,
+        local_now: datetime,
+        reason: str,
+    ) -> DisplayAmbientImpulsePublishResult | None:
+        """Restore one passive reserve fill without recording a new exposure.
+
+        Temporary right-lane overrides such as social prompts may expire while
+        normal ambient publishing is intentionally blocked. In that state Twinr
+        should keep the lane populated with the current same-day card instead
+        of leaving the surface blank.
+        """
+
+        fill_item = self.planner.peek_next_item(
+            config=config,
+            local_now=local_now,
+        )
+        if fill_item is None:
+            fill_item = self.planner.peek_idle_fill_item(
+                config=config,
+                local_now=local_now,
+            )
+        if fill_item is None:
+            return None
+        restored = self.runtime_publisher.show_visible_only(
+            DisplayReserveRuntimeRequest(
+                topic_key=fill_item.topic_key,
+                title=fill_item.title,
+                cue_source=self.source,
+                history_source=fill_item.source,
+                action=fill_item.action,
+                attention_state=fill_item.attention_state,
+                eyebrow=fill_item.eyebrow,
+                headline=fill_item.headline,
+                body=fill_item.body,
+                symbol=fill_item.symbol,
+                accent=fill_item.accent,
+                hold_seconds=self._idle_fill_hold_seconds(
+                    config=config,
+                    local_now=local_now,
+                    fallback_item=fill_item,
+                ),
+                reason=f"{fill_item.reason}; {reason}",
+                candidate_family=fill_item.candidate_family,
+                match_anchors=(fill_item.title, fill_item.headline, fill_item.body),
+                metadata={
+                    "eyebrow": fill_item.eyebrow,
+                    "accent": fill_item.accent,
+                    "symbol": fill_item.symbol,
+                    "idle_fill": True,
+                },
+            ),
+            now=local_now,
+        )
+        return DisplayAmbientImpulsePublishResult(
+            action="restored_fill",
+            reason=reason,
+            topic_key=fill_item.topic_key,
+            cue=restored.cue,
         )
 
     def _quiet_hours_active(
@@ -218,3 +370,32 @@ class DisplayAmbientImpulsePublisher:
         if start < end:
             return start <= current < end
         return current >= start or current < end
+
+    def _idle_fill_hold_seconds(
+        self,
+        *,
+        config: TwinrConfig,
+        local_now: datetime,
+        fallback_item: object,
+    ) -> float:
+        """Return how long one passive exhausted-plan fill may stay visible."""
+
+        quiet_start = _parse_local_time(
+            getattr(config, "proactive_quiet_hours_start_local", _DEFAULT_QUIET_HOURS_START),
+            fallback=_DEFAULT_QUIET_HOURS_START,
+        )
+        refresh_after = _parse_local_time(
+            getattr(config, "display_reserve_bus_refresh_after_local", _DEFAULT_REFRESH_AFTER_LOCAL),
+            fallback=_DEFAULT_REFRESH_AFTER_LOCAL,
+        )
+        next_quiet = _next_local_boundary(local_now=local_now, at_time=quiet_start)
+        next_refresh = _next_local_boundary(local_now=local_now, at_time=refresh_after)
+        seconds_until_boundary = min(
+            (next_quiet - local_now).total_seconds(),
+            (next_refresh - local_now).total_seconds(),
+        )
+        base_hold_seconds = max(
+            60.0,
+            float(getattr(fallback_item, "hold_seconds", 0.0) or 0.0),
+        )
+        return max(60.0, min(max(base_hold_seconds, 15.0 * 60.0), seconds_until_boundary))

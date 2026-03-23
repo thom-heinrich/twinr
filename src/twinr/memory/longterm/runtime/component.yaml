@@ -7,6 +7,7 @@ summary: Wire long-term memory stores, reasoning helpers, remote readiness check
 owned_concerns:
   - Assemble the runtime-facing LongTermMemoryService from config and subsystem dependencies
   - Build provider and tool-facing long-term memory context for runtime prompts
+  - Build one bounded fast-topic provider context for latency-sensitive answer lanes and preserve precise required-remote read-failure semantics on that hot path
   - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
   - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
   - Route consolidated turns and post-turn tool history into the structured personality-learning service

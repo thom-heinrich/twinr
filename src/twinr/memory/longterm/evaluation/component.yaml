@@ -3,12 +3,13 @@ name: evaluation
 path: src/twinr/memory/longterm/evaluation
 kind: python-package
 visibility: internal
-summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, live subtext-response behavior, live midterm memory attestation, and live synthetic-memory acceptance without mutating production local state paths.
+summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, live subtext-response behavior, live midterm memory attestation, live synthetic-memory acceptance, and forensic long-term retrieval latency profiling without mutating production local state paths.
 owned_concerns:
   - Seed deterministic evaluation fixtures and build fixed evaluation case sets
   - Execute recall, multimodal, and live subtext evaluations against the real Twinr services/backends
   - Execute live midterm write/persist/read/LLM-usage attestations against real OpenAI and ChonkyDB in isolated temp roots and namespaces
   - Execute live synthetic-memory acceptance matrices for earlier memory, conflict confirmation, restart persistence, and control-query containment against real OpenAI and ChonkyDB in isolated temp roots and namespaces
+  - Execute read-only forensic latency profiles that capture workflow spans, decisions, and bottleneck summaries for provider-context and fast-provider-context retrieval
   - Snapshot evaluation artifacts and expose structured result payloads for inspection
 out_of_scope:
   - Production runtime serving or permanent memory mutations outside temporary workspaces
@@ -67,6 +68,16 @@ files:
       - default_live_memory_acceptance_report_dir
       - run_live_memory_acceptance
       - write_live_memory_acceptance_artifacts
+  - path: latency_profile.py
+    role: Read-only forensic latency profiler for provider-context and fast-provider-context retrieval
+    exports:
+      - LongTermLatencyProfileQueryRun
+      - LongTermLatencySpanStat
+      - LongTermLatencyDecisionSummary
+      - LongTermLatencyProfileResult
+      - default_longterm_latency_profile_dir
+      - run_longterm_latency_profile
+      - write_longterm_latency_profile_artifacts
 compatibility_reexports:
   - path: src/twinr/memory/longterm/__init__.py
     names:
@@ -93,5 +104,6 @@ tests:
   - path: test/test_longterm_multimodal_eval.py
   - path: test/test_subtext_response_eval.py
   - path: test/test_longterm_live_midterm_attest.py
+  - path: test/test_longterm_latency_profile.py
   - path: test/test_longterm_store.py
   - path: test/test_longterm_memory.py

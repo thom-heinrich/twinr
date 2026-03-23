@@ -102,6 +102,204 @@ class AICameraTests(unittest.TestCase):
         self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
         self.assertTrue(observation.camera_ready)
 
+    def test_adapter_gesture_observe_refreshes_mediapipe_pose_hints_for_live_pipeline(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        primary_box = AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68)
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: "frame"
+        adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+            analyze_pose_hints=lambda **_: MediaPipeVisionResult(
+                pose_confidence=0.83,
+                sparse_keypoints={
+                    9: (0.36, 0.41, 0.91),
+                    10: (0.58, 0.39, 0.93),
+                },
+            )
+        )
+        live_calls = []
+
+        def _observe_live(**kwargs):
+            live_calls.append(dict(kwargs))
+            return SimpleNamespace(
+                hand_count=0,
+                fine_hand_gesture=AICameraFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            )
+
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=_observe_live,
+            debug_snapshot=lambda: {"resolved_source": "none"},
+        )
+
+        observation = adapter.observe_gesture()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertEqual(
+            live_calls[0]["sparse_keypoints"],
+            {
+                9: (0.36, 0.41, 0.91),
+                10: (0.58, 0.39, 0.93),
+            },
+        )
+        self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_source"], "fresh_mediapipe")
+        self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_confidence"], 0.83)
+
+    def test_adapter_gesture_observe_uses_full_mediapipe_fallback_when_fast_lane_returns_none(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        primary_box = AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68)
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: "frame"
+        adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+            analyze_pose_hints=lambda **_: MediaPipeVisionResult(),
+            analyze=lambda **_: MediaPipeVisionResult(
+                pose_confidence=0.78,
+                hand_near_camera=True,
+                showing_intent_likely=True,
+                fine_hand_gesture=AICameraFineHandGesture.POINTING,
+                fine_hand_gesture_confidence=0.86,
+            ),
+        )
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=lambda **_: SimpleNamespace(
+                hand_count=0,
+                fine_hand_gesture=AICameraFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            ),
+            debug_snapshot=lambda: {"resolved_source": "none"},
+        )
+
+        observation = adapter.observe_gesture()
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.POINTING)
+        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.86, places=3)
+        self.assertEqual(observation.model, "local-imx500+mediapipe-live-gesture+pose-fallback")
+        self.assertEqual(adapter.get_last_gesture_debug_details()["final_resolved_source"], "mediapipe_pose_fallback")
+
+    def test_adapter_gesture_observe_promotes_unmatched_face_anchor_over_false_primary_person(self) -> None:
+        chair_box = AICameraBox(top=0.20, left=0.58, bottom=0.98, right=0.96)
+        face_box = AICameraBox(top=0.18, left=0.24, bottom=0.34, right=0.34)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(pose_backend="mediapipe"),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.CENTER,
+                            confidence=0.93,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=chair_box,
+            primary_person_zone=AICameraZone.RIGHT,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=chair_box,
+                    zone=AICameraZone.RIGHT,
+                    confidence=0.82,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+        seen_pose_detection: list[DetectionResult] = []
+
+        def _resolve_pose_hints(**kwargs):
+            seen_pose_detection.append(kwargs["detection"])
+            return {}, "none", None
+
+        live_calls = []
+
+        def _observe_live(**kwargs):
+            live_calls.append(dict(kwargs))
+            return SimpleNamespace(
+                hand_count=0,
+                fine_hand_gesture=AICameraFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            )
+
+        adapter._resolve_gesture_pose_hints = _resolve_pose_hints
+        adapter._resolve_gesture_pose_fallback = lambda *args, **kwargs: (None, None)
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=_observe_live,
+            debug_snapshot=lambda: {"resolved_source": "none"},
+        )
+
+        observation = adapter.observe_gesture()
+
+        promoted_box = live_calls[0]["primary_person_box"]
+        self.assertTrue(promoted_box.left < face_box.center_x < promoted_box.right)
+        self.assertTrue(promoted_box.top < face_box.center_y < promoted_box.bottom)
+        self.assertGreater(promoted_box.height, face_box.height)
+        self.assertEqual(live_calls[0]["visible_person_boxes"][0], promoted_box)
+        self.assertEqual(live_calls[0]["person_count"], 2)
+        self.assertEqual(seen_pose_detection[0].primary_person_box, promoted_box)
+        self.assertEqual(adapter.get_last_gesture_debug_details()["gesture_target_source"], "face_anchor_promoted")
+        self.assertEqual(adapter.get_last_gesture_debug_details()["gesture_target_face_anchor_count"], 1)
+        self.assertEqual(observation.person_count, 1)
+
     def test_adapter_reports_missing_custom_mediapipe_gesture_model_explicitly(self) -> None:
         adapter = LocalAICameraAdapter(
             config=AICameraAdapterConfig(

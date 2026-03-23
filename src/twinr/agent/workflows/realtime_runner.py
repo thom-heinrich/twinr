@@ -431,6 +431,8 @@ class TwinrRealtimeHardwareLoop(
             return True
         if self._maybe_run_long_term_memory_proactive():
             return True
+        if self._maybe_run_display_reserve_nightly_maintenance():
+            return True
         return False
 
     def _start_idle_housekeeping_worker(self, *, poll_timeout: float) -> tuple[Event, Thread]:
@@ -842,6 +844,25 @@ class TwinrRealtimeHardwareLoop(
             stop_event = self._active_turn_stop_event
         return bool(stop_event is not None and stop_event.is_set())
 
+    def _signal_active_turn_stop(self, reason: str) -> None:
+        """Set the active-turn stop event without user-facing interruption UX."""
+
+        with self._active_turn_stop_lock:
+            stop_event = self._active_turn_stop_event
+        if stop_event is None or stop_event.is_set():
+            self._trace_event(
+                "active_turn_stop_signal_ignored",
+                kind="branch",
+                details={"reason": reason, "has_stop_event": stop_event is not None},
+            )
+            return
+        stop_event.set()
+        self._trace_event(
+            "active_turn_stop_signaled",
+            kind="mutation",
+            details={"reason": reason, "stop_event_id": id(stop_event)},
+        )
+
     def _request_active_turn_interrupt(self, source: str = "button") -> bool:
         with self._active_turn_stop_lock:
             stop_event = self._active_turn_stop_event
@@ -907,7 +928,25 @@ class TwinrRealtimeHardwareLoop(
     def _voice_orchestrator_handles_follow_up(self, *, initial_source: str) -> bool:
         if self.voice_orchestrator is None:
             return False
-        return self._follow_up_allowed_for_source(initial_source=initial_source)
+        return self._voice_orchestrator_follow_up_mode(initial_source=initial_source) == "remote"
+
+    def _voice_orchestrator_follow_up_mode(self, *, initial_source: str) -> str:
+        """Return how Twinr should reopen continuation after a finished answer."""
+
+        if self.voice_orchestrator is None:
+            return "disabled"
+        if not self._follow_up_allowed_for_source(initial_source=initial_source):
+            return "disabled"
+        supports_remote_follow_up = getattr(self.voice_orchestrator, "supports_remote_follow_up", None)
+        if callable(supports_remote_follow_up):
+            return "remote" if supports_remote_follow_up() else "local_beep"
+        ready_backend = str(getattr(self.voice_orchestrator, "ready_backend", "") or "").strip().lower()
+        if ready_backend:
+            return "remote" if ready_backend == "local_stt" else "local_beep"
+        stage1_mode = str(
+            getattr(self.config, "voice_orchestrator_wake_stage1_mode", "backend") or "backend"
+        ).strip().lower()
+        return "remote" if stage1_mode == "local_stt" else "local_beep"
 
     def _notify_voice_orchestrator_state(
         self,
@@ -948,9 +987,14 @@ class TwinrRealtimeHardwareLoop(
                 self.emit("voice_orchestrator_follow_up_skipped=busy")
                 return False
             self.emit("voice_orchestrator_follow_up=true")
+            self._trace_event(
+                "voice_orchestrator_follow_up_capture_requested",
+                kind="decision",
+                details={"play_initial_beep": True, "runtime_status": self.runtime.status.value},
+            )
             return self._run_conversation_session(
                 initial_source="follow_up",
-                play_initial_beep=False,
+                play_initial_beep=True,
             )
         except Exception as exc:
             self._handle_error(exc)
@@ -1277,26 +1321,14 @@ class TwinrRealtimeHardwareLoop(
                     saw_interim=bool(getattr(early_result, "saw_interim", False)),
                     capture_ms=capture_ms,
                 )
-                if bool(getattr(early_result, "saw_speech_final", False)):
-                    transcript = self._maybe_verify_streaming_transcript(
-                        capture_result=capture_result,
-                        transcript=early_transcript_hint,
-                        capture_ms=capture_ms,
-                        saw_speech_final=True,
-                        saw_utterance_end=bool(getattr(early_result, "saw_utterance_end", False)),
-                        confidence=getattr(early_result, "confidence", None),
-                    )
-                    self._trace_event(
-                        "turn_controller_returned_early_snapshot",
-                        kind="branch",
-                        details={"transcript_len": len(transcript)},
-                    )
-                    return capture_result, transcript, capture_ms, 0, current_turn_label()
                 self.emit("stt_streaming_deferred_until_finalize=true")
                 self._trace_event(
                     "turn_controller_early_snapshot_deferred",
                     kind="branch",
-                    details={"transcript_hint_len": len(early_transcript_hint)},
+                    details={
+                        "transcript_hint_len": len(early_transcript_hint),
+                        "speech_final": bool(getattr(early_result, "saw_speech_final", False)),
+                    },
                 )
 
             stt_started = time.monotonic()
@@ -1934,16 +1966,16 @@ class TwinrRealtimeHardwareLoop(
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
         if interrupt_event.is_set() and not force_close:
             return self._run_interrupt_follow_up_turn()
-        if (
-            not force_close
-            and self._voice_orchestrator_handles_follow_up(initial_source=initial_source)
-        ):
+        follow_up_mode = self._voice_orchestrator_follow_up_mode(initial_source=initial_source)
+        if not force_close and follow_up_mode == "remote":
             self._notify_voice_orchestrator_state(
                 "follow_up_open",
                 detail=listen_source,
                 follow_up_allowed=True,
             )
             return True
+        if not force_close and follow_up_mode == "local_beep":
+            self.emit("voice_orchestrator_follow_up_mode=local_beep")
         self._notify_voice_orchestrator_state("waiting", detail=listen_source)
         return not force_close
 

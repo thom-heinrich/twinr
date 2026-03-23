@@ -11,7 +11,7 @@ candidate long-term memory inputs.
 - Normalize structured ReSpeaker audio-policy facts and per-claim metadata into bounded audio routine seeds and observed preference hypotheses
 - Replay persisted ops history into multimodal evidence for backfill
 - Compile sensor-derived routines and deviations from pattern history
-- Compile room-agnostic smart-home environment profiles from smart-home motion and health pattern history
+- Compile room-agnostic smart-home environment profiles from smart-home motion and health pattern history, including short/long baselines, grouped acute deviations, quality states, and drift/regime signals
 
 `ingestion` does **not** own:
 - Persist long-term objects, archives, or remote state
@@ -26,7 +26,8 @@ candidate long-term memory inputs.
 | `extract.py` | Turn extraction entrypoint |
 | `propositions.py` | Structured proposition compiler |
 | `multimodal.py` | Multimodal event extractor |
-| `environment_profile.py` | Room-agnostic smart-home day-profile, baseline, and deviation compiler |
+| `environment_profile.py` | Room-agnostic smart-home day-profile, baseline, quality, and drift compiler |
+| `environment_stats.py` | Shared robust statistics and divergence helpers for environment profiling |
 | `respeaker_audio.py` | Structured ReSpeaker audio routine-seed extraction |
 | `respeaker_contract.py` | ReSpeaker claim-contract parsing and memory-attribute helpers |
 | `sensor_memory.py` | Sensor routine compiler |

@@ -292,6 +292,19 @@ class LongTermRemoteUnavailableError(RuntimeError):
         return self.message
 
 
+class LongTermRemoteReadFailedError(LongTermRemoteUnavailableError):
+    """Signal that one required remote read failed despite a configured backend.
+
+    This keeps the fail-closed runtime contract of
+    ``LongTermRemoteUnavailableError`` while preserving the narrower meaning
+    that the backend was configured and the specific read path failed.
+    """
+
+    def __init__(self, message: str, *, details: Mapping[str, object] | None = None) -> None:
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermRemoteStatus:
     """Describe whether the remote snapshot backend is ready for use."""
@@ -2210,6 +2223,7 @@ def _remote_namespace_for_config(config: TwinrConfig) -> str:
 
 
 __all__ = [
+    "LongTermRemoteReadFailedError",
     "LongTermRemoteStateStore",
     "LongTermRemoteStatus",
     "LongTermRemoteUnavailableError",

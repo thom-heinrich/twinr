@@ -34,7 +34,15 @@ _HISTOGRAM_BUCKETS_MS: tuple[tuple[float, str], ...] = (
     (2_000.0, "1000_2000_ms"),
     (5_000.0, "2000_5000_ms"),
 )
-_SUPPORTED_OPERATIONS = frozenset({"retrieve_search", "retrieve_batch"})
+_SUPPORTED_OPERATIONS = frozenset(
+    {
+        "retrieve_search",
+        "retrieve_batch",
+        "topk_search",
+        "topk_batch",
+        "fast_topic_topk_search",
+    }
+)
 _STATE_LOCK = threading.Lock()
 
 

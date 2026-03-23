@@ -52,6 +52,7 @@ _QUEUE_SENTINEL = object()
 _TTS_CHUNK_POLL_TIMEOUT_SECONDS = 0.02
 _TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.05
 _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.01
+_TTS_STREAM_CLOSE_TIMEOUT_SECONDS = 0.05
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ class _TTSChunkPump:
         self._stop = Event()
         self._stream_lock = Lock()
         self._stream = None
+        self._close_lock = Lock()
+        self._close_thread: Thread | None = None
         self._error: Exception | None = None
         self._thread = Thread(target=self._run, daemon=True, name="twinr-tts-pump")
 
@@ -98,12 +101,8 @@ class _TTSChunkPump:
         self._trace("tts_chunk_pump_stop_requested", text_len=len(self._text))
         with self._stream_lock:
             stream = self._stream
-        close = getattr(stream, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                _LOGGER.warning("Streaming speech output failed to close the live TTS stream.", exc_info=True)
+            self._stream = None
+        self._request_stream_close(stream)
 
     def join(self, *, timeout_s: float | None = None) -> bool:
         """Wait briefly for the pump thread and report whether it stopped."""
@@ -170,15 +169,43 @@ class _TTSChunkPump:
             with self._stream_lock:
                 stream = self._stream
                 self._stream = None
-            close = getattr(stream, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    _LOGGER.warning("Streaming speech output failed to close the finished TTS stream.", exc_info=True)
+            self._request_stream_close(stream)
             self._done.set()
             self._queue.put(_QUEUE_SENTINEL)
             self._trace("tts_chunk_pump_finished", has_error=self._error is not None)
+
+    def _request_stream_close(self, stream: object | None) -> None:
+        """Close one live TTS stream without letting shutdown block indefinitely."""
+
+        close = getattr(stream, "close", None)
+        if not callable(close):
+            return
+
+        def _close_stream() -> None:
+            try:
+                close()
+            except ValueError as exc:
+                if "generator already executing" in str(exc):
+                    self._trace("tts_chunk_pump_close_deferred_reentrant", text_len=len(self._text))
+                    return
+                _LOGGER.warning("Streaming speech output failed to close the live TTS stream.", exc_info=True)
+            except Exception:
+                _LOGGER.warning("Streaming speech output failed to close the live TTS stream.", exc_info=True)
+
+        with self._close_lock:
+            active_close = self._close_thread
+            if active_close is not None and active_close.is_alive():
+                return
+            close_thread = Thread(
+                target=_close_stream,
+                daemon=True,
+                name="twinr-tts-pump-close",
+            )
+            self._close_thread = close_thread
+            close_thread.start()
+        close_thread.join(timeout=_TTS_STREAM_CLOSE_TIMEOUT_SECONDS)
+        if close_thread.is_alive():
+            self._trace("tts_chunk_pump_close_timeout", text_len=len(self._text))
 
     def _trace(self, msg: str, **details: object) -> None:
         if not callable(self._trace_event):

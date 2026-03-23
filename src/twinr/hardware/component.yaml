@@ -3,13 +3,15 @@ name: hardware
 path: src/twinr/hardware
 kind: python-package
 visibility: internal
-summary: Provide bounded audio, GPIO, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
+summary: Provide bounded audio, GPIO, servo, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
   - Lift under-driven PCM16 wakeword-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
   - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
+  - Wait a short bounded window for transient XVF3800 USB/ALSA re-enumeration to clear before live capture paths fail a turn
   - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends
+  - Drive one bounded body-orientation servo from an already-derived normalized attention target, including calibrated center/invert controls, soft end-stop margins, and calm idle release near neutral
   - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes
   - Persist local portrait identities with multiple reference images per user
   - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
@@ -66,6 +68,10 @@ files:
     exports:
       - build_audio_subprocess_env
       - runtime_dir_owner_uid
+  - path: respeaker_capture_recovery.py
+    role: Bound transient XVF3800 capture recovery so live listen paths only wait briefly for real USB/ALSA re-enumeration before failing
+    exports:
+      - wait_for_transient_respeaker_capture_ready
   - path: ai_camera.py
     role: Stable compatibility facade for the public local AI-camera adapter surface, including bounded multi-person visibility observations
     exports:
@@ -121,6 +127,13 @@ files:
       - configured_button_monitor
       - edge_name
       - edge_to_action
+  - path: servo_follow.py
+    role: Bounded servo pulse adapter for normalized body-orientation follow on one GPIO line, with calibrated soft limits and calm idle release
+    exports:
+      - AttentionServoConfig
+      - AttentionServoController
+      - AttentionServoDecision
+      - LGPIOServoPulseWriter
   - path: camera.py
     role: still camera adapter with bounded ffmpeg/V4L2 capture, Pi rpicam fallback, and bounded persistence
     exports:

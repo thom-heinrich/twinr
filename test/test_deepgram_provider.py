@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import json
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -61,6 +62,36 @@ class FakeWebSocketConnection:
 
     def __iter__(self):
         return iter(self.messages)
+
+
+class DelayedFinalizeResultWebSocketConnection(FakeWebSocketConnection):
+    def __init__(
+        self,
+        *,
+        speech_final_message: str,
+        final_message: str,
+        finalize_delay_s: float = 0.15,
+    ) -> None:
+        super().__init__([])
+        self._speech_final_message = speech_final_message
+        self._final_message = final_message
+        self._finalize_delay_s = max(0.0, float(finalize_delay_s))
+        self._finalize_sent = False
+
+    def send(self, payload) -> None:
+        super().send(payload)
+        if payload == json.dumps({"type": "Finalize"}):
+            self._finalize_sent = True
+
+    def __iter__(self):
+        yield self._speech_final_message
+        deadline = time.monotonic() + 1.0
+        while not self._finalize_sent and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self._finalize_sent:
+            raise AssertionError("Finalize was not sent before the delayed final result.")
+        time.sleep(self._finalize_delay_s)
+        yield self._final_message
 
 
 class DeepgramSpeechToTextProviderTests(unittest.TestCase):
@@ -212,6 +243,59 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
         self.assertEqual(endpoints[0].event_type, "speech_final")
         self.assertEqual(endpoints[0].transcript, "ich bin noch am programmieren")
         self.assertEqual(result.transcript, "ich bin noch am programmieren")
+
+    def test_streaming_session_waits_for_real_final_after_bare_speech_final(self) -> None:
+        def fake_connector(url: str, **kwargs):
+            del url, kwargs
+            return DelayedFinalizeResultWebSocketConnection(
+                speech_final_message=json.dumps(
+                    {
+                        "type": "Results",
+                        "is_final": False,
+                        "speech_final": True,
+                        "channel": {"alternatives": [{"transcript": "Heute schon geredet."}]},
+                    }
+                ),
+                final_message=json.dumps(
+                    {
+                        "type": "Results",
+                        "is_final": True,
+                        "speech_final": True,
+                        "from_finalize": True,
+                        "channel": {
+                            "alternatives": [{"transcript": "Worüber haben wir heute schon geredet?"}]
+                        },
+                        "metadata": {"request_id": "dg-req-456"},
+                    }
+                ),
+            )
+
+        provider = DeepgramSpeechToTextProvider(
+            config=TwinrConfig(
+                deepgram_api_key="deepgram-key",
+                deepgram_base_url="https://api.deepgram.example/v1",
+                deepgram_stt_model="nova-3",
+                deepgram_stt_language="de",
+                deepgram_stt_smart_format=True,
+                deepgram_streaming_finalize_timeout_s=1.0,
+            ),
+            websocket_connector=fake_connector,
+        )
+        endpoints: list[StreamingSpeechEndpointEvent] = []
+        session = provider.start_streaming_session(
+            sample_rate=16000,
+            channels=1,
+            on_endpoint=endpoints.append,
+        )
+
+        session.send_pcm(b"PCM")
+        result = session.finalize()
+
+        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(endpoints[0].transcript, "Heute schon geredet.")
+        self.assertEqual(result.transcript, "Worüber haben wir heute schon geredet?")
+        self.assertEqual(result.request_id, "dg-req-123")
+        self.assertTrue(result.saw_speech_final)
 
 
 if __name__ == "__main__":

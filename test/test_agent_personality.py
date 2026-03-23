@@ -1,14 +1,16 @@
 """Validate the structured agent-personality package and learning flow."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.personality.ambient_feedback import AmbientImpulseFeedbackExtractor
 from twinr.agent.personality import (
     BackgroundPersonalityEvolutionLoop,
     build_positive_engagement_policies,
@@ -16,6 +18,7 @@ from twinr.agent.personality import (
     DEFAULT_PERSONALITY_SNAPSHOT_KIND,
     ContinuityThread,
     HumorProfile,
+    INTERACTION_SIGNAL_SNAPSHOT_KIND,
     InteractionSignal,
     PersonalityLearningService,
     PersonalityDelta,
@@ -35,6 +38,8 @@ from twinr.agent.personality import (
     WorldSignal,
     WorldInterestSignal,
 )
+from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
+from twinr.display.reserve_bus_feedback import DisplayReserveBusFeedbackStore
 from twinr.agent.personality.self_expression import build_mindshare_items
 from twinr.agent.personality.steering import build_turn_steering_cues, resolve_follow_up_steering
 from twinr.memory.longterm.core.models import (
@@ -2162,6 +2167,105 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(result.snapshot.place_focuses[0].name, "Hamburg")
         self.assertEqual(result.snapshot.world_signals[0].region, "Hamburg")
         self.assertIn("agent_personality_context_v1", remote_state.snapshots)
+
+    def test_learning_service_merges_display_reserve_feedback_into_personality_evolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState(None)
+            config = TwinrConfig(project_root=temp_dir)
+            history_store = DisplayAmbientImpulseHistoryStore.from_config(config)
+            feedback_store = DisplayReserveBusFeedbackStore.from_config(config)
+            shown_at = datetime(2026, 3, 20, 10, 0, tzinfo=timezone.utc)
+            history_store.append_exposure(
+                source="world",
+                topic_key="ai companions",
+                title="AI companions",
+                headline="Wie entwickeln sich AI companions gerade?",
+                body="Mich interessiert, worauf du dabei schaust.",
+                action="invite_follow_up",
+                attention_state="shared_thread",
+                shown_at=shown_at,
+                expires_at=shown_at + timedelta(minutes=10),
+                match_anchors=("AI companions",),
+            )
+            learning = PersonalityLearningService(
+                extractor=PersonalitySignalExtractor(
+                    now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+                ),
+                ambient_feedback_extractor=AmbientImpulseFeedbackExtractor(
+                    history_store=history_store,
+                    reserve_bus_feedback_store=feedback_store,
+                ),
+                background_loop=BackgroundPersonalityEvolutionLoop(
+                    config=config,
+                    remote_state=remote_state,
+                    evolution_store=RemoteStatePersonalityEvolutionStore(),
+                    snapshot_store=RemoteStatePersonalitySnapshotStore(),
+                    evolution_loop=PersonalityEvolutionLoop(
+                        policy=PersonalityEvolutionPolicy(
+                            min_support_count=2,
+                            supported_delta_targets=(
+                                "humor.intensity",
+                                "style.verbosity",
+                                "relationship.topic_affinity:",
+                            ),
+                        ),
+                        now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+                    ),
+                ),
+            )
+            turn = LongTermConversationTurn(
+                transcript="Was ist da gerade spannend an AI companions?",
+                response="Mich interessiert vor allem, wie persoenlich so ein Begleiter werden sollte.",
+                created_at=shown_at + timedelta(minutes=4),
+            )
+            consolidation = LongTermConsolidationResultV1(
+                turn_id="turn:display:learn",
+                occurred_at=shown_at + timedelta(minutes=4),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="engagement:ai_companions",
+                        kind="fact",
+                        summary="The user explicitly wanted to stay with AI companions.",
+                        source=self._source("turn:display:learn"),
+                        status="active",
+                        confidence=0.84,
+                        attributes={
+                            "memory_domain": "preference",
+                            "fact_type": "feedback",
+                            "preference_type": "topic_follow_up",
+                            "topic": "AI companions",
+                            "support_count": 2,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            )
+
+            result = learning.record_conversation_consolidation(
+                turn=turn,
+                consolidation=consolidation,
+            )
+            history = history_store.load()
+            reserve_feedback = feedback_store.load_active(now=shown_at + timedelta(minutes=4))
+
+        interaction_payload = remote_state.snapshots[INTERACTION_SIGNAL_SNAPSHOT_KIND]
+        interaction_items = interaction_payload["items"]
+        self.assertTrue(
+            any(
+                item["signal_kind"] == "topic_engagement"
+                and item.get("metadata", {}).get("signal_source") == "display_reserve_card"
+                for item in interaction_items
+            )
+        )
+        self.assertEqual(history[0].response_status, "engaged")
+        self.assertEqual(history[0].response_sentiment, "positive")
+        self.assertEqual(history[0].response_mode, "voice_immediate_pickup")
+        self.assertIsNotNone(reserve_feedback)
+        assert reserve_feedback is not None
+        self.assertEqual(reserve_feedback.reaction, "immediate_engagement")
 
     def test_background_loop_persists_snapshot_and_deltas(self) -> None:
         remote_state = _FakeRemoteState(None)

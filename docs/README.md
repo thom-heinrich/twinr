@@ -252,6 +252,7 @@ This repository defines the foundation for:
 
 - Button-driven voice capture
 - Passive PIR motion sensing for local hardware bring-up and future presence-aware behavior
+- Optional body-orientation follow through a bounded Pi servo output fed by the existing multimodal attention target
 - A stateful social-trigger engine for cautious presence, attention, and safety nudges
 - Provider-based STT / LLM / TTS orchestration
 - Agentic task execution
@@ -309,6 +310,67 @@ The current prototype wiring is:
 Software defaults assume `active_high=true` and `bias=pull-down`. The GPIO signal presented to the Pi must stay at or below `3.3V`.
 
 The runtime-facing PIR helpers live in `src/twinr/hardware/pir.py`.
+
+### Attention servo
+
+Twinr can optionally drive one body-orientation servo from the same conservative
+multimodal `attention_target` that already powers HDMI eye-follow. The servo
+path does not choose its own target; it only turns a normalized left/right
+target into bounded servo pulse widths.
+
+The current prototype wiring uses:
+
+- `SIG -> GPIO18` on the Pi (`physical pin 12`, often labeled `IO18`)
+- `GND -> GND`
+- `V+ ->` the servo supply recommended by the servo module vendor
+
+Recommended runtime env knobs:
+
+- `TWINR_ATTENTION_SERVO_ENABLED=true`
+- `TWINR_ATTENTION_SERVO_DRIVER=auto`
+- `TWINR_ATTENTION_SERVO_GPIO=18`
+- `TWINR_ATTENTION_SERVO_INVERT_DIRECTION=false`
+
+Optional tuning knobs:
+
+- `TWINR_ATTENTION_SERVO_TARGET_HOLD_S`
+- `TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_S`
+- `TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_GAIN`
+- `TWINR_ATTENTION_SERVO_MIN_CONFIDENCE`
+- `TWINR_ATTENTION_SERVO_DEADBAND`
+- `TWINR_ATTENTION_SERVO_MIN_PULSE_WIDTH_US`
+- `TWINR_ATTENTION_SERVO_CENTER_PULSE_WIDTH_US`
+- `TWINR_ATTENTION_SERVO_MAX_PULSE_WIDTH_US`
+- `TWINR_ATTENTION_SERVO_MAX_STEP_US`
+- `TWINR_ATTENTION_SERVO_TARGET_SMOOTHING_S`
+- `TWINR_ATTENTION_SERVO_MAX_VELOCITY_US_PER_S`
+- `TWINR_ATTENTION_SERVO_MAX_ACCELERATION_US_PER_S2`
+- `TWINR_ATTENTION_SERVO_MAX_JERK_US_PER_S3`
+- `TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US`
+
+Supported driver values are `auto`, `sysfs_pwm`, `pigpio`, `lgpio_pwm`, and
+`lgpio`.
+
+When `TWINR_ATTENTION_SERVO_DRIVER=auto`, Twinr probes for a usable
+kernel-PWM sysfs path first, then a usable hardware-timed `pigpio` path, and
+falls back to `lgpio_pwm` before the older `lgpio` servo helper. The
+`lgpio_pwm` path keeps the same 50 Hz pulse train but programs duty cycle
+through `lgpio.tx_pwm`, which is calmer on hosts where `lgpio.tx_servo`
+itself causes visible fidgeting.
+
+For calm physical behavior, do not think only in terms of "smaller pulse
+steps". Many hobby servos have a pulse dead band, so tiny frequent pulse
+changes can buzz or twitch instead of looking softer. Twinr therefore combines:
+
+- attention-target smoothing
+- short exit-trajectory extrapolation, so the body can keep following briefly in the user's leaving direction instead of freezing or snapping back the moment the camera loses them
+- hard velocity limits
+- acceleration and jerk limits in pulse space
+- a small command threshold so sub-dead-band plan noise is not emitted as GPIO churn
+
+Keep the servo signal at `3.3V` logic level on the Pi side, and power the
+servo from a supply that matches the specific servo module instead of feeding
+it from a weak GPIO pin.
 
 ### Social trigger engine
 

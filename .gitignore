@@ -1,5 +1,6 @@
 .env
 .env.pi
+.env.chonkydb
 .venv/
 
 # Local workflow tooling.
@@ -17,15 +18,15 @@ agentic_tools/
 common/
 
 # Local runtime and ops artifacts.
-artifacts/
-artifacts/stores/ops/
-artifacts/ops/self_tests/
-artifacts/ops/support_bundles/
-state/
-state/runtime-state.json
-state/MEMORY.md
-state/*.lock
-__legacy__/
+/artifacts/
+/artifacts/stores/ops/
+/artifacts/ops/self_tests/
+/artifacts/ops/support_bundles/
+/state/
+/state/runtime-state.json
+/state/MEMORY.md
+/state/*.lock
+/__legacy__/
 
 __pycache__/
 *.pyc
@@ -33,3 +34,7 @@ __pycache__/
 node_modules/
 hardware/display/vendor/
 .tmp_remote_chonky/
+
+.pytest*/
+.tmp_remote_chonky/
+.env*

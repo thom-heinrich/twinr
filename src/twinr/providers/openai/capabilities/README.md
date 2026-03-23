@@ -8,7 +8,7 @@ responses, live search, speech, reminder phrasing, or printing.
 
 `capabilities` owns:
 - response, vision, and streaming helpers built on the OpenAI Responses API
-- live-search prompt shaping, source extraction, and search-model fallback logic
+- live-search prompt shaping, source extraction, search-model fallback logic, and structured spoken-answer output for voice playback
 - speech-to-text and text-to-speech request handling for OpenAI audio endpoints
 - reminder, proactive, and automation phrasing with deterministic local fallbacks
 - printer-safe receipt composition and print-text sanitization

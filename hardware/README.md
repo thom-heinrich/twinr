@@ -8,6 +8,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 - persist Raspberry Pi hardware settings into Twinr env files and OS config
 - install vendor or system dependencies for display, audio, and printer paths
 - install or stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
+- stage low-level Pi-side kernel or OS integration code when a peripheral needs a real kernel-facing driver path instead of a userspace helper
 - run bounded manual probes for buttons, PIR motion, display, and printer setup
 
 `hardware` does **not** own:
@@ -26,6 +27,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 | [piaicam/](./piaicam) | Pi AI Camera smoke tests, custom gesture dataset capture, and MediaPipe model staging/training |
 | [pir/](./pir) | PIR setup and motion probe |
 | [printer/](./printer) | Thermal-printer CUPS setup |
+| [servo_kernel/](./servo_kernel) | Out-of-tree Raspberry Pi servo kernel module source and build recipe |
 | [component.yaml](./component.yaml) | Structured directory metadata |
 | [AGENTS.md](./AGENTS.md) | Local editing rules |
 

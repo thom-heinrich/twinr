@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 import logging
 from math import isfinite
@@ -201,10 +201,70 @@ def _coerce_reference_datetime(value: datetime | None, *, timezone_name: object 
         return value.replace(tzinfo=tz)
 
 
+def _parse_memory_date(value: object | None, *, timezone_name: object | None) -> date | None:
+    """Return one calendar date from a persisted memory date-like field."""
+
+    if isinstance(value, datetime):
+        return _coerce_reference_datetime(value, timezone_name=timezone_name).date()
+    if isinstance(value, date):
+        return value
+    normalized = _normalize_text(value)
+    if not normalized:
+        return None
+    try:
+        return date.fromisoformat(normalized[:10])
+    except ValueError:
+        return None
+
+
+def _parse_memory_datetime(value: object | None, *, timezone_name: object | None) -> datetime | None:
+    """Return one local reference datetime from a persisted memory date-time field."""
+
+    if isinstance(value, datetime):
+        return _coerce_reference_datetime(value, timezone_name=timezone_name)
+    normalized = _normalize_text(value)
+    if not normalized or len(normalized) <= 10:
+        return None
+    candidate = normalized.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return _coerce_reference_datetime(parsed, timezone_name=timezone_name)
+
+
 def _has_concerning_body_pose(live_facts: Mapping[str, object] | None) -> bool:
     # AUDIT-FIX(#1): Suppress routine proactive offers when the visible body pose suggests possible distress.
     body_pose = _normalize_text(_section_value(live_facts, "camera", "body_pose")).lower()
     return body_pose in _CONCERNING_BODY_POSES
+
+
+def _recent_follow_up_due_date(
+    *,
+    valid_from: object | None,
+    valid_to: object | None,
+    reference: datetime,
+    timezone_name: object | None,
+) -> str | None:
+    """Return one due date when an event or plan has just passed recently enough."""
+
+    recent_threshold = reference - timedelta(hours=2)
+    today = reference.date()
+    yesterday = today - timedelta(days=1)
+    end_datetime = _parse_memory_datetime(valid_to, timezone_name=timezone_name)
+    if end_datetime is not None and end_datetime <= recent_threshold:
+        return end_datetime.date().isoformat()
+    start_datetime = _parse_memory_datetime(valid_from, timezone_name=timezone_name)
+    if start_datetime is not None and start_datetime <= recent_threshold:
+        return start_datetime.date().isoformat()
+
+    for candidate_date in (
+        _parse_memory_date(valid_to, timezone_name=timezone_name),
+        _parse_memory_date(valid_from, timezone_name=timezone_name),
+    ):
+        if candidate_date == yesterday:
+            return candidate_date.isoformat()
+    return None
 
 
 def _ambiguous_room_guard(live_facts: Mapping[str, object] | None) -> AmbiguousRoomGuardSnapshot | None:
@@ -330,6 +390,34 @@ class LongTermProactivePlanner:
                         sensitivity=sensitivity,
                     )
                 )
+            elif kind in {"event", "plan"}:
+                recent_follow_up_due_date = _recent_follow_up_due_date(
+                    valid_from=getattr(item, "valid_from", None),
+                    valid_to=getattr(item, "valid_to", None),
+                    reference=reference,
+                    timezone_name=self.timezone_name,
+                )
+                if recent_follow_up_due_date is not None:
+                    candidates.append(
+                        LongTermProactiveCandidateV1(
+                            candidate_id=f"candidate:{_slugify(memory_id, fallback='recent')}:recent_follow_up",
+                            kind="gentle_follow_up",
+                            summary=f"If relevant, gently follow up on: {item_summary}",
+                            rationale=(
+                                "A recent event or plan appears to have just happened, so a calm continuity "
+                                "check-in may help the user add the outcome or next step."
+                            ),
+                            due_date=recent_follow_up_due_date,
+                            confidence=_coerce_confidence(
+                                confidence + 0.04,
+                                default=0.62,
+                                minimum=0.62,
+                                maximum=0.9,
+                            ),
+                            source_memory_ids=(memory_id,),
+                            sensitivity=sensitivity,
+                        )
+                    )
             elif is_thread_summary(kind, attributes):
                 # AUDIT-FIX(#4): Coerce support_count defensively because persisted summaries may store it as text or junk.
                 support_count = _coerce_int(attributes.get("support_count", 1), default=1, minimum=1)

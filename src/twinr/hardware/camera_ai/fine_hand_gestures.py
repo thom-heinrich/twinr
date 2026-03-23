@@ -63,6 +63,7 @@ _NEGATIVE_FINE_GESTURE_LABELS: Final[frozenset[str]] = frozenset(
         "unknown",
     }
 )
+_BUILTIN_GESTURE_CATEGORY_DENYLIST: Final[tuple[str, ...]] = ("None",)
 
 
 def _safe_ratio(value: object, *, default: float = 0.0) -> float:
@@ -213,9 +214,22 @@ def normalize_category_name(value: object) -> str:
     return normalized.strip("_")
 
 
+def builtin_gesture_category_denylist() -> tuple[str, ...]:
+    """Return raw canned-gesture labels to suppress via official classifier options.
+
+    MediaPipe's canned gesture classifier explicitly includes the `None` label in
+    its category set. Twinr already handles "no gesture" as the absence of a
+    positive symbol, so ask the official classifier to filter that label before
+    downstream arbitration has to compete against it.
+    """
+
+    return _BUILTIN_GESTURE_CATEGORY_DENYLIST
+
+
 __all__ = [
     "BUILTIN_FINE_GESTURE_MAP",
     "CUSTOM_FINE_GESTURE_MAP",
+    "builtin_gesture_category_denylist",
     "combine_builtin_and_custom_gesture_choice",
     "normalize_category_name",
     "prefer_gesture_choice",

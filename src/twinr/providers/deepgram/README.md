@@ -11,6 +11,10 @@ against Deepgram's REST and websocket endpoints.
 - manage bounded websocket streaming sessions and endpoint callbacks
 - normalize Deepgram payloads into Twinr STT contracts
 
+Streaming note:
+- `speech_final` endpoint callbacks are only early stop hints for Twinr's turn controller.
+- `session.finalize()` still waits for a real final Deepgram segment before returning, unless the bounded finalize timeout expires first.
+
 `deepgram` does **not** own:
 - provider selection or fallback orchestration
 - microphone capture, playback, or WAV generation

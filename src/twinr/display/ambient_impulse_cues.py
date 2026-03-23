@@ -128,8 +128,8 @@ class DisplayAmbientImpulseCue:
         object.__setattr__(self, "source", _compact_text(self.source, max_len=80) or "external")
         object.__setattr__(self, "topic_key", _compact_text(self.topic_key, max_len=96).casefold())
         object.__setattr__(self, "eyebrow", _compact_text(self.eyebrow, max_len=36))
-        object.__setattr__(self, "headline", _compact_text(self.headline, max_len=112))
-        object.__setattr__(self, "body", _compact_text(self.body, max_len=96))
+        object.__setattr__(self, "headline", _compact_text(self.headline, max_len=128))
+        object.__setattr__(self, "body", _compact_text(self.body, max_len=128))
         object.__setattr__(self, "symbol", _normalize_symbol(self.symbol).value)
         object.__setattr__(self, "accent", _normalize_accent(self.accent))
         object.__setattr__(self, "action", _normalize_action(self.action))
@@ -156,8 +156,8 @@ class DisplayAmbientImpulseCue:
             expires_at=_format_timestamp(expires_at),
             topic_key=_compact_text(payload.get("topic_key"), max_len=96).casefold(),
             eyebrow=_compact_text(payload.get("eyebrow"), max_len=36),
-            headline=_compact_text(payload.get("headline"), max_len=112),
-            body=_compact_text(payload.get("body"), max_len=96),
+            headline=_compact_text(payload.get("headline"), max_len=128),
+            body=_compact_text(payload.get("body"), max_len=128),
             symbol=_normalize_symbol(payload.get("symbol")).value,
             accent=_normalize_accent(payload.get("accent")),
             action=_normalize_action(payload.get("action")),

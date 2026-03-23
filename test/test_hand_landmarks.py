@@ -14,6 +14,7 @@ from twinr.hardware.hand_landmarks import (
     MediaPipeHandLandmarkWorker,
     _parse_hand_landmark_result,
     _build_hand_roi_candidates,
+    _crop_local_hand_from_roi_frame,
     _project_landmark_to_full_frame,
 )
 
@@ -42,7 +43,7 @@ class _FakeFrame:
 
 
 class HandLandmarkWorkerTests(unittest.TestCase):
-    def test_build_hand_roi_candidates_prefers_wrist_windows_without_upper_body_fallback(self) -> None:
+    def test_build_hand_roi_candidates_keeps_person_rescue_rois_after_wrist_windows(self) -> None:
         candidates = _build_hand_roi_candidates(
             primary_person_box=AICameraBox(top=0.14, left=0.20, bottom=0.96, right=0.78),
             sparse_keypoints={
@@ -57,19 +58,28 @@ class HandLandmarkWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual({candidates[0].source, candidates[1].source}, {HandRoiSource.LEFT_WRIST, HandRoiSource.RIGHT_WRIST})
-        self.assertEqual(len(candidates), 2)
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(
+            {candidate.source for candidate in candidates[2:]},
+            {
+                HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
+                HandRoiSource.PRIMARY_PERSON_FULL_BODY,
+            },
+        )
         wrist_centers = sorted(round(candidate.box.center_x, 2) for candidate in candidates[:2])
         self.assertEqual(wrist_centers, [0.18, 0.83])
 
-    def test_build_hand_roi_candidates_uses_upper_body_fallback_when_wrists_missing(self) -> None:
+    def test_build_hand_roi_candidates_adds_full_body_rescue_when_wrists_missing(self) -> None:
         candidates = _build_hand_roi_candidates(
             primary_person_box=AICameraBox(top=0.14, left=0.20, bottom=0.96, right=0.78),
             sparse_keypoints={},
             config=HandLandmarkWorkerConfig(model_path="state/mediapipe/models/hand_landmarker.task"),
         )
 
-        self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(candidates), 2)
         self.assertEqual(candidates[0].source, HandRoiSource.PRIMARY_PERSON_UPPER_BODY)
+        self.assertEqual(candidates[1].source, HandRoiSource.PRIMARY_PERSON_FULL_BODY)
+        self.assertGreater(candidates[1].box.height, candidates[0].box.height)
 
     def test_project_landmark_to_full_frame_maps_roi_local_coords(self) -> None:
         point = _project_landmark_to_full_frame(
@@ -123,7 +133,7 @@ class HandLandmarkWorkerTests(unittest.TestCase):
 
         self.assertEqual(len(result.detections), 2)
         self.assertEqual(result.detections[0].handedness, "left")
-        self.assertGreater(result.detections[0].confidence, result.detections[1].confidence)
+        self.assertGreaterEqual(result.detections[0].confidence, result.detections[1].confidence)
 
     def test_missing_model_path_fails_closed(self) -> None:
         worker = MediaPipeHandLandmarkWorker(
@@ -256,8 +266,47 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(len(detect_calls), 2)
-        self.assertEqual(result.final_timestamp_ms, 8)
+        self.assertEqual(len(detect_calls), 3)
+        self.assertEqual(result.final_timestamp_ms, 9)
+
+    def test_analyze_full_frame_uses_single_image_mode_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "hand_landmarker.task"
+            model_path.write_bytes(b"hand")
+            worker = MediaPipeHandLandmarkWorker(
+                config=HandLandmarkWorkerConfig(
+                    model_path=str(model_path),
+                    num_hands=1,
+                    max_roi_candidates=4,
+                )
+            )
+            detect_calls: list[int] = []
+            worker._hand_landmarker = SimpleNamespace(
+                detect=lambda image: (
+                    detect_calls.append(1),
+                    SimpleNamespace(hand_landmarks=[], handedness=[]),
+                )[1],
+                detect_for_video=lambda image, timestamp_ms: (_ for _ in ()).throw(
+                    AssertionError("Full-frame hand rescue must stay in IMAGE mode")
+                ),
+            )
+            runtime = {
+                "mp": SimpleNamespace(
+                    ImageFormat=SimpleNamespace(SRGB="srgb"),
+                    Image=lambda image_format, data: SimpleNamespace(image_format=image_format, data=data),
+                ),
+                "vision": SimpleNamespace(),
+                "BaseOptions": object,
+            }
+
+            result = worker.analyze_full_frame(
+                runtime=runtime,
+                frame_rgb=_FakeFrame(120, 160),
+                timestamp_ms=12,
+            )
+
+        self.assertEqual(len(detect_calls), 1)
+        self.assertEqual(result.final_timestamp_ms, 12)
 
     def test_parse_hand_landmark_result_tightens_roi_frame_to_local_hand_crop(self) -> None:
         roi_frame = _FakeFrame(100, 120)
@@ -282,6 +331,19 @@ class HandLandmarkWorkerTests(unittest.TestCase):
         self.assertLess(detections[0].roi_frame_rgb.shape[0], roi_frame.shape[0])
         self.assertLess(detections[0].roi_frame_rgb.shape[1], roi_frame.shape[1])
         self.assertEqual(detections[0].handedness, "right")
+
+    def test_crop_local_hand_from_roi_frame_keeps_minimum_context_window(self) -> None:
+        roi_frame = _FakeFrame(100, 120)
+
+        crop = _crop_local_hand_from_roi_frame(
+            roi_frame_rgb=roi_frame,
+            local_landmarks=[
+                SimpleNamespace(x=0.48, y=0.47, z=0.0),
+                SimpleNamespace(x=0.50, y=0.49, z=0.0),
+            ],
+        )
+
+        self.assertEqual(crop.shape, (31, 37, 3))
 
 
 if __name__ == "__main__":

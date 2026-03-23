@@ -54,6 +54,11 @@ When it can resolve the target capture card by name, it also persists
 the normal conversation recorder does not drift back onto a stale generic
 `default` alias while wakeword/proactive capture already uses the real
 ReSpeaker device.
+The same setup flow now also persists `TWINR_AUDIO_OUTPUT_DEVICE` as an
+explicit Twinr-owned playback PCM, preferring `twinr_playback_softvol` when
+the script materializes that ALSA stage and otherwise pinning Twinr to the
+resolved playback card directly instead of leaving speech output on the
+desktop-facing `default` alias.
 Pass `--skip-playback-volume` only when you intentionally want to keep the
 current sink/card loudness unchanged.
 

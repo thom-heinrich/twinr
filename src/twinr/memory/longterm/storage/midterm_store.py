@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ _MIDTERM_STORE_SCHEMA = "twinr_memory_midterm_store"
 _MIDTERM_STORE_VERSION = 1
 _DEFAULT_RETRIEVAL_LIMIT = 3
 _CROSS_SERVICE_READ_MODE = 0o644
+_REFLECTION_TURN_CONTINUITY_PRESERVE_LIMIT = 4
 
 # AUDIT-FIX(#8): Add module-level logging so storage recovery paths are diagnosable in production.
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +143,15 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
         return None
 
     return dict(loaded)
+
+
+def _packet_updated_at(packet: LongTermMidtermPacketV1) -> datetime:
+    """Return one timezone-safe packet timestamp for bounded recency ranking."""
+
+    updated_at = packet.updated_at
+    if updated_at.tzinfo is None or updated_at.tzinfo.utcoffset(updated_at) is None:
+        return updated_at.replace(tzinfo=timezone.utc)
+    return updated_at.astimezone(timezone.utc)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -353,10 +364,25 @@ class LongTermMidtermStore:
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
         """Persist the midterm packets emitted by one reflection result."""
 
-        self.save_packets_preserving_attribute(
-            packets=result.midterm_packets,
-            attribute_key="persistence_scope",
-            attribute_value="restart_recall",
+        existing_packets = self.load_packets()
+        preserved_packets = self._merged_packets(
+            primary=self._matching_packets(
+                existing_packets,
+                attribute_key="persistence_scope",
+                attribute_value="restart_recall",
+            ),
+            secondary=self._latest_matching_packets(
+                existing_packets,
+                attribute_key="persistence_scope",
+                attribute_value="turn_continuity",
+                limit=_REFLECTION_TURN_CONTINUITY_PRESERVE_LIMIT,
+            ),
+        )
+        self.save_packets(
+            packets=self._merged_packets(
+                primary=result.midterm_packets,
+                secondary=preserved_packets,
+            )
         )
 
     def replace_packets_with_attribute(
@@ -390,6 +416,47 @@ class LongTermMidtermStore:
             if self._packet_attribute(packet, attribute_key) == attribute_value
         )
         self.save_packets(packets=self._merged_packets(primary=packets, secondary=preserved_packets))
+
+    def _matching_packets(
+        self,
+        packets: tuple[LongTermMidtermPacketV1, ...],
+        *,
+        attribute_key: str,
+        attribute_value: object,
+    ) -> tuple[LongTermMidtermPacketV1, ...]:
+        """Return all packets whose attribute exactly matches one scoped value."""
+
+        return tuple(
+            packet
+            for packet in packets
+            if self._packet_attribute(packet, attribute_key) == attribute_value
+        )
+
+    def _latest_matching_packets(
+        self,
+        packets: tuple[LongTermMidtermPacketV1, ...],
+        *,
+        attribute_key: str,
+        attribute_value: object,
+        limit: int,
+    ) -> tuple[LongTermMidtermPacketV1, ...]:
+        """Return the newest packets for one scoped attribute subset."""
+
+        bounded_limit = max(0, int(limit))
+        if bounded_limit == 0:
+            return ()
+        matching = list(
+            self._matching_packets(
+                packets,
+                attribute_key=attribute_key,
+                attribute_value=attribute_value,
+            )
+        )
+        matching.sort(
+            key=lambda packet: (_packet_updated_at(packet), packet.packet_id),
+            reverse=True,
+        )
+        return tuple(matching[:bounded_limit])
 
     def _load_payload(self) -> dict[str, object] | None:
         """Load the best available validated payload from local or remote."""

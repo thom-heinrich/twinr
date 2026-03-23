@@ -38,6 +38,36 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
         self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
+        self.assertEqual(config.local_semantic_router_mode, "off")
+        self.assertIsNone(config.local_semantic_router_model_dir)
+        self.assertIsNone(config.local_semantic_router_user_intent_model_dir)
+        self.assertTrue(config.local_semantic_router_trace)
+
+    def test_from_env_reads_local_semantic_router_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_MODE=gated",
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_MODEL_DIR=artifacts/router/bundle",
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_USER_INTENT_MODEL_DIR=artifacts/router/user_intent_bundle",
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_TRACE=false",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.local_semantic_router_mode, "gated")
+        self.assertEqual(config.local_semantic_router_model_dir, "artifacts/router/bundle")
+        self.assertEqual(
+            config.local_semantic_router_user_intent_model_dir,
+            "artifacts/router/user_intent_bundle",
+        )
+        self.assertFalse(config.local_semantic_router_trace)
 
     def test_display_gpio_conflicts_reports_button_overlap(self) -> None:
         config = TwinrConfig(
@@ -83,6 +113,16 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.display_busy_timeout_s, 12.5)
+
+    def test_display_reserve_generation_defaults_follow_primary_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("OPENAI_MODEL=gpt-5.2\n", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_reserve_generation_model, "gpt-5.2")
+        self.assertEqual(config.display_reserve_generation_timeout_seconds, 12.0)
 
     def test_from_env_reads_display_runtime_trace_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -149,6 +189,61 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_attention_refresh_interval_s, 1.4)
         self.assertEqual(config.display_attention_session_focus_hold_s, 5.25)
 
+    def test_from_env_reads_attention_servo_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_ATTENTION_SERVO_ENABLED=true",
+                        "TWINR_ATTENTION_SERVO_DRIVER=lgpio_pwm",
+                        "TWINR_ATTENTION_SERVO_GPIO=18",
+                        "TWINR_ATTENTION_SERVO_INVERT_DIRECTION=true",
+                        "TWINR_ATTENTION_SERVO_TARGET_HOLD_S=1.6",
+                        "TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_S=0.9",
+                        "TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_GAIN=0.8",
+                        "TWINR_ATTENTION_SERVO_MIN_CONFIDENCE=0.66",
+                        "TWINR_ATTENTION_SERVO_DEADBAND=0.08",
+                        "TWINR_ATTENTION_SERVO_MIN_PULSE_WIDTH_US=1100",
+                        "TWINR_ATTENTION_SERVO_CENTER_PULSE_WIDTH_US=1490",
+                        "TWINR_ATTENTION_SERVO_MAX_PULSE_WIDTH_US=1910",
+                        "TWINR_ATTENTION_SERVO_MAX_STEP_US=33",
+                        "TWINR_ATTENTION_SERVO_TARGET_SMOOTHING_S=1.25",
+                        "TWINR_ATTENTION_SERVO_MAX_VELOCITY_US_PER_S=72.0",
+                        "TWINR_ATTENTION_SERVO_MAX_ACCELERATION_US_PER_S2=180.0",
+                        "TWINR_ATTENTION_SERVO_MAX_JERK_US_PER_S3=640.0",
+                        "TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US=9",
+                        "TWINR_ATTENTION_SERVO_SOFT_LIMIT_MARGIN_US=55",
+                        "TWINR_ATTENTION_SERVO_IDLE_RELEASE_S=1.4",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.attention_servo_enabled)
+        self.assertEqual(config.attention_servo_driver, "lgpio_pwm")
+        self.assertEqual(config.attention_servo_gpio, 18)
+        self.assertTrue(config.attention_servo_invert_direction)
+        self.assertEqual(config.attention_servo_target_hold_s, 1.6)
+        self.assertEqual(config.attention_servo_loss_extrapolation_s, 0.9)
+        self.assertEqual(config.attention_servo_loss_extrapolation_gain, 0.8)
+        self.assertEqual(config.attention_servo_min_confidence, 0.66)
+        self.assertEqual(config.attention_servo_deadband, 0.08)
+        self.assertEqual(config.attention_servo_min_pulse_width_us, 1100)
+        self.assertEqual(config.attention_servo_center_pulse_width_us, 1490)
+        self.assertEqual(config.attention_servo_max_pulse_width_us, 1910)
+        self.assertEqual(config.attention_servo_max_step_us, 33)
+        self.assertEqual(config.attention_servo_target_smoothing_s, 1.25)
+        self.assertEqual(config.attention_servo_max_velocity_us_per_s, 72.0)
+        self.assertEqual(config.attention_servo_max_acceleration_us_per_s2, 180.0)
+        self.assertEqual(config.attention_servo_max_jerk_us_per_s3, 640.0)
+        self.assertEqual(config.attention_servo_min_command_delta_us, 9)
+        self.assertEqual(config.attention_servo_soft_limit_margin_us, 55)
+        self.assertEqual(config.attention_servo_idle_release_s, 1.4)
+
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -177,11 +272,25 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_DISPLAY_AMBIENT_IMPULSES_ENABLED=false",
                         "TWINR_DISPLAY_AMBIENT_IMPULSE_PATH=state/custom/ambient.json",
                         "TWINR_DISPLAY_AMBIENT_IMPULSE_TTL_S=22.0",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_ENABLED=false",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_MODEL=gpt-5.2-mini",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_REASONING_EFFORT=minimal",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_TIMEOUT_SECONDS=6.5",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_MAX_OUTPUT_TOKENS=640",
                         "TWINR_DISPLAY_RESERVE_BUS_PLAN_PATH=state/custom/reserve_plan.json",
+                        "TWINR_DISPLAY_RESERVE_BUS_PREPARED_PLAN_PATH=state/custom/reserve_plan_prepared.json",
+                        "TWINR_DISPLAY_RESERVE_BUS_MAINTENANCE_STATE_PATH=state/custom/reserve_maintenance.json",
                         "TWINR_DISPLAY_RESERVE_BUS_REFRESH_AFTER_LOCAL=06:15",
+                        "TWINR_DISPLAY_RESERVE_BUS_NIGHTLY_ENABLED=false",
+                        "TWINR_DISPLAY_RESERVE_BUS_NIGHTLY_AFTER_LOCAL=01:45",
+                        "TWINR_DISPLAY_RESERVE_BUS_NIGHTLY_POLL_INTERVAL_S=420",
                         "TWINR_DISPLAY_RESERVE_BUS_CANDIDATE_LIMIT=11",
                         "TWINR_DISPLAY_RESERVE_BUS_ITEMS_PER_DAY=36",
                         "TWINR_DISPLAY_RESERVE_BUS_TOPIC_GAP=3",
+                        "TWINR_DISPLAY_RESERVE_BUS_LEARNING_WINDOW_DAYS=28",
+                        "TWINR_DISPLAY_RESERVE_BUS_LEARNING_HALF_LIFE_DAYS=9",
+                        "TWINR_DISPLAY_RESERVE_BUS_REFLECTION_CANDIDATE_LIMIT=5",
+                        "TWINR_DISPLAY_RESERVE_BUS_REFLECTION_MAX_AGE_DAYS=18",
                         "TWINR_DISPLAY_RESERVE_BUS_MIN_HOLD_S=900",
                         "TWINR_DISPLAY_RESERVE_BUS_BASE_HOLD_S=1800",
                         "TWINR_DISPLAY_RESERVE_BUS_MAX_HOLD_S=3000",
@@ -196,11 +305,25 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.display_ambient_impulses_enabled)
         self.assertEqual(config.display_ambient_impulse_path, "state/custom/ambient.json")
         self.assertEqual(config.display_ambient_impulse_ttl_s, 22.0)
+        self.assertFalse(config.display_reserve_generation_enabled)
+        self.assertEqual(config.display_reserve_generation_model, "gpt-5.2-mini")
+        self.assertEqual(config.display_reserve_generation_reasoning_effort, "minimal")
+        self.assertEqual(config.display_reserve_generation_timeout_seconds, 6.5)
+        self.assertEqual(config.display_reserve_generation_max_output_tokens, 640)
         self.assertEqual(config.display_reserve_bus_plan_path, "state/custom/reserve_plan.json")
+        self.assertEqual(config.display_reserve_bus_prepared_plan_path, "state/custom/reserve_plan_prepared.json")
+        self.assertEqual(config.display_reserve_bus_maintenance_state_path, "state/custom/reserve_maintenance.json")
         self.assertEqual(config.display_reserve_bus_refresh_after_local, "06:15")
+        self.assertFalse(config.display_reserve_bus_nightly_enabled)
+        self.assertEqual(config.display_reserve_bus_nightly_after_local, "01:45")
+        self.assertEqual(config.display_reserve_bus_nightly_poll_interval_s, 420.0)
         self.assertEqual(config.display_reserve_bus_candidate_limit, 11)
         self.assertEqual(config.display_reserve_bus_items_per_day, 36)
         self.assertEqual(config.display_reserve_bus_topic_gap, 3)
+        self.assertEqual(config.display_reserve_bus_learning_window_days, 28.0)
+        self.assertEqual(config.display_reserve_bus_learning_half_life_days, 9.0)
+        self.assertEqual(config.display_reserve_bus_reflection_candidate_limit, 5)
+        self.assertEqual(config.display_reserve_bus_reflection_max_age_days, 18.0)
         self.assertEqual(config.display_reserve_bus_min_hold_s, 900.0)
         self.assertEqual(config.display_reserve_bus_base_hold_s, 1800.0)
         self.assertEqual(config.display_reserve_bus_max_hold_s, 3000.0)
@@ -231,7 +354,6 @@ class TwinrConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "TWINR_DISPLAY_NEWS_TICKER_ENABLED=true",
-                        "TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://example.com/a.rss, https://example.com/b.atom",
                         "TWINR_DISPLAY_NEWS_TICKER_STORE_PATH=state/custom/news.json",
                         "TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S=1200",
                         "TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S=15",
@@ -247,14 +369,29 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertTrue(config.display_news_ticker_enabled)
         self.assertEqual(
-            config.display_news_ticker_feed_urls,
-            ("https://example.com/a.rss", "https://example.com/b.atom"),
+            config.display_news_ticker_legacy_feed_urls,
+            (),
         )
         self.assertEqual(config.display_news_ticker_store_path, "state/custom/news.json")
         self.assertEqual(config.display_news_ticker_refresh_interval_s, 1200.0)
         self.assertEqual(config.display_news_ticker_rotation_interval_s, 15.0)
         self.assertEqual(config.display_news_ticker_max_items, 8)
         self.assertEqual(config.display_news_ticker_timeout_s, 3.5)
+
+    def test_from_env_keeps_legacy_display_news_ticker_feed_urls_for_one_way_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://example.com/a.rss, https://example.com/b.atom\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(
+            config.display_news_ticker_legacy_feed_urls,
+            ("https://example.com/a.rss", "https://example.com/b.atom"),
+        )
 
     def test_from_env_reads_whatsapp_channel_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -670,6 +807,9 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS=false",
                         "TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE=48",
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
+                        "TWINR_LONG_TERM_MEMORY_FAST_TOPIC_ENABLED=false",
+                        "TWINR_LONG_TERM_MEMORY_FAST_TOPIC_LIMIT=2",
+                        "TWINR_LONG_TERM_MEMORY_FAST_TOPIC_TIMEOUT_S=0.45",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=5.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S=2.25",
@@ -1020,6 +1160,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 48)
         self.assertEqual(config.long_term_memory_recall_limit, 5)
+        self.assertFalse(config.long_term_memory_fast_topic_enabled)
+        self.assertEqual(config.long_term_memory_fast_topic_limit, 2)
+        self.assertEqual(config.long_term_memory_fast_topic_timeout_s, 0.45)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 5.5)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 2.25)
@@ -1194,6 +1337,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 32)
         self.assertEqual(config.long_term_memory_recall_limit, 3)
+        self.assertTrue(config.long_term_memory_fast_topic_enabled)
+        self.assertEqual(config.long_term_memory_fast_topic_limit, 3)
+        self.assertEqual(config.long_term_memory_fast_topic_timeout_s, 0.6)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
@@ -1508,6 +1654,17 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ORCHESTRATOR_PORT=9876",
                         "TWINR_ORCHESTRATOR_WS_URL=ws://10.0.0.5:9876/ws/orchestrator",
                         "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
+                        "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
+                        "TWINR_VOICE_ORCHESTRATOR_WS_URL=wss://voice.example/ws/orchestrator/voice",
+                        "TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=local_stt",
+                        "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=2400",
+                        "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_MIN_ACTIVE_RATIO=0.12",
+                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_URL=http://10.10.0.2:18090",
+                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_BEARER_TOKEN=voice-secret",
+                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_TIMEOUT_S=2.75",
+                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_LANGUAGE=de",
+                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_MODE=active_listening",
+                        "TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_TIMEOUT_S=7.5",
                     ]
                 ),
                 encoding="utf-8",
@@ -1519,3 +1676,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestrator_port, 9876)
         self.assertEqual(config.orchestrator_ws_url, "ws://10.0.0.5:9876/ws/orchestrator")
         self.assertEqual(config.orchestrator_shared_secret, "secret-token")
+        self.assertTrue(config.voice_orchestrator_enabled)
+        self.assertEqual(config.voice_orchestrator_ws_url, "wss://voice.example/ws/orchestrator/voice")
+        self.assertEqual(config.voice_orchestrator_shared_secret, "secret-token")
+        self.assertEqual(config.voice_orchestrator_wake_stage1_mode, "local_stt")
+        self.assertEqual(config.voice_orchestrator_wake_candidate_window_ms, 2400)
+        self.assertEqual(config.voice_orchestrator_wake_candidate_min_active_ratio, 0.12)
+        self.assertEqual(config.voice_orchestrator_local_stt_url, "http://10.10.0.2:18090")
+        self.assertEqual(config.voice_orchestrator_local_stt_bearer_token, "voice-secret")
+        self.assertEqual(config.voice_orchestrator_local_stt_timeout_s, 2.75)
+        self.assertEqual(config.voice_orchestrator_local_stt_language, "de")
+        self.assertEqual(config.voice_orchestrator_local_stt_mode, "active_listening")
+        self.assertEqual(config.voice_orchestrator_follow_up_timeout_s, 7.5)

@@ -28,9 +28,15 @@ _DEFAULT_MEDIAPIPE_GESTURE_MODEL = "state/mediapipe/models/gesture_recognizer.ta
 _DEFAULT_MEDIAPIPE_CUSTOM_GESTURE_MODEL = "state/mediapipe/models/custom_gesture.task"
 _DEFAULT_MAIN_SIZE = (640, 480)
 _DEFAULT_FRAME_RATE = 15
+_DEFAULT_LOW_LIGHT_FRAME_RATE = 6
 _DEFAULT_LOCK_TIMEOUT_S = 5.0
 _DEFAULT_STARTUP_WARMUP_S = 0.8
 _DEFAULT_METADATA_WAIT_S = 0.75
+_DEFAULT_LOW_LIGHT_LUX_THRESHOLD = 1.2
+_DEFAULT_LOW_LIGHT_RECOVER_LUX_THRESHOLD = 2.2
+_DEFAULT_LOW_LIGHT_MANUAL_EXPOSURE_RATIO = 0.90
+_DEFAULT_LOW_LIGHT_MANUAL_ANALOGUE_GAIN = 8.0
+_DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO = 0.60
 _DEFAULT_PERSON_CONFIDENCE = 0.40
 _DEFAULT_OBJECT_CONFIDENCE = 0.55
 _DEFAULT_PERSON_NEAR_AREA = 0.20
@@ -53,6 +59,7 @@ _MIN_CAMERA_HEIGHT = 120  # AUDIT-FIX(#1): Keep camera sizing inside Pi-safe, de
 _MAX_CAMERA_HEIGHT = 1080  # AUDIT-FIX(#1): Keep camera sizing inside Pi-safe, device-realistic limits.
 _MIN_FRAME_RATE = 1  # AUDIT-FIX(#1): Avoid zero/negative FPS and cap runaway CPU usage on Pi 4.
 _MAX_FRAME_RATE = 30  # AUDIT-FIX(#1): Avoid zero/negative FPS and cap runaway CPU usage on Pi 4.
+_MAX_LUX_THRESHOLD = 1000.0  # AUDIT-FIX(#12): Keep low-light thresholds finite and physically plausible.
 _MIN_NUM_HANDS = 1  # AUDIT-FIX(#1): Bound hand tracking to supported, realistic values.
 _MAX_NUM_HANDS = 2  # AUDIT-FIX(#1): Bound hand tracking to supported, realistic values.
 _MIN_LOCK_TIMEOUT_S = 0.1  # AUDIT-FIX(#1): Prevent effectively disabled or pathological lock timing.
@@ -83,9 +90,15 @@ class AICameraAdapterConfig:
     mediapipe_num_hands: int = 2
     main_size: tuple[int, int] = _DEFAULT_MAIN_SIZE
     frame_rate: int = _DEFAULT_FRAME_RATE
+    low_light_frame_rate: int = _DEFAULT_LOW_LIGHT_FRAME_RATE
     lock_timeout_s: float = _DEFAULT_LOCK_TIMEOUT_S
     startup_warmup_s: float = _DEFAULT_STARTUP_WARMUP_S
     metadata_wait_s: float = _DEFAULT_METADATA_WAIT_S
+    low_light_lux_threshold: float = _DEFAULT_LOW_LIGHT_LUX_THRESHOLD
+    low_light_recover_lux_threshold: float = _DEFAULT_LOW_LIGHT_RECOVER_LUX_THRESHOLD
+    low_light_manual_exposure_ratio: float = _DEFAULT_LOW_LIGHT_MANUAL_EXPOSURE_RATIO
+    low_light_manual_analogue_gain: float = _DEFAULT_LOW_LIGHT_MANUAL_ANALOGUE_GAIN
+    low_light_auto_exposure_cap_ratio: float = _DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO
     person_confidence_threshold: float = _DEFAULT_PERSON_CONFIDENCE
     object_confidence_threshold: float = _DEFAULT_OBJECT_CONFIDENCE
     person_near_area_threshold: float = _DEFAULT_PERSON_NEAR_AREA
@@ -197,6 +210,19 @@ class AICameraAdapterConfig:
             maximum=_MAX_FRAME_RATE,
         )
         object.__setattr__(self, "frame_rate", frame_rate)
+        object.__setattr__(
+            self,
+            "low_light_frame_rate",
+            min(
+                frame_rate,
+                _coerce_bounded_int(
+                    self.low_light_frame_rate,
+                    default=_DEFAULT_LOW_LIGHT_FRAME_RATE,
+                    minimum=_MIN_FRAME_RATE,
+                    maximum=_MAX_FRAME_RATE,
+                ),
+            ),
+        )
 
         object.__setattr__(
             self,
@@ -226,6 +252,52 @@ class AICameraAdapterConfig:
                 default=_DEFAULT_METADATA_WAIT_S,
                 minimum=_MIN_METADATA_WAIT_S,
                 maximum=_MAX_METADATA_WAIT_S,
+            ),
+        )
+        low_light_lux_threshold = _coerce_bounded_float(
+            self.low_light_lux_threshold,
+            default=_DEFAULT_LOW_LIGHT_LUX_THRESHOLD,
+            minimum=0.0,
+            maximum=_MAX_LUX_THRESHOLD,
+        )
+        object.__setattr__(self, "low_light_lux_threshold", low_light_lux_threshold)
+        object.__setattr__(
+            self,
+            "low_light_recover_lux_threshold",
+            max(
+                low_light_lux_threshold,
+                _coerce_bounded_float(
+                    self.low_light_recover_lux_threshold,
+                    default=_DEFAULT_LOW_LIGHT_RECOVER_LUX_THRESHOLD,
+                    minimum=0.0,
+                    maximum=_MAX_LUX_THRESHOLD,
+                ),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "low_light_manual_exposure_ratio",
+            _clamp_ratio(
+                self.low_light_manual_exposure_ratio,
+                default=_DEFAULT_LOW_LIGHT_MANUAL_EXPOSURE_RATIO,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "low_light_manual_analogue_gain",
+            _coerce_bounded_float(
+                self.low_light_manual_analogue_gain,
+                default=_DEFAULT_LOW_LIGHT_MANUAL_ANALOGUE_GAIN,
+                minimum=1.0,
+                maximum=16.0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "low_light_auto_exposure_cap_ratio",
+            _clamp_ratio(
+                self.low_light_auto_exposure_cap_ratio,
+                default=_DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO,
             ),
         )
 
@@ -410,6 +482,11 @@ class AICameraAdapterConfig:
                 "proactive_local_camera_frame_rate",
                 _DEFAULT_FRAME_RATE,
             ),
+            low_light_frame_rate=_safe_getattr(
+                config,
+                "proactive_local_camera_low_light_frame_rate",
+                _DEFAULT_LOW_LIGHT_FRAME_RATE,
+            ),
             lock_timeout_s=_safe_getattr(
                 config,
                 "proactive_local_camera_lock_timeout_s",
@@ -424,6 +501,16 @@ class AICameraAdapterConfig:
                 config,
                 "proactive_local_camera_metadata_wait_s",
                 _DEFAULT_METADATA_WAIT_S,
+            ),
+            low_light_lux_threshold=_safe_getattr(
+                config,
+                "proactive_local_camera_low_light_lux_threshold",
+                _DEFAULT_LOW_LIGHT_LUX_THRESHOLD,
+            ),
+            low_light_recover_lux_threshold=_safe_getattr(
+                config,
+                "proactive_local_camera_low_light_recover_lux_threshold",
+                _DEFAULT_LOW_LIGHT_RECOVER_LUX_THRESHOLD,
             ),
             person_confidence_threshold=_safe_getattr(
                 config,

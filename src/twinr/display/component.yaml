@@ -11,13 +11,16 @@ owned_concerns:
   - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema, and let directional cues calm the normal waiting-face idle churn instead of fighting it
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
   - Persist and load optional HDMI emoji cues so capabilities can claim the free right-hand reserve area with one real Unicode symbol and soft accent halo instead of status-card chrome
-  - Persist and load optional HDMI ambient-impulse cues so personality-driven capabilities can claim the same reserve area with one tiny bounded text-plus-emoji card that stays positive and glanceable
+  - Persist and load optional HDMI ambient-impulse cues so personality-driven capabilities can claim the same reserve area with one bounded readable question-first card that stays positive and glanceable
+  - Persist a bounded reserve-card exposure history so later learning code can correlate shown cards with later structured user reactions without coupling that memory into the renderer
+  - Persist one short-lived reserve-bus feedback hint so strong immediate pickup or pushback can bias the remaining day plan faster than the slower long-term learning loop
+  - Render prompt-mode reserve cards as one large readable text block on the Pi surface instead of tiny eyebrow-led chrome, while still letting other capabilities own the reserve bus explicitly
   - Resolve the right-hand HDMI reserve area through one explicit reserve-bus helper so emoji acknowledgements and calmer ambient reserve cards keep a clear priority contract
   - Mirror clear user camera gestures onto that right-hand reserve area with the same real Unicode emoji while keeping hostile-gesture reactions separate from face emotion
   - Persist and load optional HDMI presentation cues so capabilities can claim the otherwise free right-hand HDMI reserve area or expand into a fullscreen image or rich card without changing the generic runtime snapshot schema
   - Resolve prioritized HDMI presentation cards into a calm scene graph with eased morph stages and default face-sync reactions
   - Schedule rare idle-only HDMI ambient moments so the waiting face can occasionally show a small cute surprise without disrupting the status panel
-  - Fetch, cache, and rotate optional RSS or Atom headlines for the HDMI bottom ticker without blocking the display loop on remote network I/O
+  - Fetch, cache, and rotate optional HDMI ticker headlines from the same persisted world-intelligence subscription pool that Twinr uses for world awareness, without blocking the display loop on remote network I/O
   - Run bounded HDMI visual QC scene sets that capture screenshots, diff metrics, and report-ready artifacts for the visible monitor surface
   - Compose operator-friendly layout variants such as the grouped debug log display
   - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
@@ -83,6 +86,10 @@ files:
       - DisplayAmbientImpulseController
       - DisplayAmbientImpulseCue
       - DisplayAmbientImpulseCueStore
+  - path: ambient_impulse_history.py
+    role: Persist a bounded history of shown reserve cards and their later coarse reaction outcomes for display-driven learning
+  - path: reserve_bus_feedback.py
+    role: Persist one short-lived reserve-bus feedback hint that lets strong shown-card reactions bias reserve replanning
   - path: reserve_bus.py
     role: Resolve the explicit current owner of the right-hand HDMI reserve area so stronger acknowledgement cues outrank calmer ambient cards
   - path: respeaker_hci.py
@@ -99,7 +106,9 @@ files:
       - DisplayFaceGazeDirection
       - DisplayFaceMouthStyle
   - path: news_ticker.py
-    role: Fetch, cache, and rotate bounded RSS or Atom headlines for the HDMI bottom ticker
+    role: Run the bounded HDMI news ticker, cache snapshots locally, and rotate calm headline copy from Twinr's world-intelligence source pool
+  - path: news_ticker_sources.py
+    role: Resolve the read-only active world-intelligence feed URLs that the HDMI ticker may read
   - path: presentation_cues.py
     role: Persist and normalize optional fullscreen HDMI presentation cues and expose producer-facing single-card and scene-card controllers
     exports:
@@ -146,7 +155,9 @@ primary_callers:
   - path: hardware/display/run_visual_qc.py
 tests:
   - path: test/test_display.py
+  - path: test/test_display_reserve_generation.py
   - path: test/test_display_ambient_impulses.py
+  - path: test/test_display_reserve_bus_feedback.py
   - path: test/test_display_ambient_moments.py
   - path: test/test_display_debug_log.py
   - path: test/test_display_face_cues.py

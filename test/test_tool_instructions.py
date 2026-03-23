@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.tools.prompting.instructions import (
     build_compact_tool_agent_instructions,
     build_first_word_instructions,
+    build_local_route_first_word_instructions,
     build_supervisor_decision_instructions,
     build_supervisor_tool_agent_instructions,
     build_tool_agent_instructions,
@@ -99,6 +100,7 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Never claim that something was saved", instructions)
         self.assertIn("settings actions directly", instructions)
         self.assertIn("handoff_specialist_worker.spoken_ack", instructions)
+        self.assertIn("leave spoken_ack empty", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
         self.assertIn("Open smart-home or house-status questions usually need handoff_specialist_worker", instructions)
 
@@ -111,9 +113,9 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("three structured actions", instructions)
         self.assertIn("Choose handoff", instructions)
         self.assertIn("Choose handoff for open smart-home or house-status questions", instructions)
-        self.assertIn("set spoken_ack", instructions)
-        self.assertIn("one or two short sentences", instructions)
-        self.assertIn("without sounding canned", instructions)
+        self.assertIn("spoken_ack is optional", instructions)
+        self.assertIn("leave spoken_ack null", instructions)
+        self.assertIn("generic stock phrase", instructions)
         self.assertIn("must not imply the task is already finished", instructions)
         self.assertIn("context_scope", instructions)
         self.assertIn("location_hint", instructions)
@@ -131,6 +133,34 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("one or two short sentences", instructions)
         self.assertIn("short warm follow-up question", instructions)
         self.assertIn("relevant remembered user detail", instructions)
+
+    def test_local_route_first_word_overlay_forces_provisional_route_specific_filler(self) -> None:
+        instructions = build_local_route_first_word_instructions(
+            "memory",
+            handoff_goal="Answer using the user's persisted or recent Twinr memory.",
+            language_hint="de",
+        )
+
+        self.assertIn("slower specialist lane", instructions)
+        self.assertIn("Do not answer the user's question directly", instructions)
+        self.assertIn("Return mode filler only", instructions)
+        self.assertIn("recalling or checking remembered details", instructions)
+        self.assertIn("natural German", instructions)
+        self.assertIn("persisted or recent Twinr memory", instructions)
+
+    def test_fast_lane_instructions_allow_stable_general_knowledge_direct_replies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(openai_api_key="test-key", project_root=temp_dir, personality_dir="personality")
+            first_word_instructions = build_first_word_instructions(config)
+            supervisor_tool_instructions = build_supervisor_tool_agent_instructions(config)
+            supervisor_decision_instructions = build_supervisor_decision_instructions(config)
+
+        self.assertIn("built-in model knowledge", first_word_instructions)
+        self.assertIn("stable non-fresh explainers", first_word_instructions)
+        self.assertIn("built-in model knowledge", supervisor_tool_instructions)
+        self.assertIn("everyday how or why questions", supervisor_tool_instructions)
+        self.assertIn("built-in model knowledge", supervisor_decision_instructions)
+        self.assertIn("everyday how or why questions", supervisor_decision_instructions)
 
 
 if __name__ == "__main__":

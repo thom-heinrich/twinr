@@ -16,14 +16,17 @@ streaming APIs.
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - keep the structured supervisor-decision lane isolated from general tool-agent instructions so routing stays provider- and lane-specific
-- generate LLM-only recovery replies for streaming timeout/error paths
+- fail closed when the supervisor/specialist runtime cannot produce a verified final answer instead of synthesizing replacement speech on the active streaming path
 - emit speech-lane deltas and serialize tool results safely
-- emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and recovery-path selection
+- emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and failure-path selection
 - enforce the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
 
 The dual-lane handoff loop preserves optional explicit search hints such as a
 spoken target location or resolved date context when they are provided at the
 handoff boundary.
+It may emit one model-authored filler acknowledgement before specialist work,
+but that bridge speech is optional; the runtime must not invent canned progress
+lines when the fast lane does not provide one.
 
 `runtime` does **not** own:
 - concrete tool business logic or payload normalization in `../handlers`
@@ -41,7 +44,7 @@ handoff boundary.
 | [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
 | [streaming_loop.py](./streaming_loop.py) | Generic tool round loop |
 | [dual_lane_loop.py](./dual_lane_loop.py) | Supervisor/specialist handoff loop |
-| [recovery_reply.py](./recovery_reply.py) | LLM-only recovery replies for failed streaming paths |
+| [recovery_reply.py](./recovery_reply.py) | Legacy LLM-only recovery helper retained for non-active compatibility paths |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 ## Usage

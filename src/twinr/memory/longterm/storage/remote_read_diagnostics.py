@@ -47,6 +47,15 @@ class LongTermRemoteReadContext:
     result_limit: int | None = None
     segment_index: int | None = None
     batch_size: int | None = None
+    request_path: str | None = None
+    timeout_s: float | None = None
+    scope_ref: str | None = None
+    namespace: str | None = None
+    attempt_index: int | None = None
+    attempt_count: int | None = None
+    retry_attempts_configured: int | None = None
+    retry_backoff_s: float | None = None
+    retry_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +113,27 @@ def record_remote_read_diagnostic(
         outcome=outcome,
         request_kind="read",
     )
+
+
+def build_remote_read_failure_details(
+    *,
+    remote_state: LongTermRemoteStateStore | object | None,
+    context: LongTermRemoteReadContext,
+    exc: BaseException,
+    started_monotonic: float,
+    outcome: str = "failed",
+) -> dict[str, object]:
+    """Return the normalized diagnostic payload for one failed remote read."""
+
+    payload = _build_remote_request_diagnostic_data(
+        remote_state=remote_state,
+        context=context,
+        exc=exc,
+        started_monotonic=started_monotonic,
+        outcome=outcome,
+        request_kind="read",
+    )
+    return dict(payload)
 
 
 def record_remote_write_diagnostic(
@@ -285,6 +315,19 @@ def _normalize_float(value: object | None) -> float | None:
         return None
 
 
+def _normalize_bool(value: object | None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    lowered = " ".join(str(value).split()).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _compact_text(value: object | None, *, limit: int) -> str:
     text = " ".join(str(value or "").split())
     normalized_limit = max(int(limit), 0)
@@ -308,71 +351,18 @@ def _record_remote_request_diagnostic(
     if store is None:
         return
 
-    normalized_request_kind = str(request_kind or "read").strip().lower() or "read"
-    normalized_outcome = str(outcome or "failed").strip().lower() or "failed"
-    classification = _classify_remote_request_exception(exc)
-    root_cause = _root_cause(exc)
-    elapsed_ms = max(0.0, (time.monotonic() - float(started_monotonic)) * 1000.0)
-    data: dict[str, object] = {
-        "request_kind": normalized_request_kind,
-        "snapshot_kind": _normalize_text(getattr(context, "snapshot_kind", None)),
-        "operation": _normalize_text(getattr(context, "operation", None)),
-        "outcome": normalized_outcome,
-        "classification": classification,
-        "latency_ms": round(elapsed_ms, 3),
-        "namespace": _normalize_text(getattr(remote_state, "namespace", None)),
-        "item_id": _normalize_text(getattr(context, "item_id", None)),
-        "document_id_hint": _normalize_text(getattr(context, "document_id_hint", None)),
-        "uri_hint": _compact_text(_normalize_text(getattr(context, "uri_hint", None)), limit=160),
-        "segment_index": _normalize_int(getattr(context, "segment_index", None)),
-        "catalog_entry_count": _normalize_int(getattr(context, "catalog_entry_count", None)),
-        "allowed_doc_count": _normalize_int(getattr(context, "allowed_doc_count", None)),
-        "result_limit": _normalize_int(getattr(context, "result_limit", None)),
-        "batch_size": _normalize_int(getattr(context, "batch_size", None)),
-        "attempt_count": _normalize_int(getattr(context, "attempt_count", None)),
-        "request_item_count": _normalize_int(getattr(context, "request_item_count", None)),
-        "request_correlation_id": _normalize_text(getattr(context, "request_correlation_id", None)),
-        "batch_index": _normalize_int(getattr(context, "batch_index", None)),
-        "batch_count": _normalize_int(getattr(context, "batch_count", None)),
-        "request_bytes": _normalize_int(getattr(context, "request_bytes", None)),
-        "query_sha256": _query_sha256(getattr(context, "query_text", None)),
-        "query_term_count": _query_term_count(getattr(context, "query_text", None)),
-        "query_chars": len(str(getattr(context, "query_text", None) or "")),
-        "read_timeout_s": _normalize_float(
-            getattr(getattr(remote_state, "config", None), "long_term_memory_remote_read_timeout_s", None)
-        )
-        if normalized_request_kind == "read"
-        else None,
-        "write_timeout_s": _normalize_float(
-            getattr(getattr(remote_state, "config", None), "long_term_memory_remote_write_timeout_s", None)
-        )
-        if normalized_request_kind == "write"
-        else None,
-        "error_type": type(exc).__name__,
-        "error_message": _compact_text(str(exc), limit=_MAX_ERROR_TEXT_CHARS),
-        "root_cause_type": type(root_cause).__name__,
-        "root_cause_message": _compact_text(str(root_cause), limit=_MAX_ERROR_TEXT_CHARS),
-        "exception_chain": [type(item).__name__ for item in _exception_chain(exc)],
-    }
-    if isinstance(root_cause, OSError):
-        data["root_cause_errno"] = _normalize_int(getattr(root_cause, "errno", None))
-    status_code = _status_code_from_exception(exc)
-    if status_code is not None:
-        data["status_code"] = status_code
-    response_keys = _response_json_keys(exc)
-    if response_keys:
-        data["response_json_keys"] = response_keys
-    response_detail = _response_json_value(exc, "detail")
-    if response_detail is None:
-        response_detail = _response_text_excerpt(exc)
-    if response_detail is not None:
-        data["response_detail"] = _compact_text(response_detail, limit=_MAX_ERROR_TEXT_CHARS)
-    response_error = _response_json_value(exc, "error")
-    if response_error is not None:
-        data["response_error"] = _compact_text(response_error, limit=_MAX_ERROR_TEXT_CHARS)
-    response_error_type = _response_json_value(exc, "error_type")
-    if response_error_type is not None:
-        data["response_error_type"] = _compact_text(response_error_type, limit=80)
+    data = _build_remote_request_diagnostic_data(
+        remote_state=remote_state,
+        context=context,
+        exc=exc,
+        started_monotonic=started_monotonic,
+        outcome=outcome,
+        request_kind=request_kind,
+    )
+    normalized_request_kind = str(data.get("request_kind") or request_kind or "read").strip().lower() or "read"
+    normalized_outcome = str(data.get("outcome") or outcome or "failed").strip().lower() or "failed"
+    classification = str(data.get("classification") or "unexpected_error").strip().lower() or "unexpected_error"
+    elapsed_ms = max(0.0, float(data.get("latency_ms") or 0.0))
 
     event_name = (
         f"longterm_remote_{normalized_request_kind}_failed"
@@ -408,3 +398,122 @@ def _record_remote_request_diagnostic(
             outcome=normalized_outcome,
             classification=classification,
         )
+
+
+def _build_remote_request_diagnostic_data(
+    *,
+    remote_state: LongTermRemoteStateStore | object | None,
+    context: LongTermRemoteReadContext | LongTermRemoteWriteContext,
+    exc: BaseException,
+    started_monotonic: float,
+    outcome: str,
+    request_kind: str,
+) -> dict[str, object]:
+    normalized_request_kind = str(request_kind or "read").strip().lower() or "read"
+    normalized_outcome = str(outcome or "failed").strip().lower() or "failed"
+    classification = _classify_remote_request_exception(exc)
+    root_cause = _root_cause(exc)
+    elapsed_ms = max(0.0, (time.monotonic() - float(started_monotonic)) * 1000.0)
+    data: dict[str, object] = {
+        "request_kind": normalized_request_kind,
+        "snapshot_kind": _normalize_text(getattr(context, "snapshot_kind", None)),
+        "operation": _normalize_text(getattr(context, "operation", None)),
+        "outcome": normalized_outcome,
+        "classification": classification,
+        "latency_ms": round(elapsed_ms, 3),
+        "namespace": _normalize_text(getattr(context, "namespace", None))
+        or _normalize_text(getattr(remote_state, "namespace", None)),
+        "item_id": _normalize_text(getattr(context, "item_id", None)),
+        "document_id_hint": _normalize_text(getattr(context, "document_id_hint", None)),
+        "uri_hint": _compact_text(_normalize_text(getattr(context, "uri_hint", None)), limit=160),
+        "segment_index": _normalize_int(getattr(context, "segment_index", None)),
+        "catalog_entry_count": _normalize_int(getattr(context, "catalog_entry_count", None)),
+        "allowed_doc_count": _normalize_int(getattr(context, "allowed_doc_count", None)),
+        "result_limit": _normalize_int(getattr(context, "result_limit", None)),
+        "batch_size": _normalize_int(getattr(context, "batch_size", None)),
+        "request_path": _normalize_text(getattr(context, "request_path", None)),
+        "request_timeout_s": _normalize_float(getattr(context, "timeout_s", None)),
+        "scope_ref": _normalize_text(getattr(context, "scope_ref", None)),
+        "attempt_index": _normalize_int(getattr(context, "attempt_index", None)),
+        "attempt_count": _normalize_int(getattr(context, "attempt_count", None)),
+        "retry_attempts_configured": _normalize_int(getattr(context, "retry_attempts_configured", None)),
+        "retry_backoff_s": _normalize_float(getattr(context, "retry_backoff_s", None)),
+        "retry_mode": _normalize_text(getattr(context, "retry_mode", None)),
+        "retry_enabled": _normalize_bool(getattr(context, "retry_enabled", None)),
+        "request_item_count": _normalize_int(getattr(context, "request_item_count", None)),
+        "request_correlation_id": _normalize_text(getattr(context, "request_correlation_id", None)),
+        "batch_index": _normalize_int(getattr(context, "batch_index", None)),
+        "batch_count": _normalize_int(getattr(context, "batch_count", None)),
+        "request_bytes": _normalize_int(getattr(context, "request_bytes", None)),
+        "query_sha256": _query_sha256(getattr(context, "query_text", None)),
+        "query_term_count": _query_term_count(getattr(context, "query_text", None)),
+        "query_chars": len(str(getattr(context, "query_text", None) or "")),
+        "read_timeout_s": _normalize_float(
+            getattr(getattr(remote_state, "config", None), "long_term_memory_remote_read_timeout_s", None)
+        )
+        if normalized_request_kind == "read"
+        else None,
+        "write_timeout_s": _normalize_float(
+            getattr(getattr(remote_state, "config", None), "long_term_memory_remote_write_timeout_s", None)
+        )
+        if normalized_request_kind == "write"
+        else None,
+        "error_type": type(exc).__name__,
+        "error_message": _compact_text(str(exc), limit=_MAX_ERROR_TEXT_CHARS),
+        "root_cause_type": type(root_cause).__name__,
+        "root_cause_message": _compact_text(str(root_cause), limit=_MAX_ERROR_TEXT_CHARS),
+        "exception_chain": [type(item).__name__ for item in _exception_chain(exc)],
+    }
+    if isinstance(root_cause, OSError):
+        data["root_cause_errno"] = _normalize_int(getattr(root_cause, "errno", None))
+    status_code = _status_code_from_exception(exc)
+    if status_code is not None:
+        data["status_code"] = status_code
+        data["response_status_code"] = status_code
+    response_keys = _response_json_keys(exc)
+    if response_keys:
+        data["response_json_keys"] = response_keys
+    response_detail = _response_json_value(exc, "detail")
+    if response_detail is None:
+        response_detail = _response_text_excerpt(exc)
+    if response_detail is not None:
+        data["response_detail"] = _compact_text(response_detail, limit=_MAX_ERROR_TEXT_CHARS)
+    response_error = _response_json_value(exc, "error")
+    if response_error is not None:
+        data["response_error"] = _compact_text(response_error, limit=_MAX_ERROR_TEXT_CHARS)
+    response_error_type = _response_json_value(exc, "error_type")
+    if response_error_type is not None:
+        data["response_error_type"] = _compact_text(response_error_type, limit=80)
+    timeout_reason = _timeout_reason_from_exception(exc)
+    if timeout_reason is not None:
+        data["timeout_reason"] = timeout_reason
+    if data.get("retry_enabled") is None:
+        retry_attempts_configured = _normalize_int(getattr(context, "retry_attempts_configured", None))
+        if retry_attempts_configured is not None:
+            data["retry_enabled"] = retry_attempts_configured > 1
+    return data
+
+
+def _timeout_reason_from_exception(exc: BaseException) -> str | None:
+    status_code = _status_code_from_exception(exc)
+    if status_code == 504:
+        return "gateway_timeout"
+    for item in _exception_chain(exc):
+        if isinstance(item, socket.timeout):
+            return "socket_timeout"
+        if isinstance(item, TimeoutError):
+            return "timeout_error"
+        if isinstance(item, URLError):
+            reason = getattr(item, "reason", None)
+            if isinstance(reason, socket.timeout):
+                return "url_socket_timeout"
+            if isinstance(reason, TimeoutError):
+                return "url_timeout_error"
+        message = " ".join(str(item).lower().split())
+        if "read operation timed out" in message:
+            return "read_operation_timed_out"
+        if "connect timeout" in message:
+            return "connect_timeout"
+        if "timed out" in message or "timeout" in message:
+            return "timeout"
+    return None

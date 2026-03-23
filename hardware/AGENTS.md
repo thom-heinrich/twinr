@@ -27,6 +27,9 @@ Out of scope:
 - `pir/setup_pir.sh` - persist PIR GPIO env settings and optional probe
 - `pir/probe_pir.py` - print PIR state and motion events
 - `printer/setup_printer.sh` - configure the raw CUPS queue and optional test print
+- `ops/voice_gateway_tcp_proxy.py` - transport-only bridge that exposes a LAN-visible socket and forwards it into an existing thh1986 voice-gateway tunnel
+- `servo_kernel/twinr_servo.c` - out-of-tree Raspberry Pi servo kernel module for low-level body-orientation PWM
+- `servo_kernel/Makefile` - out-of-tree kernel module build entrypoint
 - `component.yaml` - structured metadata and manual-check map
 
 ## Invariants
@@ -37,6 +40,9 @@ Out of scope:
 - Scripts here may persist only the hardware keys they own and must not silently rewrite unrelated `.env` entries.
 - `display/setup_display.sh` must keep generated vendor files outside tracked source trees under `state/display/vendor/`.
 - Hardware bootstrap logic stays here; runtime behavior and hardware abstractions belong in `src/twinr/hardware` or `src/twinr/display`.
+- Kernel modules or other OS-facing driver code for Pi peripherals also stay here; keep the runtime-facing policy and control logic out of the module itself.
+- Transport bridges under `hardware/ops` must stay transport-only. Do not add
+  wakeword, transcript, or fallback-routing logic there.
 
 ## Verification
 

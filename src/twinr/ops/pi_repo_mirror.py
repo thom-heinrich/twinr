@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import importlib.util
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -37,22 +38,19 @@ PiConnectionSettings = _SELF_CODING_PI_MODULE.PiConnectionSettings
 load_pi_connection_settings = _SELF_CODING_PI_MODULE.load_pi_connection_settings
 
 DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
-    ".git/",
-    ".venv/",
-    ".env",
-    ".env.pi",
-    ".codex/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    "__pycache__/",
-    "*.pyc",
-    "*.pyo",
-    "*.egg-info/",
-    "node_modules/",
-    "artifacts/",
-    "state/",
-    "__legacy__/",
+    "/.git/",
+    "/.venv/",
+    "/.env",
+    "/.env.pi",
+    "/.codex/",
+    "/.pytest_cache/",
+    "/.mypy_cache/",
+    "/.ruff_cache/",
+    "/node_modules/",
+    "/artifacts/",
+    "/state/",
+    "/src/twinr/channels/whatsapp/worker/state/",
+    "/__legacy__/",
 )
 
 
@@ -295,12 +293,19 @@ class PiRepoMirrorWatchdog:
             "-e",
             "rsync",
             "-az",
+            "--no-specials",
+            "--no-devices",
             "--delete",
             "--itemize-changes",
             "--out-format=%i %n%L",
             "-e",
             "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
         ]
+        # Repo mirroring should only carry ordinary files, symlinks, and
+        # directories. Transient local FIFOs/devices from tools or root-owned
+        # helpers must not enter the Pi checkout or block sync cycles.
+        for path in _discover_nonportable_paths(self.project_root):
+            args.append(f"--exclude=/{path}")
         if dry_run:
             args.append("--dry-run")
         if checksum:
@@ -334,6 +339,40 @@ def _sshpass_env(password: str) -> dict[str, str]:
     env = dict(os.environ)
     env["SSHPASS"] = password
     return env
+
+
+def _discover_nonportable_paths(project_root: Path) -> tuple[str, ...]:
+    """Return repo-relative paths that rsync must ignore completely.
+
+    Rsync's ``--no-specials``/``--no-devices`` is not sufficient when local
+    helper processes leave behind FIFOs or sockets inside the leading repo.
+    Excluding them explicitly keeps the mirror from touching matching paths on
+    the Pi at all, which avoids receiver-side metadata failures.
+    """
+
+    excluded: list[str] = []
+    for root, dirnames, filenames in os.walk(project_root):
+        root_path = Path(root)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_nonportable_path(root_path / name)
+        ]
+        for name in filenames:
+            candidate = root_path / name
+            if _is_nonportable_path(candidate):
+                excluded.append(candidate.relative_to(project_root).as_posix())
+    return tuple(sorted(excluded))
+
+
+def _is_nonportable_path(path: Path) -> bool:
+    """Return true for repo entries that should never be mirrored."""
+
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode)
 
 
 def _parse_rsync_change_lines(text: str) -> list[str]:

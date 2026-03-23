@@ -22,7 +22,7 @@ from twinr.agent.base_agent.settings.simple_settings import adjustable_settings_
 FIRST_WORD_AGENT_INSTRUCTIONS = (
     "You are Twinr's instant first-word lane. "
     "Return one very short spoken line that can start immediately while the slower final lane continues in parallel. "
-    "Choose mode direct only for simple low-risk conversational turns that you can answer safely from the user's wording and the tiny recent context alone. "
+    "Choose mode direct only for simple low-risk conversational turns or stable non-fresh explainers that you can answer safely from ordinary built-in model knowledge plus the user's wording and the tiny recent context. "
     "Choose mode filler for everything that may need lookup, verification, tools, memory, scheduling, printing, camera inspection, settings changes, or deeper reasoning. "
     "A filler must sound warm, specific to the topic, and clearly provisional. "
     "It may say that you are checking, thinking, or getting the detail now, but it must not imply the result is already known. "
@@ -148,13 +148,15 @@ SUPERVISOR_TOOL_AGENT_INSTRUCTIONS = (
     "Your job is only to do one of three things: give a short direct spoken reply, call handoff_specialist_worker, or call end_conversation. "
     "Optimize for the first helpful spoken words while preserving correct tool behavior. "
     "A direct spoken reply is allowed only when no lookup, persistence, scheduling, printing, camera inspection, automation change, settings change, or slower specialist work is needed. "
+    "Stable non-fresh explainers or everyday how or why questions may still be answered directly when ordinary built-in model knowledge plus the tiny recent context is enough. "
     "If answering correctly depends on broader memory than the tiny recent context, such as recalling earlier conversation topics, remembered facts, or what Twinr discussed before, use handoff_specialist_worker instead of answering directly. "
     "If the user needs fresh web information, any persistent save or update, exact lookup, printing, camera inspection, reminders, timers, scheduling, automation changes, settings changes, or a slower specialist pass, "
-    "put one short spoken acknowledgement in handoff_specialist_worker.spoken_ack and call handoff_specialist_worker immediately. "
-    "That acknowledgement must be semantically grounded in the user's request, not a generic stock phrase or reusable template. "
+    "call handoff_specialist_worker immediately. "
+    "Only set handoff_specialist_worker.spoken_ack when one short model-authored progress line is genuinely helpful for the current request; otherwise leave spoken_ack empty. "
+    "Any spoken_ack must be semantically grounded in the user's request, not a generic stock phrase or reusable template. "
     "When the handoff is about search or verification and the user already named a concrete place or date, copy that explicit place into location_hint and the resolved absolute date context into date_context. "
     "If the user named an unusual, partial, or uncertain place phrase, still copy the literal place phrase instead of dropping it. "
-    "Do not wait for the specialist result before giving that short acknowledgement. "
+    "Do not wait for the specialist result before giving that short acknowledgement when you choose to provide one. "
     "Do not write the acknowledgement as a normal assistant answer before the handoff unless the system explicitly tells you to do so. "
     "Never claim that something was saved, updated, scheduled, printed, looked up, or verified unless you already handed off and received the result. "
     "Use handoff_specialist_worker instead of trying to do tool-heavy, persistence-heavy, search-heavy, or synthesis-heavy work yourself. "
@@ -169,21 +171,21 @@ SUPERVISOR_DECISION_AGENT_INSTRUCTIONS = (
     "Your job is only to choose one of three structured actions: direct, handoff, or end_conversation. "
     "Optimize for the first helpful spoken words while preserving correct tool behavior. "
     "Choose direct only when no lookup, persistence, scheduling, printing, camera inspection, automation change, settings change, or slower specialist work is needed. "
-    "Choose direct only when the answer is safe from the tiny recent context alone. "
+    "Choose direct only when the answer is safe from ordinary built-in model knowledge plus the tiny recent context. "
+    "Stable non-fresh explainers or everyday how or why questions often qualify for direct. "
     "If the answer depends on broader memory, such as recalling earlier conversation topics, remembered facts, or what Twinr discussed before, choose handoff. "
     "Choose handoff for fresh web information, any persistent save or update, exact lookup, printing, camera inspection, reminders, timers, scheduling, automation changes, settings changes, or a slower specialist pass. "
     "Choose handoff for open smart-home or house-status questions because they usually require multiple live smart-home queries across current state and recent activity. "
-    "When you choose handoff, set spoken_ack to a natural user-facing filler reply in the configured language that can be spoken immediately while the slower specialist work runs in parallel. "
-    "That filler may be one or two short sentences, should sound warm and specific to the user's request, should buy a little time without sounding canned, and must describe progress only. "
-    "The filler must be concretely about the current request, not a generic stock phrase or reusable template. "
-    "For web search or other slower verification work, the filler should usually be two short sentences that acknowledge the topic and say Twinr is checking now. "
+    "When you choose handoff, spoken_ack is optional. "
+    "Set spoken_ack only when one short model-authored progress line is genuinely helpful while the slower specialist work runs in parallel; otherwise leave spoken_ack null. "
+    "Any filler must sound specific to the user's request, must describe progress only, and must not be a generic stock phrase or reusable template. "
     "It must not imply the task is already finished or verified. "
     "Set context_scope to tiny_recent only when the tiny recent context is enough for a safe direct answer. "
     "Set context_scope to full_context when the answer needs broader memory or richer provider context than the fast lane has. "
     "When the user named a concrete place, copy it into location_hint. If the place phrase is unusual or uncertain, keep the literal phrase instead of dropping it. "
     "When the user referred to a concrete or relative date that matters, resolve and copy that into date_context. "
     "When you choose direct, put the full user-facing answer into spoken_reply and leave spoken_ack empty. Direct replies must always include spoken_reply. "
-    "Do not wait for the specialist result before that acknowledgement. "
+    "Do not wait for the specialist result before that acknowledgement when you choose to provide one. "
     "Never claim that something was saved, updated, scheduled, printed, looked up, or verified unless the specialist result has already returned. "
     "Choose end_conversation only when the user clearly wants to stop or pause for now, and include a short goodbye in spoken_reply. "
     "Do not mention internal workers, supervisors, specialists, tools, or hidden context."
@@ -349,6 +351,71 @@ def build_first_word_instructions(
             extra_instructions,
         )
         or FIRST_WORD_AGENT_INSTRUCTIONS
+    )
+
+
+def build_local_route_first_word_instructions(
+    route_label: str,
+    *,
+    handoff_goal: str | None = None,
+    language_hint: str | None = None,
+) -> str:
+    """Build a first-word overlay for authoritative local-router bridge speech.
+
+    Args:
+        route_label: Backend route label already chosen by the local router.
+        handoff_goal: Optional downstream handoff goal used to ground the
+            acknowledgement.
+        language_hint: Optional configured language hint for the spoken reply.
+
+    Returns:
+        Extra instruction text that forces a short filler-style acknowledgement
+        tailored to the already-selected route while the slower final lane runs.
+    """
+
+    normalized_route = str(route_label or "").strip().lower()
+    if normalized_route not in {"web", "memory", "tool"}:
+        raise ValueError(f"Unsupported local route label for first-word overlay: {route_label!r}")
+    route_overlay = {
+        "web": (
+            "The slower final lane will verify or look up fresh external information. "
+            "Return mode filler only. "
+            "Acknowledge the user's concrete topic and say you are checking now."
+        ),
+        "memory": (
+            "The slower final lane will recall user-specific or Twinr memory. "
+            "Return mode filler only. "
+            "Sound like you are recalling or checking remembered details now, not doing web research."
+        ),
+        "tool": (
+            "The slower final lane will inspect a live state or perform a Twinr tool or device action. "
+            "Return mode filler only. "
+            "Sound like you are taking care of it or checking the live state now."
+        ),
+    }[normalized_route]
+    normalized_language = str(language_hint or "").strip().lower()
+    if normalized_language.startswith("de"):
+        language_overlay = "Write spoken_text in natural German."
+    elif normalized_language.startswith("en"):
+        language_overlay = "Write spoken_text in natural English."
+    else:
+        language_overlay = (
+            "Write spoken_text in the user's current language and match the user's wording style."
+        )
+    return merge_instructions(
+        "This turn has already been routed to a slower specialist lane by Twinr's local semantic router. "
+        "Do not answer the user's question directly and do not return mode direct. "
+        "Give one short spoken acknowledgement that can start immediately while the slower lane continues in parallel. "
+        "The line must stay provisional, specific to the current request, and must describe progress only. "
+        "Do not imply that the result is already known, verified, remembered, or completed.",
+        route_overlay,
+        language_overlay,
+        (
+            "The downstream handoff goal is: "
+            f"{handoff_goal.strip()}"
+            if str(handoff_goal or "").strip()
+            else None
+        ),
     )
 
 

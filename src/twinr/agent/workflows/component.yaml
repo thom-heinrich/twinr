@@ -7,15 +7,19 @@ summary: Orchestrate the active realtime and streaming Twinr hardware loops plus
 owned_concerns:
   - Orchestrate button, wakeword, configured visual gesture-wakeup, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Bridge bounded edge audio and runtime-state updates into the server-backed voice orchestrator without moving runtime-state ownership off the Pi loop
+  - Keep live capture paths from failing immediately on proven transient XVF3800 re-enumeration by reusing the bounded hardware-level recovery helper
   - Cache and replay one normalized wakeword-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
   - Start one bounded managed smart-home sensor worker and feed its normalized observations into the realtime sensor path
   - Hold fatal loop/bootstrap failures in a stable runtime error state so the Pi display companion and supervisor do not flap back to the desktop
   - Forward completed tool-call history into runtime-side personality learning after turn finalization
   - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
+  - Adapt authoritative local semantic-router decisions, including optional two-stage user-intent routing, into supervisor-compatible handoffs for the streaming loop without moving bundle or ONNX logic into this package
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Bridge structured personality steering cues into concrete follow-up reopen/close decisions
-  - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns
+  - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns, with display-first prompts routed into the right-hand reserve lane instead of fullscreen presentation
+  - Trigger one bounded overnight reserve-lane maintenance pass from the idle housekeeping worker so the next local day can start from a reviewed/prepared ambient companion plan
   - Produce bounded forensic run packs for live button/session/audio investigation
   - Share workflow-local support helpers for feedback tones, reference images, background delivery, and streaming capture
   - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths without eager runner imports
@@ -41,6 +45,10 @@ files:
     role: Realtime session loop with wakeword, configured visual gesture-wakeup, print-lane, and smart-home sensor-worker orchestration that delegates guidance and transcript verification
     exports:
       - TwinrRealtimeHardwareLoop
+  - path: voice_orchestrator.py
+    role: Edge-side voice websocket bridge that streams bounded audio/runtime-state updates, survives bounded transient XVF3800 capture loss, and dispatches wake, follow-up, and barge-in events back into the realtime loop
+    exports:
+      - EdgeVoiceOrchestrator
   - path: streaming_runner.py
     role: Streaming loop entrypoint and turn orchestration shell that delegates capture, speculation, planning, and turn execution
     exports:
@@ -73,6 +81,11 @@ files:
     role: Speculative first-word and supervisor warmup controller for the streaming loop
   - path: streaming_lane_planner.py
     role: Streaming lane-plan construction, final-lane path selection, and LLM recovery callback wiring
+  - path: streaming_semantic_router.py
+    role: Streaming workflow bridge from local semantic-router decisions, including optional two-stage user-intent routing, into supervisor-style handoffs and bridge replies
+    exports:
+      - LocalSemanticRouteResolution
+      - StreamingSemanticRouterRuntime
   - path: streaming_turn_coordinator.py
     role: Authoritative streaming turn state machine for speech lifecycle, deadlines, cancellation, completion, and post-turn tool-history forwarding
     exports:
@@ -95,7 +108,7 @@ files:
       - PlaybackPriority
       - PlaybackRunResult
   - path: realtime_runtime/background.py
-    role: Active reminder, automation, and proactive background-delivery mixin
+    role: Active reminder, automation, and proactive background-delivery mixin, including reserve-lane routing for display-first proactive prompts and the overnight reserve-lane maintenance trigger
     exports:
       - TwinrRealtimeBackgroundMixin
   - path: realtime_runtime/proactive_delivery.py
@@ -163,6 +176,7 @@ primary_callers:
 tests:
   - path: test/test_playback_coordinator.py
   - path: test/test_main.py
+  - path: test/test_orchestrator.py
   - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
