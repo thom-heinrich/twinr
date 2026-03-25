@@ -1,13 +1,17 @@
 
-![twinr-logo](twinr_logo.png)
+
 
 **WHAT**
 
-*TWINR* is an AI Agent for senior citizens; fully open-source, aiming to make AI accessible to people who would really profit of it.
+*TWINR* is an AI Agent for senior citizens; fully open-source, aiming to make AI accessible to people who would really profit of it. 
+*TWINR is heavy WIP, but already working if you do some tinkering. I would love to have new contributors*
+
+![twinr-prototype-nice](twinr-prototype-nice.png)
+(You can find the completely unedited picture here --> twinr-prototype.jpeg)
 
 **WHY**
 
-I spent the last two weeks 24/7 with my mother who is really not tech-savy at all. Okay, tbh - she does not know how to start a computer or use a smart phone - so the web, AI, everything we use daily in our bubble is out of reach to her. 
+Due to a sad personal event, I spent the last two weeks 24/7 with my mother who is really not tech-savy at all. Okay, tbh - she does not know how to start a computer or use a smart phone - so the web, AI, everything we use daily in our bubble is out of reach to her. 
 However: She has so many questions and small tasks an AI Agent could handle easily - plus she loves to use her Alexa, as it is controlled by voice and thus natural to communicate with… but, as we all know, it is limited in it’s capabilities.
 
 **MISSION**
@@ -28,23 +32,23 @@ So if you are a builder, UX person, maker… and want to join add me on LinkedIn
 
 **CAPABILITIES**
 
-- Voice-first interaction with simple physical buttons for listening and printing
-- Short back-and-forth conversations without pressing a button for every single reply
-- Live answers for everyday questions, including web-backed information when needed
-- Built-in thermal printer for small notes, reminders, summaries, and take-away answers
-- Calm eye-display feedback so users can instantly see whether Twinr is waiting, listening, thinking, speaking, printing, or needs attention
-- Spoken reminders and timers for everyday support
-- Scheduled automations for recurring tasks like daily weather, news, or printed morning briefings
-- Sensor-triggered automations based on motion, sound, or camera events
-- Experimental self-programming for turning new routines into reviewed, sandboxed skills and automations
-- Integration-friendly architecture with conservative adapters for mail and calendar, plus a WhatsApp prototype path for experimentation
-- Multi-sensor awareness that combines motion, audio, and camera signals for presence, attention, and cautious incident cues
-- Optional proactive nudges when Twinr notices situations like someone returning, prolonged stillness, or possible distress
-- Optional camera understanding for visual requests such as “What am I showing you?” or “How do I look today?”
-- Optional body rotation via servo so Twinr can gently follow the user’s position
-- On-device memory for recent conversations, preferences, reminders, and things the user explicitly wants Twinr to remember
-- Optional long-term memory for durable recall of people, preferences, plans, and past conversations
-- Caregiver-friendly local dashboard for settings, devices, memory, automations, and system health
+Twinr is not just a voice wrapper. This repo spans embodied interaction, multimodal perception, memory, automations, integrations, self-programming, operator tooling, and Raspberry-Pi deployment.
+
+- Embodied multi-modal interaction: voice, physical buttons, camera, motion sensing, paper output, display feedback, and optional body movement in one agent stack
+- Transcript-first live voice pipeline with follow-up listening, spoken replies, and web-backed question answering
+- Physical output layer with speech, thermal printer notes, animated HDMI face UI, and optional servo-based user-following
+- Multimodal sensing built around Pi AI Camera, ReSpeaker XVF3800, PIR motion, VAD, and bounded event fusion
+- Presence, attention, engagement, and cautious incident cues derived from sensor fusion instead of one-off single-signal hacks
+- Proactive companion behaviors that can notice return, stillness, showing intent, or possible distress without defaulting to annoying chatter
+- Visual understanding for “look at this” moments, gesture-aware interaction, and camera-assisted embodied UX
+- Adaptive memory stack with rolling on-device context, explicit remembered facts, reminders, and optional long-term ChonkyDB memory
+- Automation engine for scheduled routines, sensor-triggered actions, printed briefings, and LLM-generated recurring jobs
+- Experimental self-programming / Adaptive Skill Engine for compiling reviewed, sandboxed new skills and automations
+- Integration-ready architecture for email, calendar, messaging, smart home, and future external systems
+- WhatsApp prototype channel plus a broader communications roadmap across TWINR-to-TWINR and TWINR-to-device links
+- Caregiver and operator dashboard for devices, memory, automations, system health, logs, and personality management
+- Raspberry-Pi hardware operations layer for display, audio, printer, camera, PIR, servo, deployment, and acceptance testing
+- Open-source prototype-body 3D-print files and state sound assets included directly in the repo for fast physical iteration
 
 **ROADMAP**
 
@@ -64,7 +68,6 @@ This repo already includes a few practical prototype assets:
 
 **SHOPPING LIST**
 
-![twinr_shopping-list](twinr_shopping-list.png)
 
 *TWINR Hardware (current prototype direction)*
 
@@ -200,3 +203,5 @@ sudo hardware/servo/setup_pololu_maestro.sh
 ```
 
 That staged approach is worth the time. It makes it much easier to catch a bad GPIO mapping, weak power rail, loose camera ribbon, muted audio path, or wrong printer polarity before everything is buried inside the enclosure.
+
+![twinr-logo](twinr_logo.png)

@@ -28,6 +28,10 @@ common/
 /state/*.lock
 /__legacy__/
 
+# Local optional browser-automation workspace.
+/browser_automation/**
+!/browser_automation/.gitkeep
+
 __pycache__/
 *.pyc
 *.egg-info/
