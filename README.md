@@ -22,11 +22,6 @@ The goal is simple: *Make a voice controlled agent that is as non-digital, as ha
 
 So if you are a builder, UX person, maker… and want to join add me on LinkedIn or write to th@arculae.com … if you are not, but you think this is cool, *just share the repo*.
 
----
-
-![twinr-design](twinr_design.jpeg)
-
-*This is how I imagine TWINR to look in the second or third iteration*
 
 ---
 
@@ -58,6 +53,12 @@ Twinr is not just a voice wrapper. This repo spans embodied interaction, multimo
 - Integration with health trackers and connected health devices
 - Proactive companion mode that stays supportive without becoming intrusive or annoying
 - Integrated autonomous indoor drone based on Crazyflie for wellbeing checks and other supportive tasks
+
+---
+
+![twinr-design](twinr_design.jpeg)
+
+*This is how I imagine TWINR to look in the second or third iteration*
 
 **PROTOTYPE ASSETS**
 
