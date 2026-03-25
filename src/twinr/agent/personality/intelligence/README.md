@@ -12,6 +12,7 @@ threads.
 `intelligence` owns:
 - define typed subscription, calibration-state, situational-awareness, and refresh-result models for RSS/world intelligence
 - persist subscriptions and refresh/discovery timing through remote-primary snapshots
+- reuse the parent package's shared payload-normalization and remote-state adapter helpers so RSS state decoding stays aligned with the rest of the personality package
 - derive slow-changing topic/region interest signals from structured conversation or tool evidence
 - derive stronger engagement evidence from explicit structured follow-up reactions so topics the user asks to revisit are weighted above passive affinity
 - translate explicit topic aversion into durable `avoid` state so Twinr backs off both conversationally and in source calibration
@@ -41,6 +42,8 @@ threads.
 | [calibration.py](./calibration.py) | Convert structured personality/tool evidence into world-intelligence calibration signals |
 | [store.py](./store.py) | Remote-primary snapshot seam for subscriptions and refresh/discovery timing |
 | [service.py](./service.py) | Feed discovery, reflection-phase recalibration, due refresh, and conversion into world/continuity/awareness context |
+| [../_payload_utils.py](../_payload_utils.py) | Shared payload normalization helpers reused by both personality and intelligence model decoding |
+| [../_remote_state_utils.py](../_remote_state_utils.py) | Shared remote-primary adapter resolution reused by both snapshot-store seams |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [AGENTS.md](./AGENTS.md) | Local invariants and verification |
 

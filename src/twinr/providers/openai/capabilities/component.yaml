@@ -58,6 +58,5 @@ primary_callers:
 tests:
   - path: test/test_openai_backend.py
   - path: test/test_openai_adapters.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py

@@ -164,7 +164,6 @@ class LiveDiscoveryContext:
             "OPENAI_MODEL=gpt-5.4-mini",
             "TWINR_LLM_PROVIDER=openai",
             "TWINR_PROACTIVE_ENABLED=false",
-            "TWINR_WAKEWORD_ENABLED=false",
             "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=false",
             "TWINR_SEARCH_FEEDBACK_TONES_ENABLED=false",
             "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=false",
@@ -195,7 +194,7 @@ class LiveDiscoveryContext:
 
         config = TwinrConfig.from_env(self.env_path)
         runtime = TwinrRuntime(config=config)
-        runtime.user_voice_status = "identified"
+        runtime.user_voice_status = "likely_user"
         runtime.user_voice_confidence = 0.99
         runtime.user_voice_user_id = "live-acceptance"
         runtime.user_voice_user_display_name = "Live Acceptance"
@@ -231,7 +230,7 @@ def run_text_turn(
     emitted: list[str] = []
     harness.owner.emit = emitted.append
     now_iso = datetime.now().astimezone().isoformat()
-    harness.runtime.user_voice_status = "identified"
+    harness.runtime.user_voice_status = "likely_user"
     harness.runtime.user_voice_confidence = 0.99
     harness.runtime.user_voice_checked_at = now_iso
     harness.runtime.user_voice_user_id = "live-acceptance"

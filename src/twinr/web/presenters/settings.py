@@ -22,13 +22,11 @@ from twinr.web.presenters.common import (
     _REASONING_EFFORT_OPTIONS,
     _SEARCH_CONTEXT_OPTIONS,
     _VISION_DETAIL_OPTIONS,
-    _WAKEWORD_FALLBACK_BACKEND_OPTIONS,
-    _WAKEWORD_PRIMARY_BACKEND_OPTIONS,
-    _WAKEWORD_VERIFIER_MODE_OPTIONS,
     _YES_NO_OPTIONS,
     _format_millis_label,
     _format_seconds_label,
 )
+
 
 def _csv_display(values: object, *, separator: str = ", ") -> str:
     """Render optional iterable config values as one display string."""
@@ -552,9 +550,54 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
             ),
         ),
         SettingsSection(
-            title="Audio capture",
-            description="Microphone device selection and thresholds for recorded speech turns.",
+            title="Voice gateway and audio capture",
+            description="Remote live-voice gateway contract plus microphone device selection for recorded speech turns.",
             fields=(
+                _select_field(
+                    "TWINR_VOICE_ORCHESTRATOR_ENABLED",
+                    "Remote voice gateway",
+                    env_values,
+                    _BOOL_OPTIONS,
+                    "true" if config.voice_orchestrator_enabled else "false",
+                    tooltip_text="Keep the live transcript-first remote voice gateway enabled for hands-free speech. Twinr uses only this remote path for live voice turns.",
+                ),
+                _text_field(
+                    "TWINR_VOICE_ORCHESTRATOR_WS_URL",
+                    "Voice gateway websocket",
+                    env_values,
+                    config.voice_orchestrator_ws_url,
+                    placeholder="wss://voice.example/ws/orchestrator/voice",
+                    tooltip_text="Authoritative websocket endpoint the Pi streams to for live voice turns.",
+                ),
+                _text_field(
+                    "TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET",
+                    "Voice gateway secret",
+                    env_values,
+                    config.voice_orchestrator_shared_secret or "",
+                    tooltip_text="Shared-secret header used for the voice gateway websocket when configured.",
+                ),
+                _text_field(
+                    "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS",
+                    "Wake candidate window (ms)",
+                    env_values,
+                    str(config.voice_orchestrator_wake_candidate_window_ms),
+                    tooltip_text="Bounded utterance window the remote gateway keeps before wake confirmation.",
+                ),
+                _text_field(
+                    "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL",
+                    "Remote ASR URL",
+                    env_values,
+                    config.voice_orchestrator_remote_asr_url or "",
+                    placeholder="https://voice.example/v1",
+                    tooltip_text="Transcript-first ASR service URL used by the live voice gateway.",
+                ),
+                _text_field(
+                    "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_TIMEOUT_S",
+                    "Remote ASR timeout (s)",
+                    env_values,
+                    str(config.voice_orchestrator_remote_asr_timeout_s),
+                    tooltip_text="Per-request timeout for bounded transcript-first ASR decisions.",
+                ),
                 _text_field(
                     "TWINR_AUDIO_INPUT_DEVICE",
                     "Input device",

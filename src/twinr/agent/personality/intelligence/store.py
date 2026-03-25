@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.personality._remote_state_utils import (
+    resolve_remote_state as _resolve_remote_state,
+)
 from twinr.agent.personality.intelligence.models import (
     DEFAULT_WORLD_INTELLIGENCE_STATE_KIND,
     DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND,
@@ -14,21 +17,6 @@ from twinr.agent.personality.intelligence.models import (
     WorldIntelligenceState,
 )
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
-
-
-def _resolve_remote_state(
-    *,
-    config: TwinrConfig,
-    remote_state: LongTermRemoteStateStore | None,
-) -> LongTermRemoteStateStore | None:
-    """Resolve the remote snapshot adapter for one intelligence call."""
-
-    if remote_state is not None:
-        return remote_state
-    resolved = LongTermRemoteStateStore.from_config(config)
-    if not getattr(resolved, "enabled", False):
-        return None
-    return resolved
 
 
 class WorldIntelligenceStore(Protocol):
@@ -158,4 +146,3 @@ class RemoteStateWorldIntelligenceStore:
             snapshot_kind=self.state_snapshot_kind,
             payload=state.to_payload(),
         )
-

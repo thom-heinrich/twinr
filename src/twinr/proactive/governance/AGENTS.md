@@ -7,7 +7,7 @@ reservation issuance, cooldown checks, and bounded finalized history. Structural
 metadata lives in [component.yaml](./component.yaml).
 
 Out of scope:
-- trigger scoring, wakeword logic, or presence-session detection
+- trigger scoring, voice activation logic, or presence-session detection
 - sensor polling or background worker lifecycle code
 - actual prompt delivery, printing, or spoken output handling
 - durable storage beyond this in-memory policy object
@@ -46,13 +46,12 @@ PYTHONPATH=src pytest test/test_config.py -q
 `governor.py` changes -> also check:
 - `src/twinr/agent/base_agent/runtime/base.py`
 - `src/twinr/agent/base_agent/runtime/context.py`
-- `src/twinr/agent/workflows/runner.py`
-- `src/twinr/agent/workflows/realtime_runner_background.py`
+- `src/twinr/agent/workflows/realtime_runtime/background.py`
 - `test/test_proactive_governor.py`
 
 `__init__.py` changes -> also check:
 - `src/twinr/proactive/__init__.py`
-- import sites in runner and realtime background workflows
+- import sites in active realtime and streaming workflows
 
 ## Security
 

@@ -15,61 +15,26 @@ ChonkyDB object layer later.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, cast
+
+from twinr.agent.personality._payload_utils import (
+    clean_text as _clean_text,
+    mapping_items as _mapping_items,
+    normalize_float as _normalize_float,
+    normalize_int as _normalize_int,
+    normalize_mapping as _normalize_mapping,
+    normalize_string_tuple as _normalize_string_tuple,
+    optional_text as _optional_text,
+    required_mapping_text as _required_mapping_text,
+)
 
 DEFAULT_PERSONALITY_SNAPSHOT_KIND = "agent_personality_context_v1"
 INTERACTION_SIGNAL_SNAPSHOT_KIND = "agent_personality_interaction_signals_v1"
 PLACE_SIGNAL_SNAPSHOT_KIND = "agent_personality_place_signals_v1"
 WORLD_SIGNAL_SNAPSHOT_KIND = "agent_personality_world_signals_v1"
 PERSONALITY_DELTA_SNAPSHOT_KIND = "agent_personality_deltas_v1"
-
-
-def _clean_text(value: object | None) -> str:
-    """Collapse arbitrary text-like input into a single trimmed string."""
-
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).strip()
-
-
-def _optional_text(value: object | None) -> str | None:
-    """Return normalized text or ``None`` when the input is blank."""
-
-    normalized = _clean_text(value)
-    return normalized or None
-
-
-def _normalize_string_tuple(value: object | None, *, field_name: str) -> tuple[str, ...]:
-    """Normalize a sequence of text items into a non-blank tuple."""
-
-    if value is None:
-        return ()
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"{field_name} must be a sequence of strings.")
-    items: list[str] = []
-    for index, item in enumerate(value):
-        normalized = _clean_text(item)
-        if not normalized:
-            raise ValueError(f"{field_name}[{index}] cannot be blank.")
-        items.append(normalized)
-    return tuple(items)
-
-
-def _normalize_float(value: object | None, *, field_name: str, default: float) -> float:
-    """Normalize a confidence/salience-like value onto the inclusive 0..1 band."""
-
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be numeric.") from exc
-    if parsed < 0.0:
-        return 0.0
-    if parsed > 1.0:
-        return 1.0
-    return parsed
 
 
 def _normalize_signed_float(
@@ -83,7 +48,7 @@ def _normalize_signed_float(
     if value is None:
         return default
     try:
-        parsed = float(value)
+        parsed = float(cast(Any, value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be numeric.") from exc
     if parsed < -1.0:
@@ -91,71 +56,6 @@ def _normalize_signed_float(
     if parsed > 1.0:
         return 1.0
     return parsed
-
-
-def _normalize_int(
-    value: object | None,
-    *,
-    field_name: str,
-    default: int,
-    minimum: int = 0,
-) -> int:
-    """Normalize a non-negative integer field."""
-
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer.") from exc
-    return max(minimum, parsed)
-
-
-def _normalize_mapping(value: object | None, *, field_name: str) -> Mapping[str, object] | None:
-    """Normalize a plain JSON-like mapping field."""
-
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{field_name} must be a mapping.")
-    normalized: dict[str, object] = {}
-    for raw_key, raw_value in value.items():
-        key = _clean_text(raw_key)
-        if not key:
-            raise ValueError(f"{field_name} cannot contain blank keys.")
-        normalized[key] = raw_value
-    return normalized
-
-
-def _mapping_items(value: object | None, *, field_name: str) -> tuple[Mapping[str, object], ...]:
-    """Normalize a payload field into a tuple of mappings."""
-
-    if value is None:
-        return ()
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"{field_name} must be a sequence of mappings.")
-    items: list[Mapping[str, object]] = []
-    for index, item in enumerate(value):
-        if not isinstance(item, Mapping):
-            raise ValueError(f"{field_name}[{index}] must be a mapping.")
-        items.append(item)
-    return tuple(items)
-
-
-def _required_mapping_text(
-    payload: Mapping[str, object],
-    *,
-    field_name: str,
-    aliases: tuple[str, ...] = (),
-) -> str:
-    """Read one required normalized text field from a payload mapping."""
-
-    candidate_keys = (field_name,) + aliases
-    for key in candidate_keys:
-        normalized = _clean_text(payload.get(key))
-        if normalized:
-            return normalized
-    raise ValueError(f"{field_name} is required.")
 
 
 @dataclass(frozen=True, slots=True)

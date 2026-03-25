@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 
 
 class TwinrConfigTests(unittest.TestCase):
@@ -87,6 +87,64 @@ class TwinrConfigTests(unittest.TestCase):
         )
         self.assertFalse(config.local_semantic_router_trace)
 
+    def test_from_env_second_pi_mode_derives_remote_frame_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_CAMERA_HOST_MODE=second_pi",
+                        "TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767/",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.camera_host_mode, "second_pi")
+        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
+        self.assertEqual(config.proactive_remote_camera_base_url, "http://10.42.0.2:8767")
+        self.assertEqual(config.proactive_vision_provider, "remote_frame")
+        self.assertEqual(config.camera_proxy_snapshot_url, "http://10.42.0.2:8767/snapshot.png")
+
+    def test_from_env_explicit_onboard_mode_does_not_derive_remote_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_CAMERA_HOST_MODE=onboard",
+                        "TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.camera_host_mode, "onboard")
+        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
+        self.assertEqual(config.proactive_vision_provider, "local_first")
+        self.assertIsNone(config.camera_proxy_snapshot_url)
+
+    def test_from_env_legacy_remote_camera_settings_derive_second_pi_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_PROACTIVE_REMOTE_CAMERA_BASE_URL=http://10.42.0.2:8767\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.camera_host_mode, "second_pi")
+        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
+        self.assertEqual(config.proactive_vision_provider, "remote_frame")
+        self.assertEqual(config.camera_proxy_snapshot_url, "http://10.42.0.2:8767/snapshot.png")
+
     def test_display_gpio_conflicts_reports_button_overlap(self) -> None:
         config = TwinrConfig(
             display_driver="waveshare_4in2_v2",
@@ -147,6 +205,25 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.conversation_closure_model, "gpt-5.4-mini")
         self.assertEqual(config.display_reserve_generation_model, "gpt-5.4-mini")
         self.assertEqual(config.display_reserve_generation_timeout_seconds, 12.0)
+
+    def test_from_env_reads_proactive_audio_input_device_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_PROACTIVE_AUDIO_ENABLED=true",
+                        "TWINR_PROACTIVE_AUDIO_INPUT_DEVICE=sysdefault:CARD=Array",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.proactive_audio_enabled)
+        self.assertEqual(config.proactive_audio_input_device, "sysdefault:CARD=Array")
 
     def test_from_env_reads_display_runtime_trace_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,6 +309,7 @@ class TwinrConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "TWINR_ATTENTION_SERVO_ENABLED=true",
+                        "TWINR_ATTENTION_SERVO_FORENSIC_TRACE_ENABLED=true",
                         "TWINR_ATTENTION_SERVO_DRIVER=lgpio_pwm",
                         "TWINR_ATTENTION_SERVO_GPIO=18",
                         "TWINR_ATTENTION_SERVO_INVERT_DIRECTION=true",
@@ -257,12 +335,15 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_IDLE_RELEASE_S=1.4",
                         "TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S=0.7",
                         "TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY=true",
+                        "TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_INTERVAL_S=42.5",
+                        "TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_CENTER_TOLERANCE=0.11",
                         "TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES=270.0",
                         "TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES=60.0",
                         "TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S=0.45",
                         "TWINR_ATTENTION_SERVO_EXIT_SETTLE_HOLD_S=0.85",
                         "TWINR_ATTENTION_SERVO_EXIT_REACQUIRE_CENTER_TOLERANCE=0.09",
                         "TWINR_ATTENTION_SERVO_EXIT_VISIBLE_EDGE_THRESHOLD=0.76",
+                        "TWINR_ATTENTION_SERVO_EXIT_VISIBLE_BOX_EDGE_THRESHOLD=0.94",
                         "TWINR_ATTENTION_SERVO_EXIT_COOLDOWN_S=33.0",
                     ]
                 )
@@ -273,6 +354,7 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertTrue(config.attention_servo_enabled)
+        self.assertTrue(config.attention_servo_forensic_trace_enabled)
         self.assertEqual(config.attention_servo_driver, "lgpio_pwm")
         self.assertEqual(config.attention_servo_gpio, 18)
         self.assertTrue(config.attention_servo_invert_direction)
@@ -298,12 +380,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_idle_release_s, 1.4)
         self.assertEqual(config.attention_servo_settled_release_s, 0.7)
         self.assertTrue(config.attention_servo_follow_exit_only)
+        self.assertEqual(config.attention_servo_visible_recenter_interval_s, 42.5)
+        self.assertEqual(config.attention_servo_visible_recenter_center_tolerance, 0.11)
         self.assertEqual(config.attention_servo_mechanical_range_degrees, 270.0)
         self.assertEqual(config.attention_servo_exit_follow_max_degrees, 60.0)
         self.assertEqual(config.attention_servo_exit_activation_delay_s, 0.45)
         self.assertEqual(config.attention_servo_exit_settle_hold_s, 0.85)
         self.assertEqual(config.attention_servo_exit_reacquire_center_tolerance, 0.09)
         self.assertEqual(config.attention_servo_exit_visible_edge_threshold, 0.76)
+        self.assertEqual(config.attention_servo_exit_visible_box_edge_threshold, 0.94)
         self.assertEqual(config.attention_servo_exit_cooldown_s, 33.0)
 
     def test_attention_servo_exit_activation_delay_is_clamped_to_target_hold(self) -> None:
@@ -322,6 +407,68 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.attention_servo_driver, "twinr_kernel")
+
+    def test_from_env_reads_pololu_maestro_attention_servo_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_ATTENTION_SERVO_DRIVER=pololu_maestro",
+                        "TWINR_ATTENTION_SERVO_CONTROL_MODE=continuous_rotation",
+                        "TWINR_ATTENTION_SERVO_MAESTRO_DEVICE=/dev/serial/by-id/maestro-if00",
+                        "TWINR_ATTENTION_SERVO_MAESTRO_CHANNEL=0",
+                        "TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES=360.0",
+                        "TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES=90.0",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_DEGREES_PER_S=140.0",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_SLOW_ZONE_DEGREES=28.0",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_STOP_TOLERANCE_DEGREES=3.5",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US=72",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US=165",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.attention_servo_driver, "pololu_maestro")
+        self.assertEqual(config.attention_servo_control_mode, "continuous_rotation")
+        self.assertEqual(config.attention_servo_maestro_device, "/dev/serial/by-id/maestro-if00")
+        self.assertEqual(config.attention_servo_maestro_channel, 0)
+        self.assertEqual(config.attention_servo_mechanical_range_degrees, 360.0)
+        self.assertEqual(config.attention_servo_exit_follow_max_degrees, 90.0)
+        self.assertEqual(config.attention_servo_continuous_max_speed_degrees_per_s, 140.0)
+        self.assertEqual(config.attention_servo_continuous_slow_zone_degrees, 28.0)
+        self.assertEqual(config.attention_servo_continuous_stop_tolerance_degrees, 3.5)
+        self.assertEqual(config.attention_servo_continuous_min_speed_pulse_delta_us, 72)
+        self.assertEqual(config.attention_servo_continuous_max_speed_pulse_delta_us, 165)
+
+    def test_from_env_reads_peer_pololu_maestro_attention_servo_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_ATTENTION_SERVO_DRIVER=peer_pololu_maestro",
+                        "TWINR_ATTENTION_SERVO_CONTROL_MODE=continuous_rotation",
+                        "TWINR_ATTENTION_SERVO_PEER_BASE_URL=http://10.42.0.2:8768/",
+                        "TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S=2.25",
+                        "TWINR_ATTENTION_SERVO_MAESTRO_CHANNEL=1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.attention_servo_driver, "peer_pololu_maestro")
+        self.assertEqual(config.attention_servo_control_mode, "continuous_rotation")
+        self.assertEqual(config.attention_servo_peer_base_url, "http://10.42.0.2:8768")
+        self.assertEqual(config.attention_servo_peer_timeout_s, 2.25)
+        self.assertEqual(config.attention_servo_maestro_channel, 1)
 
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1501,7 +1648,6 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
                         "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
                         "TWINR_VOICE_ORCHESTRATOR_WS_URL=wss://voice.example/ws/orchestrator/voice",
-                        "TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=remote_asr",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=2400",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_MIN_ACTIVE_RATIO=0.12",
                         "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://10.10.0.2:18090",
@@ -1513,6 +1659,9 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_VOICE_ORCHESTRATOR_INTENT_MIN_WAKE_DURATION_RELIEF_MS=140",
                         "TWINR_VOICE_ORCHESTRATOR_INTENT_FOLLOW_UP_TIMEOUT_BONUS_S=2.25",
                         "TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_TIMEOUT_S=7.5",
+                        "TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_ENABLED=1",
+                        "TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_DIR=artifacts/stores/ops/voice_gateway_audio_live",
+                        "TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_MAX_FILES=12",
                     ]
                 ),
                 encoding="utf-8",
@@ -1527,7 +1676,6 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.voice_orchestrator_enabled)
         self.assertEqual(config.voice_orchestrator_ws_url, "wss://voice.example/ws/orchestrator/voice")
         self.assertEqual(config.voice_orchestrator_shared_secret, "secret-token")
-        self.assertEqual(config.voice_orchestrator_wake_stage1_mode, "remote_asr")
         self.assertEqual(config.voice_orchestrator_wake_candidate_window_ms, 2400)
         self.assertEqual(config.voice_orchestrator_wake_candidate_min_active_ratio, 0.12)
         self.assertEqual(config.voice_orchestrator_remote_asr_url, "http://10.10.0.2:18090")
@@ -1539,3 +1687,29 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.voice_orchestrator_intent_min_wake_duration_relief_ms, 140)
         self.assertEqual(config.voice_orchestrator_intent_follow_up_timeout_bonus_s, 2.25)
         self.assertEqual(config.voice_orchestrator_follow_up_timeout_s, 7.5)
+        self.assertTrue(config.voice_orchestrator_audio_debug_enabled)
+        self.assertEqual(
+            config.voice_orchestrator_audio_debug_dir,
+            "artifacts/stores/ops/voice_gateway_audio_live",
+        )
+        self.assertEqual(config.voice_orchestrator_audio_debug_max_files, 12)
+
+    def test_voice_orchestrator_enabled_requires_explicit_ws_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL",
+            ):
+                TwinrConfig.from_env(env_path)

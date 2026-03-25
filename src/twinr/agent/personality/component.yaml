@@ -30,12 +30,18 @@ out_of_scope:
 files:
   - path: __init__.py
     role: Narrow package export surface for structured personality helpers.
+  - path: _payload_utils.py
+    role: Shared payload normalization helpers reused by personality and intelligence model decoding.
   - path: models.py
     role: Typed evolving-personality state including conversation style, relationship stance, and prompt-layer contracts.
+  - path: profile_defaults.py
+    role: Shared baseline style and humor profiles used by runtime evolution and evaluation tooling.
   - path: context_builder.py
     role: Ordered prompt-layer assembly.
   - path: self_expression.py
     role: Conversational self-expression policy and prompt-facing current-mindshare rendering.
+  - path: _display_utils.py
+    role: Shared text normalization, truncation, and deterministic variation helpers for ambient display generation.
   - path: display_impulse_copy.py
     role: Question-first reserve-card copy builder that keeps topic context and memory-follow-up helper text generic and policy-driven.
   - path: display_impulses.py
@@ -46,6 +52,8 @@ files:
     role: Explicit positive-engagement actions that convert generic appetite/co-attention state into bounded turn actions.
   - path: steering.py
     role: Authoritative turn-steering cues plus compact runtime follow-up resolution derived from co-attention and appetite.
+  - path: _remote_state_utils.py
+    role: Shared remote-primary adapter resolution for personality and intelligence snapshot persistence seams.
   - path: store.py
     role: Remote snapshot persistence seam for snapshots, signals, and deltas.
   - path: evolution.py

@@ -3,7 +3,7 @@
 The text-turn orchestrator already owns bounded websocket transport for remote
 tool turns. This module adds the audio-session contract used by the Alexa-like
 server-backed voice path: the edge sends bounded PCM frames plus runtime-state
-updates, and the server responds with explicit wakeword, transcript-commit,
+updates, and the server responds with explicit voice activation, transcript-commit,
 follow-up-close, and barge-in decisions.
 """
 
@@ -96,27 +96,80 @@ class OrchestratorVoiceHelloRequest:
     sample_rate: int
     channels: int
     chunk_ms: int
+    trace_id: str | None = None
     initial_state: str = "waiting"
+    detail: str | None = None
+    follow_up_allowed: bool = False
+    attention_state: str | None = None
+    interaction_intent_state: str | None = None
+    person_visible: bool | None = None
+    interaction_ready: bool | None = None
+    targeted_inference_blocked: bool | None = None
+    recommended_channel: str | None = None
+    state_attested: bool = True
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "type": "voice_hello",
             "session_id": self.session_id,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "chunk_ms": self.chunk_ms,
             "initial_state": self.initial_state,
+            "follow_up_allowed": self.follow_up_allowed,
+            "state_attested": self.state_attested,
         }
+        if self.trace_id is not None:
+            payload["trace_id"] = self.trace_id
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        if self.attention_state is not None:
+            payload["attention_state"] = self.attention_state
+        if self.interaction_intent_state is not None:
+            payload["interaction_intent_state"] = self.interaction_intent_state
+        if self.person_visible is not None:
+            payload["person_visible"] = self.person_visible
+        if self.interaction_ready is not None:
+            payload["interaction_ready"] = self.interaction_ready
+        if self.targeted_inference_blocked is not None:
+            payload["targeted_inference_blocked"] = self.targeted_inference_blocked
+        if self.recommended_channel is not None:
+            payload["recommended_channel"] = self.recommended_channel
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorVoiceHelloRequest:
         payload_dict = _coerce_dict(payload)
         return cls(
             session_id=_coerce_text(payload_dict.get("session_id")),
+            trace_id=_coerce_optional_text(payload_dict.get("trace_id")),
             sample_rate=_coerce_positive_int(payload_dict.get("sample_rate"), default=16_000),
             channels=_coerce_positive_int(payload_dict.get("channels"), default=1),
             chunk_ms=_coerce_positive_int(payload_dict.get("chunk_ms"), default=100),
             initial_state=_coerce_text(payload_dict.get("initial_state")) or "waiting",
+            detail=_coerce_optional_text(payload_dict.get("detail")),
+            follow_up_allowed=_coerce_bool(payload_dict.get("follow_up_allowed"), default=False),
+            attention_state=_coerce_optional_text(payload_dict.get("attention_state")),
+            interaction_intent_state=_coerce_optional_text(
+                payload_dict.get("interaction_intent_state")
+            ),
+            person_visible=(
+                _coerce_bool(payload_dict.get("person_visible"))
+                if payload_dict.get("person_visible") is not None
+                else None
+            ),
+            interaction_ready=(
+                _coerce_bool(payload_dict.get("interaction_ready"))
+                if payload_dict.get("interaction_ready") is not None
+                else None
+            ),
+            targeted_inference_blocked=(
+                _coerce_bool(payload_dict.get("targeted_inference_blocked"))
+                if payload_dict.get("targeted_inference_blocked") is not None
+                else None
+            ),
+            recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
+            state_attested=_coerce_bool(payload_dict.get("state_attested"), default=False),
         )
 
 
@@ -234,7 +287,7 @@ class OrchestratorVoiceReadyEvent:
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorVoiceWakeConfirmedEvent:
-    """Represent one confirmed remote wakeword match."""
+    """Represent one confirmed remote voice activation match."""
 
     matched_phrase: str | None
     remaining_text: str

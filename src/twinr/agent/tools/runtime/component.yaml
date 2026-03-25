@@ -3,18 +3,23 @@ name: runtime
 path: src/twinr/agent/tools/runtime
 kind: python-package
 visibility: internal
-summary: Bind realtime tool handlers and run the bounded single-lane and dual-lane tool loops used by Twinr live turns.
+summary: Bind realtime tool handlers and run the bounded single-lane and dual-lane tool loops used by Twinr live turns, with focused handoff, speech-lane, and loop-support helpers.
 owned_concerns:
   - Adapt workflow owners into the handler method surface used for realtime tool execution
   - Validate the canonical realtime tool-name to handler binding map before live turns start
+  - Filter the exposed realtime tool surface against local integration readiness before tool schemas reach live providers
   - Route smart-home entity discovery, state-read, control, and stream tools through the same thin executor path as the rest of the realtime tool surface
   - Route the shared household-identity tool through the same executor and binding path as legacy portrait and voice tools
   - Route the RSS/world-intelligence configuration tool through the same thin executor and binding path as the other persistent tool handlers
   - Persist one normalized success/failure observability event per realtime tool call so operator artifacts can show tool name, status, latency, and fallback/model metadata
+  - Surface shared sensitive-confirmation guards as structured `confirmation_required` tool results instead of letting them degrade into generic live-turn tool failures
+  - Define the synthetic specialist-handoff tool schema and normalize/merge handoff payloads outside the main dual-lane orchestrator
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
+  - Keep speech-lane callback semantics and redacted branch forensics isolated from the main dual-lane orchestration file
   - Generate LLM-only recovery replies when streaming lanes fail after the user has already started a turn
   - Define the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
+  - Share common stop-guard, result-envelope, token-merge, and JSON-envelope helpers across runtime loops
 out_of_scope:
   - Concrete tool-side business logic or runtime mutations inside src/twinr/agent/tools/handlers
   - Tool schema authoring and prompt instruction assembly in sibling packages
@@ -32,6 +37,11 @@ files:
       - ToolCallingStreamingLoop
       - bind_realtime_tool_handlers
       - realtime_tool_names
+  - path: availability.py
+    role: Local readiness gate that filters the canonical realtime tool surface before live exposure
+    exports:
+      - available_realtime_tool_names
+      - bind_available_realtime_tool_handlers
   - path: executor.py
     role: Thin dispatcher from workflow owners to handler modules
     exports:
@@ -46,16 +56,25 @@ files:
       - realtime_tool_names
   - path: broker_policy.py
     role: Background automation tool-call policy and handler resolution
+  - path: handoff.py
+    role: Handoff schema, normalization, and chronological specialist merge helpers
+  - path: speech_lane.py
+    role: Speech-lane event model and safe callback emission
+    exports:
+      - SpeechLaneDelta
+  - path: forensics.py
+    role: Redacted branch-forensics summary helpers for dual-lane tracing
+  - path: loop_support.py
+    role: Shared loop stop/result/json/token helpers
   - path: streaming_loop.py
     role: Generic bounded streaming tool-calling loop
     exports:
       - StreamingToolLoopResult
       - ToolCallingStreamingLoop
   - path: dual_lane_loop.py
-    role: Supervisor and specialist handoff loop with speech-lane deltas
+    role: Supervisor and specialist handoff orchestration
     exports:
       - DualLaneToolLoop
-      - SpeechLaneDelta
   - path: recovery_reply.py
     role: LLM-only recovery reply builder for failed streaming runtime paths
 public_api:
@@ -82,7 +101,6 @@ compatibility_reexports:
 primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/agent/workflows/realtime_runner.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/speech_output.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
@@ -90,7 +108,6 @@ tests:
   - path: test/test_dual_lane_loop.py
   - path: test/test_openai_realtime.py
   - path: test/test_realtime_runner.py
-  - path: test/test_runner.py
   - path: test/test_speech_output.py
   - path: test/test_streaming_runner.py
   - path: test/test_streaming_tool_loop.py

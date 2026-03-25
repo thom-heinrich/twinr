@@ -16,8 +16,8 @@ runtime model directory that Twinr expects.
 
 Purpose
 -------
-Turn a labeled gesture dataset such as `none`, `ok_sign`, and
-`middle_finger` into a bounded `.task` asset and a JSON summary that Twinr can
+Turn a labeled gesture dataset such as `none`, `thumbs_up`, `thumbs_down`, and
+`peace_sign` into a bounded `.task` asset and a JSON summary that Twinr can
 later deploy to `/twinr/state/mediapipe/models/`.
 
 Usage
@@ -31,9 +31,16 @@ Command-line invocation examples::
 Inputs
 ------
 - A folder-per-label dataset root that includes at minimum `none`,
-  `ok_sign`, and `middle_finger`.
+  `thumbs_up`, `thumbs_down`, and `peace_sign`.
 - A Python environment that can import `mediapipe_model_maker`. If the import
   fails because `pkg_resources` is missing, pin `setuptools<81`.
+
+Notes
+-----
+Extra label directories may coexist in the dataset root for experiments or old
+models. Before calling Model Maker, Twinr stages only the explicitly required
+labels into a fresh training directory so the classifier head stays locked to
+the intended product contract.
 
 Outputs
 -------
@@ -47,7 +54,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 import argparse
 import json
 import sys
@@ -63,6 +70,7 @@ from custom_gesture_workflow import (
     current_timestamp_slug,
     ensure_minimum_examples,
     runtime_env_hint,
+    stage_required_label_dataset,
     write_json_summary,
 )
 
@@ -123,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--required-label",
         action="append",
         default=None,
-        help="Required dataset label. May be passed multiple times. Defaults to none, ok_sign, middle_finger.",
+        help="Required dataset label. May be passed multiple times. Defaults to none, thumbs_up, thumbs_down, peace_sign.",
     )
     parser.add_argument(
         "--validation-split",
@@ -174,8 +182,10 @@ def train_custom_gesture_model(
     manifest = collect_dataset_manifest(
         config.dataset_root,
         required_labels=config.required_labels,
+        include_only_required=True,
     )
     ensure_minimum_examples(manifest, min_images_per_label=config.min_images_per_label)
+    staged_dataset_root = config.output_dir / "training_dataset"
     exported_model_path = config.output_dir / config.model_name
     runtime_model_path = config.runtime_model_dir / config.runtime_model_name
     summary: dict[str, object] = {
@@ -193,6 +203,7 @@ def train_custom_gesture_model(
             "batch_size": config.batch_size,
             "learning_rate": config.learning_rate,
             "min_images_per_label": config.min_images_per_label,
+            "training_dataset_root": str(staged_dataset_root),
         },
         "exported_model_path": str(exported_model_path),
         "runtime_model_path": str(runtime_model_path),
@@ -203,9 +214,13 @@ def train_custom_gesture_model(
 
     gesture_recognizer = loader()
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    staged_manifest = stage_required_label_dataset(
+        source_manifest=manifest,
+        output_root=staged_dataset_root,
+    )
     dataset = _load_training_dataset(
         gesture_recognizer=gesture_recognizer,
-        dataset_root=config.dataset_root,
+        dataset_root=staged_manifest.root,
     )
     training_data, validation_data = dataset.split(1.0 - config.validation_split)
     options = gesture_recognizer.GestureRecognizerOptions(
@@ -232,10 +247,13 @@ def train_custom_gesture_model(
     )
     summary["runtime_model_path"] = str(copied_runtime_model)
     summary["runtime_env_hint"] = runtime_env_hint(copied_runtime_model)
-    summary["dataset"]["label_names"] = list(getattr(dataset, "label_names", ()))
-    summary["dataset"]["num_classes"] = int(getattr(dataset, "num_classes", len(manifest.labels)) or len(manifest.labels))
-    summary["dataset"]["training_size"] = _dataset_size(training_data)
-    summary["dataset"]["validation_size"] = _dataset_size(validation_data)
+    dataset_summary = cast(dict[str, object], summary["dataset"])
+    dataset_summary["label_names"] = list(getattr(dataset, "label_names", ()))
+    dataset_summary["num_classes"] = int(
+        getattr(dataset, "num_classes", len(manifest.labels)) or len(manifest.labels)
+    )
+    dataset_summary["training_size"] = _dataset_size(training_data)
+    dataset_summary["validation_size"] = _dataset_size(validation_data)
     summary["evaluation"] = _normalize_evaluation(evaluation)
     return summary
 
@@ -309,7 +327,7 @@ def _load_training_dataset(*, gesture_recognizer, dataset_root: Path):
 def _coerce_validation_split(value: object) -> float:
     """Clamp the validation split into a safe open interval."""
 
-    split = float(value)
+    split = float(cast(Any, value))
     if split <= 0.0 or split >= 0.5:
         raise ValueError("custom_gesture_validation_split_invalid")
     return split

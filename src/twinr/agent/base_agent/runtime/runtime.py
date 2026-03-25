@@ -8,12 +8,14 @@ from twinr.agent.base_agent.runtime.context import TwinrRuntimeContextMixin
 from twinr.agent.base_agent.runtime.discovery import TwinrRuntimeDiscoveryMixin
 from twinr.agent.base_agent.runtime.flow import TwinrRuntimeFlowMixin
 from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
+from twinr.agent.base_agent.runtime.self_coding import TwinrRuntimeSelfCodingMixin
 from twinr.agent.base_agent.runtime.snapshot import TwinrRuntimeSnapshotMixin
 
 
 class TwinrRuntime(
     TwinrRuntimeFlowMixin,
     TwinrRuntimeContextMixin,
+    TwinrRuntimeSelfCodingMixin,
     TwinrRuntimeDiscoveryMixin,
     TwinrRuntimeMemoryMixin,
     TwinrRuntimeAutomationMixin,

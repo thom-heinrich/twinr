@@ -20,9 +20,10 @@ from twinr.agent.tools.prompting.instructions import (
     build_tool_agent_instructions,
     tool_agent_time_context,
 )
-from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
+from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.tools.runtime.executor import RealtimeToolExecutor
 from twinr.agent.tools.runtime.registry import bind_realtime_tool_handlers, realtime_tool_names
+from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
 from twinr.agent.tools.schemas.contracts import (
     build_agent_tool_schemas,

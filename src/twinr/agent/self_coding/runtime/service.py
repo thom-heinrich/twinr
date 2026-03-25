@@ -9,7 +9,7 @@ import logging
 import math
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.self_coding.execution_runs import SelfCodingExecutionRunService
@@ -366,12 +366,12 @@ class SkillContext:
         for callback_name in ("close", "shutdown", "dispose"):
             callback = getattr(runtime, callback_name, None)
             if callable(callback):
+                close_callback = cast(Callable[[], object], callback)
                 try:
-                    callback()  # AUDIT-FIX(#6): Release sockets/session resources held by managed integrations after each execution.
+                    close_callback()  # pylint: disable=not-callable  # AUDIT-FIX(#6): getattr + callable guard makes this runtime-safe.
                 except Exception:
                     self.log_event("failed_to_close_managed_integrations", severity="warning")
-                finally:
-                    return
+                return
 
     @property
     def spoken_count(self) -> int:

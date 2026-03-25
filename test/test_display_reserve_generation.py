@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.agent.personality.models import (
     ConversationStyleProfile,

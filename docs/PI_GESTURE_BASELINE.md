@@ -18,7 +18,7 @@ This baseline covers:
 
 This baseline does **not** cover:
 
-- wakeword tuning
+- voice activation tuning
 - eye-follow tuning
 - servo-follow tuning
 - general social-vision policy outside HDMI gesture acknowledgement
@@ -106,7 +106,7 @@ All current HDMI ack gestures use `confirm_samples=1`.
 | Gesture | Effective min confidence | Hold |
 |---|---|---|
 | `thumbs_up` | `0.56` | `0.35 s` |
-| `thumbs_down` | `0.67` | `0.35 s` |
+| `thumbs_down` | `0.44` | `0.35 s` |
 | `pointing` | `0.66` | `0.32 s` |
 | `peace_sign` | `0.60` | `0.40 s` |
 | `ok_sign` | `0.86` | `0.46 s` |
@@ -115,6 +115,9 @@ All current HDMI ack gestures use `confirm_samples=1`.
 
 These floors are Pi-tuned acknowledgement floors for the HDMI emoji lane only.
 They are intentionally separate from broader social/wakeup policy.
+`thumbs_down` is intentionally lower than the earlier freeze because fresh Pi
+runtime rows on 2026-03-23 still showed valid live ROI detections around
+`0.446` and `0.489`, while `0.360` remained safely below the floor.
 
 ### Candidate Capture Debugging
 

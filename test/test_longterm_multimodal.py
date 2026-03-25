@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.workflows.realtime_runtime.background import TwinrRealtimeBackgroundMixin
 from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryObjectV1,
@@ -22,7 +22,7 @@ from twinr.memory.longterm.core.models import (
 )
 from twinr.memory.longterm.ingestion.multimodal import LongTermMultimodalExtractor
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
-from twinr.runtime import TwinrRuntime
+from twinr.agent.base_agent import TwinrRuntime
 
 
 class _FakeCameraCapture:

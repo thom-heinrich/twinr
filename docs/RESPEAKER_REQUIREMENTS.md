@@ -60,7 +60,7 @@ should plug into instead of bypassing:
 - proactive cooldown and reservation governance
 - bounded ambient audio observation
 - long-term sensor routine ingestion
-- wakeword monitoring and proactive audio-device selection
+- voice-activation monitoring and proactive audio-device selection
 
 Relevant current paths:
 
@@ -224,7 +224,7 @@ Allowed long-term learning targets:
 - [x] typical conversation-start dayparts
 - [x] typical quiet windows
 - [x] typical response-channel preferences when later confirmed
-- [x] repeated friction patterns around wakeword or interruptions
+- [x] repeated friction patterns around voice activation or interruptions
 - [x] repeated resume behavior after short pauses
 
 Disallowed from ReSpeaker alone:
@@ -251,7 +251,7 @@ Current implementation note:
   proactive tick while a dedicated scheduled XVF3800 wrapper throttles heavier
   host-control refreshes when the room is idle.
 - That scheduler takes current monitor context into account, including PIR
-  motion, pending camera inspection, wakeword/presence arming, and whether
+  motion, pending camera inspection, voice-activation/presence arming, and whether
   Twinr is already speaking.
 
 ## Feature Mapping
@@ -329,7 +329,7 @@ The ReSpeaker path is not done until these pass on `/twinr`.
 - [x] Twinr starts with ReSpeaker output and ReSpeaker input without manual fixes.
 - [x] Device diagnostics show XVF3800 mode and capture readiness.
 - [x] Proactive runtime reads ReSpeaker signals without blocking the main loop.
-- [x] Wakeword / presence / proactive audio path recovers after supervisor restart.
+- [x] Voice activation / presence / proactive audio path recovers after supervisor restart.
 - [x] Disconnect / reconnect errors are explicit and operator-readable.
 - [x] Long-term memory stores only structured facts, not raw audio.
 

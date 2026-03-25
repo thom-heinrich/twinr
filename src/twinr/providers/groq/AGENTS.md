@@ -52,7 +52,6 @@ PYTHONPATH=src pytest test/test_config.py -q
 
 `adapters.py` changes -> also check:
 - `src/twinr/providers/factory.py`
-- `src/twinr/agent/workflows/runner.py`
 - `src/twinr/agent/workflows/streaming_runner.py`
 - `test/test_groq_providers.py`
 - `test/test_streaming_runner.py`

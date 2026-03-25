@@ -1,7 +1,7 @@
-"""Track wakeword presence sessions from recent sensor activity.
+"""Track voice-activation presence sessions from recent sensor activity.
 
 This module owns the bounded presence-session controller used by the proactive
-runtime to decide whether wakeword listening should remain armed after recent
+runtime to decide whether voice-activation listening should remain armed after recent
 visual, PIR, or qualifying speech activity.
 """
 
@@ -124,7 +124,7 @@ class PresenceSessionController:
             transport_reason: Optional transport degradation reason.
 
         Returns:
-            One snapshot describing whether wakeword listening should remain
+            One snapshot describing whether voice-activation listening should remain
             armed and why.
         """
 

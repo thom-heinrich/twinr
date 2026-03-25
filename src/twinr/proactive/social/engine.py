@@ -10,10 +10,19 @@ from __future__ import annotations
 import math  # AUDIT-FIX(#2,#4): Finite/monotonic timestamp checks and numeric threshold sanitisation require explicit numeric validation.
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
+from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 
+from .normalization import (
+    coerce_enum_member,
+    coerce_non_negative_int_or_default,
+    coerce_spatial_box_coordinates,
+)
 from .scoring import TriggerScoreEvidence, bool_score, hold_progress, recent_progress, weighted_trigger_score
+
+
+_FloatLike: TypeAlias = str | bytes | bytearray | SupportsFloat | SupportsIndex
 
 
 # AUDIT-FIX(#2,#4,#5): Normalize permissive upstream sensor/config payloads before they can corrupt state, crash enum access, or break scoring math.
@@ -55,7 +64,7 @@ def _coerce_timestamp(value: object) -> float | None:
     """Coerce one value to a non-negative finite timestamp."""
 
     try:
-        timestamp = float(value)
+        timestamp = float(cast(_FloatLike, value))
     except (TypeError, ValueError):
         return None
     if not math.isfinite(timestamp) or timestamp < 0.0:
@@ -67,7 +76,7 @@ def _normalize_positive_float(value: object, *, default: float) -> float:
     """Coerce one value to a positive finite float."""
 
     try:
-        number = float(value)
+        number = float(cast(_FloatLike, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number) or number <= 0.0:
@@ -79,7 +88,7 @@ def _normalize_non_negative_float(value: object, *, default: float = 0.0) -> flo
     """Coerce one value to a non-negative finite float."""
 
     try:
-        number = float(value)
+        number = float(cast(_FloatLike, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number) or number < 0.0:
@@ -93,7 +102,7 @@ def _coerce_recent_age(value: object) -> float | None:
     if value is None:
         return None
     try:
-        number = float(value)
+        number = float(cast(_FloatLike, value))
     except (TypeError, ValueError):
         return None
     if not math.isfinite(number) or number < 0.0:
@@ -118,7 +127,7 @@ def _coerce_optional_azimuth(value: object) -> int | None:
     if value is None:
         return None
     try:
-        number = int(float(value))
+        number = int(float(cast(_FloatLike, value)))
     except (TypeError, ValueError):
         return None
     return number % 360
@@ -128,7 +137,7 @@ def _normalize_unit_interval(value: object, *, default: float) -> float:
     """Clamp one numeric value into ``[0.0, 1.0]`` with fallback."""
 
     try:
-        number = float(value)
+        number = float(cast(_FloatLike, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number):
@@ -284,85 +293,57 @@ class SocialVisiblePerson:
 def _coerce_body_pose(value: object) -> SocialBodyPose:
     """Coerce one value to a known body pose."""
 
-    if isinstance(value, SocialBodyPose):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        try:
-            return SocialBodyPose(normalized)
-        except ValueError:
-            return SocialBodyPose.UNKNOWN
-    return SocialBodyPose.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialBodyPose,
+        unknown=SocialBodyPose.UNKNOWN,
+    )
 
 
 def _coerce_motion_state(value: object) -> SocialMotionState:
     """Coerce one value to a known motion state."""
 
-    if isinstance(value, SocialMotionState):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        try:
-            return SocialMotionState(normalized)
-        except ValueError:
-            return SocialMotionState.UNKNOWN
-    return SocialMotionState.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialMotionState,
+        unknown=SocialMotionState.UNKNOWN,
+    )
 
 
 def _coerce_gesture_event(value: object) -> SocialGestureEvent:
     """Coerce one value to a known gesture event."""
 
-    if isinstance(value, SocialGestureEvent):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        try:
-            return SocialGestureEvent(normalized)
-        except ValueError:
-            return SocialGestureEvent.UNKNOWN
-    return SocialGestureEvent.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialGestureEvent,
+        unknown=SocialGestureEvent.UNKNOWN,
+    )
 
 
 def _coerce_fine_hand_gesture(value: object) -> SocialFineHandGesture:
     """Coerce one value to a bounded fine-hand gesture enum."""
 
-    if isinstance(value, SocialFineHandGesture):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        try:
-            return SocialFineHandGesture(normalized)
-        except ValueError:
-            return SocialFineHandGesture.UNKNOWN
-    return SocialFineHandGesture.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialFineHandGesture,
+        unknown=SocialFineHandGesture.UNKNOWN,
+    )
 
 
 def _coerce_person_zone(value: object) -> SocialPersonZone:
     """Coerce one value to a known coarse person zone."""
 
-    if isinstance(value, SocialPersonZone):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        try:
-            return SocialPersonZone(normalized)
-        except ValueError:
-            return SocialPersonZone.UNKNOWN
-    return SocialPersonZone.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialPersonZone,
+        unknown=SocialPersonZone.UNKNOWN,
+    )
 
 
 def _coerce_non_negative_int(value: object, *, default: int) -> int:
     """Coerce one value to a non-negative integer with fallback."""
 
-    if isinstance(value, bool):
-        return default
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return default
-    if number < 0:
-        return default
-    return number
+    return coerce_non_negative_int_or_default(value, default=default)
 
 
 def _coerce_bounded_text(value: object, *, max_length: int = 160) -> str | None:
@@ -381,23 +362,10 @@ def _coerce_spatial_box(value: object) -> SocialSpatialBox | None:
 
     if isinstance(value, SocialSpatialBox):
         return value
-    if isinstance(value, dict):
-        candidate = (
-            value.get("top"),
-            value.get("left"),
-            value.get("bottom"),
-            value.get("right"),
-        )
-    elif isinstance(value, (tuple, list)) and len(value) == 4:
-        candidate = tuple(value)
-    else:
-        candidate = None
-    if candidate is None:
+    coordinates = coerce_spatial_box_coordinates(value)
+    if coordinates is None:
         return None
-    try:
-        top, left, bottom, right = (float(item) for item in candidate)
-    except (TypeError, ValueError):
-        return None
+    top, left, bottom, right = coordinates
     return SocialSpatialBox(top=top, left=left, bottom=bottom, right=right)
 
 
@@ -1788,7 +1756,9 @@ __all__ = [
     "SocialAudioObservation",
     "SocialBodyPose",
     "SocialDetectedObject",
+    "SocialFineHandGesture",
     "SocialGestureEvent",
+    "SocialMotionState",
     "SocialObservation",
     "SocialPersonZone",
     "SocialSpatialBox",

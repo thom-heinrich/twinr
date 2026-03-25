@@ -6,6 +6,8 @@ installed ``twinr`` script. Runtime behavior stays in the focused subsystem
 packages that this bootstrap imports on demand.
 """
 
+# pylint: disable=no-name-in-module
+
 from __future__ import annotations
 
 import argparse
@@ -19,9 +21,9 @@ from twinr.runtime_paths import prime_raspberry_pi_system_site_packages
 
 prime_raspberry_pi_system_site_packages()
 
-from twinr.agent.base_agent import TwinrConfig
-from twinr.ops.locks import TwinrInstanceAlreadyRunningError
-from twinr.ops.runtime_env import prime_user_session_audio_env
+from twinr.agent.base_agent import TwinrConfig  # noqa: E402
+from twinr.ops.locks import TwinrInstanceAlreadyRunningError  # noqa: E402
+from twinr.ops.runtime_env import prime_user_session_audio_env  # noqa: E402
 
 _RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 
@@ -99,16 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format-for-print",
         help="Rewrite text into a short thermal-printer format using OpenAI",
-    )
-    parser.add_argument(
-        "--run-hardware-loop",
-        action="store_true",
-        help="Run the GPIO -> mic -> OpenAI -> speaker/printer loop",
-    )
-    parser.add_argument(
-        "--run-realtime-loop",
-        action="store_true",
-        help="Run the GPIO -> mic -> OpenAI Realtime -> speaker/printer loop",
     )
     parser.add_argument(
         "--run-streaming-loop",
@@ -226,13 +218,21 @@ def _should_enable_respeaker_led_companion(config: TwinrConfig, env_file: str | 
         return bool(explicit_setting)
     if not _is_raspberry_pi_host():
         return False
-    from twinr.hardware.respeaker import config_targets_respeaker
+    from twinr.hardware.respeaker import config_targets_respeaker, probe_respeaker_xvf3800
 
-    return config_targets_respeaker(
+    if config_targets_respeaker(
         getattr(config, "voice_orchestrator_audio_device", None),
         getattr(config, "proactive_audio_input_device", None),
         getattr(config, "audio_input_device", None),
-    )
+    ):
+        return True
+    # Field Pi deployments often route the XVF3800 through ALSA/PipeWire
+    # "default", so string-only config matching can miss the real hardware.
+    try:
+        probe = probe_respeaker_xvf3800()
+    except Exception:
+        return False
+    return getattr(probe, "usb_device", None) is not None
 
 
 def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str | Path) -> bool:
@@ -504,8 +504,6 @@ def main() -> int:
             args.tts_text,
             args.format_for_print,
             args.proactive_observe_once,
-            args.run_hardware_loop,
-            args.run_realtime_loop,
             args.run_streaming_loop,
             args.run_whatsapp_channel,
             args.run_orchestrator_server,
@@ -619,37 +617,6 @@ def main() -> int:
             with loop_instance_lock(config, "display-loop"):
                 return loop.run(duration_s=args.loop_duration)
 
-        if args.run_realtime_loop:
-            _assert_pi_runtime_root(args.env_file, command_name="run-realtime-loop")
-            from twinr.agent.workflows.runtime_error_hold import hold_runtime_error_state
-            from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
-            from twinr.display.companion import optional_display_companion
-            from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
-            from twinr.ops import loop_instance_lock
-
-            with loop_instance_lock(config, "realtime-loop"):
-                with optional_display_companion(
-                    config,
-                    enabled=_should_enable_display_companion(config, args.env_file),
-                ):
-                    with optional_respeaker_led_companion(
-                        config,
-                        enabled=_should_enable_respeaker_led_companion(config, args.env_file),
-                    ):
-                        try:
-                            loop = TwinrRealtimeHardwareLoop(
-                                config=config,
-                                runtime=runtime,
-                                print_backend=backend,
-                            )
-                            return loop.run(duration_s=args.loop_duration)
-                        except Exception as exc:
-                            return hold_runtime_error_state(
-                                runtime=runtime,
-                                error=exc,
-                                duration_s=args.loop_duration,
-                            )
-
         if args.run_whatsapp_channel:
             if backend is None:
                 raise RuntimeError("WhatsApp channel requires configured providers")
@@ -709,37 +676,6 @@ def main() -> int:
             if result.model:
                 print(f"model={result.model}")
             return 0
-
-        if args.run_hardware_loop and backend is not None:
-            _assert_pi_runtime_root(args.env_file, command_name="run-hardware-loop")
-            from twinr.agent.legacy.classic_hardware_loop import TwinrHardwareLoop
-            from twinr.agent.workflows.runtime_error_hold import hold_runtime_error_state
-            from twinr.display.companion import optional_display_companion
-            from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
-            from twinr.ops import loop_instance_lock
-
-            with loop_instance_lock(config, "hardware-loop"):
-                with optional_display_companion(
-                    config,
-                    enabled=_should_enable_display_companion(config, args.env_file),
-                ):
-                    with optional_respeaker_led_companion(
-                        config,
-                        enabled=_should_enable_respeaker_led_companion(config, args.env_file),
-                    ):
-                        try:
-                            loop = TwinrHardwareLoop(
-                                config=config,
-                                runtime=runtime,
-                                backend=backend,
-                            )
-                            return loop.run(duration_s=args.loop_duration)
-                        except Exception as exc:
-                            return hold_runtime_error_state(
-                                runtime=runtime,
-                                error=exc,
-                                duration_s=args.loop_duration,
-                            )
 
         if args.audio_file and backend is not None:
             transcript = backend.transcribe_path(args.audio_file)

@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from queue import Empty, Full
+from threading import RLock
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from twinr.agent.tools.handlers.automations import normalize_delivery
+from twinr.agent.tools.handlers.automation_support import normalize_delivery
 from twinr.agent.tools.runtime.broker_policy import AutomationToolBrokerPolicy, default_automation_tool_broker_policy
 from twinr.automations import AutomationAction, AutomationDefinition
-from twinr.memory.reminders import format_due_label
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.agent.workflows.realtime_runtime.background_delivery import (
+    BackgroundDeliveryBlocked as _BackgroundDeliveryBlocked,
+    background_block_reason,
+    background_block_reason_locked,
+    background_work_allowed,
+    begin_background_delivery,
+)
+from twinr.agent.workflows.realtime_runtime.reminder_delivery import (
+    default_due_reminder_text,
+    deliver_due_reminder,
+    phrase_due_reminder_with_fallback,
+    safe_format_due_label,
+)
 from twinr.agent.workflows.realtime_runtime.proactive_delivery import (
     ProactiveDeliveryDecision,
     ProactiveDeliveryPolicy,
@@ -39,24 +52,21 @@ from twinr.proactive.runtime.sensitive_behavior_gate import evaluate_respeaker_s
 from twinr.providers.openai.core.instructions import REMINDER_DELIVERY_INSTRUCTIONS
 
 
-@dataclass(slots=True)
-class _LocalMetadataResponse:
-    """Represent a locally generated fallback response for background work."""
-
-    text: str
-    model: str = "local_fallback"
-    response_id: str | None = None
-    request_id: str | None = None
-    token_usage: dict[str, int] | None = None
-    used_web_search: bool = False
-
-
 class TwinrRealtimeBackgroundMixin:
     """Handle background delivery paths without destabilizing the live loop.
 
     The mixin keeps reminder, automation, and proactive follow-up work bounded
     and makes telemetry or cleanup failures best-effort.
     """
+
+    def _get_lock(self, name: str) -> RLock:
+        """Return one lazily created re-entrant lock for background state."""
+
+        lock = getattr(self, name, None)
+        if lock is None:
+            lock = RLock()
+            setattr(self, name, lock)
+        return lock
 
     # AUDIT-FIX(#8): Telemetry/status side-effects must be best-effort so completed speech/print actions do not get reclassified as failures.
     def _remember_background_fault(self, source: str, error: Exception | str) -> None:
@@ -222,6 +232,13 @@ class TwinrRealtimeBackgroundMixin:
             self.runtime.mark_reminder_failed(reminder_id, error=error)
         except Exception as exc:
             self._remember_background_fault("mark_reminder_failed", exc)
+
+    # AUDIT-FIX(#13): Reminder reservations must be releasable when a late idle-window race aborts delivery before speech starts.
+    def _safe_release_reminder_reservation(self, reminder_id: str) -> None:
+        try:
+            self.runtime.release_reminder_reservation(reminder_id)
+        except Exception as exc:
+            self._remember_background_fault("release_reminder_reservation", exc)
 
     def _smart_home_context_tracker(self) -> SmartHomeContextTracker:
         """Return the cached smart-home context tracker instance."""
@@ -470,27 +487,11 @@ class TwinrRealtimeBackgroundMixin:
 
     # AUDIT-FIX(#7): Due reminders need a deterministic local fallback so a backend hiccup never produces silence.
     def _default_due_reminder_text(self, reminder) -> str:
-        summary = self._coerce_text(getattr(reminder, "summary", None))
-        details = self._coerce_text(getattr(reminder, "details", None))
-        original_request = self._coerce_text(getattr(reminder, "original_request", None))
-        reminder_text = summary or details or original_request
-        if reminder_text:
-            return f"Reminder. {reminder_text}"
-        return "This is your reminder."
+        return default_due_reminder_text(self, reminder)
 
     # AUDIT-FIX(#5): Formatting helper must tolerate invalid timezone config and naive datetimes without exploding.
     def _safe_format_due_label(self, value: object) -> str:
-        try:
-            return format_due_label(value, timezone_name=self._local_timezone_name())
-        except Exception as exc:
-            self._remember_background_fault("format_due_label", exc)
-            if isinstance(value, datetime):
-                when = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-                try:
-                    return when.astimezone(self._local_timezone()).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    return when.isoformat()
-            return self._coerce_text(value)
+        return safe_format_due_label(self, value)
 
     # AUDIT-FIX(#1): Failed automations need bounded retry state instead of being permanently marked as successfully triggered.
     def _automation_failure_backoff_seconds(self) -> float:
@@ -578,17 +579,48 @@ class TwinrRealtimeBackgroundMixin:
         if governor_reservation is None:
             return False
 
+        blocked_reason = self._background_block_reason()
+        if blocked_reason is not None:
+            self._safe_cancel_governor_reservation(governor_reservation)
+            self._safe_emit(f"social_trigger_skipped={blocked_reason}")
+            self._safe_record_event(
+                "social_trigger_skipped",
+                "Social trigger prompt was skipped because Twinr stopped being idle before delivery started.",
+                trigger=trigger_id,
+                reason=trigger_reason,
+                prompt=default_prompt,
+                priority=priority,
+                skip_reason=blocked_reason,
+            )
+            return False
+
         phrase_response = None
         prompt_mode = proactive_prompt_mode(trigger)
         prompt_text = default_prompt
         try:
             if delivery_decision.channel == "display":
-                self._show_social_trigger_display_cue(
-                    trigger_id=trigger_id,
-                    prompt_text=prompt_text,
-                    reason=delivery_decision.reason,
-                    cue_hold_seconds=delivery_decision.cue_hold_seconds,
-                )
+                try:
+                    self._begin_background_delivery(
+                        lambda: self._show_social_trigger_display_cue(
+                            trigger_id=trigger_id,
+                            prompt_text=prompt_text,
+                            reason=delivery_decision.reason,
+                            cue_hold_seconds=delivery_decision.cue_hold_seconds,
+                        )
+                    )
+                except _BackgroundDeliveryBlocked as blocked:
+                    self._safe_cancel_governor_reservation(governor_reservation)
+                    self._safe_emit(f"social_trigger_skipped={blocked.reason}")
+                    self._safe_record_event(
+                        "social_trigger_skipped",
+                        "Social trigger display cue was skipped because Twinr stopped being idle before delivery started.",
+                        trigger=trigger_id,
+                        reason=trigger_reason,
+                        prompt=prompt_text,
+                        priority=priority,
+                        skip_reason=blocked.reason,
+                    )
+                    return False
                 self._safe_mark_governor_delivered(governor_reservation)
                 self._safe_emit(f"social_trigger={trigger_id}")
                 self._safe_emit(f"social_trigger_priority={priority}")
@@ -639,9 +671,25 @@ class TwinrRealtimeBackgroundMixin:
                     )
 
             # AUDIT-FIX(#7): Never begin a spoken prompt with empty text; blank output is a real user-visible failure.
-            prompt = self.runtime.begin_proactive_prompt(
-                self._require_non_empty_text(prompt_text, context=f"social trigger {trigger_id} prompt")
-            )
+            try:
+                prompt = self._begin_background_delivery(
+                    lambda: self.runtime.begin_proactive_prompt(
+                        self._require_non_empty_text(prompt_text, context=f"social trigger {trigger_id} prompt")
+                    )
+                )
+            except _BackgroundDeliveryBlocked as blocked:
+                self._safe_cancel_governor_reservation(governor_reservation)
+                self._safe_emit(f"social_trigger_skipped={blocked.reason}")
+                self._safe_record_event(
+                    "social_trigger_skipped",
+                    "Social trigger prompt was skipped because Twinr stopped being idle before speech started.",
+                    trigger=trigger_id,
+                    reason=trigger_reason,
+                    prompt=prompt_text,
+                    priority=priority,
+                    skip_reason=blocked.reason,
+                )
+                return False
             self._safe_emit_status(force=True)
             tts_started = time.monotonic()
             tts_ms, first_audio_ms = self._play_streaming_tts_with_feedback(prompt, turn_started=tts_started)
@@ -730,48 +778,85 @@ class TwinrRealtimeBackgroundMixin:
         cloned_facts = self._clone_background_value(facts)
         copied_facts = cloned_facts if isinstance(cloned_facts, dict) else dict(facts)
         normalized_event_names = self._normalize_event_names(event_names)
-        merged_facts = self._merge_sensor_observation_facts(
-            existing=getattr(self, "_latest_sensor_observation_facts", None),
-            incoming=copied_facts,
+        self._apply_sensor_observation_facts(
+            copied_facts,
+            normalized_event_names=normalized_event_names,
+            queue_for_automation=True,
         )
-        context_update = self._smart_home_context_tracker().observe(
-            observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
-            live_facts=merged_facts,
-            incoming_facts=copied_facts,
+
+    def handle_live_sensor_context(self, facts: dict[str, object]) -> None:
+        """Refresh the live multimodal context without enqueueing automations.
+
+        Fast HDMI attention refreshes can surface fresher camera facts than the
+        slower automation-observation cadence. Voice gating should consume that
+        authoritative state immediately, but sensor automations must not fire on
+        every display-refresh tick.
+        """
+
+        cloned_facts = self._clone_background_value(facts)
+        copied_facts = cloned_facts if isinstance(cloned_facts, dict) else dict(facts)
+        self._apply_sensor_observation_facts(
+            copied_facts,
+            normalized_event_names=(),
+            queue_for_automation=False,
         )
-        merged_facts = context_update.snapshot.apply_to_facts(merged_facts)
-        merged_facts["person_state"] = derive_person_state(
-            observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
-            live_facts=merged_facts,
-        ).to_automation_facts()
-        normalized_event_names = self._normalize_event_names((*normalized_event_names, *context_update.event_names))
-        self._latest_sensor_observation_facts = merged_facts
+
+    def _apply_sensor_observation_facts(
+        self,
+        facts: dict[str, object],
+        *,
+        normalized_event_names: tuple[str, ...],
+        queue_for_automation: bool,
+    ) -> None:
+        """Merge one sensor snapshot into live state and optionally queue it."""
+
+        with self._get_lock("_sensor_observation_state_lock"):
+            merged_facts = self._merge_sensor_observation_facts(
+                existing=getattr(self, "_latest_sensor_observation_facts", None),
+                incoming=facts,
+            )
+            context_update = self._smart_home_context_tracker().observe(
+                observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
+                live_facts=merged_facts,
+                incoming_facts=facts,
+            )
+            merged_facts = context_update.snapshot.apply_to_facts(merged_facts)
+            merged_facts["person_state"] = derive_person_state(
+                observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
+                live_facts=merged_facts,
+            ).to_automation_facts()
+            normalized_event_names = self._normalize_event_names(
+                (*normalized_event_names, *context_update.event_names)
+            )
+            self._latest_sensor_observation_facts = merged_facts
+            if queue_for_automation:
+                # AUDIT-FIX(#4): Never block on a full observation queue; drop the oldest entry and keep the newest live state.
+                try:
+                    self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
+                except Full:
+                    try:
+                        self._sensor_observation_queue.get_nowait()
+                    except Empty:
+                        pass
+                    try:
+                        self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
+                    except Full as exc:
+                        self._remember_background_fault("sensor_observation_queue", exc)
+                        self._safe_emit("sensor_observation_queue_overflow=true")
+                        self._safe_record_event(
+                            "sensor_observation_queue_overflow",
+                            "Twinr dropped a sensor observation because the queue stayed full.",
+                            level="warning",
+                            event_names=list(normalized_event_names),
+                        )
         refresh_voice_context = getattr(self, "_refresh_voice_orchestrator_sensor_context", None)
         if callable(refresh_voice_context):
             try:
-                refresh_voice_context()
+                refresh_voice_context()  # pylint: disable=not-callable
             except Exception as exc:
                 self._safe_emit(f"voice_orchestrator_context_refresh_failed={type(exc).__name__}")
-
-        # AUDIT-FIX(#4): Never block on a full observation queue; drop the oldest entry and keep the newest live state.
-        try:
-            self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
-        except Full:
-            try:
-                self._sensor_observation_queue.get_nowait()
-            except Empty:
-                pass
-            try:
-                self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
-            except Full as exc:
-                self._remember_background_fault("sensor_observation_queue", exc)
-                self._safe_emit("sensor_observation_queue_overflow=true")
-                self._safe_record_event(
-                    "sensor_observation_queue_overflow",
-                    "Twinr dropped a sensor observation because the queue stayed full.",
-                    level="warning",
-                    event_names=list(normalized_event_names),
-                )
+        if not queue_for_automation:
+            return
 
     def _maybe_deliver_due_reminder(self) -> bool:
         # AUDIT-FIX(#9): Validate timer state and poll interval before touching reminder delivery logic.
@@ -801,6 +886,17 @@ class TwinrRealtimeBackgroundMixin:
                 governor_inputs=governor_inputs,
             )
             if governor_reservation is None:
+                return False
+            blocked_reason = self._background_block_reason()
+            if blocked_reason is not None:
+                self._safe_cancel_governor_reservation(governor_reservation)
+                self._safe_emit(f"reminder_skipped={blocked_reason}")
+                self._safe_record_event(
+                    "reminder_skipped",
+                    "A due reminder was skipped because Twinr stopped being idle before reminder delivery started.",
+                    reminder_id=preview_entries[0].reminder_id,
+                    skip_reason=blocked_reason,
+                )
                 return False
             due_entries = self.runtime.reserve_due_reminders(limit=1)
             if not due_entries:
@@ -899,12 +995,17 @@ class TwinrRealtimeBackgroundMixin:
                     error=str(exc),
                 )
 
+    def _background_block_reason_locked(self) -> str | None:
+        return background_block_reason_locked(self)
+
+    def _background_block_reason(self) -> str | None:
+        return background_block_reason(self)
+
     def _background_work_allowed(self) -> bool:
-        # AUDIT-FIX(#11): Background gating should tolerate partially initialized runtime state during startup/recovery.
-        return (
-            getattr(getattr(self.runtime, "status", None), "value", None) == "waiting"
-            and not bool(getattr(self, "_conversation_session_active", False))
-        )
+        return background_work_allowed(self)
+
+    def _begin_background_delivery(self, action):
+        return begin_background_delivery(self, action)
 
     def _current_presence_session_id(self) -> int | None:
         monitor = getattr(self, "proactive_monitor", None)
@@ -1522,6 +1623,43 @@ class TwinrRealtimeBackgroundMixin:
                 rationale=self._coerce_text(getattr(candidate, "rationale", None)),
             )
             return True
+        except LongTermRemoteUnavailableError as exc:
+            # Required remote-primary memory must fail closed even from idle
+            # background probes; otherwise Twinr keeps running in a noisy
+            # half-alive state while the remote contract is already broken.
+            self._recover_speaking_output_state()
+            if self._enter_required_remote_error(exc):
+                if governor_reservation is not None:
+                    self._safe_cancel_governor_reservation(governor_reservation)
+                self._safe_record_event(
+                    "longterm_proactive_required_remote_failed",
+                    "A long-term proactive probe hit a required remote-memory failure and forced Twinr into fail-closed error state.",
+                    level="error",
+                    candidate_id=candidate_id,
+                    error=str(exc),
+                )
+                return False
+            if reservation is not None:
+                self._safe_mark_long_term_proactive_candidate_skipped(
+                    reservation,
+                    reason=f"delivery_failed: {exc}",
+                )
+                if governor_reservation is not None:
+                    self._safe_mark_governor_skipped(
+                        governor_reservation,
+                        reason=f"delivery_failed: {exc}",
+                    )
+            elif governor_reservation is not None:
+                self._safe_cancel_governor_reservation(governor_reservation)
+            self._safe_emit(f"longterm_proactive_error={exc}")
+            self._safe_record_event(
+                "longterm_proactive_failed",
+                "A long-term proactive prompt failed during delivery.",
+                level="error",
+                candidate_id=candidate_id,
+                error=str(exc),
+            )
+            return False
         except Exception as exc:
             # AUDIT-FIX(#12): Reservation/state failures in long-term proactive delivery must be contained so the loop can recover.
             self._recover_speaking_output_state()
@@ -1601,137 +1739,19 @@ class TwinrRealtimeBackgroundMixin:
         *,
         governor_reservation: ProactiveGovernorReservation,
     ) -> bool:
-        response = None
-        spoken_prompt = ""
-        reminder_id = self._coerce_text(getattr(reminder, "reminder_id", None)) or "unknown"
-        try:
-            stop_processing_feedback = self._start_working_feedback_loop("processing")
-            try:
-                response = self._phrase_due_reminder_with_fallback(reminder)
-            finally:
-                stop_processing_feedback()
-
-            # AUDIT-FIX(#7): Reminder delivery must reject blank backend output and use deterministic fallback text instead.
-            spoken_prompt = self.runtime.begin_reminder_prompt(
-                self._require_non_empty_text(
-                    getattr(response, "text", None),
-                    context=f"reminder {reminder_id} prompt",
-                )
-            )
-            self._safe_emit_status(force=True)
-            tts_started = time.monotonic()
-            tts_ms, first_audio_ms = self._play_streaming_tts_with_feedback(
-                spoken_prompt,
-                turn_started=tts_started,
-            )
-            self._finalize_speaking_output()
-            delivered = self.runtime.mark_reminder_delivered(reminder.reminder_id)
-            self._safe_mark_governor_delivered(governor_reservation)
-            self._safe_emit("reminder_delivered=true")
-            self._safe_emit(f"reminder_due_at={delivered.due_at.isoformat()}")
-            self._safe_emit(f"reminder_text={spoken_prompt}")
-            if getattr(response, "response_id", None):
-                self._safe_emit(f"reminder_response_id={response.response_id}")
-            if getattr(response, "request_id", None):
-                self._safe_emit(f"reminder_request_id={response.request_id}")
-            self._safe_emit(f"timing_reminder_tts_ms={tts_ms}")
-            if first_audio_ms is not None:
-                self._safe_emit(f"timing_reminder_first_audio_ms={first_audio_ms}")
-            self._safe_record_usage(
-                request_kind="reminder_delivery",
-                source="realtime_loop",
-                model=getattr(response, "model", "unknown"),
-                response_id=getattr(response, "response_id", None),
-                request_id=getattr(response, "request_id", None),
-                used_web_search=False,
-                token_usage=getattr(response, "token_usage", None),
-                reminder_id=delivered.reminder_id,
-                reminder_kind=delivered.kind,
-            )
-            return True
-        except Exception as exc:
-            # AUDIT-FIX(#8): Reminder failures must clean up state and log without leaving the device stuck in answering mode.
-            self._recover_speaking_output_state()
-            self._safe_mark_reminder_failed(reminder.reminder_id, error=str(exc))
-            self._safe_mark_governor_skipped(
-                governor_reservation,
-                reason=f"delivery_failed: {exc}",
-            )
-            self._safe_emit(f"reminder_error={exc}")
-            self._safe_record_event(
-                "reminder_delivery_failed",
-                "A due reminder failed during delivery.",
-                level="error",
-                reminder_id=reminder_id,
-                spoken_prompt=spoken_prompt,
-                error=str(exc),
-            )
-            return False
+        return deliver_due_reminder(
+            self,
+            reminder,
+            governor_reservation=governor_reservation,
+            instructions=REMINDER_DELIVERY_INSTRUCTIONS,
+        )
 
     def _phrase_due_reminder_with_fallback(self, reminder):
-        # AUDIT-FIX(#7): Due reminders are safety-relevant and need a local deterministic fallback when all provider paths fail.
-        fallback_text = self._default_due_reminder_text(reminder)
-
-        helper = getattr(self.agent_provider, "phrase_due_reminder_with_metadata", None)
-        if callable(helper):
-            try:
-                response = helper(reminder)
-            except Exception as exc:
-                self._safe_emit(f"reminder_backend_primary_error={exc}")
-                self._safe_record_event(
-                    "reminder_backend_primary_failed",
-                    "The dedicated reminder phrasing backend failed.",
-                    level="warning",
-                    reminder_id=self._coerce_text(getattr(reminder, "reminder_id", None)),
-                    error=str(exc),
-                )
-            else:
-                if self._coerce_text(getattr(response, "text", None)):
-                    return response
-                self._safe_emit("reminder_backend_fallback=empty_primary_phrase")
-
-        generic = getattr(self.agent_provider, "respond_with_metadata", None)
-        if callable(generic):
-            current_time = datetime.now(self._local_timezone())
-            timezone_name = self._local_timezone_name()
-            prompt_parts = [
-                "A stored Twinr reminder is due now.",
-                f"Current local time: {self._safe_format_due_label(current_time)}",
-                f"Scheduled reminder time: {self._safe_format_due_label(getattr(reminder, 'due_at', None))}",
-                f"Reminder kind: {self._coerce_text(getattr(reminder, 'kind', None)) or 'reminder'}",
-                f"Reminder summary: {self._coerce_text(getattr(reminder, 'summary', None))}",
-            ]
-            if getattr(reminder, "details", None):
-                prompt_parts.append(f"Reminder details: {self._coerce_text(getattr(reminder, 'details', None))}")
-            if getattr(reminder, "original_request", None):
-                prompt_parts.append(
-                    f"Original user request: {self._coerce_text(getattr(reminder, 'original_request', None))}"
-                )
-            prompt_parts.append(f"Use timezone context: {timezone_name}")
-            prompt_parts.append("Speak the reminder now.")
-            self._safe_emit("reminder_backend_fallback=generic")
-            try:
-                response = generic(
-                    "\n".join(prompt_parts),
-                    instructions=REMINDER_DELIVERY_INSTRUCTIONS,
-                    allow_web_search=False,
-                )
-            except Exception as exc:
-                self._safe_emit(f"reminder_backend_generic_error={exc}")
-                self._safe_record_event(
-                    "reminder_backend_generic_failed",
-                    "The generic reminder phrasing backend failed.",
-                    level="warning",
-                    reminder_id=self._coerce_text(getattr(reminder, "reminder_id", None)),
-                    error=str(exc),
-                )
-            else:
-                if self._coerce_text(getattr(response, "text", None)):
-                    return response
-                self._safe_emit("reminder_backend_fallback=empty_generic_phrase")
-
-        self._safe_emit("reminder_backend_fallback=local")
-        return _LocalMetadataResponse(text=fallback_text)
+        return phrase_due_reminder_with_fallback(
+            self,
+            reminder,
+            instructions=REMINDER_DELIVERY_INSTRUCTIONS,
+        )
 
     def _run_automation_entry(
         self,
@@ -1767,6 +1787,21 @@ class TwinrRealtimeBackgroundMixin:
                 )
                 if governor_reservation is None:
                     return False
+            blocked_reason = self._background_block_reason()
+            if blocked_reason is not None:
+                if governor_reservation is not None:
+                    self._safe_cancel_governor_reservation(governor_reservation)
+                self._safe_emit(f"automation_skipped={blocked_reason}")
+                self._safe_record_event(
+                    "automation_skipped",
+                    "A due automation was skipped because Twinr stopped being idle before automation delivery started.",
+                    automation_id=automation_id,
+                    name=automation_name,
+                    trigger_source=trigger_source,
+                    event_name=event_name,
+                    skip_reason=blocked_reason,
+                )
+                return False
 
             for action in tuple(getattr(entry, "actions", ()) or ()):
                 if not getattr(action, "enabled", False):
@@ -1796,6 +1831,21 @@ class TwinrRealtimeBackgroundMixin:
                 facts=facts,
             )
             return True
+        except _BackgroundDeliveryBlocked as blocked:
+            if governor_reservation is not None:
+                self._safe_cancel_governor_reservation(governor_reservation)
+            self._safe_emit(f"automation_skipped={blocked.reason}")
+            self._safe_record_event(
+                "automation_skipped",
+                "A due automation was skipped because Twinr stopped being idle before automation output started.",
+                automation_id=automation_id,
+                name=automation_name,
+                trigger_source=trigger_source,
+                event_name=event_name,
+                skip_reason=blocked.reason,
+                executed_partial=executed,
+            )
+            return False
         except Exception as exc:
             self._recover_automation_output_state()
             self._register_automation_failure_backoff(automation_id)
@@ -1922,8 +1972,10 @@ class TwinrRealtimeBackgroundMixin:
 
     def _speak_automation_text(self, entry: AutomationDefinition, text: str) -> None:
         # AUDIT-FIX(#7): Static and generated automation speech must be non-empty before TTS starts.
-        spoken_prompt = self.runtime.begin_automation_prompt(
-            self._require_non_empty_text(text, context="automation speech output")
+        spoken_prompt = self._begin_background_delivery(
+            lambda: self.runtime.begin_automation_prompt(
+                self._require_non_empty_text(text, context="automation speech output")
+            )
         )
         self._safe_emit_status(force=True)
         tts_started = time.monotonic()
@@ -1942,7 +1994,7 @@ class TwinrRealtimeBackgroundMixin:
     def _print_automation_text(self, entry: AutomationDefinition, text: str, *, request_source: str) -> None:
         # AUDIT-FIX(#7): Empty print jobs are silent failures for seniors and should be rejected before hitting the printer.
         printable_text = self._require_non_empty_text(text, context="automation print output")
-        self.runtime.maybe_begin_automation_print()
+        self._begin_background_delivery(lambda: self.runtime.maybe_begin_automation_print())
         self._safe_emit_status(force=True)
         stop_printing_feedback = self._start_working_feedback_loop("printing")
         try:

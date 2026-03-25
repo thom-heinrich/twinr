@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort, record_usage_best_effort
 
 _T = TypeVar("_T")
 
@@ -25,10 +26,10 @@ _PRINT_LOCKS_GUARD = threading.Lock()
 
 
 # AUDIT-FIX(#7): Validate tool arguments up front so malformed payloads fail predictably instead of crashing on `.get()`.
-def _ensure_arguments_mapping(arguments: dict[str, object]) -> Mapping[str, object]:
+def _ensure_arguments_mapping(arguments: dict[str, object]) -> dict[str, object]:
     if not isinstance(arguments, Mapping):
         raise RuntimeError("tool arguments must be a JSON object")
-    return arguments
+    return dict(arguments)
 
 
 # AUDIT-FIX(#8): Separate plain stringification from stripped normalization so backend outputs can retain formatting where needed.
@@ -212,10 +213,7 @@ def _sanitize_emit_value(value: object) -> str:
 
 # AUDIT-FIX(#5): Make non-critical `emit()` calls best-effort so telemetry outages do not turn successful tool executions into user-visible failures.
 def _emit_safe(owner: Any, payload: str) -> None:
-    try:
-        owner.emit(payload)
-    except Exception:
-        return None
+    emit_best_effort(owner, payload)
 
 
 # AUDIT-FIX(#4): Emit structured key/value telemetry through a sanitized path.
@@ -225,18 +223,12 @@ def _emit_kv_safe(owner: Any, key: str, value: object) -> None:
 
 # AUDIT-FIX(#5): Make event recording best-effort for the same reason as telemetry emission.
 def _record_event_safe(owner: Any, event_name: str, message: str, **data: object) -> None:
-    try:
-        owner._record_event(event_name, message, **data)
-    except Exception:
-        return None
+    record_event_best_effort(owner, event_name, message, data)
 
 
 # AUDIT-FIX(#5): Make usage recording best-effort so analytics persistence failures do not flip successful tool calls into errors.
 def _record_usage_safe(owner: Any, **data: object) -> None:
-    try:
-        owner._record_usage(**data)
-    except Exception:
-        return None
+    record_usage_best_effort(owner, data)
 
 
 # AUDIT-FIX(#5): Generalize best-effort side effects that should never be allowed to fail the primary user action.

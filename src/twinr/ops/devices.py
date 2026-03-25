@@ -6,6 +6,7 @@ to build dashboard-friendly device status snapshots.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -545,11 +546,6 @@ def _captured_at() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _command_available_or_path_exists(command: str) -> bool:
-    # AUDIT-FIX(#5): This helper now only returns true for non-empty executable files, not arbitrary existing paths or directories.
-    return _resolve_executable(command) is not None
-
-
 def _run_command(command: list[str], *, timeout: float = _COMMAND_TIMEOUT_SECONDS) -> _CommandResult:
     env = os.environ.copy()
     # AUDIT-FIX(#3): Force a stable C locale because downstream parsers depend on English command output tokens.
@@ -707,11 +703,10 @@ def _safe_collect_device_status(
 def _normalize_event_entries(entries: object) -> list[dict[str, object]]:
     if isinstance(entries, list):
         raw_entries = entries
+    elif isinstance(entries, Iterable):
+        raw_entries = list(entries)
     else:
-        try:
-            raw_entries = list(entries)
-        except Exception:
-            return []
+        return []
     normalized: list[dict[str, object]] = []
     for entry in raw_entries:
         if isinstance(entry, dict):
@@ -754,12 +749,21 @@ def _path_is_char_device(path: Path | None) -> bool:
 
 
 # AUDIT-FIX(#7): Reject bools, negative numbers, and non-integer GPIO values before reporting hardware as healthy.
-def _normalize_gpio(value: object) -> int | None:
+def _coerce_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
+    if not isinstance(value, (int, float, str)):
+        return None
     try:
-        gpio = int(value)
+        return int(value)
     except (TypeError, ValueError):
+        return None
+
+
+# AUDIT-FIX(#7): Reject bools, negative numbers, and non-integer GPIO values before reporting hardware as healthy.
+def _normalize_gpio(value: object) -> int | None:
+    gpio = _coerce_int(value)
+    if gpio is None:
         return None
     if gpio < 0:
         return None
@@ -795,12 +799,10 @@ def _display_optional_bool(value: object, *, default: str = "unknown") -> str:
 def _display_optional_number(value: object, *, default: str = "—") -> str:
     """Render one optional integer-like device fact."""
 
-    if value is None:
+    parsed = _coerce_int(value)
+    if parsed is None:
         return default
-    try:
-        return str(int(value))
-    except (TypeError, ValueError):
-        return default
+    return str(parsed)
 
 
 def _display_float_tuple(values: tuple[float | None, ...] | None, *, default: str = "unknown") -> str:

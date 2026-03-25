@@ -11,7 +11,7 @@ from twinr.proactive import (
     SocialTriggerEngine,
     SocialVisionObservation,
 )
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 
 
 class SocialTriggerEngineTests(unittest.TestCase):

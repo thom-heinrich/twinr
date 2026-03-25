@@ -17,6 +17,7 @@ from pathlib import Path
 import tempfile
 from threading import Lock, RLock
 import time
+from typing import cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
@@ -37,7 +38,6 @@ from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogSt
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteReadFailedError,
     LongTermRemoteStateStore,
-    LongTermRemoteUnavailableError,
 )
 from twinr.text_utils import retrieval_terms
 
@@ -530,8 +530,9 @@ class LongTermStructuredStore:
             return False
         required = getattr(remote_state, "required", None)
         if callable(required):
+            required_check = cast(Callable[[], object], required)
             try:
-                return bool(required())
+                return bool(required_check())  # pylint: disable=not-callable
             except Exception:
                 return True
         if required is None:
@@ -2058,7 +2059,7 @@ class LongTermStructuredStore:
                             durable_limit=resolved_durable_limit,
                             candidate_limit=candidate_limit,
                         ),
-                        operation=lambda: remote_catalog.search_current_item_payloads(
+                        operation=lambda candidate_limit=candidate_limit: remote_catalog.search_current_item_payloads(
                             snapshot_kind="objects",
                             query_text=clean_query,
                             limit=candidate_limit,

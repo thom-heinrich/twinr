@@ -1,5 +1,5 @@
 [Unit]
-Description=Twinr Local Voice Orchestrator Server
+Description=Twinr Remote-ASR Voice Gateway Server with Embedded /v1/transcribe
 After=network-online.target
 Wants=network-online.target
 

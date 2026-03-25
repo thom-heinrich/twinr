@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermEnvironmentProfileCompiler,

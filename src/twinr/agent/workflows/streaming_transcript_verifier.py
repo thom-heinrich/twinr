@@ -7,7 +7,8 @@ from difflib import SequenceMatcher
 from hashlib import sha1
 from typing import Any
 
-from twinr.agent.base_agent.conversation.turn_controller import StreamingTurnController, _normalize_turn_text
+from twinr.agent.base_agent.conversation.decision_core import normalize_turn_text
+from twinr.agent.base_agent.conversation.turn_controller import StreamingTurnController
 from twinr.agent.base_agent.contracts import StreamingSpeechToTextProvider
 from twinr.hardware.audio import SpeechCaptureResult, pcm16_duration_ms, pcm16_to_wav_bytes
 
@@ -468,7 +469,7 @@ class StreamingTranscriptVerifierRuntime:
                 },
             )
             return verified
-        if _normalize_turn_text(verified) == _normalize_turn_text(cleaned):
+        if normalize_turn_text(verified) == normalize_turn_text(cleaned):
             loop.emit("stt_streaming_verified_via_openai=true")
             loop._trace_event(
                 "streaming_transcript_verifier_selected",
@@ -485,8 +486,8 @@ class StreamingTranscriptVerifierRuntime:
 
         similarity = SequenceMatcher(
             None,
-            _normalize_turn_text(cleaned),
-            _normalize_turn_text(verified),
+            normalize_turn_text(cleaned),
+            normalize_turn_text(verified),
         ).ratio()
         if similarity < 0.9 or len(verified) > len(cleaned):
             loop.emit("stt_streaming_verifier_disagreement=true")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from numbers import Integral
 from typing import Any
 
 from twinr.hardware.household_identity import (
@@ -18,6 +19,7 @@ from twinr.hardware.household_identity import (
     HouseholdIdentityObservation,
 )
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import (
     ArgumentValidationError,
     SensitiveActionConfirmationRequired,
@@ -60,17 +62,23 @@ def _normalize_action(arguments: dict[str, object]) -> str:
 
 
 def _emit_safe(owner: Any, message: str) -> None:
-    try:
-        owner.emit(message)
-    except Exception:
-        LOGGER.warning("Household-identity telemetry emit failed.", exc_info=True)
+    emit_best_effort(
+        owner,
+        message,
+        logger=LOGGER,
+        failure_message="Household-identity telemetry emit failed.",
+    )
 
 
 def _record_event_safe(owner: Any, event_name: str, message: str, **fields: object) -> None:
-    try:
-        owner._record_event(event_name, message, **fields)
-    except Exception:
-        LOGGER.warning("Household-identity event recording failed.", exc_info=True)
+    record_event_best_effort(
+        owner,
+        event_name,
+        message,
+        dict(fields),
+        logger=LOGGER,
+        failure_message="Household-identity event recording failed.",
+    )
 
 
 def _error_payload(
@@ -152,13 +160,23 @@ def _audio_context(owner: Any) -> tuple[bytes | None, int | None, int | None]:
         return None, None, None
     sample_rate = getattr(owner, "_current_turn_audio_sample_rate", None)
     channels = getattr(getattr(owner, "config", None), "audio_channels", None)
-    try:
+    if isinstance(sample_rate, Integral) and not isinstance(sample_rate, bool):
         normalized_sample_rate = int(sample_rate)
-    except (TypeError, ValueError):
+    elif isinstance(sample_rate, str):
+        try:
+            normalized_sample_rate = int(sample_rate)
+        except ValueError:
+            normalized_sample_rate = None
+    else:
         normalized_sample_rate = None
-    try:
+    if isinstance(channels, Integral) and not isinstance(channels, bool):
         normalized_channels = int(channels)
-    except (TypeError, ValueError):
+    elif isinstance(channels, str):
+        try:
+            normalized_channels = int(channels)
+        except ValueError:
+            normalized_channels = None
+    else:
         normalized_channels = None
     return bytes(audio_pcm), normalized_sample_rate, normalized_channels
 
@@ -320,7 +338,7 @@ def handle_manage_household_identity(owner: Any, arguments: dict[str, object]) -
                     message="Household face enrollment failed.",
                     detail="Twinr could not save the local household face identity right now.",
                 )
-            hints = []
+            hints: list[str] = []
             if enrollment.status in {"no_face_detected", "ambiguous_face_count"}:
                 hints.extend(("single_face_in_frame", "face_camera", "steady_pose"))
             elif enrollment.status in {"capture_unavailable", "decode_failed", "embedding_failed"}:

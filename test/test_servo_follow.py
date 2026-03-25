@@ -1,11 +1,14 @@
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
+from typing import cast
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware import servo_follow
 from twinr.hardware.servo_follow import (
     AttentionServoConfig,
@@ -25,6 +28,9 @@ class FakeServoPulseWriter:
         self.closed = False
         self.current_pulse_width_us_value: int | None = None
 
+    def probe(self, gpio: int) -> None:
+        del gpio
+
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         self.writes.append((gpio_chip, gpio, pulse_width_us))
 
@@ -37,6 +43,22 @@ class FakeServoPulseWriter:
 
     def close(self) -> None:
         self.closed = True
+
+
+class RecoveringFakeServoPulseWriter(FakeServoPulseWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.probes: list[int] = []
+        self.fail_next_write = True
+
+    def probe(self, gpio: int) -> None:
+        self.probes.append(gpio)
+
+    def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
+        if self.fail_next_write:
+            self.fail_next_write = False
+            raise RuntimeError("maestro command port missing")
+        super().write(gpio_chip=gpio_chip, gpio=gpio, pulse_width_us=pulse_width_us)
 
 
 class FakeLGPIOModule:
@@ -93,6 +115,41 @@ class FakePigpioModule:
 
 
 class LGPIOServoPulseWriterTests(unittest.TestCase):
+    def test_explicit_pololu_maestro_driver_builds_maestro_writer(self) -> None:
+        config = AttentionServoConfig(
+            enabled=True,
+            driver="pololu_maestro",
+            maestro_device="/dev/serial/by-id/maestro-if00",
+            gpio=0,
+        )
+
+        with mock.patch.object(servo_follow, "PololuMaestroServoPulseWriter") as writer_class:
+            writer = writer_class.return_value
+            selected = servo_follow._default_pulse_writer_for_config(config)
+
+        writer_class.assert_called_once_with(device_path="/dev/serial/by-id/maestro-if00")
+        writer.probe.assert_not_called()
+        self.assertIs(selected, writer)
+
+    def test_explicit_peer_pololu_maestro_driver_builds_peer_writer(self) -> None:
+        config = AttentionServoConfig(
+            enabled=True,
+            driver="peer_pololu_maestro",
+            peer_base_url="http://10.42.0.2:8768",
+            peer_timeout_s=2.5,
+            gpio=1,
+        )
+
+        with mock.patch.object(servo_follow, "PeerPololuMaestroServoPulseWriter") as writer_class:
+            writer = writer_class.return_value
+            selected = servo_follow._default_pulse_writer_for_config(config)
+
+        writer_class.assert_called_once_with(
+            base_url="http://10.42.0.2:8768",
+            timeout_s=2.5,
+        )
+        self.assertIs(selected, writer)
+
     def test_write_claims_output_before_first_servo_pulse(self) -> None:
         fake_module = FakeLGPIOModule()
         writer = LGPIOServoPulseWriter()
@@ -138,6 +195,16 @@ class LGPIOServoPulseWriterTests(unittest.TestCase):
 
         with (
             mock.patch.object(
+                servo_follow.TwinrKernelServoPulseWriter,
+                "probe",
+                side_effect=RuntimeError("kernel servo unavailable"),
+            ),
+            mock.patch.object(
+                servo_follow,
+                "_detect_conflicting_servo_gpio_environment",
+                return_value=[],
+            ),
+            mock.patch.object(
                 servo_follow.SysfsPWMServoPulseWriter,
                 "probe",
                 side_effect=RuntimeError("sysfs pwm unavailable"),
@@ -155,10 +222,22 @@ class LGPIOServoPulseWriterTests(unittest.TestCase):
     def test_auto_driver_prefers_sysfs_pwm_when_probe_succeeds(self) -> None:
         config = AttentionServoConfig(enabled=True, driver="auto", gpio_chip="gpiochip0", gpio=18)
 
-        with mock.patch.object(
-            servo_follow.SysfsPWMServoPulseWriter,
-            "probe",
-            return_value=None,
+        with (
+            mock.patch.object(
+                servo_follow.TwinrKernelServoPulseWriter,
+                "probe",
+                side_effect=RuntimeError("kernel servo unavailable"),
+            ),
+            mock.patch.object(
+                servo_follow,
+                "_detect_conflicting_servo_gpio_environment",
+                return_value=[],
+            ),
+            mock.patch.object(
+                servo_follow.SysfsPWMServoPulseWriter,
+                "probe",
+                return_value=None,
+            ),
         ):
             writer = servo_follow._default_pulse_writer_for_config(config)
 
@@ -260,7 +339,9 @@ class SysfsPWMServoPulseWriterTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "pwmchip0").mkdir()
             writer = SysfsPWMServoPulseWriter(sysfs_root=root)
-            writer._run_pinctrl = mock.Mock(return_value="18, GPIO18, SPI1_CE0, DPI_D14, I2S0_SCLK, PWM0_CHAN2")
+            writer._run_pinctrl = mock.Mock(  # type: ignore[method-assign]
+                return_value="18, GPIO18, SPI1_CE0, DPI_D14, I2S0_SCLK, PWM0_CHAN2"
+            )
 
             writer.probe(18)
 
@@ -295,7 +376,7 @@ class SysfsPWMServoPulseWriterTests(unittest.TestCase):
                 return ""
 
             writer = SysfsPWMServoPulseWriter(sysfs_root=root)
-            writer._run_pinctrl = fake_run_pinctrl
+            writer._run_pinctrl = fake_run_pinctrl  # type: ignore[method-assign]
 
             writer.write(gpio_chip="gpiochip0", gpio=18, pulse_width_us=1500)
 
@@ -359,6 +440,54 @@ class TwinrKernelServoPulseWriterTests(unittest.TestCase):
             self.assertEqual((root / "gpio").read_text(encoding="utf-8").strip(), "-1")
 
 
+class ServoEnvironmentGuardTests(unittest.TestCase):
+    def test_detect_conflicting_servo_gpio_environment_reports_pwm_pio_overlay_and_remove_process(self) -> None:
+        def fake_run_text_command(args: list[str]) -> str | None:
+            if args == ["dtoverlay", "-l"]:
+                return "Overlays (in load order):\n0: pwm pin=18 func=2\n1: pwm-pio gpio=18\n"
+            if args == ["ps", "-eo", "pid=,stat=,args="]:
+                return "504086 D dtoverlay pwm-pio gpio=18\n532933 D dtoverlay -r 1\n"
+            return None
+
+        conflicts = servo_follow._detect_conflicting_servo_gpio_environment(
+            gpio=18,
+            run_text_command=fake_run_text_command,
+        )
+
+        self.assertIn("overlay pwm-pio gpio=18", conflicts)
+        self.assertIn("process pid=504086 stat=D args=dtoverlay pwm-pio gpio=18", conflicts)
+        self.assertIn("process pid=532933 stat=D args=dtoverlay -r 1", conflicts)
+
+    def test_from_config_fail_closes_servo_when_startup_preflight_fails(self) -> None:
+        config = SimpleNamespace(
+            attention_servo_enabled=True,
+            attention_servo_driver="lgpio_pwm",
+            attention_servo_gpio=18,
+            attention_servo_invert_direction=True,
+            gpio_chip="gpiochip0",
+        )
+
+        with mock.patch.object(
+            servo_follow,
+            "_default_pulse_writer_for_config",
+            side_effect=RuntimeError("conflicting overlay"),
+        ):
+            controller = AttentionServoController.from_config(cast(TwinrConfig, config))
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.65,
+            confidence=0.9,
+        )
+        debug = controller.debug_snapshot(observed_at=10.0)
+
+        self.assertFalse(controller.config.enabled)
+        self.assertEqual(decision.reason, "faulted")
+        self.assertTrue(debug["disabled_due_to_fault"])
+        self.assertIn("conflicting overlay", str(debug["fault_reason"]))
+
+
 class AttentionServoControllerTests(unittest.TestCase):
     def _build_controller(
         self,
@@ -382,19 +511,29 @@ class AttentionServoControllerTests(unittest.TestCase):
         idle_release_s: float = 1.0,
         settled_release_s: float = 0.0,
         follow_exit_only: bool = False,
+        visible_recenter_interval_s: float = 30.0,
+        visible_recenter_center_tolerance: float = 0.12,
         mechanical_range_degrees: float = 270.0,
         exit_follow_max_degrees: float = 60.0,
         exit_activation_delay_s: float = 0.75,
         exit_settle_hold_s: float = 0.6,
         exit_reacquire_center_tolerance: float = 0.08,
         exit_visible_edge_threshold: float = 0.74,
+        exit_visible_box_edge_threshold: float = 0.92,
         exit_cooldown_s: float = 30.0,
+        control_mode: str = "position",
+        continuous_max_speed_degrees_per_s: float = 120.0,
+        continuous_slow_zone_degrees: float = 45.0,
+        continuous_stop_tolerance_degrees: float = 4.0,
+        continuous_min_speed_pulse_delta_us: int = 70,
+        continuous_max_speed_pulse_delta_us: int = 160,
     ) -> tuple[AttentionServoController, FakeServoPulseWriter]:
         writer = FakeServoPulseWriter()
         controller = AttentionServoController(
             config=AttentionServoConfig(
                 enabled=True,
                 driver="lgpio",
+                control_mode=control_mode,
                 gpio_chip="gpiochip0",
                 gpio=18,
                 invert_direction=invert_direction,
@@ -421,13 +560,21 @@ class AttentionServoControllerTests(unittest.TestCase):
                 idle_release_s=idle_release_s,
                 settled_release_s=settled_release_s,
                 follow_exit_only=follow_exit_only,
+                visible_recenter_interval_s=visible_recenter_interval_s,
+                visible_recenter_center_tolerance=visible_recenter_center_tolerance,
                 mechanical_range_degrees=mechanical_range_degrees,
                 exit_follow_max_degrees=exit_follow_max_degrees,
                 exit_activation_delay_s=exit_activation_delay_s,
                 exit_settle_hold_s=exit_settle_hold_s,
                 exit_reacquire_center_tolerance=exit_reacquire_center_tolerance,
                 exit_visible_edge_threshold=exit_visible_edge_threshold,
+                exit_visible_box_edge_threshold=exit_visible_box_edge_threshold,
                 exit_cooldown_s=exit_cooldown_s,
+                continuous_max_speed_degrees_per_s=continuous_max_speed_degrees_per_s,
+                continuous_slow_zone_degrees=continuous_slow_zone_degrees,
+                continuous_stop_tolerance_degrees=continuous_stop_tolerance_degrees,
+                continuous_min_speed_pulse_delta_us=continuous_min_speed_pulse_delta_us,
+                continuous_max_speed_pulse_delta_us=continuous_max_speed_pulse_delta_us,
             ),
             pulse_writer=writer,
         )
@@ -449,6 +596,116 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(decision.commanded_pulse_width_us, 1540)
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1540)])
 
+    def test_follow_exit_only_clamps_three_sixty_degree_servo_to_ninety_degree_offset(self) -> None:
+        controller, _ = self._build_controller(
+            follow_exit_only=True,
+            mechanical_range_degrees=360.0,
+            exit_follow_max_degrees=90.0,
+        )
+
+        self.assertEqual(controller._pulse_width_for_center_x(1.0), 1690)
+        self.assertEqual(controller._pulse_width_for_center_x(0.0), 1310)
+
+    def test_continuous_rotation_mode_uses_bounded_speed_commands_for_three_sixty_servo(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+        )
+
+        left = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=1.0,
+            confidence=0.95,
+        )
+        right = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.0,
+            confidence=0.95,
+        )
+
+        self.assertEqual(left.target_pulse_width_us, 1660)
+        self.assertEqual(left.commanded_pulse_width_us, 1660)
+        self.assertEqual(right.target_pulse_width_us, 1340)
+        self.assertEqual(right.commanded_pulse_width_us, 1410)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1660), ("gpiochip0", 18, 1410)])
+
+    def test_continuous_rotation_mode_recenters_after_virtual_heading_reaches_target(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            continuous_max_speed_degrees_per_s=180.0,
+            continuous_slow_zone_degrees=35.0,
+            continuous_stop_tolerance_degrees=5.0,
+            continuous_min_speed_pulse_delta_us=70,
+            continuous_max_speed_pulse_delta_us=160,
+        )
+
+        decisions = [
+            controller.update(
+                observed_at=10.0 + (0.2 * step),
+                active=True,
+                target_center_x=0.75,
+                confidence=0.95,
+            )
+            for step in range(7)
+        ]
+        debug = controller.debug_snapshot(observed_at=11.4)
+
+        self.assertEqual(decisions[0].commanded_pulse_width_us, 1660)
+        self.assertEqual(decisions[-1].target_pulse_width_us, 1500)
+        self.assertEqual(decisions[-1].commanded_pulse_width_us, 1500)
+        self.assertEqual(writer.writes[-1], ("gpiochip0", 18, 1500))
+        self.assertIsNotNone(debug["continuous_estimated_heading_degrees"])
+        self.assertEqual(debug["config"]["control_mode"], "continuous_rotation")
+
+    def test_pololu_fault_recovers_on_later_update_when_writer_probe_succeeds(self) -> None:
+        writer = RecoveringFakeServoPulseWriter()
+        controller = AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=True,
+                driver="pololu_maestro",
+                control_mode="continuous_rotation",
+                gpio_chip="gpiochip0",
+                gpio=0,
+                follow_exit_only=False,
+                max_step_us=250,
+                min_command_delta_us=1,
+                mechanical_range_degrees=360.0,
+            ),
+            pulse_writer=writer,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "maestro command port missing"):
+            controller.update(
+                observed_at=10.0,
+                active=True,
+                target_center_x=1.0,
+                confidence=0.95,
+            )
+
+        decision = controller.update(
+            observed_at=11.5,
+            active=True,
+            target_center_x=1.0,
+            confidence=0.95,
+        )
+
+        self.assertEqual(writer.probes, [0])
+        self.assertTrue(writer.closed)
+        self.assertEqual(decision.reason, "following_target")
+        self.assertIsNone(controller.debug_snapshot(observed_at=11.5)["fault_reason"])
+        self.assertEqual(writer.writes, [("gpiochip0", 0, decision.commanded_pulse_width_us or 0)])
+        self.assertIsNotNone(decision.commanded_pulse_width_us)
+        self.assertGreater(decision.commanded_pulse_width_us or 0, 1500)
+
     def test_disabled_controller_releases_stale_output_on_startup(self) -> None:
         writer = FakeServoPulseWriter()
 
@@ -463,6 +720,59 @@ class AttentionServoControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_from_config_uses_dedicated_maestro_channel_for_pololu_driver(self) -> None:
+        config = TwinrConfig(
+            attention_servo_enabled=True,
+            attention_servo_driver="pololu_maestro",
+            attention_servo_maestro_device="/dev/serial/by-id/maestro-if00",
+            attention_servo_maestro_channel=0,
+            attention_servo_gpio=18,
+        )
+
+        servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
+
+        self.assertEqual(servo_config.driver, "pololu_maestro")
+        self.assertEqual(servo_config.maestro_device, "/dev/serial/by-id/maestro-if00")
+        self.assertEqual(servo_config.gpio, 0)
+
+    def test_from_config_uses_dedicated_maestro_channel_for_peer_pololu_driver(self) -> None:
+        config = TwinrConfig(
+            attention_servo_enabled=True,
+            attention_servo_driver="peer_pololu_maestro",
+            attention_servo_peer_base_url="http://10.42.0.2:8768/",
+            attention_servo_peer_timeout_s=2.0,
+            attention_servo_maestro_channel=1,
+            attention_servo_gpio=18,
+        )
+
+        servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
+
+        self.assertEqual(servo_config.driver, "peer_pololu_maestro")
+        self.assertEqual(servo_config.peer_base_url, "http://10.42.0.2:8768")
+        self.assertEqual(servo_config.peer_timeout_s, 2.0)
+        self.assertEqual(servo_config.gpio, 1)
+
+    def test_from_config_reads_continuous_rotation_servo_tuning(self) -> None:
+        config = TwinrConfig(
+            attention_servo_enabled=True,
+            attention_servo_control_mode="continuous_rotation",
+            attention_servo_continuous_max_speed_degrees_per_s=140.0,
+            attention_servo_continuous_slow_zone_degrees=28.0,
+            attention_servo_continuous_stop_tolerance_degrees=3.5,
+            attention_servo_continuous_min_speed_pulse_delta_us=72,
+            attention_servo_continuous_max_speed_pulse_delta_us=165,
+        )
+
+        servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
+
+        self.assertEqual(servo_config.control_mode, "continuous_rotation")
+        self.assertTrue(servo_config.uses_continuous_rotation)
+        self.assertEqual(servo_config.continuous_max_speed_degrees_per_s, 140.0)
+        self.assertEqual(servo_config.continuous_slow_zone_degrees, 28.0)
+        self.assertEqual(servo_config.continuous_stop_tolerance_degrees, 3.5)
+        self.assertEqual(servo_config.continuous_min_speed_pulse_delta_us, 72)
+        self.assertEqual(servo_config.continuous_max_speed_pulse_delta_us, 165)
 
     def test_exit_only_recentering_starts_from_writer_seed_instead_of_blind_center(self) -> None:
         writer = FakeServoPulseWriter()
@@ -1112,6 +1422,133 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(writer.writes, [])
         self.assertEqual(writer.disables, [])
 
+    def test_exit_only_visible_target_waits_for_visible_recenter_interval_before_moving(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_recenter_interval_s=30.0,
+            visible_recenter_center_tolerance=0.12,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+        second = controller.update(
+            observed_at=39.9,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+
+        self.assertEqual(first.reason, "waiting_for_exit")
+        self.assertEqual(second.reason, "waiting_for_exit")
+        self.assertIsNone(second.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+
+    def test_exit_only_visible_target_periodically_recenters_after_interval(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_recenter_interval_s=30.0,
+            visible_recenter_center_tolerance=0.12,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+        pursuing = controller.update(
+            observed_at=40.0,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+        centered = controller.update(
+            observed_at=40.2,
+            active=True,
+            target_center_x=0.56,
+            confidence=0.95,
+        )
+
+        self.assertEqual(pursuing.reason, "pursuing_visible_recenter")
+        self.assertEqual(pursuing.target_pulse_width_us, 1637)
+        self.assertEqual(pursuing.commanded_pulse_width_us, 1637)
+        self.assertEqual(centered.reason, "waiting_for_exit")
+        self.assertIsNone(centered.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1637)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_visible_target_recenter_timer_resets_once_user_is_centered(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_recenter_interval_s=30.0,
+            visible_recenter_center_tolerance=0.12,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=20.0,
+            active=True,
+            target_center_x=0.56,
+            confidence=0.95,
+        )
+        retry = controller.update(
+            observed_at=49.9,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+
+        self.assertEqual(retry.reason, "waiting_for_exit")
+        self.assertIsNone(retry.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+
+    def test_exit_only_visible_target_recenter_releases_after_settle_when_still_off_center(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_recenter_interval_s=0.0,
+            visible_recenter_center_tolerance=0.12,
+            settled_release_s=0.3,
+        )
+
+        pursuing = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+        released = controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.68,
+            confidence=0.95,
+        )
+
+        self.assertEqual(pursuing.reason, "pursuing_visible_recenter")
+        self.assertEqual(pursuing.commanded_pulse_width_us, 1637)
+        self.assertEqual(released.reason, "waiting_for_exit")
+        self.assertIsNone(released.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1637)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
     def test_exit_only_visible_edge_departure_can_start_monotone_pursuit_without_full_loss(self) -> None:
         controller, writer = self._build_controller(
             follow_exit_only=True,
@@ -1119,35 +1556,117 @@ class AttentionServoControllerTests(unittest.TestCase):
             max_step_us=400,
             target_smoothing_s=0.0,
             exit_activation_delay_s=0.4,
-            exit_visible_edge_threshold=0.74,
+            exit_visible_edge_threshold=0.62,
+            exit_visible_box_edge_threshold=0.92,
         )
 
         controller.update(
             observed_at=10.0,
             active=True,
-            target_center_x=0.78,
+            target_center_x=0.63,
             confidence=0.95,
             visible_target_present=True,
+            visible_target_box_left=0.84,
+            visible_target_box_right=0.94,
         )
         waiting = controller.update(
             observed_at=10.2,
             active=True,
-            target_center_x=0.79,
+            target_center_x=0.64,
             confidence=0.95,
             visible_target_present=True,
+            visible_target_box_left=0.85,
+            visible_target_box_right=0.95,
         )
         pursuing = controller.update(
             observed_at=10.5,
             active=True,
-            target_center_x=0.79,
+            target_center_x=0.64,
             confidence=0.95,
             visible_target_present=True,
+            visible_target_box_left=0.85,
+            visible_target_box_right=0.95,
         )
 
         self.assertEqual(waiting.reason, "waiting_for_exit")
         self.assertEqual(pursuing.reason, "pursuing_edge_departure")
         self.assertEqual(pursuing.commanded_pulse_width_us, 1669)
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_recent_side_departure_anchor_can_start_pursuit_after_target_snaps_inward(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.4,
+            exit_visible_edge_threshold=0.62,
+            exit_visible_box_edge_threshold=0.92,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.66,
+            confidence=0.95,
+            visible_target_present=True,
+            visible_target_box_left=0.84,
+            visible_target_box_right=0.95,
+        )
+        waiting = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.54,
+            confidence=0.95,
+            visible_target_present=True,
+            visible_target_box_left=0.83,
+            visible_target_box_right=0.94,
+        )
+        pursuing = controller.update(
+            observed_at=10.5,
+            active=True,
+            target_center_x=0.54,
+            confidence=0.95,
+            visible_target_present=True,
+            visible_target_box_left=0.83,
+            visible_target_box_right=0.94,
+        )
+
+        self.assertEqual(waiting.reason, "waiting_for_exit")
+        self.assertEqual(pursuing.reason, "pursuing_edge_departure")
+
+    def test_exit_only_visible_edge_departure_waits_for_real_frame_edge_geometry(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.4,
+            exit_visible_edge_threshold=0.62,
+            exit_visible_box_edge_threshold=0.92,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.63,
+            confidence=0.95,
+            visible_target_present=True,
+            visible_target_box_left=0.58,
+            visible_target_box_right=0.80,
+        )
+        waiting = controller.update(
+            observed_at=10.5,
+            active=True,
+            target_center_x=0.64,
+            confidence=0.95,
+            visible_target_present=True,
+            visible_target_box_left=0.59,
+            visible_target_box_right=0.81,
+        )
+
+        self.assertEqual(waiting.reason, "waiting_for_exit")
+        self.assertEqual(writer.writes, [])
 
     def test_exit_only_waits_for_loss_confirmation_before_projecting(self) -> None:
         controller, writer = self._build_controller(

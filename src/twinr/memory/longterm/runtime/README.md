@@ -27,6 +27,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Verify remote-primary snapshot readiness before runtime loops start
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
+- Propagate successful external watchdog attestations back into every owned remote-state adapter so stale local cooldown state cannot contradict the Pi's required-remote gate
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
 - Split remote readiness into a strict bootstrap pass and a cheaper steady-state watchdog pass so live keepalives can prove current remote readability without reseeding every snapshot on every tick
 - Skip the heavier `archive` snapshot during steady-state watchdog probes while keeping startup and recovery fully archive-inclusive and fail closed

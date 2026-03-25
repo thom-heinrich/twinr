@@ -20,8 +20,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-import hashlib
 
+from twinr.agent.personality._display_utils import (
+    normalized_text as _normalized_text,
+    stable_fraction as _stable_fraction,
+    truncate_text as _truncate_text,
+)
 from twinr.agent.personality.display_impulse_copy import build_ambient_display_impulse_copy
 from twinr.agent.personality.intelligence.models import WorldInterestSignal
 from twinr.agent.personality.models import PersonalitySnapshot
@@ -89,34 +93,10 @@ class AmbientDisplayImpulseCandidate:
     generation_context: Mapping[str, object] | None = None
 
 
-def _normalized_text(value: object | None) -> str:
-    """Collapse one arbitrary text value into a trimmed single line."""
-
-    return " ".join(str(value or "").split()).strip()
-
-
 def _topic_key(value: object | None) -> str:
     """Return one stable topic key for cooldown and dedupe behavior."""
 
     return _normalized_text(value).casefold()
-
-
-def _stable_fraction(*parts: object) -> float:
-    """Return one deterministic 0..1 fraction for bounded daily variation."""
-
-    digest = hashlib.sha1(
-        "::".join(_normalized_text(part) for part in parts).encode("utf-8")
-    ).digest()
-    return int.from_bytes(digest[:4], "big") / 4_294_967_295.0
-
-
-def _truncate_text(value: object | None, *, max_len: int) -> str:
-    """Return one bounded display-safe line."""
-
-    compact = _normalized_text(value)
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
 
 
 def _candidate_score(

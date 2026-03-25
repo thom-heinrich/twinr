@@ -4,8 +4,8 @@ The edge Pi streams bounded PCM frames over the orchestrator websocket. This
 module keeps the server-side logic focused on three responsibilities:
 
 - detect a configured activation phrase on the remote ASR stream
-- confirm activations with a short post-roll and extract any spoken remainder
-- commit the spoken request/follow-up from that same stream and detect barge-in
+- buffer one same-stream utterance until endpoint silence decides it is complete
+- route that utterance as wake, transcript commit, or barge-in
 
 It deliberately does not open local devices or mutate the Pi runtime directly.
 """
@@ -22,12 +22,16 @@ from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import WorkflowForensics
-from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
+from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample, pcm16_signal_profile
 from twinr.orchestrator.remote_asr import RemoteAsrBackendAdapter
 from twinr.orchestrator.voice_activation import (
     VoiceActivationMatch,
     VoiceActivationPhraseMatcher,
-    VoiceActivationTailExtractor,
+)
+from twinr.orchestrator.voice_audio_debug_store import VoiceAudioDebugArtifactStore
+from twinr.orchestrator.voice_forensics import (
+    VoiceFrameTelemetryBucket,
+    prefixed_signal_profile_details,
 )
 from twinr.orchestrator.voice_transcript_debug_stream import VoiceTranscriptDebugStream
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
@@ -69,21 +73,6 @@ class _RecentFrame:
 
 
 @dataclass(slots=True)
-class _PendingWakeConfirmation:
-    """Track one stage-one activation candidate awaiting post-roll confirmation."""
-
-    match: VoiceActivationMatch
-    remaining_postroll_ms: int
-    stage1_source: str = "remote_asr"
-    elapsed_ms: int = 0
-    saw_post_wake_activity: bool = False
-    trailing_silence_ms: int = 0
-    frames: deque[_RecentFrame] = field(default_factory=deque)
-    captured_ms: int = 0
-    max_capture_ms: int = 0
-
-
-@dataclass(slots=True)
 class _PendingTranscriptUtterance:
     """Track one same-stream utterance for transcript-first wake/follow-up routing."""
 
@@ -93,6 +82,7 @@ class _PendingTranscriptUtterance:
     max_capture_ms: int = 0
     active_ms: int = 0
     trailing_silence_ms: int = 0
+    speech_active: bool = False
 
 
 def _pcm16_rms(samples: bytes) -> int:
@@ -124,7 +114,11 @@ def _normalize_text_length(text: str) -> int:
 class EdgeOrchestratorVoiceSession:
     """Maintain one server-side streaming voice session."""
 
-    _ACTIVE_STATES = frozenset({"waiting", "wake_armed", "listening", "speaking", "follow_up_open"})
+    _ACTIVE_STATES = frozenset({"waiting", "listening", "speaking", "follow_up_open"})
+    _REMOTE_ASR_UTTERANCE_STATES = frozenset({"waiting", "listening"})
+    _SUPPORTED_RUNTIME_STATES = frozenset({"waiting", "listening", "thinking", "speaking", "follow_up_open"})
+    _WAITING_VISIBILITY_GRACE_S = 6.0
+    _REMOTE_ASR_SPEECH_CONTINUE_RATIO = 0.35
 
     def __init__(
         self,
@@ -132,7 +126,6 @@ class EdgeOrchestratorVoiceSession:
         *,
         backend: _TranscriptBackend | None = None,
         wake_phrase_spotter: VoiceActivationPhraseMatcher | None = None,
-        backend_tail_transcript_extractor: VoiceActivationTailExtractor | None = None,
         monotonic_fn=time.monotonic,
     ) -> None:
         self.config = config
@@ -143,9 +136,6 @@ class EdgeOrchestratorVoiceSession:
             1500,
             int(getattr(config, "voice_orchestrator_history_ms", 4000) or 4000),
         )
-        self.wake_stage1_mode = str(
-            getattr(config, "voice_orchestrator_wake_stage1_mode", "remote_asr") or "remote_asr"
-        ).strip().lower() or "remote_asr"
         self.wake_candidate_window_ms = max(
             self.chunk_ms,
             int(getattr(config, "voice_orchestrator_wake_candidate_window_ms", 2200) or 2200),
@@ -203,12 +193,8 @@ class EdgeOrchestratorVoiceSession:
                 or 100
             ),
         )
-        self.wake_postroll_ms = max(
-            self.chunk_ms,
-            int(getattr(config, "voice_orchestrator_wake_postroll_ms", 900) or 900),
-        )
         self.wake_tail_max_ms = max(
-            self.wake_postroll_ms,
+            self.chunk_ms,
             int(getattr(config, "voice_orchestrator_wake_tail_max_ms", 2200) or 2200),
         )
         self.wake_tail_endpoint_silence_ms = max(
@@ -266,31 +252,31 @@ class EdgeOrchestratorVoiceSession:
         self.speech_threshold = int(config.audio_speech_threshold)
         self._monotonic = monotonic_fn
         self._history: deque[_RecentFrame] = deque(maxlen=max(8, math.ceil(self.history_ms / self.chunk_ms)))
-        self._pending_wake: _PendingWakeConfirmation | None = None
-        self._pending_transcript_utterance: _PendingTranscriptUtterance | None = None
-        self._follow_up_deadline_at: float | None = None
-        self._follow_up_opened_at: float | None = None
         self._next_wake_candidate_check_at: float = 0.0
-        self._next_listening_candidate_check_at: float = 0.0
-        self._next_follow_up_candidate_check_at: float = 0.0
         self._next_barge_in_candidate_check_at: float = 0.0
         self._barge_in_sent = False
         self._session_id = ""
         self._state = "waiting"
         self._follow_up_allowed = False
+        self._runtime_state_attested = False
+        self._last_waiting_visible_at: float | None = None
+        self._pending_transcript_utterance: _PendingTranscriptUtterance | None = None
+        self._follow_up_deadline_at: float | None = None
+        self._follow_up_opened_at: float | None = None
         self._intent_context = VoiceRuntimeIntentContext()
         self.backend = backend or _build_transcript_backend(config)
         self._wake_phrase_spotter = wake_phrase_spotter or _build_wake_phrase_spotter(
             config,
             backend=self.backend,
         )
-        self._backend_tail_transcript_extractor = (
-            backend_tail_transcript_extractor
-            or _build_backend_tail_transcript_extractor(config)
-        )
+        self._audio_debug_store = VoiceAudioDebugArtifactStore.from_config(config)
         self._transcript_debug_stream = VoiceTranscriptDebugStream.from_config(config)
         self._forensics: WorkflowForensics | None = None
         self._trace_id: str = uuid4().hex
+        self._received_frame_bucket = VoiceFrameTelemetryBucket(
+            chunk_ms=self.chunk_ms,
+            speech_threshold=self.speech_threshold,
+        )
 
     def set_forensics(
         self,
@@ -304,6 +290,9 @@ class EdgeOrchestratorVoiceSession:
             self._forensics = tracer
         else:
             self._forensics = None
+        configure_backend_forensics = getattr(self.backend, "set_forensics", None)
+        if callable(configure_backend_forensics):
+            configure_backend_forensics(self._forensics)
         if trace_id:
             self._trace_id = str(trace_id)
 
@@ -390,6 +379,7 @@ class EdgeOrchestratorVoiceSession:
         if capture is None:
             return {}
         sample = capture.sample
+        signal_profile = pcm16_signal_profile(capture.pcm_bytes)
         return {
             "duration_ms": int(sample.duration_ms),
             "chunk_count": int(sample.chunk_count),
@@ -397,6 +387,7 @@ class EdgeOrchestratorVoiceSession:
             "average_rms": int(sample.average_rms),
             "peak_rms": int(sample.peak_rms),
             "active_ratio": round(float(sample.active_ratio), 6),
+            **prefixed_signal_profile_details(signal_profile, prefix="signal"),
         }
 
     def _record_transcript_debug(
@@ -417,6 +408,16 @@ class EdgeOrchestratorVoiceSession:
         resolved_details = self._intent_context.trace_details()
         if details:
             resolved_details.update(details)
+        if capture is not None:
+            audio_artifact = self._audio_debug_store.persist_capture(
+                capture=capture,
+                session_id=self._session_id or None,
+                trace_id=self._trace_id,
+                stage=stage,
+                outcome=outcome,
+            )
+            if audio_artifact:
+                resolved_details.update(audio_artifact)
         self._transcript_debug_stream.append_entry(
             session_id=self._session_id or None,
             trace_id=self._trace_id,
@@ -443,7 +444,12 @@ class EdgeOrchestratorVoiceSession:
         """Run one activation-detector pass and surface backend errors as buffered evidence."""
 
         try:
-            return self._wake_phrase_spotter.detect(capture)
+            with self._backend_request_context(
+                stage=stage,
+                capture=capture,
+                origin_state=(details or {}).get("origin_state"),
+            ):
+                return self._wake_phrase_spotter.detect(capture)
         except Exception as exc:
             error_message = str(exc).strip()
             resolved_details: dict[str, object] = {
@@ -479,16 +485,22 @@ class EdgeOrchestratorVoiceSession:
     def close(self) -> None:
         """Reset any buffered streaming state."""
 
+        self._flush_received_frame_bucket()
         self._history.clear()
-        self._pending_wake = None
         self._pending_transcript_utterance = None
         self._follow_up_deadline_at = None
         self._follow_up_opened_at = None
+        self._last_waiting_visible_at = None
+
     def handle_hello(self, request: OrchestratorVoiceHelloRequest) -> list[dict[str, Any]]:
         """Accept one new edge voice session and validate stream metadata."""
 
         self._session_id = request.session_id
-        self._trace_id = uuid4().hex
+        self._trace_id = str(request.trace_id or request.session_id or uuid4().hex).strip() or uuid4().hex
+        self._received_frame_bucket = VoiceFrameTelemetryBucket(
+            chunk_ms=self.chunk_ms,
+            speech_threshold=self.speech_threshold,
+        )
         if int(request.sample_rate) != self.sample_rate:
             return [
                 {
@@ -509,7 +521,19 @@ class EdgeOrchestratorVoiceSession:
                     ),
                 }
             ]
-        self._state = request.initial_state or "waiting"
+        raw_initial_state = request.initial_state or "waiting"
+        self._state = self._normalize_runtime_state(raw_initial_state)
+        self._follow_up_allowed = bool(getattr(request, "follow_up_allowed", False))
+        self._runtime_state_attested = bool(getattr(request, "state_attested", False))
+        self._intent_context = VoiceRuntimeIntentContext.from_runtime_event(request)
+        if self._state == "follow_up_open" and self._follow_up_allowed:
+            now = self._monotonic()
+            self._follow_up_opened_at = now
+            self._follow_up_deadline_at = now + self._effective_follow_up_timeout_s()
+        else:
+            self._follow_up_deadline_at = None
+            self._follow_up_opened_at = None
+        self._refresh_waiting_visibility_anchor()
         self._trace_event(
             "voice_session_hello_accepted",
             kind="run_start",
@@ -518,6 +542,11 @@ class EdgeOrchestratorVoiceSession:
                 "channels": request.channels,
                 "chunk_ms": request.chunk_ms,
                 "initial_state": self._state,
+                "raw_initial_state": raw_initial_state,
+                "detail": getattr(request, "detail", None),
+                "follow_up_allowed": self._follow_up_allowed,
+                "state_attested": self._runtime_state_attested,
+                **self._intent_context.trace_details(),
             },
         )
         return [OrchestratorVoiceReadyEvent(session_id=request.session_id, backend=self.backend_name).to_payload()]
@@ -526,26 +555,34 @@ class EdgeOrchestratorVoiceSession:
         """Update explicit edge runtime state and drain any timeout-based events."""
 
         previous_state = self._state
-        self._state = event.state or "waiting"
+        raw_state = event.state or "waiting"
+        self._state = self._normalize_runtime_state(raw_state)
         self._follow_up_allowed = bool(event.follow_up_allowed)
+        self._runtime_state_attested = True
         self._intent_context = VoiceRuntimeIntentContext.from_runtime_event(event)
         if self._state == "follow_up_open" and self._follow_up_allowed:
             now = self._monotonic()
             if previous_state != "follow_up_open" or self._follow_up_opened_at is None:
                 self._follow_up_opened_at = now
             self._follow_up_deadline_at = self._follow_up_opened_at + self._effective_follow_up_timeout_s()
-            self._next_follow_up_candidate_check_at = 0.0
         else:
             self._follow_up_deadline_at = None
             self._follow_up_opened_at = None
-        if self._state == "listening":
-            self._next_listening_candidate_check_at = 0.0
+        self._refresh_waiting_visibility_anchor()
+        if previous_state != self._state and self._uses_remote_asr_utterance_path():
+            self._reset_remote_asr_utterance_history(
+                previous_state=previous_state,
+                detail=event.detail,
+            )
         if self._state != "speaking":
             self._barge_in_sent = False
+        self._cancel_blocked_waiting_activation_buffers(
+            previous_state=previous_state,
+            detail=event.detail,
+        )
         if not self._uses_remote_asr_utterance_path():
             self._pending_transcript_utterance = None
         if self._state not in self._ACTIVE_STATES:
-            self._pending_wake = None
             self._pending_transcript_utterance = None
         self._trace_event(
             "voice_runtime_state_received",
@@ -553,12 +590,152 @@ class EdgeOrchestratorVoiceSession:
             details={
                 "previous_state": previous_state,
                 "new_state": self._state,
+                "raw_state": raw_state,
                 "detail": event.detail,
                 "follow_up_allowed": self._follow_up_allowed,
+                "state_attested": self._runtime_state_attested,
                 **self._intent_context.trace_details(),
             },
         )
         return self._drain_timeouts()
+
+    def _normalize_runtime_state(self, state: str | None) -> str:
+        """Map retired runtime-state labels onto the supported remote-only set."""
+
+        normalized = str(state or "").strip() or "waiting"
+        if normalized == "wake_armed":
+            return "waiting"
+        if normalized in self._SUPPORTED_RUNTIME_STATES:
+            return normalized
+        return normalized
+
+    def _reset_remote_asr_utterance_history(
+        self,
+        *,
+        previous_state: str,
+        detail: str | None,
+    ) -> None:
+        """Drop stale stream history before a fresh remote utterance window starts.
+
+        The remote transcript-first path keeps the Pi microphone stream open
+        across wake acknowledgements and answer playback. When Twinr explicitly
+        re-enters ``listening`` or ``follow_up_open``, the next utterance should
+        start from a clean server-side buffer instead of reusing old wake/beep/
+        answer audio that can poison the first ASR commit window.
+        """
+
+        preserved_pending = self._preserve_pending_waiting_utterance_on_listening_handoff(
+            previous_state=previous_state,
+            detail=detail,
+        )
+        self._history.clear()
+        self._pending_transcript_utterance = preserved_pending
+        self._trace_event(
+            "voice_remote_asr_utterance_history_reset",
+            kind="mutation",
+            details={
+                "previous_state": previous_state,
+                "new_state": self._state,
+                "detail": detail,
+                "preserved_pending_utterance": preserved_pending is not None,
+                "preserved_pending_active_ms": (
+                    preserved_pending.active_ms if preserved_pending is not None else 0
+                ),
+                "preserved_pending_captured_ms": (
+                    preserved_pending.captured_ms if preserved_pending is not None else 0
+                ),
+            },
+        )
+
+    def _preserve_pending_waiting_utterance_on_listening_handoff(
+        self,
+        *,
+        previous_state: str,
+        detail: str | None,
+    ) -> _PendingTranscriptUtterance | None:
+        """Carry a just-started waiting utterance across the listen-beep handoff.
+
+        The Pi intentionally sends the explicit ``listening`` runtime state only
+        after the listen earcon has finished so the fresh server-side window can
+        drop that playback audio. A user can still start speaking during that
+        short earcon gap, which means the same live stream may already have one
+        active waiting-origin utterance in flight by the time the state flips.
+        Preserve only that active overlap case; older completed waiting audio
+        must still be discarded when the explicit listening window opens.
+        """
+
+        pending = self._pending_transcript_utterance
+        if pending is None:
+            return None
+        if previous_state != "waiting" or self._state != "listening":
+            return None
+        if pending.origin_state != "waiting":
+            return None
+        if pending.active_ms <= 0:
+            return None
+        if pending.trailing_silence_ms >= self.wake_tail_endpoint_silence_ms:
+            return None
+        carried_frames = self._latest_active_speech_burst_frames(tuple(pending.frames))
+        if not carried_frames:
+            return None
+        promoted = self._pending_transcript_utterance_from_frames(
+            origin_state="listening",
+            frames=carried_frames,
+            max_capture_ms=pending.max_capture_ms,
+        )
+        self._trace_event(
+            "voice_remote_asr_listening_handoff_preserved",
+            kind="mutation",
+            details={
+                "previous_state": previous_state,
+                "new_state": self._state,
+                "detail": detail,
+                "carried_frame_count": len(carried_frames),
+                "carried_active_ms": promoted.active_ms,
+                "carried_captured_ms": promoted.captured_ms,
+            },
+        )
+        return promoted
+
+    def _cancel_blocked_waiting_activation_buffers(
+        self,
+        *,
+        previous_state: str,
+        detail: str | None,
+    ) -> None:
+        """Drop buffered waiting/wake audio once live context explicitly blocks speech.
+
+        A websocket reconnect can briefly leave the gateway on an unknown
+        context before the Pi replays a full runtime-state update. If room/TV
+        audio opens a pending waiting utterance during that gap, the gateway
+        must not keep pushing that same buffered audio into transcript-first STT
+        after the current person-state later says speech is not allowed.
+        """
+
+        if self._state != "waiting":
+            return
+        if self._waiting_activation_allowed():
+            return
+        if self._pending_transcript_utterance is None:
+            return
+        self._history.clear()
+        self._pending_transcript_utterance = None
+        details = {
+            "previous_state": previous_state,
+            "new_state": self._state,
+            "detail": detail,
+            **self._intent_context.trace_details(),
+        }
+        self._record_transcript_debug(
+            stage="activation_utterance",
+            outcome="cancelled_context_blocked",
+            details=details,
+        )
+        self._trace_event(
+            "voice_waiting_activation_cancelled_context_blocked",
+            kind="mutation",
+            details=details,
+        )
 
     def handle_audio_frame(self, frame: OrchestratorVoiceAudioFrame) -> list[dict[str, Any]]:
         """Process one streamed PCM frame and emit any server-side decisions."""
@@ -567,60 +744,27 @@ class EdgeOrchestratorVoiceSession:
         pcm_bytes = bytes(frame.pcm_bytes or b"")
         if not pcm_bytes:
             return events
+        self._received_frame_bucket.add_frame(sequence=int(frame.sequence), pcm_bytes=pcm_bytes)
+        if self._received_frame_bucket.should_flush():
+            self._flush_received_frame_bucket()
         self._remember_frame(pcm_bytes)
         if self._uses_remote_asr_utterance_path():
             utterance_event = self._advance_remote_asr_utterance()
             if utterance_event is not None:
                 events.append(utterance_event.to_payload())
             return events
-        if self._pending_wake is not None:
-            wake_event = self._advance_pending_wake(len(pcm_bytes))
-            if wake_event is not None:
-                events.append(wake_event.to_payload())
-                return events
-            return events
-        if self._should_run_stage1_wake_detection() and self._maybe_start_stage1_wake(pcm_bytes):
-            return events
         if self._state == "speaking" and not self._barge_in_sent:
-            barge_in_event = self._maybe_detect_speech_candidate(kind="barge_in")
+            barge_in_event = self._maybe_detect_barge_in_candidate()
             if barge_in_event is not None:
                 self._barge_in_sent = True
                 self._state = "thinking"
                 events.append(barge_in_event.to_payload())
-                return events
-        if self._state == "listening":
-            listening_event = self._maybe_detect_speech_candidate(kind="listening")
-            if listening_event is not None:
-                self._state = "thinking"
-                events.append(listening_event.to_payload())
-                return events
-        if self._state == "follow_up_open" and self._follow_up_allowed:
-            follow_up_event = self._maybe_detect_speech_candidate(kind="follow_up")
-            if follow_up_event is not None:
-                if isinstance(follow_up_event, OrchestratorVoiceWakeConfirmedEvent):
-                    self._state = "thinking"
-                else:
-                    self._state = "waiting"
-                self._follow_up_deadline_at = None
-                self._follow_up_opened_at = None
-                events.append(follow_up_event.to_payload())
         return events
-
-    def _should_run_stage1_wake_detection(self) -> bool:
-        """Keep fresh wake detection active in wake and follow-up windows."""
-
-        if self._uses_remote_asr_utterance_path():
-            return False
-        if self._state in {"waiting", "wake_armed"}:
-            return True
-        return self._state == "follow_up_open" and self._follow_up_allowed
 
     def _uses_remote_asr_utterance_path(self) -> bool:
         """Return whether the same-stream remote ASR utterance scanner owns routing."""
 
-        if self.wake_stage1_mode != "remote_asr":
-            return False
-        if self._state in {"waiting", "wake_armed", "listening"}:
+        if self._state in self._REMOTE_ASR_UTTERANCE_STATES:
             return True
         return self._state == "follow_up_open" and self._follow_up_allowed
 
@@ -628,6 +772,44 @@ class EdgeOrchestratorVoiceSession:
         """Return whether compact multimodal context may relax audio-owned gates."""
 
         return self._intent_context.audio_bias_allowed()
+
+    def _refresh_waiting_visibility_anchor(self) -> None:
+        """Remember the last attested visible waiting context.
+
+        Camera/person-state refreshes can briefly drop ``person_visible`` while
+        the same person is still standing at the device and speaking the wake
+        phrase. Keep one short grace anchor so the server-owned audio wake path
+        does not throw away an in-flight wake burst on those transient dips.
+        """
+
+        if not self._runtime_state_attested:
+            return
+        if self._state != "waiting":
+            self._last_waiting_visible_at = None
+            return
+        if self._intent_context.person_visible is True:
+            self._last_waiting_visible_at = self._monotonic()
+
+    def _waiting_visibility_grace_active(self) -> bool:
+        """Return whether a recent visible waiting context is still fresh."""
+
+        if self._state != "waiting":
+            return False
+        last_visible_at = self._last_waiting_visible_at
+        if last_visible_at is None:
+            return False
+        return (self._monotonic() - last_visible_at) <= self._WAITING_VISIBILITY_GRACE_S
+
+    def _waiting_activation_allowed(self) -> bool:
+        """Return whether idle transcript-first scanning may open a new utterance."""
+
+        if self._state != "waiting":
+            return True
+        if not self._runtime_state_attested:
+            return False
+        if self._intent_context.waiting_activation_allowed():
+            return True
+        return self._waiting_visibility_grace_active()
 
     def _effective_remote_asr_stage1_window_ms(self) -> int:
         """Return the current transcript-first stage-one scan window."""
@@ -643,6 +825,11 @@ class EdgeOrchestratorVoiceSession:
         """Return the bounded minimum activation duration for the current context."""
 
         if not self._intent_audio_bias_active():
+            if self._waiting_visibility_grace_active():
+                return max(
+                    self.chunk_ms,
+                    self.remote_asr_min_wake_duration_ms - self.intent_min_wake_duration_relief_ms,
+                )
             return self.remote_asr_min_wake_duration_ms
         return max(
             self.chunk_ms,
@@ -656,37 +843,70 @@ class EdgeOrchestratorVoiceSession:
             return self.follow_up_timeout_s
         return self.follow_up_timeout_s + self.intent_follow_up_timeout_bonus_s
 
-    def _maybe_start_stage1_wake(self, pcm_bytes: bytes) -> bool:
-        """Start one pending wake confirmation when stage one reports a hit."""
+    def _remote_asr_speech_continue_threshold(self) -> int:
+        """Return the bounded lower threshold for one already-open speech burst."""
 
-        stage1_source = "remote_asr"
-        match = self._maybe_detect_remote_asr_activation_candidate()
-        if match is None or not match.detected:
-            return False
-        self._pending_wake = self._new_pending_wake_confirmation(
-            match=match,
-            stage1_source=stage1_source,
+        return max(
+            1,
+            min(
+                self.speech_threshold,
+                int(round(self.speech_threshold * self._REMOTE_ASR_SPEECH_CONTINUE_RATIO)),
+            ),
         )
-        self._trace_event(
-            "voice_wake_pending_started",
-            kind="decision",
-            details={
-                "matched_phrase": match.matched_phrase,
-                "remaining_text_chars": len(str(match.remaining_text or "").strip()),
-                "detector_label": match.detector_label,
-                "score": match.score,
-                "stage1_source": stage1_source,
-                "runtime_path": "follow_up_open" if self._state == "follow_up_open" else self._state,
-            },
-        )
-        return True
 
-    def _frame_counts_as_remote_asr_speech(self, frame: _RecentFrame) -> bool:
-        """Keep the remote-ASR utterance path open for quiet nonzero activation onsets."""
+    def _frame_counts_as_remote_asr_speech(
+        self,
+        frame: _RecentFrame,
+        *,
+        continuing: bool = False,
+    ) -> bool:
+        """Treat speech bursts with bounded hysteresis for wake-duration accounting.
+
+        Quiet onset preservation is handled separately by
+        ``_latest_active_speech_burst_frames()``, which keeps a bounded nonzero
+        pre-roll ahead of the first threshold-crossing frame. Counting every
+        nonzero frame here lets far-field hiss or room bed-noise satisfy the
+        minimum wake duration and opens long empty 4.4 s captures that later
+        reach the ASR backend as ``no_match`` with empty transcripts.
+
+        Real wake phrases can dip far below their peak frame within one spoken
+        burst. Once a burst has already crossed the conservative threshold,
+        keep it alive down to one lower continuation threshold so quiet
+        follow-through syllables still count without reintroducing the old
+        "any nonzero frame is speech" bug.
+        """
 
         if frame.rms >= self.speech_threshold:
             return True
-        return self.wake_stage1_mode == "remote_asr" and self.wake_candidate_min_active_ratio <= 0.0 and frame.rms > 0
+        return continuing and frame.rms >= self._remote_asr_speech_continue_threshold()
+
+    def _remote_asr_speech_flags(
+        self,
+        frames: tuple[_RecentFrame, ...],
+    ) -> tuple[bool, ...]:
+        """Return one forward hysteresis speech mask for the provided frames."""
+
+        flags: list[bool] = []
+        continuing = False
+        for frame in frames:
+            continuing = self._frame_counts_as_remote_asr_speech(
+                frame,
+                continuing=continuing,
+            )
+            flags.append(continuing)
+        return tuple(flags)
+
+    def _pending_utterance_details(
+        self,
+        pending: _PendingTranscriptUtterance,
+    ) -> dict[str, int]:
+        """Expose compact buffered-utterance metrics for transcript debug traces."""
+
+        return {
+            "pending_captured_ms": int(pending.captured_ms),
+            "pending_active_ms": int(pending.active_ms),
+            "pending_trailing_silence_ms": int(pending.trailing_silence_ms),
+        }
 
     def _remember_frame(self, pcm_bytes: bytes) -> None:
         duration_ms = max(
@@ -701,6 +921,45 @@ class EdgeOrchestratorVoiceSession:
             )
         )
 
+    def _flush_received_frame_bucket(self) -> None:
+        """Persist one bounded summary of recently received websocket frames."""
+
+        if not self._received_frame_bucket.has_data():
+            return
+        self._trace_event(
+            "voice_server_frame_window_received",
+            kind="io",
+            details=self._received_frame_bucket.flush_details(),
+        )
+
+    def _backend_request_context(
+        self,
+        *,
+        stage: str,
+        capture: AmbientAudioCaptureWindow,
+        origin_state: str | None = None,
+    ):
+        """Expose compact capture metadata to the remote-ASR client adapter."""
+
+        bind_context = getattr(self.backend, "bind_request_context", None)
+        if not callable(bind_context):
+            return nullcontext()
+        signal_profile = pcm16_signal_profile(capture.pcm_bytes)
+        return bind_context(
+            {
+                "session_id": self._session_id,
+                "trace_id": self._trace_id,
+                "stage": stage,
+                "state": self._state,
+                "origin_state": origin_state,
+                "capture_duration_ms": int(capture.sample.duration_ms),
+                "capture_average_rms": int(capture.sample.average_rms),
+                "capture_peak_rms": int(capture.sample.peak_rms),
+                "capture_active_ratio": round(float(capture.sample.active_ratio), 6),
+                **prefixed_signal_profile_details(signal_profile, prefix="capture_signal"),
+            }
+        )
+
     def _drain_timeouts(self) -> list[dict[str, Any]]:
         if self._state != "follow_up_open" or self._follow_up_deadline_at is None:
             return []
@@ -711,127 +970,6 @@ class EdgeOrchestratorVoiceSession:
         self._state = "waiting"
         return [OrchestratorVoiceFollowUpClosedEvent(reason="timeout").to_payload()]
 
-    def _advance_pending_wake(self, byte_count: int) -> OrchestratorVoiceWakeConfirmedEvent | None:
-        pending = self._pending_wake
-        if pending is None:
-            return None
-        latest_frame = self._history[-1] if self._history else None
-        if latest_frame is not None:
-            self._append_pending_frame(pending, latest_frame)
-        frame_duration_ms = max(
-            self.chunk_ms,
-            int(round((byte_count / max(1, self.channels * 2 * self.sample_rate)) * 1000.0)),
-        )
-        pending.elapsed_ms += frame_duration_ms
-        pending.remaining_postroll_ms -= frame_duration_ms
-        latest_rms = int(latest_frame.rms) if latest_frame is not None else 0
-        frame_active = latest_rms >= self.speech_threshold
-        if frame_active:
-            pending.saw_post_wake_activity = True
-            pending.trailing_silence_ms = 0
-        else:
-            pending.trailing_silence_ms += frame_duration_ms
-        if pending.remaining_postroll_ms > 0:
-            return None
-        should_finalize = False
-        remote_asr_has_remaining_text = (
-            pending.stage1_source == "remote_asr"
-            and _normalize_text_length(pending.match.remaining_text) > 0
-        )
-        remote_asr_activation_only = pending.stage1_source == "remote_asr" and not remote_asr_has_remaining_text
-        if pending.elapsed_ms >= self.wake_tail_max_ms:
-            should_finalize = True
-        elif (
-            pending.saw_post_wake_activity
-            and pending.trailing_silence_ms >= self.wake_tail_endpoint_silence_ms
-            and (
-                pending.stage1_source != "remote_asr"
-                or remote_asr_has_remaining_text
-                or remote_asr_activation_only
-            )
-        ):
-            should_finalize = True
-        if not should_finalize:
-            return None
-        self._pending_wake = None
-        if pending.match.detected:
-            self._state = "thinking"
-            self._follow_up_opened_at = None
-            remaining_text = self._extract_backend_remaining_text(pending)
-            if not remaining_text:
-                remaining_text = str(pending.match.remaining_text or "").strip()
-            self._trace_event(
-                "voice_wake_confirmed",
-                kind="decision",
-                details={
-                    "path": "stage1_direct",
-                    "stage1_source": pending.stage1_source,
-                    "matched_phrase": pending.match.matched_phrase,
-                    "remaining_text_chars": len(remaining_text),
-                    "detector_label": pending.match.detector_label,
-                    "score": pending.match.score,
-                },
-            )
-            return OrchestratorVoiceWakeConfirmedEvent(
-                matched_phrase=pending.match.matched_phrase,
-                remaining_text=remaining_text,
-                backend=pending.match.backend or self.backend_name,
-                detector_label=pending.match.detector_label,
-                score=pending.match.score,
-            )
-        capture = self._pending_capture_window(pending)
-        confirmed = self._detect_wake_capture(
-            capture=capture,
-            stage="wake_tail_confirmation",
-            details={"stage1_source": pending.stage1_source},
-        )
-        if confirmed is None:
-            return None
-        self._record_transcript_debug(
-            stage="wake_tail_confirmation",
-            outcome="matched" if confirmed.detected else "no_match",
-            transcript=confirmed.transcript,
-            matched_phrase=confirmed.matched_phrase,
-            remaining_text=confirmed.remaining_text,
-            detector_label=confirmed.detector_label,
-            score=confirmed.score,
-            capture=capture,
-            details={"stage1_source": pending.stage1_source},
-        )
-        if confirmed.detected:
-            self._state = "thinking"
-            self._follow_up_opened_at = None
-            self._trace_event(
-                "voice_wake_confirmed",
-                kind="decision",
-                details={
-                    "path": "tail_confirmation",
-                    "matched_phrase": confirmed.matched_phrase,
-                    "remaining_text_chars": len(str(confirmed.remaining_text or "").strip()),
-                    "detector_label": confirmed.detector_label,
-                    "score": confirmed.score,
-                },
-            )
-            return OrchestratorVoiceWakeConfirmedEvent(
-                matched_phrase=confirmed.matched_phrase,
-                remaining_text=confirmed.remaining_text,
-                backend=confirmed.backend or self.backend_name,
-                detector_label=confirmed.detector_label,
-                score=confirmed.score,
-            )
-        if not confirmed.detected:
-            return None
-        return None
-
-    def _extract_backend_remaining_text(self, pending: _PendingWakeConfirmation) -> str:
-        """Recover optional trailing user speech after a stage-one wake hit."""
-
-        extractor = self._backend_tail_transcript_extractor
-        if extractor is None:
-            return ""
-        capture = self._pending_capture_window(pending)
-        return extractor.extract(capture)
-
     def _advance_remote_asr_utterance(
         self,
     ) -> OrchestratorVoiceWakeConfirmedEvent | OrchestratorVoiceTranscriptCommittedEvent | None:
@@ -840,8 +978,12 @@ class EdgeOrchestratorVoiceSession:
         latest_frame = self._history[-1] if self._history else None
         if latest_frame is None:
             return None
+        if not self._runtime_state_attested:
+            return None
         pending = self._pending_transcript_utterance
         if pending is None:
+            if not self._waiting_activation_allowed():
+                return None
             if not self._frame_counts_as_remote_asr_speech(latest_frame):
                 return None
             pending = self._new_pending_transcript_utterance(origin_state=self._state)
@@ -855,12 +997,23 @@ class EdgeOrchestratorVoiceSession:
                         "origin_state": pending.origin_state,
                         "active_ms": pending.active_ms,
                         "required_active_ms": self._effective_remote_asr_min_activation_duration_ms(),
+                        **self._pending_utterance_details(pending),
                         **self._intent_context.trace_details(),
                     },
                 )
             return None
+        if pending.origin_state == "waiting" and not self._waiting_activation_allowed():
+            self._cancel_blocked_waiting_activation_buffers(
+                previous_state=pending.origin_state,
+                detail="runtime_context_blocked",
+            )
+            return None
         self._append_pending_frame(pending, latest_frame)
-        if self._frame_counts_as_remote_asr_speech(latest_frame):
+        pending.speech_active = self._frame_counts_as_remote_asr_speech(
+            latest_frame,
+            continuing=pending.speech_active,
+        )
+        if pending.speech_active:
             pending.active_ms += latest_frame.duration_ms
             pending.trailing_silence_ms = 0
         else:
@@ -883,6 +1036,7 @@ class EdgeOrchestratorVoiceSession:
                     "origin_state": pending.origin_state,
                     "active_ms": pending.active_ms,
                     "required_active_ms": self._effective_remote_asr_min_activation_duration_ms(),
+                    **self._pending_utterance_details(pending),
                     **self._intent_context.trace_details(),
                 },
             )
@@ -890,7 +1044,10 @@ class EdgeOrchestratorVoiceSession:
         match = self._detect_wake_capture(
             capture=capture,
             stage="activation_utterance",
-            details={"origin_state": pending.origin_state},
+            details={
+                "origin_state": pending.origin_state,
+                **self._pending_utterance_details(pending),
+            },
         )
         if match is None:
             return None
@@ -904,7 +1061,10 @@ class EdgeOrchestratorVoiceSession:
             detector_label=match.detector_label,
             score=match.score,
             capture=capture,
-            details={"origin_state": pending.origin_state},
+            details={
+                "origin_state": pending.origin_state,
+                **self._pending_utterance_details(pending),
+            },
         )
         if match.detected:
             self._state = "thinking"
@@ -966,40 +1126,41 @@ class EdgeOrchestratorVoiceSession:
             )
         return None
 
-    def _new_pending_wake_confirmation(
-        self,
-        *,
-        match: VoiceActivationMatch,
-        stage1_source: str,
-    ) -> _PendingWakeConfirmation:
-        """Seed one bounded wake buffer from the recent pre-hit stream context."""
-
-        pending = _PendingWakeConfirmation(
-            match=match,
-            remaining_postroll_ms=self.wake_postroll_ms,
-            max_capture_ms=max(self.history_ms, self.wake_candidate_window_ms + self.wake_tail_max_ms),
-            stage1_source=stage1_source,
-            saw_post_wake_activity=stage1_source == "remote_asr",
-        )
-        for frame in self._recent_frames_window(self.wake_candidate_window_ms):
-            self._append_pending_frame(pending, frame)
-        return pending
-
     def _new_pending_transcript_utterance(self, *, origin_state: str) -> _PendingTranscriptUtterance:
         """Seed one same-stream utterance from the latest active speech burst."""
 
-        pending = _PendingTranscriptUtterance(
-            origin_state=origin_state,
-            max_capture_ms=max(self.history_ms, self.wake_candidate_window_ms + self.wake_tail_max_ms),
-        )
         seed_frames = self._latest_active_speech_burst_frames(self._recent_frames_window(self.history_ms))
         if not seed_frames:
             seed_frames = self._recent_frames_window(self.chunk_ms)
-        for frame in seed_frames:
+        return self._pending_transcript_utterance_from_frames(
+            origin_state=origin_state,
+            frames=seed_frames,
+        )
+
+    def _pending_transcript_utterance_from_frames(
+        self,
+        *,
+        origin_state: str,
+        frames: tuple[_RecentFrame, ...],
+        max_capture_ms: int | None = None,
+    ) -> _PendingTranscriptUtterance:
+        """Build one bounded pending utterance from the provided frame slice."""
+
+        pending = _PendingTranscriptUtterance(
+            origin_state=origin_state,
+            max_capture_ms=max_capture_ms
+            if max_capture_ms is not None
+            else max(self.history_ms, self.wake_candidate_window_ms + self.wake_tail_max_ms),
+        )
+        for frame in frames:
             self._append_pending_frame(pending, frame)
-            if self._frame_counts_as_remote_asr_speech(frame):
+            pending.speech_active = self._frame_counts_as_remote_asr_speech(
+                frame,
+                continuing=pending.speech_active,
+            )
+            if pending.speech_active:
                 pending.active_ms += frame.duration_ms
-        pending.trailing_silence_ms = 0
+        pending.trailing_silence_ms = 0 if pending.speech_active else pending.captured_ms
         return pending
 
     def _recent_frames_window(self, duration_ms: int) -> tuple[_RecentFrame, ...]:
@@ -1018,7 +1179,7 @@ class EdgeOrchestratorVoiceSession:
 
     def _append_pending_frame(
         self,
-        pending: _PendingWakeConfirmation | _PendingTranscriptUtterance,
+        pending: _PendingTranscriptUtterance,
         frame: _RecentFrame,
     ) -> None:
         """Append one frame into the wake buffer and trim to the bounded budget."""
@@ -1028,15 +1189,6 @@ class EdgeOrchestratorVoiceSession:
         while pending.captured_ms > pending.max_capture_ms and pending.frames:
             removed = pending.frames.popleft()
             pending.captured_ms = max(0, pending.captured_ms - removed.duration_ms)
-
-    def _pending_capture_window(self, pending: _PendingWakeConfirmation) -> AmbientAudioCaptureWindow:
-        """Build one capture window from the bounded wake buffer."""
-
-        if pending.frames:
-            frames = tuple(pending.frames)
-        else:
-            frames = self._recent_frames_window(self.history_ms)
-        return self._capture_window_from_frames(frames)
 
     def _pending_transcript_capture_window(
         self,
@@ -1085,7 +1237,7 @@ class EdgeOrchestratorVoiceSession:
         """Return the latest speech burst plus a tiny pre-roll for quiet onsets.
 
         The speech threshold is intentionally conservative for far-field room
-        noise, but the first consonant of a wakeword can still land below that
+        noise, but the first consonant of an activation phrase can still land below that
         threshold. If we anchor the transcript-first scan at the first strictly
         active frame, the STT backend often loses the opening phoneme and turns
         ``Twinner`` into ``Winner``. Keep a bounded lead-in from the frames
@@ -1096,9 +1248,10 @@ class EdgeOrchestratorVoiceSession:
         resolved_frames = tuple(frames)
         if not resolved_frames:
             return ()
+        speech_flags = self._remote_asr_speech_flags(resolved_frames)
         last_active_index: int | None = None
         for index in range(len(resolved_frames) - 1, -1, -1):
-            if resolved_frames[index].rms >= self.speech_threshold:
+            if speech_flags[index]:
                 last_active_index = index
                 break
         if last_active_index is None:
@@ -1117,7 +1270,7 @@ class EdgeOrchestratorVoiceSession:
         start_index = last_active_index
         have_active = False
         for index, frame in enumerate(resolved_frames[: last_active_index + 1]):
-            if frame.rms >= self.speech_threshold:
+            if speech_flags[index]:
                 if not have_active or silence_ms >= max_silence_ms:
                     start_index = index
                 have_active = True
@@ -1175,13 +1328,13 @@ class EdgeOrchestratorVoiceSession:
                 capture = self._recent_remote_asr_stage1_capture()
             # The colocated STT service already owns its own VAD /
             # active-listening gate. Keep the Twinr-side pre-gate open by
-            # default so far-field or quiet wakewords do not get rejected
+            # default so far-field or quiet activation phrases do not get rejected
             # before transcript-first matching ever runs. Operators can still
             # opt back into an explicit activity ratio if they want a stricter
             # compute budget. Only truly empty windows should be buffered here.
             if capture.sample.peak_rms <= 0 and capture.sample.average_rms <= 0:
                 self._record_transcript_debug(
-                    stage="wake_stage1",
+                    stage="activation_stage1",
                     outcome="buffering_no_audio_energy",
                     capture=capture,
                     details={"reason": "nonzero_audio_energy_required"},
@@ -1205,7 +1358,7 @@ class EdgeOrchestratorVoiceSession:
                 return None
             if capture.sample.duration_ms < self._effective_remote_asr_min_activation_duration_ms():
                 self._record_transcript_debug(
-                    stage="wake_stage1",
+                    stage="activation_stage1",
                     outcome="buffering_short_wake_burst",
                     capture=capture,
                     details={
@@ -1236,7 +1389,7 @@ class EdgeOrchestratorVoiceSession:
                 and capture.sample.active_ratio < self.wake_candidate_min_active_ratio
             ):
                 self._record_transcript_debug(
-                    stage="wake_stage1",
+                    stage="activation_stage1",
                     outcome="rejected_low_activity",
                     capture=capture,
                     details={
@@ -1259,13 +1412,13 @@ class EdgeOrchestratorVoiceSession:
                 return None
             match = self._detect_wake_capture(
                 capture=capture,
-                stage="wake_stage1",
+                stage="activation_stage1",
             )
             if match is None:
                 return None
             if not match.detected:
                 self._record_transcript_debug(
-                    stage="wake_stage1",
+                    stage="activation_stage1",
                     outcome="no_match",
                     transcript=match.transcript,
                     matched_phrase=match.matched_phrase,
@@ -1315,7 +1468,7 @@ class EdgeOrchestratorVoiceSession:
                 )
                 return None
             self._record_transcript_debug(
-                stage="wake_stage1",
+                stage="activation_stage1",
                 outcome="matched",
                 transcript=match.transcript,
                 matched_phrase=match.matched_phrase,
@@ -1337,94 +1490,25 @@ class EdgeOrchestratorVoiceSession:
         finally:
             self._next_wake_candidate_check_at = self._monotonic() + self._wake_candidate_cooldown_s
 
-    def _maybe_detect_speech_candidate(
-        self,
-        *,
-        kind: str,
-    ) -> (
-        OrchestratorVoiceBargeInInterruptEvent
-        | OrchestratorVoiceTranscriptCommittedEvent
-        | OrchestratorVoiceWakeConfirmedEvent
-        | None
-    ):
-        if kind == "barge_in":
-            if self._monotonic() < self._next_barge_in_candidate_check_at:
-                return None
-            capture = self._recent_capture_window(self.barge_in_window_ms)
-            min_active_ratio = self.barge_in_min_active_ratio
-            min_chars = self.barge_in_min_transcript_chars
-            self._next_barge_in_candidate_check_at = self._monotonic() + self.candidate_cooldown_s
-        elif kind == "listening":
-            if self._monotonic() < self._next_listening_candidate_check_at:
-                return None
-            capture = self._recent_capture_window(self.follow_up_window_ms)
-            min_active_ratio = self.follow_up_min_active_ratio
-            min_chars = self.follow_up_min_transcript_chars
-            self._next_listening_candidate_check_at = self._monotonic() + self.candidate_cooldown_s
-            if capture.sample.duration_ms < self.follow_up_window_ms:
-                self._record_transcript_debug(
-                    stage="listening_candidate",
-                    outcome="buffering_partial_window",
-                    capture=capture,
-                    details={"required_window_ms": self.follow_up_window_ms},
-                )
-                self._trace_decision(
-                    "voice_listening_candidate_rejected",
-                    question="Should this same-stream listening window be transcribed already?",
-                    selected={"id": "reject", "summary": "Wait until the bounded listening window has filled"},
-                    options=[
-                        {"id": "reject", "summary": "Keep buffering listening audio before transcribing"},
-                        {"id": "transcribe", "summary": "Transcribe the partial listening window now"},
-                    ],
-                    context={
-                        "window_ms": capture.sample.duration_ms,
-                        "required_window_ms": self.follow_up_window_ms,
-                    },
-                    confidence="high",
-                    guardrails=["listening_window_fullness"],
-                )
-                return None
-        else:
-            if self._monotonic() < self._next_follow_up_candidate_check_at:
-                return None
-            capture = self._recent_capture_window(self.follow_up_window_ms)
-            min_active_ratio = self.follow_up_min_active_ratio
-            min_chars = self.follow_up_min_transcript_chars
-            self._next_follow_up_candidate_check_at = self._monotonic() + self.candidate_cooldown_s
-            if capture.sample.duration_ms < self.follow_up_window_ms:
-                self._record_transcript_debug(
-                    stage="follow_up_candidate",
-                    outcome="buffering_partial_window",
-                    capture=capture,
-                    details={"required_window_ms": self.follow_up_window_ms},
-                )
-                self._trace_decision(
-                    "voice_follow_up_candidate_rejected",
-                    question="Should this follow-up window be transcribed already?",
-                    selected={"id": "reject", "summary": "Wait until the bounded follow-up window has filled"},
-                    options=[
-                        {"id": "reject", "summary": "Keep buffering follow-up audio before transcribing"},
-                        {"id": "transcribe", "summary": "Transcribe the partial follow-up window now"},
-                    ],
-                    context={
-                        "window_ms": capture.sample.duration_ms,
-                        "required_window_ms": self.follow_up_window_ms,
-                    },
-                    confidence="high",
-                    guardrails=["follow_up_window_fullness"],
-                )
-                return None
-        if capture.sample.active_chunk_count <= 0 or capture.sample.active_ratio < min_active_ratio:
+    def _maybe_detect_barge_in_candidate(self) -> OrchestratorVoiceBargeInInterruptEvent | None:
+        """Transcribe one bounded speaking window to detect a user interruption."""
+
+        if self._monotonic() < self._next_barge_in_candidate_check_at:
+            return None
+        capture = self._recent_capture_window(self.barge_in_window_ms)
+        self._next_barge_in_candidate_check_at = self._monotonic() + self.candidate_cooldown_s
+        if (
+            capture.sample.active_chunk_count <= 0
+            or capture.sample.active_ratio < self.barge_in_min_active_ratio
+        ):
             self._record_transcript_debug(
-                stage=f"{kind}_candidate",
+                stage="barge_in_candidate",
                 outcome="rejected_low_activity",
                 capture=capture,
-                details={"required_active_ratio": min_active_ratio},
+                details={"required_active_ratio": self.barge_in_min_active_ratio},
             )
             self._trace_decision(
-                "voice_follow_up_candidate_rejected"
-                if kind == "follow_up"
-                else ("voice_listening_candidate_rejected" if kind == "listening" else "voice_barge_in_candidate_rejected"),
+                "voice_barge_in_candidate_rejected",
                 question="Should this speech candidate trigger a remote action?",
                 selected={"id": "reject", "summary": "Insufficient active speech evidence"},
                 options=[
@@ -1432,7 +1516,6 @@ class EdgeOrchestratorVoiceSession:
                     {"id": "transcribe", "summary": "Transcribe candidate window"},
                 ],
                 context={
-                    "kind": kind,
                     "active_chunk_count": capture.sample.active_chunk_count,
                     "active_ratio": round(float(capture.sample.active_ratio), 4),
                 },
@@ -1441,34 +1524,33 @@ class EdgeOrchestratorVoiceSession:
             )
             return None
         with self._trace_span(
-            name=f"voice_{kind}_candidate_transcribe",
+            name="voice_barge_in_candidate_transcribe",
             kind="llm_call",
             details={"window_ms": capture.sample.duration_ms},
         ):
-            transcript = self.backend.transcribe(
-                _pcm_capture_to_wav_bytes(capture),
-                filename="voice-window.wav",
-                content_type="audio/wav",
-                language=self.config.openai_realtime_language,
-            ).strip()
+            with self._backend_request_context(stage="barge_in_candidate", capture=capture):
+                transcript = self.backend.transcribe(
+                    _pcm_capture_to_wav_bytes(capture),
+                    filename="voice-window.wav",
+                    content_type="audio/wav",
+                    language=self.config.openai_realtime_language,
+                ).strip()
         self._record_transcript_debug(
-            stage=f"{kind}_candidate",
+            stage="barge_in_candidate",
             outcome="transcribed",
             transcript=transcript,
             capture=capture,
         )
-        if _normalize_text_length(transcript) < min_chars:
+        if _normalize_text_length(transcript) < self.barge_in_min_transcript_chars:
             self._record_transcript_debug(
-                stage=f"{kind}_candidate",
+                stage="barge_in_candidate",
                 outcome="rejected_short_transcript",
                 transcript=transcript,
                 capture=capture,
-                details={"required_transcript_chars": min_chars},
+                details={"required_transcript_chars": self.barge_in_min_transcript_chars},
             )
             self._trace_decision(
-                "voice_follow_up_candidate_rejected"
-                if kind == "follow_up"
-                else ("voice_listening_candidate_rejected" if kind == "listening" else "voice_barge_in_candidate_rejected"),
+                "voice_barge_in_candidate_rejected",
                 question="Should this transcribed speech candidate trigger a remote action?",
                 selected={"id": "reject", "summary": "Transcript did not contain enough speech"},
                 options=[
@@ -1476,7 +1558,6 @@ class EdgeOrchestratorVoiceSession:
                     {"id": "accept", "summary": "Trigger remote action"},
                 ],
                 context={
-                    "kind": kind,
                     "transcript_chars": len(transcript),
                     "active_ratio": round(float(capture.sample.active_ratio), 4),
                 },
@@ -1484,116 +1565,18 @@ class EdgeOrchestratorVoiceSession:
                 guardrails=["min_transcript_chars"],
             )
             return None
-        if kind == "follow_up":
-            wake_match = self._wake_phrase_spotter.match_transcript(transcript)
-            if wake_match.detected:
-                self._record_transcript_debug(
-                    stage="follow_up_candidate",
-                    outcome="wake_routed",
-                    transcript=transcript,
-                    matched_phrase=wake_match.matched_phrase,
-                    remaining_text=str(wake_match.remaining_text or "").strip(),
-                    detector_label=wake_match.detector_label,
-                    score=wake_match.score,
-                    capture=capture,
-                )
-                self._trace_decision(
-                    "voice_follow_up_candidate_routed",
-                    question="How should follow-up window speech be routed?",
-                    selected={"id": "wake_confirmed", "summary": "Treat repeated wake phrase as a fresh wake turn"},
-                    options=[
-                        {"id": "wake_confirmed", "summary": "Open a fresh wake turn on the same stream"},
-                        {"id": "transcript_committed", "summary": "Commit the follow-up transcript from the same stream"},
-                    ],
-                    context={
-                        "transcript_chars": len(transcript),
-                        "matched_phrase": wake_match.matched_phrase,
-                        "remaining_text_chars": len(str(wake_match.remaining_text or "").strip()),
-                    },
-                    confidence="high",
-                    guardrails=["wakeword_prefix_match"],
-                )
-                return OrchestratorVoiceWakeConfirmedEvent(
-                    matched_phrase=wake_match.matched_phrase,
-                    remaining_text=str(wake_match.remaining_text or "").strip(),
-                    backend=wake_match.backend or self.backend_name,
-                    detector_label=wake_match.detector_label,
-                    score=wake_match.score,
-                )
-            self._record_transcript_debug(
-                stage="follow_up_candidate",
-                outcome="committed",
-                transcript=transcript,
-                capture=capture,
-            )
-            self._trace_decision(
-                "voice_follow_up_candidate_routed",
-                question="How should follow-up window speech be routed?",
-                selected={"id": "transcript_committed", "summary": "Commit the follow-up transcript from the same remote stream"},
-                options=[
-                    {"id": "wake_confirmed", "summary": "Open a fresh wake turn on the same stream"},
-                    {"id": "transcript_committed", "summary": "Commit the follow-up transcript from the same stream"},
-                ],
-                context={
-                    "transcript_chars": len(transcript),
-                    "transcript_preview": transcript[:80],
-                },
-                confidence="medium",
-                guardrails=["follow_up_window"],
-            )
-            return OrchestratorVoiceTranscriptCommittedEvent(
-                transcript=transcript,
-                source="follow_up",
-            )
-        elif kind == "listening":
-            wake_match = self._wake_phrase_spotter.match_transcript(transcript)
-            committed_transcript = transcript
-            if wake_match.detected and str(wake_match.remaining_text or "").strip():
-                committed_transcript = str(wake_match.remaining_text or "").strip()
-            self._record_transcript_debug(
-                stage="listening_candidate",
-                outcome="committed",
-                transcript=transcript,
-                matched_phrase=wake_match.matched_phrase if wake_match.detected else None,
-                remaining_text=committed_transcript if wake_match.detected else None,
-                detector_label=wake_match.detector_label if wake_match.detected else None,
-                score=wake_match.score if wake_match.detected else None,
-                capture=capture,
-            )
-            self._trace_decision(
-                "voice_listening_candidate_routed",
-                question="How should this same-stream listening window be routed?",
-                selected={"id": "transcript_committed", "summary": "Commit the spoken request from the same remote stream"},
-                options=[
-                    {"id": "transcript_committed", "summary": "Commit the transcript from the same stream"},
-                ],
-                context={
-                    "transcript_chars": len(transcript),
-                    "transcript_preview": transcript[:80],
-                    "wake_alias_detected": bool(wake_match.detected),
-                },
-                confidence="medium",
-                guardrails=["same_stream_transcript_commit"],
-            )
-            return OrchestratorVoiceTranscriptCommittedEvent(
-                transcript=committed_transcript,
-                source="listening",
-            )
-        elif kind == "barge_in":
-            self._record_transcript_debug(
-                stage="barge_in_candidate",
-                outcome="interrupt_requested",
-                transcript=transcript,
-                capture=capture,
-            )
-            self._trace_event(
-                "voice_barge_in_candidate_triggered",
-                kind="decision",
-                details={"transcript_chars": len(transcript), "transcript_preview": transcript[:80]},
-            )
-        if kind == "barge_in":
-            return OrchestratorVoiceBargeInInterruptEvent(transcript_preview=transcript[:160])
-        return None
+        self._record_transcript_debug(
+            stage="barge_in_candidate",
+            outcome="interrupt_requested",
+            transcript=transcript,
+            capture=capture,
+        )
+        self._trace_event(
+            "voice_barge_in_candidate_triggered",
+            kind="decision",
+            details={"transcript_chars": len(transcript), "transcript_preview": transcript[:80]},
+        )
+        return OrchestratorVoiceBargeInInterruptEvent(transcript_preview=transcript[:160])
 
     def _recent_capture_window(self, duration_ms: int) -> AmbientAudioCaptureWindow:
         frames = self._recent_frames_window(duration_ms)
@@ -1611,7 +1594,7 @@ class EdgeOrchestratorVoiceSession:
         pcm_fragments = [frame.pcm_bytes for frame in resolved_frames]
         rms_values = [int(frame.rms) for frame in resolved_frames]
         collected_ms = sum(max(0, int(frame.duration_ms)) for frame in resolved_frames)
-        active_chunk_count = sum(1 for rms in rms_values if rms >= self.speech_threshold)
+        active_chunk_count = sum(1 for active in self._remote_asr_speech_flags(resolved_frames) if active)
         sample = AmbientAudioLevelSample(
             duration_ms=collected_ms,
             chunk_count=len(rms_values),
@@ -1650,8 +1633,8 @@ def _build_remote_asr_backend(
     remote_asr_url = str(getattr(config, "voice_orchestrator_remote_asr_url", "") or "").strip()
     if not remote_asr_url:
         raise ValueError(
-            "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL is required when "
-            "TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=remote_asr."
+            "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL is required for the "
+            "transcript-first remote voice gateway."
         )
     if timeout_s is None:
         timeout_s = float(getattr(config, "voice_orchestrator_remote_asr_timeout_s", 3.0) or 3.0)
@@ -1689,25 +1672,6 @@ def _build_wake_phrase_spotter(
         phrases=getattr(config, "voice_activation_phrases", ()),
         language=config.openai_realtime_language,
         suppress_transcription_errors=False,
-    )
-
-
-def _build_backend_tail_transcript_extractor(
-    config: TwinrConfig,
-) -> VoiceActivationTailExtractor | None:
-    """Build a low-latency remote-ASR tail extractor for backend-led continuations."""
-
-    remote_asr_url = str(getattr(config, "voice_orchestrator_remote_asr_url", "") or "").strip()
-    if not remote_asr_url:
-        return None
-    backend = _build_remote_asr_backend(
-        config,
-        timeout_s=float(getattr(config, "voice_orchestrator_remote_asr_tail_timeout_s", 1.25) or 1.25),
-    )
-    return VoiceActivationTailExtractor(
-        backend=backend,  # type: ignore[arg-type]
-        phrases=getattr(config, "voice_activation_phrases", ()),
-        language=config.openai_realtime_language,
     )
 
 

@@ -332,6 +332,11 @@ Recommended runtime env knobs:
 - `TWINR_ATTENTION_SERVO_GPIO=18`
 - `TWINR_ATTENTION_SERVO_INVERT_DIRECTION=false`
 
+When the physical Pololu Maestro lives on a helper Pi instead of the main Pi,
+configure `TWINR_ATTENTION_SERVO_DRIVER=peer_pololu_maestro` and point
+`TWINR_ATTENTION_SERVO_PEER_BASE_URL` at the helper's direct-link proxy, for
+example `http://10.42.0.2:8768`.
+
 Optional tuning knobs:
 
 - `TWINR_ATTENTION_SERVO_TARGET_HOLD_S`
@@ -352,12 +357,21 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_IDLE_RELEASE_S`
 - `TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S`
 - `TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY`
+- `TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_INTERVAL_S`
+- `TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_CENTER_TOLERANCE`
 - `TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES`
 - `TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES`
 - `TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_DEGREES_PER_S`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_SLOW_ZONE_DEGREES`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_STOP_TOLERANCE_DEGREES`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US`
+- `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
+- `TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S`
 
 Supported driver values are `auto`, `twinr_kernel`, `sysfs_pwm`, `pigpio`,
-`lgpio_pwm`, and `lgpio`.
+`lgpio_pwm`, `lgpio`, `pololu_maestro`, and `peer_pololu_maestro`.
 
 When `TWINR_ATTENTION_SERVO_DRIVER=auto`, Twinr first probes for the custom
 `/sys/class/twinr_servo/servo0` kernel-module contract, then a usable
@@ -365,6 +379,11 @@ kernel-PWM sysfs path, then a usable hardware-timed `pigpio` path, and only
 falls back to `lgpio_pwm` before the older `lgpio` servo helper. The
 `twinr_kernel` path is the preferred senior-facing option when the out-of-tree
 Twinr kernel servo module is built and loaded on the Pi.
+
+`pololu_maestro` expects the Maestro command port to exist locally on the same
+host as the Twinr runtime. `peer_pololu_maestro` keeps the follow logic on the
+main Pi but sends bounded channel commands over HTTP to a helper Pi that owns
+the physical Maestro USB connection.
 
 For calm physical behavior, do not think only in terms of "smaller pulse
 steps". Many hobby servos have a pulse dead band, so tiny frequent pulse
@@ -382,6 +401,11 @@ changes can buzz or twitch instead of looking softer. Twinr therefore combines:
 Keep the servo signal at `3.3V` logic level on the Pi side, and power the
 servo from a supply that matches the specific servo module instead of feeding
 it from a weak GPIO pin.
+
+In continuous-rotation mode, Twinr cannot read an absolute shaft angle back
+from the servo. The controller therefore treats the physically current pose at
+startup as virtual `0°`. If an operator hand-sets a forward-facing neutral
+pose, start or restart the runtime only after that pose is in place.
 
 ### Social trigger engine
 
@@ -551,14 +575,10 @@ TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES=8
 TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=4
 TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=12.0
 TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.2
-TWINR_WAKEWORD_ENABLED=true
-TWINR_WAKEWORD_BACKEND=stt
-TWINR_WAKEWORD_PHRASES="hey twinr, hey twinna, twinr"
-TWINR_WAKEWORD_SAMPLE_MS=1700
-TWINR_WAKEWORD_PRESENCE_GRACE_S=900
-TWINR_WAKEWORD_MOTION_GRACE_S=300
-TWINR_WAKEWORD_SPEECH_GRACE_S=90
-TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S=4.0
+TWINR_VOICE_ORCHESTRATOR_ENABLED=true
+TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator/voice
+TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://192.168.1.154:8797
+TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET=twinr-voice-gateway-20260322
 ```
 
 `OPENAI_MODEL` is the central non-coding text model. Search, supervisor routing, first-word replies, conversation closure, long-term-memory text compilation, and display reserve generation inherit it unless a dedicated override is configured. Audio-specialized paths stay separate on purpose.
@@ -578,34 +598,16 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-au
 ```
 
 The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
-The live hardware loop can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
-With `TWINR_PROACTIVE_ENABLED=true`, the hardware and realtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
+The active realtime and streaming loops can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
+With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
-With `TWINR_WAKEWORD_ENABLED=true`, the same idle monitor keeps a presence-gated wakeword session armed after recent PIR motion or visible presence. If ambient speech starts with one of the configured aliases, Twinr either answers the rest of the spoken request directly or opens the normal hands-free listening window.
-For lower latency, set `TWINR_WAKEWORD_BACKEND=openwakeword` and point `TWINR_WAKEWORD_OPENWAKEWORD_MODELS` at one or more local `.tflite` or `.onnx` wakeword models. `openWakeWord` runs fully on-device, but it still needs a real model for the chosen phrase; for `Twinr/Twinna/Twinner` that normally means a custom-trained model. Until such a model is configured, Twinr can stay on the slower STT backend.
+With `TWINR_VOICE_ORCHESTRATOR_ENABLED=true`, the Pi keeps one live websocket stream open to the transcript-first voice gateway and leaves wake detection there. The same remote stream stays authoritative for wake, transcript commit, continuation, and follow-up closure. Twinr has no separate local wake or STT path in the live product flow.
+Remove any retired local voice-selector env from current deployments. The live runtime contract is remote-only and fails closed on legacy local-selector config.
 
-Run the live hardware loop with:
-
-```bash
-source .venv/bin/activate
-twinr --env-file /twinr/.env --run-hardware-loop
-```
-
-The live loop watches the configured GPIO buttons, records from the default microphone until short silence, sends the transcript through OpenAI, plays the spoken answer, and lets the yellow button print the last answer.
-
-For a lower-latency speech test, run the Realtime loop instead:
-
-```bash
-source .venv/bin/activate
-twinr --env-file /twinr/.env --run-realtime-loop
-```
-
-The Realtime loop keeps the same button UX but uses OpenAI Realtime for direct audio input/output. It now also exposes bounded tools for web research, durable memory writes, reminder/timer scheduling, print requests, camera inspection, and ending the follow-up loop.
+The active runtime loops keep the same green/yellow button UX. They can inspect the camera for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 With `TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true`, Twinr emits a short beep before listening, answers, then automatically beeps and listens again for a short follow-up window so a short back-and-forth conversation works without pressing the button every turn.
-The Realtime loop can now also inspect the camera view for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
-If the user says things like `Erinnere mich morgen um 12 Uhr an den Arzttermin`, the realtime agent resolves the time into an absolute due time, stores the reminder in `state/reminders.json`, and later speaks a fresh reminder generated from the stored reminder facts.
 
-For the migration path away from OpenAI Realtime, Twinr now also exposes a provider-neutral streaming loop:
+Twinr exposes a provider-neutral streaming loop:
 
 ```bash
 source .venv/bin/activate

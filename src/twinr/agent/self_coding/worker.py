@@ -424,7 +424,13 @@ class LocalCodexCompileDriver:
             driver_name = type(driver).__name__
             sink_failure_message: str | None = None
 
-            def _forward(event: CodexCompileEvent, progress: CodexCompileProgress) -> None:
+            def _forward(
+                event: CodexCompileEvent,
+                progress: CodexCompileProgress,
+                *,
+                driver_name: str = driver_name,
+                attempt_index: int = attempt_index,
+            ) -> None:
                 nonlocal sink_failure_message, total_event_count
                 enriched_event = _event_with_driver_metadata(event, driver_name=driver_name, attempt_index=attempt_index)
                 total_event_count += 1

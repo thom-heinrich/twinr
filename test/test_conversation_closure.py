@@ -18,7 +18,7 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingTurnResponse,
 )
 from twinr.agent.personality.steering import ConversationTurnSteeringCue
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 
 
 class FakeClosureToolAgentProvider:

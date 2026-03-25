@@ -1,4 +1,4 @@
-"""Expose the base-agent package surface and compatibility re-exports.
+"""Expose the base-agent package surface lazily.
 
 Import commonly used config, runtime, state, prompting, and conversation
 helpers from this package root. The module stays lazy so importing

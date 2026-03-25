@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -58,19 +58,20 @@ from pathlib import Path
 import sys
 import tempfile
 import time
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
-from twinr.agent.personality.evolution import _default_humor_profile, _default_style_profile
 from twinr.agent.personality.intelligence import (
     RemoteStateWorldIntelligenceStore,
-    WorldFeedSubscription,
     WorldIntelligenceState,
 )
 from twinr.agent.personality.models import PersonalitySnapshot
+from twinr.agent.personality.profile_defaults import (
+    default_humor_profile,
+    default_style_profile,
+)
 from twinr.agent.personality.positive_engagement import build_positive_engagement_policies
 from twinr.agent.personality.self_expression import build_mindshare_items
 from twinr.agent.personality.signals import PersonalitySignalBatch
@@ -965,8 +966,8 @@ def _build_evaluation_summary(
     - Did that drift become visible in downstream mindshare/engagement policy?
     """
 
-    default_style = _default_style_profile()
-    default_humor = _default_humor_profile()
+    default_style = default_style_profile()
+    default_humor = default_humor_profile()
     humor_shift = _metric_shift(
         initial_value=initial_snapshot_metrics["humor_intensity"],
         final_value=final_snapshot_metrics["humor_intensity"],

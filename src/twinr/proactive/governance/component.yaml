@@ -10,7 +10,7 @@ owned_concerns:
   - Record delivered and skipped outcomes for bounded cooldown enforcement
   - Read governor policy thresholds from TwinrConfig with safe coercion
 out_of_scope:
-  - Social trigger scoring, wakeword matching, or presence-session detection
+  - Social trigger scoring, activation matching, or presence-session detection
   - Sensor polling or background worker lifecycle orchestration
   - Actual prompt delivery, printing, or speech output handling
   - Long-term proactive planning or durable history persistence
@@ -50,10 +50,8 @@ compatibility_reexports:
 primary_callers:
   - path: src/twinr/agent/base_agent/runtime/base.py
   - path: src/twinr/agent/base_agent/runtime/context.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runtime/background.py
 tests:
   - path: test/test_proactive_governor.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_config.py

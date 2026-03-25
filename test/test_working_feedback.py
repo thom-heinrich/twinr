@@ -11,7 +11,7 @@ import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.workflows.rendered_audio_clip import RenderedAudioClipSpec
 from twinr.agent.workflows.working_feedback import (
     WorkingFeedbackMediaSpec,

@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
 from twinr.proactive.runtime.display_social_reserve import DisplaySocialReservePublisher

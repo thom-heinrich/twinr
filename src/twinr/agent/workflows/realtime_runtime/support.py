@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-import logging
-import mimetypes
-import os
-import stat
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +22,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+from twinr.agent.workflows.realtime_runtime import required_remote_support, vision_support
 from twinr.agent.workflows.required_remote_snapshot import (
     assess_required_remote_watchdog_snapshot,
     ensure_required_remote_watchdog_snapshot_ready,
@@ -67,9 +64,6 @@ _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "timeout waiting for user speech",
     "no input audio received",
 )
-
-_LOGGER = logging.getLogger(__name__)
-
 
 def _default_emit(line: str) -> None:
     """Print one workflow telemetry line to stdout."""
@@ -210,347 +204,53 @@ class TwinrRealtimeSupportMixin:
         return f"{exc.__class__.__name__}: {message}"
 
     def _required_remote_dependency_interval_seconds(self) -> float:
-        if self._required_remote_dependency_uses_watchdog_artifact():
-            raw_value = getattr(
-                getattr(self, "config", None),
-                "long_term_memory_remote_watchdog_interval_s",
-                1.0,
-            )
-            try:
-                return max(0.1, float(raw_value))
-            except (TypeError, ValueError):
-                return 1.0
-        raw_value = getattr(
-            getattr(self, "config", None),
-            "long_term_memory_remote_keepalive_interval_s",
-            _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
+        return required_remote_support.required_remote_dependency_interval_seconds(
+            self,
+            default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
         )
-        try:
-            return max(0.1, float(raw_value))
-        except (TypeError, ValueError):
-            return _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS
 
     def _required_remote_dependency_recovery_hold_seconds(self) -> float:
-        """Return how long watchdog-artifact readiness must stay stable before recovery."""
-
-        if not self._required_remote_dependency_uses_watchdog_artifact():
-            return 0.0
-        interval_s = self._required_remote_dependency_interval_seconds()
-        raw_keepalive = getattr(
-            getattr(self, "config", None),
-            "long_term_memory_remote_keepalive_interval_s",
-            interval_s,
+        return required_remote_support.required_remote_dependency_recovery_hold_seconds(
+            self,
+            default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
         )
-        try:
-            keepalive_s = max(0.0, float(raw_keepalive))
-        except (TypeError, ValueError):
-            keepalive_s = interval_s
-        return max(interval_s * 3.0, keepalive_s)
 
     def _remote_dependency_is_required(self) -> bool:
-        runtime = getattr(self, "runtime", None)
-        checker = getattr(runtime, "remote_dependency_required", None)
-        if callable(checker):
-            try:
-                return bool(checker())
-            except Exception as exc:
-                error_text = self._safe_error_text(exc)
-                self._trace_event(
-                    "remote_dependency_required_check_failed",
-                    kind="error",
-                    details={"error": error_text},
-                    level="WARNING",
-                )
-                _LOGGER.warning(
-                    "remote_dependency_required() failed; assuming remote dependency is not required.",
-                    exc_info=True,
-                )
-                return False
-        config = getattr(self, "config", None)
-        return bool(
-            getattr(config, "long_term_memory_enabled", False)
-            and str(getattr(config, "long_term_memory_mode", "") or "").strip().lower() == "remote_primary"
-            and getattr(config, "long_term_memory_remote_required", False)
-        )
+        return required_remote_support.remote_dependency_is_required(self)
 
     def _required_remote_dependency_uses_watchdog_artifact(self) -> bool:
-        """Report whether live remote gating should use the external watchdog artifact."""
-
-        config = getattr(self, "config", None)
-        mode = str(
-            getattr(config, "long_term_memory_remote_runtime_check_mode", "direct") or "direct"
-        ).strip().lower()
-        return mode == "watchdog_artifact"
+        return required_remote_support.required_remote_dependency_uses_watchdog_artifact(self)
 
     def _best_effort_stop_player(self) -> None:
-        coordinator = getattr(self, "playback_coordinator", None)
-        stop_from_coordinator = getattr(coordinator, "stop_playback", None)
-        if callable(stop_from_coordinator):
-            try:
-                stop_from_coordinator()
-                return
-            except Exception as exc:
-                self._trace_event(
-                    "required_remote_stop_from_coordinator_failed",
-                    kind="error",
-                    level="ERROR",
-                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
-                )
-        player = getattr(self, "player", None)
-        stop_fn = getattr(player, "stop_playback", None)
-        if not callable(stop_fn):
-            stop_fn = getattr(player, "stop", None)
-        if not callable(stop_fn):
-            return
-        try:
-            stop_fn()
-        except Exception as exc:
-            self._trace_event(
-                "required_remote_stop_player_failed",
-                kind="error",
-                level="ERROR",
-                details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
-            )
-            return
+        required_remote_support.best_effort_stop_player(self)
 
     def _enter_required_remote_error(self, exc: BaseException | str) -> bool:
-        if not self._remote_dependency_is_required():
-            return False
-        message = self._safe_error_text(exc) if isinstance(exc, BaseException) else str(exc or "").strip()
-        if not message:
-            message = "Required remote long-term memory is unavailable."
-        remote_write_context = extract_remote_write_context(exc) if isinstance(exc, BaseException) else None
-        self._trace_event(
-            "required_remote_error_entered",
-            kind="invariant",
-            level="ERROR",
-            details={
-                "message": message,
-                "runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown"),
-                "remote_write_context": remote_write_context,
-            },
+        return required_remote_support.enter_required_remote_error(
+            self,
+            exc,
+            extract_remote_write_context=extract_remote_write_context,
+            default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
         )
-        active = bool(getattr(self, "_required_remote_dependency_error_active", False))
-        self._required_remote_dependency_cached_ready = False
-        self._required_remote_dependency_recovery_started_at = None
-        self._required_remote_dependency_next_check_at = (
-            time.monotonic() + self._required_remote_dependency_interval_seconds()
-        )
-        self._required_remote_dependency_error_active = True
-        self._required_remote_dependency_error_message = message
-        if active and getattr(getattr(self.runtime, "status", None), "value", None) == "error":
-            return True
-        request_interrupt = getattr(self, "_request_active_turn_interrupt", None)
-        if callable(request_interrupt):
-            try:
-                request_interrupt("required_remote")
-            except Exception as exc:
-                self._trace_event(
-                    "required_remote_interrupt_request_failed",
-                    kind="error",
-                    level="ERROR",
-                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
-                )
-        self._best_effort_stop_player()
-        self.runtime.fail(message)
-        self._emit_status(force=True)
-        self._try_emit(f"error={message}")
-        if isinstance(remote_write_context, dict):
-            request_correlation_id = remote_write_context.get("request_correlation_id")
-            if isinstance(request_correlation_id, str) and request_correlation_id:
-                self._try_emit(f"required_remote_correlation_id={request_correlation_id}")
-        self._try_emit("required_remote_dependency=false")
-        return True
 
     def _required_remote_dependency_current_ready(self) -> bool:
-        if not self._remote_dependency_is_required():
-            return True
-        cached_ready = getattr(self, "_required_remote_dependency_cached_ready", None)
-        if cached_ready is not None:
-            return bool(cached_ready)
-        return getattr(getattr(self.runtime, "status", None), "value", None) != "error"
+        return required_remote_support.required_remote_dependency_current_ready(self)
 
     def _request_required_remote_dependency_refresh(self) -> None:
-        watcher = getattr(self, "_required_remote_dependency_watch", None)
-        request_refresh = getattr(watcher, "request_refresh", None)
-        if callable(request_refresh):
-            try:
-                request_refresh()
-            except Exception as exc:
-                self._trace_event(
-                    "required_remote_refresh_request_failed",
-                    kind="error",
-                    level="ERROR",
-                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
-                )
-                return
+        required_remote_support.request_required_remote_dependency_refresh(self)
+
+    def _attest_watchdog_artifact_remote_ready(self) -> None:
+        required_remote_support.attest_watchdog_artifact_remote_ready(self)
 
     def _refresh_required_remote_dependency(self, *, force: bool = False, force_sync: bool = False) -> bool:
-        with self._get_lock("_required_remote_dependency_lock"):
-            if not self._remote_dependency_is_required():
-                self._required_remote_dependency_error_active = False
-                self._required_remote_dependency_error_message = None
-                self._required_remote_dependency_cached_ready = True
-                self._required_remote_dependency_recovery_started_at = None
-                self._required_remote_dependency_next_check_at = 0.0
-                self._trace_event(
-                    "required_remote_not_required",
-                    kind="invariant",
-                    details={"force": force, "force_sync": force_sync},
-                )
-                return True
-            now = time.monotonic()
-            next_check_at = float(getattr(self, "_required_remote_dependency_next_check_at", 0.0) or 0.0)
-            cached_ready = getattr(self, "_required_remote_dependency_cached_ready", None)
-            if not force and now < next_check_at and cached_ready is not None:
-                self._trace_event(
-                    "required_remote_cached_readiness_used",
-                    kind="cache",
-                    details={
-                        "force": force,
-                        "force_sync": force_sync,
-                        "cached_ready": bool(cached_ready),
-                        "next_check_in_ms": int(max(0.0, next_check_at - now) * 1000),
-                    },
-                )
-                return bool(cached_ready)
-            checker = getattr(getattr(self, "runtime", None), "check_required_remote_dependency", None)
-            started = time.monotonic()
-            try:
-                if self._required_remote_dependency_uses_watchdog_artifact():
-                    assessment = ensure_required_remote_watchdog_snapshot_ready(self.config)
-                    self._trace_event(
-                        "required_remote_watchdog_artifact_ready",
-                        kind="invariant",
-                        details={
-                            "artifact_path": assessment.artifact_path,
-                            "sample_age_s": assessment.sample_age_s,
-                            "max_sample_age_s": assessment.max_sample_age_s,
-                            "pid_alive": assessment.pid_alive,
-                        },
-                    )
-                else:
-                    if not callable(checker):
-                        self._trace_event(
-                            "required_remote_checker_missing",
-                            kind="warning",
-                            level="WARN",
-                            details={"force": force, "force_sync": force_sync},
-                        )
-                        return True
-                    checker(force_sync=force_sync)
-            except LongTermRemoteUnavailableError as exc:
-                if self._required_remote_dependency_uses_watchdog_artifact():
-                    assessment = assess_required_remote_watchdog_snapshot(self.config)
-                    self._trace_event(
-                        "required_remote_watchdog_artifact_failed",
-                        kind="exception",
-                        level="ERROR",
-                        details={
-                            "force": force,
-                            "force_sync": force_sync,
-                            "artifact_path": assessment.artifact_path,
-                            "detail": assessment.detail,
-                            "sample_age_s": assessment.sample_age_s,
-                            "max_sample_age_s": assessment.max_sample_age_s,
-                            "pid_alive": assessment.pid_alive,
-                            "sample_status": assessment.sample_status,
-                            "sample_ready": assessment.sample_ready,
-                        },
-                    )
-                self._trace_event(
-                    "required_remote_refresh_failed",
-                    kind="exception",
-                    level="ERROR",
-                    details={
-                        "force": force,
-                        "force_sync": force_sync,
-                        "exception": self._safe_error_text(exc),
-                        "remote_write_context": extract_remote_write_context(exc),
-                    },
-                    kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
-                )
-                self._enter_required_remote_error(exc)
-                return False
-            except Exception as exc:
-                self._trace_event(
-                    "required_remote_refresh_failed",
-                    kind="exception",
-                    level="ERROR",
-                    details={"force": force, "force_sync": force_sync, "exception": self._safe_error_text(exc)},
-                    kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
-                )
-                self._enter_required_remote_error(exc)
-                return False
-
-            runtime_status_value = getattr(getattr(self.runtime, "status", None), "value", None)
-            remote_error_owns_runtime = (
-                getattr(self, "_required_remote_dependency_error_active", False)
-                and runtime_status_value == "error"
-                and self._current_runtime_error_matches_required_remote()
-            )
-            recovery_hold_s = self._required_remote_dependency_recovery_hold_seconds()
-            if (
-                recovery_hold_s > 0.0
-                and remote_error_owns_runtime
-            ):
-                recovery_started_at = getattr(self, "_required_remote_dependency_recovery_started_at", None)
-                if recovery_started_at is None:
-                    recovery_started_at = now
-                    self._required_remote_dependency_recovery_started_at = now
-                stable_ready_s = max(0.0, now - float(recovery_started_at))
-                if stable_ready_s < recovery_hold_s:
-                    self._required_remote_dependency_cached_ready = False
-                    self._required_remote_dependency_next_check_at = (
-                        now + self._required_remote_dependency_interval_seconds()
-                    )
-                    self._trace_event(
-                        "required_remote_restore_pending",
-                        kind="cache",
-                        details={
-                            "force": force,
-                            "force_sync": force_sync,
-                            "stable_ready_s": round(stable_ready_s, 3),
-                            "required_stable_s": round(recovery_hold_s, 3),
-                        },
-                    )
-                    return False
-
-            self._required_remote_dependency_cached_ready = True
-            self._required_remote_dependency_recovery_started_at = None
-            self._required_remote_dependency_next_check_at = now + self._required_remote_dependency_interval_seconds()
-            if (
-                getattr(self, "_required_remote_dependency_error_active", False)
-                and runtime_status_value == "error"
-                and not remote_error_owns_runtime
-            ):
-                self._required_remote_dependency_error_active = False
-                self._required_remote_dependency_error_message = None
-                self._trace_event(
-                    "required_remote_restore_skipped_for_foreign_error",
-                    kind="invariant",
-                    details={"runtime_status": runtime_status_value},
-                )
-            self._trace_event(
-                "required_remote_refresh_succeeded",
-                kind="invariant",
-                details={"force": force, "force_sync": force_sync},
-                kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
-            )
-            if (
-                remote_error_owns_runtime
-            ):
-                self.runtime.reset_error()
-                self._emit_status(force=True)
-                self._try_emit("required_remote_dependency_restored=true")
-                self._trace_event(
-                    "required_remote_restored",
-                    kind="invariant",
-                    details={"runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown")},
-                )
-            self._required_remote_dependency_error_active = False
-            self._required_remote_dependency_error_message = None
-            return True
+        return required_remote_support.refresh_required_remote_dependency(
+            self,
+            force=force,
+            force_sync=force_sync,
+            ensure_watchdog_ready=ensure_required_remote_watchdog_snapshot_ready,
+            assess_watchdog_snapshot=assess_required_remote_watchdog_snapshot,
+            extract_remote_write_context=extract_remote_write_context,
+            default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
+        )
 
     # AUDIT-FIX(#4): Error reporting must not throw while handling another failure.
     def _try_emit(self, line: str) -> None:
@@ -561,60 +261,19 @@ class TwinrRealtimeSupportMixin:
 
     # AUDIT-FIX(#2): Resolve the parent directory strictly while deferring the final component to O_NOFOLLOW open().
     def _normalize_reference_image_path(self, raw_path: str) -> Path:
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return path.parent.resolve(strict=True) / path.name
+        return vision_support.normalize_reference_image_path(raw_path)
 
     # AUDIT-FIX(#2): Optional base-dir enforcement keeps reference media inside an explicit safe area when configured.
     def _validate_reference_image_base_dir(self, path: Path) -> bool:
-        base_dir_raw = (getattr(self.config, "vision_reference_image_base_dir", "") or "").strip()
-        if not base_dir_raw:
-            return True
-        try:
-            base_dir = Path(base_dir_raw).expanduser().resolve(strict=True)
-        except OSError:
-            self._try_emit("vision_reference_rejected=invalid_base_dir")
-            return False
-        try:
-            path.relative_to(base_dir)
-        except ValueError:
-            self._try_emit(f"vision_reference_rejected=outside_base_dir:{path.name}")
-            return False
-        return True
+        return vision_support.validate_reference_image_base_dir(self, path)
 
     # AUDIT-FIX(#2): Open reference images without following symlinks and reject oversized/non-regular files.
     def _safe_read_reference_image_bytes(self, path: Path, *, max_bytes: int) -> bytes:
-        flags = os.O_RDONLY
-        nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow_flag:
-            flags |= nofollow_flag
-        fd = os.open(path, flags)
-        try:
-            file_stat = os.fstat(fd)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise OSError("Reference image must be a regular file")
-            if file_stat.st_size > max_bytes:
-                raise OSError(f"Reference image exceeds {max_bytes} bytes")
-            with os.fdopen(fd, "rb", closefd=True) as handle:
-                data = handle.read(max_bytes + 1)
-            fd = -1
-        finally:
-            if fd >= 0:
-                os.close(fd)
-        if len(data) > max_bytes:
-            raise OSError(f"Reference image exceeds {max_bytes} bytes")
-        return data
+        return vision_support.safe_read_reference_image_bytes(path, max_bytes=max_bytes)
 
     # AUDIT-FIX(#2,#7): Guess a safe content type and keep only a basename when passing files downstream.
     def _build_image_input(self, data: bytes, *, path: Path, label: str) -> OpenAIImageInput:
-        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        return OpenAIImageInput(
-            data=data,
-            content_type=content_type,
-            filename=path.name,
-            label=label,
-        )
+        return vision_support.build_image_input(data, path=path, label=label)
 
     # AUDIT-FIX(#1): Support both legacy and renamed cooldown config fields with a safe default.
     def _print_button_cooldown_seconds(self) -> float:
@@ -755,27 +414,7 @@ class TwinrRealtimeSupportMixin:
         )
 
     def _current_runtime_error_matches_required_remote(self) -> bool:
-        expected = str(getattr(self, "_required_remote_dependency_error_message", "") or "").strip()
-        if not expected:
-            return False
-        snapshot_store = getattr(getattr(self, "runtime", None), "snapshot_store", None)
-        load = getattr(snapshot_store, "load", None)
-        if not callable(load):
-            return False
-        try:
-            snapshot = load()
-        except Exception as exc:
-            self._trace_event(
-                "required_remote_error_match_read_failed",
-                kind="error",
-                level="ERROR",
-                details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
-            )
-            return False
-        if snapshot is None:
-            return False
-        current_error = " ".join(str(getattr(snapshot, "error_message", "") or "").split()).strip()
-        return current_error == expected
+        return required_remote_support.current_runtime_error_matches_required_remote(self)
 
     def _emit_status(self, *, force: bool = False) -> None:
         status = getattr(getattr(self.runtime, "status", None), "value", "unknown")  # AUDIT-FIX(#9): Guard the first emit when _last_status is unset or runtime is partially initialised.
@@ -1084,8 +723,10 @@ class TwinrRealtimeSupportMixin:
             previous_stop = getattr(self, "_search_feedback_stop", None)
             previous_generation = int(getattr(self, "_search_feedback_generation", 0) or 0)
         if callable(previous_stop):
+            previous_stop_call = getattr(previous_stop, "__call__", None)
             try:
-                previous_stop()
+                if callable(previous_stop_call):
+                    previous_stop_call()  # pylint: disable=not-callable
             except Exception as exc:
                 self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
 
@@ -1156,8 +797,10 @@ class TwinrRealtimeSupportMixin:
             active_stop = getattr(self, "_search_feedback_stop", None)
             self._search_feedback_stop = None
         if callable(active_stop):
+            active_stop_call = getattr(active_stop, "__call__", None)
             try:
-                active_stop()
+                if callable(active_stop_call):
+                    active_stop_call()  # pylint: disable=not-callable
             except Exception as exc:
                 self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
 
@@ -1199,7 +842,11 @@ class TwinrRealtimeSupportMixin:
         sentinel = object()
         producer_stop = Event()
         feedback_started = False
-        stop_answering_feedback: Callable[[], None] = lambda: None
+
+        def _noop_stop_answering_feedback() -> None:
+            return None
+
+        stop_answering_feedback: Callable[[], None] = _noop_stop_answering_feedback
 
         def queue_put(item: bytes | Exception | object) -> bool:
             while not producer_stop.is_set():
@@ -1290,100 +937,21 @@ class TwinrRealtimeSupportMixin:
         return tts_ms, int((first_audio_at[0] - turn_started) * 1000)
 
     def _build_vision_images(self) -> list[OpenAIImageInput]:
-        capture_filename = f"camera-capture-{time.time_ns()}.png"  # AUDIT-FIX(#7): Avoid filename collisions and stale capture reuse.
-        try:
-            with self._get_lock("_camera_lock"):
-                capture = self.camera.capture_photo(filename=capture_filename)
-        except Exception as exc:
-            self._try_emit(f"camera_error={self._safe_error_text(exc)}")  # AUDIT-FIX(#7): Camera failure should surface as a controlled turn error.
-            raise RuntimeError("Camera capture failed") from exc
-        self._try_emit(f"camera_device={capture.source_device}")
-        self._try_emit(f"camera_input_format={capture.input_format or 'default'}")
-        self._try_emit(f"camera_capture_bytes={len(capture.data)}")
-        try:
-            self.runtime.long_term_memory.enqueue_multimodal_evidence(
-                event_name="camera_capture",
-                modality="camera",
-                source="camera_tool",
-                message="Live camera frame captured for device interaction.",
-                data={
-                    "purpose": "vision_inspection",
-                    "source_device": capture.source_device,
-                    "input_format": capture.input_format or "default",
-                },
-            )
-        except Exception as exc:  # AUDIT-FIX(#7,#8): Memory persistence is optional; vision should still continue without it.
-            self._try_emit(f"camera_memory_error={self._safe_error_text(exc)}")
-        capture_path = Path(getattr(capture, "filename", capture_filename)).name
-        capture_content_type = capture.content_type or mimetypes.guess_type(capture_path)[0] or "application/octet-stream"
-        images = [
-            OpenAIImageInput(
-                data=capture.data,
-                content_type=capture_content_type,
-                filename=capture_path,
-                label="Image 1: live camera frame from the device.",
-            )
-        ]
-        reference_image = self._load_reference_image()
-        if reference_image is not None:
-            images.append(reference_image)
-        return images
+        return vision_support.build_vision_images(
+            self,
+            allowed_suffixes=_ALLOWED_REFERENCE_IMAGE_SUFFIXES,
+            default_max_bytes=_DEFAULT_REFERENCE_IMAGE_MAX_BYTES,
+        )
 
     def _load_reference_image(self) -> OpenAIImageInput | None:
-        raw_path = (getattr(self.config, "vision_reference_image_path", "") or "").strip()
-        if not raw_path:
-            return None
-        try:
-            path = self._normalize_reference_image_path(raw_path)
-        except FileNotFoundError:
-            self._try_emit(f"vision_reference_missing={Path(raw_path).name}")
-            return None
-        except OSError as exc:
-            self._try_emit(f"vision_reference_error={self._safe_error_text(exc)}")  # AUDIT-FIX(#2): Reject invalid paths without leaking the full filesystem layout.
-            return None
-        if not self._validate_reference_image_base_dir(path):
-            return None
-        if path.suffix.casefold() not in _ALLOWED_REFERENCE_IMAGE_SUFFIXES:
-            self._try_emit(f"vision_reference_rejected=unsupported_file_type:{path.name}")  # AUDIT-FIX(#2): Only permit known image formats.
-            return None
-        max_bytes = max(
-            1024,
-            int(getattr(self.config, "vision_reference_image_max_bytes", _DEFAULT_REFERENCE_IMAGE_MAX_BYTES)),
-        )
-        try:
-            data = self._safe_read_reference_image_bytes(path, max_bytes=max_bytes)
-        except FileNotFoundError:
-            self._try_emit(f"vision_reference_missing={path.name}")
-            return None
-        except OSError as exc:
-            self._try_emit(f"vision_reference_error={self._safe_error_text(exc)}")
-            return None
-        self._try_emit(f"vision_reference_image={path.name}")
-        return self._build_image_input(
-            data,
-            path=path,
-            label="Image 2: stored reference image of the main user. Use it only for person or identity comparison.",
+        return vision_support.load_reference_image(
+            self,
+            allowed_suffixes=_ALLOWED_REFERENCE_IMAGE_SUFFIXES,
+            default_max_bytes=_DEFAULT_REFERENCE_IMAGE_MAX_BYTES,
         )
 
     def _build_vision_prompt(self, question: str, *, include_reference: bool) -> str:
-        clean_question = question.strip()  # AUDIT-FIX(#7): Avoid sending accidental leading/trailing control whitespace to the model.
-        if include_reference:
-            return (
-                "This request includes camera input. "
-                "Image 1 is the current live camera frame from the device. "
-                "Image 2 is a stored reference image of the main user. "
-                "Use the reference image only when the user's question depends on whether the live image shows that user. "
-                "If identity is uncertain, say that clearly. "
-                "If the camera view is too unclear, tell the user how to position themselves or the object.\n\n"
-                f"User request: {clean_question}"
-            )
-        return (
-            "This request includes camera input. "
-            "Image 1 is the current live camera frame from the device. "
-            "Answer from what is actually visible. "
-            "If the view is too unclear, tell the user how to position themselves or the object in front of the camera.\n\n"
-            f"User request: {clean_question}"
-        )
+        return vision_support.build_vision_prompt(question, include_reference=include_reference)
 
     def _is_no_speech_timeout(self, exc: Exception) -> bool:
         message = str(exc).casefold()  # AUDIT-FIX(#11): Provider errors drift over time; avoid brittle exact-match classification.

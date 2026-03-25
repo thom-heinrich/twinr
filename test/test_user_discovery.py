@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.tools.handlers.user_discovery import handle_manage_user_discovery
 from twinr.agent.tools.runtime.registry import realtime_tool_names
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
 from twinr.memory.user_discovery import (
     UserDiscoveryFact,
@@ -21,7 +21,7 @@ from twinr.memory.user_discovery import (
     UserDiscoveryTopicState,
 )
 from twinr.proactive.runtime.display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
-from twinr.runtime import TwinrRuntime
+from twinr.agent.base_agent import TwinrRuntime
 
 
 class UserDiscoveryTests(unittest.TestCase):

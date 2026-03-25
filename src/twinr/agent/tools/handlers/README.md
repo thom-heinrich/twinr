@@ -5,7 +5,8 @@ translates tool payloads into bounded runtime reads or mutations for automations
 smart-home, memory, reminders, guided user-discovery, output, self-coding,
 settings, voice-profile, portrait-identity, shared household-identity flows,
 and RSS/world-intelligence source configuration, and keeps shared voice/argument
-guards close to that boundary.
+guards close to that boundary. It also carries the focused helper modules that
+multiple handlers reuse for best-effort telemetry and automation parsing.
 
 ## Responsibility
 
@@ -31,7 +32,9 @@ guards close to that boundary.
 
 | File | Purpose |
 |---|---|
+| [automation_support.py](./automation_support.py) | Shared automation delivery, timezone, weekday, and tag parsing |
 | [automations.py](./automations.py) | Automation CRUD handlers |
+| [handler_telemetry.py](./handler_telemetry.py) | Shared best-effort telemetry, event, and usage helpers |
 | [smarthome.py](./smarthome.py) | Smart-home discovery, filtered state-read, control, and stream handlers |
 | [intelligence.py](./intelligence.py) | RSS/world-intelligence subscription and refresh-config handler |
 | [memory.py](./memory.py) | Durable-memory tool handlers |
@@ -41,6 +44,7 @@ guards close to that boundary.
 | [portrait_identity.py](./portrait_identity.py) | Local portrait-identity enrollment, status, and reset handlers |
 | [reminders.py](./reminders.py) | Reminder scheduling handler |
 | [self_coding.py](./self_coding.py) | Self-coding learning, activation, pause/reactivate, and hidden runtime handlers |
+| [self_coding_support.py](./self_coding_support.py) | Shared self-coding runtime/cache/signature support for handler entrypoints |
 | [settings.py](./settings.py) | Simple setting mutation handler |
 | [support.py](./support.py) | Shared voice and argument guards |
 | [voice_profile.py](./voice_profile.py) | Voice-profile tool handlers |

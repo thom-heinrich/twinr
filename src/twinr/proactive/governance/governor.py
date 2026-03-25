@@ -173,7 +173,7 @@ class ProactiveGovernorCandidate:
         summary: Short operator-facing summary kept in governor history.
         channel: Delivery channel currently supported by the governor.
         priority: Higher-level caller priority for downstream orchestration.
-        presence_session_id: Optional wakeword/presence session identifier.
+        presence_session_id: Optional voice-activation/presence session identifier.
         safety_exempt: Skip normal cooldown checks when True.
         counts_toward_presence_budget: Include the candidate in per-session
             prompt budgets when True.
@@ -622,7 +622,7 @@ class ProactiveGovernor:
             minimum=1,
         )
         window_s = self._config_float(
-            "wakeword_presence_grace_s",
+            "voice_orchestrator_follow_up_timeout_s",
             default=_DEFAULT_PRESENCE_GRACE_S,
             minimum=1.0,
         )
@@ -685,7 +685,7 @@ class ProactiveGovernor:
                 minimum=0.0,
             ),
             self._config_float(
-                "wakeword_presence_grace_s",
+                "voice_orchestrator_follow_up_timeout_s",
                 default=_DEFAULT_PRESENCE_GRACE_S,
                 minimum=1.0,
             ),

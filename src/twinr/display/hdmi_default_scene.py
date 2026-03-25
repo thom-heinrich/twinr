@@ -917,7 +917,9 @@ class HdmiDefaultSceneRenderer:
                 fill=accent_fill,
             )
         eyebrow_font = self.tools._font(13 if compact else 15, bold=True)
-        prompt_text_size = 30 if compact else 36
+        # Keep the reserve opener large, but leave a little more air on the
+        # 800x480 Pi surface so multi-line prompts stay easier to scan.
+        prompt_text_size = 26 if compact else 31
         headline_font = self.tools._font(prompt_text_size, bold=True) if prompt_mode else self.tools._font(
             22 if compact else 28,
             bold=True,
@@ -2321,7 +2323,6 @@ class HdmiDefaultSceneRenderer:
         horizontal_highlight_scale = 8 if status == "error" else 6
         vertical_highlight_scale = 3 if status == "error" else 5
         merged["eye_shift_x"] = int(merged["eye_shift_x"]) + (face_cue.gaze_x * horizontal_eye_scale)
-        vertical_shift = face_cue.gaze_y * (1 if status == "error" else 3)
         merged["eye_shift_y"] = int(merged["eye_shift_y"]) + (face_cue.gaze_y * vertical_eye_scale)
         merged["highlight_dx"] = int(merged["highlight_dx"]) + (face_cue.gaze_x * horizontal_highlight_scale)
         merged["highlight_dy"] = int(merged["highlight_dy"]) + (face_cue.gaze_y * vertical_highlight_scale)

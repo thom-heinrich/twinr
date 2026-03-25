@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
+from threading import Event, Thread
 import unittest
 from contextvars import copy_context
 
@@ -17,11 +18,39 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 WorkflowForensics = _MODULE.WorkflowForensics
 bind_workflow_forensics = _MODULE.bind_workflow_forensics
+capture_thread_snapshot = _MODULE.capture_thread_snapshot
 workflow_event = _MODULE.workflow_event
 workflow_span = _MODULE.workflow_span
 
 
 class WorkflowForensicsTests(unittest.TestCase):
+    def test_capture_thread_snapshot_reports_live_top_frame(self) -> None:
+        started = Event()
+        release = Event()
+
+        def _worker() -> None:
+            started.set()
+            release.wait(timeout=0.5)
+
+        thread = Thread(target=_worker, name="snapshot-worker", daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(timeout=1.0))
+        try:
+            snapshot = capture_thread_snapshot(thread)
+        finally:
+            release.set()
+            thread.join(timeout=1.0)
+
+        self.assertTrue(snapshot["present"])
+        self.assertTrue(snapshot["alive"])
+        self.assertEqual(snapshot["name"], "snapshot-worker")
+        self.assertTrue(snapshot["stack_present"])
+        self.assertIsNotNone(snapshot["top_frame"])
+        self.assertIn(
+            "_worker",
+            [frame["func"] for frame in snapshot["stack"]],
+        )
+
     def test_forensics_runpack_contains_events_decisions_and_spans(self) -> None:
         with TemporaryDirectory() as temp_dir:
             trace_dir = Path(temp_dir) / "state" / "forensics" / "workflow"

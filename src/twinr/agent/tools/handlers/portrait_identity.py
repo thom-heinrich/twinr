@@ -15,6 +15,7 @@ from typing import Any
 
 from twinr.hardware.portrait_match import PortraitMatchProvider
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import (
     ArgumentValidationError,
     SensitiveActionConfirmationRequired,
@@ -39,17 +40,23 @@ _RETRYABLE_CAPTURE_STATUSES = frozenset(
 
 
 def _emit_safe(owner: Any, message: str) -> None:
-    try:
-        owner.emit(message)
-    except Exception:
-        LOGGER.warning("Portrait-identity telemetry emit failed.", exc_info=True)
+    emit_best_effort(
+        owner,
+        message,
+        logger=LOGGER,
+        failure_message="Portrait-identity telemetry emit failed.",
+    )
 
 
 def _record_event_safe(owner: Any, event_name: str, message: str, **fields: object) -> None:
-    try:
-        owner._record_event(event_name, message, **fields)
-    except Exception:
-        LOGGER.warning("Portrait-identity event recording failed.", exc_info=True)
+    record_event_best_effort(
+        owner,
+        event_name,
+        message,
+        dict(fields),
+        logger=LOGGER,
+        failure_message="Portrait-identity event recording failed.",
+    )
 
 
 def _normalize_optional_text(value: object) -> str | None:

@@ -7,9 +7,19 @@ deleting scheduled and sensor-triggered automations at the runtime boundary.
 from __future__ import annotations
 
 from math import isfinite
-from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Any, cast
 
+from .automation_support import (
+    automation_name_key,
+    normalize_delivery,
+    parse_content_mode,
+    parse_delivery,
+    parse_tags,
+    parse_weekdays,
+    resolve_timezone_name,
+    validate_non_negative_finite,
+)
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import optional_bool, optional_float, require_sensitive_voice_confirmation
 from twinr.automations import (
     AutomationAction,
@@ -18,12 +28,15 @@ from twinr.automations import (
     build_sensor_trigger,
     describe_sensor_trigger,
 )
+from twinr.automations.store import TimeSchedule
 
-_UNSET = object()
-_PRINT_DELIVERY_ALIASES = {"print", "printed", "printer"}
-_SPOKEN_DELIVERY_ALIASES = {"say", "speak", "spoken", "speech", "voice", "audio"}
+
+class _UnsetType:
+    """Sentinel type for omitted optional automation-update fields."""
+
+
+_UNSET = _UnsetType()
 _MAX_TELEMETRY_VALUE_LENGTH = 256
-_MAX_TAG_LENGTH = 64
 
 
 def handle_list_automations(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
@@ -219,7 +232,7 @@ def handle_update_time_automation(owner: Any, arguments: dict[str, object]) -> d
         raise RuntimeError("Only time-based automations can be updated with update_time_automation")
     name_update = _optional_non_empty_argument(arguments, "name")
     description_update = _optional_non_empty_argument(arguments, "description")
-    if name_update is not _UNSET:
+    if isinstance(name_update, str):
         ensure_unique_automation_name(owner, name_update, excluding_automation_id=entry.automation_id)  # AUDIT-FIX(#6): Preserve unique names during rename operations.
     enabled_update = optional_bool(arguments, "enabled", default=None) if "enabled" in arguments else None
     trigger = build_updated_time_trigger(owner, entry, arguments)
@@ -293,7 +306,7 @@ def handle_update_sensor_automation(owner: Any, arguments: dict[str, object]) ->
         raise RuntimeError("Only supported sensor-triggered automations can be updated with update_sensor_automation")
     name_update = _optional_non_empty_argument(arguments, "name")
     description_update = _optional_non_empty_argument(arguments, "description")
-    if name_update is not _UNSET:
+    if isinstance(name_update, str):
         ensure_unique_automation_name(owner, name_update, excluding_automation_id=entry.automation_id)  # AUDIT-FIX(#6): Preserve unique names during rename operations.
     enabled_update = optional_bool(arguments, "enabled", default=None) if "enabled" in arguments else None
     trigger = build_updated_sensor_trigger(entry, arguments)
@@ -477,7 +490,10 @@ def build_updated_time_trigger(
     trigger_fields = {"schedule", "due_at", "time_of_day", "weekdays", "timezone_name"}
     if not any(field in arguments for field in trigger_fields):
         return None
-    schedule = _lower_text_or_empty(arguments.get("schedule", existing.schedule)) or existing.schedule  # AUDIT-FIX(#10): Avoid stringifying null schedule values into invalid persisted data.
+    schedule = cast(
+        TimeSchedule,
+        _lower_text_or_empty(arguments.get("schedule", existing.schedule)) or existing.schedule,
+    )  # AUDIT-FIX(#10): Avoid stringifying null schedule values into invalid persisted data.
     weekdays = parse_weekdays(arguments.get("weekdays")) if "weekdays" in arguments else tuple(existing.weekdays or ())
     timezone_name = resolve_timezone_name(
         owner,
@@ -769,10 +785,7 @@ def _call_runtime(operation_label: str, callback: Any) -> Any:
 
 
 def _safe_emit(owner: Any, event: str) -> None:
-    try:
-        owner.emit(event)
-    except Exception:
-        return
+    emit_best_effort(owner, event)
 
 
 def _safe_emit_kv(owner: Any, key: str, value: object) -> None:
@@ -788,10 +801,7 @@ def _safe_record_event(owner: Any, event_name: str, description: str, **payload:
             safe_payload[key] = value if isfinite(value) else None
         else:
             safe_payload[key] = sanitize_telemetry_value(value)
-    try:
-        owner._record_event(event_name, description, **safe_payload)
-    except Exception:
-        return
+    record_event_best_effort(owner, event_name, description, safe_payload)
 
 
 def sanitize_telemetry_value(raw_value: object) -> str:
@@ -834,66 +844,7 @@ def ensure_unique_automation_name(
             raise RuntimeError("An automation with that name already exists; choose a different name.")  # AUDIT-FIX(#6): Prevent future ambiguous lookups in voice flows.
 
 
-def automation_name_key(raw_value: object) -> str:
-    """Normalize an automation name for case-insensitive comparisons."""
-    return _text_or_empty(raw_value).lower()
-
-
-def resolve_timezone_name(owner: Any, raw_value: object, *, fallback: str | None = None) -> str:
-    """Validate and resolve a timezone name for automation scheduling.
-
-    Args:
-        owner: Tool executor owner exposing the configured local timezone.
-        raw_value: Candidate timezone name from the current tool payload.
-        fallback: Existing timezone name to reuse when the payload omits one.
-
-    Returns:
-        A valid IANA timezone name.
-
-    Raises:
-        RuntimeError: If the resolved timezone name is unknown.
-    """
-    candidate = _text_or_empty(raw_value) or _text_or_empty(fallback) or _text_or_empty(getattr(owner.config, "local_timezone_name", "")) or "UTC"
-    try:
-        ZoneInfo(candidate)
-    except ZoneInfoNotFoundError as exc:
-        raise RuntimeError(f"Unknown timezone_name `{candidate}`") from exc
-    return candidate
-
-
-def validate_non_negative_finite(field_name: str, raw_value: object) -> float:
-    """Coerce a numeric field and reject negative or non-finite values."""
-    value = float(raw_value)
-    if not isfinite(value):
-        raise RuntimeError(f"{field_name} must be a finite number")
-    if value < 0:
-        raise RuntimeError(f"{field_name} must be zero or greater")
-    return value
-
-
-def parse_delivery(raw_value: object, *, default: str) -> str:
-    """Normalize a spoken or printed delivery selector."""
-    normalized = _lower_text_or_empty(raw_value)
-    if not normalized:
-        return default
-    if normalized in _PRINT_DELIVERY_ALIASES:
-        return "printed"
-    if normalized in _SPOKEN_DELIVERY_ALIASES:
-        return "spoken"
-    raise RuntimeError("delivery must be `spoken` or `printed`")
-
-
-def parse_content_mode(raw_value: object, *, default: str) -> str:
-    """Normalize the automation content-mode selector."""
-    normalized = _lower_text_or_empty(raw_value)
-    if not normalized:
-        return default
-    if normalized in {"static_text", "llm_prompt"}:
-        return normalized
-    raise RuntimeError("content_mode must be `static_text` or `llm_prompt`")
-
-
-def _optional_non_empty_argument(arguments: dict[str, object], key: str) -> object:
+def _optional_non_empty_argument(arguments: dict[str, object], key: str) -> str | _UnsetType:
     if key not in arguments:
         return _UNSET
     value = _text_or_empty(arguments.get(key))
@@ -938,7 +889,8 @@ def serialize_automation_record(record: dict[str, object]) -> dict[str, object]:
     Returns:
         The stable JSON-safe response payload returned to the model.
     """
-    actions = tuple(record.get("actions", ()) or ())
+    raw_actions = record.get("actions")
+    actions = tuple(raw_actions) if isinstance(raw_actions, (list, tuple)) else ()
     primary_action = actions[0] if actions else {}
     if not isinstance(primary_action, dict):
         primary_action = {}
@@ -976,61 +928,3 @@ def serialize_automation_record(record: dict[str, object]) -> dict[str, object]:
             }
         )
     return serialised
-
-
-def normalize_delivery(raw_value: object) -> str:
-    """Best-effort normalize a delivery alias for existing action payloads."""
-    normalized = _lower_text_or_empty(raw_value)
-    if normalized in _PRINT_DELIVERY_ALIASES:
-        return "printed"
-    if normalized in _SPOKEN_DELIVERY_ALIASES:
-        return "spoken"
-    return "spoken"
-
-
-def parse_weekdays(raw_value: object) -> tuple[int, ...]:
-    """Parse weekday values into a unique sorted tuple of integers."""
-    if raw_value is None or raw_value == "":
-        return ()
-    if not isinstance(raw_value, (list, tuple)):
-        raise RuntimeError("weekdays must be an array of weekday numbers 0-6")
-    weekdays: list[int] = []
-    for item in raw_value:
-        if isinstance(item, bool):
-            raise RuntimeError("weekdays must be integers 0-6")  # AUDIT-FIX(#14): Reject bools so True/False cannot silently become weekday 1/0.
-        if isinstance(item, int):
-            weekday = item
-        elif isinstance(item, str):
-            normalized = item.strip()
-            if not normalized or not normalized.lstrip("+-").isdigit():
-                raise RuntimeError("weekdays must be integers 0-6")  # AUDIT-FIX(#14): Reject non-integral numeric strings such as "1.5".
-            weekday = int(normalized)
-        else:
-            raise RuntimeError("weekdays must be integers 0-6")  # AUDIT-FIX(#14): Reject silent coercions from floats and arbitrary objects.
-        if weekday < 0 or weekday > 6:
-            raise RuntimeError("weekdays must use integers 0-6")
-        weekdays.append(weekday)
-    return tuple(sorted(set(weekdays)))
-
-
-def parse_tags(raw_value: object) -> tuple[str, ...]:
-    """Parse user-provided automation tags into a bounded unique tuple."""
-    if raw_value is None or raw_value == "":
-        return ()
-    if not isinstance(raw_value, (list, tuple)):
-        raise RuntimeError("tags must be an array of short strings")
-    tags: list[str] = []
-    for item in raw_value:
-        if item is None:
-            continue
-        if not isinstance(item, str):
-            raise RuntimeError("tags must be an array of short strings")  # AUDIT-FIX(#15): Reject non-string tag values instead of persisting str(dict(...)) garbage.
-        tag = item.strip()
-        if not tag:
-            continue
-        if len(tag) > _MAX_TAG_LENGTH:
-            raise RuntimeError(f"tags must be at most {_MAX_TAG_LENGTH} characters long")  # AUDIT-FIX(#15): Enforce the documented 'short strings' contract.
-        if any(ord(char) < 32 for char in tag):
-            raise RuntimeError("tags must not contain control characters")  # AUDIT-FIX(#15): Prevent control-character pollution in state and logs.
-        tags.append(tag)
-    return tuple(dict.fromkeys(tags))  # AUDIT-FIX(#15): Deduplicate tags while preserving the caller's order.

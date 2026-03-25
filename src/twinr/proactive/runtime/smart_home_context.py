@@ -12,7 +12,7 @@ The tracker is intentionally conservative:
 
 - same-room semantics require explicit entity-id configuration
 - stale or unhealthy smart-home streams fail closed
-- smart-home never manufactures local ``person_visible`` or wakeword arming
+- smart-home never manufactures local ``person_visible`` or voice-activation arming
 """
 
 from __future__ import annotations

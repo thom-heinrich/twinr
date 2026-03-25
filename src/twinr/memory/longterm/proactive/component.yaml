@@ -60,4 +60,3 @@ tests:
   - path: test/test_longterm_planner.py
   - path: test/test_longterm_proactive.py
   - path: test/test_longterm_memory.py
-  - path: test/test_runner.py

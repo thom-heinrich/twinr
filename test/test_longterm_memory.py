@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from test.longterm_test_program import make_test_extractor
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
 from twinr.memory.chonkydb.client import ChonkyDBError
@@ -37,7 +37,6 @@ from twinr.memory.longterm import (
 )
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteReadFailedError,
-    LongTermRemoteUnavailableError,
 )
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -132,11 +131,15 @@ class _BudgetRecordingWriter:
 class _CountingRemoteState:
     def __init__(self) -> None:
         self.enter_count = 0
+        self.attest_count = 0
 
     @contextmanager
     def cache_probe_reads(self):
         self.enter_count += 1
         yield
+
+    def attest_external_readiness(self) -> None:
+        self.attest_count += 1
 
 
 class _ProbeCachingRetriever:
@@ -408,6 +411,24 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertEqual(context.episodic_context, "remembered")
         self.assertEqual(remote_state.enter_count, 1)
+
+    def test_attest_external_remote_ready_visits_each_unique_remote_state_once(self) -> None:
+        shared_remote_state = _CountingRemoteState()
+        distinct_remote_state = _CountingRemoteState()
+        service = object.__new__(LongTermMemoryService)
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=shared_remote_state),
+            user_store=SimpleNamespace(remote_state=shared_remote_state),
+            personality_store=SimpleNamespace(remote_state=distinct_remote_state),
+        )
+        service.graph_store = SimpleNamespace(remote_state=shared_remote_state)
+        service.object_store = SimpleNamespace(remote_state=distinct_remote_state)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+
+        service.attest_external_remote_ready()
+
+        self.assertEqual(shared_remote_state.attest_count, 1)
+        self.assertEqual(distinct_remote_state.attest_count, 1)
 
     def test_build_provider_context_does_not_wait_on_shared_store_lock(self) -> None:
         remote_state = _CountingRemoteState()
@@ -2049,7 +2070,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 entries=entries,
                 now=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
             )
-            source_ids_before = objects = {
+            source_ids_before = {
                 item.memory_id: tuple(item.source.event_ids)
                 for item in service.object_store.load_objects()
             }

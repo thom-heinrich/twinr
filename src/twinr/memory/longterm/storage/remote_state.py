@@ -556,6 +556,22 @@ class LongTermRemoteStateStore:
                 if self._probe_cache_depth == 0:
                     self._probe_cache.clear()
 
+    def attest_external_readiness(self) -> None:
+        """Clear local cooldown state after an external required-remote proof.
+
+        The Pi runtime can gate required remote readiness from the external
+        watchdog artifact instead of re-running a deep in-process probe on
+        every keepalive tick. Once that external proof has already shown the
+        current remote namespace is readable, this store must drop any stale
+        local circuit-breaker cooldown and negative probe cache so the next
+        foreground turn does not fail closed against older local state.
+        """
+
+        with self._state_lock:
+            self._consecutive_failures = 0
+            self._circuit_open_until_monotonic = 0.0
+            self._probe_cache.clear()
+
     def load_snapshot(
         self,
         *,
@@ -594,7 +610,7 @@ class LongTermRemoteStateStore:
         if cached_payload is not None:
             return cached_payload
         try:
-            read_client = self._require_client(self.read_client, operation="read")
+            self._require_client(self.read_client, operation="read")
         except LongTermRemoteUnavailableError as exc:
             if self.required:
                 raise
@@ -684,7 +700,7 @@ class LongTermRemoteStateStore:
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Keep snapshot identity validation consistent across operations.
         if not self.enabled:
             return False
-        read_client = self._require_client(self.read_client, operation="read")
+        self._require_client(self.read_client, operation="read")
         probe = self.probe_snapshot_load(snapshot_kind=normalized_snapshot_kind)
         if probe.payload is not None:
             return False
@@ -1523,21 +1539,19 @@ class LongTermRemoteStateStore:
     ) -> LongTermRemoteSnapshotProbe:
         """Poll one just-written snapshot until the expected payload is visible.
 
-        Exact-document reads are deterministic and therefore checked once. When the
-        write acknowledgement did not return a ``document_id``, Twinr must resolve
-        by ``origin_uri`` and tolerate bounded propagation lag or a temporarily
-        stale same-URI head before concluding the write is unreadable.
+        ChonkyDB may acknowledge a write before the fresh document body or same-URI
+        head is visible to subsequent reads. Twinr therefore keeps a bounded
+        visibility window for post-write attestation, but still fails fast on
+        explicit read errors or malformed payloads instead of silently degrading.
         """
 
         started = time.monotonic()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
-        resolved_attempts = 1 if document_id else self._retry_attempts()
-        backoff_s = 0.0 if document_id else self._retry_backoff_s()
         last_result = _RemoteSnapshotFetchResult(status="not_found", selected_source=source)
         expected_payload_dict = dict(expected_payload)
-        poll_interval_s = 0.0
-        if document_id is None:
-            poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        resolved_attempts = self._retry_attempts()
+        if poll_interval_s > 0.0:
             visibility_timeout_s = self._async_attestation_visibility_timeout_s()
             resolved_attempts = max(
                 resolved_attempts,
@@ -1564,7 +1578,7 @@ class LongTermRemoteStateStore:
                     payload=dict(result.payload or expected_payload_dict),
                     attempts=tuple(attempt_records),
                 )
-            if document_id is not None or result.status == "unavailable":
+            if result.status == "unavailable":
                 break
             if attempt + 1 >= resolved_attempts:
                 break

@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date as LocalDate, datetime, time as LocalTime, timedelta, timezone
+from datetime import date as LocalDate, datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -38,6 +38,14 @@ from .display_reserve_learning import (
     DisplayReserveLearningProfile,
     DisplayReserveLearningProfileBuilder,
 )
+from .display_reserve_support import (
+    compact_text,
+    default_local_now,
+    format_timestamp,
+    parse_local_time as _parse_local_time,
+    parse_timestamp as _parse_timestamp,
+    utc_now,
+)
 
 _DEFAULT_PREPARED_PLAN_PATH = "artifacts/stores/ops/display_reserve_bus_plan_prepared.json"
 _DEFAULT_MAINTENANCE_STATE_PATH = "artifacts/stores/ops/display_reserve_bus_maintenance.json"
@@ -45,72 +53,6 @@ _DEFAULT_NIGHTLY_AFTER_LOCAL = "00:30"
 _DEFAULT_OUTCOME_LOOKBACK_DAYS = 2.0
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _default_local_now() -> datetime:
-    """Return the current local wall clock as an aware datetime."""
-
-    return datetime.now().astimezone()
-
-
-def _utc_now() -> datetime:
-    """Return the current UTC wall clock."""
-
-    return datetime.now(timezone.utc)
-
-
-def _compact_text(value: object | None, *, max_len: int) -> str:
-    """Collapse arbitrary text into one bounded single line."""
-
-    if value is None:
-        return ""
-    compact = " ".join(str(value).split()).strip()
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
-
-
-def _parse_timestamp(value: object | None) -> datetime | None:
-    """Parse one optional ISO-8601 timestamp into an aware UTC datetime."""
-
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _format_timestamp(value: datetime) -> str:
-    """Serialize one aware timestamp as UTC ISO-8601 text."""
-
-    return value.astimezone(timezone.utc).isoformat()
-
-
-def _parse_local_time(value: object | None, *, fallback: str) -> LocalTime:
-    """Parse one bounded ``HH:MM`` local time."""
-
-    text = str(value or "").strip() or fallback
-    hour_text, separator, minute_text = text.partition(":")
-    if separator != ":":
-        hour_text, minute_text = fallback.split(":", 1)
-    try:
-        hour = int(hour_text)
-        minute = int(minute_text)
-    except ValueError:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    return LocalTime(hour=hour, minute=minute)
-
 
 def _resolve_store_path(config: TwinrConfig, attr_name: str, default_path: str) -> Path:
     """Resolve one configured artifact path under the current project root."""
@@ -123,14 +65,14 @@ def _resolve_store_path(config: TwinrConfig, attr_name: str, default_path: str) 
 def _coerce_iso_day(value: object | None) -> str | None:
     """Normalize one stored local-day string."""
 
-    text = _compact_text(value, max_len=16)
+    text = compact_text(value, max_len=16)
     return text or None
 
 
 def _topic_key(value: object | None) -> str:
     """Return one normalized topic key."""
 
-    return _compact_text(value, max_len=96).casefold()
+    return compact_text(value, max_len=96).casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,17 +150,17 @@ class DisplayReserveNightlyMaintenanceState:
         return cls(
             prepared_local_day=_coerce_iso_day(payload.get("prepared_local_day")),
             last_attempted_at=(
-                _format_timestamp(_parse_timestamp(payload.get("last_attempted_at")))
+                format_timestamp(_parse_timestamp(payload.get("last_attempted_at")))
                 if _parse_timestamp(payload.get("last_attempted_at")) is not None
                 else None
             ),
             last_completed_at=(
-                _format_timestamp(_parse_timestamp(payload.get("last_completed_at")))
+                format_timestamp(_parse_timestamp(payload.get("last_completed_at")))
                 if _parse_timestamp(payload.get("last_completed_at")) is not None
                 else None
             ),
-            last_status=_compact_text(payload.get("last_status"), max_len=24).lower() or "idle",
-            last_error=_compact_text(payload.get("last_error"), max_len=240) or None,
+            last_status=compact_text(payload.get("last_status"), max_len=24).lower() or "idle",
+            last_error=compact_text(payload.get("last_error"), max_len=240) or None,
             reflection_reflected_object_count=max(
                 0,
                 int(payload.get("reflection_reflected_object_count", 0) or 0),
@@ -331,7 +273,7 @@ class DisplayReserveCompanionPlanner:
     history_store: DisplayAmbientImpulseHistoryStore
     learning_builder_factory: type[DisplayReserveLearningProfileBuilder] = DisplayReserveLearningProfileBuilder
     long_term_memory_factory: Callable[[TwinrConfig], LongTermMemoryService] = LongTermMemoryService.from_config
-    local_now: Callable[[], datetime] = _default_local_now
+    local_now: Callable[[], datetime] = default_local_now
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayReserveCompanionPlanner":
@@ -498,8 +440,8 @@ class DisplayReserveCompanionPlanner:
             self.prepared_store.save(prepared_plan)
             state = DisplayReserveNightlyMaintenanceState(
                 prepared_local_day=target_day_text,
-                last_attempted_at=_format_timestamp(attempted_at),
-                last_completed_at=_format_timestamp(_utc_now()),
+                last_attempted_at=format_timestamp(attempted_at),
+                last_completed_at=format_timestamp(utc_now()),
                 last_status="prepared",
                 last_error=None,
                 reflection_reflected_object_count=len(reflection.reflected_objects),
@@ -521,7 +463,7 @@ class DisplayReserveCompanionPlanner:
         except LongTermRemoteUnavailableError:
             failed_state = DisplayReserveNightlyMaintenanceState(
                 prepared_local_day=target_day_text,
-                last_attempted_at=_format_timestamp(attempted_at),
+                last_attempted_at=format_timestamp(attempted_at),
                 last_completed_at=existing_state.last_completed_at if existing_state is not None else None,
                 last_status="failed",
                 last_error="remote_unavailable",
@@ -540,10 +482,10 @@ class DisplayReserveCompanionPlanner:
         except Exception as exc:
             failed_state = DisplayReserveNightlyMaintenanceState(
                 prepared_local_day=target_day_text,
-                last_attempted_at=_format_timestamp(attempted_at),
+                last_attempted_at=format_timestamp(attempted_at),
                 last_completed_at=existing_state.last_completed_at if existing_state is not None else None,
                 last_status="failed",
-                last_error=_compact_text(exc, max_len=240) or exc.__class__.__name__,
+                last_error=compact_text(exc, max_len=240) or exc.__class__.__name__,
                 reflection_reflected_object_count=0,
                 reflection_created_summary_count=0,
                 prepared_candidate_count=0,
@@ -663,7 +605,7 @@ class DisplayReserveCompanionPlanner:
         ignored_count = 0
         pending_count = 0
         for exposure in exposures:
-            status = _compact_text(exposure.response_status, max_len=24).casefold()
+            status = compact_text(exposure.response_status, max_len=24).casefold()
             if status == "engaged":
                 engaged_count += 1
                 positive_topics[exposure.topic_key] += 1

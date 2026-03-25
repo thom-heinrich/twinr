@@ -1,7 +1,7 @@
 """Expose the lazy top-level Twinr import surface.
 
 Import package-root symbols from ``twinr`` when callers need the canonical
-compatibility surface for runtime configuration and on-device memory types.
+runtime configuration and on-device memory surface.
 The heavy implementations stay in focused child packages and are imported only
 on demand.
 """

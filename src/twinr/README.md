@@ -1,7 +1,7 @@
 # twinr
 
 `twinr` is the root Python package for the device runtime. It owns the package
-boundary, the CLI bootstrap, the lazy compatibility import surface, and a small
+boundary, the CLI bootstrap, the lazy package-root import surface, and a small
 set of shared helpers that multiple subsystems reuse.
 
 ## Responsibility

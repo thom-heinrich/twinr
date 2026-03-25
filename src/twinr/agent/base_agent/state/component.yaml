@@ -43,9 +43,6 @@ root_exports:
     - TwinrEvent
     - TwinrStateMachine
     - TwinrStatus
-compatibility_reexports:
-  - path: src/twinr/state_machine.py
-    mode: star
 tests:
   - path: test/test_state_machine.py
   - path: test/test_display_service.py

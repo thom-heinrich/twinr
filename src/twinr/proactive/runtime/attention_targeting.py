@@ -434,6 +434,30 @@ class MultimodalAttentionTargetTracker:
             confidence=0.0,
         )
 
+    def debug_snapshot(self, *, observed_at: float | None) -> dict[str, object]:
+        """Return one bounded debug snapshot of the targeting internals."""
+
+        checked_at = 0.0 if observed_at is None else float(observed_at)
+        focus_memory = self._focus_memory
+        focus_summary = None
+        if focus_memory is not None:
+            focus_summary = {
+                "presence_session_id": focus_memory.presence_session_id,
+                "source": focus_memory.source,
+                "track_id": focus_memory.track_id,
+                "center_x": focus_memory.center_x,
+                "center_y": focus_memory.center_y,
+                "velocity_x": focus_memory.velocity_x,
+                "age_s": round(max(0.0, checked_at - focus_memory.updated_at), 3),
+            }
+        continuous_summary = None
+        if self._continuous_tracker is not None:
+            continuous_summary = self._continuous_tracker.debug_snapshot(observed_at=observed_at)
+        return {
+            "session_focus_memory": focus_summary,
+            "continuous_tracker": continuous_summary,
+        }
+
     def _remember_focus(
         self,
         *,

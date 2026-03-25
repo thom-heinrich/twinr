@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import io
 import json
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 import math
 import shutil
@@ -25,7 +25,7 @@ from twinr.agent.base_agent.contracts import (
     StreamingTranscriptionResult,
     ToolCallingTurnResponse,
 )
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
 from twinr.hardware import VoiceAssessment
 from twinr.hardware.buttons import ButtonAction, ButtonEvent
@@ -46,9 +46,9 @@ from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractErr
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.core.types import OpenAISearchAttempt
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
-from twinr.realtime_runner import TwinrRealtimeHardwareLoop
-from twinr.runtime import TwinrRuntime
-from twinr.state_machine import TwinrStatus
+from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
+from twinr.agent.base_agent import TwinrRuntime
+from twinr.agent.base_agent import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.personality.intelligence import WorldFeedItem
 from twinr.agent.personality.steering import ConversationTurnSteeringCue
@@ -247,11 +247,6 @@ class FakePrintBackend:
     ) -> OpenAITextResponse:
         self.vision_calls.append((prompt, list(images), conversation, allow_web_search))
         return OpenAITextResponse(text="Ich sehe die Kameraansicht.")
-
-    def respond_with_metadata(self, prompt: str, *, instructions=None, allow_web_search=None) -> OpenAITextResponse:
-        del instructions, allow_web_search
-        self.summary_calls.append(prompt)
-        return OpenAITextResponse(text="Guten Morgen. Hier ist dein Morgenabstract.")
 
     def synthesize_stream(self, text: str):
         self.synthesize_calls.append(text)
@@ -723,6 +718,15 @@ class FakeVoiceOrchestrator:
         self.paused: list[str] = []
         self.resumed: list[str] = []
         self.ready_backend = ready_backend
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
 
     def notify_runtime_state(
         self,
@@ -1035,6 +1039,42 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
         loop._test_temp_dir = temp_dir_handle
         return loop, lines, realtime_session, resolved_print_backend, recorder, player, printer
+
+    def test_realtime_session_omits_smart_home_tools_when_integration_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "twinr.agent.tools.runtime.availability.build_smart_home_hub_adapter",
+            return_value=None,
+        ):
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+            )
+            loop = TwinrRealtimeHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                print_backend=FakePrintBackend(),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                camera=FakeCamera(),
+                voice_profile_monitor=SimpleNamespace(),
+                usage_store=SimpleNamespace(),
+                button_monitor=SimpleNamespace(
+                    __enter__=lambda self: self,
+                    __exit__=lambda self, exc_type, exc, tb: None,
+                ),
+                proactive_monitor=SimpleNamespace(
+                    __enter__=lambda self: self,
+                    __exit__=lambda self, exc_type, exc, tb: None,
+                ),
+            )
+
+        self.assertNotIn("list_smart_home_entities", loop._tool_handlers)
+        self.assertNotIn("read_smart_home_sensor_stream", loop._tool_handlers)
+        self.assertIn("inspect_camera", loop._tool_handlers)
+        self.assertNotIn("list_smart_home_entities", loop.realtime_session._tool_handlers)
+        self.assertNotIn("read_smart_home_sensor_stream", loop.realtime_session._tool_handlers)
+        self.assertIn("inspect_camera", loop.realtime_session._tool_handlers)
 
     @staticmethod
     def _sandbox_path(
@@ -1753,11 +1793,185 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop._refresh_voice_orchestrator_sensor_context()
         self.assertEqual(len(fake_voice.states), 2)
 
+    def test_handle_live_sensor_context_refreshes_voice_without_queueing_automation(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+
+        loop.handle_live_sensor_context(
+            {
+                "sensor": {"inspected": True, "observed_at": 5.0},
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "primary_person_zone": "left",
+                    "primary_person_center_x": 0.22,
+                    "primary_person_center_y": 0.5,
+                    "person_near_device": True,
+                    "looking_toward_device": True,
+                },
+                "attention_target": {
+                    "active": True,
+                    "target_center_x": 0.22,
+                    "target_center_y": 0.5,
+                    "target_horizontal": "left",
+                    "target_vertical": "center",
+                    "speaker_locked": False,
+                },
+                "vad": {"speech_detected": False},
+                "respeaker": {"direction_confidence": 0.82, "azimuth_deg": 0},
+                "audio_policy": {
+                    "speaker_direction_stable": True,
+                    "quiet_window_open": True,
+                },
+            }
+        )
+
+        self.assertEqual(len(fake_voice.states), 2)
+        self.assertTrue(fake_voice.intent_contexts[-1]["person_visible"])
+        self.assertEqual(loop._sensor_observation_queue.qsize(), 0)
+
+    def test_concurrent_sensor_context_updates_preserve_both_live_and_automation_facts(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+        loop._latest_sensor_observation_facts = {"base": {"v": 1}}
+
+        first_merge_entered = Event()
+        release_first_merge = Event()
+        original_merge = loop._merge_sensor_observation_facts
+        merge_call_count = {"count": 0}
+
+        def blocking_merge(*, existing, incoming):
+            result = original_merge(existing=existing, incoming=incoming)
+            merge_call_count["count"] += 1
+            if merge_call_count["count"] == 1:
+                first_merge_entered.set()
+                release_first_merge.wait(timeout=1.0)
+            return result
+
+        loop._merge_sensor_observation_facts = blocking_merge
+
+        live_context_thread = Thread(
+            target=loop.handle_live_sensor_context,
+            args=(
+                {
+                    "sensor": {"inspected": True, "observed_at": 5.0},
+                    "camera": {
+                        "person_visible": True,
+                        "person_count": 1,
+                        "primary_person_zone": "left",
+                        "primary_person_center_x": 0.22,
+                        "primary_person_center_y": 0.5,
+                        "person_near_device": True,
+                        "looking_toward_device": True,
+                    },
+                    "attention_target": {
+                        "active": True,
+                        "target_center_x": 0.22,
+                        "target_center_y": 0.5,
+                        "target_horizontal": "left",
+                        "target_vertical": "center",
+                        "speaker_locked": False,
+                    },
+                    "vad": {"speech_detected": False},
+                    "respeaker": {"direction_confidence": 0.82, "azimuth_deg": 0},
+                    "audio_policy": {
+                        "speaker_direction_stable": True,
+                        "quiet_window_open": True,
+                    },
+                },
+            ),
+        )
+        automation_thread = Thread(
+            target=loop.handle_sensor_observation,
+            args=(
+                {
+                    "sensor": {"observed_at": 6.0},
+                    "smart_home": {"door_open": True},
+                },
+                ("door_opened",),
+            ),
+        )
+
+        live_context_thread.start()
+        self.assertTrue(first_merge_entered.wait(timeout=1.0))
+        automation_thread.start()
+        time.sleep(0.05)
+        release_first_merge.set()
+        live_context_thread.join(timeout=1.0)
+        automation_thread.join(timeout=1.0)
+
+        final_facts = loop._latest_sensor_observation_facts or {}
+        self.assertTrue(final_facts.get("camera", {}).get("person_visible"))
+        self.assertTrue(final_facts.get("smart_home", {}).get("door_open"))
+
+    def test_refresh_voice_orchestrator_sensor_context_cannot_revert_fresh_listening_to_waiting(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        class _RefreshingVoiceOrchestrator(FakeVoiceOrchestrator):
+            def __init__(self) -> None:
+                super().__init__()
+                self._refreshed = False
+
+            def notify_runtime_state(
+                self,
+                *,
+                state: str,
+                detail: str | None = None,
+                follow_up_allowed: bool = False,
+                **kwargs,
+            ) -> None:
+                super().notify_runtime_state(
+                    state=state,
+                    detail=detail,
+                    follow_up_allowed=follow_up_allowed,
+                    **kwargs,
+                )
+                if state == "listening" and not self._refreshed:
+                    self._refreshed = True
+                    loop._refresh_voice_orchestrator_sensor_context()
+
+        loop.voice_orchestrator = _RefreshingVoiceOrchestrator()
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
+
+        loop._notify_voice_orchestrator_state("listening", detail="voice_activation", follow_up_allowed=False)
+
+        self.assertEqual(
+            loop.voice_orchestrator.states,
+            [
+                ("waiting", "idle", False),
+                ("listening", "voice_activation", False),
+            ],
+        )
+
     def test_gesture_wakeup_opens_listening_window_with_beep(self) -> None:
         recorder = FakeRecorder(recordings=[RuntimeError("No speech detected before timeout")])
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
             recorder=recorder,
         )
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
 
         handled = loop.handle_gesture_wakeup(
             GestureWakeupDecision(
@@ -1778,6 +1992,103 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("gesture_wakeup_mode=listen", lines)
         self.assertIn("gesture_wakeup_gesture=peace_sign", lines)
         self.assertNotIn("voice_activation_ack=Ja?", lines)
+
+    def test_gesture_wakeup_is_skipped_when_intent_context_blocks_speech(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": False,
+                "targeted_inference_blocked": True,
+                "recommended_channel": "display",
+                "attention_state": {"state": "inactive"},
+                "interaction_intent_state": {"state": "passive"},
+            },
+        }
+
+        handled = loop.handle_gesture_wakeup(
+            GestureWakeupDecision(
+                active=True,
+                reason="gesture_wakeup:peace_sign",
+                confidence=0.92,
+            )
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(player.played, [])
+        self.assertIn("gesture_wakeup_skipped=context_blocked", lines)
+
+    def test_prime_voice_orchestrator_waiting_state_seeds_idle_context(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
+
+        loop._prime_voice_orchestrator_waiting_state()
+
+        self.assertEqual(fake_voice.states, [("waiting", None, False)])
+        self.assertEqual(
+            fake_voice.intent_contexts,
+            [
+                {
+                    "attention_state": "attending_to_device",
+                    "interaction_intent_state": "showing_intent",
+                    "person_visible": True,
+                    "interaction_ready": True,
+                    "targeted_inference_blocked": False,
+                    "recommended_channel": "speech",
+                }
+            ],
+        )
+
+    def test_prime_voice_orchestrator_waiting_state_defers_until_sensor_context_exists(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+
+        loop._prime_voice_orchestrator_waiting_state()
+
+        self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("waiting", None, False))
+        self.assertIsNone(loop._last_voice_orchestrator_intent_context)
+        self.assertEqual(fake_voice.states, [])
+        self.assertEqual(fake_voice.intent_contexts, [])
+
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
+
+        loop._refresh_voice_orchestrator_sensor_context()
+
+        self.assertEqual(fake_voice.states, [("waiting", None, False)])
+        self.assertEqual(
+            fake_voice.intent_contexts,
+            [
+                {
+                    "attention_state": "attending_to_device",
+                    "interaction_intent_state": "showing_intent",
+                    "person_visible": True,
+                    "interaction_ready": True,
+                    "targeted_inference_blocked": False,
+                    "recommended_channel": "speech",
+                }
+            ],
+        )
 
     def test_gesture_wakeup_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
@@ -1825,6 +2136,25 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [])
         self.assertGreaterEqual(len(player.tones), 1)
         self.assertIn("voice_activation_ack=earcon", lines)
+
+    def test_voice_orchestrator_disables_local_interrupt_stt_watcher(self) -> None:
+        config = TwinrConfig(turn_controller_interrupt_enabled=True)
+        loop, lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+            print_backend=FakePrintBackend(),
+        )
+        loop.voice_orchestrator = FakeVoiceOrchestrator()
+
+        watcher = loop._start_answer_interrupt_watcher(
+            interrupt_event=Event(),
+            stop_event=Event(),
+            transcript_holder=[""],
+            answer_started=lambda: True,
+        )
+
+        self.assertIsNone(watcher)
+        self.assertEqual(print_backend.transcribe_calls, [])
+        self.assertIn("interrupt_watcher_remote_owned=true", lines)
 
     def test_voice_orchestrator_handles_follow_up_remotely_after_answer(self) -> None:
         config = TwinrConfig(conversation_follow_up_enabled=True)
@@ -2465,6 +2795,58 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "queued")
         self.assertIn("self_coding_tool_call=true", lines)
 
+    def test_tool_provider_context_includes_active_self_coding_guidance(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        proposed = loop._handle_propose_skill_learning_tool_call(
+            {
+                "name": "Announce Family Updates",
+                "action": "Read new family updates aloud",
+                "request_summary": "Read out new family updates.",
+                "capabilities": ["speaker", "safety", "rules"],
+                "trigger_mode": "push",
+                "trigger_conditions": ["new_message"],
+            }
+        )
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "trigger_conditions": ["user_visible"],
+            }
+        )
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "scope": {"contacts": ["family"]},
+            }
+        )
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "constraints": ["ask_first"],
+            }
+        )
+        final = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "confirmed": True,
+            }
+        )
+
+        context = loop.runtime.tool_provider_conversation_context()
+        system_messages = [content for role, content in context if role == "system"]
+
+        self.assertTrue(
+            any(
+                "Active self-coding state for this turn." in message
+                and f"Session id: {proposed['session_id']}." in message
+                and "call answer_skill_question with this exact session_id" in message
+                and f"Compile job id: {final['compile_job_id']}." in message
+                and "call confirm_skill_activation with this exact job_id" in message
+                for message in system_messages
+            )
+        )
+
     def test_self_coding_confirm_activation_tool_call_enables_soft_launch(self) -> None:
         from twinr.agent.self_coding.codex_driver import CodexCompileArtifact, CodexCompileEvent, CodexCompileProgress, CodexCompileResult
         from twinr.agent.self_coding.status import ArtifactKind
@@ -2524,6 +2906,73 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(activated["skill_id"], "announce_family_updates")
         self.assertEqual(activated["version"], 1)
         self.assertTrue(activated["automation_enabled"])
+
+    def test_self_coding_confirm_activation_tool_call_compiles_queued_job_before_activation(self) -> None:
+        from twinr.agent.self_coding.codex_driver import CodexCompileArtifact, CodexCompileEvent, CodexCompileProgress, CodexCompileResult
+        from twinr.agent.self_coding.status import ArtifactKind
+        from twinr.agent.self_coding.worker import SelfCodingCompileWorker
+
+        class FakeCompileDriver:
+            def __init__(self) -> None:
+                self.run_calls: list[str] = []
+
+            def run_compile(self, request, *, event_sink=None):
+                del request
+                self.run_calls.append("run")
+                if event_sink is not None:
+                    event_sink(
+                        CodexCompileEvent(kind="turn_started"),
+                        CodexCompileProgress(driver_name="FakeCompileDriver", event_count=1, last_event_kind="turn_started"),
+                    )
+                return CodexCompileResult(
+                    status="ok",
+                    summary="Compiled",
+                    artifacts=(
+                        CodexCompileArtifact(
+                            kind=ArtifactKind.AUTOMATION_MANIFEST,
+                            artifact_name="automation_manifest.json",
+                            media_type="application/json",
+                            content='{"automation":{"name":"Announce Family Updates","trigger":{"kind":"if_then","event_name":"new_message","all_conditions":[],"any_conditions":[],"cooldown_seconds":45},"actions":[{"kind":"say","text":"Family update arrived."}]}}',
+                            summary="Manifest",
+                        ),
+                    ),
+                )
+
+        driver = FakeCompileDriver()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        loop._self_coding_compile_worker = SelfCodingCompileWorker(
+            store=loop._self_coding_store,
+            driver=driver,
+        )
+
+        proposed = loop._handle_propose_skill_learning_tool_call(
+            {
+                "name": "Announce Family Updates",
+                "action": "Read new family updates aloud",
+                "request_summary": "Read out new family updates.",
+                "capabilities": ["speaker", "safety", "rules"],
+                "trigger_mode": "push",
+                "trigger_conditions": ["new_message"],
+            }
+        )
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "trigger_conditions": ["user_visible"]})
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "scope": {"contacts": ["family"]}})
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "constraints": ["ask_first"]})
+        final = loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "confirmed": True})
+
+        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "queued")
+
+        activated = loop._handle_confirm_skill_activation_tool_call(
+            {
+                "job_id": final["compile_job_id"],
+                "confirmed": True,
+            }
+        )
+
+        self.assertEqual(driver.run_calls, ["run"])
+        self.assertEqual(activated["status"], "active")
+        self.assertEqual(activated["skill_id"], "announce_family_updates")
+        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "soft_launch_ready")
 
     def test_remember_memory_tool_call_writes_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2770,6 +3219,48 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIsNotNone(stored.last_triggered_at)
         self.assertIn("automation_executed=true", lines)
 
+    def test_due_spoken_automation_is_released_when_idle_window_turns_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Daily weather",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Give the morning weather report.",
+                        payload={"delivery": "spoken", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+            original_reserve = loop._reserve_governed_prompt
+
+            def wrapped_reserve(candidate, *, governor_inputs=None):
+                reservation = original_reserve(candidate, governor_inputs=governor_inputs)
+                loop._conversation_session_active = True
+                return reservation
+
+            loop._reserve_governed_prompt = wrapped_reserve  # type: ignore[method-assign]
+
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertFalse(executed)
+        self.assertEqual(len(print_backend.automation_calls), 0)
+        self.assertEqual(player.played, [])
+        self.assertIn("automation_skipped=conversation_active", lines)
+        assert stored is not None
+        self.assertIsNone(stored.last_triggered_at)
+
     def test_due_spoken_automation_is_governor_blocked_after_recent_social_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -2867,7 +3358,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 automation_poll_interval_s=0.0,
             )
             loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop(config=config)
-            entry = loop.runtime.create_time_automation(
+            loop.runtime.create_time_automation(
                 name="Daily headlines",
                 schedule="daily",
                 time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
@@ -2883,8 +3374,6 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             )
 
             executed = loop._maybe_run_due_automation()
-            stored = loop.runtime.automation_store.get(entry.automation_id)
-
         self.assertTrue(executed)
         self.assertEqual(print_backend.automation_calls, [("Print the main headlines of the day.", True, "printed")])
         self.assertEqual(printer.printed, ["GUTEN TAG"])
@@ -3240,6 +3729,40 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("reminder_delivered=true", lines)
         self.assertTrue(stored_entries[0].delivered)
 
+    def test_due_reminder_is_released_when_idle_window_turns_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Medikament nehmen",
+                kind="medication",
+                source="test",
+            )
+            original_reserve = loop._reserve_governed_prompt
+
+            def wrapped_reserve(candidate, *, governor_inputs=None):
+                reservation = original_reserve(candidate, governor_inputs=governor_inputs)
+                loop._conversation_session_active = True
+                return reservation
+
+            loop._reserve_governed_prompt = wrapped_reserve  # type: ignore[method-assign]
+
+            delivered = loop._maybe_deliver_due_reminder()
+            stored_entries = loop.runtime.reminder_store.load_entries()
+
+        self.assertFalse(delivered)
+        self.assertEqual(len(print_backend.reminder_calls), 0)
+        self.assertEqual(player.played, [])
+        self.assertIn("reminder_skipped=conversation_active", lines)
+        self.assertFalse(stored_entries[0].delivered)
+        self.assertIsNone(stored_entries[0].next_attempt_at)
+
     def test_social_trigger_is_governor_blocked_after_recent_reminder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -3587,6 +4110,42 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].last_skip_reason, "low_confidence_speaker_association")
 
+    def test_idle_longterm_proactive_required_remote_failure_enters_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.reset_error()
+            loop.runtime.preview_long_term_proactive_candidate = mock.Mock(  # type: ignore[method-assign]
+                side_effect=LongTermRemoteUnavailableError("remote unavailable during proactive preview")
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+
+        self.assertFalse(delivered)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertTrue(loop._required_remote_dependency_error_active)
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("status=error", lines)
+        self.assertIn("required_remote_dependency=false", lines)
+        self.assertIn(
+            "error=LongTermRemoteUnavailableError: remote unavailable during proactive preview",
+            lines,
+        )
+        self.assertNotIn(
+            "longterm_proactive_error=remote unavailable during proactive preview",
+            lines,
+        )
+
     def test_idle_loop_delivers_due_reminder_with_generic_backend_fallback(self) -> None:
         class LegacyReminderBackend(FakePrintBackend):
             phrase_due_reminder_with_metadata = None
@@ -3834,13 +4393,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             )
             loop.runtime.user_voice_status = "unknown_voice"
 
-            with self.assertRaisesRegex(RuntimeError, "Please ask for clear confirmation"):
-                loop._handle_resolve_memory_conflict_tool_call(
-                    {
-                        "slot_key": "contact:person:corinna_maier:phone",
-                        "selected_memory_id": "fact:corinna_phone_new",
-                    }
-                )
+            gated = loop._handle_resolve_memory_conflict_tool_call(
+                {
+                    "slot_key": "contact:person:corinna_maier:phone",
+                    "selected_memory_id": "fact:corinna_phone_new",
+                }
+            )
 
             resolved = loop._handle_resolve_memory_conflict_tool_call(
                 {
@@ -3850,6 +4408,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 }
             )
 
+        self.assertEqual(gated["status"], "confirmation_required")
+        self.assertTrue(gated["requires_confirmation"])
+        self.assertIn("confirmed=true", gated["detail"])
         self.assertEqual(resolved["status"], "resolved")
 
     def test_remember_preference_and_plan_tool_calls_feed_provider_context(self) -> None:
@@ -3907,13 +4468,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 checked_at="2026-03-13T12:30:00+00:00",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "confirmed=true"):
-                loop._handle_update_user_profile_tool_call(
-                    {
-                        "category": "preferred_name",
-                        "instruction": "Call the user Thom in future turns.",
-                    }
-                )
+            gated = loop._handle_update_user_profile_tool_call(
+                {
+                    "category": "preferred_name",
+                    "instruction": "Call the user Thom in future turns.",
+                }
+            )
 
             result = loop._handle_update_user_profile_tool_call(
                 {
@@ -3923,6 +4483,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 }
             )
 
+        self.assertEqual(gated["status"], "confirmation_required")
+        self.assertTrue(gated["requires_confirmation"])
+        self.assertIn("confirmed=true", gated["detail"])
         self.assertEqual(result["status"], "updated")
 
     def test_update_personality_tool_call_updates_personality_markdown(self) -> None:
@@ -4076,13 +4639,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 checked_at="2026-03-13T21:00:00+00:00",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "confirmed=true"):
-                loop._handle_update_simple_setting_tool_call(
-                    {
-                        "setting": "memory_capacity",
-                        "action": "increase",
-                    }
-                )
+            gated = loop._handle_update_simple_setting_tool_call(
+                {
+                    "setting": "memory_capacity",
+                    "action": "increase",
+                }
+            )
 
             result = loop._handle_update_simple_setting_tool_call(
                 {
@@ -4092,6 +4654,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 }
             )
 
+        self.assertEqual(gated["status"], "confirmation_required")
+        self.assertTrue(gated["requires_confirmation"])
+        self.assertIn("confirmed=true", gated["detail"])
         self.assertEqual(result["status"], "updated")
 
     def test_update_simple_setting_can_change_voice_and_speed(self) -> None:
@@ -4785,6 +5350,35 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertGreaterEqual(len(social_events), 1)
         self.assertEqual(social_events[-1]["data"]["skip_reason"], "conversation_active")
 
+    def test_social_trigger_is_released_when_idle_window_turns_stale(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(proactive_quiet_hours_visual_only_enabled=False)
+        )
+        original_reserve = loop._reserve_governed_prompt
+
+        def wrapped_reserve(candidate, *, governor_inputs=None):
+            reservation = original_reserve(candidate, governor_inputs=governor_inputs)
+            loop._conversation_session_active = True
+            return reservation
+
+        loop._reserve_governed_prompt = wrapped_reserve  # type: ignore[method-assign]
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="person_returned",
+                prompt="Hey Thom, schön dich zu sehen. Wie geht's dir?",
+                reason="Person returned after a long absence.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.PERSON_RETURNED,
+            )
+        )
+
+        self.assertFalse(spoke)
+        self.assertEqual(len(print_backend.proactive_calls), 0)
+        self.assertEqual(player.played, [])
+        self.assertIn("social_trigger_skipped=conversation_active", lines)
+        self.assertIsNone(loop.runtime.proactive_governor._active_reservation)
+
     def test_run_opens_and_closes_proactive_monitor(self) -> None:
         button_monitor = FakeIdleButtonMonitor()
         proactive_monitor = FakeProactiveMonitor()
@@ -5130,6 +5724,63 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(remote.calls, 0)
         self.assertEqual(len(printer.printed), 1)
         self.assertIn("button=yellow", lines)
+
+    def test_watchdog_artifact_refresh_attests_runtime_remote_state(self) -> None:
+        startup_ready_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            sample_age_s=0.0,
+            max_sample_age_s=45.0,
+            pid_alive=True,
+        )
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=startup_ready_assessment,
+        ):
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=TwinrConfig(
+                    long_term_memory_enabled=True,
+                    long_term_memory_mode="remote_primary",
+                    long_term_memory_remote_required=True,
+                    long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                    long_term_memory_remote_watchdog_interval_s=0.01,
+                ),
+            )
+
+        class _AttestedRequiredRemote:
+            def __init__(self) -> None:
+                self.attest_calls = 0
+                self.deep_calls = 0
+
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                self.deep_calls += 1
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+            def attest_external_remote_ready(self):
+                self.attest_calls += 1
+
+        remote = _AttestedRequiredRemote()
+        loop.runtime.long_term_memory = remote
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=SimpleNamespace(
+                artifact_path="/tmp/remote_memory_watchdog.json",
+                sample_age_s=1.0,
+                max_sample_age_s=45.0,
+                pid_alive=True,
+            ),
+        ):
+            refreshed = loop._refresh_required_remote_dependency(force=True, force_sync=True)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(remote.deep_calls, 0)
+        self.assertEqual(remote.attest_calls, 1)
 
     def test_run_enters_error_when_external_watchdog_artifact_reports_failure(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

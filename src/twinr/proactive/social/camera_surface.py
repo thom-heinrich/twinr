@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any
+from typing import Any, SupportsIndex, SupportsInt, TypeAlias, cast
 
 from .engine import (
     SocialBodyPose,
@@ -24,6 +24,13 @@ from .engine import (
     SocialVisionObservation,
 )
 from .gesture_calibration import GestureCalibrationProfile
+from .normalization import (
+    coerce_enum_member,
+    coerce_non_negative_int_or_default,
+    coerce_spatial_box_coordinates,
+)
+
+_IntLike: TypeAlias = str | bytes | bytearray | SupportsInt | SupportsIndex
 
 _PERSON_VISIBLE_EVENT = "camera.person_visible"
 _HAND_NEAR_EVENT = "camera.hand_or_object_near_camera"
@@ -1941,57 +1948,45 @@ def _duration_since(since: float | None, now: float) -> float:
 def _coerce_body_pose(value: object) -> SocialBodyPose:
     """Normalize a raw pose token into the coarse ``SocialBodyPose`` enum."""
 
-    if isinstance(value, SocialBodyPose):
-        return value
-    if value is None:
-        return SocialBodyPose.UNKNOWN
-    token = str(value).strip().lower()
-    for pose in SocialBodyPose:
-        if pose.value == token:
-            return pose
-    return SocialBodyPose.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialBodyPose,
+        unknown=SocialBodyPose.UNKNOWN,
+        allow_stringify=True,
+    )
 
 
 def _coerce_motion_state(value: object) -> SocialMotionState:
     """Normalize a raw motion token into the coarse ``SocialMotionState`` enum."""
 
-    if isinstance(value, SocialMotionState):
-        return value
-    if value is None:
-        return SocialMotionState.UNKNOWN
-    token = str(value).strip().lower()
-    for state in SocialMotionState:
-        if state.value == token:
-            return state
-    return SocialMotionState.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialMotionState,
+        unknown=SocialMotionState.UNKNOWN,
+        allow_stringify=True,
+    )
 
 
 def _coerce_person_zone(value: object) -> SocialPersonZone:
     """Normalize a raw zone token into the coarse ``SocialPersonZone`` enum."""
 
-    if isinstance(value, SocialPersonZone):
-        return value
-    if value is None:
-        return SocialPersonZone.UNKNOWN
-    token = str(value).strip().lower()
-    for zone in SocialPersonZone:
-        if zone.value == token:
-            return zone
-    return SocialPersonZone.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialPersonZone,
+        unknown=SocialPersonZone.UNKNOWN,
+        allow_stringify=True,
+    )
 
 
 def _coerce_gesture_event(value: object) -> SocialGestureEvent:
     """Normalize a raw gesture token into the ``SocialGestureEvent`` enum."""
 
-    if isinstance(value, SocialGestureEvent):
-        return value
-    if value is None:
-        return SocialGestureEvent.UNKNOWN
-    token = str(value).strip().lower()
-    for event in SocialGestureEvent:
-        if event.value == token:
-            return event
-    return SocialGestureEvent.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialGestureEvent,
+        unknown=SocialGestureEvent.UNKNOWN,
+        allow_stringify=True,
+    )
 
 
 def _coalesce_coarse_gesture_aliases(observation: object) -> SocialGestureEvent:
@@ -2019,15 +2014,12 @@ def _coalesce_coarse_gesture_aliases(observation: object) -> SocialGestureEvent:
 def _coerce_fine_hand_gesture(value: object) -> SocialFineHandGesture:
     """Normalize a raw fine-hand gesture token into the bounded enum."""
 
-    if isinstance(value, SocialFineHandGesture):
-        return value
-    if value is None:
-        return SocialFineHandGesture.UNKNOWN
-    token = str(value).strip().lower()
-    for event in SocialFineHandGesture:
-        if event.value == token:
-            return event
-    return SocialFineHandGesture.UNKNOWN
+    return coerce_enum_member(
+        value,
+        SocialFineHandGesture,
+        unknown=SocialFineHandGesture.UNKNOWN,
+        allow_stringify=True,
+    )
 
 
 def _coerce_optional_ratio(value: object) -> float | None:
@@ -2051,7 +2043,7 @@ def _coerce_positive_int(value: object, *, default: int) -> int:
     if isinstance(value, bool):
         return default
     try:
-        number = int(value)
+        number = int(cast(_IntLike, value))
     except (TypeError, ValueError):
         return default
     return default if number < 1 else number
@@ -2062,21 +2054,10 @@ def _coerce_spatial_box(value: object) -> SocialSpatialBox | None:
 
     if isinstance(value, SocialSpatialBox):
         return value
-    if isinstance(value, dict):
-        candidate = (
-            value.get("top"),
-            value.get("left"),
-            value.get("bottom"),
-            value.get("right"),
-        )
-    elif isinstance(value, (tuple, list)) and len(value) == 4:
-        candidate = tuple(value)
-    else:
+    coordinates = coerce_spatial_box_coordinates(value)
+    if coordinates is None:
         return None
-    try:
-        top, left, bottom, right = (float(item) for item in candidate)
-    except (TypeError, ValueError):
-        return None
+    top, left, bottom, right = coordinates
     return SocialSpatialBox(top=top, left=left, bottom=bottom, right=right)
 
 
@@ -2148,15 +2129,7 @@ def _coerce_optional_text(value: object) -> str | None:
 def _coerce_non_negative_int(value: object, *, default: int) -> int:
     """Coerce one value to a non-negative integer with fallback."""
 
-    if isinstance(value, bool):
-        return default
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return default
-    if number < 0:
-        return default
-    return number
+    return coerce_non_negative_int_or_default(value, default=default)
 
 
 def _camera_health_surface_present(observation: SocialVisionObservation) -> bool:

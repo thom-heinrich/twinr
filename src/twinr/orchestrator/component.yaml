@@ -11,6 +11,7 @@ owned_concerns:
   - Define bounded streaming voice contracts for edge audio frames, runtime-state updates, wake confirmations, same-stream transcript commits, follow-up windows, and barge-in interrupts
   - Host the server-side voice session that evaluates activation candidates and emits same-stream transcript or barge-in decisions
   - Adapt the thh1986 remote ASR HTTP service into bounded transcript calls for the server-side voice session
+  - Host the embedded `/v1/transcribe` HTTP surface when the remote-ASR URL points back to the local orchestrator server
 out_of_scope:
   - Tool prompt authoring, schema construction, or concrete tool-side business logic in src/twinr/agent/tools
   - Runtime loop selection or CLI orchestration in src/twinr/__main__.py and src/twinr/agent/workflows
@@ -22,17 +23,29 @@ files:
       - ACK_ID_TO_TEXT
       - EdgeOrchestratorServer
       - EdgeOrchestratorSession
+      - EdgeOrchestratorVoiceSession
       - OrchestratorAckEvent
       - OrchestratorClientTurnResult
       - OrchestratorToolRequest
       - OrchestratorToolResponse
       - OrchestratorTurnCompleteEvent
       - OrchestratorTurnRequest
+      - OrchestratorVoiceAudioFrame
+      - OrchestratorVoiceBargeInInterruptEvent
+      - OrchestratorVoiceErrorEvent
+      - OrchestratorVoiceFollowUpClosedEvent
+      - OrchestratorVoiceHelloRequest
+      - OrchestratorVoiceReadyEvent
+      - OrchestratorVoiceRuntimeStateEvent
+      - OrchestratorVoiceTranscriptCommittedEvent
+      - OrchestratorVoiceWakeConfirmedEvent
+      - OrchestratorVoiceWebSocketClient
       - OrchestratorWebSocketClient
       - RemoteToolBridge
       - ack_id_for_text
       - ack_text_for_id
       - create_app
+      - decode_voice_server_event
   - path: acks.py
     role: Canonical ack ID and text mapping
     exports:
@@ -66,6 +79,7 @@ files:
       - OrchestratorVoiceRuntimeStateEvent
       - OrchestratorVoiceTranscriptCommittedEvent
       - OrchestratorVoiceWakeConfirmedEvent
+      - VoiceServerEvent
       - decode_voice_server_event
   - path: voice_client.py
     role: Blocking websocket client for streaming edge-audio sessions
@@ -87,6 +101,40 @@ files:
       - RemoteAsrBackendAdapter
       - RemoteAsrServiceError
       - RemoteAsrTranscript
+  - path: remote_asr_service.py
+    role: Embedded remote-ASR HTTP surface for colocated orchestrator deployments
+    exports:
+      - RemoteAsrHttpService
+      - remote_asr_url_targets_local_orchestrator
+  - path: voice_activation.py
+    role: Transcript-first wake phrase matching and continuation extraction
+    exports:
+      - DEFAULT_VOICE_ACTIVATION_PHRASES
+      - VoiceActivationMatch
+      - VoiceActivationPhraseMatcher
+      - VoiceActivationTailExtractor
+      - match_voice_activation_transcript
+      - normalize_activation_detector_label
+      - phrase_from_activation_detector_label
+      - voice_activation_primary_prompt
+  - path: voice_gateway_guardrails.py
+    role: Fail-closed startup checks for the remote-only live voice gateway contract
+    exports:
+      - assert_transcript_first_voice_gateway_contract
+  - path: voice_runtime_intent.py
+    role: Compact person-state projection and multimodal audio-bias policy
+    exports:
+      - VoiceRuntimeIntentContext
+  - path: voice_forensics.py
+    role: Bounded voice-frame telemetry shared by edge and host-side voice paths
+    exports:
+      - VoiceFrameTelemetryBucket
+      - prefixed_signal_profile_details
+  - path: voice_audio_debug_store.py
+    role: Opt-in rolling WAV artifact store for forensic-only voice debugging
+    exports:
+      - VoiceAudioDebugArtifactStore
+      - VoiceAudioDebugArtifactStoreConfig
   - path: voice_transcript_debug_stream.py
     role: Bounded JSONL storage for raw transcript-first gateway decisions
     exports:
@@ -127,6 +175,11 @@ public_api:
     - decode_voice_server_event
 primary_callers:
   - path: src/twinr/__main__.py
+  - path: src/twinr/agent/base_agent/config.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/voice_orchestrator.py
 tests:
   - path: test/test_orchestrator.py
+  - path: test/test_orchestrator_gateway_policy.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_voice_orchestrator.py

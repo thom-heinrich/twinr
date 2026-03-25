@@ -209,7 +209,6 @@ class ToolMatrixContext:
             f"TWINR_LONG_TERM_MEMORY_PATH={self.state_dir / 'chonkydb'}",
             f"TWINR_LONG_TERM_MEMORY_REMOTE_NAMESPACE=pi_tool_matrix_{self.run_id}",
             "TWINR_PROACTIVE_ENABLED=false",
-            "TWINR_WAKEWORD_ENABLED=false",
             "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=false",
             "TWINR_TURN_CONTROLLER_ENABLED=false",
             "TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED=false",

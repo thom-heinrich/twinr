@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import logging
 import math  # AUDIT-FIX(#5): reject non-finite numeric values inside JSON-like scope payloads.
-import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any, Callable, TypedDict, TypeVar
+from typing import Any, Callable, TypeVar
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
+from .self_coding_support import (
+    SELF_CODING_RUNTIME_LOCK as _SELF_CODING_RUNTIME_LOCK,
+    ensure_confirm_activation_job_ready as _ensure_confirm_activation_job_ready,
+    ensure_self_coding_runtime,
+    resolve_activation_service as _resolve_activation_service,
+    resolve_learning_flow as _resolve_learning_flow,
+)
 from twinr.agent.self_coding import (
-    SelfCodingActivationService,
-    SelfCodingCapabilityRegistry,
-    SelfCodingCompileWorker,
-    SelfCodingFeasibilityChecker,
-    SelfCodingHealthService,
-    SelfCodingLearningFlow,
-    SelfCodingRequirementsDialogue,
-    SelfCodingSkillExecutionService,
-    SelfCodingStore,
     SkillSpec,
     SkillTriggerSpec,
 )
@@ -33,24 +31,8 @@ _MAX_LIST_ITEM_LENGTH = 256
 _MAX_MAPPING_ENTRIES = 64
 _MAX_MAPPING_KEY_LENGTH = 128
 _MAX_JSON_DEPTH = 6  # AUDIT-FIX(#5): bound nested JSON-like structures to protect RPi memory and serialization budgets.
-_MAX_RUNTIME_SIGNATURE_ITEMS = 128  # AUDIT-FIX(#6): fingerprint a broader config surface so cache invalidation survives in-place config updates.
-_MAX_RUNTIME_SIGNATURE_REPR_LENGTH = 256
 _DEFAULT_REMAINING_QUESTIONS = 3
-_SELF_CODING_RUNTIME_LOCK = threading.RLock()
 _T = TypeVar("_T")
-
-
-class _SelfCodingRuntime(TypedDict):
-    store: SelfCodingStore
-    registry: SelfCodingCapabilityRegistry
-    checker: SelfCodingFeasibilityChecker
-    dialogue: SelfCodingRequirementsDialogue
-    compile_worker: SelfCodingCompileWorker
-    automation_store: AutomationStore
-    activation_service: SelfCodingActivationService
-    health_service: SelfCodingHealthService
-    skill_execution_service: SelfCodingSkillExecutionService
-    flow: SelfCodingLearningFlow
 
 
 class _SelfCodingToolInputError(RuntimeError):
@@ -145,6 +127,7 @@ def handle_confirm_skill_activation(owner: Any, arguments: dict[str, object]) ->
     def _operation() -> dict[str, object]:
         job_id = _require_text(arguments.get("job_id"), field_name="job_id", max_length=_MAX_ID_LENGTH)
         confirmed = _coerce_bool(arguments.get("confirmed"), field_name="confirmed")  # AUDIT-FIX(#2): require an explicit confirmation bit instead of silently treating omission as a decline.
+        job_id = _ensure_confirm_activation_job_ready(owner, job_id=job_id)
         activation = _resolve_activation_service(owner).confirm_activation(job_id=job_id, confirmed=confirmed)
         activation_skill_id = getattr(activation, "skill_id", None)  # AUDIT-FIX(#4): telemetry and audit logging must tolerate partial activation payloads.
         activation_version = getattr(activation, "version", None)
@@ -313,109 +296,6 @@ def handle_run_self_coding_skill_sensor(owner: Any, arguments: dict[str, object]
     return _run_tool_call(owner, "run_self_coding_skill_sensor", _operation)
 
 
-def ensure_self_coding_runtime(owner: Any) -> _SelfCodingRuntime:
-    """Build and cache the focused self-coding helpers on one runtime owner."""
-
-    with _SELF_CODING_RUNTIME_LOCK:
-        config = _require_owner_config(owner)
-        runtime_signature = _runtime_signature(config)
-        cached_runtime_signature = getattr(owner, "_self_coding_runtime_signature", None)
-
-        store = getattr(owner, "_self_coding_store", None)
-        if runtime_signature != cached_runtime_signature or not isinstance(store, SelfCodingStore):
-            store = SelfCodingStore.from_config(config)
-
-        registry = getattr(owner, "_self_coding_capability_registry", None)
-        if runtime_signature != cached_runtime_signature or not isinstance(registry, SelfCodingCapabilityRegistry):
-            registry = SelfCodingCapabilityRegistry.from_config(config)
-
-        checker = getattr(owner, "_self_coding_feasibility_checker", None)
-        if not isinstance(checker, SelfCodingFeasibilityChecker) or _get_dependency(checker, "registry") is not registry:
-            checker = SelfCodingFeasibilityChecker(registry)
-
-        dialogue = getattr(owner, "_self_coding_requirements_dialogue", None)
-        if not isinstance(dialogue, SelfCodingRequirementsDialogue):
-            dialogue = SelfCodingRequirementsDialogue()
-
-        compile_worker = getattr(owner, "_self_coding_compile_worker", None)
-        if not isinstance(compile_worker, SelfCodingCompileWorker) or _get_dependency(compile_worker, "store") is not store:
-            compile_worker = SelfCodingCompileWorker(store=store)
-
-        automation_store = getattr(owner, "_self_coding_automation_store", None)
-        if runtime_signature != cached_runtime_signature or not isinstance(automation_store, AutomationStore):
-            automation_store = AutomationStore(
-                config.automation_store_path,
-                timezone_name=config.local_timezone_name,
-                max_entries=config.automation_max_entries,
-            )
-
-        activation_service = getattr(owner, "_self_coding_activation_service", None)
-        if (
-            not isinstance(activation_service, SelfCodingActivationService)
-            or _get_dependency(activation_service, "store") is not store
-            or _get_dependency(activation_service, "automation_store") is not automation_store
-        ):
-            activation_service = SelfCodingActivationService(store=store, automation_store=automation_store)
-
-        health_service = getattr(owner, "_self_coding_health_service", None)
-        if (
-            not isinstance(health_service, SelfCodingHealthService)
-            or _get_dependency(health_service, "store") is not store
-            or _get_dependency(health_service, "activation_service") is not activation_service
-        ):
-            health_service = SelfCodingHealthService(store=store, activation_service=activation_service)
-
-        skill_execution_service = getattr(owner, "_self_coding_skill_execution_service", None)
-        if (
-            not isinstance(skill_execution_service, SelfCodingSkillExecutionService)
-            or _get_dependency(skill_execution_service, "store") is not store
-            or _get_dependency(skill_execution_service, "health_service") is not health_service
-        ):
-            skill_execution_service = SelfCodingSkillExecutionService(store=store, health_service=health_service)
-
-        flow = getattr(owner, "_self_coding_learning_flow", None)
-        if (
-            not isinstance(flow, SelfCodingLearningFlow)
-            or _get_dependency(flow, "store") is not store
-            or _get_dependency(flow, "checker") is not checker
-            or _get_dependency(flow, "dialogue") is not dialogue
-            or _get_dependency(flow, "compile_worker") is not compile_worker
-        ):
-            flow = SelfCodingLearningFlow(store=store, checker=checker, dialogue=dialogue, compile_worker=compile_worker)
-
-        setattr(owner, "_self_coding_runtime_signature", runtime_signature)
-        setattr(owner, "_self_coding_store", store)
-        setattr(owner, "_self_coding_capability_registry", registry)
-        setattr(owner, "_self_coding_feasibility_checker", checker)
-        setattr(owner, "_self_coding_requirements_dialogue", dialogue)
-        setattr(owner, "_self_coding_compile_worker", compile_worker)
-        setattr(owner, "_self_coding_automation_store", automation_store)
-        setattr(owner, "_self_coding_activation_service", activation_service)
-        setattr(owner, "_self_coding_health_service", health_service)
-        setattr(owner, "_self_coding_skill_execution_service", skill_execution_service)
-        setattr(owner, "_self_coding_learning_flow", flow)
-        return {
-            "store": store,
-            "registry": registry,
-            "checker": checker,
-            "dialogue": dialogue,
-            "compile_worker": compile_worker,
-            "automation_store": automation_store,
-            "activation_service": activation_service,
-            "health_service": health_service,
-            "skill_execution_service": skill_execution_service,
-            "flow": flow,
-        }
-
-
-def _resolve_learning_flow(owner: Any) -> SelfCodingLearningFlow:
-    return ensure_self_coding_runtime(owner)["flow"]
-
-
-def _resolve_activation_service(owner: Any) -> SelfCodingActivationService:
-    return ensure_self_coding_runtime(owner)["activation_service"]
-
-
 def _learning_update_payload(update: Any) -> dict[str, object]:
     feasibility = getattr(update, "feasibility", None)
     if feasibility is None:
@@ -531,6 +411,7 @@ def _require_string_list(
 ) -> list[str]:
     if raw_value is None:
         return []
+    raw_items: Sequence[object]
     if isinstance(raw_value, (str, bytes, bytearray)):
         raw_items = (raw_value,)
     elif isinstance(raw_value, (list, tuple)):
@@ -696,63 +577,6 @@ def _remaining_questions(session: Any) -> int:
     return max(0, _DEFAULT_REMAINING_QUESTIONS - answered)
 
 
-def _require_owner_config(owner: Any) -> Any:
-    config = getattr(owner, "config", None)
-    if config is None:
-        raise RuntimeError("owner config is not available")
-    return config
-
-
-def _runtime_signature(config: Any) -> tuple[object, ...]:  # AUDIT-FIX(#6): broaden runtime cache invalidation beyond a tiny fixed config subset.
-    raw_state = getattr(config, "__dict__", None)
-    if isinstance(raw_state, Mapping):
-        items = tuple(
-            (key, raw_state[key])
-            for key in sorted(raw_state)
-            if not str(key).startswith("_")
-        )[:_MAX_RUNTIME_SIGNATURE_ITEMS]
-        return (type(config), tuple((str(key), _freeze_signature_value(value, depth=0)) for key, value in items))  # AUDIT-FIX(#6): fingerprint public config values so in-place updates rebuild runtime helpers.
-    return (
-        type(config),
-        getattr(config, "automation_store_path", None),
-        getattr(config, "local_timezone_name", None),
-        getattr(config, "automation_max_entries", None),
-    )
-
-
-def _freeze_signature_value(raw_value: object, *, depth: int) -> object:  # AUDIT-FIX(#6): create a bounded, hashable fingerprint for public config values.
-    if depth >= _MAX_JSON_DEPTH:
-        return "<max-depth>"  # AUDIT-FIX(#6): cap recursive config fingerprinting to predictable cost on RPi.
-    if raw_value is None or isinstance(raw_value, (bool, int, str)):
-        return raw_value
-    if isinstance(raw_value, float):
-        return raw_value if math.isfinite(raw_value) else "<non-finite-float>"
-    if isinstance(raw_value, (bytes, bytearray)):
-        return _internal_text(raw_value, max_length=_MAX_RUNTIME_SIGNATURE_REPR_LENGTH)
-    if isinstance(raw_value, Mapping):
-        items = []
-        for index, (key, value) in enumerate(sorted(raw_value.items(), key=lambda item: str(item[0]))):
-            if index >= _MAX_MAPPING_ENTRIES:
-                break
-            items.append((str(key), _freeze_signature_value(value, depth=depth + 1)))
-        return tuple(items)
-    if isinstance(raw_value, (list, tuple, set, frozenset)):
-        values: list[object] = []
-        for index, value in enumerate(raw_value):
-            if index >= _MAX_LIST_ITEMS:
-                break
-            values.append(_freeze_signature_value(value, depth=depth + 1))
-        return tuple(values)
-    return _safe_repr(raw_value, max_length=_MAX_RUNTIME_SIGNATURE_REPR_LENGTH)  # AUDIT-FIX(#6): fallback to a bounded representation for exotic config values without crashing fingerprint generation.
-
-
-def _get_dependency(instance: object, attribute_name: str) -> object:
-    try:
-        return getattr(instance, attribute_name)
-    except Exception:
-        return object()
-
-
 def _enum_value(raw_value: object) -> str:
     value = getattr(raw_value, "value", raw_value)
     return _safe_stringify(value, max_length=_MAX_TEXT_LENGTH).strip()
@@ -882,14 +706,6 @@ def _truncate_text(text: str, max_length: int) -> str:
     return normalized[:max_length]
 
 
-def _safe_repr(raw_value: object, *, max_length: int) -> str:  # AUDIT-FIX(#6): fingerprint exotic config values without letting repr() failures bubble.
-    try:
-        text = repr(raw_value)
-    except Exception:
-        text = f"<unrepresentable:{type(raw_value).__name__}>"
-    return _truncate_text(text, max_length)
-
-
 def _safe_stringify(raw_value: object, *, max_length: int) -> str:  # AUDIT-FIX(#7): protect telemetry from broken __str__ implementations and falsey-value loss.
     if raw_value is None:
         return ""
@@ -909,10 +725,13 @@ def _safe_stringify(raw_value: object, *, max_length: int) -> str:  # AUDIT-FIX(
 
 
 def _safe_emit(owner: Any, event: str) -> None:
-    try:
-        owner.emit(event)
-    except Exception as exc:
-        _LOGGER.debug("self-coding telemetry emit failed: %s", type(exc).__name__)
+    emit_best_effort(
+        owner,
+        event,
+        logger=_LOGGER,
+        failure_message="self-coding telemetry emit failed.",
+        failure_log_level="debug",
+    )
 
 
 def _safe_emit_kv(owner: Any, key: str, value: object) -> None:
@@ -921,7 +740,12 @@ def _safe_emit_kv(owner: Any, key: str, value: object) -> None:
 
 
 def _safe_record_event(owner: Any, event_name: str, description: str, **payload: object) -> None:
-    try:
-        owner._record_event(event_name, description, **payload)
-    except Exception as exc:
-        _LOGGER.debug("self-coding event recording failed: %s", type(exc).__name__)
+    record_event_best_effort(
+        owner,
+        event_name,
+        description,
+        dict(payload),
+        logger=_LOGGER,
+        failure_message="self-coding event recording failed.",
+        failure_log_level="debug",
+    )

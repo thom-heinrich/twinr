@@ -26,13 +26,17 @@ from twinr.orchestrator.contracts import (
     OrchestratorTurnRequest,
 )
 from twinr.orchestrator.session import EdgeOrchestratorSession, RemoteToolBridge
+from twinr.orchestrator.remote_asr_service import (
+    RemoteAsrHttpService,
+    remote_asr_url_targets_local_orchestrator,
+)
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceHelloRequest,
     OrchestratorVoiceRuntimeStateEvent,
 )
-from twinr.orchestrator.voice_gateway_policy import (
+from twinr.orchestrator.voice_gateway_guardrails import (
     assert_transcript_first_voice_gateway_contract,
 )
 from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
@@ -88,16 +92,28 @@ class EdgeOrchestratorServer:
             project_root=Path(self.config.project_root),
             service="EdgeOrchestratorVoiceServer",
         )
+        self._remote_asr_service = (
+            RemoteAsrHttpService(self.config, forensics=self._voice_forensics)
+            if remote_asr_url_targets_local_orchestrator(self.config)
+            else None
+        )
 
     def create_app(self) -> FastAPI:
         """Build the FastAPI application that exposes the orchestrator socket."""
 
-        app = FastAPI(title="Twinr Orchestrator", version="0.1.0")
         server = self
 
-        @app.on_event("shutdown")
-        async def _shutdown_forensics() -> None:
-            server._voice_forensics.close()
+        @contextlib.asynccontextmanager
+        async def _app_lifespan(_app: FastAPI):
+            try:
+                yield
+            finally:
+                await _best_effort_close(server._remote_asr_service, label="remote ASR service")
+                await _best_effort_close(server._voice_forensics, label="voice orchestrator forensics")
+
+        app = FastAPI(title="Twinr Orchestrator", version="0.1.0", lifespan=_app_lifespan)
+        if server._remote_asr_service is not None:
+            app.include_router(server._remote_asr_service.build_router())
 
         @app.websocket("/ws/orchestrator")
         async def orchestrator_socket(websocket: WebSocket) -> None:
@@ -394,8 +410,9 @@ async def _sender_loop(
 def create_app(env_file: str | Path) -> FastAPI:
     """Load Twinr config from disk and build the orchestrator FastAPI app."""
 
-    config = TwinrConfig.from_env(Path(env_file))
-    assert_transcript_first_voice_gateway_contract(config)
+    env_path = Path(env_file)
+    config = TwinrConfig.from_env(env_path)
+    assert_transcript_first_voice_gateway_contract(config, env_file=str(env_path))
     return EdgeOrchestratorServer(config).create_app()
 
 

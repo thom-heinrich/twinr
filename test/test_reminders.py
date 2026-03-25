@@ -58,6 +58,26 @@ class ReminderStoreTests(unittest.TestCase):
         self.assertIsNotNone(delivered.delivered_at)
         self.assertTrue(delivered.delivered)
 
+    def test_release_reservation_clears_retry_delay_without_marking_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "reminders.json"
+            store = ReminderStore(path, timezone_name="Europe/Berlin", retry_delay_s=30.0)
+            due_at = (now_in_timezone("Europe/Berlin") + timedelta(seconds=1)).isoformat()
+            created = store.schedule(due_at=due_at, summary="Wasser trinken")
+
+            reserved = store.reserve_due(now=created.due_at + timedelta(seconds=1))
+            released = store.release_reservation(
+                created.reminder_id,
+                released_at=created.due_at + timedelta(seconds=2),
+            )
+            peeked = store.peek_due(now=created.due_at + timedelta(seconds=2), limit=1)
+
+        self.assertEqual(len(reserved), 1)
+        self.assertFalse(released.delivered)
+        self.assertIsNone(released.next_attempt_at)
+        self.assertEqual(len(peeked), 1)
+        self.assertEqual(peeked[0].reminder_id, created.reminder_id)
+
     def test_render_context_lists_pending_reminders(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "reminders.json"

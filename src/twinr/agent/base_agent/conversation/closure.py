@@ -11,11 +11,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from threading import Event, Thread
-import inspect
 import json
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.decision_core import (
+    coerce_probability as _coerce_probability,
+    coerce_text as _coerce_text,
+    compact_conversation as _compact_conversation,
+    config_float as _config_float,
+    config_int as _config_int,
+    detect_provider_timeout_kwarg,
+    extract_json_object as _extract_json_object,
+)
 from twinr.agent.base_agent.contracts import (
     ConversationClosureProvider,
     ConversationClosureProviderDecision,
@@ -24,14 +32,6 @@ from twinr.agent.base_agent.contracts import (
 )
 from twinr.agent.base_agent.prompting.personality import load_conversation_closure_instructions
 from twinr.agent.personality.steering import ConversationTurnSteeringCue, serialize_turn_steering_cues
-from twinr.agent.base_agent.conversation.turn_controller import (
-    _coerce_probability,
-    _coerce_text,
-    _compact_conversation,
-    _config_float,
-    _config_int,
-    _extract_json_object,
-)
 
 _DEFAULT_CONTEXT_TURNS = 4
 _DEFAULT_MAX_TRANSCRIPT_CHARS = 512
@@ -323,7 +323,7 @@ class ToolCallingConversationClosureEvaluator(_ConversationClosureEvaluatorBase)
     ) -> None:
         super().__init__(config=config)
         self.provider = provider
-        self._provider_timeout_kwarg_name = self._detect_provider_timeout_kwarg()
+        self._provider_timeout_kwarg_name = detect_provider_timeout_kwarg(self.provider.start_turn_streaming)
 
     def evaluate(
         self,
@@ -368,7 +368,7 @@ class ToolCallingConversationClosureEvaluator(_ConversationClosureEvaluatorBase)
         response = self._call_with_watchdog(
             timeout_seconds=timeout_seconds,
             target_name="closure-evaluator",
-            call=lambda: self.provider.start_turn_streaming(
+            call=lambda: cast(Any, self.provider.start_turn_streaming)(
                 prompt,
                 conversation=compact_conversation,
                 instructions=load_conversation_closure_instructions(self.config),
@@ -389,21 +389,6 @@ class ToolCallingConversationClosureEvaluator(_ConversationClosureEvaluatorBase)
             return self._coerce_decision(payload)
         payload = _extract_json_object(getattr(response, "text", "")) or {}
         return self._coerce_decision(payload)
-
-    def _detect_provider_timeout_kwarg(self) -> str | None:
-        try:
-            signature = inspect.signature(self.provider.start_turn_streaming)
-        except (TypeError, ValueError):
-            return None
-        parameter_names = set(signature.parameters)
-        if "timeout_seconds" in parameter_names:
-            return "timeout_seconds"
-        if "timeout" in parameter_names:
-            return "timeout"
-        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
-            return "timeout_seconds"
-        return None
-
 
 class StructuredConversationClosureEvaluator(_ConversationClosureEvaluatorBase):
     """Ask a structured decision provider for one fast closure decision."""

@@ -10,6 +10,13 @@ import math
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import (
+    current_workflow_forensics,
+    current_workflow_trace_id,
+    workflow_decision,
+    workflow_event,
+    workflow_span,
+)
 
 from .config import AICameraAdapterConfig, MediaPipeVisionConfig
 from .detection import DetectionResult, capture_detection
@@ -289,22 +296,11 @@ class LocalAICameraAdapter:
                     runtime,
                     observed_at=observed_at,
                 )
-            detection, face_anchors = self._supplement_visible_persons_with_face_anchors(
+            observation = self._build_attention_observation_locked(
                 detection=detection,
                 frame_rgb=frame_rgb,
-            )
-            observation = self._compose_observation(
                 observed_at=observed_at,
                 observed_monotonic=observed_monotonic,
-                detection=detection,
-                pose=None,
-                pose_error=None,
-                face_anchors=face_anchors,
-            )
-            self._last_attention_debug_details = self._build_attention_debug_details(
-                detection=detection,
-                observation=observation,
-                face_anchors=face_anchors,
             )
             return self._with_health(
                 observation,
@@ -325,6 +321,69 @@ class LocalAICameraAdapter:
             }
             return self._health_only_observation(
                 observed_at=observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_attention_from_frame(
+        self,
+        *,
+        detection: Any,
+        frame_rgb: Any | None,
+        observed_at: float | None = None,
+        frame_at: float | None = None,
+    ) -> AICameraObservation:
+        """Process one externally supplied frame plus person boxes for fast attention.
+
+        This entrypoint lets the main Pi reuse the same bounded attention logic
+        even when the physical camera lives on a helper Pi. The caller provides
+        the IMX500-style detection facts plus the matching RGB frame; the
+        adapter keeps motion caches, face-anchor supplementation, and debug
+        payloads local to the main runtime.
+        """
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        resolved_observed_at = self._coerce_observed_at(observed_at)
+        resolved_frame_at = resolved_observed_at if frame_at is None else self._coerce_observed_at(frame_at)
+        observed_monotonic = self._monotonic_now()
+        try:
+            observation = self._build_attention_observation_locked(
+                detection=self._coerce_detection_result(detection),
+                frame_rgb=frame_rgb,
+                observed_at=resolved_observed_at,
+                observed_monotonic=observed_monotonic,
+            )
+            return self._with_health(
+                observation,
+                online=True,
+                ready=True,
+                ai_ready=True,
+                error=None,
+                frame_at=resolved_frame_at,
+            )
+        except Exception as exc:  # pragma: no cover - transport/runtime coupling is environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("External AI camera attention observation failed with %s.", code)
+            logger.debug("External AI camera attention observation exception details.", exc_info=True)
+            self._last_attention_debug_details = {
+                "mode": "attention_fast",
+                "pipeline_error": code,
+                "attention_pipeline_note": "attention_fast_path_skips_pose_and_hand_inference",
+            }
+            return self._health_only_observation(
+                observed_at=resolved_observed_at,
                 online=True,
                 ready=False,
                 ai_ready=False,
@@ -354,207 +413,132 @@ class LocalAICameraAdapter:
         observed_at = self._now()
         observed_monotonic = self._monotonic_now()
         try:
-            try:
-                runtime = self._load_detection_runtime()
-            except Exception as exc:  # pragma: no cover - depends on local environment.
-                code = self._classify_error(exc)
-                logger.warning("Local AI camera gesture runtime load failed with %s.", code)
-                logger.debug("Local AI camera gesture runtime load exception details.", exc_info=True)
-                self._safe_close_live_gesture_pipeline_locked()
-                self._safe_close_runtime_locked()
-                return self._health_only_observation(
-                    observed_at=observed_at,
-                    online=False,
-                    ready=False,
-                    ai_ready=False,
-                    error=code,
-                )
-            online_error = self._probe_online(runtime)
-            if online_error is not None:
-                logger.warning("Local AI camera gesture online probe failed with %s.", online_error)
-                self._last_gesture_debug_details = {
-                    "resolved_source": "camera_offline",
-                    "pipeline_error": online_error,
-                }
-                return self._health_only_observation(
-                    observed_at=observed_at,
-                    online=False,
-                    ready=False,
-                    ai_ready=False,
-                    error=online_error,
-                )
-            try:
-                detection = self._coerce_detection_result(
-                    self._capture_detection(runtime, observed_at=observed_at)
-                )
-                frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
-                face_anchors = self._detect_face_anchors_for_gesture(
-                    detection=detection,
-                    frame_rgb=frame_rgb,
-                )
-                gesture_targets = self._resolve_gesture_person_targets(
-                    detection=detection,
-                    face_anchors=face_anchors,
-                )
-                gesture_detection = self._gesture_detection_result(
-                    detection=detection,
-                    targets=gesture_targets,
-                )
-                sparse_keypoints, pose_hint_source, pose_hint_confidence = self._resolve_gesture_pose_hints(
+            with workflow_span(
+                name="camera_adapter_observe_gesture",
+                kind="io",
+                details={"observed_at": round(float(observed_at), 6)},
+            ):
+                try:
+                    with workflow_span(
+                        name="camera_adapter_gesture_load_runtime",
+                        kind="io",
+                    ):
+                        runtime = self._load_detection_runtime()
+                except Exception as exc:  # pragma: no cover - depends on local environment.
+                    code = self._classify_error(exc)
+                    logger.warning("Local AI camera gesture runtime load failed with %s.", code)
+                    logger.debug("Local AI camera gesture runtime load exception details.", exc_info=True)
+                    workflow_event(
+                        kind="exception",
+                        msg="camera_adapter_gesture_runtime_load_failed",
+                        level="ERROR",
+                        details={"error_type": type(exc).__name__, "error_code": code},
+                    )
+                    self._safe_close_live_gesture_pipeline_locked()
+                    self._safe_close_runtime_locked()
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=code,
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_online_probe",
+                    kind="io",
+                ):
+                    online_error = self._probe_online(runtime)
+                if online_error is not None:
+                    logger.warning("Local AI camera gesture online probe failed with %s.", online_error)
+                    workflow_event(
+                        kind="branch",
+                        msg="camera_adapter_gesture_camera_offline",
+                        details={"online_error": online_error},
+                        reason={
+                            "selected": {
+                                "id": "camera_offline",
+                                "justification": "The adapter online probe failed, so the gesture lane must fail closed for this frame.",
+                                "expected_outcome": "Return a health-only observation without running gesture inference.",
+                            },
+                            "options": [
+                                {"id": "camera_online", "summary": "Continue with gesture inference."},
+                                {"id": "camera_offline", "summary": "Return a health-only observation."},
+                            ],
+                            "confidence": "forensic",
+                            "guardrails": ["camera_online_required"],
+                            "kpi_impact_estimate": {"latency": "low", "gesture_output": "none"},
+                        },
+                    )
+                    self._last_gesture_debug_details = {
+                        "resolved_source": "camera_offline",
+                        "pipeline_error": online_error,
+                    }
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=online_error,
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_capture_detection",
+                    kind="io",
+                ):
+                    detection = self._coerce_detection_result(
+                        self._capture_detection(runtime, observed_at=observed_at)
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_capture_rgb",
+                    kind="io",
+                ):
+                    frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+                return self._build_gesture_observation_locked(
                     runtime=runtime,
                     observed_at=observed_at,
                     observed_monotonic=observed_monotonic,
-                    detection=gesture_detection,
+                    detection=detection,
                     frame_rgb=frame_rgb,
+                    frame_at=observed_at,
                 )
-                gesture_pipeline = self._ensure_live_gesture_pipeline()
-                gesture_observation = gesture_pipeline.observe(
-                    frame_rgb=frame_rgb,
-                    observed_at=observed_at,
-                    primary_person_box=gesture_targets.primary_person_box,
-                    visible_person_boxes=gesture_targets.visible_person_boxes,
-                    person_count=gesture_targets.person_count,
-                    sparse_keypoints=sparse_keypoints,
-                )
-                gesture_debug = gesture_pipeline.debug_snapshot()
-                pose_fallback, pose_fallback_error = self._resolve_gesture_pose_fallback(
-                    runtime,
-                    observed_at=observed_at,
-                    observed_monotonic=observed_monotonic,
-                    detection=gesture_detection,
-                    frame_rgb=frame_rgb,
-                    gesture_observation=gesture_observation,
-                )
-                final_resolved_source = str(gesture_debug.get("resolved_source", "none") or "none")
-                if pose_fallback is not None and final_resolved_source == "none":
-                    if pose_fallback.fine_hand_gesture != AICameraFineHandGesture.NONE:
-                        final_resolved_source = "mediapipe_pose_fallback"
-                    elif pose_fallback.gesture_event != AICameraGestureEvent.NONE:
-                        final_resolved_source = "mediapipe_pose_event_fallback"
-                self._last_gesture_debug_details = {
-                    **gesture_debug,
-                    "live_fine_hand_gesture": gesture_observation.fine_hand_gesture.value,
-                    "live_fine_hand_gesture_confidence": (
-                        None
-                        if gesture_observation.fine_hand_gesture_confidence is None
-                        else round(float(gesture_observation.fine_hand_gesture_confidence), 3)
-                    ),
-                    "live_gesture_event": gesture_observation.gesture_event.value,
-                    "live_gesture_confidence": (
-                        None
-                        if gesture_observation.gesture_confidence is None
-                        else round(float(gesture_observation.gesture_confidence), 3)
-                    ),
-                    "pose_hint_source": pose_hint_source,
-                    "pose_hint_confidence": (
-                        None if pose_hint_confidence is None else round(float(pose_hint_confidence), 3)
-                    ),
-                    "pose_fallback_used": pose_fallback is not None,
-                    "pose_fallback_error": pose_fallback_error,
-                    "pose_fallback_fine_hand_gesture": (
-                        None if pose_fallback is None else pose_fallback.fine_hand_gesture.value
-                    ),
-                    "pose_fallback_fine_hand_gesture_confidence": (
-                        None
-                        if pose_fallback is None or pose_fallback.fine_hand_gesture_confidence is None
-                        else round(float(pose_fallback.fine_hand_gesture_confidence), 3)
-                    ),
-                    "pose_fallback_gesture_event": (
-                        None if pose_fallback is None else pose_fallback.gesture_event.value
-                    ),
-                    "pose_fallback_gesture_confidence": (
-                        None
-                        if pose_fallback is None or pose_fallback.gesture_confidence is None
-                        else round(float(pose_fallback.gesture_confidence), 3)
-                    ),
-                    "final_resolved_source": final_resolved_source,
-                    "detection_person_count": detection.person_count,
-                    "detection_primary_person_zone": detection.primary_person_zone.value,
-                    "detection_visible_person_count": len(detection.visible_persons),
-                    "detection_primary_person_box_available": detection.primary_person_box is not None,
-                    "gesture_target_source": gesture_targets.source,
-                    "gesture_target_face_anchor_state": gesture_targets.face_anchor_state,
-                    "gesture_target_face_anchor_count": gesture_targets.face_anchor_count,
-                    "gesture_target_person_count": gesture_targets.person_count,
-                    "gesture_target_primary_person_box_available": gesture_targets.primary_person_box is not None,
-                }
-                camera_metrics = self._runtime_manager.last_camera_metrics()
-                if camera_metrics:
-                    self._last_gesture_debug_details.update(camera_metrics)
-                capture_result = self._gesture_candidate_capture.maybe_capture(
-                    observed_at=observed_at,
-                    frame_rgb=frame_rgb,
-                    debug_details=self._last_gesture_debug_details,
-                )
-                self._last_gesture_debug_details.update(capture_result.debug_fields())
-            except Exception as exc:  # pragma: no cover - hardware-dependent path.
-                code = self._classify_error(exc)
-                logger.warning("Local AI camera live gesture observation failed with %s.", code)
-                logger.debug("Local AI camera live gesture exception details.", exc_info=True)
-                self._last_gesture_debug_details = {
-                    "resolved_source": "pipeline_error",
-                    "pipeline_error": code,
-                }
-                self._safe_close_live_gesture_pipeline_locked()
-                self._safe_close_runtime_locked()
-                return self._health_only_observation(
-                    observed_at=observed_at,
-                    online=True,
-                    ready=False,
-                    ai_ready=False,
-                    error=code,
-                )
+        finally:
+            self._lock.release()
 
-            fine_hand_gesture = gesture_observation.fine_hand_gesture
-            fine_hand_gesture_confidence = gesture_observation.fine_hand_gesture_confidence
-            gesture_event = gesture_observation.gesture_event
-            gesture_confidence = gesture_observation.gesture_confidence
-            hand_or_object_near_camera = gesture_observation.hand_count > 0
-            showing_intent_likely = (
-                True
-                if gesture_observation.hand_count > 0
-                or fine_hand_gesture != AICameraFineHandGesture.NONE
-                or gesture_event != AICameraGestureEvent.NONE
-                else None
-            )
-            model_name = "local-imx500+mediapipe-live-gesture"
-            if pose_fallback is not None:
-                if fine_hand_gesture == AICameraFineHandGesture.NONE and pose_fallback.fine_hand_gesture != AICameraFineHandGesture.NONE:
-                    fine_hand_gesture = pose_fallback.fine_hand_gesture
-                    fine_hand_gesture_confidence = pose_fallback.fine_hand_gesture_confidence
-                    model_name = "local-imx500+mediapipe-live-gesture+pose-fallback"
-                if gesture_event == AICameraGestureEvent.NONE and pose_fallback.gesture_event != AICameraGestureEvent.NONE:
-                    gesture_event = pose_fallback.gesture_event
-                    gesture_confidence = pose_fallback.gesture_confidence
-                    model_name = "local-imx500+mediapipe-live-gesture+pose-fallback"
-                hand_or_object_near_camera = hand_or_object_near_camera or bool(pose_fallback.hand_near_camera)
-                if showing_intent_likely is None and pose_fallback.showing_intent_likely is not None:
-                    showing_intent_likely = pose_fallback.showing_intent_likely
+    def observe_gesture_from_frame(
+        self,
+        *,
+        detection: Any,
+        frame_rgb: Any,
+        observed_at: float | None = None,
+        frame_at: float | None = None,
+    ) -> AICameraObservation:
+        """Run the hot gesture lane on an externally supplied RGB frame.
 
-            observation = AICameraObservation(
-                observed_at=observed_at,
-                camera_online=True,
-                camera_ready=True,
-                camera_ai_ready=True,
-                person_count=detection.person_count,
-                primary_person_box=detection.primary_person_box,
-                primary_person_zone=detection.primary_person_zone,
-                visible_persons=detection.visible_persons,
-                hand_or_object_near_camera=hand_or_object_near_camera,
-                showing_intent_likely=showing_intent_likely,
-                gesture_event=gesture_event,
-                gesture_confidence=gesture_confidence,
-                fine_hand_gesture=fine_hand_gesture,
-                fine_hand_gesture_confidence=fine_hand_gesture_confidence,
-                model=model_name,
-            )
-            return self._with_health(
-                observation,
+        The helper Pi can provide the RGB frame and IMX500 person boxes while
+        the main Pi executes the expensive MediaPipe gesture work locally. This
+        preserves the existing gesture heuristics and caches without requiring
+        local camera hardware on the main board.
+        """
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
                 online=True,
-                ready=True,
-                ai_ready=True,
-                error=None,
-                frame_at=observed_at,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        resolved_observed_at = self._coerce_observed_at(observed_at)
+        resolved_frame_at = resolved_observed_at if frame_at is None else self._coerce_observed_at(frame_at)
+        observed_monotonic = self._monotonic_now()
+        try:
+            return self._build_gesture_observation_locked(
+                runtime={},
+                observed_at=resolved_observed_at,
+                observed_monotonic=observed_monotonic,
+                detection=self._coerce_detection_result(detection),
+                frame_rgb=frame_rgb,
+                frame_at=resolved_frame_at,
             )
         finally:
             self._lock.release()
@@ -662,6 +646,334 @@ class LocalAICameraAdapter:
         if camera_metrics:
             payload.update(camera_metrics)
         return payload
+
+    def _build_attention_observation_locked(
+        self,
+        *,
+        detection: DetectionResult,
+        frame_rgb: Any | None,
+        observed_at: float,
+        observed_monotonic: float,
+    ) -> AICameraObservation:
+        """Compose one fast attention observation from supplied detection/frame facts."""
+
+        detection, face_anchors = self._supplement_visible_persons_with_face_anchors(
+            detection=detection,
+            frame_rgb=frame_rgb,
+        )
+        observation = self._compose_observation(
+            observed_at=observed_at,
+            observed_monotonic=observed_monotonic,
+            detection=detection,
+            pose=None,
+            pose_error=None,
+            face_anchors=face_anchors,
+        )
+        self._last_attention_debug_details = self._build_attention_debug_details(
+            detection=detection,
+            observation=observation,
+            face_anchors=face_anchors,
+        )
+        return observation
+
+    def _build_gesture_observation_locked(
+        self,
+        *,
+        runtime: dict[str, Any],
+        observed_at: float,
+        observed_monotonic: float,
+        detection: DetectionResult,
+        frame_rgb: Any,
+        frame_at: float | None,
+    ) -> AICameraObservation:
+        """Run the dedicated gesture lane from one supplied detection/frame pair."""
+
+        try:
+            with workflow_span(
+                name="camera_adapter_gesture_face_anchor_detect",
+                kind="io",
+            ):
+                face_anchors = self._detect_face_anchors_for_gesture(
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                )
+            with workflow_span(
+                name="camera_adapter_gesture_target_resolution",
+                kind="decision",
+            ):
+                gesture_targets = self._resolve_gesture_person_targets(
+                    detection=detection,
+                    face_anchors=face_anchors,
+                )
+            workflow_decision(
+                msg="camera_adapter_gesture_target_selection",
+                question="Which visible person targets should the dedicated gesture lane trust for this frame?",
+                selected={
+                    "id": gesture_targets.source,
+                    "summary": "Use the resolved gesture target set for ROI-conditioned gesture recovery.",
+                },
+                options=[
+                    {"id": "imx500", "summary": "Use the direct IMX500 person boxes."},
+                    {"id": "face_anchor", "summary": "Use face-anchor-supplemented person boxes."},
+                    {"id": "none", "summary": "Proceed without a usable person target."},
+                ],
+                context={
+                    "detection_person_count": detection.person_count,
+                    "visible_person_count": len(detection.visible_persons),
+                    "gesture_target_person_count": gesture_targets.person_count,
+                    "face_anchor_state": gesture_targets.face_anchor_state,
+                    "face_anchor_count": gesture_targets.face_anchor_count,
+                },
+                confidence="forensic",
+                guardrails=["gesture_person_target_resolution"],
+                kpi_impact_estimate={"latency": "low", "roi_quality": "high"},
+            )
+            gesture_detection = self._gesture_detection_result(
+                detection=detection,
+                targets=gesture_targets,
+            )
+            with workflow_span(
+                name="camera_adapter_gesture_pose_hints",
+                kind="decision",
+            ):
+                sparse_keypoints, pose_hint_source, pose_hint_confidence = self._resolve_gesture_pose_hints(
+                    runtime=runtime,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=gesture_detection,
+                    frame_rgb=frame_rgb,
+                )
+            with workflow_span(
+                name="camera_adapter_gesture_live_pipeline",
+                kind="io",
+            ):
+                gesture_pipeline = self._ensure_live_gesture_pipeline()
+                gesture_observation = gesture_pipeline.observe(
+                    frame_rgb=frame_rgb,
+                    observed_at=observed_at,
+                    primary_person_box=gesture_targets.primary_person_box,
+                    visible_person_boxes=gesture_targets.visible_person_boxes,
+                    person_count=gesture_targets.person_count,
+                    sparse_keypoints=sparse_keypoints,
+                )
+                gesture_debug = gesture_pipeline.debug_snapshot()
+            with workflow_span(
+                name="camera_adapter_gesture_pose_fallback",
+                kind="decision",
+            ):
+                pose_fallback, pose_fallback_error = self._resolve_gesture_pose_fallback(
+                    runtime,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=gesture_detection,
+                    frame_rgb=frame_rgb,
+                    gesture_observation=gesture_observation,
+                )
+            final_resolved_source = str(gesture_debug.get("resolved_source", "none") or "none")
+            if (
+                pose_fallback is not None
+                and final_resolved_source == "none"
+                and pose_fallback.gesture_event != AICameraGestureEvent.NONE
+            ):
+                final_resolved_source = "mediapipe_pose_event_fallback"
+            active_workflow_forensics = current_workflow_forensics()
+            hand_count = max(0, int(getattr(gesture_observation, "hand_count", 0) or 0))
+            forensics_zero_signal_capture_requested = (
+                active_workflow_forensics is not None
+                and detection.person_count <= 0
+                and gesture_targets.person_count <= 0
+                and hand_count <= 0
+                and gesture_observation.fine_hand_gesture == AICameraFineHandGesture.NONE
+                and gesture_observation.gesture_event == AICameraGestureEvent.NONE
+                and final_resolved_source == "none"
+            )
+            self._last_gesture_debug_details = {
+                **gesture_debug,
+                "forensics_active": active_workflow_forensics is not None,
+                "forensics_run_id": (
+                    None if active_workflow_forensics is None else active_workflow_forensics.run_id
+                ),
+                "forensics_trace_id": current_workflow_trace_id(),
+                "forensics_zero_signal_capture_requested": forensics_zero_signal_capture_requested,
+                "live_fine_hand_gesture": gesture_observation.fine_hand_gesture.value,
+                "live_fine_hand_gesture_confidence": (
+                    None
+                    if gesture_observation.fine_hand_gesture_confidence is None
+                    else round(float(gesture_observation.fine_hand_gesture_confidence), 3)
+                ),
+                "live_gesture_event": gesture_observation.gesture_event.value,
+                "live_gesture_confidence": (
+                    None
+                    if gesture_observation.gesture_confidence is None
+                    else round(float(gesture_observation.gesture_confidence), 3)
+                ),
+                "live_hand_count": hand_count,
+                "pose_hint_source": pose_hint_source,
+                "pose_hint_confidence": (
+                    None if pose_hint_confidence is None else round(float(pose_hint_confidence), 3)
+                ),
+                "pose_fallback_used": pose_fallback is not None,
+                "pose_fallback_error": pose_fallback_error,
+                "pose_fallback_fine_hand_gesture": (
+                    None if pose_fallback is None else pose_fallback.fine_hand_gesture.value
+                ),
+                "pose_fallback_fine_hand_gesture_confidence": (
+                    None
+                    if pose_fallback is None or pose_fallback.fine_hand_gesture_confidence is None
+                    else round(float(pose_fallback.fine_hand_gesture_confidence), 3)
+                ),
+                "pose_fallback_gesture_event": (
+                    None if pose_fallback is None else pose_fallback.gesture_event.value
+                ),
+                "pose_fallback_gesture_confidence": (
+                    None
+                    if pose_fallback is None or pose_fallback.gesture_confidence is None
+                    else round(float(pose_fallback.gesture_confidence), 3)
+                ),
+                "final_resolved_source": final_resolved_source,
+                "detection_person_count": detection.person_count,
+                "detection_primary_person_zone": detection.primary_person_zone.value,
+                "detection_visible_person_count": len(detection.visible_persons),
+                "detection_primary_person_box_available": detection.primary_person_box is not None,
+                "gesture_target_source": gesture_targets.source,
+                "gesture_target_face_anchor_state": gesture_targets.face_anchor_state,
+                "gesture_target_face_anchor_count": gesture_targets.face_anchor_count,
+                "gesture_target_person_count": gesture_targets.person_count,
+                "gesture_target_primary_person_box_available": gesture_targets.primary_person_box is not None,
+            }
+            workflow_decision(
+                msg="camera_adapter_gesture_resolution",
+                question="Which gesture source should the adapter expose for this frame?",
+                selected={
+                    "id": final_resolved_source,
+                    "summary": "Expose the strongest bounded gesture source that survived the dedicated live pipeline.",
+                },
+                options=[
+                    {"id": "live_stream", "summary": "Use the direct live-stream recognizer result."},
+                    {"id": "person_roi", "summary": "Use one person-conditioned ROI hand result."},
+                    {"id": "visible_person_roi", "summary": "Use one visible-person ROI hand result."},
+                    {"id": "live_hand_roi", "summary": "Use one tight hand ROI recovered from live hand boxes."},
+                    {"id": "full_frame_hand_roi", "summary": "Use the final whole-frame hand rescue result."},
+                    {"id": "mediapipe_pose_event_fallback", "summary": "Use only the pose-event fallback path."},
+                    {"id": "none", "summary": "Expose no concrete gesture from this frame."},
+                ],
+                context={
+                    "live_fine_hand_gesture": gesture_observation.fine_hand_gesture.value,
+                    "live_fine_hand_confidence": self._last_gesture_debug_details["live_fine_hand_gesture_confidence"],
+                    "live_gesture_event": gesture_observation.gesture_event.value,
+                    "live_gesture_confidence": self._last_gesture_debug_details["live_gesture_confidence"],
+                    "pose_hint_source": pose_hint_source,
+                    "pose_hint_confidence": self._last_gesture_debug_details["pose_hint_confidence"],
+                    "pose_fallback_used": pose_fallback is not None,
+                    "pose_fallback_event": None if pose_fallback is None else pose_fallback.gesture_event.value,
+                    "person_count": detection.person_count,
+                },
+                confidence="forensic",
+                guardrails=["dedicated_gesture_lane"],
+                kpi_impact_estimate={"latency": "medium", "gesture_accuracy": "high"},
+            )
+            camera_metrics = self._runtime_manager.last_camera_metrics()
+            if camera_metrics:
+                self._last_gesture_debug_details.update(camera_metrics)
+            with workflow_span(
+                name="camera_adapter_gesture_candidate_capture",
+                kind="io",
+            ):
+                capture_result = self._gesture_candidate_capture.maybe_capture(
+                    observed_at=observed_at,
+                    frame_rgb=frame_rgb,
+                    debug_details=self._last_gesture_debug_details,
+                )
+            self._last_gesture_debug_details.update(capture_result.debug_fields())
+        except Exception as exc:  # pragma: no cover - hardware/runtime coupling is environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning(
+                "Local AI camera live gesture observation failed with %s.",
+                code,
+                exc_info=True,
+            )
+            workflow_event(
+                kind="exception",
+                msg="camera_adapter_gesture_pipeline_failed",
+                level="ERROR",
+                details={
+                    "error_type": type(exc).__name__,
+                    "error_code": code,
+                    "error_message": str(exc)[:240],
+                },
+            )
+            self._last_gesture_debug_details = {
+                "resolved_source": "pipeline_error",
+                "pipeline_error": code,
+                "pipeline_error_message": str(exc)[:240],
+            }
+            self._safe_close_live_gesture_pipeline_locked()
+            self._safe_close_runtime_locked()
+            return self._health_only_observation(
+                observed_at=observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+
+        fine_hand_gesture = gesture_observation.fine_hand_gesture
+        fine_hand_gesture_confidence = gesture_observation.fine_hand_gesture_confidence
+        gesture_event = gesture_observation.gesture_event
+        gesture_confidence = gesture_observation.gesture_confidence
+        hand_or_object_near_camera = gesture_observation.hand_count > 0
+        showing_intent_likely = (
+            True
+            if gesture_observation.hand_count > 0
+            or fine_hand_gesture != AICameraFineHandGesture.NONE
+            or gesture_event != AICameraGestureEvent.NONE
+            else None
+        )
+        model_name = "local-imx500+mediapipe-live-gesture"
+        if pose_fallback is not None:
+            if gesture_event == AICameraGestureEvent.NONE and pose_fallback.gesture_event != AICameraGestureEvent.NONE:
+                gesture_event = pose_fallback.gesture_event
+                gesture_confidence = pose_fallback.gesture_confidence
+                model_name = "local-imx500+mediapipe-live-gesture+pose-fallback"
+            hand_or_object_near_camera = hand_or_object_near_camera or bool(pose_fallback.hand_near_camera)
+            if showing_intent_likely is None and pose_fallback.showing_intent_likely is not None:
+                showing_intent_likely = pose_fallback.showing_intent_likely
+
+        observation = AICameraObservation(
+            observed_at=observed_at,
+            camera_online=True,
+            camera_ready=True,
+            camera_ai_ready=True,
+            person_count=detection.person_count,
+            primary_person_box=detection.primary_person_box,
+            primary_person_zone=detection.primary_person_zone,
+            visible_persons=detection.visible_persons,
+            hand_or_object_near_camera=hand_or_object_near_camera,
+            showing_intent_likely=showing_intent_likely,
+            gesture_event=gesture_event,
+            gesture_confidence=gesture_confidence,
+            fine_hand_gesture=fine_hand_gesture,
+            fine_hand_gesture_confidence=fine_hand_gesture_confidence,
+            model=model_name,
+        )
+        workflow_event(
+            kind="metric",
+            msg="camera_adapter_gesture_observation_ready",
+            details={
+                "model": model_name,
+                "fine_hand_gesture": fine_hand_gesture.value,
+                "gesture_event": gesture_event.value,
+                "hand_count": gesture_observation.hand_count,
+            },
+        )
+        return self._with_health(
+            observation,
+            online=True,
+            ready=True,
+            ai_ready=True,
+            error=None,
+            frame_at=frame_at,
+        )
 
     def _resolve_gesture_pose_fallback(
         self,
@@ -1011,6 +1323,19 @@ class LocalAICameraAdapter:
             raise RuntimeError("pose_people_missing")
         selected = candidates[0]
         return selected.raw_keypoints, selected.raw_score, selected.box
+
+    def _coerce_observed_at(self, value: float | None) -> float:
+        """Return one finite observation timestamp or fall back to the local clock."""
+
+        if value is None:
+            return self._now()
+        try:
+            observed_at = float(value)
+        except (TypeError, ValueError):
+            return self._now()
+        if not math.isfinite(observed_at):
+            return self._now()
+        return observed_at
 
     def _compose_observation(
         self,

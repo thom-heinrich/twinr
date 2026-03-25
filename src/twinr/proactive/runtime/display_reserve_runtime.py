@@ -9,7 +9,7 @@ different reserve-side effects.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -20,23 +20,7 @@ from twinr.display.ambient_impulse_cues import (
     DisplayAmbientImpulseCueStore,
 )
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
-
-
-def _utc_now() -> datetime:
-    """Return the current UTC wall clock."""
-
-    return datetime.now(timezone.utc)
-
-
-def _compact_text(value: object | None, *, max_len: int) -> str:
-    """Collapse one value into bounded single-line display text."""
-
-    if value is None:
-        return ""
-    compact = " ".join(str(value).split()).strip()
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
+from .display_reserve_support import compact_text, utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +88,7 @@ class DisplayReserveRuntimePublisher:
     ) -> DisplayReserveRuntimePublishResult:
         """Show one reserve-lane item and append one exposure history record."""
 
-        effective_now = (now or _utc_now()).astimezone(timezone.utc)
+        effective_now = (now or utc_now()).astimezone(timezone.utc)
         cue = self.controller.show_impulse(
             topic_key=request.topic_key,
             eyebrow=request.eyebrow,
@@ -122,7 +106,7 @@ class DisplayReserveRuntimePublisher:
         metadata: dict[str, object] = {"reason": request.reason, "candidate_family": request.candidate_family}
         if isinstance(request.metadata, Mapping):
             for raw_key, raw_value in request.metadata.items():
-                key = _compact_text(raw_key, max_len=80)
+                key = compact_text(raw_key, max_len=80)
                 if not key:
                     continue
                 metadata[key] = raw_value
@@ -157,7 +141,7 @@ class DisplayReserveRuntimePublisher:
         counted as a second shown-card exposure.
         """
 
-        effective_now = (now or _utc_now()).astimezone(timezone.utc)
+        effective_now = (now or utc_now()).astimezone(timezone.utc)
         cue = self.controller.show_impulse(
             topic_key=request.topic_key,
             eyebrow=request.eyebrow,
@@ -178,7 +162,7 @@ class DisplayReserveRuntimePublisher:
 
         anchors: list[str] = []
         for value in request.match_anchors:
-            compact = _compact_text(value, max_len=160)
+            compact = compact_text(value, max_len=160)
             if compact:
                 anchors.append(compact)
         return tuple(anchors[:8])

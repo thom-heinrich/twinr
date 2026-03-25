@@ -56,6 +56,55 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_identified_voice_guidance_allows_low_risk_discovery_without_identity_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.user_voice_status = "likely_user"
+                runtime.user_voice_confidence = 0.91
+                runtime.user_voice_checked_at = datetime.now(timezone.utc)
+
+                context = runtime.provider_conversation_context()
+
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "you do not need to ask who the person is again" in message.lower()
+                        and "low-risk guided user-discovery" in message.lower()
+                        for message in system_messages
+                    )
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_legacy_identified_voice_status_maps_to_likely_user_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.user_voice_status = "identified"
+                runtime.user_voice_confidence = 0.91
+                runtime.user_voice_checked_at = datetime.now(timezone.utc)
+
+                context = runtime.provider_conversation_context()
+
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "low-risk guided user-discovery" in message.lower()
+                        and "you do not need to ask who the person is again" in message.lower()
+                        for message in system_messages
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        "for persistent or security-sensitive changes, first ask for explicit confirmation"
+                        in message.lower()
+                        for message in system_messages
+                    )
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_snapshot_restore_normalizes_voice_timestamp_to_string(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
@@ -274,6 +323,46 @@ class RuntimeContextTests(unittest.TestCase):
 
                 self.assertIn(("user", "Letzte Frage"), provider_context)
                 self.assertIn(("user", "Letzte Frage"), tool_context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tool_provider_context_includes_active_user_discovery_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.manage_user_discovery(action="start_or_resume", topic_id="basics")
+
+                context = runtime.tool_provider_conversation_context()
+
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "Guided user-discovery state for this turn." in message
+                        and "Session state: active." in message
+                        and "Current discovery topic: Basisinfos." in message
+                        and "next discovery answer" in message
+                        and "review_profile plus replace_fact or delete_fact in the same turn" in message
+                        for message in system_messages
+                    )
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tool_provider_context_includes_idle_user_discovery_availability_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                context = runtime.tool_provider_conversation_context()
+
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "Guided user-discovery is available for this turn." in message
+                        and "start_or_resume or answer directly" in message
+                        and "Do not ask a separate save-permission question" in message
+                        for message in system_messages
+                    )
+                )
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

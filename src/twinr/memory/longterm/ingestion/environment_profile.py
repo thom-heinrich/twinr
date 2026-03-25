@@ -153,29 +153,6 @@ def _parse_source_event_datetime(event_id: str) -> datetime | None:
     return None
 
 
-def _quantile(values: Sequence[float], q: float) -> float:
-    """Return one bounded linear-interpolated quantile."""
-
-    if not values:
-        raise ValueError("values must not be empty.")
-    if len(values) == 1:
-        return float(values[0])
-    ordered = sorted(float(value) for value in values)
-    position = max(0.0, min(1.0, q)) * (len(ordered) - 1)
-    lower_index = int(math.floor(position))
-    upper_index = int(math.ceil(position))
-    if lower_index == upper_index:
-        return ordered[lower_index]
-    weight = position - lower_index
-    return ordered[lower_index] + ((ordered[upper_index] - ordered[lower_index]) * weight)
-
-
-def _iqr(values: Sequence[float]) -> float:
-    """Return the interquartile range for one non-empty sample."""
-
-    return _quantile(values, 0.75) - _quantile(values, 0.25)
-
-
 def _ewma(values: Sequence[float], *, alpha: float = 0.35) -> float:
     """Return one simple exponentially weighted moving average."""
 

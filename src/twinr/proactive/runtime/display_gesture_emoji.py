@@ -4,6 +4,10 @@ This module keeps gesture-to-emoji acknowledgement policy separate from the
 main proactive monitor orchestration. It listens only to stabilized rising-edge
 camera gesture events and publishes a short-lived right-hand HDMI emoji cue
 without touching the face channel.
+
+The dedicated live HDMI path intentionally mirrors only the three user-facing
+symbols Twinr currently needs to make maximally robust on the Pi:
+`thumbs_up`, `thumbs_down`, and `peace_sign`.
 """
 
 from __future__ import annotations
@@ -24,39 +28,18 @@ _SOURCE = "proactive_gesture_ack"
 _DEFAULT_HOLD_SECONDS = 2.8
 _COARSE_GESTURE_EVENT_NAMES = frozenset({"camera.gesture_detected", "camera.coarse_arm_gesture_detected"})
 _FINE_GESTURE_EVENT_NAME = "camera.fine_hand_gesture_detected"
-_MOTION_COARSE_GESTURES = frozenset(
-    {
-        SocialGestureEvent.WAVE,
-        SocialGestureEvent.DISMISS,
-        SocialGestureEvent.TWO_HAND_DISMISS,
-    }
-)
+_MOTION_COARSE_GESTURES: frozenset[SocialGestureEvent] = frozenset()
 _MOTION_GESTURE_DOMINANCE_WINDOW_S = 1.0
 _MIN_REFRESH_INTERVAL_S = 0.1
-_CUSTOM_ONLY_FINE_GESTURES = frozenset(
-    {
-        SocialFineHandGesture.OK_SIGN,
-        SocialFineHandGesture.MIDDLE_FINGER,
-    }
-)
+_CUSTOM_ONLY_FINE_GESTURES: frozenset[SocialFineHandGesture] = frozenset()
 
 _FINE_HAND_GESTURE_MAP: dict[SocialFineHandGesture, tuple[DisplayEmojiSymbol, str]] = {
     SocialFineHandGesture.THUMBS_UP: (DisplayEmojiSymbol.THUMBS_UP, "success"),
     SocialFineHandGesture.THUMBS_DOWN: (DisplayEmojiSymbol.THUMBS_DOWN, "warm"),
-    SocialFineHandGesture.POINTING: (DisplayEmojiSymbol.POINTING_HAND, "info"),
     SocialFineHandGesture.PEACE_SIGN: (DisplayEmojiSymbol.VICTORY_HAND, "warm"),
-    SocialFineHandGesture.OPEN_PALM: (DisplayEmojiSymbol.RAISED_HAND, "info"),
-    SocialFineHandGesture.OK_SIGN: (DisplayEmojiSymbol.OK_HAND, "success"),
-    SocialFineHandGesture.MIDDLE_FINGER: (DisplayEmojiSymbol.WARNING, "alert"),
 }
 
-_COARSE_GESTURE_MAP: dict[SocialGestureEvent, tuple[DisplayEmojiSymbol, str]] = {
-    SocialGestureEvent.WAVE: (DisplayEmojiSymbol.WAVING_HAND, "warm"),
-    SocialGestureEvent.STOP: (DisplayEmojiSymbol.RAISED_HAND, "info"),
-    SocialGestureEvent.DISMISS: (DisplayEmojiSymbol.WAVING_HAND, "neutral"),
-    SocialGestureEvent.TWO_HAND_DISMISS: (DisplayEmojiSymbol.WAVING_HAND, "neutral"),
-    SocialGestureEvent.CONFIRM: (DisplayEmojiSymbol.CHECK, "success"),
-}
+_COARSE_GESTURE_MAP: dict[SocialGestureEvent, tuple[DisplayEmojiSymbol, str]] = {}
 
 
 def resolve_display_gesture_refresh_interval(config: TwinrConfig) -> float | None:

@@ -1,7 +1,7 @@
 # agent
 
 `agent` is the top-level package boundary for Twinr's agent stack. It keeps the
-small `twinr.agent` compatibility surface alongside the focused child packages
+small `twinr.agent` package-root surface alongside the focused child packages
 that own core runtime, tool, and workflow behavior.
 
 ## Responsibility

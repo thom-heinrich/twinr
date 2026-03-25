@@ -3,7 +3,7 @@ name: agent
 path: src/twinr/agent
 kind: python-package
 visibility: internal
-summary: Top-level package boundary for Twinr's core agent stack, local routing package, and the thin `twinr.agent` compatibility imports.
+summary: Top-level package boundary for Twinr's core agent stack, local routing package, and the thin `twinr.agent` package-root exports.
 owned_concerns:
   - Expose the minimal `twinr.agent` import surface for `TwinrConfig`, `TwinrRuntime`, and `TwinrStatus`
   - Define the package boundary between the core runtime, routing, personality, tool, and workflow child packages
@@ -17,7 +17,7 @@ out_of_scope:
   - Detailed self-coding contracts, persistence, compiler validation, local compile-worker logic, and capability readiness inside src/twinr/agent/self_coding
 files:
   - path: __init__.py
-    role: Lazy root compatibility export surface
+    role: Lazy root export surface
     exports:
       - TwinrConfig
       - TwinrRuntime
@@ -32,7 +32,7 @@ subpackages:
   - path: tools
     role: Tool prompting, schemas, handlers, and runtime tool orchestration
   - path: workflows
-    role: Classic, realtime, and streaming workflow loops
+    role: Realtime and streaming workflow loops
   - path: self_coding
     role: Adaptive Skill Engine contracts, persistence, compiler validation, compile worker, and capability readiness
 public_api:
@@ -44,7 +44,6 @@ public_api:
 tests:
   - path: test/test_config.py
   - path: test/test_tool_instructions.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
   - path: test/test_main.py

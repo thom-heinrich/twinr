@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import time
 from typing import Any
 
+from ..handlers.support import SensitiveActionConfirmationRequired
+
 
 _FAILED_STATUSES = {"error", "failed", "failure"}
 
@@ -156,6 +158,26 @@ def observe_realtime_tool_call(
     started = time.monotonic()
     try:
         result = handler(owner, arguments)
+    except SensitiveActionConfirmationRequired as exc:
+        latency_ms = max(0, int(round((time.monotonic() - started) * 1000.0)))
+        result = {
+            "status": "confirmation_required",
+            "detail": str(exc),
+            "requires_confirmation": True,
+        }
+        observation = _observation_from_result(
+            tool_name=tool_name,
+            result=result,
+            latency_ms=latency_ms,
+        )
+        _record_event_safe(
+            owner,
+            observation.event_name(),
+            observation.event_message(),
+            level=observation.event_level(),
+            **observation.to_event_payload(),
+        )
+        return result
     except Exception as exc:
         latency_ms = max(0, int(round((time.monotonic() - started) * 1000.0)))
         observation = ToolCallObservation(
@@ -188,4 +210,3 @@ def observe_realtime_tool_call(
         **observation.to_event_payload(),
     )
     return result
-

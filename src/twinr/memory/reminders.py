@@ -448,6 +448,35 @@ class ReminderStore:
                 return delivered
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
+    def release_reservation(
+        self,
+        reminder_id: str,
+        *,
+        released_at: datetime | None = None,
+    ) -> ReminderEntry:
+        """Release a reserved reminder without adding failure retry delay."""
+
+        current_time = _coerce_datetime(
+            released_at or now_in_timezone(self.timezone_name),
+            timezone_name=self.timezone_name,
+            field_name="released_at",
+        )
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            for index, entry in enumerate(entries):
+                if entry.reminder_id != reminder_id:
+                    continue
+                released = replace(
+                    entry,
+                    updated_at=current_time,
+                    next_attempt_at=None,
+                    last_error=None,
+                )
+                entries[index] = released
+                self._write_entries_locked(tuple(entries))
+                return released
+        raise KeyError(f"Unknown reminder_id: {reminder_id}")
+
     def mark_failed(
         self,
         reminder_id: str,

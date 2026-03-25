@@ -15,7 +15,7 @@ from twinr.agent.base_agent.contracts import (
     SupervisorDecision,
     supervisor_decision_requires_full_context,
 )
-from twinr.agent.base_agent.conversation.turn_controller import _normalize_turn_text
+from twinr.agent.base_agent.conversation.decision_core import normalize_turn_text
 from twinr.agent.tools import DualLaneToolLoop
 from twinr.agent.workflows.streaming_supervisor_context import (
     build_streaming_supervisor_turn_instructions,
@@ -175,8 +175,8 @@ class StreamingSpeculationController:
             reply = loop._speculative_first_word_reply
         if reply is None:
             return None
-        normalized_seed = _normalize_turn_text(seeded_transcript)
-        normalized_final = _normalize_turn_text(transcript)
+        normalized_seed = normalize_turn_text(seeded_transcript)
+        normalized_final = normalize_turn_text(transcript)
         if not normalized_seed or not normalized_final:
             return None
         if not (
@@ -522,8 +522,8 @@ class StreamingSpeculationController:
         action = str(getattr(decision, "action", "") or "").strip().lower()
         if action not in {"direct", "handoff", "end_conversation"}:
             return None
-        normalized_seed = _normalize_turn_text(seeded_transcript)
-        normalized_final = _normalize_turn_text(transcript)
+        normalized_seed = normalize_turn_text(seeded_transcript)
+        normalized_final = normalize_turn_text(transcript)
         if not normalized_seed or not normalized_final:
             return None
         if not (
@@ -541,8 +541,8 @@ class StreamingSpeculationController:
             if not loop._speculative_supervisor_started:
                 return False
             seeded_transcript = loop._speculative_supervisor_transcript
-        normalized_seed = _normalize_turn_text(seeded_transcript)
-        normalized_final = _normalize_turn_text(transcript)
+        normalized_seed = normalize_turn_text(seeded_transcript)
+        normalized_final = normalize_turn_text(transcript)
         if not normalized_seed or not normalized_final:
             return False
         return (

@@ -6,7 +6,7 @@ Purpose
 Keep the Raspberry Pi on the single thh1986 transcript-first voice path even
 when the actual websocket gateway is reachable only through a local SSH tunnel
 on the development host. This script is transport-only: it does not inspect or
-modify websocket payloads, audio, or wakeword decisions.
+modify websocket payloads, audio, or voice activation decisions.
 
 Usage
 -----

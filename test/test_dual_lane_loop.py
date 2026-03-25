@@ -6,7 +6,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
-from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
+from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
+from twinr.agent.tools.runtime.handoff import _HANDOFF_TOOL_SCHEMA
+from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 
 
 class FakeSupervisorProvider:
@@ -178,6 +180,17 @@ class FakeSupervisorDecisionProvider:
 
 
 class DualLaneLoopTests(unittest.TestCase):
+    def test_handoff_schema_guides_local_smart_home_requests_to_automation(self) -> None:
+        kind_description = _HANDOFF_TOOL_SCHEMA["parameters"]["properties"]["kind"]["description"]
+        allow_web_search_description = _HANDOFF_TOOL_SCHEMA["parameters"]["properties"]["allow_web_search"][
+            "description"
+        ]
+
+        self.assertIn("Use search only for external/web research", kind_description)
+        self.assertIn("smart-home inventory", kind_description)
+        self.assertIn("Keep this false", allow_web_search_description)
+        self.assertIn("recent in-home smart-home events", allow_web_search_description)
+
     def test_resolve_supervisor_decision_merges_per_turn_instructions(self) -> None:
         supervisor_decision_provider = FakeSupervisorDecisionProvider(
             {
@@ -458,7 +471,7 @@ class DualLaneLoopTests(unittest.TestCase):
             specialist_instructions="Specialist instructions",
         )
 
-        result = loop.run(
+        loop.run(
             "Wie wird das Wetter morgen in Schwarzenbek?",
             supervisor_conversation=(("user", "kurzer kontext"),),
             specialist_conversation=(("user", "voller suchkontext"),),

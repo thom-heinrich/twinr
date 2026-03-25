@@ -6,8 +6,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from twinr.agent.tools.handlers.support import optional_bool, require_sensitive_voice_confirmation
 from twinr.integrations import IntegrationRequest, SmartHomeIntegrationAdapter, build_smart_home_hub_adapter
+
+from .handler_telemetry import emit_best_effort, record_event_best_effort
+from .support import optional_bool, require_sensitive_voice_confirmation
 
 _MAX_ENTITY_IDS = 8
 _MAX_ENTITY_LIMIT = 32
@@ -131,23 +133,32 @@ def _string_list(value: object, *, field_name: str) -> list[str]:
         return [normalized] if normalized else []
     if not isinstance(value, (list, tuple)):
         raise RuntimeError(f"{field_name} must be a string or a list of strings.")
-    normalized: list[str] = []
+    normalized_values: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str) or not item.strip():
             raise RuntimeError(f"{field_name}[{index}] must be a non-empty string.")
-        normalized.append(item.strip())
-    if len(normalized) > _MAX_ENTITY_IDS:
+        normalized_values.append(item.strip())
+    if len(normalized_values) > _MAX_ENTITY_IDS:
         raise RuntimeError(f"{field_name} must contain at most {_MAX_ENTITY_IDS} values.")
-    return normalized
+    return normalized_values
 
 
 def _bounded_positive_int(value: object, *, field_name: str, maximum: int) -> int:
     if isinstance(value, bool):
         raise RuntimeError(f"{field_name} must be a positive whole number.")
-    try:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise RuntimeError(f"{field_name} must be a positive whole number.")
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{field_name} must be a positive whole number.") from exc
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"{field_name} must be a positive whole number.") from exc
+    else:
+        raise RuntimeError(f"{field_name} must be a positive whole number.")
     if parsed < 1:
         raise RuntimeError(f"{field_name} must be a positive whole number.")
     return min(maximum, parsed)
@@ -171,17 +182,11 @@ def _result_payload(owner: Any, tool_name: str, result) -> dict[str, object]:
 
 
 def _emit_safe(owner: Any, message: str) -> None:
-    try:
-        owner.emit(message)
-    except Exception:
-        return
+    emit_best_effort(owner, message)
 
 
 def _record_event_safe(owner: Any, event_name: str, message: str) -> None:
-    try:
-        owner._record_event(event_name, message)
-    except Exception:
-        return
+    record_event_best_effort(owner, event_name, message)
 
 
 __all__ = [

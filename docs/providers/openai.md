@@ -62,16 +62,4 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --vision-promp
 ```
 
 The vision flow can attach multiple images in one OpenAI Responses API request. Twinr labels the live camera frame separately from any user-supplied reference images so the model can compare them.
-The standard hardware loop can trigger this automatically for common visual requests and will include the configured reference image when a stored user portrait path is available.
-
-## Realtime voice loop
-
-```bash
-cd /twinr
-source .venv/bin/activate
-twinr --env-file /twinr/.env --run-realtime-loop
-```
-
-This path uses the Realtime API for direct audio input/output. It is the low-latency voice mode. The current implementation does not call the OpenAI `web_search` tool from inside the Realtime session.
-When follow-up mode is enabled, Twinr beeps before listening and automatically opens a short follow-up listening window after each answer.
-The Realtime path can now also call a camera inspection tool for requests such as "Schau mich mal an" or "Was zeige ich dir?" and will use the configured reference image when the operator has set one.
+The active realtime and streaming loops can trigger this automatically for common visual requests and will include the configured reference image when a stored user portrait path is available.

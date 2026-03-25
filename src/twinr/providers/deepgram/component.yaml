@@ -27,7 +27,6 @@ public_api:
     - DeepgramSpeechToTextProvider
 primary_callers:
   - path: src/twinr/providers/factory.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
 tests:

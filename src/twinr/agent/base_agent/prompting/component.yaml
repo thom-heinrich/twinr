@@ -36,10 +36,6 @@ compatibility_reexports:
     names:
       - load_personality_instructions
       - merge_instructions
-  - path: src/twinr/agent/base_agent/personality.py
-    mode: star
-  - path: src/twinr/personality.py
-    mode: star
 primary_callers:
   - path: src/twinr/providers/openai/base.py
   - path: src/twinr/providers/openai/realtime.py

@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.proactive.runtime.gesture_ack_lane import GestureAckLane
 from twinr.proactive.social.engine import SocialFineHandGesture, SocialGestureEvent, SocialVisionObservation
 
@@ -14,11 +14,8 @@ class GestureAckLaneTests(unittest.TestCase):
     def test_lane_honors_current_pi_frozen_ack_floors_for_supported_fine_gestures(self) -> None:
         cases = (
             (SocialFineHandGesture.THUMBS_UP, 0.56, "thumbs_up"),
-            (SocialFineHandGesture.THUMBS_DOWN, 0.67, "thumbs_down"),
-            (SocialFineHandGesture.POINTING, 0.66, "pointing_hand"),
+            (SocialFineHandGesture.THUMBS_DOWN, 0.44, "thumbs_down"),
             (SocialFineHandGesture.PEACE_SIGN, 0.60, "victory_hand"),
-            (SocialFineHandGesture.OK_SIGN, 0.86, "ok_hand"),
-            (SocialFineHandGesture.MIDDLE_FINGER, 0.90, "warning"),
         )
 
         for gesture, confidence, expected_symbol in cases:
@@ -40,11 +37,8 @@ class GestureAckLaneTests(unittest.TestCase):
     def test_lane_blocks_values_just_below_current_pi_frozen_ack_floors(self) -> None:
         cases = (
             (SocialFineHandGesture.THUMBS_UP, 0.559),
-            (SocialFineHandGesture.THUMBS_DOWN, 0.669),
-            (SocialFineHandGesture.POINTING, 0.659),
+            (SocialFineHandGesture.THUMBS_DOWN, 0.439),
             (SocialFineHandGesture.PEACE_SIGN, 0.599),
-            (SocialFineHandGesture.OK_SIGN, 0.859),
-            (SocialFineHandGesture.MIDDLE_FINGER, 0.899),
         )
 
         for gesture, confidence in cases:
@@ -116,7 +110,7 @@ class GestureAckLaneTests(unittest.TestCase):
         self.assertFalse(second.active)
         self.assertEqual(second.reason, "live_gesture_cooldown")
 
-    def test_lane_acknowledges_wave_from_supported_coarse_gesture(self) -> None:
+    def test_lane_ignores_wave_in_three_gesture_live_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
 
@@ -125,36 +119,6 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=SocialVisionObservation(
                     gesture_event=SocialGestureEvent.WAVE,
                     gesture_confidence=0.86,
-                ),
-            )
-
-        self.assertTrue(decision.active)
-        self.assertEqual(decision.symbol.value, "waving_hand")
-
-    def test_lane_honors_current_pi_frozen_wave_floor(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
-
-            decision = lane.observe(
-                observed_at=10.0,
-                observation=SocialVisionObservation(
-                    gesture_event=SocialGestureEvent.WAVE,
-                    gesture_confidence=0.68,
-                ),
-            )
-
-        self.assertTrue(decision.active)
-        self.assertEqual(decision.symbol.value, "waving_hand")
-
-    def test_lane_blocks_wave_just_below_current_pi_frozen_floor(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
-
-            decision = lane.observe(
-                observed_at=10.0,
-                observation=SocialVisionObservation(
-                    gesture_event=SocialGestureEvent.WAVE,
-                    gesture_confidence=0.679,
                 ),
             )
 
@@ -175,6 +139,21 @@ class GestureAckLaneTests(unittest.TestCase):
 
         self.assertTrue(decision.active)
         self.assertEqual(decision.symbol.value, "victory_hand")
+
+    def test_lane_acknowledges_latest_pi_range_thumbs_down_above_ack_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.THUMBS_DOWN,
+                    fine_hand_gesture_confidence=0.446,
+                ),
+            )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.symbol.value, "thumbs_down")
 
     def test_lane_acknowledges_pi_range_thumbs_up_above_ack_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -206,7 +185,22 @@ class GestureAckLaneTests(unittest.TestCase):
         self.assertFalse(decision.active)
         self.assertEqual(decision.reason, "no_supported_live_gesture")
 
-    def test_lane_keeps_weak_pose_fallback_pointing_inactive(self) -> None:
+    def test_lane_keeps_weak_thumbs_down_below_ack_floor_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.THUMBS_DOWN,
+                    fine_hand_gesture_confidence=0.36,
+                ),
+            )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "no_supported_live_gesture")
+
+    def test_lane_ignores_pointing_even_when_confident(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
 
@@ -214,7 +208,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observed_at=10.0,
                 observation=SocialVisionObservation(
                     fine_hand_gesture=SocialFineHandGesture.POINTING,
-                    fine_hand_gesture_confidence=0.575,
+                    fine_hand_gesture_confidence=0.92,
                 ),
             )
 

@@ -7,9 +7,10 @@ workflows. Import from this package or from ``twinr.agent.tools`` instead of
 reaching into private module helpers from callers.
 """
 
-from .dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
+from .dual_lane_loop import DualLaneToolLoop
 from .executor import RealtimeToolExecutor
 from .registry import RealtimeToolBindingError, bind_realtime_tool_handlers, realtime_tool_names
+from .speech_lane import SpeechLaneDelta
 from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
 
 __all__ = [

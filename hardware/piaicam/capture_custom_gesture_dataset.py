@@ -14,16 +14,17 @@ can consume directly.
 
 Purpose
 -------
-Capture `none`, `ok_sign`, `middle_finger`, or later custom labels into the
-folder layout expected by Twinr's MediaPipe gesture-model training workflow.
+Capture `none`, `thumbs_up`, `thumbs_down`, `peace_sign`, or later custom
+labels into the folder layout expected by Twinr's MediaPipe gesture-model
+training workflow.
 
 Usage
 -----
 Command-line invocation examples::
 
     python3 hardware/piaicam/capture_custom_gesture_dataset.py --label none --count 24
-    python3 hardware/piaicam/capture_custom_gesture_dataset.py --label ok sign --count 40 --interval-s 0.35
-    python3 hardware/piaicam/capture_custom_gesture_dataset.py --label middle_finger --dataset-root /twinr/state/mediapipe/custom_gesture_dataset
+    python3 hardware/piaicam/capture_custom_gesture_dataset.py --label peace sign --count 40 --interval-s 0.35
+    python3 hardware/piaicam/capture_custom_gesture_dataset.py --label thumbs_down --dataset-root /twinr/state/mediapipe/custom_gesture_dataset
 
 Outputs
 -------
@@ -57,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--label",
         required=True,
-        help="Label name for this capture run, for example none, ok_sign, or middle_finger.",
+        help="Label name for this capture run, for example none, thumbs_up, thumbs_down, or peace_sign.",
     )
     parser.add_argument(
         "--count",
@@ -187,7 +188,7 @@ def _build_camera(camera_factory):
     if camera_factory is not None:
         return camera_factory()
     try:
-        from picamera2 import Picamera2
+        from picamera2 import Picamera2  # pylint: disable=import-error
     except Exception as exc:  # pragma: no cover - depends on the host environment.
         raise RuntimeError("picamera2_unavailable") from exc
     return Picamera2()

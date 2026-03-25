@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
-from typing import Final
+from collections.abc import Mapping, Set as AbstractSet
+from typing import Any, Final, cast
 
 from .config import _clamp_ratio
 from .models import AICameraFineHandGesture
@@ -31,6 +31,13 @@ BUILTIN_FINE_GESTURE_MAP: Final[dict[str, AICameraFineHandGesture]] = {
 }
 
 CUSTOM_FINE_GESTURE_MAP: Final[dict[str, AICameraFineHandGesture]] = {
+    "thumb_up": AICameraFineHandGesture.THUMBS_UP,
+    "thumbs_up": AICameraFineHandGesture.THUMBS_UP,
+    "thumb_down": AICameraFineHandGesture.THUMBS_DOWN,
+    "thumbs_down": AICameraFineHandGesture.THUMBS_DOWN,
+    "victory": AICameraFineHandGesture.PEACE_SIGN,
+    "peace": AICameraFineHandGesture.PEACE_SIGN,
+    "peace_sign": AICameraFineHandGesture.PEACE_SIGN,
     "ok": AICameraFineHandGesture.OK_SIGN,
     "ok_sign": AICameraFineHandGesture.OK_SIGN,
     "okay": AICameraFineHandGesture.OK_SIGN,
@@ -85,7 +92,7 @@ def _safe_iterable(value: object) -> tuple[object, ...]:
     if value is None or isinstance(value, (str, bytes)):
         return ()
     try:
-        return tuple(value)
+        return tuple(cast(Any, value))
     except TypeError:
         return ()
 
@@ -193,6 +200,42 @@ def combine_builtin_and_custom_gesture_choice(
     return builtin
 
 
+def combine_task_specific_custom_gesture_choice(
+    builtin: tuple[AICameraFineHandGesture, float | None],
+    custom: tuple[AICameraFineHandGesture, float | None],
+    *,
+    preferred_custom_gestures: AbstractSet[AICameraFineHandGesture],
+) -> tuple[AICameraFineHandGesture, float | None]:
+    """Prefer task-specific custom labels before falling back to generic arbitration.
+
+    Twinr's Pi live-HCI path now targets exactly `thumbs_up`, `thumbs_down`,
+    and `peace_sign`. When a custom model is trained specifically for that
+    product slice, its predictions for those labels should outrank the generic
+    built-in recognizer whenever the custom model is stronger or when the
+    built-in recognizer only has an unrelated fallback.
+    """
+
+    if not preferred_custom_gestures:
+        return combine_builtin_and_custom_gesture_choice(builtin, custom)
+
+    builtin_gesture, builtin_confidence = builtin
+    custom_gesture, custom_confidence = custom
+    if custom_gesture == AICameraFineHandGesture.NONE:
+        return builtin
+    if custom_gesture not in preferred_custom_gestures:
+        return combine_builtin_and_custom_gesture_choice(builtin, custom)
+
+    custom_score = _safe_ratio(custom_confidence, default=0.0)
+    builtin_score = _safe_ratio(builtin_confidence, default=0.0)
+    if builtin_gesture in {AICameraFineHandGesture.NONE, AICameraFineHandGesture.UNKNOWN}:
+        return custom
+    if builtin_gesture not in preferred_custom_gestures:
+        return custom
+    if custom_score >= builtin_score:
+        return custom
+    return builtin
+
+
 def normalize_category_name(value: object) -> str:
     """Normalize one classifier category label to a stable token."""
 
@@ -231,6 +274,7 @@ __all__ = [
     "CUSTOM_FINE_GESTURE_MAP",
     "builtin_gesture_category_denylist",
     "combine_builtin_and_custom_gesture_choice",
+    "combine_task_specific_custom_gesture_choice",
     "normalize_category_name",
     "prefer_gesture_choice",
     "resolve_fine_hand_gesture",

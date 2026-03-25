@@ -6,12 +6,13 @@ import json
 import sys
 import tempfile
 import time
+from typing import cast
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops import TwinrOpsEventStore
 from twinr.ops.remote_memory_watchdog import (
@@ -19,6 +20,7 @@ from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogSample,
     RemoteMemoryWatchdogSnapshot,
     RemoteMemoryWatchdogStore,
+    build_remote_memory_watchdog_bootstrap_snapshot,
 )
 
 
@@ -280,6 +282,11 @@ class _ProbeModeRecordingRemoteService:
         self.shutdown_calls += 1
 
 
+def _object_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return {str(key): item for key, item in value.items()}
+
+
 class RemoteMemoryWatchdogTests(unittest.TestCase):
     def test_store_load_roundtrips_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -379,6 +386,76 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
             mode = store.path.stat().st_mode & 0o777
 
         self.assertEqual(mode, 0o644)
+
+    def test_snapshot_round_trips_through_json_payload_after_state_helper_extraction(self) -> None:
+        sample = RemoteMemoryWatchdogSample(
+            seq=5,
+            captured_at="2026-03-16T18:00:05Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=42.5,
+            consecutive_ok=0,
+            consecutive_fail=2,
+            detail="remote unavailable",
+            probe={
+                "remote_write_context": {
+                    "request_correlation_id": "ltw-test123",
+                    "request_item_count": 51,
+                }
+            },
+        )
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at="2026-03-16T18:00:00Z",
+            updated_at="2026-03-16T18:00:05Z",
+            hostname="picarx",
+            pid=123,
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=5,
+            failure_count=2,
+            last_ok_at=None,
+            last_failure_at="2026-03-16T18:00:05Z",
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            current=sample,
+            recent_samples=(sample,),
+            heartbeat_at="2026-03-16T18:00:05Z",
+            probe_inflight=False,
+            probe_started_at=None,
+            probe_age_s=None,
+        )
+
+        reloaded = RemoteMemoryWatchdogSnapshot.from_dict(json.loads(json.dumps(snapshot.to_dict())))
+
+        self.assertEqual(reloaded.current.probe, sample.probe)
+        self.assertEqual(reloaded.recent_samples[0].probe, sample.probe)
+        self.assertEqual(reloaded.failure_count, 2)
+
+    def test_bootstrap_snapshot_builder_stays_reexported_from_main_watchdog_module(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            artifact_path = root / "state" / "ops" / "remote_memory_watchdog.json"
+
+            snapshot = build_remote_memory_watchdog_bootstrap_snapshot(
+                config,
+                pid=321,
+                artifact_path=artifact_path,
+                started_at="2026-03-16T18:00:00Z",
+                captured_at="2026-03-16T18:00:01Z",
+            )
+
+        self.assertEqual(snapshot.pid, 321)
+        self.assertEqual(snapshot.current.status, "starting")
+        self.assertTrue(snapshot.probe_inflight)
+        self.assertEqual(snapshot.artifact_path, str(artifact_path))
 
     def test_probe_once_persists_rolling_snapshot_and_transition_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -626,9 +703,12 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(snapshot.current.status, "fail")
         self.assertIsNotNone(snapshot.current.probe)
         assert snapshot.current.probe is not None
-        warm_result = snapshot.current.probe["steps"][0]["warm_result"]
+        steps = cast(list[dict[str, object]], snapshot.current.probe["steps"])
+        warm_result = _object_dict(steps[0]["warm_result"])
+        checks = cast(list[dict[str, object]], warm_result["checks"])
+        attempts = cast(list[dict[str, object]], checks[0]["attempts"])
         self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
-        self.assertEqual(warm_result["checks"][0]["attempts"][0]["status_code"], 503)
+        self.assertEqual(attempts[0]["status_code"], 503)
 
     def test_heartbeat_snapshot_compacts_historical_probe_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -805,11 +885,12 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(snapshot.current.status, "fail")
         self.assertIsNotNone(snapshot.current.probe)
         assert snapshot.current.probe is not None
-        remote_write_context = snapshot.current.probe["remote_write_context"]
+        remote_write_context = _object_dict(snapshot.current.probe["remote_write_context"])
         self.assertEqual(remote_write_context["request_correlation_id"], "ltw-test123")
         transition_event = next(event for event in events if event["event"] == "remote_memory_watchdog_status_changed")
-        transition_data = dict(transition_event["data"])
-        self.assertEqual(transition_data["remote_write_context"]["request_correlation_id"], "ltw-test123")
+        transition_data = _object_dict(transition_event["data"])
+        event_remote_write_context = _object_dict(transition_data["remote_write_context"])
+        self.assertEqual(event_remote_write_context["request_correlation_id"], "ltw-test123")
 
 
 if __name__ == "__main__":

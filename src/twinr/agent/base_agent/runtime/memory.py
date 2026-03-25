@@ -119,13 +119,15 @@ class TwinrRuntimeMemoryMixin:
 
     # AUDIT-FIX(#5): Ops-event logging is best-effort only and must never turn a successful memory
     # mutation into a user-visible failure.
-    def _append_ops_event(
+    def _append_memory_ops_event(
         self,
         *,
         event: str,
         message: str,
         data: Mapping[str, object] | None = None,
     ) -> None:
+        """Append a memory-scoped ops event without sharing a generic MRO helper name."""
+
         ops_events = getattr(self, "ops_events", None)
         if ops_events is None:
             return
@@ -258,7 +260,7 @@ class TwinrRuntimeMemoryMixin:
                 date_context=date_context,
             )
             self._persist_snapshot_or_raise(operation="remember_search_result")  # AUDIT-FIX(#1)
-            self._append_ops_event(  # AUDIT-FIX(#3/#5)
+            self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                 event="search_result_stored",
                 message="Search result stored in structured on-device memory.",
                 data={
@@ -435,7 +437,7 @@ class TwinrRuntimeMemoryMixin:
                 metadata=normalized_metadata,
             )
             self._persist_snapshot_or_raise(operation="remember_note")  # AUDIT-FIX(#1)
-            self._append_ops_event(  # AUDIT-FIX(#3/#5)
+            self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                 event="memory_note_stored",
                 message="Structured memory note stored in on-device memory.",
                 data={
@@ -503,7 +505,7 @@ class TwinrRuntimeMemoryMixin:
             self._persist_snapshot_or_raise(operation="remember_contact")  # AUDIT-FIX(#1)
 
             if note_stored:
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="memory_note_stored",
                     message="Structured memory note stored in on-device memory.",
                     data={
@@ -511,7 +513,7 @@ class TwinrRuntimeMemoryMixin:
                         "content_chars": len(note_content),
                     },
                 )
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="graph_contact_saved",
                     message="Structured contact memory was stored in the personal graph.",
                     data={
@@ -591,7 +593,7 @@ class TwinrRuntimeMemoryMixin:
             self._persist_snapshot_or_raise(operation="remember_preference")  # AUDIT-FIX(#1)
 
             if note_stored:
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="memory_note_stored",
                     message="Structured memory note stored in on-device memory.",
                     data={
@@ -599,7 +601,7 @@ class TwinrRuntimeMemoryMixin:
                         "content_chars": len(note_content),
                     },
                 )
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="graph_preference_saved",
                     message="Structured preference memory was stored in the personal graph.",
                     data={
@@ -653,7 +655,7 @@ class TwinrRuntimeMemoryMixin:
             self._persist_snapshot_or_raise(operation="remember_plan")  # AUDIT-FIX(#1)
 
             if note_stored:
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="memory_note_stored",
                     message="Structured memory note stored in on-device memory.",
                     data={
@@ -661,7 +663,7 @@ class TwinrRuntimeMemoryMixin:
                         "content_chars": len(note_content),
                     },
                 )
-                self._append_ops_event(  # AUDIT-FIX(#3/#5)
+                self._append_memory_ops_event(  # AUDIT-FIX(#3/#5)
                     event="graph_plan_saved",
                     message="Structured plan memory was stored in the personal graph.",
                     data={

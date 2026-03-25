@@ -19,24 +19,12 @@ from twinr.agent.personality.models import (
     PlaceSignal,
     WorldSignal,
 )
+from twinr.agent.personality._remote_state_utils import (
+    resolve_remote_state as _resolve_remote_state,
+)
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
 _ItemT = TypeVar("_ItemT")
-
-
-def _resolve_remote_state(
-    *,
-    config: TwinrConfig,
-    remote_state: LongTermRemoteStateStore | None,
-) -> LongTermRemoteStateStore | None:
-    """Resolve the remote snapshot adapter for one load/save call."""
-
-    if remote_state is not None:
-        return remote_state
-    resolved = LongTermRemoteStateStore.from_config(config)
-    if not getattr(resolved, "enabled", False):
-        return None
-    return resolved
 
 
 def _load_list_snapshot(

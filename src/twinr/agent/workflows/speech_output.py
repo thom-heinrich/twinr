@@ -13,9 +13,8 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Callable, Protocol
 import logging
-import time
 
-from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
 
 

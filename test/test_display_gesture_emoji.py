@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.proactive.runtime.display_gesture_emoji import (
     DisplayGestureEmojiPublisher,
@@ -115,17 +115,16 @@ class DisplayGestureEmojiTests(unittest.TestCase):
         self.assertEqual(decision.symbol.value, "thumbs_up")
         self.assertEqual(decision.accent, "success")
 
-    def test_derive_maps_wave_to_waving_hand(self) -> None:
+    def test_derive_ignores_unsupported_coarse_gestures(self) -> None:
         decision = derive_display_gesture_emoji(
             snapshot=_snapshot(gesture_event=SocialGestureEvent.WAVE),
             event_names=("camera.gesture_detected",),
         )
 
-        self.assertTrue(decision.active)
-        self.assertEqual(decision.symbol.value, "waving_hand")
-        self.assertEqual(decision.accent, "warm")
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "unsupported_coarse_gesture")
 
-    def test_derive_prefers_motion_wave_over_open_palm_when_both_are_present(self) -> None:
+    def test_derive_ignores_open_palm_even_when_wave_event_is_also_present(self) -> None:
         decision = derive_display_gesture_emoji(
             snapshot=_snapshot(
                 gesture_event=SocialGestureEvent.WAVE,
@@ -134,9 +133,8 @@ class DisplayGestureEmojiTests(unittest.TestCase):
             event_names=("camera.fine_hand_gesture_detected", "camera.gesture_detected"),
         )
 
-        self.assertTrue(decision.active)
-        self.assertEqual(decision.symbol.value, "waving_hand")
-        self.assertEqual(decision.reason, "motion_coarse_gesture:wave")
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "unsupported_fine_hand_gesture")
 
     def test_derive_ignores_unsupported_or_hostile_gestures(self) -> None:
         decision = derive_display_gesture_emoji(
@@ -144,9 +142,8 @@ class DisplayGestureEmojiTests(unittest.TestCase):
             event_names=("camera.fine_hand_gesture_detected",),
         )
 
-        self.assertTrue(decision.active)
-        self.assertEqual(decision.symbol.value, "warning")
-        self.assertEqual(decision.accent, "alert")
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "unsupported_fine_hand_gesture")
 
     def test_derive_maps_peace_sign_to_victory_hand(self) -> None:
         decision = derive_display_gesture_emoji(
@@ -183,7 +180,7 @@ class DisplayGestureEmojiTests(unittest.TestCase):
         self.assertEqual(active.source, "presentation")
         self.assertEqual(active.symbol, "sparkles")
 
-    def test_publisher_suppresses_custom_only_fine_gesture_immediately_after_wave(self) -> None:
+    def test_publisher_ignores_unsupported_wave_and_ok_sign_without_persisting_cue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)
             publisher = DisplayGestureEmojiPublisher.from_config(config)
@@ -204,12 +201,11 @@ class DisplayGestureEmojiTests(unittest.TestCase):
             )
             active = publisher.store.load_active(now=datetime(2026, 3, 21, 12, 0, 0, 500000, tzinfo=timezone.utc))
 
-        self.assertEqual(wave_result.action, "created")
+        self.assertEqual(wave_result.action, "inactive")
+        self.assertEqual(wave_result.decision.reason, "unsupported_coarse_gesture")
         self.assertEqual(ok_result.action, "inactive")
-        self.assertEqual(ok_result.decision.reason, "suppressed_by_recent_motion_gesture")
-        self.assertIsNotNone(active)
-        assert active is not None
-        self.assertEqual(active.symbol, "waving_hand")
+        self.assertEqual(ok_result.decision.reason, "unsupported_fine_hand_gesture")
+        self.assertIsNone(active)
 
 
 if __name__ == "__main__":

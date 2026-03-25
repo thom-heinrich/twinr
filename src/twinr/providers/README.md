@@ -8,7 +8,7 @@
 
 `providers` owns:
 - assemble the runtime provider bundle in [`factory.py`](./factory.py)
-- expose package-root imports and compatibility re-exports in [`__init__.py`](./__init__.py)
+- expose package-root imports in [`__init__.py`](./__init__.py)
 - define the boundary above [`deepgram/`](./deepgram/README.md), [`groq/`](./groq/README.md), and [`openai/`](./openai/README.md)
 - attach the optional OpenAI streaming-transcript verifier to the runtime bundle when the fail-safe verifier path is enabled
 
@@ -21,7 +21,7 @@
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Root exports and compatibility imports |
+| [__init__.py](./__init__.py) | Root exports and package-root imports |
 | [factory.py](./factory.py) | Provider bundle assembly |
 | [deepgram/](./deepgram/README.md) | Deepgram STT package |
 | [groq/](./groq/README.md) | Groq text package |

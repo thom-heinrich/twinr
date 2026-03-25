@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.debug_log import TwinrDisplayDebugLogBuilder
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth

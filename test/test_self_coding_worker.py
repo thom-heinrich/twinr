@@ -13,7 +13,6 @@ from twinr.agent.self_coding import (
     ArtifactKind,
     CompileJobRecord,
     CompileJobStatus,
-    CompileRunStatusRecord,
     CompileTarget,
     FeasibilityOutcome,
     FeasibilityResult,
@@ -68,6 +67,35 @@ class _FakeCompileDriver:
 class _UnavailableCompileDriver:
     def run_compile(self, request, *, event_sink=None) -> CodexCompileResult:
         raise CodexDriverUnavailableError("primary compile driver unavailable")
+
+
+class _DelayedUnavailableCompileDriver:
+    def __init__(self) -> None:
+        self.saved_sink = None
+
+    def run_compile(self, request, *, event_sink=None) -> CodexCompileResult:
+        del request
+        self.saved_sink = event_sink
+        raise CodexDriverUnavailableError("primary compile driver unavailable")
+
+
+class _ReplayPrimaryEventFallbackDriver:
+    def __init__(self, primary: _DelayedUnavailableCompileDriver) -> None:
+        self.primary = primary
+
+    def run_compile(self, request, *, event_sink=None) -> CodexCompileResult:
+        del request
+        del event_sink
+        if self.primary.saved_sink is not None:
+            self.primary.saved_sink(
+                CodexCompileEvent(kind="assistant_delta", message="late primary event"),
+                CodexCompileProgress(
+                    driver_name=type(self.primary).__name__,
+                    event_count=1,
+                    last_event_kind="assistant_delta",
+                ),
+            )
+        return CodexCompileResult(status="ok", summary="Fallback worked.")
 
 
 def _ready_session() -> RequirementsDialogueSession:
@@ -148,6 +176,39 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.summary, "Fallback worked.")
         self.assertEqual(len(fallback_driver.requests), 1)
+
+    def test_local_codex_driver_binds_event_metadata_to_original_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request_path = root / "REQUEST.md"
+            schema_path = root / "output_schema.json"
+            request_path.write_text("compile", encoding="utf-8")
+            schema_path.write_text("{}", encoding="utf-8")
+            request = CodexCompileRequest(
+                job=CompileJobRecord(
+                    job_id="job_late_event123",
+                    skill_id="late_event_skill",
+                    skill_name="Late Event Skill",
+                    status=CompileJobStatus.QUEUED,
+                    requested_target=CompileTarget.AUTOMATION_MANIFEST,
+                    spec_hash=stable_sha256("late-event-spec"),
+                ),
+                session=_ready_session(),
+                prompt="compile",
+                output_schema={},
+                workspace_root=str(root),
+                request_path=str(request_path),
+                output_schema_path=str(schema_path),
+            )
+            primary_driver = _DelayedUnavailableCompileDriver()
+            fallback_driver = _ReplayPrimaryEventFallbackDriver(primary_driver)
+            driver = LocalCodexCompileDriver(primary=primary_driver, fallback=fallback_driver)
+
+            result = driver.run_compile(request)
+
+        delayed_event = next(event for event in result.events if event.message == "late primary event")
+        self.assertEqual(delayed_event.metadata["driver_name"], "_DelayedUnavailableCompileDriver")
+        self.assertEqual(delayed_event.metadata["driver_attempt"], 1)
 
     def test_worker_runs_job_and_persists_artifacts(self) -> None:
         compile_result = CodexCompileResult(

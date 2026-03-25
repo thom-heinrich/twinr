@@ -12,9 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 import math
 
+from twinr.agent.workflows.forensics import workflow_decision, workflow_span
 from twinr.hardware.camera_ai.mediapipe_runtime import normalize_image_data
 from twinr.hardware.camera_ai.models import AICameraBox
 
@@ -28,6 +29,11 @@ _ELBOW_SCORE_THRESHOLD = 0.30
 _SHOULDER_SCORE_THRESHOLD = 0.30
 _LOCAL_HAND_CROP_PADDING = 0.14
 _LOCAL_HAND_MIN_CONTEXT_RATIO = 0.30
+_LOCAL_HAND_RETRY_CROP_PADDING = 0.24
+_LOCAL_HAND_RETRY_MIN_CONTEXT_RATIO = 0.42
+_WIDE_CONTEXT_HORIZONTAL_PADDING = 0.45
+_WIDE_CONTEXT_TOP_PADDING = 0.12
+_WIDE_CONTEXT_BOTTOM_PADDING = 0.55
 
 
 class HandRoiSource(StrEnum):
@@ -36,8 +42,12 @@ class HandRoiSource(StrEnum):
     FULL_FRAME = "full_frame"
     PRIMARY_PERSON_FULL_BODY = "primary_person_full_body"
     PRIMARY_PERSON_UPPER_BODY = "primary_person_upper_body"
+    PRIMARY_PERSON_WIDE_FULL_BODY = "primary_person_wide_full_body"
+    PRIMARY_PERSON_WIDE_UPPER_BODY = "primary_person_wide_upper_body"
     LEFT_WRIST = "left_wrist"
     RIGHT_WRIST = "right_wrist"
+    WIDE_LEFT_WRIST = "wide_left_wrist"
+    WIDE_RIGHT_WRIST = "wide_right_wrist"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +60,9 @@ class HandLandmarkWorkerConfig:
     primary_person_roi_padding: float = 0.18
     primary_person_upper_body_ratio: float = 0.78
     wrist_roi_scale: float = 0.34
+    wide_context_horizontal_padding: float = _WIDE_CONTEXT_HORIZONTAL_PADDING
+    wide_context_top_padding: float = _WIDE_CONTEXT_TOP_PADDING
+    wide_context_bottom_padding: float = _WIDE_CONTEXT_BOTTOM_PADDING
     min_hand_detection_confidence: float = 0.35
     min_hand_presence_confidence: float = 0.35
     min_hand_tracking_confidence: float = 0.35
@@ -73,6 +86,18 @@ class HandLandmarkWorkerConfig:
             wrist_roi_scale=_clamp_ratio(
                 getattr(config, "wrist_roi_scale", 0.34),
                 default=0.34,
+            ),
+            wide_context_horizontal_padding=_clamp_ratio(
+                getattr(config, "wide_context_horizontal_padding", _WIDE_CONTEXT_HORIZONTAL_PADDING),
+                default=_WIDE_CONTEXT_HORIZONTAL_PADDING,
+            ),
+            wide_context_top_padding=_clamp_ratio(
+                getattr(config, "wide_context_top_padding", _WIDE_CONTEXT_TOP_PADDING),
+                default=_WIDE_CONTEXT_TOP_PADDING,
+            ),
+            wide_context_bottom_padding=_clamp_ratio(
+                getattr(config, "wide_context_bottom_padding", _WIDE_CONTEXT_BOTTOM_PADDING),
+                default=_WIDE_CONTEXT_BOTTOM_PADDING,
             ),
             min_hand_detection_confidence=_clamp_ratio(
                 getattr(config, "min_hand_detection_confidence", 0.35),
@@ -109,6 +134,8 @@ class HandLandmarkDetection:
     handedness_score: float | None
     landmarks: tuple[HandLandmarkPoint, ...]
     roi_frame_rgb: Any
+    gesture_frame_rgb: Any | None = None
+    gesture_context_frame_rgb: Any | None = None
 
     @property
     def confidence(self) -> float:
@@ -170,7 +197,8 @@ class MediaPipeHandLandmarkWorker:
             return
         close_fn = getattr(self._hand_landmarker, "close", None)
         if callable(close_fn):
-            close_fn()
+            close_callable = cast(Callable[[], None], close_fn)
+            close_callable()  # pylint: disable=not-callable
         self._hand_landmarker = None
 
     def analyze(
@@ -188,20 +216,119 @@ class MediaPipeHandLandmarkWorker:
         instead of feeding alternating ROI spaces into one video tracker.
         """
 
-        candidates = _build_hand_roi_candidates(
-            primary_person_box=primary_person_box,
-            sparse_keypoints=sparse_keypoints or {},
-            config=self.config,
-        )
-        if not candidates:
-            return HandLandmarkResult()
+        with workflow_span(
+            name="hand_landmark_worker_analyze",
+            kind="io",
+            details={"timestamp_ms": timestamp_ms},
+        ):
+            candidates = _build_hand_roi_candidates(
+                primary_person_box=primary_person_box,
+                sparse_keypoints=sparse_keypoints or {},
+                config=self.config,
+            )
+            if not candidates:
+                workflow_decision(
+                    msg="hand_landmark_roi_strategy",
+                    question="Should the hand landmark worker run any person-conditioned ROI pass?",
+                    selected={"id": "no_candidates", "summary": "No ROI candidates were available for this frame."},
+                    options=[
+                        {"id": "primary_candidates", "summary": "Run the focused person-conditioned ROI pass."},
+                        {"id": "no_candidates", "summary": "Return without running hand landmark inference."},
+                    ],
+                    context={"candidate_count": 0},
+                    confidence="forensic",
+                    guardrails=["hand_roi_candidates_required"],
+                    kpi_impact_estimate={"latency": "low"},
+                )
+                return HandLandmarkResult()
+            primary_result = self._analyze_candidates(
+                runtime=runtime,
+                frame_rgb=frame_rgb,
+                timestamp_ms=timestamp_ms,
+                candidates=candidates,
+            )
+            if primary_result.detections:
+                workflow_decision(
+                    msg="hand_landmark_roi_strategy",
+                    question="Which ROI pass should the hand landmark worker use for this frame?",
+                    selected={"id": "primary_candidates", "summary": "The focused person-conditioned ROI pass already found hands."},
+                    options=[
+                        {"id": "primary_candidates", "summary": "Keep the focused person-conditioned ROI detections."},
+                        {"id": "wide_context_rescue", "summary": "Retry with a wider torso/table context pass."},
+                    ],
+                    context={
+                        "primary_candidate_count": len(candidates),
+                        "primary_detection_count": len(primary_result.detections),
+                    },
+                    confidence="forensic",
+                    guardrails=["hand_roi_primary_first"],
+                    kpi_impact_estimate={"latency": "low", "gesture_accuracy": "primary"},
+                )
+                return primary_result
 
-        return self._analyze_candidates(
-            runtime=runtime,
-            frame_rgb=frame_rgb,
-            timestamp_ms=timestamp_ms,
-            candidates=candidates,
-        )
+            rescue_candidates = _build_wide_context_hand_roi_candidates(
+                primary_person_box=primary_person_box,
+                sparse_keypoints=sparse_keypoints or {},
+                config=self.config,
+            )
+            if not rescue_candidates:
+                workflow_decision(
+                    msg="hand_landmark_roi_strategy",
+                    question="Should the hand landmark worker retry with a wide-context ROI pass?",
+                    selected={"id": "primary_only", "summary": "No wide-context rescue candidates were available."},
+                    options=[
+                        {"id": "primary_only", "summary": "Keep only the focused person-conditioned pass."},
+                        {"id": "wide_context_rescue", "summary": "Retry with a wider torso/table context pass."},
+                    ],
+                    context={
+                        "primary_candidate_count": len(candidates),
+                        "primary_detection_count": len(primary_result.detections),
+                        "wide_candidate_count": 0,
+                    },
+                    confidence="forensic",
+                    guardrails=["hand_roi_wide_context_optional"],
+                    kpi_impact_estimate={"latency": "low"},
+                )
+                return primary_result
+            rescue_timestamp_ms = (
+                primary_result.final_timestamp_ms + 1
+                if primary_result.final_timestamp_ms is not None
+                else timestamp_ms + len(candidates)
+            )
+            rescue_result = self._analyze_candidates(
+                runtime=runtime,
+                frame_rgb=frame_rgb,
+                timestamp_ms=rescue_timestamp_ms,
+                candidates=rescue_candidates,
+            )
+            workflow_decision(
+                msg="hand_landmark_roi_strategy",
+                question="Should the hand landmark worker promote the wide-context rescue pass?",
+                selected={
+                    "id": "wide_context_rescue" if rescue_result.detections else "primary_only",
+                    "summary": (
+                        "Promote the wide-context rescue detections."
+                        if rescue_result.detections
+                        else "Keep the empty primary result because the rescue pass also found no hands."
+                    ),
+                },
+                options=[
+                    {"id": "primary_only", "summary": "Keep only the focused person-conditioned pass."},
+                    {"id": "wide_context_rescue", "summary": "Promote the wider torso/table context pass."},
+                ],
+                context={
+                    "primary_candidate_count": len(candidates),
+                    "primary_detection_count": len(primary_result.detections),
+                    "wide_candidate_count": len(rescue_candidates),
+                    "wide_detection_count": len(rescue_result.detections),
+                },
+                confidence="forensic",
+                guardrails=["hand_roi_wide_context_optional"],
+                kpi_impact_estimate={"latency": "medium", "gesture_accuracy": "rescue"},
+            )
+            if rescue_result.detections or rescue_result.final_timestamp_ms is not None:
+                return rescue_result
+            return primary_result
 
     def analyze_full_frame(
         self,
@@ -259,6 +386,7 @@ class MediaPipeHandLandmarkWorker:
                     roi=candidate.box,
                     roi_source=candidate.source,
                     roi_frame_rgb=image_data,
+                    full_frame_rgb=frame_rgb,
                 )
             )
         detections.sort(
@@ -364,15 +492,95 @@ def _build_hand_roi_candidates(
     return tuple(deduped)
 
 
+def _build_wide_context_hand_roi_candidates(
+    *,
+    primary_person_box: AICameraBox,
+    sparse_keypoints: dict[int, tuple[float, float, float]],
+    config: HandLandmarkWorkerConfig,
+) -> tuple[_HandRoiCandidate, ...]:
+    """Return a second bounded ROI set with wider torso/table context.
+
+    Pi repro frames showed that the default person-conditioned crops can miss
+    hands entirely in seated table scenes even when a person box is present.
+    Official MediaPipe-style pipelines keep more direct frame context around the
+    hand search, so when the focused first pass returns zero detections we run
+    one wider retry derived from the same person anchor instead of immediately
+    giving up.
+    """
+
+    rescue_context_box = _build_primary_person_wide_context_box(
+        primary_person_box=primary_person_box,
+        config=config,
+    )
+    if rescue_context_box == primary_person_box:
+        return ()
+    candidates: list[_HandRoiCandidate] = []
+    left_wrist_candidate = _build_wrist_roi_candidate(
+        wrist_key=9,
+        elbow_key=7,
+        shoulder_key=5,
+        primary_person_box=rescue_context_box,
+        sparse_keypoints=sparse_keypoints,
+        config=config,
+        source=HandRoiSource.WIDE_LEFT_WRIST,
+    )
+    if left_wrist_candidate is not None:
+        candidates.append(left_wrist_candidate)
+    right_wrist_candidate = _build_wrist_roi_candidate(
+        wrist_key=10,
+        elbow_key=8,
+        shoulder_key=6,
+        primary_person_box=rescue_context_box,
+        sparse_keypoints=sparse_keypoints,
+        config=config,
+        source=HandRoiSource.WIDE_RIGHT_WRIST,
+    )
+    if right_wrist_candidate is not None:
+        candidates.append(right_wrist_candidate)
+    candidates.append(
+        _HandRoiCandidate(
+            box=_build_primary_person_upper_body_roi(
+                primary_person_box=rescue_context_box,
+                config=config,
+                padding_override=0.0,
+            ),
+            source=HandRoiSource.PRIMARY_PERSON_WIDE_UPPER_BODY,
+            priority=2,
+        )
+    )
+    candidates.append(
+        _HandRoiCandidate(
+            box=_build_primary_person_full_body_roi(
+                primary_person_box=rescue_context_box,
+                config=config,
+                padding_override=0.0,
+            ),
+            source=HandRoiSource.PRIMARY_PERSON_WIDE_FULL_BODY,
+            priority=3,
+        )
+    )
+    candidates.sort(key=lambda item: (item.priority, -item.box.area))
+    deduped: list[_HandRoiCandidate] = []
+    for candidate in candidates:
+        if any(_should_dedupe_candidate(candidate, existing) for existing in deduped):
+            continue
+        deduped.append(candidate)
+        if len(deduped) >= config.max_roi_candidates:
+            break
+    return tuple(deduped)
+
+
 def _build_primary_person_upper_body_roi(
     *,
     primary_person_box: AICameraBox,
     config: HandLandmarkWorkerConfig,
+    padding_override: float | None = None,
 ) -> AICameraBox:
     """Expand the primary person box into one upper-body hand-search ROI."""
 
-    horizontal_padding = primary_person_box.width * config.primary_person_roi_padding
-    vertical_padding = primary_person_box.height * config.primary_person_roi_padding
+    padding = config.primary_person_roi_padding if padding_override is None else padding_override
+    horizontal_padding = primary_person_box.width * padding
+    vertical_padding = primary_person_box.height * padding
     return AICameraBox(
         top=primary_person_box.top - vertical_padding,
         left=primary_person_box.left - horizontal_padding,
@@ -389,6 +597,7 @@ def _build_primary_person_full_body_roi(
     *,
     primary_person_box: AICameraBox,
     config: HandLandmarkWorkerConfig,
+    padding_override: float | None = None,
 ) -> AICameraBox:
     """Expand the primary person box into one full-body rescue ROI.
 
@@ -398,12 +607,31 @@ def _build_primary_person_full_body_roi(
     produce a hand landmark result before the gesture lane gives up.
     """
 
-    horizontal_padding = primary_person_box.width * config.primary_person_roi_padding
-    vertical_padding = primary_person_box.height * config.primary_person_roi_padding
+    padding = config.primary_person_roi_padding if padding_override is None else padding_override
+    horizontal_padding = primary_person_box.width * padding
+    vertical_padding = primary_person_box.height * padding
     return AICameraBox(
         top=primary_person_box.top - vertical_padding,
         left=primary_person_box.left - horizontal_padding,
         bottom=primary_person_box.bottom + vertical_padding,
+        right=primary_person_box.right + horizontal_padding,
+    )
+
+
+def _build_primary_person_wide_context_box(
+    *,
+    primary_person_box: AICameraBox,
+    config: HandLandmarkWorkerConfig,
+) -> AICameraBox:
+    """Return one wider bounded person context for seated/table rescues."""
+
+    horizontal_padding = primary_person_box.width * config.wide_context_horizontal_padding
+    top_padding = primary_person_box.height * config.wide_context_top_padding
+    bottom_padding = primary_person_box.height * config.wide_context_bottom_padding
+    return AICameraBox(
+        top=primary_person_box.top - top_padding,
+        left=primary_person_box.left - horizontal_padding,
+        bottom=primary_person_box.bottom + bottom_padding,
         right=primary_person_box.right + horizontal_padding,
     )
 
@@ -454,6 +682,7 @@ def _parse_hand_landmark_result(
     roi: AICameraBox,
     roi_source: HandRoiSource,
     roi_frame_rgb: Any,
+    full_frame_rgb: Any | None = None,
 ) -> tuple[HandLandmarkDetection, ...]:
     """Map one MediaPipe hand-landmarker result into typed detections."""
 
@@ -462,24 +691,50 @@ def _parse_hand_landmark_result(
     detections: list[HandLandmarkDetection] = []
     for index, local_landmarks in enumerate(hand_landmarks):
         handedness_label, handedness_score = _resolve_handedness(handedness, index=index)
+        projected_landmarks = tuple(
+            _project_landmark_to_full_frame(
+                landmark=landmark,
+                roi=roi,
+            )
+            for landmark in local_landmarks or ()
+        )
         tight_roi_frame_rgb = _crop_local_hand_from_roi_frame(
             roi_frame_rgb=roi_frame_rgb,
             local_landmarks=local_landmarks,
         )
+        local_gesture_context_frame_rgb = _crop_local_hand_from_roi_frame(
+            roi_frame_rgb=roi_frame_rgb,
+            local_landmarks=local_landmarks,
+            padding=_LOCAL_HAND_RETRY_CROP_PADDING,
+            min_context_ratio=_LOCAL_HAND_RETRY_MIN_CONTEXT_RATIO,
+        )
+        gesture_frame_rgb = None
+        gesture_context_frame_rgb = None
+        if full_frame_rgb is not None:
+            gesture_frame_rgb = _crop_local_hand_from_roi_frame(
+                roi_frame_rgb=full_frame_rgb,
+                local_landmarks=projected_landmarks,
+            )
+            gesture_context_frame_rgb = _crop_local_hand_from_roi_frame(
+                roi_frame_rgb=full_frame_rgb,
+                local_landmarks=projected_landmarks,
+                padding=_LOCAL_HAND_RETRY_CROP_PADDING,
+                min_context_ratio=_LOCAL_HAND_RETRY_MIN_CONTEXT_RATIO,
+            )
         detections.append(
             HandLandmarkDetection(
                 roi=roi,
                 roi_source=roi_source,
                 handedness=handedness_label,
                 handedness_score=handedness_score,
-                landmarks=tuple(
-                    _project_landmark_to_full_frame(
-                        landmark=landmark,
-                        roi=roi,
-                    )
-                    for landmark in local_landmarks or ()
-                ),
+                landmarks=projected_landmarks,
                 roi_frame_rgb=tight_roi_frame_rgb,
+                gesture_frame_rgb=gesture_frame_rgb if gesture_frame_rgb is not None else tight_roi_frame_rgb,
+                gesture_context_frame_rgb=(
+                    gesture_context_frame_rgb
+                    if gesture_context_frame_rgb is not None
+                    else local_gesture_context_frame_rgb
+                ),
             )
         )
     return tuple(detections)
@@ -489,6 +744,8 @@ def _crop_local_hand_from_roi_frame(
     *,
     roi_frame_rgb: Any,
     local_landmarks: Any,
+    padding: float = _LOCAL_HAND_CROP_PADDING,
+    min_context_ratio: float = _LOCAL_HAND_MIN_CONTEXT_RATIO,
 ) -> Any:
     """Return a tight hand crop inside one ROI frame when shape data is available.
 
@@ -516,15 +773,15 @@ def _crop_local_hand_from_roi_frame(
         ys.append(y)
     if not xs or not ys:
         return roi_frame_rgb
-    raw_left = max(0.0, min(xs) - _LOCAL_HAND_CROP_PADDING)
-    raw_right = min(1.0, max(xs) + _LOCAL_HAND_CROP_PADDING)
-    raw_top = max(0.0, min(ys) - _LOCAL_HAND_CROP_PADDING)
-    raw_bottom = min(1.0, max(ys) + _LOCAL_HAND_CROP_PADDING)
+    raw_left = max(0.0, min(xs) - padding)
+    raw_right = min(1.0, max(xs) + padding)
+    raw_top = max(0.0, min(ys) - padding)
+    raw_bottom = min(1.0, max(ys) + padding)
     if raw_right <= raw_left or raw_bottom <= raw_top:
         return roi_frame_rgb
     crop_width = raw_right - raw_left
     crop_height = raw_bottom - raw_top
-    side = max(crop_width, crop_height, _LOCAL_HAND_MIN_CONTEXT_RATIO)
+    side = max(crop_width, crop_height, min_context_ratio)
     center_x = (raw_left + raw_right) / 2.0
     center_y = (raw_top + raw_bottom) / 2.0
     half_side = side / 2.0
@@ -653,7 +910,14 @@ def _should_dedupe_candidate(candidate: _HandRoiCandidate, existing: _HandRoiCan
         HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
         HandRoiSource.PRIMARY_PERSON_FULL_BODY,
     }
-    return not allowed_pair
+    wide_allowed_pair = {
+        candidate.source,
+        existing.source,
+    } == {
+        HandRoiSource.PRIMARY_PERSON_WIDE_UPPER_BODY,
+        HandRoiSource.PRIMARY_PERSON_WIDE_FULL_BODY,
+    }
+    return not (allowed_pair or wide_allowed_pair)
 
 
 def _normalize_label(value: object) -> str:
@@ -672,7 +936,7 @@ def _clamp_ratio(value: object, *, default: float) -> float:
     """Clamp one numeric value into the unit interval."""
 
     try:
-        number = float(value)
+        number = float(cast(Any, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number):
@@ -688,7 +952,7 @@ def _coerce_float(value: object, *, default: float) -> float:
     """Coerce one value into a finite float."""
 
     try:
-        number = float(value)
+        number = float(cast(Any, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number):
@@ -702,7 +966,7 @@ def _coerce_optional_ratio(value: object, *, default: float | None) -> float | N
     if value is None:
         return default
     try:
-        number = float(value)
+        number = float(cast(Any, value))
     except (TypeError, ValueError):
         return default
     if not math.isfinite(number):

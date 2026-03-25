@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolResult
 from twinr.providers.openai import (
     OpenAIConversationClosureDecisionProvider,
@@ -616,7 +616,7 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(backend._client.responses.create_requests[0]["max_output_tokens"], 80)
         self.assertEqual(backend._client.responses.create_requests[1]["max_output_tokens"], 160)
 
-    def test_decide_floors_gpt5_supervisor_budget_to_160_tokens(self) -> None:
+    def test_decide_floors_gpt5_supervisor_budget_to_512_tokens(self) -> None:
         backend = FakeToolBackend(
             TwinrConfig(
                 openai_api_key="test-key",
@@ -647,7 +647,167 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
 
         request = backend._client.responses.create_requests[0]
         self.assertEqual(request["model"], "gpt-5.2-chat-latest")
-        self.assertEqual(request["max_output_tokens"], 160)
+        self.assertEqual(request["max_output_tokens"], 512)
+
+    def test_decide_uses_extended_retry_ladder_for_gpt5_supervisor_budget_failures(self) -> None:
+        backend = FakeToolBackend(
+            TwinrConfig(
+                openai_api_key="test-key",
+                default_model="gpt-5.4-mini",
+                streaming_supervisor_max_output_tokens=80,
+            )
+        )
+        backend._client.responses.create_results.extend(
+            [
+                SimpleNamespace(
+                    id="resp_decide_gpt5_incomplete_1",
+                    _request_id="req_decide_gpt5_incomplete_1",
+                    model="gpt-5.4-mini-2026-03-17",
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    output_text="",
+                    output=[],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    id="resp_decide_gpt5_incomplete_2",
+                    _request_id="req_decide_gpt5_incomplete_2",
+                    model="gpt-5.4-mini-2026-03-17",
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    output_text="",
+                    output=[],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    id="resp_decide_gpt5_retry_3",
+                    _request_id="req_decide_gpt5_retry_3",
+                    model="gpt-5.4-mini-2026-03-17",
+                    status="completed",
+                    output_text=(
+                        '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                        '"kind":"search","goal":"latest headlines","allow_web_search":true,'
+                        '"location_hint":null,"date_context":null,"context_scope":"tiny_recent"}'
+                    ),
+                    output=[],
+                    usage=None,
+                ),
+            ]
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-5.4-mini",
+            reasoning_effort_override="low",
+        )
+
+        decision = provider.decide("Was gibt es Neues?")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "search")
+        self.assertEqual(len(backend._client.responses.create_requests), 3)
+        self.assertEqual(
+            [request["max_output_tokens"] for request in backend._client.responses.create_requests],
+            [512, 768, 1024],
+        )
+
+    def test_decide_extracts_first_balanced_json_object_from_text_fallback(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_extra",
+                _request_id="req_decide_extra",
+                model="gpt-5.4-mini-2026-03-17",
+                status="completed",
+                output_parsed=None,
+                output_text=(
+                    '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                    '"kind":"search","goal":"latest headlines","prompt":null,"allow_web_search":true,'
+                    '"location_hint":null,"date_context":null,"context_scope":"tiny_recent"}'
+                    '\nHinweis: structured output completed.'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-5.4-mini",
+        )
+
+        decision = provider.decide("Was gibt es Neues?")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "search")
+        self.assertEqual(decision.context_scope, "tiny_recent")
+
+    def test_decide_ignores_following_json_objects_in_text_fallback(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_extra_objects",
+                _request_id="req_decide_extra_objects",
+                model="gpt-5.4-mini-2026-03-17",
+                status="completed",
+                output_parsed=None,
+                output_text=(
+                    '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                    '"kind":"memory","goal":"check remembered contact details","prompt":null,'
+                    '"allow_web_search":false,"location_hint":null,"date_context":null,'
+                    '"context_scope":"full_context"}'
+                    '\n'
+                    '{"debug":"duplicate fragment"}'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-5.4-mini",
+        )
+
+        decision = provider.decide("Wie ist die Telefonnummer von Anna Schulz?")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "memory")
+        self.assertFalse(decision.allow_web_search)
+        self.assertEqual(decision.context_scope, "full_context")
+
+    def test_decide_prefers_sdk_parsed_mapping_when_output_text_is_invalid(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_parsed",
+                _request_id="req_decide_parsed",
+                model="gpt-5.4-mini-2026-03-17",
+                status="completed",
+                output_parsed={
+                    "action": "handoff",
+                    "spoken_ack": "Ich schaue kurz nach.",
+                    "spoken_reply": None,
+                    "kind": "memory",
+                    "goal": "Check stored conflicts.",
+                    "prompt": None,
+                    "allow_web_search": False,
+                    "location_hint": None,
+                    "date_context": None,
+                    "context_scope": "full_context",
+                },
+                output_text='{"broken": true} trailing',
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-5.4-mini",
+        )
+
+        decision = provider.decide("Gibt es offene Erinnerungskonflikte?")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "memory")
+        self.assertEqual(decision.context_scope, "full_context")
 
 
 class OpenAIConversationClosureDecisionProviderTests(unittest.TestCase):

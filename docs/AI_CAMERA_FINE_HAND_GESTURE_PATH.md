@@ -8,9 +8,7 @@ This note evaluates a realistic local path for Twinr to add
 The target class is:
 - `thumbs_up`
 - `thumbs_down`
-- `ok_sign`
-- `pointing`
-- `middle_finger`
+- `peace_sign`
 
 This document is deliberately separate from the main camera contract. The
 current V1 camera path must stay defensible without pretending that coarse
@@ -34,8 +32,8 @@ The current stack now has:
   `TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_CUSTOM_GESTURE_MODEL_PATH`
 
 The current stack still does **not** have:
-- a checked-in product-grade custom `.task` for `ok_sign` and `middle_finger`
-- enough real household data yet to call those two labels production-ready
+- a checked-in product-grade custom `.task` for `thumbs_up`, `thumbs_down`, and `peace_sign`
+- enough real household data yet to call that three-gesture live-HCI model production-ready
 
 Environment observations from the current workspace:
 - repo-local `.venv` on the leading checkout does **not** currently have `mediapipe`
@@ -86,9 +84,10 @@ Pros:
 - faster path to a working canned gesture surface
 
 Cons:
-- canned gestures will not necessarily match Twinr's exact product labels
-- `pointing` and `middle_finger` will likely still need custom logic or custom
-  training
+- canned gestures still do not become Pi-specific just because Twinr filters the
+  output set
+- `peace_sign` remains too brittle on the real device unless Twinr trains for
+  the exact user distance, framing, and lighting
 - less transparent than working directly from landmarks
 
 Assessment:
@@ -117,13 +116,12 @@ Assessment:
 
 Recommended path:
 1. Keep IMX500 as the always-on coarse gate.
-2. Add a bounded local `hand_landmarks` worker using MediaPipe on the Pi CPU.
-3. Trigger it only when the current camera path sees:
-   - `person_visible`
-   - `person_near_device` or `showing_intent`
-   - a likely upper-body/hand gesture window
-4. Use the worker's ROIs and landmarks to drive fine-hand inference instead of
-   pretending coarse pose heuristics can see fingers.
+2. Keep one bounded hand-first `LIVE_STREAM` Gesture Recognizer path for the
+   user-facing Pi HCI lane.
+3. Train a product-specific custom model for exactly `thumbs_up`,
+   `thumbs_down`, `peace_sign`, and `none`.
+4. Use ROI hand-landmark work only as bounded rescue/context, not as the main
+   symbol-decision path.
 
 Why this is the right cut:
 - it is local-first
@@ -150,11 +148,8 @@ The next concrete experiment should be:
   `hardware/piaicam/capture_custom_gesture_dataset.py`
 - train/export a first custom `.task` with
   `hardware/piaicam/train_custom_gesture_model.py`
-- validate `ok_sign` and `middle_finger` accuracy on the real Pi runtime before
-  treating them as product-grade signals
-
-Do **not** start with `middle_finger` as the engineering anchor. It is a poor
-first benchmark and not product-critical.
+- validate `thumbs_up`, `thumbs_down`, and `peace_sign` accuracy on the real Pi
+  runtime before treating them as product-grade signals
 
 ## Sources
 

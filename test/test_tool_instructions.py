@@ -13,7 +13,7 @@ from twinr.agent.tools.prompting.instructions import (
     build_supervisor_tool_agent_instructions,
     build_tool_agent_instructions,
 )
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 
 
 class ToolInstructionTests(unittest.TestCase):
@@ -62,9 +62,16 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("build a small live situation picture", instructions)
         self.assertIn("two to four targeted smart-home queries", instructions)
         self.assertIn("copy the exact routed entity_id values verbatim", instructions)
+        self.assertIn("from the user's exact routed IDs", instructions)
+        self.assertIn("call read_smart_home_state directly instead of relisting", instructions)
         self.assertIn("catch-all entity dump", instructions)
         self.assertIn("list is truncated", instructions)
         self.assertIn("do not treat that alone as the whole house status", instructions)
+        self.assertIn("Never use search_live_info for the user's own smart-home inventory", instructions)
+        self.assertIn("resolve vague quiet, lull, inactivity, or Ruhe wording", instructions)
+        self.assertIn("Use vad_quiet only", instructions)
+        self.assertIn("no-motion trigger", instructions)
+        self.assertIn("mutation request, not a request to end the conversation", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -80,9 +87,15 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("multiple targeted smart-home queries", instructions)
         self.assertIn("aggregate_by first", instructions)
         self.assertIn("copied verbatim from prior smart-home tool results", instructions)
+        self.assertIn("spoken directly by the user as exact routed IDs", instructions)
+        self.assertIn("do not relist them first", instructions)
+        self.assertIn("Never use search_live_info for the user's own smart-home inventory", instructions)
         self.assertIn("catch-all entity list", instructions)
         self.assertIn("manage_user_discovery", instructions)
         self.assertIn("sensitive permission gate", instructions)
+        self.assertIn("Use vad_quiet only", instructions)
+        self.assertIn("no-motion trigger", instructions)
+        self.assertIn("not as end_conversation", instructions)
 
     def test_discovery_instructions_cover_semantic_intents_and_self_disclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -106,11 +119,17 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Imperative wording about how Twinr should address the user", instructions)
         self.assertIn("Names, preferred forms of address, family relations, and favorite brands", instructions)
         self.assertIn("not a request for permission to store it", instructions)
+        self.assertIn("Wish-form profile statements", instructions)
+        self.assertIn("current speaker as the profile subject", instructions)
+        self.assertIn("preferred-name and address-preference statements as already confirmed answers", instructions)
         self.assertIn("rename instruction itself as the confirmation", instructions)
+        self.assertIn("contrasts a new value against an older learned value", instructions)
         self.assertIn("Map semantic start wording to start_or_resume", instructions)
         self.assertIn("do not ask a second permission question", instructions)
         self.assertIn("what have you learned about me", instructions)
         self.assertIn("replace_fact or delete_fact in the same turn", instructions)
+        self.assertIn("Do not tell the user to first ask what Twinr has stored", instructions)
+        self.assertIn("takes precedence over treating the utterance as the next topic answer", instructions)
         self.assertIn("special setup phrase", instructions)
 
     def test_compact_discovery_instructions_cover_semantic_intents_and_self_disclosure(self) -> None:
@@ -131,10 +150,16 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Imperative wording about how Twinr should address the user", instructions)
         self.assertIn("Names, preferred forms of address, family relations, and favorite brands", instructions)
         self.assertIn("not a request for permission to store it", instructions)
+        self.assertIn("Wish-form profile statements", instructions)
+        self.assertIn("current speaker as the profile subject", instructions)
+        self.assertIn("preferred-name and address-preference statements as already confirmed answers", instructions)
         self.assertIn("rename instruction itself as the confirmation", instructions)
+        self.assertIn("contrasts a new value against an older learned value", instructions)
         self.assertIn("Map semantic start wording to start discovery", instructions)
         self.assertIn("do not ask a second permission question", instructions)
         self.assertIn("stored profile details", instructions)
+        self.assertIn("Do not tell the user to first ask what Twinr has stored", instructions)
+        self.assertIn("takes precedence over treating the utterance as the next topic answer", instructions)
         self.assertIn("special setup phrase", instructions)
 
     def test_supervisor_instructions_do_not_embed_full_business_tool_rules(self) -> None:
@@ -160,6 +185,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("leave spoken_ack empty", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
         self.assertIn("Open smart-home or house-status questions usually need handoff_specialist_worker", instructions)
+        self.assertIn("do not frame it as web research", instructions)
+        self.assertIn("prefer an automation handoff over a search handoff", instructions)
 
     def test_supervisor_decision_instructions_use_structured_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,6 +211,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("broader memory", instructions)
         self.assertIn("put the full user-facing answer into spoken_reply", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
+        self.assertIn("not a web-search handoff", instructions)
+        self.assertIn("prefer kind automation over kind search", instructions)
 
     def test_first_word_instructions_encourage_warm_conversational_replies(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

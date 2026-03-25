@@ -147,7 +147,7 @@ class TwinrRuntimeAutomationMixin:
         except Exception:
             logger.exception("Failed to persist runtime note after successful state mutation.")
 
-    def _safe_append_ops_event(
+    def _append_automation_ops_event(
         self,
         *,
         event: str,
@@ -155,6 +155,8 @@ class TwinrRuntimeAutomationMixin:
         data: dict[str, object],
         level: str | None = None,
     ) -> None:
+        """Append an automation-scoped ops event without relying on MRO shadowing."""
+
         kwargs: dict[str, object] = {
             "event": event,
             "message": message,
@@ -198,7 +200,7 @@ class TwinrRuntimeAutomationMixin:
                 "reminder_kind": getattr(entry, "kind", kind),
             },
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="reminder_scheduled",
             message="A reminder or timer was scheduled.",
             data={
@@ -260,7 +262,7 @@ class TwinrRuntimeAutomationMixin:
                 "trigger_kind": getattr(trigger, "kind", None),
             },
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="automation_created",
             message="A time-based automation was created.",
             data={
@@ -316,7 +318,7 @@ class TwinrRuntimeAutomationMixin:
                 "trigger_kind": getattr(trigger, "kind", None),
             },
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="automation_created",
             message="An if-then automation was created.",
             data={
@@ -365,7 +367,7 @@ class TwinrRuntimeAutomationMixin:
                 "trigger_kind": getattr(trigger_value, "kind", None),
             },
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="automation_updated",
             message="An automation was updated.",
             data={
@@ -388,7 +390,7 @@ class TwinrRuntimeAutomationMixin:
             source=source,
             metadata={"automation_id": getattr(entry, "automation_id", automation_id)},
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="automation_deleted",
             message="An automation was deleted.",
             data={
@@ -444,7 +446,7 @@ class TwinrRuntimeAutomationMixin:
             source=source,
             metadata={"automation_id": getattr(entry, "automation_id", automation_id)},
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="automation_triggered",
             message="A scheduled automation was executed.",
             data={
@@ -479,9 +481,24 @@ class TwinrRuntimeAutomationMixin:
             source="reminder_delivery",
             metadata={"reminder_id": getattr(entry, "reminder_id", reminder_id)},
         )
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="reminder_delivered",
             message="A due reminder was delivered successfully.",
+            data={
+                "reminder_id": getattr(entry, "reminder_id", reminder_id),
+                "summary": self._compact_text_value(getattr(entry, "summary", reminder_id)),
+            },
+        )
+        return entry
+
+    def release_reminder_reservation(self, reminder_id: str) -> ReminderEntry:
+        """Release a reserved reminder without marking it delivered or failed."""
+
+        reminder_id = self._require_non_empty_identifier(reminder_id, field_name="reminder_id")
+        entry = self.reminder_store.release_reservation(reminder_id)
+        self._append_automation_ops_event(
+            event="reminder_delivery_released",
+            message="A reserved reminder was released before delivery started.",
             data={
                 "reminder_id": getattr(entry, "reminder_id", reminder_id),
                 "summary": self._compact_text_value(getattr(entry, "summary", reminder_id)),
@@ -497,7 +514,7 @@ class TwinrRuntimeAutomationMixin:
         sanitized_error = self._sanitize_error_text(error)
         entry = self.reminder_store.mark_failed(reminder_id, error=sanitized_error)
         # AUDIT-FIX(#1): Ops-event emission is post-commit and must not mask the store outcome.
-        self._safe_append_ops_event(
+        self._append_automation_ops_event(
             event="reminder_delivery_failed",
             level="error",
             message="A due reminder could not be delivered.",

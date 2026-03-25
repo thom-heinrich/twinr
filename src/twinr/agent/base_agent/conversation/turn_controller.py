@@ -11,14 +11,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
-from typing import Literal, Protocol
-import inspect
+from typing import Any, Literal, Protocol, cast
 import json
-import logging
-import math
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.decision_core import (
+    coerce_probability as _coerce_probability,
+    coerce_text as _coerce_text,
+    compact_conversation as _compact_conversation,
+    config_bool as _config_bool,
+    config_float as _config_float,
+    config_int as _config_int,
+    detect_provider_timeout_kwarg,
+    extract_json_object as _extract_json_object,
+    normalize_turn_text,
+    safe_getattr as _safe_getattr,
+    sanitize_emit_value as _sanitize_emit_value,
+)
 from twinr.agent.base_agent.contracts import (
     ConversationLike,
     StreamingSpeechEndpointEvent,
@@ -39,8 +49,6 @@ _DEFAULT_EVALUATION_TIMEOUT_SECONDS = 2.5
 _DEFAULT_CIRCUIT_BREAKER_FAILURES = 3
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 15.0
 _DEFAULT_EMIT_VALUE_MAX_CHARS = 256
-
-_LOGGER = logging.getLogger(__name__)
 
 _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
     "type": "function",
@@ -73,210 +81,6 @@ _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
         "required": ["decision", "label", "confidence", "reason", "transcript"],
     },
 }
-
-
-def _safe_getattr(obj: object, name: str, default: object = None) -> object:
-    # AUDIT-FIX(#3): Treat external event/provider objects as untrusted and avoid attribute access crashes.
-    try:
-        return getattr(obj, name)
-    except Exception:
-        return default
-
-
-def _coerce_text(
-    value: object,
-    *,
-    default: str = "",
-    max_chars: int | None = None,
-) -> str:
-    # AUDIT-FIX(#3): Normalize external values defensively so None/non-str payloads do not explode inside callbacks.
-    if value is None:
-        text = default
-    else:
-        try:
-            text = str(value)
-        except Exception:
-            text = default
-    text = text.strip()
-    if max_chars is not None and max_chars >= 0 and len(text) > max_chars:
-        text = text[:max_chars].rstrip()
-    return text
-
-
-def _coerce_bool(value: object, *, default: bool) -> bool:
-    # AUDIT-FIX(#4): Parse env-derived booleans safely instead of relying on Python truthiness for strings like "false".
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    normalized = _coerce_text(value).lower()
-    if normalized in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    return default
-
-
-def _coerce_int(
-    value: object,
-    *,
-    default: int,
-    minimum: int | None = None,
-    maximum: int | None = None,
-) -> int:
-    # AUDIT-FIX(#4): Clamp integer config values so malformed env settings do not raise or create absurd bounds.
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        number = default
-    if minimum is not None:
-        number = max(minimum, number)
-    if maximum is not None:
-        number = min(maximum, number)
-    return number
-
-
-def _coerce_float(
-    value: object,
-    *,
-    default: float,
-    minimum: float | None = None,
-    maximum: float | None = None,
-) -> float:
-    # AUDIT-FIX(#4): Reject malformed and non-finite floats from config/provider responses.
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        number = default
-    if not math.isfinite(number):
-        number = default
-    if minimum is not None:
-        number = max(minimum, number)
-    if maximum is not None:
-        number = min(maximum, number)
-    return number
-
-
-def _coerce_probability(value: object, *, default: float) -> float:
-    # AUDIT-FIX(#4): NaN/Inf must never become fake confidence values like 1.0.
-    return _coerce_float(value, default=default, minimum=0.0, maximum=1.0)
-
-
-def _config_bool(config: object, name: str, default: bool) -> bool:
-    return _coerce_bool(_safe_getattr(config, name, default), default=default)
-
-
-def _config_int(
-    config: object,
-    name: str,
-    default: int,
-    *,
-    minimum: int | None = None,
-    maximum: int | None = None,
-) -> int:
-    return _coerce_int(_safe_getattr(config, name, default), default=default, minimum=minimum, maximum=maximum)
-
-
-def _config_float(
-    config: object,
-    name: str,
-    default: float,
-    *,
-    minimum: float | None = None,
-    maximum: float | None = None,
-) -> float:
-    return _coerce_float(_safe_getattr(config, name, default), default=default, minimum=minimum, maximum=maximum)
-
-
-def _sanitize_emit_value(value: object, *, max_chars: int) -> str:
-    # AUDIT-FIX(#7): Strip control characters so model/output text cannot forge extra log or SSE-style lines.
-    sanitized = _coerce_text(value, max_chars=max_chars).replace("\r", " ").replace("\n", " ")
-    return " ".join(sanitized.split())
-
-
-def _extract_json_object(text: object) -> dict[str, object] | None:
-    # AUDIT-FIX(#10): Accept fenced/prose-wrapped JSON because LLM fallbacks are often messy in practice.
-    raw = _coerce_text(text)
-    if not raw:
-        return None
-
-    candidates: list[str] = [raw]
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        if lines:
-            inner_lines = lines[1:]
-            if inner_lines and inner_lines[-1].strip().startswith("```"):
-                inner_lines = inner_lines[:-1]
-            fenced_body = "\n".join(inner_lines).strip()
-            if fenced_body:
-                candidates.append(fenced_body)
-
-    start_index = raw.find("{")
-    end_index = raw.rfind("}")
-    if start_index != -1 and end_index > start_index:
-        candidates.append(raw[start_index : end_index + 1])
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        stripped = candidate.strip()
-        if not stripped or stripped in seen:
-            continue
-        seen.add(stripped)
-        try:
-            payload = json.loads(stripped)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return None
-
-
-def _compact_conversation(
-    conversation: ConversationLike | None,
-    *,
-    max_turns: int,
-    max_item_chars: int,
-    max_total_chars: int,
-) -> tuple[tuple[str, str], ...]:
-    if not conversation:
-        return ()
-    # AUDIT-FIX(#9): Snapshot conversation best-effort so concurrent mutation does not crash turn evaluation.
-    try:
-        turns = list(conversation)
-    except Exception:
-        _LOGGER.warning("Turn controller failed to snapshot conversation for compaction.", exc_info=True)
-        return ()
-    if max_turns > 0 and len(turns) > max_turns:
-        turns = turns[-max_turns:]
-    compacted: list[tuple[str, str]] = []
-    total_chars = 0
-    for item in turns:
-        try:
-            if isinstance(item, tuple) and len(item) == 2:
-                role, content = item
-            else:
-                role = _safe_getattr(item, "role", "")
-                content = _safe_getattr(item, "content", "")
-        except Exception:
-            _LOGGER.warning("Turn controller skipped a malformed conversation item during compaction.", exc_info=True)
-            continue
-        role_text = _coerce_text(role, default="user", max_chars=64) or "user"
-        content_text = _coerce_text(content, max_chars=max_item_chars)
-        if not content_text:
-            continue
-        projected_chars = total_chars + len(role_text) + len(content_text)
-        if max_total_chars > 0 and projected_chars > max_total_chars:
-            remaining_chars = max_total_chars - total_chars - len(role_text)
-            if remaining_chars <= 0:
-                break
-            content_text = content_text[:remaining_chars].rstrip()
-            if not content_text:
-                break
-            compacted.append((role_text, content_text))
-            break
-        compacted.append((role_text, content_text))
-        total_chars = projected_chars
-    return tuple(compacted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,7 +192,7 @@ class ToolCallingTurnDecisionEvaluator:
         self._state_lock = Lock()
         self._consecutive_failures = 0
         self._circuit_open_until_monotonic = 0.0
-        self._provider_timeout_kwarg_name = self._detect_provider_timeout_kwarg()
+        self._provider_timeout_kwarg_name = detect_provider_timeout_kwarg(self.provider.start_turn_streaming)
 
     def evaluate(
         self,
@@ -458,7 +262,7 @@ class ToolCallingTurnDecisionEvaluator:
             )
 
         try:
-            response = self.provider.start_turn_streaming(
+            response = cast(Any, self.provider.start_turn_streaming)(
                 prompt,
                 conversation=compact_conversation,
                 instructions=load_turn_controller_instructions(self.config),
@@ -475,7 +279,8 @@ class ToolCallingTurnDecisionEvaluator:
 
         self._note_success()
 
-        tool_calls = _safe_getattr(response, "tool_calls", ()) or ()
+        tool_calls_value = _safe_getattr(response, "tool_calls", ())
+        tool_calls = tool_calls_value if isinstance(tool_calls_value, (list, tuple)) else ()
         for tool_call in tool_calls:
             tool_name = _coerce_text(_safe_getattr(tool_call, "name", ""), max_chars=64)
             if tool_name != "submit_turn_decision":
@@ -634,20 +439,6 @@ class ToolCallingTurnDecisionEvaluator:
                 ),
             ),
         )
-
-    def _detect_provider_timeout_kwarg(self) -> str | None:
-        try:
-            signature = inspect.signature(self.provider.start_turn_streaming)
-        except (TypeError, ValueError):
-            return None
-        parameter_names = set(signature.parameters)
-        if "timeout_seconds" in parameter_names:
-            return "timeout_seconds"
-        if "timeout" in parameter_names:
-            return "timeout"
-        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
-            return "timeout_seconds"
-        return None
 
     def _is_circuit_open(self) -> bool:
         # AUDIT-FIX(#5): Simple cooldown breaker prevents repeated failing calls on flaky home Wi-Fi.
@@ -1158,14 +949,6 @@ class StreamingTurnController:
 
 
 def _normalize_turn_text(text: str) -> str:
-    """Normalize transcript text for equality checks across STT updates.
+    """Preserve the legacy turn-controller normalizer import path."""
 
-    Args:
-        text: Raw transcript text from an interim or endpoint event.
-
-    Returns:
-        Lowercased whitespace-normalized text suitable for comparing successive
-        transcript snapshots.
-    """
-
-    return " ".join(_coerce_text(text).lower().split())
+    return normalize_turn_text(text)

@@ -16,7 +16,9 @@ from twinr.hardware.audio import (
     SilenceDetectedRecorder,
     SpeechStartTimeoutError,
     WaveAudioPlayer,
+    capture_device_identity,
     normalize_wav_playback_level,
+    resolve_capture_device,
     resolve_dynamic_pause_thresholds,
     resolve_pause_resume_confirmation,
 )
@@ -94,6 +96,23 @@ class DynamicPauseThresholdTests(unittest.TestCase):
         )
 
         self.assertEqual((pause_ms, pause_grace_ms), (880, 230))
+
+
+class CaptureDeviceResolutionTests(unittest.TestCase):
+    def test_resolve_capture_device_prefers_specific_fallback_over_generic_alias(self) -> None:
+        resolved = resolve_capture_device(
+            "default",
+            None,
+            "sysdefault:CARD=Array",
+        )
+
+        self.assertEqual(resolved, "sysdefault:CARD=Array")
+
+    def test_capture_device_identity_normalizes_same_card_aliases(self) -> None:
+        identity_a = capture_device_identity("sysdefault:CARD=Array")
+        identity_b = capture_device_identity("plughw:CARD=Array,DEV=0")
+
+        self.assertEqual(identity_a, identity_b)
 
 
 class AudioEnvTests(unittest.TestCase):

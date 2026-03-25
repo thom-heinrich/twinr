@@ -52,6 +52,5 @@ tests:
   - path: test/test_state_machine.py
   - path: test/test_web_app.py
   - path: test/test_runtime_context.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py

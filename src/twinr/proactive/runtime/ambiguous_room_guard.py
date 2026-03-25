@@ -123,11 +123,11 @@ def derive_ambiguous_room_guard(
     audio_policy = coerce_mapping(facts.get("audio_policy"))
     vad = coerce_mapping(facts.get("vad"))
 
+    person_count = coerce_optional_int(camera.get("person_count"))
     explicit_person_visible = coerce_optional_bool(camera.get("person_visible"))
     person_visible = explicit_person_visible is True or (
         explicit_person_visible is None and person_count is not None and person_count > 0
     )
-    person_count = coerce_optional_int(camera.get("person_count"))
     person_count_unknown = coerce_optional_bool(camera.get("person_count_unknown")) is True
     room_busy = coerce_optional_bool(audio_policy.get("room_busy_or_overlapping")) is True
     background_media = (

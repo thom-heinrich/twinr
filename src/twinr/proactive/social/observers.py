@@ -195,7 +195,7 @@ class AmbientAudioObservationProvider:
 class ReSpeakerAudioObservationProvider:
     """Overlay XVF3800 host-control signals onto a fallback audio snapshot.
 
-    This wrapper keeps the existing PCM/sample-based wakeword path available
+    This wrapper keeps the existing PCM/sample-based voice-activation path available
     while upgrading the normalized audio observation with direct XVF3800 facts
     such as current speech detection, runtime mode, and direction hint.
     """

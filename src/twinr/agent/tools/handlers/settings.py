@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from twinr.agent.base_agent.settings.simple_settings import update_simple_setting, write_env_updates
+
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import require_sensitive_voice_confirmation
 
 
@@ -40,15 +42,22 @@ def handle_update_simple_setting(owner: Any, arguments: dict[str, object]) -> di
         raise RuntimeError("update_simple_setting requires `setting` and `action`")
 
     value: float | int | str | None
-    if raw_value in {None, ""}:
+    if raw_value is None or raw_value == "":
         value = None
+    elif isinstance(raw_value, (int, float)):
+        value = float(raw_value)
+    elif isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            value = None
+        else:
+            try:
+                value = float(stripped)
+            except ValueError:
+                value = stripped
     else:
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError):
-            value = str(raw_value).strip()
-            if not value:
-                value = None
+        normalized = str(raw_value).strip()
+        value = normalized or None
 
     try:
         result = update_simple_setting(
@@ -70,21 +79,25 @@ def handle_update_simple_setting(owner: Any, arguments: dict[str, object]) -> di
         source="update_simple_setting",
         metadata={key: str(value) for key, value in result.data.items()},
     )
-    owner.emit("simple_setting_tool_call=true")
-    owner.emit(f"simple_setting={result.setting}")
-    owner.emit(f"simple_setting_summary={result.summary}")
-    owner._record_event(
+    emit_best_effort(owner, "simple_setting_tool_call=true")
+    emit_best_effort(owner, f"simple_setting={result.setting}")
+    emit_best_effort(owner, f"simple_setting_summary={result.summary}")
+    record_event_best_effort(
+        owner,
         "simple_setting_updated",
         "Twinr updated a bounded runtime setting from an explicit user request.",
-        setting=result.setting,
-        changed=result.changed,
-        summary=result.summary,
+        {
+            "setting": result.setting,
+            "changed": result.changed,
+            "summary": result.summary,
+        },
     )
-    response = {
+    response: dict[str, object] = {
         "status": "updated" if result.changed else "unchanged",
         "setting": result.setting,
         "summary": result.summary,
         "changed": result.changed,
     }
-    response.update(result.data)
+    for key, data_value in result.data.items():
+        response[key] = data_value
     return response

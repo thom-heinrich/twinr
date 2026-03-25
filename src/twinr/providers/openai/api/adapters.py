@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import json
 import logging
 import re
@@ -20,27 +20,21 @@ import re
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
     AgentToolResult,
-    AgentTextProvider,
     CompositeSpeechAgentProvider,
-    ConversationClosureProvider,
     ConversationClosureProviderDecision,
     ConversationLike,
-    FirstWordProvider,
     FirstWordReply,
     ProviderBundle,
     SearchResponse,
-    SpeechToTextProvider,
     SupervisorDecision,
-    SupervisorDecisionProvider,
     TextResponse,
-    TextToSpeechProvider,
-    ToolCallingAgentProvider,
     ToolCallingTurnResponse,
 )
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.language import user_response_language_instruction
 from twinr.agent.base_agent.prompting.personality import merge_instructions
 from twinr.ops.usage import extract_model_name, extract_token_usage
+from twinr.text_utils import extract_json_object
 
 from .backend import OpenAIBackend
 from ..core.types import OpenAIImageInput
@@ -744,8 +738,9 @@ class OpenAIConversationClosureDecisionProvider:
             request,
             context="conversation closure decision",
         )
-        payload = _load_json_object(
-            _coerce_text(self.backend._extract_output_text(response)),
+        payload = _extract_structured_response_object(
+            self.backend,
+            response,
             context="conversation closure decision",
         )
         return ConversationClosureProviderDecision(
@@ -904,15 +899,34 @@ class OpenAISupervisorDecisionProvider:
         GPT-5-family supervisor calls on the live Pi regularly need more than
         the old 80-token cap to finish the strict JSON contract, especially when
         the fast lane carries richer grounding and personality instructions.
-        Keep smaller legacy models free to use the configured lower cap, but
-        floor GPT-5/o-series structured supervisor turns to a safer budget.
+        Live Pi broad-tool-matrix runs on March 24, 2026 still showed
+        ``status=incomplete`` for some GPT-5.4-mini supervisor turns at the old
+        320-token floor. Keep smaller legacy models free to use the configured
+        lower cap, but floor GPT-5/o-series structured supervisor turns to a
+        safer first-pass budget.
         """
 
         configured = max(32, int(self.config.streaming_supervisor_max_output_tokens))
         normalized_model = str(model or "").strip().lower()
         if normalized_model.startswith(("gpt-5", "o")):
-            return max(configured, 160)
+            return max(configured, 512)
         return configured
+
+    def _retry_max_output_tokens(self, *, model: str, initial: int) -> tuple[int, ...] | None:
+        """Return bounded larger retry budgets for structured supervisor turns.
+
+        The live Pi broad-tool-matrix run proved that a single retry capped at
+        ``512`` still leaves some GPT-5.4-mini supervisor turns stuck in
+        ``status=incomplete``. Use a small monotonic ladder for GPT-5/o-series
+        structured calls while keeping legacy models on the existing one-retry
+        path.
+        """
+
+        normalized_model = str(model or "").strip().lower()
+        if not normalized_model.startswith(("gpt-5", "o")):
+            return None
+        ladder = (512, 768, 1024)
+        return tuple(budget for budget in ladder if budget > max(32, int(initial)))
 
     def _merged_base_instructions(self, instructions: str | None) -> str | None:
         """Merge backend tool-loop instructions with supervisor overrides."""
@@ -966,10 +980,17 @@ class OpenAISupervisorDecisionProvider:
         response = _create_response_with_reasoning_fallback(
             self.backend,
             request,
-            context="supervisor decision",  # AUDIT-FIX(#1,#3): Validate response status and retry once without unsupported reasoning.
+            context="supervisor decision",  # AUDIT-FIX(#1,#3): Validate response status, drop unsupported reasoning once, and use a bounded GPT-5 retry ladder for incomplete structured output.
+            retry_max_output_tokens=(
+                self._retry_max_output_tokens(
+                    model=model,
+                    initial=int(request["max_output_tokens"]),
+                )
+            ),
         )
-        payload = _load_json_object(
-            _coerce_text(self.backend._extract_output_text(response)),
+        payload = _extract_structured_response_object(
+            self.backend,
+            response,
             context="supervisor decision",
         )
         return SupervisorDecision(
@@ -1096,8 +1117,9 @@ class OpenAIFirstWordProvider:
             _FIRST_WORD_MODEL_FALLBACKS,
             _call,
         )
-        payload = _load_json_object(
-            _coerce_text(self.backend._extract_output_text(response)),
+        payload = _extract_structured_response_object(
+            self.backend,
+            response,
             context="first-word reply",
         )
         return FirstWordReply(
@@ -1240,6 +1262,21 @@ def _coerce_text(value: Any) -> str:
     return str(value)
 
 
+def _coerce_mapping(value: Any) -> dict[str, Any] | None:
+    """Normalize SDK structured-output helpers into a plain mapping."""
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dict(dumped)
+    return None
+
+
 def _validated_choice(
     value: Any,
     *,
@@ -1281,6 +1318,39 @@ def _load_json_object(text: str, *, context: str) -> dict[str, Any]:
     return payload
 
 
+def _extract_structured_response_object(
+    backend: OpenAIBackend,
+    response: Any,
+    *,
+    context: str,
+) -> dict[str, Any]:
+    """Decode a structured Responses API payload into one JSON object.
+
+    Structured JSON-schema calls must not rely on the generic free-text
+    extractor alone. The SDK may expose a parsed mapping separately, and the
+    concatenated ``output_text`` can contain trailing prose or multiple message
+    fragments that turn valid structured output into ``Extra data`` failures.
+    """
+
+    parsed_payload = _coerce_mapping(getattr(response, "output_parsed", None))
+    if parsed_payload is not None:
+        return parsed_payload
+
+    for item in getattr(response, "output", None) or ():
+        for content in getattr(item, "content", None) or ():
+            parsed_content = _coerce_mapping(getattr(content, "parsed", None))
+            if parsed_content is not None:
+                return parsed_content
+
+    payload_text = _coerce_text(backend._extract_output_text(response))
+    if not payload_text.strip():
+        raise RuntimeError(f"{context} returned empty structured output")
+    try:
+        return extract_json_object(payload_text)
+    except ValueError as exc:
+        raise RuntimeError(f"{context} returned invalid JSON: {exc}") from exc
+
+
 def _emit_text_delta(
     on_text_delta: Callable[[str], None] | None,
     text: str,
@@ -1303,8 +1373,9 @@ def _create_response_with_reasoning_fallback(
     request: dict[str, Any],
     *,
     context: str,
+    retry_max_output_tokens: Sequence[int] | None = None,
 ) -> Any:
-    """Create a response and retry once without reasoning if unsupported."""
+    """Create a response with bounded retries for reasoning and token budgets."""
 
     # AUDIT-FIX(#1,#3): Centralize create-path status validation and unsupported-reasoning retry logic.
     def _create_once(request_payload: dict[str, Any]) -> Any:
@@ -1318,9 +1389,13 @@ def _create_response_with_reasoning_fallback(
             return backend._client.responses.create(**retry_request)
 
     response = _create_once(request)
-    if _should_retry_incomplete_max_output_tokens(response, request=request):
+    for retry_budget in _iter_retry_max_output_tokens(
+        response,
+        request=request,
+        retry_max_output_tokens=retry_max_output_tokens,
+    ):
         retry_request = dict(request)
-        retry_request["max_output_tokens"] = _expanded_max_output_tokens(request.get("max_output_tokens"))
+        retry_request["max_output_tokens"] = retry_budget
         response = _create_once(retry_request)
     _validate_response_status(response, context=context)
     return response
@@ -1381,6 +1456,44 @@ def _should_retry_incomplete_max_output_tokens(
         return False
     incomplete_detail = _extract_detail_message(getattr(response, "incomplete_details", None)) or ""
     return "max_output_tokens" in incomplete_detail.lower()
+
+
+def _iter_retry_max_output_tokens(
+    response: Any,
+    *,
+    request: dict[str, Any],
+    retry_max_output_tokens: Sequence[int] | None,
+) -> tuple[int, ...]:
+    """Return bounded larger retry budgets for one incomplete response.
+
+    When callers do not provide a ladder, preserve the legacy single-retry
+    behavior. Callers with a model-specific ladder can supply it to keep the
+    retry path monotonic and bounded.
+    """
+
+    if not _should_retry_incomplete_max_output_tokens(response, request=request):
+        return ()
+
+    if retry_max_output_tokens is None:
+        return (_expanded_max_output_tokens(request.get("max_output_tokens")),)
+
+    try:
+        current_budget = max(16, int(request.get("max_output_tokens")))
+    except (TypeError, ValueError):
+        current_budget = 16
+
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for raw_budget in retry_max_output_tokens:
+        try:
+            budget = max(16, int(raw_budget))
+        except (TypeError, ValueError):
+            continue
+        if budget <= current_budget or budget in seen:
+            continue
+        seen.add(budget)
+        normalized.append(budget)
+    return tuple(normalized)
 
 
 def _expanded_max_output_tokens(value: Any) -> int:

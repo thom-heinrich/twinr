@@ -3,12 +3,12 @@
 ## Scope
 
 This directory owns proactive runtime orchestration: presence-session control,
-monitor tick coordination, wakeword arming, degraded-mode sensor handling, and
+monitor tick coordination, voice-activation arming, degraded-mode sensor handling, and
 bounded monitor lifecycle. Structural metadata lives in
 [component.yaml](./component.yaml).
 
 Out of scope:
-- social trigger scoring, review prompt content, or wakeword matching internals
+- social trigger scoring, review prompt content, or voice-activation matching internals
 - raw hardware adapters and low-level audio/camera/PIR implementations
 - proactive delivery cooldown policy in `../governance/`
 - top-level agent runtime loops above the monitor boundary
@@ -48,13 +48,14 @@ Out of scope:
 - `gesture_wakeup_lane.py` — dedicated visual wakeup stabilizer for one configured fine-hand symbol, separate from emoji acknowledgement and workflow entry orchestration
 - `gesture_wakeup_priority.py` — interaction-priority guard that lets button/voice outrank visual wakeups before a gesture can steal shared audio capture
 - `gesture_debug_stream.py` — bounded continuous JSONL debug stream for HDMI gesture refresh ticks, including raw observations, ack decisions, publish outcomes, and stage timings
+- `service.py` — runtime monitor orchestration plus the opt-in end-to-end gesture-refresh workflow run-pack binding used for hard Pi repro forensics
 - `audio_perception.py` — runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries for operator checks and recovery smokes
 - `pir_open_gate.py` — bounded startup gate that retries only exact transient PIR GPIO busy overlaps during runtime handover
 - `respeaker_capture_gate.py` — bounded startup gate that requires consecutive readable-frame probes before ReSpeaker capture is considered stable
 - `claim_metadata.py` — shared `confidence` / `source` / `requires_confirmation` helpers for runtime claims
 - `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
 - `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
-- `presence.py` — source of truth for wakeword presence-session arming
+- `presence.py` — source of truth for voice-activation presence-session arming
 - `service.py` — monitor orchestration, degraded-mode handling, lifecycle, and shared attention-surface fanout to HDMI plus optional body-follow servo
 - `__init__.py` — package export surface; treat changes as API-impacting
 - `component.yaml` — structured metadata, callers, and tests
@@ -62,13 +63,13 @@ Out of scope:
 ## Invariants
 
 - `PresenceSessionController.observe()` must preserve a monotonic internal timeline even when callers pass regressing or malformed timestamps.
-- Wakeword arming must fail closed on malformed sensor flags or unavailable dependencies.
-- `service.py` stays orchestration-focused; trigger scoring and wakeword matching belong in sibling packages.
+- Voice-activation arming must fail closed on malformed sensor flags or unavailable dependencies.
+- `service.py` stays orchestration-focused; trigger scoring and voice-activation matching belong in sibling packages.
 - `safety_trigger_fusion.py` may prefer fused safety claims over the legacy engine when the short-window evidence is stronger, but it must not bypass engine cooldown state, fall-reset state, vision review, presence-session suppression, or later runtime policy gates.
 - `service.py` may fan the same conservative `attention_target` out to HDMI face cues and the optional body-follow servo, but it must not create a parallel servo-specific targeting policy.
 - `audio_perception.py` must stay a bounded diagnostic/guard surface that reuses existing normalized observation and policy helpers; it must not grow its own parallel monitor orchestration.
-- `service.py` must pause the active streaming wakeword capture before handing an accepted streaming wakeword or visual gesture wakeup to an exclusive conversation-recording path on the same ALSA device, and reopen it after the handler returns; otherwise wakeups degenerate into immediate `Device or resource busy` capture failures.
-- `service.py` must not open a second proactive PCM `arecord` path or ReSpeaker readable-frame startup probe against the same ALSA device while the voice orchestrator already owns that capture and no shared wakeword buffer exists; in that case the proactive monitor should stay signal-only/fail-closed instead of thrashing ALSA.
+- `service.py` must pause the active streaming voice activation capture before handing an accepted streaming voice activation or visual gesture wakeup to an exclusive conversation-recording path on the same ALSA device, and reopen it after the handler returns; otherwise wakeups degenerate into immediate `Device or resource busy` capture failures.
+- `service.py` must not open a second proactive PCM `arecord` path or ReSpeaker readable-frame startup probe against the same ALSA device while the voice orchestrator already owns that capture and no shared voice activation buffer exists; in that case the proactive monitor should stay signal-only/fail-closed instead of thrashing ALSA.
 - `service.py` must not clear a targeted ReSpeaker startup blocker after a single transient readable-frame probe; startup needs sustained bounded capture success so unstable USB enumeration does not flap the runtime between `ok` and `error`.
 - `service.py` must tolerate only short exact `EBUSY` handover races when opening the PIR monitor; permanent GPIO contention or non-busy faults stay fail-closed and must not be downgraded.
 - `audio_policy.py` must treat classified non-speech/background-media room activity as incompatible with calm `presence_audio_active`; do not let uncorroborated XVF3800 speech flags alone re-elevate media/noise into device-directed presence speech.
@@ -77,7 +78,7 @@ Out of scope:
 - ReSpeaker ambient classification must not discard strong PCM non-speech evidence just because the legacy chunk/RMS activity gate returns false on a bounded playback window.
 - The operator-facing room-context guard should prefer already-classified non-speech/background-media over weak overlap hints; ambiguous low-confidence XVF3800 overlap alone must not relabel playback noise as human room speech.
 - `ambiguous_room_guard`, `identity_fusion`, `portrait_match`, `known_user_hint`, and `affect_proxy` must remain conservative claim surfaces, not direct product decisions.
-- `smart_home_context.py` must stay a bounded optional context layer: explicit same-room entity IDs only, stale streams fail closed, and smart-home facts must never manufacture local `person_visible` or wakeword arming.
+- `smart_home_context.py` must stay a bounded optional context layer: explicit same-room entity IDs only, stale streams fail closed, and smart-home facts must never manufacture local `person_visible` or voice-activation arming.
 - `person_state.py` must stay aggregation-only: reuse the current bounded runtime surfaces, keep axis contracts explicit, and do not smuggle new hidden policy or diagnosis logic into the aggregate layer.
 - `known_user_hint` must stay weaker than identity even when temporal portrait evidence is strong, and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
 - `identity_fusion` may use presence-session memory, enrolled household-voice candidates, and visual-anchor history, but it must stay confirm-first and fail closed on ambiguity or modality conflict.
@@ -88,7 +89,8 @@ Out of scope:
 - `attention_debug_stream.py` may expose bounded operator forensics for the fast attention lane, but it must stay inspection-only: report raw fallback sources, thresholds, and block reasons instead of introducing new runtime policy or a second truth source for camera facts.
 - `display_attention.py` may only publish its own `proactive_attention_follow` face cues and must fail closed when another display producer currently owns the cue store.
 - `display_debug_signals.py` must stay inspection-only: publish only bounded header pills from current camera facts and brief event/trigger holds, keep the lane file-backed and optional, and do not widen the generic runtime snapshot schema or invent a second alerting surface.
-- `display_gesture_emoji.py` may only acknowledge stabilized rising-edge camera gesture events, must stay bounded and short-lived, must fail closed when another producer currently owns the emoji surface, and must prefer motion-bearing coarse gestures like `wave` over a simultaneous generic `open_palm` hand-shape cue.
+- `display_gesture_emoji.py` may only acknowledge stabilized rising-edge camera gesture events, must stay bounded and short-lived, and must fail closed when another producer currently owns the emoji surface.
+- The dedicated live HDMI gesture acknowledgement path is intentionally limited to `thumbs_up`, `thumbs_down`, and `peace_sign`; do not reintroduce `wave`, `pointing`, `open_palm`, `ok_sign`, or other symbols there without fresh Pi acceptance evidence.
 - `display_reserve_day_plan.py` must keep reserve scheduling persistent and local-day-scoped: plan generation belongs there, not inline in the proactive monitor tick, and repetition control must stay generic rather than topic-hardcoded. If the first same-day plan is empty, it must retry after a short bounded backoff rather than leaving the reserve blank until midnight. A current-day plan must keep unresolved topics in same-day rotation instead of treating one visual exposure as retirement; only real user feedback or the next nightly replacement may take a topic out of that day’s loop. Fresh shown-card feedback may trigger a rebuild, but only through bounded generic biasing and answer-based retirement rather than ad-hoc named-topic overrides. The planner may spread source families such as world/place/memory/social/reflection, but that family mixing must stay generic and derived from candidate state rather than named-topic rules.
 - `display_reserve_companion_planner.py` owns the explicit overnight reserve-lane review. Nightly reflection/world-refresh triggering, prepared next-day plan storage, recent shown-card outcome summarization, and morning adoption rules belong there rather than in `display_ambient_impulses.py` or the active loop classes.
 - `display_reserve_flow.py` owns ambient companion candidate orchestration. Keep memory hooks in `display_reserve_memory.py`, slower reflection sourcing in `display_reserve_reflection.py`, and long-horizon shown-card learning in `display_reserve_learning.py` instead of regrowing one large mixed loader.
@@ -105,6 +107,7 @@ Out of scope:
 - `display_ambient_impulses.py` may persist bounded exposure metadata for later learning, but that path must stay write-only from the monitor loop perspective: no reaction inference, transcript parsing, or ranking decisions belong in the live publisher.
 - `display_reserve_runtime.py` owns the actual right-lane text-card publish side effects. New reserve-lane producers must reuse it instead of duplicating cue/history writes or adding another right-lane store.
 - `display_social_reserve.py` may reuse the shared reserve runtime publisher for visual-first proactive prompts, but it must stay a thin routing layer: no proactive ranking, no personality planning, and no fullscreen presentation fallback logic belongs there.
+- `display_reserve_support.py` owns the shared reserve-lane text, timestamp, and local-time normalization helpers. Reserve planners and publishers must reuse it instead of regrowing tiny duplicate parsing helpers.
 - `gesture_wakeup_lane.py` may only derive one bounded wake decision from the configured fine-hand trigger. It must not publish HDMI cues itself, must stay independent from emoji acknowledgement cooldowns, and must never open a conversation turn directly.
 - `gesture_wakeup_priority.py` must enforce the interaction precedence `button > voice > gesture`: a visual wakeup may not dispatch while Twinr is already in a non-waiting runtime state or while recent speech evidence says the voice path should win.
 - Accepted visual gesture wakeups must not run synchronously on the proactive monitor worker thread. Dispatch them through `gesture_wakeup_dispatcher.py` so HDMI attention refresh keeps running during `listening` and `processing`.
@@ -117,6 +120,9 @@ Out of scope:
 - `service.py` should keep a bounded changed-only ops trace for HDMI attention-follow decisions so Pi debugging can prove whether failures come from camera health, stabilized camera semantics, target selection, or cue publishing.
 - `service.py` should also keep a bounded continuous attention debug stream for each HDMI refresh tick so transient 1-3 minute eye-follow dropouts still leave first-run evidence after the fact.
 - `service.py` should also keep a bounded continuous gesture debug stream for each HDMI gesture refresh tick so Pi-side symbol latency and missed acknowledgements can be diagnosed from first-run evidence instead of blind retuning. That stream should include bounded provenance from the dedicated gesture pipeline itself when available, so operators can tell whether a miss came from full-frame live recognition, a recent-person ROI fallback, a recent-hand ROI fallback, or publish/ack policy.
+- When hard Pi gesture repros still are not explained by `gesture_debug_stream.py`, `service.py` may bind an opt-in end-to-end workflow run-pack around the gesture refresh, but that path must stay bounded, redacted by default, and debugging-only.
+- `service_attention_helpers.py` owns HDMI attention-follow live-context export, changed-only follow traces, servo decision logging, and per-tick attention debug packaging. `service.py` should orchestrate those helpers rather than regrowing attention logic inline.
+- `service_gesture_helpers.py` owns HDMI gesture acknowledgement publish, accepted gesture wakeup dispatch, and gesture debug/trace packaging. `service.py` should remain the lifecycle/tick coordinator, not the gesture-policy implementation file.
 - The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
 - The fast HDMI attention-refresh path may stay active while the main runtime is in `error`, but only for local face-cue following; it must not be used to re-enable agent turns, remote-memory work, or other degraded runtime behavior.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.
@@ -131,28 +137,28 @@ After any edit in this directory, run:
 python3 -m compileall src/twinr/proactive/runtime
 PYTHONPATH=src pytest test/test_person_state.py -q
 PYTHONPATH=src pytest test/test_proactive_monitor.py -q
-PYTHONPATH=src pytest test/test_display_reserve_generation.py test/test_display_reserve_prompting.py test/test_display_reserve_learning.py test/test_display_reserve_reflection.py test/test_display_reserve_flow.py test/test_display_reserve_day_plan.py test/test_display_reserve_companion_planner.py test/test_display_reserve_runtime.py test/test_display_ambient_impulses.py test/test_display_social_reserve.py -q
+PYTHONPATH=src pytest test/test_proactive_runtime_service.py -q
+PYTHONPATH=src pytest test/test_display_reserve_support.py test/test_display_reserve_generation.py test/test_display_reserve_prompting.py test/test_display_reserve_learning.py test/test_display_reserve_reflection.py test/test_display_reserve_flow.py test/test_display_reserve_day_plan.py test/test_display_reserve_companion_planner.py test/test_display_reserve_runtime.py test/test_display_ambient_impulses.py test/test_display_social_reserve.py -q
 ```
 
 If workflow wiring or export surface changed, also run:
 
 ```bash
-PYTHONPATH=src pytest test/test_runner.py test/test_realtime_runner.py -q
+PYTHONPATH=src pytest test/test_realtime_runner.py test/test_streaming_runner.py -q
 ```
 
 ## Coupling
 
 `presence.py` changes -> also check:
 - `service.py`
-- `src/twinr/proactive/wakeword/stream.py`
 - `test/test_proactive_monitor.py`
 
-`service.py`, `display_ambient_impulses.py`, `display_social_reserve.py`, `display_reserve_runtime.py`, `display_reserve_day_plan.py`, `display_reserve_companion_planner.py`, `display_reserve_flow.py`, `display_reserve_learning.py`, `display_reserve_memory.py`, `display_reserve_reflection.py`, `display_reserve_prompting.py`, or `display_reserve_generation.py` changes -> also check:
+`service.py`, `service_attention_helpers.py`, `service_gesture_helpers.py`, `display_ambient_impulses.py`, `display_social_reserve.py`, `display_reserve_runtime.py`, `display_reserve_day_plan.py`, `display_reserve_companion_planner.py`, `display_reserve_flow.py`, `display_reserve_learning.py`, `display_reserve_memory.py`, `display_reserve_reflection.py`, `display_reserve_prompting.py`, `display_reserve_generation.py`, or `display_reserve_support.py` changes -> also check:
 - `src/twinr/proactive/social/`
-- `src/twinr/proactive/wakeword/`
-- `src/twinr/agent/workflows/runner.py`
 - `src/twinr/agent/workflows/realtime_runner.py`
+- `src/twinr/agent/workflows/streaming_runner.py`
 - `test/test_proactive_monitor.py`
+- `test/test_proactive_runtime_service.py`
 - `test/test_display_reserve_flow.py`
 - `test/test_display_reserve_learning.py`
 - `test/test_display_reserve_prompting.py`
@@ -160,6 +166,7 @@ PYTHONPATH=src pytest test/test_runner.py test/test_realtime_runner.py -q
 - `test/test_display_reserve_day_plan.py`
 - `test/test_display_reserve_companion_planner.py`
 - `test/test_display_reserve_runtime.py`
+- `test/test_display_reserve_support.py`
 
 `audio_perception.py` or `audio_policy.py` changes -> also check:
 - `src/twinr/__main__.py`
@@ -174,7 +181,7 @@ PYTHONPATH=src pytest test/test_runner.py test/test_realtime_runner.py -q
 
 ## Security
 
-- Keep wakeword capture writes under validated artifacts-root subpaths; do not widen path or symlink handling.
+- Keep voice activation capture writes under validated artifacts-root subpaths; do not widen path or symlink handling.
 - Do not bypass the privacy gate that disables camera-triggered proactive behavior when `proactive_enabled` is false.
 - Keep emit and ops-event paths non-throwing so sensor and worker faults remain recoverable.
 

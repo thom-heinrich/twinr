@@ -13,17 +13,18 @@ from typing import Any
 
 from twinr.agent.personality.intelligence import WorldIntelligenceConfigRequest
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import ArgumentValidationError, optional_bool, optional_float, require_sensitive_voice_confirmation
 
 _MAX_TEXT_LENGTH = 256
 
 
-def _ensure_mapping(arguments: dict[str, object]) -> Mapping[str, object]:
+def _ensure_mapping(arguments: dict[str, object]) -> dict[str, object]:
     """Validate that one tool payload is a JSON-like object."""
 
     if not isinstance(arguments, Mapping):
         raise RuntimeError("Tool arguments must be an object.")
-    return arguments
+    return dict(arguments)
 
 
 def _text_argument(
@@ -115,19 +116,13 @@ def _serialize_refresh(refresh: object | None) -> dict[str, object] | None:
 def _safe_emit(owner: Any, key: str, value: object) -> None:
     """Emit one best-effort telemetry key/value pair."""
 
-    try:
-        owner.emit(f"{key}={value}")
-    except Exception:
-        return
+    emit_best_effort(owner, f"{key}={value}")
 
 
 def _safe_record_event(owner: Any, event_name: str, message: str, **metadata: object) -> None:
     """Record one best-effort tool event."""
 
-    try:
-        owner._record_event(event_name, message, **metadata)
-    except Exception:
-        return
+    record_event_best_effort(owner, event_name, message, dict(metadata))
 
 
 def handle_configure_world_intelligence(owner: Any, arguments: dict[str, object]) -> dict[str, object]:

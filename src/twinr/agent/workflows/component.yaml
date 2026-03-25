@@ -3,14 +3,15 @@ name: workflows
 path: src/twinr/agent/workflows
 kind: python-package
 visibility: internal
-summary: Orchestrate the active realtime and streaming Twinr hardware loops plus their bounded capture, speech, print, and feedback helpers while retaining compatibility shims for older loop imports.
+summary: Orchestrate the active realtime and streaming Twinr hardware loops plus their bounded capture, speech, print, and feedback helpers.
 owned_concerns:
-  - Orchestrate button, wakeword, configured visual gesture-wakeup, and proactive entry points for Twinr hardware loops
+  - Orchestrate button, voice-activation, configured visual gesture-wakeup, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
   - Bridge bounded edge audio and runtime-state updates into the server-backed voice orchestrator without moving runtime-state ownership off the Pi loop
   - Coordinate bounded same-stream transcript commits from the server-backed voice orchestrator so live wake/listen turns stay remote and the Pi remains an I/O edge
+  - Keep remote live barge-in on that same server stream instead of reopening a second local interrupt-STT watcher on the Pi
   - Keep live capture paths from failing immediately on proven transient XVF3800 re-enumeration by reusing the bounded hardware-level recovery helper
-  - Cache and replay one normalized wakeword-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
+  - Cache and replay one normalized activation-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
   - Start one bounded managed smart-home sensor worker and feed its normalized observations into the realtime sensor path
   - Hold fatal loop/bootstrap failures in a stable runtime error state so the Pi display companion and supervisor do not flap back to the desktop
   - Forward completed tool-call history into runtime-side personality learning after turn finalization
@@ -24,8 +25,9 @@ owned_concerns:
   - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns, with display-first prompts routed into the right-hand reserve lane instead of fullscreen presentation
   - Trigger one bounded overnight reserve-lane maintenance pass from the idle housekeeping worker so the next local day can start from a reviewed/prepared ambient companion plan
   - Produce bounded forensic run packs for live button/session/audio investigation
+  - Capture bounded helper-thread snapshots for live dual-lane watchdog and timeout failures
   - Share workflow-local support helpers for feedback tones, reference images, background delivery, and streaming capture
-  - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths without eager runner imports
+  - Expose the active workflow entry points without eager runner imports
 out_of_scope:
   - Runtime state, memory, reminder, or automation store implementations
   - Provider transport adapters, prompt authoring, or tool schema definitions
@@ -37,21 +39,38 @@ files:
     exports:
       - SocialTriggerDecision
       - SocialTriggerEngine
-      - TwinrHardwareLoop
       - TwinrRealtimeHardwareLoop
       - TwinrStreamingHardwareLoop
-  - path: runner.py
-    role: Compatibility shim to the legacy classic press-to-talk hardware loop implementation
-    exports:
-      - TwinrHardwareLoop
   - path: realtime_runner.py
-    role: Realtime session loop with wakeword, configured visual gesture-wakeup, print-lane, and smart-home sensor-worker orchestration that delegates guidance and transcript verification
+    role: Realtime session loop with voice activation, configured visual gesture-wakeup, print-lane, and smart-home sensor-worker orchestration that delegates focused follow-up, voice-bridge, guidance, and transcript-verification helpers
     exports:
       - TwinrRealtimeHardwareLoop
+  - path: realtime_follow_up.py
+    role: Focused follow-up reopening and closure-decision helper for the realtime loop
+    exports:
+      - apply_follow_up_closure_evaluation
+      - emit_closure_decision
+      - evaluate_follow_up_closure
+      - follow_up_allowed_for_source
+      - follow_up_vetoed_by_closure
   - path: voice_orchestrator.py
     role: Edge-side voice websocket bridge that streams bounded audio/runtime-state updates, survives bounded transient XVF3800 capture loss, and dispatches wake, same-stream transcript commits, follow-up-close, and barge-in events back into the realtime loop
     exports:
       - EdgeVoiceOrchestrator
+  - path: voice_orchestrator_runtime.py
+    role: Runtime-side voice-orchestrator state replay, intent-context refresh, same-stream transcript handoff, and remote follow-up helper
+    exports:
+      - begin_remote_transcript_wait
+      - handle_remote_transcript_committed
+      - notify_voice_orchestrator_state
+      - pause_voice_orchestrator_capture
+      - prime_voice_orchestrator_waiting_state
+      - refresh_voice_orchestrator_sensor_context
+      - resume_voice_orchestrator_capture
+      - voice_orchestrator_follow_up_mode
+      - voice_orchestrator_handles_follow_up
+      - voice_orchestrator_owns_live_listening
+      - wait_for_remote_transcript_commit
   - path: remote_transcript_commit.py
     role: Coordinate active waits for server-side transcript commits during remote listen windows
     exports:
@@ -140,6 +159,22 @@ files:
     role: Active reminder, automation, and proactive background-delivery mixin, including reserve-lane routing for display-first proactive prompts and the overnight reserve-lane maintenance trigger
     exports:
       - TwinrRealtimeBackgroundMixin
+  - path: realtime_runtime/background_delivery.py
+    role: Idle-window gate for background speech/display delivery starts
+    exports:
+      - BackgroundDeliveryBlocked
+      - begin_background_delivery
+      - background_block_reason
+      - background_block_reason_locked
+      - background_work_allowed
+  - path: realtime_runtime/reminder_delivery.py
+    role: Focused reminder phrasing and reminder-speech delivery helpers with deterministic local fallback text
+    exports:
+      - LocalMetadataResponse
+      - default_due_reminder_text
+      - deliver_due_reminder
+      - phrase_due_reminder_with_fallback
+      - safe_format_due_label
   - path: realtime_runtime/proactive_delivery.py
     role: Display-first versus speech delivery policy for proactive background prompts
     exports:
@@ -150,14 +185,30 @@ files:
     exports:
       - TwinrRealtimeSupportMixin
       - _default_emit
-  - path: realtime_runner_background.py
-    role: Compatibility shim for the active realtime background-delivery mixin
+  - path: realtime_runtime/required_remote_support.py
+    role: Focused required-remote fail-closed gating, watchdog-artifact attestation, and recovery helper for live loops
     exports:
-      - TwinrRealtimeBackgroundMixin
-  - path: realtime_runner_support.py
-    role: Compatibility shim for the active realtime support helpers
+      - attest_watchdog_artifact_remote_ready
+      - best_effort_stop_player
+      - current_runtime_error_matches_required_remote
+      - enter_required_remote_error
+      - refresh_required_remote_dependency
+      - remote_dependency_is_required
+      - request_required_remote_dependency_refresh
+      - required_remote_dependency_current_ready
+      - required_remote_dependency_interval_seconds
+      - required_remote_dependency_recovery_hold_seconds
+      - required_remote_dependency_uses_watchdog_artifact
+  - path: realtime_runtime/vision_support.py
+    role: Safe reference-image loading, live camera image bundling, and bounded vision prompt construction
     exports:
-      - TwinrRealtimeSupportMixin
+      - build_image_input
+      - build_vision_images
+      - build_vision_prompt
+      - load_reference_image
+      - normalize_reference_image_path
+      - safe_read_reference_image_bytes
+      - validate_reference_image_base_dir
   - path: realtime_runner_tools.py
     role: Thin realtime tool-callback delegate mixin, including smart-home and RSS/world-intelligence wiring
     exports:
@@ -175,7 +226,7 @@ files:
       - StreamingTextToSpeechProviderLike
       - WaveAudioPlayerLike
   - path: forensics.py
-    role: Queue-based forensic workflow tracing and runpack generation
+    role: Queue-based forensic workflow tracing, runpack generation, and bounded helper-thread snapshots
     exports:
       - WorkflowForensics
   - path: print_lane.py
@@ -189,17 +240,8 @@ files:
       - WorkingFeedbackKind
       - WorkingFeedbackProfile
       - start_working_feedback_loop
-  - path: social_triggers.py
-    role: Compatibility wrapper for proactive trigger imports
-compatibility_reexports:
-  - path: src/twinr/runner.py
-    mode: star
-  - path: src/twinr/realtime_runner.py
-    mode: star
 primary_callers:
   - path: src/twinr/__main__.py
-  - path: src/twinr/runner.py
-  - path: src/twinr/realtime_runner.py
   - path: src/twinr/agent/tools/handlers/output.py
   - path: src/twinr/agent/tools/runtime/dual_lane_loop.py
 tests:
@@ -208,7 +250,6 @@ tests:
   - path: test/test_startup_boot_sound.py
   - path: test/test_main.py
   - path: test/test_orchestrator.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
   - path: test/test_dual_lane_loop.py
@@ -217,4 +258,6 @@ tests:
   - path: test/test_workflow_forensics.py
   - path: test/test_openai_realtime.py
   - path: test/test_longterm_multimodal.py
+  - path: test/test_realtime_runtime_helpers.py
+  - path: test/test_realtime_runner_helpers.py
   - path: test/run_pi_tool_matrix.py

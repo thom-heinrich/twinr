@@ -16,8 +16,18 @@ The world-intelligence layer keeps three concerns explicit:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from twinr.agent.personality._payload_utils import (
+    clean_text as _clean_text,
+    mapping_items as _mapping_items,
+    normalize_float as _normalize_float,
+    normalize_int as _normalize_int,
+    normalize_string_tuple as _normalize_string_tuple,
+    optional_text as _optional_text,
+    required_mapping_text as _required_mapping_text,
+)
 
 DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND = "agent_world_intelligence_subscriptions_v1"
 DEFAULT_WORLD_INTELLIGENCE_STATE_KIND = "agent_world_intelligence_state_v1"
@@ -29,71 +39,6 @@ _ALLOWED_WORLD_SCOPES = frozenset({"local", "regional", "national", "global", "t
 _ALLOWED_ENGAGEMENT_STATES = frozenset({"resonant", "warm", "uncertain", "cooling", "avoid"})
 _ALLOWED_ONGOING_INTEREST_STATES = frozenset({"active", "growing", "peripheral"})
 _ALLOWED_CO_ATTENTION_STATES = frozenset({"latent", "forming", "shared_thread"})
-
-
-def _clean_text(value: object | None) -> str:
-    """Normalize one free-form text value into a trimmed single line."""
-
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).strip()
-
-
-def _optional_text(value: object | None) -> str | None:
-    """Return one normalized string or ``None`` for blank input."""
-
-    normalized = _clean_text(value)
-    return normalized or None
-
-
-def _normalize_string_tuple(value: object | None, *, field_name: str) -> tuple[str, ...]:
-    """Normalize a sequence of strings while rejecting blank items."""
-
-    if value is None:
-        return ()
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"{field_name} must be a sequence of strings.")
-    items: list[str] = []
-    for index, item in enumerate(value):
-        normalized = _clean_text(item)
-        if not normalized:
-            raise ValueError(f"{field_name}[{index}] cannot be blank.")
-        items.append(normalized)
-    return tuple(items)
-
-
-def _normalize_float(value: object | None, *, field_name: str, default: float) -> float:
-    """Normalize one bounded 0..1 float field."""
-
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be numeric.") from exc
-    if parsed < 0.0:
-        return 0.0
-    if parsed > 1.0:
-        return 1.0
-    return parsed
-
-
-def _normalize_int(
-    value: object | None,
-    *,
-    field_name: str,
-    default: int,
-    minimum: int,
-) -> int:
-    """Normalize one positive integer field."""
-
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer.") from exc
-    return max(minimum, parsed)
 
 
 def _legacy_default_engagement_score(payload: Mapping[str, object]) -> float:
@@ -118,36 +63,6 @@ def _legacy_default_engagement_score(payload: Mapping[str, object]) -> float:
     if explicit:
         base = max(base, 0.86)
     return _normalize_float(base, field_name="engagement_score", default=0.5)
-
-
-def _mapping_items(value: object | None, *, field_name: str) -> tuple[Mapping[str, object], ...]:
-    """Normalize one payload field into a tuple of mappings."""
-
-    if value is None:
-        return ()
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"{field_name} must be a sequence of mappings.")
-    items: list[Mapping[str, object]] = []
-    for index, item in enumerate(value):
-        if not isinstance(item, Mapping):
-            raise ValueError(f"{field_name}[{index}] must be a mapping.")
-        items.append(item)
-    return tuple(items)
-
-
-def _required_mapping_text(
-    payload: Mapping[str, object],
-    *,
-    field_name: str,
-    aliases: tuple[str, ...] = (),
-) -> str:
-    """Read one required normalized text field from a payload mapping."""
-
-    for key in (field_name,) + aliases:
-        normalized = _clean_text(payload.get(key))
-        if normalized:
-            return normalized
-    raise ValueError(f"{field_name} is required.")
 
 
 def _derive_engagement_state(

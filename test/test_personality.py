@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.personality import DEFAULT_PERSONALITY_SNAPSHOT_KIND
 from twinr.agent.personality.intelligence import DEFAULT_WORLD_INTELLIGENCE_STATE_KIND
 from twinr.memory.longterm.storage.remote_state import (
@@ -16,7 +16,7 @@ from twinr.memory.longterm.storage.remote_state import (
     remote_snapshot_document_hints_path,
 )
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
-from twinr.personality import (
+from twinr.agent.base_agent.prompting.personality import (
     load_conversation_closure_instructions,
     load_personality_instructions,
     load_supervisor_loop_instructions,

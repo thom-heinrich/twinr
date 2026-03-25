@@ -51,7 +51,7 @@ def assess_respeaker_monitor_startup_contract(
             ops_reason="respeaker_dfu_mode_blocked",
             detail=(
                 "ReSpeaker XVF3800 is visible on USB but has no ALSA capture device. "
-                "Twinr refuses to start proactive or wakeword audio against DFU/safe mode. "
+                "Twinr refuses to start proactive or voice-activation audio against DFU/safe mode. "
                 "Reboot or reflash the board into its normal USB-audio runtime first."
             ),
         )
@@ -62,7 +62,7 @@ def assess_respeaker_monitor_startup_contract(
             ops_reason="respeaker_not_detected_blocked",
             detail=(
                 "ReSpeaker XVF3800 is not visible to the Pi, so Twinr refuses to start "
-                "proactive or wakeword audio against the configured Array capture path. "
+                "proactive or voice-activation audio against the configured Array capture path. "
                 "Reconnect the board or fix the USB/audio path before restarting Twinr."
             ),
         )

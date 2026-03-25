@@ -864,7 +864,7 @@ class LongTermRemoteCatalogStore:
                             scope_ref=scope_ref,
                             namespace=namespace,
                         ),
-                        operation=lambda: self._search_remote_candidates(
+                        operation=lambda request_limit=request_limit: self._search_remote_candidates(
                             snapshot_kind=snapshot_kind,
                             read_client=read_client,
                             query_text=clean_query,
@@ -2801,7 +2801,7 @@ class LongTermRemoteCatalogStore:
 
         if not batches:
             return ()
-        remote_state = self._require_remote_state()
+        self._require_remote_state()
 
         def load_one(batch: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
             try:

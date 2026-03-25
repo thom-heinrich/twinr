@@ -117,11 +117,36 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
         self.assertEqual(transcript, "Guten Morgen aus Schwarzenbek.")
         call = client.calls[0]
         self.assertEqual(call["url"], "https://api.deepgram.example/v1/listen")
-        self.assertEqual(call["params"]["model"], "nova-3")
-        self.assertEqual(call["params"]["language"], "de")
-        self.assertEqual(call["params"]["smart_format"], "true")
+        self.assertIn(("model", "nova-3"), call["params"])
+        self.assertIn(("language", "de"), call["params"])
+        self.assertIn(("smart_format", "true"), call["params"])
         self.assertEqual(call["headers"]["Authorization"], "Token deepgram-key")
         self.assertEqual(call["content"], b"WAVDATA")
+
+    def test_transcribe_maps_prompt_terms_to_nova3_keyterms(self) -> None:
+        client = FakeDeepgramClient()
+        provider = DeepgramSpeechToTextProvider(
+            config=TwinrConfig(
+                deepgram_api_key="deepgram-key",
+                deepgram_base_url="https://api.deepgram.example/v1",
+                deepgram_stt_model="nova-3",
+                deepgram_stt_language="de",
+                deepgram_stt_smart_format=True,
+            ),
+            client=client,
+        )
+
+        provider.transcribe(
+            b"WAVDATA",
+            filename="turn.wav",
+            content_type="audio/wav",
+            prompt="Twinr, Twinna, Twinner.",
+        )
+
+        params = client.calls[0]["params"]
+        self.assertIn(("keyterm", "Twinr"), params)
+        self.assertIn(("keyterm", "Twinna"), params)
+        self.assertIn(("keyterm", "Twinner"), params)
 
     def test_start_streaming_session_uses_websocket_and_returns_final_transcript(self) -> None:
         captured = {}

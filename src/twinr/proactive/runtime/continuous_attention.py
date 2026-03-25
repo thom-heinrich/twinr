@@ -276,6 +276,44 @@ class ContinuousAttentionTracker:
             confidence=max(0.6, primary_track.confidence),
         )
 
+    def debug_snapshot(self, *, observed_at: float | None) -> dict[str, object]:
+        """Return one bounded debug view of the current visible-track state."""
+
+        checked_at = 0.0 if observed_at is None else float(observed_at)
+        active_tracks = [
+            track
+            for track in self._tracks.values()
+            if (checked_at - track.updated_at) <= self.config.track_stale_s
+        ]
+        active_tracks.sort(key=lambda item: (item.updated_at, item.confidence), reverse=True)
+        track_summaries: list[dict[str, object]] = []
+        for track in active_tracks[:4]:
+            last_motion_age_s = None
+            if track.last_motion_at is not None:
+                last_motion_age_s = round(max(0.0, checked_at - track.last_motion_at), 3)
+            track_summaries.append(
+                {
+                    "track_id": track.track_id,
+                    "center_x": round(track.center_x, 4),
+                    "center_y": round(track.center_y, 4),
+                    "zone": track.zone,
+                    "confidence": round(track.confidence, 4),
+                    "velocity_x": round(track.velocity_x, 4),
+                    "age_s": round(max(0.0, checked_at - track.updated_at), 3),
+                    "last_motion_age_s": last_motion_age_s,
+                }
+            )
+        selected_track_age_s = None
+        if self._last_selected_at is not None:
+            selected_track_age_s = round(max(0.0, checked_at - self._last_selected_at), 3)
+        return {
+            "selected_track_id": self._last_selected_track_id,
+            "selected_track_age_s": selected_track_age_s,
+            "audio_mirror_score": self._audio_mirror_score,
+            "active_track_count": len(active_tracks),
+            "tracks": track_summaries,
+        }
+
     def _update_tracks(
         self,
         *,

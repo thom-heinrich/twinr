@@ -165,7 +165,7 @@ For Pi deployment, install the provided systemd unit under [`hardware/ops`](../h
 ## Minimal usage
 
 ```python
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBRetrieveRequest
 
 config = TwinrConfig.from_env(".env")

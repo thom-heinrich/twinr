@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupLane
 from twinr.proactive.social.engine import SocialFineHandGesture, SocialVisionObservation
 

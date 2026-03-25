@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
+    from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+    from twinr.proactive import SocialTriggerDecision, SocialTriggerEngine
 
 __all__ = [
     "SocialTriggerDecision",
     "SocialTriggerEngine",
-    "TwinrHardwareLoop",
     "TwinrRealtimeHardwareLoop",
     "TwinrStreamingHardwareLoop",
 ]
@@ -15,7 +20,6 @@ __all__ = [
 _EXPORTS = {
     "SocialTriggerDecision": "twinr.proactive",
     "SocialTriggerEngine": "twinr.proactive",
-    "TwinrHardwareLoop": "twinr.agent.legacy.classic_hardware_loop",
     "TwinrRealtimeHardwareLoop": "twinr.agent.workflows.realtime_runner",
     "TwinrStreamingHardwareLoop": "twinr.agent.workflows.streaming_runner",
 }

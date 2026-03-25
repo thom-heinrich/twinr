@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
-from typing import Callable, Generic, TypeVar
+from typing import Callable, Generic, TypeVar, cast
 import time
 
 from twinr.agent.base_agent.contracts import FirstWordReply
-from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
+from twinr.agent.workflows.forensics import capture_thread_snapshot
 
 
 T = TypeVar("T")
@@ -71,6 +72,8 @@ class _BackgroundLaneTask(Generic[T]):
         self._lock = Lock()
         self._result: T | None = None
         self._error: BaseException | None = None
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
         self._thread = Thread(
             target=self._run,
             name=f"twinr-{name}",
@@ -80,6 +83,7 @@ class _BackgroundLaneTask(Generic[T]):
     def start(self) -> None:
         """Start the background lane task exactly once."""
 
+        self._started_at = time.monotonic()
         self._thread.start()
 
     @property
@@ -98,6 +102,7 @@ class _BackgroundLaneTask(Generic[T]):
             with self._lock:
                 self._result = result
         finally:
+            self._finished_at = time.monotonic()
             self._done.set()
 
     def result(self) -> T:
@@ -108,7 +113,25 @@ class _BackgroundLaneTask(Generic[T]):
         with self._lock:
             if self._error is not None:
                 raise self._error
-            return self._result
+            return cast(T, self._result)
+
+    def snapshot(self) -> dict[str, object]:
+        """Describe the current task/thread state for bounded forensics."""
+
+        now = self._finished_at if self._finished_at is not None else time.monotonic()
+        started_at = self._started_at
+        elapsed_ms = None if started_at is None else round((now - started_at) * 1000.0, 3)
+        with self._lock:
+            error_type = type(self._error).__name__ if self._error is not None else None
+            has_result = self._result is not None
+        return {
+            "name": self.name,
+            "done": self.done,
+            "elapsed_ms": elapsed_ms,
+            "error_type": error_type,
+            "has_result": has_result,
+            "thread": capture_thread_snapshot(self._thread),
+        }
 
 
 class StreamingTurnOrchestrator:
@@ -133,6 +156,7 @@ class StreamingTurnOrchestrator:
         resume_processing_after_bridge: Callable[[], None] | None = None,
         stop_final_lane_feedback: Callable[[], None] | None = None,
         emit: Callable[[str], None] | None = None,
+        trace_event: Callable[..., None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         request_final_lane_stop: Callable[[str], None] | None = None,
     ) -> None:
@@ -145,6 +169,7 @@ class StreamingTurnOrchestrator:
         self.resume_processing_after_bridge = resume_processing_after_bridge
         self.stop_final_lane_feedback = stop_final_lane_feedback
         self.emit = emit
+        self.trace_event = trace_event
         self.should_stop = should_stop
         self.request_final_lane_stop = request_final_lane_stop
 
@@ -257,6 +282,16 @@ class StreamingTurnOrchestrator:
             ):
                 bridge_wait_feedback_resumed = True
                 self._emit("bridge_ack_completed_while_final_lane_running=true")
+                self._trace_event(
+                    "streaming_final_lane_still_running_after_bridge",
+                    kind="branch",
+                    details={
+                        "elapsed_ms": round((now - started_at) * 1000.0, 3),
+                        "bridge_source": bridge_source,
+                        "bridge_mode": bridge_reply.mode if bridge_reply is not None else None,
+                        "final_lane": final_task.snapshot(),
+                    },
+                )
                 self._resume_processing_after_bridge()
 
             if (
@@ -330,11 +365,34 @@ class StreamingTurnOrchestrator:
             if not final_lane_watchdog_triggered and now >= final_watchdog_deadline:
                 final_lane_watchdog_triggered = True
                 self._emit("final_lane_watchdog=true")
+                self._trace_event(
+                    "streaming_final_lane_watchdog_triggered",
+                    kind="warning",
+                    level="WARN",
+                    details={
+                        "elapsed_ms": round((now - started_at) * 1000.0, 3),
+                        "bridge_emitted": bridge_emitted,
+                        "bridge_source": bridge_source,
+                        "final_lane": final_task.snapshot(),
+                    },
+                )
                 if not bridge_emitted:
                     self.ensure_processing_feedback()
 
             if now >= final_hard_deadline:
                 self._emit("final_lane_timeout=true")
+                self._trace_event(
+                    "streaming_final_lane_timeout",
+                    kind="exception",
+                    level="ERROR",
+                    details={
+                        "elapsed_ms": round((now - started_at) * 1000.0, 3),
+                        "bridge_emitted": bridge_emitted,
+                        "bridge_source": bridge_source,
+                        "bridge_watchdog_triggered": bridge_watchdog_triggered,
+                        "final_lane": final_task.snapshot(),
+                    },
+                )
                 self._request_final_lane_stop("timeout")
                 self._stop_final_lane_feedback()
                 raise FinalLaneTimeoutError("streaming final lane exceeded its hard deadline")
@@ -390,6 +448,28 @@ class StreamingTurnOrchestrator:
     def _emit(self, message: str) -> None:
         if self.emit is not None:
             self.emit(message)
+
+    def _trace_event(
+        self,
+        name: str,
+        *,
+        kind: str,
+        details: dict[str, object] | None = None,
+        level: str | None = None,
+        kpi: dict[str, object] | None = None,
+    ) -> None:
+        if self.trace_event is None:
+            return
+        try:
+            self.trace_event(
+                name,
+                kind=kind,
+                details=dict(details or {}),
+                level=level,
+                kpi=kpi,
+            )
+        except Exception:
+            pass
 
     def _stop_final_lane_feedback(self) -> None:
         if self.stop_final_lane_feedback is None:

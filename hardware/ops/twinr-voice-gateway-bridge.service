@@ -1,11 +1,11 @@
 [Unit]
-Description=Twinr Voice Gateway LAN Bridge to local orchestrator server
-After=network-online.target
-Wants=network-online.target
+Description=Twinr Voice Gateway LAN Bridge to host orchestrator endpoint
+After=network-online.target twinr-orchestrator-server.service
+Wants=network-online.target twinr-orchestrator-server.service
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/env bash -lc 'ss -ltn sport = :8798 | grep -q "127.0.0.1:8798\\|0.0.0.0:8798"'
+ExecStartPre=/usr/bin/env bash -lc 'for _ in $(seq 1 50); do ss -ltnH sport = :8798 | grep -Fq ":8798" && exit 0; sleep 0.1; done; exit 1'
 ExecStart=/usr/bin/socat TCP-LISTEN:8797,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:8798
 Restart=always
 RestartSec=1

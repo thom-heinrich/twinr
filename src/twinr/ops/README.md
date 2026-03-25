@@ -36,6 +36,7 @@ tools.
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
 - mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
+- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, replace the old manual mirror-as-deploy workflow, restart the productive Pi service set, and verify post-restart health
 - bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
 - expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
 
@@ -58,11 +59,15 @@ tools.
 | [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
+| [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start the external watchdog process for live Pi loops when needed |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment |
 | [runtime_scope.py](./runtime_scope.py) | Build scoped runtime configs so auxiliary loops do not overwrite the primary display/runtime snapshot |
 | [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, and leave display degradation to ops health instead of recycling the speech path |
+| [runtime_supervisor_process.py](./runtime_supervisor_process.py) | Internal child-process, timestamp, and runtime-env helpers kept separate from supervisor orchestration |
 | [pi_repo_mirror.py](./pi_repo_mirror.py) | One-way repo mirror watchdog that keeps `/twinr` aligned with the authoritative leading repo without deleting Pi-local runtime state |
+| [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: mirror code, sync the authoritative runtime `.env`, refresh the editable install, restart the base services plus any repo-backed Pi runtime units already enabled on the host, support first rollout of disabled optional Pi units, and verify restart health |
+| [pi_runtime_deploy_remote.py](./pi_runtime_deploy_remote.py) | Internal SSH/SCP/service-state helper layer kept separate from deploy phase orchestration |
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
 | [devices.py](./devices.py) | Device overview probes |
@@ -126,6 +131,8 @@ PYTHONPATH=src python3 -m twinr.ops.remote_memory_watchdog_soak --project-root /
 python3 hardware/ops/watch_pi_repo_mirror.py --once
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
+python3 hardware/ops/deploy_pi_runtime.py
+python3 hardware/ops/deploy_pi_runtime.py --rollout-service twinr-whatsapp-channel
 python3 hardware/ops/check_pi_openai_env_contract.py --env-file /twinr/.env
 python3 hardware/ops/bootstrap_self_coding_pi.py
 PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
@@ -137,6 +144,27 @@ into `--metadata-only` when you explicitly accept the weaker quick-check plus
 periodic checksum-audit model.
 Its Pi-local preserve rules are perishable, which keeps root runtime state
 protected while still allowing accidental nested repo copies to be deleted.
+Python bytecode caches are intentionally excluded from the mirror because they
+are runtime artefacts and productive root-owned imports on the Pi can otherwise
+block later sync cycles.
+Nested `node_modules/` trees are intentionally excluded from the mirror for the
+same reason: SDK and channel dependency installs are local build artefacts, not
+authoritative source content for `/twinr`.
+When a deleted remote tree survives only because it still contains ignored
+Python caches, the mirror prunes those cache-only stale directories and reruns
+the sync once so the acceptance checkout can still converge cleanly.
+The deploy helper builds on that mirror contract and adds the explicit pieces
+the mirror intentionally does not own: authoritative `.env` sync, a no-deps
+editable refresh by default, productive unit installation/restart, and bounded
+post-restart verification. By default it always manages the base runtime units
+and also picks up any repo-backed Pi unit that is already enabled on the
+acceptance host, which keeps optional services such as WhatsApp inside the same
+restart proof once they are live there. Opt into a dependency-refreshing
+install only when you deliberately want the Pi to re-resolve runtime packages.
+For first rollout of an optional Pi unit that is present in the repo but not
+enabled on the host yet, add `--rollout-service <unit>` so the deploy includes,
+enables, restarts, and verifies that unit without replacing the default base
+service set.
 
 ## See also
 

@@ -1,0 +1,24 @@
+# ============================================================================
+# Legacy code extracted from: registry.py
+# Extracted on: 2026-03-24
+# Reason: Dead wrapper helpers duplicated direct broker-policy access and had
+# no visible in-repo callers in src/ or test/.
+# Recovery: Copy the relevant block back into registry.py and restore imports.
+# ============================================================================
+
+# --- From: registry.py::automation_safe_tool_names (lines 115-118) ---
+# Status: DEAD - no in-repo callers found in src/ or test/
+
+def automation_safe_tool_names() -> tuple[str, ...]:
+    """Return the tool names that background automations may execute directly."""
+
+    return default_automation_tool_broker_policy().allowed_tool_names
+
+
+# --- From: registry.py::is_automation_safe_tool_name (lines 121-124) ---
+# Status: DEAD - no in-repo callers found in src/ or test/
+
+def is_automation_safe_tool_name(tool_name: str) -> bool:
+    """Return whether one tool may be executed from background automations."""
+
+    return default_automation_tool_broker_policy().is_allowed(tool_name)

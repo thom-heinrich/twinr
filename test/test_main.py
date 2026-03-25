@@ -108,6 +108,7 @@ class MainCliTests(unittest.TestCase):
         main_mod = importlib.import_module("twinr.__main__")
         fake_respeaker_module = ModuleType("twinr.hardware.respeaker")
         fake_respeaker_module.config_targets_respeaker = lambda *_devices: True
+        fake_respeaker_module.probe_respeaker_xvf3800 = lambda: SimpleNamespace(usb_device=None)
         try:
             config = main_mod.TwinrConfig(audio_input_device="hw:CARD=Array,DEV=0")
             with patch.dict(sys.modules, {"twinr.hardware.respeaker": fake_respeaker_module}):
@@ -116,6 +117,23 @@ class MainCliTests(unittest.TestCase):
                 with patch.object(main_mod, "_is_raspberry_pi_host", return_value=False):
                     self.assertFalse(main_mod._should_enable_respeaker_led_companion(config, "/twinr/.env"))
                 self.assertFalse(main_mod._should_enable_respeaker_led_companion(config, "/home/thh/twinr/.env"))
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+    def test_should_enable_respeaker_led_companion_falls_back_to_usb_probe_for_default_devices(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        fake_respeaker_module = ModuleType("twinr.hardware.respeaker")
+        fake_respeaker_module.config_targets_respeaker = lambda *_devices: False
+        fake_respeaker_module.probe_respeaker_xvf3800 = lambda: SimpleNamespace(usb_device=object())
+        try:
+            config = main_mod.TwinrConfig(
+                audio_input_device="default",
+                voice_orchestrator_audio_device="default",
+                proactive_audio_input_device="default",
+            )
+            with patch.dict(sys.modules, {"twinr.hardware.respeaker": fake_respeaker_module}):
+                with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                    self.assertTrue(main_mod._should_enable_respeaker_led_companion(config, "/twinr/.env"))
         finally:
             sys.modules.pop("twinr.__main__", None)
 
@@ -456,84 +474,6 @@ class MainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(events, [f"watchdog:{env_path}:{root / 'runtime-state.json'}", "build_runtime"])
-
-    def test_run_hardware_loop_enables_display_companion_for_pi_runtime(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            env_path = root / ".env"
-            env_path.write_text(
-                "\n".join(
-                    (
-                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
-                        "TWINR_OPENAI_API_KEY=sk-test",
-                    )
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            fake_loop = _FakeHardwareLoop()
-            companion_calls: list[bool] = []
-            fake_runner_module = ModuleType("twinr.agent.legacy.classic_hardware_loop")
-            fake_runner_module.TwinrHardwareLoop = lambda **_kwargs: fake_loop
-            fake_openai_module = ModuleType("twinr.providers.openai")
-
-            class _FakeBackend:
-                def __init__(self, config) -> None:
-                    self.config = config
-
-            fake_openai_module.OpenAIBackend = _FakeBackend
-            fake_companion_module = ModuleType("twinr.display.companion")
-            fake_respeaker_led_module = ModuleType("twinr.hardware.respeaker.companion")
-
-            @contextmanager
-            def _fake_companion(_config, *, enabled: bool):
-                companion_calls.append(enabled)
-                yield
-
-            fake_companion_module.optional_display_companion = _fake_companion
-
-            @contextmanager
-            def _fake_led_companion(_config, *, enabled: bool):
-                companion_calls.append(enabled)
-                yield
-
-            fake_respeaker_led_module.optional_respeaker_led_companion = _fake_led_companion
-            fake_ops_module = ModuleType("twinr.ops")
-            fake_ops_module.loop_instance_lock = _fake_lock
-            original_argv = list(sys.argv)
-
-            try:
-                sys.modules.pop("twinr.__main__", None)
-                with patch.dict(
-                    sys.modules,
-                    {
-                        "twinr.agent.legacy.classic_hardware_loop": fake_runner_module,
-                        "twinr.providers.openai": fake_openai_module,
-                        "twinr.display.companion": fake_companion_module,
-                        "twinr.hardware.respeaker.companion": fake_respeaker_led_module,
-                        "twinr.ops": fake_ops_module,
-                    },
-                ):
-                    main_mod = importlib.import_module("twinr.__main__")
-                    with patch.object(main_mod, "_should_enable_display_companion", return_value=True):
-                        with patch.object(main_mod, "_should_enable_respeaker_led_companion", return_value=True):
-                            with patch.object(main_mod, "_assert_pi_runtime_root", return_value=None):
-                                sys.argv = [
-                                    "twinr",
-                                    "--env-file",
-                                    str(env_path),
-                                    "--run-hardware-loop",
-                                    "--loop-duration",
-                                    "0",
-                                ]
-                                exit_code = main_mod.main()
-            finally:
-                sys.argv = original_argv
-                sys.modules.pop("twinr.__main__", None)
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(companion_calls, [True, True])
-        self.assertEqual(fake_loop.duration_s, 0.0)
 
     def test_streaming_loop_ensures_remote_watchdog_companion_for_pi_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1109,7 +1049,7 @@ class MainCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
-            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            env_path.write_text("", encoding="utf-8")
             original_argv = list(sys.argv)
 
             try:

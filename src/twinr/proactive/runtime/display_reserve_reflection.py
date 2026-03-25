@@ -159,21 +159,18 @@ class DisplayReserveReflectionConfig:
 
 
 def _summary_title(item: LongTermMemoryObjectV1) -> str:
-    """Return one stable topic title for a reflection summary object."""
+    """Return one structured user-facing anchor for a reflection summary."""
 
     attributes = _mapping(item.attributes)
     for value in (
+        attributes.get("display_anchor"),
         attributes.get("person_name"),
         attributes.get("environment_id"),
-        item.summary,
-        attributes.get("slot_key"),
-        item.slot_key,
-        item.value_key,
     ):
         label = _normalize_label(value, title_case=True)
         if label:
             return label
-    return _compact_text(item.summary, max_len=72)
+    return ""
 
 
 def _summary_hook_hint(item: LongTermMemoryObjectV1) -> str:
@@ -237,6 +234,8 @@ def _summary_candidate(item: LongTermMemoryObjectV1, *, now: datetime, max_age_d
     if item.updated_at.astimezone(timezone.utc) < now - timedelta(days=max_age_days):
         return None
     title = _summary_title(item)
+    if not title:
+        return None
     topic_key = _topic_key(item.slot_key, item.value_key, item.memory_id, title)
     if not topic_key:
         return None
@@ -276,25 +275,41 @@ def _packet_title(packet: LongTermMidtermPacketV1) -> str:
     """Return one stable topic title for a midterm packet."""
 
     attributes = _mapping(packet.attributes)
-    kind = _compact_text(packet.kind, max_len=40).casefold()
-    if kind in _CONTINUITY_PACKET_KINDS:
-        continuity_anchor = (
-            _sentence_label(attributes.get("display_anchor"), max_len=72)
-            or _sentence_label(attributes.get("transcript_excerpt"), max_len=72)
-            or _sentence_label(_primary_hint_phrase(packet.query_hints, max_len=48), max_len=72)
-        )
-        if continuity_anchor:
-            return continuity_anchor
     for value in (
+        attributes.get("display_anchor"),
+        attributes.get("transcript_excerpt"),
         attributes.get("person_name"),
         attributes.get("environment_id"),
-        _primary_hint_phrase(packet.query_hints, max_len=48),
         packet.summary,
     ):
         label = _sentence_label(value, max_len=72)
         if label:
             return label
     return _compact_text(packet.summary, max_len=72)
+
+
+def _packet_explicit_display_anchor(packet: LongTermMidtermPacketV1) -> str:
+    """Return one user-facing anchor derived only from structured packet fields.
+
+    Raw query hints and generic packet titles are often canonical English
+    keywords or internal residue. They may help durable indexing, but they are
+    not safe as visible HDMI anchors. The right lane should therefore surface a
+    packet only when reflection already carries an explicit, user-recognizable
+    anchor such as a display_anchor, transcript excerpt, person name, or
+    environment id.
+    """
+
+    attributes = _mapping(packet.attributes)
+    for value in (
+        attributes.get("display_anchor"),
+        attributes.get("transcript_excerpt"),
+        attributes.get("person_name"),
+        attributes.get("environment_id"),
+    ):
+        label = _sentence_label(value, max_len=72)
+        if label:
+            return label
+    return ""
 
 
 def _packet_action(packet: LongTermMidtermPacketV1) -> tuple[str, str]:
@@ -331,18 +346,7 @@ def _continuity_packet_has_displayable_anchor(packet: LongTermMidtermPacketV1) -
     visible reserve-lane conversation openers.
     """
 
-    attributes = _mapping(packet.attributes)
-    if _compact_text(attributes.get("display_anchor"), max_len=72):
-        return True
-    if _compact_text(attributes.get("person_name"), max_len=72):
-        return True
-    if _compact_text(attributes.get("environment_id"), max_len=72):
-        return True
-    for raw_hint in packet.query_hints:
-        normalized = _normalize_label(raw_hint, title_case=False, max_len=72)
-        if normalized and " " in normalized:
-            return True
-    return False
+    return bool(_packet_explicit_display_anchor(packet))
 
 
 def _packet_candidate_family(packet: LongTermMidtermPacketV1) -> str:
@@ -363,19 +367,8 @@ def _packet_candidate_family(packet: LongTermMidtermPacketV1) -> str:
 def _packet_display_anchor(packet: LongTermMidtermPacketV1, *, title: str) -> str:
     """Return one compact user-facing anchor for a reflection packet."""
 
-    attributes = _mapping(packet.attributes)
-    kind = _compact_text(packet.kind, max_len=40).casefold()
-    if kind in _CONTINUITY_PACKET_KINDS:
-        return (
-            _sentence_label(attributes.get("display_anchor"), max_len=72)
-            or _sentence_label(attributes.get("transcript_excerpt"), max_len=72)
-            or _sentence_label(_primary_hint_phrase(packet.query_hints, max_len=48), max_len=72)
-            or _sentence_label(title, max_len=72)
-        )
-    return (
-        _sentence_label(title, max_len=72)
-        or _sentence_label(_primary_hint_phrase(packet.query_hints, max_len=48), max_len=72)
-    )
+    del title
+    return _packet_explicit_display_anchor(packet)
 
 
 def _packet_hook_hint(packet: LongTermMidtermPacketV1) -> str:
@@ -435,9 +428,11 @@ def _packet_topic_key(packet: LongTermMidtermPacketV1, *, title: str) -> str:
     """Return one stable semantic topic key for one reflection packet."""
 
     attributes = _mapping(packet.attributes)
+    display_anchor = _packet_display_anchor(packet, title=title)
     primary_hint = _primary_hint_phrase(packet.query_hints, max_len=48)
     kind = _compact_text(packet.kind, max_len=40).casefold()
     return _topic_key(
+        display_anchor,
         attributes.get("person_name"),
         attributes.get("environment_id"),
         primary_hint,
@@ -492,6 +487,10 @@ def _packet_candidate(packet: LongTermMidtermPacketV1, *, now: datetime, max_age
     if kind in _CONTINUITY_PACKET_KINDS and not _continuity_packet_has_displayable_anchor(packet):
         return None
     title = _packet_title(packet)
+    display_anchor = _packet_display_anchor(packet, title=title)
+    if not display_anchor:
+        return None
+    title = display_anchor
     topic_key = _packet_topic_key(packet, title=title)
     if not topic_key:
         return None
@@ -523,7 +522,7 @@ def _packet_candidate(packet: LongTermMidtermPacketV1, *, now: datetime, max_age
         candidate_family=candidate_family,
         generation_context={
             "candidate_family": candidate_family,
-            "display_anchor": _packet_display_anchor(packet, title=title),
+            "display_anchor": display_anchor,
             "hook_hint": _packet_hook_hint(packet),
             "reflection_kind": _compact_text(packet.kind, max_len=48),
             "topic_title": title,

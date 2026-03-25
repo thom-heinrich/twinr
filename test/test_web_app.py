@@ -1315,6 +1315,8 @@ class WebAppTests(unittest.TestCase):
 
     def test_settings_post_updates_env(self) -> None:
         client, env_path = self.make_client()
+        settings_response = client.get("/settings")
+        self.assertEqual(settings_response.status_code, 200)
 
         response = client.post(
             "/settings",
@@ -1363,19 +1365,11 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Proactive behavior", response.text)
         self.assertIn("Proactive timing", response.text)
         self.assertIn("Proactive sensitivity", response.text)
-        self.assertIn("Wakeword mode", response.text)
-        self.assertIn("Primary wakeword detector", response.text)
-        self.assertIn("Fallback detector", response.text)
-        self.assertIn("STT verifier", response.text)
-        self.assertIn("Wakeword phrases", response.text)
-        self.assertIn("openWakeWord models", response.text)
-        self.assertIn("Calibration profile", response.text)
-        self.assertIn("Recommended profile", response.text)
-        self.assertIn("Wake presence grace (s)", response.text)
-        self.assertIn("Wake audio ratio", response.text)
-        self.assertIn("Wake active chunks", response.text)
-        self.assertIn("Wake patience frames", response.text)
-        self.assertIn("Wakeword min score", response.text)
+        self.assertIn("Voice gateway and audio capture", response.text)
+        self.assertIn("Remote voice gateway", response.text)
+        self.assertIn("Voice gateway websocket", response.text)
+        self.assertIn("Remote ASR URL", response.text)
+        self.assertIn("Remote ASR timeout (s)", response.text)
         self.assertIn("Buttons and motion sensor", response.text)
         self.assertIn("Display and printer", response.text)
         self.assertIn("Adaptive timing", response.text)
@@ -1388,7 +1382,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("TTS speed", response.text)
         self.assertIn("Realtime speed", response.text)
         self.assertIn(
-            "openWakeWord is the professional default for passive listening. STT stays available as an explicit degraded fallback path.",
+            "Keep the live transcript-first remote voice gateway enabled for hands-free speech. Twinr uses only this remote path for live voice turns.",
             response.text,
         )
         self.assertIn("After this many quiet seconds without motion, the scene is treated as idle / low-motion.", response.text)
@@ -1416,6 +1410,8 @@ class WebAppTests(unittest.TestCase):
 
     def test_settings_post_updates_extended_env_values(self) -> None:
         client, env_path = self.make_client()
+        settings_response = client.get("/settings")
+        self.assertEqual(settings_response.status_code, 200)
 
         response = client.post(
             "/settings",
@@ -1459,15 +1455,12 @@ class WebAppTests(unittest.TestCase):
                 "TWINR_PROACTIVE_AUDIO_ENABLED": "true",
                 "TWINR_PROACTIVE_AUDIO_DEVICE": "plughw:CARD=CameraB409241,DEV=0",
                 "TWINR_PROACTIVE_AUDIO_SAMPLE_MS": "900",
-                "TWINR_WAKEWORD_ENABLED": "true",
-                "TWINR_WAKEWORD_PHRASES": "hey twinr, hey twinna, twinr",
-                "TWINR_WAKEWORD_SAMPLE_MS": "1700",
-                "TWINR_WAKEWORD_PRESENCE_GRACE_S": "600",
-                "TWINR_WAKEWORD_MOTION_GRACE_S": "180",
-                "TWINR_WAKEWORD_SPEECH_GRACE_S": "75",
-                "TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S": "5.5",
-                "TWINR_WAKEWORD_MIN_ACTIVE_RATIO": "0.06",
-                "TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS": "2",
+                "TWINR_VOICE_ORCHESTRATOR_ENABLED": "true",
+                "TWINR_VOICE_ORCHESTRATOR_WS_URL": "ws://voice-gateway.example/ws/orchestrator/voice",
+                "TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET": "voice-secret",
+                "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS": "1700",
+                "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL": "http://asr.example:18090",
+                "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_TIMEOUT_S": "5.5",
                 "TWINR_PROACTIVE_ATTENTION_WINDOW_S": "8.5",
                 "TWINR_PROACTIVE_FLOOR_STILLNESS_S": "26.0",
                 "TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD": "0.76",
@@ -1517,11 +1510,13 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("OPENAI_VISION_DETAIL=high", env_text)
         self.assertIn("TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0", env_text)
         self.assertIn("TWINR_PROACTIVE_LOW_MOTION_AFTER_S=14.0", env_text)
-        self.assertIn("TWINR_WAKEWORD_ENABLED=true", env_text)
-        self.assertIn('TWINR_WAKEWORD_PHRASES="hey twinr, hey twinna, twinr"', env_text)
-        self.assertIn("TWINR_WAKEWORD_SAMPLE_MS=1700", env_text)
-        self.assertIn("TWINR_WAKEWORD_MIN_ACTIVE_RATIO=0.06", env_text)
-        self.assertIn("TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS=2", env_text)
+        self.assertIn("TWINR_VOICE_ORCHESTRATOR_ENABLED=true", env_text)
+        self.assertIn(
+            "TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://voice-gateway.example/ws/orchestrator/voice",
+            env_text,
+        )
+        self.assertIn("TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=1700", env_text)
+        self.assertIn("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://asr.example:18090", env_text)
         self.assertIn("TWINR_PROACTIVE_ATTENTION_WINDOW_S=8.5", env_text)
         self.assertIn("TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD=0.76", env_text)
         self.assertIn("TWINR_RUNTIME_STATE_PATH=/tmp/twinr-runtime-state.json", env_text)

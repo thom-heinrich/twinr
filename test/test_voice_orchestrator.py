@@ -1,5 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryFile
+from threading import Lock, Thread
+import time
 from unittest import mock
 import sys
 import unittest
@@ -92,6 +94,21 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         orchestrator._client = fake_client
         return orchestrator, fake_client, lines, committed
 
+    def test_generic_voice_device_alias_resolves_to_specific_input_device(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="default",
+                audio_input_device="sysdefault:CARD=Array",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        self.assertEqual(orchestrator._device, "sysdefault:CARD=Array")
+
     def test_reconnects_and_replays_runtime_state_after_remote_close(self) -> None:
         orchestrator, fake_client, lines, _committed = self._make_orchestrator()
 
@@ -141,6 +158,75 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertTrue(event.interaction_ready)
         self.assertFalse(event.targeted_inference_blocked)
         self.assertEqual(event.recommended_channel, "speech")
+
+    def test_connect_client_embeds_cached_runtime_state_in_hello(self) -> None:
+        orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
+
+        orchestrator.seed_runtime_state(
+            state="waiting",
+            detail="idle",
+            follow_up_allowed=False,
+            person_visible=False,
+            interaction_ready=False,
+            targeted_inference_blocked=True,
+            recommended_channel="display",
+        )
+
+        orchestrator._connect_client()
+
+        hello = fake_client.hello_requests[-1]
+        self.assertEqual(hello.trace_id, orchestrator._session_id)
+        self.assertEqual(hello.initial_state, "waiting")
+        self.assertEqual(hello.detail, "idle")
+        self.assertFalse(hello.follow_up_allowed)
+        self.assertTrue(hello.state_attested)
+        self.assertFalse(hello.person_visible)
+        self.assertFalse(hello.interaction_ready)
+        self.assertTrue(hello.targeted_inference_blocked)
+        self.assertEqual(hello.recommended_channel, "display")
+        self.assertEqual(fake_client.runtime_states[-1].state, "waiting")
+
+    def test_connect_client_does_not_replay_stale_runtime_state_after_newer_update(self) -> None:
+        orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
+
+        class _ConcurrentRuntimeStateClient(_FakeVoiceClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self._send_lock = Lock()
+                self._triggered = False
+
+            def send_hello(self, request) -> None:
+                super().send_hello(request)
+                if self._triggered:
+                    return
+                self._triggered = True
+
+                def concurrent_notify() -> None:
+                    while not orchestrator._connected:
+                        time.sleep(0.001)
+                    orchestrator.notify_runtime_state(state="listening", detail="voice_activation")
+
+                Thread(target=concurrent_notify, daemon=True).start()
+
+            def send_runtime_state(self, event) -> None:
+                if event.state == "waiting":
+                    time.sleep(0.05)
+                with self._send_lock:
+                    self.runtime_states.append(event)
+
+        fake_client = _ConcurrentRuntimeStateClient()
+        orchestrator._client = fake_client
+        orchestrator.seed_runtime_state(state="waiting", detail="idle")
+
+        orchestrator._connect_client()
+        for _ in range(100):
+            if len(fake_client.runtime_states) >= 2:
+                break
+            time.sleep(0.01)
+
+        observed_states = [(event.state, event.detail) for event in fake_client.runtime_states]
+        listening_index = observed_states.index(("listening", "voice_activation"))
+        self.assertNotIn(("waiting", "idle"), observed_states[listening_index + 1 :])
 
     def test_open_starts_capture_thread_even_when_initial_connect_fails(self) -> None:
         orchestrator, fake_client, lines, _committed = self._make_orchestrator()

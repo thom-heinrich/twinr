@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import threading
 from datetime import datetime, timedelta, timezone
-
 from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow, AdaptiveTimingProfile
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
 from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
@@ -76,9 +75,10 @@ class TwinrRuntimeContextMixin:
         persist = getattr(self, "_persist_snapshot", None)
         if not callable(persist):
             return
+        assert callable(persist)
         try:
             # AUDIT-FIX(#5): Snapshot persistence is best-effort; runtime state must survive transient file-write failures.
-            persist()
+            persist()  # pylint: disable=not-callable
         except Exception as exc:
             self._safe_append_ops_event(
                 event=event_on_error,
@@ -153,6 +153,10 @@ class TwinrRuntimeContextMixin:
         normalized = (status or "").strip().lower()
         if not normalized:
             return None
+        if normalized == "identified":
+            # Accept the older generic label as the current main-user signal so
+            # provider guidance stays stable across legacy callers and tests.
+            return "likely_user"
         if normalized in _ALLOWED_VOICE_STATUSES:
             return normalized
         # AUDIT-FIX(#1): Collapse unknown values to a conservative state instead of injecting raw text into a system prompt.
@@ -184,6 +188,17 @@ class TwinrRuntimeContextMixin:
         except (TypeError, ValueError):
             return _DEFAULT_VOICE_ASSESSMENT_MAX_AGE_S
         return max(1, value)
+
+    @staticmethod
+    def _compact_runtime_guidance_text(value: object | None, *, limit: int = 220) -> str | None:
+        """Return one bounded single-line text snippet for runtime guidance."""
+
+        compact = " ".join(str(value or "").split()).strip()
+        if not compact:
+            return None
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
 
     def _voice_assessment_is_fresh_unlocked(self) -> bool:
         checked_at = self._parse_aware_utc_datetime(getattr(self, "user_voice_checked_at", None))
@@ -297,6 +312,14 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
+            discovery_guidance = self._discovery_guidance_message(tool_context=tool_context)
+            if discovery_guidance:
+                messages.append(("system", discovery_guidance))
+
+            self_coding_guidance = self._self_coding_guidance_message(tool_context=tool_context)
+            if self_coding_guidance:
+                messages.append(("system", self_coding_guidance))
+
             retrieval_query = str(
                 query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
             )
@@ -332,6 +355,127 @@ class TwinrRuntimeContextMixin:
 
             messages.extend(self._conversation_context_unlocked())
             return tuple(messages)
+
+    def _discovery_guidance_message(self, *, tool_context: bool) -> str | None:
+        """Return bounded user-discovery state guidance for tool-capable turns."""
+
+        if not tool_context:
+            return None
+        manage_discovery = getattr(self, "manage_user_discovery", None)
+        if not callable(manage_discovery):
+            return None
+        assert callable(manage_discovery)
+        try:
+            status = manage_discovery(action="status")  # pylint: disable=not-callable
+        except Exception:
+            return None
+        session_state = self._compact_runtime_guidance_text(getattr(status, "session_state", None), limit=32)
+        response_mode = self._compact_runtime_guidance_text(getattr(status, "response_mode", None), limit=32)
+        topic_label = self._compact_runtime_guidance_text(
+            getattr(status, "display_topic_label", None) or getattr(status, "topic_label", None),
+            limit=80,
+        )
+        question_brief = self._compact_runtime_guidance_text(getattr(status, "question_brief", None), limit=220)
+        assistant_brief = self._compact_runtime_guidance_text(getattr(status, "assistant_brief", None), limit=220)
+        if session_state != "active" and response_mode not in {"review_profile", "ask_permission"}:
+            parts = ["Guided user-discovery is available for this turn."]
+            if topic_label:
+                parts.append(f"Suggested discovery topic: {topic_label}.")
+            parts.append(
+                "If the user asks Twinr to get to know them better, wants to start setup, or begins telling something stable about themselves, use manage_user_discovery start_or_resume or answer directly. Do not ask a separate save-permission question before beginning the bounded discovery flow."
+            )
+            return " ".join(parts)
+        parts = ["Guided user-discovery state for this turn."]
+        if session_state:
+            parts.append(f"Session state: {session_state}.")
+        if response_mode:
+            parts.append(f"Discovery response mode: {response_mode}.")
+        if topic_label:
+            parts.append(f"Current discovery topic: {topic_label}.")
+        if question_brief:
+            parts.append(f"Question focus: {question_brief}.")
+        if response_mode == "ask_permission":
+            parts.append(
+                "If the user answers that sensitive-topic permission prompt, use manage_user_discovery rather than a freeform paraphrase."
+            )
+            return " ".join(parts)
+        if response_mode == "review_profile":
+            parts.append(
+                "If the user asks what Twinr learned or corrects or deletes a reviewed profile detail, use manage_user_discovery review_profile, replace_fact, or delete_fact instead of a standalone confirmation question."
+            )
+            return " ".join(parts)
+        parts.append(
+            "If the user gives a direct self-description, preferred name, preferred form of address, family detail, routine, hobby, pet, no-go, or other profile answer, treat it as the next discovery answer and call manage_user_discovery instead of replying with a separate save or naming confirmation question."
+        )
+        parts.append(
+            "If the user explicitly corrects or deletes something Twinr already learned, do not treat that utterance as the next discovery answer. Use manage_user_discovery review_profile plus replace_fact or delete_fact in the same turn instead of asking the user to request the stored profile first."
+        )
+        if assistant_brief:
+            parts.append(f"Discovery assistant brief: {assistant_brief}.")
+        return " ".join(parts)
+
+    def _self_coding_guidance_message(self, *, tool_context: bool) -> str | None:
+        """Return bounded self-coding guidance for tool-capable turns."""
+
+        if not tool_context:
+            return None
+        guidance_state_reader = getattr(self, "self_coding_guidance_state", None)
+        if not callable(guidance_state_reader):
+            return None
+        assert callable(guidance_state_reader)
+        try:
+            state = guidance_state_reader()  # pylint: disable=not-callable
+        except Exception:
+            return None
+        if state is None:
+            return None
+        session_id = self._compact_runtime_guidance_text(getattr(state, "session_id", None), limit=160)
+        session_state = self._compact_runtime_guidance_text(getattr(state, "session_state", None), limit=48)
+        skill_id = self._compact_runtime_guidance_text(getattr(state, "skill_id", None), limit=160)
+        skill_name = self._compact_runtime_guidance_text(getattr(state, "skill_name", None), limit=160)
+        current_question_id = self._compact_runtime_guidance_text(getattr(state, "current_question_id", None), limit=48)
+        compile_job_id = self._compact_runtime_guidance_text(getattr(state, "compile_job_id", None), limit=160)
+        compile_job_status = self._compact_runtime_guidance_text(getattr(state, "compile_job_status", None), limit=48)
+        active_versions = tuple(int(value) for value in getattr(state, "active_versions", ()) or ())
+        paused_versions = tuple(int(value) for value in getattr(state, "paused_versions", ()) or ())
+        if not any((session_id, skill_id, skill_name, compile_job_id, active_versions, paused_versions)):
+            return None
+        parts = ["Active self-coding state for this turn."]
+        if skill_name:
+            parts.append(f"Skill name: {skill_name}.")
+        if skill_id:
+            parts.append(f"Skill id: {skill_id}.")
+        if session_state:
+            parts.append(f"Dialogue status: {session_state}.")
+        if session_id:
+            parts.append(f"Session id: {session_id}.")
+        if current_question_id:
+            parts.append(f"Current dialogue step: {current_question_id}.")
+        if session_id:
+            parts.append(
+                "If the user is answering the active learned-skill question or confirming the learned behavior, call answer_skill_question with this exact session_id instead of only paraphrasing or asking the user for the id."
+            )
+        if compile_job_id:
+            parts.append(f"Compile job id: {compile_job_id}.")
+        if compile_job_status:
+            parts.append(f"Compile job status: {compile_job_status}.")
+        if compile_job_id:
+            parts.append(
+                "If the user explicitly wants the learned skill enabled now, call confirm_skill_activation with this exact job_id and confirmed true. Do not ask the user to provide the job id."
+            )
+        if active_versions:
+            parts.append(
+                "Active learned-skill versions: "
+                + ", ".join(str(version) for version in active_versions)
+                + "."
+            )
+        if paused_versions:
+            parts.append(
+                "Paused learned-skill versions: "
+                + ", ".join(str(version) for version in paused_versions)
+                + "."
+            )
+        return " ".join(parts)
 
     def _fast_topic_system_messages_unlocked(
         self,
@@ -585,7 +729,10 @@ class TwinrRuntimeContextMixin:
                     config=config,
                 )
                 if config.adaptive_timing_enabled:
-                    new_adaptive_timing_store.ensure_saved()
+                    ensure_saved = getattr(new_adaptive_timing_store, "ensure_saved", None)
+                    if callable(ensure_saved):
+                        assert callable(ensure_saved)
+                        ensure_saved()  # pylint: disable=not-callable
                 self.memory.reconfigure(
                     max_turns=memory_max_turns,
                     keep_recent=memory_keep_recent,
@@ -816,6 +963,6 @@ class TwinrRuntimeContextMixin:
                 )
             else:
                 parts.append(
-                    "You may use this signal for calmer personalization, but never as the only authorization for a sensitive action."
+                    "You may use this signal for calmer personalization. For low-risk guided user-discovery and simple profile-preference saves based on direct self-description, you do not need to ask who the person is again. Never use this signal as the only authorization for a sensitive action."
                 )
             return " ".join(parts)

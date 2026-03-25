@@ -1,0 +1,17 @@
+[Unit]
+Description=Twinr Peer Servo Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/twinr-peer-servo/repo
+ExecStartPre=/usr/bin/env bash -lc 'for _ in $(seq 1 50); do ip -4 addr show dev eth0 | grep -Fq "10.42.0.2/" && exit 0; sleep 0.2; done; exit 1'
+ExecStart=/usr/bin/python3 /opt/twinr-peer-servo/repo/hardware/ops/peer_servo_proxy.py --repo-root /opt/twinr-peer-servo/repo --bind 10.42.0.2 --port 8768
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

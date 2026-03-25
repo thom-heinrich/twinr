@@ -67,7 +67,6 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/providers/__init__.py
   - path: src/twinr/providers/factory.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/realtime_runtime/support.py
   - path: src/twinr/agent/workflows/streaming_runner.py
@@ -75,8 +74,6 @@ primary_callers:
   - path: src/twinr/proactive/runtime/service.py
   - path: src/twinr/proactive/social/observers.py
   - path: src/twinr/proactive/social/vision_review.py
-  - path: src/twinr/proactive/wakeword/matching.py
-  - path: src/twinr/proactive/wakeword/spotter.py
   - path: src/twinr/memory/query_normalization.py
   - path: src/twinr/memory/longterm/evaluation/subtext_eval.py
   - path: src/twinr/memory/longterm/ingestion/propositions.py
@@ -90,5 +87,4 @@ tests:
   - path: test/test_proactive_vision_review.py
   - path: test/test_provider_factory.py
   - path: test/test_realtime_runner.py
-  - path: test/test_runner.py
   - path: test/test_streaming_runner.py

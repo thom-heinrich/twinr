@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import audioop
+import hashlib
 from array import array
 from collections import deque
 from collections.abc import Iterable
@@ -42,12 +43,68 @@ _PCM16_MAX_ABS = 32767
 _DEFAULT_WAV_TARGET_PEAK = 28000
 _DEFAULT_WAV_MAX_GAIN = 4.0
 _TONE_HEADROOM_SCALE = 0.92
+_GENERIC_CAPTURE_DEVICE_ALIASES = frozenset({"default", "pulse", "sysdefault"})
+_CANONICAL_CAPTURE_PREFIXES = frozenset({"dsnoop", "front", "hw", "plughw", "sysdefault"})
 
 
 def _normalize_audio_device(device: str | None) -> str:
     # AUDIT-FIX(#7): Normalize blank/None device names to a safe default instead of passing invalid values to ALSA.
     normalized = str(device or "default").strip()
     return normalized or "default"
+
+
+def resolve_capture_device(*candidates: str | None) -> str:
+    """Return the first specific capture device from one fallback chain.
+
+    Twinr keeps one logical input-device chain in config, but operators can
+    still leave earlier slots on generic ALSA aliases such as ``default`` while
+    later fallbacks point at the real hardware card. For long-lived capture
+    paths we prefer the first non-generic candidate so different runtime lanes
+    do not accidentally open the same microphone through mismatched aliases.
+    """
+
+    normalized_candidates = [str(candidate or "").strip() for candidate in candidates if str(candidate or "").strip()]
+    if not normalized_candidates:
+        return "default"
+    first = normalized_candidates[0]
+    if first.lower() not in _GENERIC_CAPTURE_DEVICE_ALIASES:
+        return first
+    for candidate in normalized_candidates[1:]:
+        if candidate.lower() not in _GENERIC_CAPTURE_DEVICE_ALIASES:
+            return candidate
+    return first
+
+
+def capture_device_identity(device: str | None) -> str:
+    """Return one stable equivalence key for ALSA capture-device aliases.
+
+    Several ALSA capture descriptors such as ``sysdefault:CARD=Array`` and
+    ``plughw:CARD=Array,DEV=0`` point at the same physical capture endpoint.
+    Twinr uses this identity to detect shared-microphone conflicts before two
+    runtime lanes try to open the same card through different aliases.
+    """
+
+    normalized = _normalize_audio_device(device)
+    prefix, separator, suffix = normalized.partition(":")
+    normalized_prefix = prefix.strip().lower()
+    if not separator or normalized_prefix not in _CANONICAL_CAPTURE_PREFIXES:
+        return normalized.lower()
+    tokens: dict[str, str] = {}
+    for section in suffix.split(":"):
+        for field in section.split(","):
+            field = field.strip()
+            if "=" not in field:
+                continue
+            key, value = field.split("=", 1)
+            key = key.strip().upper()
+            value = value.strip().lower()
+            if key and value:
+                tokens[key] = value
+    card = tokens.get("CARD")
+    if not card:
+        return normalized.lower()
+    device_index = tokens.get("DEV") or "0"
+    return f"alsa-card={card};dev={device_index}"
 
 
 def _ensure_int(name: str, value: object, *, minimum: int) -> int:
@@ -267,6 +324,24 @@ class AmbientAudioLevelSample:
 
 
 @dataclass(frozen=True, slots=True)
+class Pcm16SignalProfile:
+    """Summarize one PCM16 payload without persisting the raw waveform."""
+
+    sample_count: int
+    rms: int
+    mean_abs: int
+    peak_abs: int
+    dc_offset: int
+    nonzero_sample_count: int
+    nonzero_sample_ratio: float
+    clipped_sample_count: int
+    clipped_sample_ratio: float
+    zero_crossing_count: int
+    zero_crossing_ratio: float
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class AmbientAudioCaptureWindow:
     """Represent ambient PCM bytes together with sampled loudness metadata."""
 
@@ -443,6 +518,81 @@ def pcm16_duration_ms(
         return 0
     frame_count = len(aligned_pcm_bytes) // frame_bytes
     return int((frame_count / normalized_sample_rate) * 1000)
+
+
+def pcm16_signal_profile(samples: bytes) -> Pcm16SignalProfile:
+    """Return bounded shape metrics for one PCM16 payload.
+
+    The live voice debugging path needs enough information to distinguish
+    silence, clipped noise, steady hum, and likely speech without persisting
+    raw household audio into the forensic run pack.
+    """
+
+    aligned_samples = _trim_incomplete_bytes(samples, alignment=_SAMPLE_WIDTH_BYTES)
+    digest = hashlib.sha256(aligned_samples).hexdigest()[:12]
+    if not aligned_samples:
+        return Pcm16SignalProfile(
+            sample_count=0,
+            rms=0,
+            mean_abs=0,
+            peak_abs=0,
+            dc_offset=0,
+            nonzero_sample_count=0,
+            nonzero_sample_ratio=0.0,
+            clipped_sample_count=0,
+            clipped_sample_ratio=0.0,
+            zero_crossing_count=0,
+            zero_crossing_ratio=0.0,
+            sha256=digest,
+        )
+    pcm_samples = array("h")
+    pcm_samples.frombytes(aligned_samples)
+    if sys.byteorder != "little":
+        pcm_samples.byteswap()
+    sample_count = len(pcm_samples)
+    if sample_count <= 0:
+        return Pcm16SignalProfile(
+            sample_count=0,
+            rms=0,
+            mean_abs=0,
+            peak_abs=0,
+            dc_offset=0,
+            nonzero_sample_count=0,
+            nonzero_sample_ratio=0.0,
+            clipped_sample_count=0,
+            clipped_sample_ratio=0.0,
+            zero_crossing_count=0,
+            zero_crossing_ratio=0.0,
+            sha256=digest,
+        )
+    rms = _pcm16_rms(aligned_samples)
+    absolute_values = [abs(sample) for sample in pcm_samples]
+    mean_abs = int(sum(absolute_values) / sample_count)
+    peak_abs = max(absolute_values)
+    dc_offset = int(sum(pcm_samples) / sample_count)
+    nonzero_sample_count = sum(1 for sample in pcm_samples if sample != 0)
+    clipped_sample_count = sum(1 for value in absolute_values if value >= _PCM16_MAX_ABS)
+    zero_crossing_count = 0
+    previous_sample = pcm_samples[0]
+    for sample in pcm_samples[1:]:
+        if (previous_sample < 0 <= sample) or (previous_sample > 0 >= sample):
+            zero_crossing_count += 1
+        if sample != 0:
+            previous_sample = sample
+    return Pcm16SignalProfile(
+        sample_count=sample_count,
+        rms=rms,
+        mean_abs=mean_abs,
+        peak_abs=peak_abs,
+        dc_offset=dc_offset,
+        nonzero_sample_count=nonzero_sample_count,
+        nonzero_sample_ratio=nonzero_sample_count / sample_count,
+        clipped_sample_count=clipped_sample_count,
+        clipped_sample_ratio=clipped_sample_count / sample_count,
+        zero_crossing_count=zero_crossing_count,
+        zero_crossing_ratio=zero_crossing_count / max(1, sample_count - 1),
+        sha256=digest,
+    )
 
 
 class SilenceDetectedRecorder:

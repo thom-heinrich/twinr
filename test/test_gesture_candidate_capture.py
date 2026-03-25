@@ -66,6 +66,30 @@ class GestureCandidateCaptureTests(unittest.TestCase):
             self.assertFalse(second.saved)
             self.assertEqual(second.skipped_reason, "cooldown_active")
 
+    def test_store_saves_frame_for_forensics_zero_signal_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = GestureCandidateCaptureStore(
+                capture_dir=tmpdir,
+                cooldown_s=0.0,
+                max_images=4,
+            )
+
+            result = store.maybe_capture(
+                observed_at=1710000002.0,
+                frame_rgb=np.full((8, 8, 3), 64, dtype=np.uint8),
+                debug_details={
+                    "forensics_zero_signal_capture_requested": True,
+                    "final_resolved_source": "none",
+                },
+            )
+
+            self.assertTrue(result.saved)
+            self.assertEqual(result.reasons, ("forensics_zero_signal",))
+            self.assertTrue(Path(result.image_path or "").is_file())
+            metadata = json.loads(Path(result.metadata_path or "").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["reasons"], ["forensics_zero_signal"])
+            self.assertTrue(metadata["gesture_debug"]["forensics_zero_signal_capture_requested"])
+
     def test_store_prunes_older_capture_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = GestureCandidateCaptureStore(

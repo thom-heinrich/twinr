@@ -1,9 +1,10 @@
 """Share bounded dataset and packaging helpers for custom gesture workflows.
 
 This module keeps filesystem and summary logic separate from the Pi-side
-capture script and the local MediaPipe Model Maker training script. It owns
-dataset-label normalization, dataset validation, capture target planning, and
-runtime-model copy helpers so the workflow stays predictable and testable.
+capture script, public seed import script, and the local MediaPipe Model Maker
+training script. It owns dataset-label normalization, dataset validation,
+capture target planning, filtered training-dataset staging, and runtime-model
+copy helpers so the workflow stays predictable and testable.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ DEFAULT_DATASET_ROOT = Path("state/mediapipe/custom_gesture_dataset")
 DEFAULT_TRAINING_RUNS_ROOT = Path("state/mediapipe/custom_gesture_training")
 DEFAULT_RUNTIME_MODEL_DIR = Path("state/mediapipe/models")
 DEFAULT_RUNTIME_MODEL_NAME = "custom_gesture.task"
-DEFAULT_REQUIRED_LABELS = ("none", "ok_sign", "middle_finger")
+DEFAULT_REQUIRED_LABELS = ("none", "thumbs_up", "thumbs_down", "peace_sign")
 SUPPORTED_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
 
@@ -92,6 +93,7 @@ def collect_dataset_manifest(
     dataset_root: Path,
     *,
     required_labels: tuple[str, ...] = DEFAULT_REQUIRED_LABELS,
+    include_only_required: bool = False,
 ) -> DatasetManifest:
     """Validate the dataset layout and summarize supported image files."""
 
@@ -105,6 +107,8 @@ def collect_dataset_manifest(
     counts: dict[str, DatasetLabelSummary] = {}
     for directory in sorted(path for path in root.iterdir() if path.is_dir()):
         label = normalize_label_name(directory.name)
+        if include_only_required and label not in normalized_required:
+            continue
         image_count = len(_list_image_files(directory))
         counts[label] = DatasetLabelSummary(label=label, directory=directory, count=image_count)
 
@@ -120,6 +124,40 @@ def collect_dataset_manifest(
         root=root,
         labels=tuple(counts[label] for label in sorted(counts)),
     )
+
+
+def stage_required_label_dataset(
+    *,
+    source_manifest: DatasetManifest,
+    output_root: Path,
+) -> DatasetManifest:
+    """Copy the selected manifest labels into one clean training dataset root.
+
+    MediaPipe Model Maker loads every label directory present under the dataset
+    root. Twinr's gesture workflow therefore stages just the required labels
+    into a fresh training directory before calling ``Dataset.from_folder`` so
+    legacy or exploratory labels do not silently change the classifier head.
+    """
+
+    target_root = Path(output_root)
+    if target_root.exists():
+        raise ValueError(f"custom_gesture_training_dataset_target_exists:{target_root}")
+    target_root.mkdir(parents=True, exist_ok=False)
+    staged_labels: list[DatasetLabelSummary] = []
+    for label_summary in source_manifest.labels:
+        target_dir = target_root / label_summary.label
+        target_dir.mkdir(parents=True, exist_ok=False)
+        image_paths = _list_image_files(label_summary.directory)
+        for image_path in image_paths:
+            shutil.copy2(image_path, target_dir / image_path.name)
+        staged_labels.append(
+            DatasetLabelSummary(
+                label=label_summary.label,
+                directory=target_dir,
+                count=len(image_paths),
+            )
+        )
+    return DatasetManifest(root=target_root, labels=tuple(staged_labels))
 
 
 def ensure_minimum_examples(manifest: DatasetManifest, *, min_images_per_label: int) -> None:

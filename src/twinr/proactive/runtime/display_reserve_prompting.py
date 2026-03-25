@@ -79,45 +79,36 @@ def _first_text(mapping: Mapping[str, object], keys: Sequence[str], *, max_len: 
 def _topic_anchor(candidate: AmbientDisplayImpulseCandidate, context: Mapping[str, object]) -> str:
     """Derive one clear topical anchor for the visible reserve-card text."""
 
-    return (
-        _first_text(
-            context,
-            (
-                "display_anchor",
-                "topic_title",
-                "person_name",
-                "environment_id",
-                "source_title",
-                "source_label",
-                "question",
-                "summary",
-            ),
-            max_len=84,
-        )
-        or _truncate_text(candidate.title, max_len=84)
-        or _truncate_text(candidate.topic_key, max_len=84)
+    del candidate
+    return _first_text(
+        context,
+        (
+            "display_anchor",
+            "topic_title",
+            "person_name",
+            "environment_id",
+            "source_title",
+            "source_label",
+            "question",
+        ),
+        max_len=84,
     )
 
 
 def _hook_hint(candidate: AmbientDisplayImpulseCandidate, context: Mapping[str, object]) -> str:
     """Return one compact conversational angle for the current candidate."""
 
-    return (
-        _first_text(
-            context,
-            (
-                "hook_hint",
-                "question",
-                "topic_summary",
-                "summary",
-                "rationale",
-                "reason",
-                "details",
-            ),
-            max_len=120,
-        )
-        or _truncate_text(candidate.body, max_len=120)
-        or _truncate_text(candidate.headline, max_len=120)
+    del candidate
+    return _first_text(
+        context,
+        (
+            "hook_hint",
+            "question",
+            "topic_summary",
+            "rationale",
+            "reason",
+        ),
+        max_len=120,
     )
 
 
@@ -163,14 +154,7 @@ def _context_summary(
         if len(" | ".join(parts)) >= _DEFAULT_CONTEXT_SUMMARY_MAX_CHARS:
             break
     if not parts:
-        parts.extend(
-            text
-            for text in (
-                _truncate_text(candidate.body, max_len=96),
-                _truncate_text(candidate.headline, max_len=96),
-            )
-            if text and text.casefold() not in seen
-        )
+        return ""
     return _truncate_text(" | ".join(parts), max_len=_DEFAULT_CONTEXT_SUMMARY_MAX_CHARS)
 
 

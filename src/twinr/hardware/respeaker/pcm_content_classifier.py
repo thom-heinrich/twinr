@@ -11,7 +11,7 @@ The classifier is intentionally conservative:
 - it only overrides XVF3800 speech when the PCM window looks strongly
   non-speech-like
 - ambiguous windows stay undecided so upstream host-control can continue to win
-- it is not a wakeword or ASR model and should only be used for speech vs.
+- it is not a voice-activation or ASR model and should only be used for speech vs.
   non-speech/media suppression decisions
 
 The frozen weights come from one mixed corpus:

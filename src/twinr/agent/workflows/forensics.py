@@ -16,7 +16,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue   # AUDIT-FIX(#1): Begrenzte Queue braucht explizite Full-Behandlung.
 from threading import Event, Lock, Thread, current_thread   # AUDIT-FIX(#7): Koordinierter Shutdown und Snapshots brauchen Locks.
 from types import TracebackType
-from typing import Callable, Iterator, TextIO
+from typing import Iterator, TextIO
 import atexit
 import hashlib   # AUDIT-FIX(#3): Redaktions-Summaries nutzen stabile Hashes ohne Rohtext zu speichern.
 import inspect
@@ -385,6 +385,62 @@ def _sanitize_argv(argv: list[str], *, allow_raw_text: bool) -> list[object]:
     return sanitized
 
 
+def capture_thread_snapshot(
+    thread: Thread | None,
+    *,
+    max_frames: int = 8,
+) -> dict[str, object]:
+    """Return one bounded stack/location snapshot for a Python thread.
+
+    The snapshot is intentionally shallow and metadata-first so it can be
+    written into live workflow runpacks without dumping locals or other
+    unbounded payloads.
+    """
+
+    if thread is None:
+        return {"present": False}
+    snapshot: dict[str, object] = {
+        "present": True,
+        "name": _bounded_text(getattr(thread, "name", "")),
+        "ident": getattr(thread, "ident", None),
+        "native_id": getattr(thread, "native_id", None),
+        "daemon": bool(getattr(thread, "daemon", False)),
+    }
+    try:
+        snapshot["alive"] = bool(thread.is_alive())
+    except Exception:
+        snapshot["alive"] = None
+    ident = snapshot.get("ident")
+    if not isinstance(ident, int):
+        snapshot["stack_present"] = False
+        snapshot["stack"] = []
+        snapshot["top_frame"] = None
+        return snapshot
+    try:
+        frame = sys._current_frames().get(ident)
+    except Exception:
+        frame = None
+    if frame is None:
+        snapshot["stack_present"] = False
+        snapshot["stack"] = []
+        snapshot["top_frame"] = None
+        return snapshot
+    extracted = traceback.extract_stack(frame, limit=max(1, int(max_frames)))
+    bounded_stack: list[dict[str, object]] = []
+    for entry in extracted[-max(1, int(max_frames)) :]:
+        bounded_stack.append(
+            {
+                "file": _bounded_text(entry.filename),
+                "line": int(entry.lineno),
+                "func": _bounded_text(entry.name),
+            }
+        )
+    snapshot["stack_present"] = bool(bounded_stack)
+    snapshot["stack"] = bounded_stack
+    snapshot["top_frame"] = bounded_stack[-1] if bounded_stack else None
+    return snapshot
+
+
 @dataclass(frozen=True, slots=True)
 class _SpanState:
     trace_id: str
@@ -565,6 +621,19 @@ class WorkflowForensics:
             self._safe_stderr(f"[twinr-workflow-trace] record build failed: {_bounded_text(exc)}")
             return
         self._enqueue_record(record)
+
+    def can_accept_events(self) -> bool:
+        """Return whether the tracer can still accept non-critical events."""
+
+        if not self.enabled:
+            return False
+        with self._stats_lock:
+            return not (
+                self._closed
+                or not self._accepting_events
+                or self._writer_failed
+                or self._trace_truncated
+            )
 
     def decision(
         self,

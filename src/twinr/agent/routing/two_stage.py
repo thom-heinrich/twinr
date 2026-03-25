@@ -8,14 +8,15 @@ import time
 import numpy as np
 
 from .bundle import SemanticRouterBundle
+from .inference import OnnxSentenceEncoder, _coerce_embedding_row, _l2_normalize, _softmax
 from .policy import SemanticRouterPolicy
-from .service import LocalSemanticRouter, OnnxSentenceEncoder, _coerce_embedding_row, _l2_normalize, _softmax
+from .service import LocalSemanticRouter
 from .user_intent import (
     TwoStageSemanticRouteDecision,
     UserIntentDecision,
     allowed_route_labels_for_user_intent,
 )
-from .user_intent_bundle import UserIntentBundle
+from .user_intent_bundle import UserIntentBundle, UserIntentBundleMetadata
 
 
 @dataclass(slots=True)
@@ -25,8 +26,8 @@ class LocalUserIntentRouter:
     bundle: UserIntentBundle
     encoder: OnnxSentenceEncoder | None = None
     centroids: np.ndarray | None = None
-    metadata: object = field(init=False, repr=False)
-    _centroids: np.ndarray = field(init=False, repr=False)
+    metadata: UserIntentBundleMetadata = field(init=False, repr=False)
+    _centroids: np.ndarray | None = field(init=False, default=None, repr=False)
     _weights: np.ndarray | None = field(init=False, default=None, repr=False)
     _bias: np.ndarray | None = field(init=False, default=None, repr=False)
 
@@ -44,13 +45,14 @@ class LocalUserIntentRouter:
         self._weights: np.ndarray | None = None
         self._bias: np.ndarray | None = None
         if self.metadata.classifier_type == "embedding_centroid_v1":
-            if self.bundle.centroids_path is None and self.centroids is None:
+            centroids_path = self.bundle.centroids_path
+            if centroids_path is None and self.centroids is None:
                 raise ValueError("Centroid user-intent bundles must provide centroids.npy.")
-            centroid_matrix = (
-                np.asarray(self.centroids, dtype=np.float32)
-                if self.centroids is not None
-                else np.load(self.bundle.centroids_path).astype(np.float32)
-            )
+            if self.centroids is not None:
+                centroid_matrix = np.asarray(self.centroids, dtype=np.float32)
+            else:
+                assert centroids_path is not None
+                centroid_matrix = np.load(centroids_path).astype(np.float32)
             if centroid_matrix.ndim != 2:
                 raise ValueError("User intent centroids must be a rank-2 matrix.")
             if centroid_matrix.shape[0] != len(self.metadata.labels):
@@ -83,7 +85,10 @@ class LocalUserIntentRouter:
         if not cleaned:
             raise ValueError("LocalUserIntentRouter.classify requires non-empty text.")
         started = time.perf_counter()
-        embedding = self.encoder.encode([cleaned])[0:1]
+        encoder = self.encoder
+        if encoder is None:
+            raise RuntimeError("LocalUserIntentRouter encoder was not initialized.")
+        embedding = encoder.encode([cleaned])[0:1]
         return self.classify_embedding(
             embedding,
             latency_ms=(time.perf_counter() - started) * 1000.0,

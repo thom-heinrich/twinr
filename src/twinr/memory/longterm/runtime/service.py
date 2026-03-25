@@ -644,26 +644,47 @@ class LongTermMemoryService:
     def _cache_remote_probe_reads(self) -> Iterator[None]:
         """Reuse snapshot probes only within one bounded readiness pass."""
 
-        seen: set[int] = set()
         with ExitStack() as stack:
-            for remote_state in (
-                getattr(self.prompt_context_store.memory_store, "remote_state", None),
-                getattr(self.prompt_context_store.user_store, "remote_state", None),
-                getattr(self.prompt_context_store.personality_store, "remote_state", None),
-                getattr(self.graph_store, "remote_state", None),
-                getattr(self.object_store, "remote_state", None),
-                getattr(self.midterm_store, "remote_state", None),
-            ):
-                if remote_state is None:
-                    continue
-                state_id = id(remote_state)
-                if state_id in seen:
-                    continue
-                seen.add(state_id)
+            for remote_state in self._iter_unique_remote_states():
                 cache_probe_reads = getattr(remote_state, "cache_probe_reads", None)
                 if callable(cache_probe_reads):
                     stack.enter_context(cache_probe_reads())
             yield
+
+    def _iter_unique_remote_states(self) -> Iterator[object]:
+        """Yield each owned remote-state adapter at most once."""
+
+        seen: set[int] = set()
+        for remote_state in (
+            getattr(self.prompt_context_store.memory_store, "remote_state", None),
+            getattr(self.prompt_context_store.user_store, "remote_state", None),
+            getattr(self.prompt_context_store.personality_store, "remote_state", None),
+            getattr(self.graph_store, "remote_state", None),
+            getattr(self.object_store, "remote_state", None),
+            getattr(self.midterm_store, "remote_state", None),
+        ):
+            if remote_state is None:
+                continue
+            state_id = id(remote_state)
+            if state_id in seen:
+                continue
+            seen.add(state_id)
+            yield remote_state
+
+    def attest_external_remote_ready(self) -> None:
+        """Synchronize local remote-state cooldowns to an external proof.
+
+        In `watchdog_artifact` mode the realtime loop can already have a fresh
+        external proof that the required remote namespace is readable. Push
+        that proof down into every owned remote-state adapter so stale local
+        cooldown or probe-cache state does not contradict the watchdog on the
+        next foreground turn.
+        """
+
+        for remote_state in self._iter_unique_remote_states():
+            attest_external_readiness = getattr(remote_state, "attest_external_readiness", None)
+            if callable(attest_external_readiness):
+                attest_external_readiness()
 
     def ensure_remote_ready(self) -> LongTermRemoteReadinessResult:
         """Prove required remote-primary long-term state is ready to use.

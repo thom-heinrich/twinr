@@ -101,6 +101,75 @@ def _parse_optional_text(value: str | None) -> str | None:
     return normalized or None
 
 
+def _parse_optional_url(value: str | None, *, strip_trailing_slash: bool = False) -> str | None:
+    """Parse one optional URL-like value and normalize surrounding whitespace."""
+
+    normalized = _parse_optional_text(value)
+    if normalized is None:
+        return None
+    if strip_trailing_slash:
+        normalized = normalized.rstrip("/")
+    return normalized or None
+
+
+def _parse_camera_host_mode(value: str | None, default: str = "onboard") -> str:
+    """Parse the high-level camera host mode used for open-source wiring defaults."""
+
+    normalized = str(value or default or "onboard").strip().lower().replace("-", "_") or "onboard"
+    if normalized in {"main_pi", "local"}:
+        normalized = "onboard"
+    if normalized in {"helper_pi", "peer_pi", "remote"}:
+        normalized = "second_pi"
+    if normalized not in {"onboard", "second_pi"}:
+        raise ValueError(f"Unsupported camera host mode: {value}")
+    return normalized
+
+
+def _derive_camera_host_mode(
+    *,
+    raw_value: str | None,
+    camera_second_pi_base_url: str | None,
+    proactive_remote_camera_base_url: str | None,
+    camera_proxy_snapshot_url: str | None,
+) -> str:
+    """Resolve the effective high-level camera topology from explicit or legacy envs."""
+
+    if raw_value is not None and raw_value.strip():
+        return _parse_camera_host_mode(raw_value, default="onboard")
+    if (
+        camera_second_pi_base_url is not None
+        or proactive_remote_camera_base_url is not None
+        or camera_proxy_snapshot_url is not None
+    ):
+        return "second_pi"
+    return "onboard"
+
+
+def _derive_snapshot_proxy_url(base_url: str | None) -> str | None:
+    """Derive the peer snapshot endpoint from the helper AI-camera base URL."""
+
+    normalized = _parse_optional_url(base_url, strip_trailing_slash=True)
+    if normalized is None:
+        return None
+    return f"{normalized}/snapshot.png"
+
+
+def _derive_proactive_vision_provider(
+    raw_value: str | None,
+    *,
+    camera_host_mode: str,
+    proactive_remote_camera_base_url: str | None,
+) -> str:
+    """Resolve the effective proactive camera provider from friendly topology config."""
+
+    explicit_value = _parse_optional_text(raw_value)
+    if explicit_value is not None:
+        return explicit_value.strip().lower()
+    if camera_host_mode == "second_pi" and proactive_remote_camera_base_url is not None:
+        return "remote_frame"
+    return "local_first"
+
+
 def _normalize_model_setting(value: object, *, fallback: str) -> str:
     """Return one non-blank model identifier, or the provided fallback."""
 
@@ -187,21 +256,36 @@ def _parse_local_semantic_router_mode(value: str | None, default: str = "off") -
     return normalized
 
 
-def _parse_voice_orchestrator_wake_stage1_mode(value: str | None, default: str = "remote_asr") -> str:
-    """Parse the server-side voice stage-one mode with validation."""
-
-    normalized = str(value or default or "remote_asr").strip().lower() or "remote_asr"
-    if normalized != "remote_asr":
-        raise ValueError(f"Unsupported voice orchestrator wake stage1 mode: {value}")
-    return normalized
-
-
 def _parse_attention_servo_driver(value: str | None, default: str = "auto") -> str:
     """Parse the configured attention-servo driver strategy with validation."""
 
     normalized = str(value or default or "auto").strip().lower() or "auto"
-    if normalized not in {"auto", "twinr_kernel", "sysfs_pwm", "pigpio", "lgpio_pwm", "lgpio"}:
+    if normalized == "maestro":
+        normalized = "pololu_maestro"
+    if normalized in {"peer_maestro", "peer_pololu"}:
+        normalized = "peer_pololu_maestro"
+    if normalized not in {
+        "auto",
+        "twinr_kernel",
+        "sysfs_pwm",
+        "pigpio",
+        "lgpio_pwm",
+        "lgpio",
+        "pololu_maestro",
+        "peer_pololu_maestro",
+    }:
         raise ValueError(f"Unsupported attention-servo driver: {value}")
+    return normalized
+
+
+def _parse_attention_servo_control_mode(value: str | None, default: str = "position") -> str:
+    """Parse the configured attention-servo control model with validation."""
+
+    normalized = str(value or default or "position").strip().lower().replace("-", "_") or "position"
+    if normalized in {"continuous", "continuous_servo"}:
+        normalized = "continuous_rotation"
+    if normalized not in {"position", "continuous_rotation"}:
+        raise ValueError(f"Unsupported attention-servo control mode: {value}")
     return normalized
 
 
@@ -385,12 +469,11 @@ class TwinrConfig:
     orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator"
     orchestrator_shared_secret: str | None = None
     voice_orchestrator_enabled: bool = False
-    voice_orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator/voice"
+    voice_orchestrator_ws_url: str = ""
     voice_orchestrator_shared_secret: str | None = None
     voice_orchestrator_audio_device: str | None = None
     voice_activation_phrases: tuple[str, ...] = DEFAULT_VOICE_ACTIVATION_PHRASES
     voice_orchestrator_history_ms: int = 4000
-    voice_orchestrator_wake_stage1_mode: str = "remote_asr"
     voice_orchestrator_wake_candidate_window_ms: int = 2200
     voice_orchestrator_wake_candidate_min_active_ratio: float = 0.0
     voice_orchestrator_wake_candidate_min_transcript_chars: int = 4
@@ -417,6 +500,9 @@ class TwinrConfig:
     voice_orchestrator_barge_in_min_active_ratio: float = 0.28
     voice_orchestrator_barge_in_min_transcript_chars: int = 4
     voice_orchestrator_candidate_cooldown_s: float = 0.9
+    voice_orchestrator_audio_debug_enabled: bool = False
+    voice_orchestrator_audio_debug_dir: str | None = None
+    voice_orchestrator_audio_debug_max_files: int = 24
     whatsapp_node_binary: str = "node"
     whatsapp_allow_from: str | None = None
     whatsapp_auth_dir: str = "state/channels/whatsapp/auth"
@@ -428,12 +514,15 @@ class TwinrConfig:
     whatsapp_send_timeout_s: float = 20.0
     whatsapp_sent_cache_ttl_s: float = 180.0
     whatsapp_sent_cache_max_entries: int = 256
+    camera_host_mode: str = "onboard"
+    camera_second_pi_base_url: str | None = None
     camera_device: str = "/dev/video0"
     camera_width: int = 640
     camera_height: int = 480
     camera_framerate: int = 30
     camera_input_format: str | None = None
     camera_ffmpeg_path: str = "ffmpeg"
+    camera_proxy_snapshot_url: str | None = None
     vision_reference_image_path: str | None = None
     portrait_match_enabled: bool = True
     portrait_match_detector_model_path: str = "state/opencv/models/face_detection_yunet_2023mar.onnx"
@@ -453,6 +542,8 @@ class TwinrConfig:
     openai_vision_detail: str = "auto"
     proactive_enabled: bool = False
     proactive_vision_provider: str = "local_first"
+    proactive_remote_camera_base_url: str | None = None
+    proactive_remote_camera_timeout_s: float = 4.0
     proactive_local_camera_detection_network_path: str = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
     proactive_local_camera_pose_network_path: str = "/usr/share/imx500-models/imx500_network_posenet.rpk"
     proactive_local_camera_pose_backend: str = "mediapipe"
@@ -694,7 +785,14 @@ class TwinrConfig:
     display_attention_refresh_interval_s: float = 0.2
     display_attention_session_focus_hold_s: float = 4.5
     attention_servo_enabled: bool = False
+    attention_servo_forensic_trace_enabled: bool = False
     attention_servo_driver: str = "auto"
+    attention_servo_control_mode: str = "position"
+    attention_servo_maestro_device: str | None = None
+    attention_servo_maestro_channel: int | None = None
+    attention_servo_peer_base_url: str | None = None
+    attention_servo_peer_timeout_s: float = 1.5
+    attention_servo_state_path: str = "state/attention_servo_state.json"
     attention_servo_gpio: int | None = None
     attention_servo_invert_direction: bool = False
     attention_servo_target_hold_s: float = 1.1
@@ -719,13 +817,21 @@ class TwinrConfig:
     attention_servo_idle_release_s: float = 1.0
     attention_servo_settled_release_s: float = 0.0
     attention_servo_follow_exit_only: bool = False
+    attention_servo_visible_recenter_interval_s: float = 30.0
+    attention_servo_visible_recenter_center_tolerance: float = 0.12
     attention_servo_mechanical_range_degrees: float = 270.0
     attention_servo_exit_follow_max_degrees: float = 60.0
     attention_servo_exit_activation_delay_s: float = 0.75
     attention_servo_exit_settle_hold_s: float = 0.6
     attention_servo_exit_reacquire_center_tolerance: float = 0.08
-    attention_servo_exit_visible_edge_threshold: float = 0.74
+    attention_servo_exit_visible_edge_threshold: float = 0.62
+    attention_servo_exit_visible_box_edge_threshold: float = 0.92
     attention_servo_exit_cooldown_s: float = 30.0
+    attention_servo_continuous_max_speed_degrees_per_s: float = 120.0
+    attention_servo_continuous_slow_zone_degrees: float = 45.0
+    attention_servo_continuous_stop_tolerance_degrees: float = 4.0
+    attention_servo_continuous_min_speed_pulse_delta_us: int = 70
+    attention_servo_continuous_max_speed_pulse_delta_us: int = 160
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
     display_vendor_dir: str = "state/display/vendor"
@@ -921,6 +1027,33 @@ class TwinrConfig:
             normalized_attention_servo_loss_extrapolation_gain,
         )
         normalized_attention_servo_driver = _parse_attention_servo_driver(self.attention_servo_driver, "auto")
+        normalized_attention_servo_control_mode = _parse_attention_servo_control_mode(
+            self.attention_servo_control_mode,
+            "position",
+        )
+        normalized_attention_servo_maestro_device = (
+            None
+            if self.attention_servo_maestro_device is None
+            else (str(self.attention_servo_maestro_device).strip() or None)
+        )
+        normalized_attention_servo_maestro_channel = (
+            None
+            if self.attention_servo_maestro_channel is None
+            else max(0, min(23, int(self.attention_servo_maestro_channel)))
+        )
+        normalized_attention_servo_peer_base_url = (
+            None
+            if self.attention_servo_peer_base_url is None
+            else (str(self.attention_servo_peer_base_url).strip().rstrip("/") or None)
+        )
+        normalized_attention_servo_peer_timeout_s = float(self.attention_servo_peer_timeout_s)
+        if not math.isfinite(normalized_attention_servo_peer_timeout_s):
+            raise ValueError("attention_servo_peer_timeout_s must be finite")
+        normalized_attention_servo_peer_timeout_s = max(0.1, normalized_attention_servo_peer_timeout_s)
+        normalized_attention_servo_state_path = (
+            str(self.attention_servo_state_path or "state/attention_servo_state.json").strip()
+            or "state/attention_servo_state.json"
+        )
         normalized_attention_servo_min_confidence = float(self.attention_servo_min_confidence)
         if not math.isfinite(normalized_attention_servo_min_confidence):
             raise ValueError("attention_servo_min_confidence must be finite")
@@ -1034,6 +1167,24 @@ class TwinrConfig:
         if not math.isfinite(normalized_attention_servo_settled_release_s):
             raise ValueError("attention_servo_settled_release_s must be finite")
         normalized_attention_servo_settled_release_s = max(0.0, normalized_attention_servo_settled_release_s)
+        normalized_attention_servo_visible_recenter_interval_s = float(
+            self.attention_servo_visible_recenter_interval_s
+        )
+        if not math.isfinite(normalized_attention_servo_visible_recenter_interval_s):
+            raise ValueError("attention_servo_visible_recenter_interval_s must be finite")
+        normalized_attention_servo_visible_recenter_interval_s = max(
+            0.0,
+            normalized_attention_servo_visible_recenter_interval_s,
+        )
+        normalized_attention_servo_visible_recenter_center_tolerance = float(
+            self.attention_servo_visible_recenter_center_tolerance
+        )
+        if not math.isfinite(normalized_attention_servo_visible_recenter_center_tolerance):
+            raise ValueError("attention_servo_visible_recenter_center_tolerance must be finite")
+        normalized_attention_servo_visible_recenter_center_tolerance = max(
+            0.0,
+            min(0.3, normalized_attention_servo_visible_recenter_center_tolerance),
+        )
         normalized_attention_servo_mechanical_range_degrees = float(
             self.attention_servo_mechanical_range_degrees
         )
@@ -1089,10 +1240,73 @@ class TwinrConfig:
             0.55,
             min(0.95, normalized_attention_servo_exit_visible_edge_threshold),
         )
+        normalized_attention_servo_exit_visible_box_edge_threshold = float(
+            self.attention_servo_exit_visible_box_edge_threshold
+        )
+        if not math.isfinite(normalized_attention_servo_exit_visible_box_edge_threshold):
+            raise ValueError("attention_servo_exit_visible_box_edge_threshold must be finite")
+        normalized_attention_servo_exit_visible_box_edge_threshold = max(
+            0.75,
+            min(0.99, normalized_attention_servo_exit_visible_box_edge_threshold),
+        )
         normalized_attention_servo_exit_cooldown_s = float(self.attention_servo_exit_cooldown_s)
         if not math.isfinite(normalized_attention_servo_exit_cooldown_s):
             raise ValueError("attention_servo_exit_cooldown_s must be finite")
         normalized_attention_servo_exit_cooldown_s = max(0.0, normalized_attention_servo_exit_cooldown_s)
+        normalized_attention_servo_continuous_max_speed_degrees_per_s = float(
+            self.attention_servo_continuous_max_speed_degrees_per_s
+        )
+        if not math.isfinite(normalized_attention_servo_continuous_max_speed_degrees_per_s):
+            raise ValueError("attention_servo_continuous_max_speed_degrees_per_s must be finite")
+        normalized_attention_servo_continuous_max_speed_degrees_per_s = max(
+            1.0,
+            normalized_attention_servo_continuous_max_speed_degrees_per_s,
+        )
+        normalized_attention_servo_continuous_slow_zone_degrees = float(
+            self.attention_servo_continuous_slow_zone_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_continuous_slow_zone_degrees):
+            raise ValueError("attention_servo_continuous_slow_zone_degrees must be finite")
+        normalized_attention_servo_continuous_slow_zone_degrees = max(
+            0.5,
+            min(
+                normalized_attention_servo_mechanical_range_degrees * 0.5,
+                normalized_attention_servo_continuous_slow_zone_degrees,
+            ),
+        )
+        normalized_attention_servo_continuous_stop_tolerance_degrees = float(
+            self.attention_servo_continuous_stop_tolerance_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_continuous_stop_tolerance_degrees):
+            raise ValueError("attention_servo_continuous_stop_tolerance_degrees must be finite")
+        normalized_attention_servo_continuous_stop_tolerance_degrees = max(
+            0.0,
+            min(
+                normalized_attention_servo_continuous_slow_zone_degrees,
+                normalized_attention_servo_continuous_stop_tolerance_degrees,
+            ),
+        )
+        continuous_available_delta_us = max(
+            1,
+            min(
+                normalized_attention_servo_center_pulse_width_us - normalized_attention_servo_min_pulse_width_us,
+                normalized_attention_servo_max_pulse_width_us - normalized_attention_servo_center_pulse_width_us,
+            ),
+        )
+        normalized_attention_servo_continuous_min_speed_pulse_delta_us = max(
+            0,
+            min(
+                int(self.attention_servo_continuous_min_speed_pulse_delta_us),
+                continuous_available_delta_us,
+            ),
+        )
+        normalized_attention_servo_continuous_max_speed_pulse_delta_us = max(
+            normalized_attention_servo_continuous_min_speed_pulse_delta_us,
+            min(
+                int(self.attention_servo_continuous_max_speed_pulse_delta_us),
+                continuous_available_delta_us,
+            ),
+        )
         normalized_display_presentation_ttl_s = float(self.display_presentation_ttl_s)
         if not math.isfinite(normalized_display_presentation_ttl_s):
             raise ValueError("display_presentation_ttl_s must be finite")
@@ -1160,6 +1374,27 @@ class TwinrConfig:
             str(self.display_news_ticker_store_path or "artifacts/stores/ops/display_news_ticker.json").strip()
             or "artifacts/stores/ops/display_news_ticker.json"
         )
+        normalized_voice_orchestrator_ws_url = str(self.voice_orchestrator_ws_url or "").strip()
+        normalized_camera_host_mode = _parse_camera_host_mode(self.camera_host_mode, default="onboard")
+        normalized_camera_second_pi_base_url = _parse_optional_url(
+            None if self.camera_second_pi_base_url is None else str(self.camera_second_pi_base_url),
+            strip_trailing_slash=True,
+        )
+        normalized_camera_proxy_snapshot_url = _parse_optional_url(
+            None if self.camera_proxy_snapshot_url is None else str(self.camera_proxy_snapshot_url),
+        )
+        normalized_proactive_remote_camera_base_url = _parse_optional_url(
+            None if self.proactive_remote_camera_base_url is None else str(self.proactive_remote_camera_base_url),
+            strip_trailing_slash=True,
+        )
+        normalized_proactive_vision_provider = (
+            str(self.proactive_vision_provider or "local_first").strip().lower() or "local_first"
+        )
+        if self.voice_orchestrator_enabled and not normalized_voice_orchestrator_ws_url:
+            raise ValueError(
+                "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL; "
+                "Twinr must not fall back to an implicit voice gateway endpoint."
+            )
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
             self,
@@ -1172,7 +1407,13 @@ class TwinrConfig:
         object.__setattr__(self, "streaming_specialist_model", normalized_streaming_specialist_model)
         object.__setattr__(self, "conversation_closure_model", normalized_conversation_closure_model)
         object.__setattr__(self, "openai_search_model", normalized_openai_search_model)
+        object.__setattr__(self, "voice_orchestrator_ws_url", normalized_voice_orchestrator_ws_url)
         object.__setattr__(self, "display_driver", normalized_display_driver)
+        object.__setattr__(self, "camera_host_mode", normalized_camera_host_mode)
+        object.__setattr__(self, "camera_second_pi_base_url", normalized_camera_second_pi_base_url)
+        object.__setattr__(self, "camera_proxy_snapshot_url", normalized_camera_proxy_snapshot_url)
+        object.__setattr__(self, "proactive_remote_camera_base_url", normalized_proactive_remote_camera_base_url)
+        object.__setattr__(self, "proactive_vision_provider", normalized_proactive_vision_provider)
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
@@ -1288,6 +1529,12 @@ class TwinrConfig:
             normalized_display_attention_session_focus_hold_s,
         )
         object.__setattr__(self, "attention_servo_driver", normalized_attention_servo_driver)
+        object.__setattr__(self, "attention_servo_control_mode", normalized_attention_servo_control_mode)
+        object.__setattr__(self, "attention_servo_maestro_device", normalized_attention_servo_maestro_device)
+        object.__setattr__(self, "attention_servo_maestro_channel", normalized_attention_servo_maestro_channel)
+        object.__setattr__(self, "attention_servo_peer_base_url", normalized_attention_servo_peer_base_url)
+        object.__setattr__(self, "attention_servo_peer_timeout_s", normalized_attention_servo_peer_timeout_s)
+        object.__setattr__(self, "attention_servo_state_path", normalized_attention_servo_state_path)
         object.__setattr__(self, "attention_servo_target_hold_s", normalized_attention_servo_target_hold_s)
         object.__setattr__(
             self,
@@ -1364,6 +1611,16 @@ class TwinrConfig:
         object.__setattr__(self, "attention_servo_follow_exit_only", bool(self.attention_servo_follow_exit_only))
         object.__setattr__(
             self,
+            "attention_servo_visible_recenter_interval_s",
+            normalized_attention_servo_visible_recenter_interval_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_visible_recenter_center_tolerance",
+            normalized_attention_servo_visible_recenter_center_tolerance,
+        )
+        object.__setattr__(
+            self,
             "attention_servo_mechanical_range_degrees",
             normalized_attention_servo_mechanical_range_degrees,
         )
@@ -1394,8 +1651,38 @@ class TwinrConfig:
         )
         object.__setattr__(
             self,
+            "attention_servo_exit_visible_box_edge_threshold",
+            normalized_attention_servo_exit_visible_box_edge_threshold,
+        )
+        object.__setattr__(
+            self,
             "attention_servo_exit_cooldown_s",
             normalized_attention_servo_exit_cooldown_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_max_speed_degrees_per_s",
+            normalized_attention_servo_continuous_max_speed_degrees_per_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_slow_zone_degrees",
+            normalized_attention_servo_continuous_slow_zone_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_stop_tolerance_degrees",
+            normalized_attention_servo_continuous_stop_tolerance_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_min_speed_pulse_delta_us",
+            normalized_attention_servo_continuous_min_speed_pulse_delta_us,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_max_speed_pulse_delta_us",
+            normalized_attention_servo_continuous_max_speed_pulse_delta_us,
         )
         object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
         object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
@@ -1529,6 +1816,32 @@ class TwinrConfig:
         voice_activation_phrases = _parse_csv_strings(
             get_value("TWINR_VOICE_ACTIVATION_PHRASES"),
             DEFAULT_VOICE_ACTIVATION_PHRASES,
+        )
+        raw_camera_host_mode = get_value("TWINR_CAMERA_HOST_MODE")
+        camera_second_pi_base_url = _parse_optional_url(
+            get_value("TWINR_CAMERA_SECOND_PI_BASE_URL"),
+            strip_trailing_slash=True,
+        )
+        proactive_remote_camera_base_url = _parse_optional_url(
+            get_value("TWINR_PROACTIVE_REMOTE_CAMERA_BASE_URL"),
+            strip_trailing_slash=True,
+        )
+        camera_proxy_snapshot_url = _parse_optional_url(
+            get_value("TWINR_CAMERA_PROXY_SNAPSHOT_URL"),
+        )
+        camera_host_mode = _derive_camera_host_mode(
+            raw_value=raw_camera_host_mode,
+            camera_second_pi_base_url=camera_second_pi_base_url,
+            proactive_remote_camera_base_url=proactive_remote_camera_base_url,
+            camera_proxy_snapshot_url=camera_proxy_snapshot_url,
+        )
+        effective_second_pi_base_url = proactive_remote_camera_base_url or camera_second_pi_base_url
+        if camera_proxy_snapshot_url is None and camera_host_mode == "second_pi":
+            camera_proxy_snapshot_url = _derive_snapshot_proxy_url(effective_second_pi_base_url)
+        proactive_vision_provider = _derive_proactive_vision_provider(
+            get_value("TWINR_PROACTIVE_VISION_PROVIDER"),
+            camera_host_mode=camera_host_mode,
+            proactive_remote_camera_base_url=effective_second_pi_base_url,
         )
 
         return cls(
@@ -1936,10 +2249,10 @@ class TwinrConfig:
                 get_value("TWINR_VOICE_ORCHESTRATOR_ENABLED"),
                 False,
             ),
-            voice_orchestrator_ws_url=(
-                get_value("TWINR_VOICE_ORCHESTRATOR_WS_URL", "ws://127.0.0.1:8797/ws/orchestrator/voice")
-                or "ws://127.0.0.1:8797/ws/orchestrator/voice"
-            ),
+            voice_orchestrator_ws_url=_parse_optional_text(
+                get_value("TWINR_VOICE_ORCHESTRATOR_WS_URL")
+            )
+            or "",
             voice_orchestrator_shared_secret=(
                 get_value("TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET")
                 or get_value("TWINR_ORCHESTRATOR_SHARED_SECRET")
@@ -1949,10 +2262,6 @@ class TwinrConfig:
             voice_activation_phrases=voice_activation_phrases,
             voice_orchestrator_history_ms=int(
                 get_value("TWINR_VOICE_ORCHESTRATOR_HISTORY_MS", "4000") or "4000"
-            ),
-            voice_orchestrator_wake_stage1_mode=_parse_voice_orchestrator_wake_stage1_mode(
-                get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE"),
-                "remote_asr",
             ),
             voice_orchestrator_wake_candidate_window_ms=int(
                 get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS", "2200") or "2200"
@@ -2090,6 +2399,17 @@ class TwinrConfig:
                 0.9,
                 minimum=0.1,
             ),
+            voice_orchestrator_audio_debug_enabled=_parse_bool(
+                get_value("TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_ENABLED"),
+                False,
+            ),
+            voice_orchestrator_audio_debug_dir=_parse_optional_text(
+                get_value("TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_DIR")
+            ),
+            voice_orchestrator_audio_debug_max_files=max(
+                4,
+                int(get_value("TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_MAX_FILES", "24") or "24"),
+            ),
             whatsapp_node_binary=get_value("TWINR_WHATSAPP_NODE_BINARY", "node") or "node",
             whatsapp_allow_from=get_value("TWINR_WHATSAPP_ALLOW_FROM") or None,
             whatsapp_auth_dir=get_value(
@@ -2128,12 +2448,15 @@ class TwinrConfig:
                 16,
                 int(get_value("TWINR_WHATSAPP_SENT_CACHE_MAX_ENTRIES", "256") or "256"),
             ),
+            camera_host_mode=camera_host_mode,
+            camera_second_pi_base_url=effective_second_pi_base_url,
             camera_device=get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0",
             camera_width=int(get_value("TWINR_CAMERA_WIDTH", "640") or "640"),
             camera_height=int(get_value("TWINR_CAMERA_HEIGHT", "480") or "480"),
             camera_framerate=int(get_value("TWINR_CAMERA_FRAMERATE", "30") or "30"),
             camera_input_format=get_value("TWINR_CAMERA_INPUT_FORMAT"),
             camera_ffmpeg_path=get_value("TWINR_CAMERA_FFMPEG_PATH", "ffmpeg") or "ffmpeg",
+            camera_proxy_snapshot_url=camera_proxy_snapshot_url,
             vision_reference_image_path=get_value("TWINR_VISION_REFERENCE_IMAGE"),
             portrait_match_enabled=_parse_bool(get_value("TWINR_PORTRAIT_MATCH_ENABLED"), True),
             portrait_match_detector_model_path=(
@@ -2209,7 +2532,13 @@ class TwinrConfig:
             ),
             openai_vision_detail=get_value("OPENAI_VISION_DETAIL", "auto") or "auto",
             proactive_enabled=_parse_bool(get_value("TWINR_PROACTIVE_ENABLED"), False),
-            proactive_vision_provider=(get_value("TWINR_PROACTIVE_VISION_PROVIDER", "local_first") or "local_first").strip().lower(),
+            proactive_vision_provider=proactive_vision_provider,
+            proactive_remote_camera_base_url=effective_second_pi_base_url,
+            proactive_remote_camera_timeout_s=_parse_float(
+                get_value("TWINR_PROACTIVE_REMOTE_CAMERA_TIMEOUT_S"),
+                4.0,
+                minimum=0.1,
+            ),
             proactive_local_camera_detection_network_path=(
                 get_value(
                     "TWINR_PROACTIVE_LOCAL_CAMERA_DETECTION_NETWORK_PATH",
@@ -2379,7 +2708,10 @@ class TwinrConfig:
             proactive_motion_window_s=_parse_float(get_value("TWINR_PROACTIVE_MOTION_WINDOW_S"), 20.0),
             proactive_low_motion_after_s=_parse_float(get_value("TWINR_PROACTIVE_LOW_MOTION_AFTER_S"), 12.0),
             proactive_audio_enabled=_parse_bool(get_value("TWINR_PROACTIVE_AUDIO_ENABLED"), False),
-            proactive_audio_input_device=get_value("TWINR_PROACTIVE_AUDIO_DEVICE"),
+            proactive_audio_input_device=(
+                get_value("TWINR_PROACTIVE_AUDIO_INPUT_DEVICE")
+                or get_value("TWINR_PROACTIVE_AUDIO_DEVICE")
+            ),
             proactive_audio_sample_ms=int(get_value("TWINR_PROACTIVE_AUDIO_SAMPLE_MS", "1000") or "1000"),
             proactive_audio_distress_enabled=_parse_bool(
                 get_value("TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED"),
@@ -3061,10 +3393,33 @@ class TwinrConfig:
                 get_value("TWINR_ATTENTION_SERVO_ENABLED"),
                 False,
             ),
+            attention_servo_forensic_trace_enabled=_parse_bool(
+                get_value("TWINR_ATTENTION_SERVO_FORENSIC_TRACE_ENABLED"),
+                False,
+            ),
             attention_servo_driver=_parse_attention_servo_driver(
                 get_value("TWINR_ATTENTION_SERVO_DRIVER"),
                 "auto",
             ),
+            attention_servo_control_mode=_parse_attention_servo_control_mode(
+                get_value("TWINR_ATTENTION_SERVO_CONTROL_MODE"),
+                "position",
+            ),
+            attention_servo_maestro_device=get_value("TWINR_ATTENTION_SERVO_MAESTRO_DEVICE") or None,
+            attention_servo_maestro_channel=_parse_optional_int(
+                get_value("TWINR_ATTENTION_SERVO_MAESTRO_CHANNEL")
+            ),
+            attention_servo_peer_base_url=get_value("TWINR_ATTENTION_SERVO_PEER_BASE_URL") or None,
+            attention_servo_peer_timeout_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S"),
+                1.5,
+                minimum=0.1,
+            ),
+            attention_servo_state_path=get_value(
+                "TWINR_ATTENTION_SERVO_STATE_PATH",
+                str(project_root / "state" / "attention_servo_state.json"),
+            )
+            or str(project_root / "state" / "attention_servo_state.json"),
             attention_servo_gpio=_parse_optional_int(get_value("TWINR_ATTENTION_SERVO_GPIO")),
             attention_servo_invert_direction=_parse_bool(
                 get_value("TWINR_ATTENTION_SERVO_INVERT_DIRECTION"),
@@ -3164,6 +3519,16 @@ class TwinrConfig:
                 get_value("TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY"),
                 False,
             ),
+            attention_servo_visible_recenter_interval_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_INTERVAL_S"),
+                30.0,
+                minimum=0.0,
+            ),
+            attention_servo_visible_recenter_center_tolerance=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_CENTER_TOLERANCE"),
+                0.12,
+                minimum=0.0,
+            ),
             attention_servo_mechanical_range_degrees=_parse_float(
                 get_value("TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES"),
                 270.0,
@@ -3191,14 +3556,41 @@ class TwinrConfig:
             ),
             attention_servo_exit_visible_edge_threshold=_parse_float(
                 get_value("TWINR_ATTENTION_SERVO_EXIT_VISIBLE_EDGE_THRESHOLD"),
-                0.74,
+                0.62,
                 minimum=0.55,
                 maximum=0.95,
+            ),
+            attention_servo_exit_visible_box_edge_threshold=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_VISIBLE_BOX_EDGE_THRESHOLD"),
+                0.92,
+                minimum=0.75,
+                maximum=0.99,
             ),
             attention_servo_exit_cooldown_s=_parse_float(
                 get_value("TWINR_ATTENTION_SERVO_EXIT_COOLDOWN_S"),
                 30.0,
                 minimum=0.0,
+            ),
+            attention_servo_continuous_max_speed_degrees_per_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_DEGREES_PER_S"),
+                120.0,
+                minimum=1.0,
+            ),
+            attention_servo_continuous_slow_zone_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_SLOW_ZONE_DEGREES"),
+                45.0,
+                minimum=0.5,
+            ),
+            attention_servo_continuous_stop_tolerance_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_STOP_TOLERANCE_DEGREES"),
+                4.0,
+                minimum=0.0,
+            ),
+            attention_servo_continuous_min_speed_pulse_delta_us=int(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US", "70") or "70"
+            ),
+            attention_servo_continuous_max_speed_pulse_delta_us=int(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US", "160") or "160"
             ),
             display_presentation_path=get_value(
                 "TWINR_DISPLAY_PRESENTATION_PATH",

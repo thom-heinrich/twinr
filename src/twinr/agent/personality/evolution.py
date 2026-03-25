@@ -37,6 +37,10 @@ from twinr.agent.personality.models import (
     RelationshipSignal,
     WorldSignal,
 )
+from twinr.agent.personality.profile_defaults import (
+    default_humor_profile,
+    default_style_profile,
+)
 from twinr.agent.personality.signals import (
     RELATIONSHIP_TOPIC_AVERSION_DELTA_PREFIX,
     RELATIONSHIP_TOPIC_DELTA_PREFIX,
@@ -114,30 +118,6 @@ def _merge_by_key(
             order.append(key)
         merged[key] = item
     return tuple(merged[key] for key in order)
-
-
-def _default_humor_profile() -> HumorProfile:
-    """Return the baseline humor stance used before any learning lands."""
-
-    return HumorProfile(
-        style="gentle observational humor",
-        summary="Use gentle wit sparingly and only when the moment is relaxed.",
-        intensity=0.25,
-        boundaries=(
-            "never mocking",
-            "never undercutting serious moments",
-            "never sounding flippant about health or distress",
-        ),
-    )
-
-
-def _default_style_profile() -> ConversationStyleProfile:
-    """Return the baseline conversational style before any learning lands."""
-
-    return ConversationStyleProfile(
-        verbosity=0.5,
-        initiative=0.45,
-    )
 
 
 def _place_key(signal: PlaceSignal | PlaceFocus) -> str:
@@ -663,33 +643,33 @@ class PersonalityEvolutionLoop:
         relationship_signals = snapshot.relationship_signals
         for delta in accepted_deltas:
             if delta.target == STYLE_VERBOSITY_DELTA_TARGET:
-                baseline = style_profile or _default_style_profile()
+                style_baseline = style_profile or default_style_profile()
                 style_profile = ConversationStyleProfile(
-                    verbosity=_clamp(baseline.verbosity + delta.delta_value, minimum=0.0, maximum=1.0),
-                    initiative=baseline.initiative,
-                    evidence=baseline.evidence + delta.source_signal_ids,
+                    verbosity=_clamp(style_baseline.verbosity + delta.delta_value, minimum=0.0, maximum=1.0),
+                    initiative=style_baseline.initiative,
+                    evidence=style_baseline.evidence + delta.source_signal_ids,
                 )
                 continue
             if delta.target == STYLE_INITIATIVE_DELTA_TARGET:
-                baseline = style_profile or _default_style_profile()
+                style_baseline = style_profile or default_style_profile()
                 style_profile = ConversationStyleProfile(
-                    verbosity=baseline.verbosity,
-                    initiative=_clamp(baseline.initiative + delta.delta_value, minimum=0.0, maximum=1.0),
-                    evidence=baseline.evidence + delta.source_signal_ids,
+                    verbosity=style_baseline.verbosity,
+                    initiative=_clamp(style_baseline.initiative + delta.delta_value, minimum=0.0, maximum=1.0),
+                    evidence=style_baseline.evidence + delta.source_signal_ids,
                 )
                 continue
             if delta.target == "humor.intensity":
-                baseline = humor_profile or _default_humor_profile()
+                humor_baseline = humor_profile or default_humor_profile()
                 humor_profile = HumorProfile(
-                    style=baseline.style,
-                    summary=baseline.summary,
+                    style=humor_baseline.style,
+                    summary=humor_baseline.summary,
                     intensity=_clamp(
-                        baseline.intensity + delta.delta_value,
+                        humor_baseline.intensity + delta.delta_value,
                         minimum=0.0,
                         maximum=self.policy.max_humor_intensity,
                     ),
-                    boundaries=baseline.boundaries,
-                    evidence=baseline.evidence + delta.source_signal_ids,
+                    boundaries=humor_baseline.boundaries,
+                    evidence=humor_baseline.evidence + delta.source_signal_ids,
                 )
                 continue
 

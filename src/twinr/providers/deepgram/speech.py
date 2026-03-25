@@ -32,6 +32,7 @@ from twinr.agent.base_agent.contracts import (
 )
 
 logger = logging.getLogger(__name__)
+_DEEPGRAM_KEYWORD_INTENSIFIER = 2.0
 
 
 def _extract_transcript(payload: dict[str, object]) -> str:
@@ -64,6 +65,39 @@ def _extract_transcript(payload: dict[str, object]) -> str:
     if not isinstance(transcript, str):
         raise RuntimeError("Deepgram response did not contain a string transcript")
     return transcript.strip()
+
+
+def _prompt_bias_terms(prompt: str | None) -> tuple[str, ...]:
+    """Extract one bounded list of transcription-bias terms from a prompt string."""
+
+    normalized_prompt = str(prompt or "").strip()
+    if not normalized_prompt:
+        return ()
+    translated = normalized_prompt
+    for separator in ("\n", "\r", ";", "|"):
+        translated = translated.replace(separator, ",")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw_part in translated.split(","):
+        term = raw_part.strip(" \t.,!?:")
+        normalized_term = term.casefold()
+        if not term or normalized_term in seen:
+            continue
+        seen.add(normalized_term)
+        terms.append(term)
+    return tuple(terms)
+
+
+def _deepgram_prompt_params(*, model: str, prompt: str | None) -> list[tuple[str, str]]:
+    """Map one provider-agnostic prompt string onto Deepgram bias parameters."""
+
+    terms = _prompt_bias_terms(prompt)
+    if not terms:
+        return []
+    normalized_model = str(model or "").strip().lower()
+    if normalized_model.startswith("nova-3"):
+        return [("keyterm", term) for term in terms]
+    return [("keywords", f"{term}:{_DEEPGRAM_KEYWORD_INTENSIFIER:g}") for term in terms]
 
 
 def _extract_streaming_transcript(payload: dict[str, object]) -> str:
@@ -583,7 +617,7 @@ class DeepgramSpeechToTextProvider:
             filename: Unused compatibility parameter kept for provider parity.
             content_type: MIME type describing ``audio_bytes``.
             language: Optional override for the configured transcription language.
-            prompt: Unused compatibility parameter kept for provider parity.
+            prompt: Optional provider-agnostic hint terms to bias transcription.
 
         Returns:
             The best transcript string returned by Deepgram, or an empty string
@@ -592,7 +626,7 @@ class DeepgramSpeechToTextProvider:
         Raises:
             RuntimeError: If configuration is incomplete or the request fails.
         """
-        del filename, prompt
+        del filename
         if not audio_bytes:
             return ""
 
@@ -600,14 +634,18 @@ class DeepgramSpeechToTextProvider:
         if not api_key:
             raise RuntimeError("DEEPGRAM_API_KEY is required to use the Deepgram speech provider")
 
-        params: dict[str, str] = {
-            "model": self.config.deepgram_stt_model,
-        }
+        params: list[tuple[str, str]] = [("model", self.config.deepgram_stt_model)]
         resolved_language = (language or self.config.deepgram_stt_language or "").strip()
         if resolved_language:
-            params["language"] = resolved_language
+            params.append(("language", resolved_language))
         if self.config.deepgram_stt_smart_format:
-            params["smart_format"] = "true"
+            params.append(("smart_format", "true"))
+        params.extend(
+            _deepgram_prompt_params(
+                model=self.config.deepgram_stt_model,
+                prompt=prompt,
+            )
+        )
 
         try:
             response = self._client.post(
@@ -639,7 +677,7 @@ class DeepgramSpeechToTextProvider:
         Args:
             path: Filesystem path to a regular audio file.
             language: Optional override for the configured transcription language.
-            prompt: Unused compatibility parameter kept for provider parity.
+            prompt: Optional provider-agnostic hint terms to bias transcription.
 
         Returns:
             The transcript produced by :meth:`transcribe`.

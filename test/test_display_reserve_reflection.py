@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
     LongTermMidtermPacketV1,
@@ -74,6 +74,19 @@ class DisplayReserveReflectionTests(unittest.TestCase):
                 sensitivity="normal",
                 updated_at=now - timedelta(hours=3),
             )
+            grounded_preference_packet = LongTermMidtermPacketV1(
+                packet_id="midterm:user_preference_coffee_grounded",
+                kind="preference",
+                summary="User likes to drink Melitta coffee in the morning.",
+                details="This can help with relevant small talk about morning routines.",
+                query_hints=("Melitta", "morning coffee"),
+                sensitivity="normal",
+                updated_at=now - timedelta(hours=2),
+                attributes={
+                    "display_anchor": "Dein Kaffee am Morgen",
+                    "transcript_excerpt": "Mein Kaffee am Morgen ist mir wichtig.",
+                },
+            )
             continuity_packet = LongTermMidtermPacketV1(
                 packet_id="midterm:turn:recent",
                 kind="recent_turn_continuity",
@@ -82,7 +95,11 @@ class DisplayReserveReflectionTests(unittest.TestCase):
                 query_hints=("doctor appointment", "yesterday"),
                 sensitivity="normal",
                 updated_at=now - timedelta(minutes=20),
-                attributes={"persistence_scope": "turn_continuity"},
+                attributes={
+                    "persistence_scope": "turn_continuity",
+                    "display_anchor": "Arzttermin gestern",
+                    "transcript_excerpt": "Wie war der Arzttermin gestern?",
+                },
             )
             conversation_packet = LongTermMidtermPacketV1(
                 packet_id="midterm:conversation:check_in",
@@ -120,15 +137,26 @@ class DisplayReserveReflectionTests(unittest.TestCase):
                 sensitivity="normal",
                 updated_at=now - timedelta(minutes=8),
             )
+            interaction_packet = LongTermMidtermPacketV1(
+                packet_id="midterm:interaction:green_button",
+                kind="interaction",
+                summary="The user asked about the green button.",
+                details="Generic interaction residue only.",
+                query_hints=("green button",),
+                sensitivity="normal",
+                updated_at=now - timedelta(minutes=15),
+            )
             memory_service = _FakeMemoryService(
                 objects=(summary,),
                 packets=(
                     preference_packet,
+                    grounded_preference_packet,
                     continuity_packet,
                     conversation_packet,
                     quality_packet,
                     conversation_state_packet,
                     device_packet,
+                    interaction_packet,
                 ),
             )
 
@@ -141,23 +169,24 @@ class DisplayReserveReflectionTests(unittest.TestCase):
 
         by_topic = {candidate.topic_key: candidate for candidate in candidates}
         sources = {candidate.source for candidate in candidates}
-        self.assertEqual(len(candidates), 4)
+        self.assertEqual(len(candidates), 3)
         self.assertIn("thread:person:janina", by_topic)
-        self.assertIn("morning coffee", by_topic)
-        self.assertIn("small talk", by_topic)
-        self.assertIn("doctor appointment", by_topic)
+        self.assertIn("dein kaffee am morgen", by_topic)
+        self.assertIn("arzttermin gestern", by_topic)
         self.assertIn("reflection_summary", sources)
         self.assertIn("reflection_midterm", sources)
-        self.assertEqual(by_topic["small talk"].attention_state, "shared_thread")
-        self.assertEqual(by_topic["doctor appointment"].attention_state, "shared_thread")
-        self.assertEqual(by_topic["small talk"].candidate_family, "reflection_thread")
-        self.assertEqual(by_topic["doctor appointment"].candidate_family, "reflection_thread")
-        self.assertNotIn("Recent conversation continuity", by_topic["doctor appointment"].headline)
-        self.assertNotIn("Immediate continuity only", by_topic["doctor appointment"].body)
+        self.assertEqual(by_topic["arzttermin gestern"].attention_state, "shared_thread")
+        self.assertEqual(by_topic["arzttermin gestern"].candidate_family, "reflection_thread")
+        self.assertEqual(by_topic["dein kaffee am morgen"].candidate_family, "reflection_preference")
+        self.assertNotIn("Recent conversation continuity", by_topic["arzttermin gestern"].headline)
+        self.assertNotIn("Immediate continuity only", by_topic["arzttermin gestern"].body)
         self.assertEqual(
-            (by_topic["doctor appointment"].generation_context or {}).get("display_anchor"),
-            "Doctor appointment",
+            (by_topic["arzttermin gestern"].generation_context or {}).get("display_anchor"),
+            "Arzttermin gestern",
         )
+        self.assertNotIn("morning coffee", by_topic)
+        self.assertNotIn("small talk", by_topic)
+        self.assertNotIn("green button", by_topic)
         self.assertNotIn("warm", by_topic)
 
     def test_continuity_packets_do_not_surface_internal_midterm_text(self) -> None:
@@ -219,6 +248,41 @@ class DisplayReserveReflectionTests(unittest.TestCase):
                 attributes={"persistence_scope": "turn_continuity"},
             )
             memory_service = _FakeMemoryService(packets=(continuity_packet,))
+
+            candidates = load_display_reserve_reflection_candidates(
+                memory_service,
+                config=config,
+                local_now=now,
+                max_items=3,
+            )
+
+        self.assertEqual(candidates, ())
+
+    def test_summary_objects_without_structured_display_anchor_are_suppressed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                display_reserve_bus_reflection_candidate_limit=5,
+            )
+            now = datetime(2026, 3, 24, 15, 0, tzinfo=timezone.utc)
+            summary = LongTermMemoryObjectV1(
+                memory_id="summary:place:schwarzen_weg",
+                kind="summary",
+                summary="The assistant answered a weather query for Schwarzen Weg, Berlin.",
+                details="Internal reflected event summary only.",
+                source=LongTermSourceRefV1(source_type="reflection", event_ids=("turn:99",)),
+                status="active",
+                confidence=0.91,
+                sensitivity="normal",
+                slot_key="summary:place:schwarzen_weg",
+                value_key="weather_query",
+                updated_at=now - timedelta(hours=2),
+                attributes={
+                    "summary_type": "thread",
+                    "memory_domain": "thread",
+                },
+            )
+            memory_service = _FakeMemoryService(objects=(summary,))
 
             candidates = load_display_reserve_reflection_candidates(
                 memory_service,

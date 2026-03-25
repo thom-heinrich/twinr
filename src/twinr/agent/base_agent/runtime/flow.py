@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from threading import RLock
 
 from twinr.agent.base_agent.state.machine import InvalidTransitionError, TwinrEvent, TwinrStatus
+from twinr.agent.workflows.forensics import workflow_event
 from twinr.ops.events import compact_text
 
 _LOGGER = logging.getLogger(__name__)
@@ -106,21 +108,61 @@ class TwinrRuntimeFlowMixin:
         pretending that a new state transition happened.
         """
 
-        with self._runtime_flow_lock():
+        lock = self._runtime_flow_lock()
+        lock_wait_started = time.monotonic()
+        with lock:
+            lock_wait_ms = round((time.monotonic() - lock_wait_started) * 1000.0, 3)
+            refresh_started = time.monotonic()
             self._persist_snapshot_safe()
+            workflow_event(
+                kind="metric",
+                msg="runtime_snapshot_activity_refreshed",
+                details={"status": self.state_machine.status.value},
+                kpi={
+                    "lock_wait_ms": lock_wait_ms,
+                    "duration_ms": round((time.monotonic() - refresh_started) * 1000.0, 3),
+                },
+            )
 
     def _store_agent_turn(self, cleaned_answer: str, *, transition_to_answering: bool) -> str:
-        with self._runtime_flow_lock():  # AUDIT-FIX(#7): Keep transition-to-answering and response storage atomic.
+        lock = self._runtime_flow_lock()
+        lock_wait_started = time.monotonic()
+        with lock:  # AUDIT-FIX(#7): Keep transition-to-answering and response storage atomic.
+            lock_wait_ms = round((time.monotonic() - lock_wait_started) * 1000.0, 3)
+            workflow_event(
+                kind="metric",
+                msg="runtime_store_agent_turn_lock_acquired",
+                details={"transition_to_answering": transition_to_answering},
+                kpi={"lock_wait_ms": lock_wait_ms},
+            )
             transcript = self._validated_last_transcript()
             if transition_to_answering:
                 status_value = self.state_machine.transition(TwinrEvent.RESPONSE_READY).value
             else:
                 status_value = self.state_machine.status.value
 
+            memory_started = time.monotonic()
             self.memory.remember("user", transcript)
             self.memory.remember("assistant", cleaned_answer)
             self.last_response = cleaned_answer
+            workflow_event(
+                kind="metric",
+                msg="runtime_store_agent_turn_memory_updated",
+                details={
+                    "transition_to_answering": transition_to_answering,
+                    "transcript_chars": len(transcript),
+                    "response_chars": len(cleaned_answer),
+                },
+                kpi={"duration_ms": round((time.monotonic() - memory_started) * 1000.0, 3)},
+            )
+            snapshot_started = time.monotonic()
             self._persist_snapshot_safe()  # AUDIT-FIX(#2): Persist runtime state before durable background indexing.
+            workflow_event(
+                kind="metric",
+                msg="runtime_store_agent_turn_snapshot_persisted",
+                details={"transition_to_answering": transition_to_answering},
+                kpi={"duration_ms": round((time.monotonic() - snapshot_started) * 1000.0, 3)},
+            )
 
             event_data = {
                 "status": status_value,
@@ -130,14 +172,28 @@ class TwinrRuntimeFlowMixin:
                 "response_chars": len(cleaned_answer),
             }
 
+        enqueue_started = time.monotonic()
         self._enqueue_conversation_turn_safe(
             transcript=transcript,
             response=cleaned_answer,
         )
+        workflow_event(
+            kind="metric",
+            msg="runtime_store_agent_turn_longterm_enqueued",
+            details={"transition_to_answering": transition_to_answering},
+            kpi={"duration_ms": round((time.monotonic() - enqueue_started) * 1000.0, 3)},
+        )
+        ops_started = time.monotonic()
         self._append_ops_event(
             event="turn_completed",
             message="Assistant response stored in runtime memory.",
             data=event_data,
+        )
+        workflow_event(
+            kind="metric",
+            msg="runtime_store_agent_turn_ops_appended",
+            details={"transition_to_answering": transition_to_answering},
+            kpi={"duration_ms": round((time.monotonic() - ops_started) * 1000.0, 3)},
         )
         return cleaned_answer
 

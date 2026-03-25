@@ -13,7 +13,7 @@ import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
-from twinr.agent.base_agent.personality import merge_instructions
+from twinr.agent.base_agent import merge_instructions
 from twinr.agent.workflows.forensics import workflow_span
 from twinr.ops.usage import extract_model_name, extract_token_usage
 

@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from twinr.agent.personality.intelligence.models import WorldInterestSignal
 from twinr.agent.personality.models import PersonalitySnapshot
 from twinr.agent.personality.positive_engagement import (
-    PositiveEngagementTopicPolicy,
     derive_positive_engagement_policy,
 )
 from twinr.agent.personality.self_expression import (

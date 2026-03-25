@@ -16,7 +16,6 @@ import subprocess
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
-from twinr.display.heartbeat import assess_display_companion_health
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
@@ -291,7 +290,7 @@ def _collect_service_health() -> tuple[tuple[ServiceHealth, ...], bool]:
         (
             "conversation_loop",
             "Conversation loop",
-            ("--run-realtime-loop", "--run-hardware-loop", "--run-streaming-loop"),
+            ("--run-streaming-loop",),
         ),
         ("display", "Display loop", ("--run-display-loop",)),
     )
@@ -455,6 +454,10 @@ def _apply_display_companion_health(
     config: TwinrConfig,
     services: tuple[ServiceHealth, ...],
 ) -> tuple[ServiceHealth, ...]:
+    # Import lazily so display heartbeat helpers can import ops locks without
+    # pulling health back in through twinr.ops.__init__ during package init.
+    from twinr.display.heartbeat import assess_display_companion_health
+
     display_service = _get_service(services, "display")
     if display_service is None:
         return services

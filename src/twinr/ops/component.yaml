@@ -3,7 +3,7 @@ name: ops
 path: src/twinr/ops
 kind: python-package
 visibility: internal
-summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, detached-runtime audio-session env priming, leading-repo to Pi mirroring, the rolling remote-memory watchdog, authoritative Pi runtime supervision, Pi-side self-coding Codex bootstrap, self-tests, and support exports.
+summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, detached-runtime audio-session env priming, leading-repo to Pi mirroring, end-to-end Pi deployment, the rolling remote-memory watchdog, authoritative Pi runtime supervision, Pi-side self-coding Codex bootstrap, self-tests, and support exports.
 owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
@@ -15,6 +15,7 @@ owned_concerns:
   - Seed detached Pi runtime processes with the minimum user-session audio environment required for Pulse/ALSA default playback
   - Build scoped runtime configs so auxiliary loops cannot overwrite the primary display/runtime snapshot
   - Mirror the authoritative leading repo into the Pi acceptance checkout while preserving Pi-local runtime-only paths
+  - Deploy the authoritative leading repo plus runtime `.env` to the Pi acceptance host, replace the old manual mirror rollout path, refresh the editable install, and verify the productive Pi service set after restart
   - Supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner
   - Keep display-companion degradation visible through ops health without letting it tear down the productive speech runtime
   - Coordinate singleton loop ownership through secure per-loop lock files
@@ -101,6 +102,8 @@ files:
     role: Pi bootstrap for the pinned self-coding Codex bridge, CLI, auth sync, and remote self-test
   - path: pi_repo_mirror.py
     role: One-way repo mirror watchdog that keeps /twinr aligned with the authoritative leading repo while preserving Pi-local runtime-only paths
+  - path: pi_runtime_deploy.py
+    role: Operator-facing Pi deploy orchestration that mirrors code, syncs the authoritative runtime env, refreshes the editable install, restarts the base services plus any already-enabled repo-backed Pi runtime units, supports first rollout of disabled optional Pi units, and verifies restart health
   - path: health.py
     role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract
     exports:
@@ -113,6 +116,8 @@ files:
       - RemoteMemoryWatchdog
       - RemoteMemoryWatchdogSample
       - RemoteMemoryWatchdogSnapshot
+  - path: remote_memory_watchdog_state.py
+    role: Internal sample, snapshot, bootstrap, and store helpers for persisted remote-memory watchdog state
   - path: remote_memory_watchdog_companion.py
     role: Process-based launcher for the external remote-memory watchdog used by live Pi loops
   - path: runtime_env.py
@@ -124,6 +129,8 @@ files:
     exports:
       - RUNTIME_SUPERVISOR_ENV_KEY
       - TwinrRuntimeSupervisor
+  - path: runtime_supervisor_process.py
+    role: Internal child-process, timestamp, PID, and runtime-env helpers used by the runtime supervisor
   - path: devices.py
     role: Dashboard-ready device overview probes and summaries, including ReSpeaker runtime and host-control state
     exports:
@@ -131,6 +138,8 @@ files:
       - DeviceOverview
       - DeviceStatus
       - collect_device_overview
+  - path: pi_runtime_deploy_remote.py
+    role: Internal SSH, SCP, sync, and systemd verification helpers used by the Pi deploy orchestrator
   - path: self_test.py
     role: Bounded hardware self-test execution and artifact capture
     exports:
@@ -185,13 +194,12 @@ primary_callers:
   - path: src/twinr/web/app.py
   - path: src/twinr/web/context.py
   - path: src/twinr/web/viewmodels_voice.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/display/service.py
   - path: hardware/ops/twinr-runtime-supervisor.service
-  - path: src/twinr/proactive/wakeword/evaluation.py
 tests:
   - path: test/test_ops.py
+  - path: test/test_ops_pi_runtime_deploy.py
   - path: test/test_ops_pi_repo_mirror.py
   - path: test/test_ops_health.py
   - path: test/test_devices.py

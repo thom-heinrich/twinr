@@ -10,17 +10,22 @@ streaming APIs.
 `runtime` owns:
 - adapt workflow owners into `handle_*` methods for realtime tools
 - validate the canonical tool-name to handler binding registry
+- gate runtime tool exposure against local integration readiness so unavailable tool families are omitted before a live turn starts
 - route smart-home discovery, state-read, control, and sensor-stream tools through the same thin executor surface as the other realtime tools
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - record one generic success/failure observability event per realtime tool call so operator readback can see which tool ran, how long it took, and whether model fallback metadata was involved
+- convert shared sensitive-confirmation guards into structured `confirmation_required` tool results so live turns can ask for explicit approval instead of collapsing into generic technical-error speech
+- define the synthetic specialist-handoff tool schema and normalize/merge handoff payloads outside the main dual-lane orchestrator
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - keep the structured supervisor-decision lane isolated from general tool-agent instructions so routing stays provider- and lane-specific
 - fail closed when the supervisor/specialist runtime cannot produce a verified final answer instead of synthesizing replacement speech on the active streaming path
-- emit speech-lane deltas and serialize tool results safely
-- emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and failure-path selection
+- emit speech-lane deltas through a focused callback helper module and serialize tool results safely
+- emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and failure-path selection through focused helper modules
 - enforce the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
+- keep handoff metadata aligned with product reality so the user's own smart-home inventory, room/device state, and recent in-home events stay on local automation/smart-home lanes instead of drifting into web-search handoffs
+- share common stop-guard, loop-result, token-merge, and JSON-envelope helpers across the single-lane and dual-lane runtime paths
 
 The dual-lane handoff loop preserves optional explicit search hints such as a
 spoken target location or resolved date context when they are provided at the
@@ -40,13 +45,18 @@ lines when the fast lane does not provide one.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Runtime export surface |
+| [availability.py](./availability.py) | Filter the canonical realtime tool surface against local capability/readiness before exposing it to models |
 | [executor.py](./executor.py) | Owner-to-handler dispatcher |
 | [observability.py](./observability.py) | Generic per-tool runtime telemetry for operator artifacts |
 | [registry.py](./registry.py) | Tool binding validation |
 | [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
+| [handoff.py](./handoff.py) | Handoff schema, normalization, and chronological specialist merge helpers |
+| [speech_lane.py](./speech_lane.py) | Speech-lane event model and safe callback emission |
+| [forensics.py](./forensics.py) | Redacted branch-forensics summaries |
+| [loop_support.py](./loop_support.py) | Shared loop stop/result/json/token helpers |
 | [streaming_loop.py](./streaming_loop.py) | Generic tool round loop |
-| [dual_lane_loop.py](./dual_lane_loop.py) | Supervisor/specialist handoff loop |
-| [recovery_reply.py](./recovery_reply.py) | Legacy LLM-only recovery helper retained for non-active compatibility paths |
+| [dual_lane_loop.py](./dual_lane_loop.py) | Supervisor/specialist orchestration loop |
+| [recovery_reply.py](./recovery_reply.py) | LLM-only recovery helper for failed runtime lanes |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 ## Usage
@@ -59,6 +69,18 @@ from twinr.agent.tools.runtime import (
 
 executor = RealtimeToolExecutor(owner)
 tool_handlers = bind_realtime_tool_handlers(executor)
+```
+
+When the local runtime may not support every canonical tool family, resolve the
+available surface first and pass only that filtered set to the loop/provider:
+
+```python
+from twinr.agent.tools.runtime.availability import bind_available_realtime_tool_handlers
+
+tool_handlers = bind_available_realtime_tool_handlers(
+    executor,
+    config=owner.config,
+)
 ```
 
 ```python

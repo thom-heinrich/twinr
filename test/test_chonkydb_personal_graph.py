@@ -9,17 +9,20 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
 from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
+        self.required = False
         self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
         self.snapshots: dict[str, dict[str, object]] = {}
         self.load_calls: list[dict[str, object]] = []
+        self.load_error: Exception | None = None
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None, prefer_cached_document_id: bool = False):
         self.load_calls.append(
@@ -30,6 +33,8 @@ class _FakeRemoteState:
             }
         )
         del local_path
+        if self.load_error is not None:
+            raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
 
@@ -244,6 +249,23 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
 
         self.assertTrue(remote_state.load_calls)
         self.assertTrue(remote_state.load_calls[0]["prefer_cached_document_id"])
+
+    def test_optional_remote_unavailable_error_falls_back_to_empty_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.load_error = LongTermRemoteUnavailableError("remote unavailable")
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            document = store.load_document()
+
+        self.assertEqual(document.subject_node_id, "user:main")
+        self.assertEqual(document.edges, ())
+        self.assertTrue(remote_state.load_calls)
 
 
 if __name__ == "__main__":

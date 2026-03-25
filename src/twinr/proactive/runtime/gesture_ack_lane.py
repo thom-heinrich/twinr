@@ -5,13 +5,18 @@ from the broader social camera surface. It accepts only the explicit hand
 symbols Twinr should mirror quickly on the display, applies bounded
 per-gesture confirmation/cooldown rules, and returns ready-to-publish emoji
 decisions without touching eye-follow state.
+
+The current Pi-focused live HCI contract is intentionally limited to
+`thumbs_up`, `thumbs_down`, and `peace_sign`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import SupportsFloat, SupportsIndex, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import workflow_decision
 
 from ..social.engine import SocialFineHandGesture, SocialGestureEvent, SocialVisionObservation
 from ..social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
@@ -26,13 +31,10 @@ _SUPPORTED_FINE_GESTURES = frozenset(
     {
         SocialFineHandGesture.THUMBS_UP,
         SocialFineHandGesture.THUMBS_DOWN,
-        SocialFineHandGesture.POINTING,
         SocialFineHandGesture.PEACE_SIGN,
-        SocialFineHandGesture.OK_SIGN,
-        SocialFineHandGesture.MIDDLE_FINGER,
     }
 )
-_SUPPORTED_COARSE_GESTURES = frozenset({SocialGestureEvent.WAVE})
+_SUPPORTED_COARSE_GESTURES: frozenset[SocialGestureEvent] = frozenset()
 _PENDING_RESET_AFTER_S = 0.9
 _DISPLAY_ACK_FALLBACK_POLICIES = {
     # Pi-side live/ROI gesture scores are materially lower than the broader
@@ -40,11 +42,8 @@ _DISPLAY_ACK_FALLBACK_POLICIES = {
     # so clear user gestures publish, while still blocking the weakest false
     # positives seen in candidate-frame QA.
     SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.56, 1, 0.35),
-    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.67, 1, 0.35),
-    SocialFineHandGesture.POINTING: FineHandGesturePolicy(0.66, 1, 0.32),
+    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.44, 1, 0.35),
     SocialFineHandGesture.PEACE_SIGN: FineHandGesturePolicy(0.60, 1, 0.40),
-    SocialFineHandGesture.OK_SIGN: FineHandGesturePolicy(0.86, 1, 0.46),
-    SocialFineHandGesture.MIDDLE_FINGER: FineHandGesturePolicy(0.90, 1, 0.28),
 }
 
 
@@ -92,7 +91,9 @@ class GestureAckLane:
         candidate = self._candidate_from_observation(observation)
         if candidate is None:
             self._reset_pending_if_stale(observed_at)
-            return DisplayGestureEmojiDecision(reason="no_supported_live_gesture")
+            decision = DisplayGestureEmojiDecision(reason="no_supported_live_gesture")
+            self._trace_ack_decision(observation=observation, candidate=None, decision=decision)
+            return decision
 
         if self._pending_key == candidate.key:
             self._pending_count += 1
@@ -102,17 +103,22 @@ class GestureAckLane:
         self._pending_seen_at = observed_at
 
         if self._pending_count < candidate.confirm_samples:
-            return DisplayGestureEmojiDecision(reason="awaiting_live_gesture_confirmation")
+            decision = DisplayGestureEmojiDecision(reason="awaiting_live_gesture_confirmation")
+            self._trace_ack_decision(observation=observation, candidate=candidate, decision=decision)
+            return decision
 
         if (
             self._last_emitted_key == candidate.key
             and self._last_emitted_at is not None
             and (observed_at - self._last_emitted_at) < candidate.hold_s
         ):
-            return DisplayGestureEmojiDecision(reason="live_gesture_cooldown")
+            decision = DisplayGestureEmojiDecision(reason="live_gesture_cooldown")
+            self._trace_ack_decision(observation=observation, candidate=candidate, decision=decision)
+            return decision
 
         self._last_emitted_key = candidate.key
         self._last_emitted_at = observed_at
+        self._trace_ack_decision(observation=observation, candidate=candidate, decision=candidate.decision)
         return candidate.decision
 
     def _candidate_from_observation(
@@ -173,12 +179,53 @@ class GestureAckLane:
         self._pending_count = 0
         self._pending_seen_at = None
 
+    def _trace_ack_decision(
+        self,
+        *,
+        observation: SocialVisionObservation,
+        candidate: _GestureCandidate | None,
+        decision: DisplayGestureEmojiDecision,
+    ) -> None:
+        """Emit one bounded decision ledger entry for the ack lane."""
+
+        workflow_decision(
+            msg="gesture_ack_lane_observe",
+            question="Should the HDMI ack lane emit a user-facing gesture acknowledgement now?",
+            selected={
+                "id": decision.reason,
+                "summary": (
+                    f"Emit {decision.symbol.value}."
+                    if decision.active
+                    else "Do not emit a user-facing gesture acknowledgement."
+                ),
+            },
+            options=[
+                {"id": "emit", "summary": "Emit the current gesture acknowledgement immediately."},
+                {"id": "awaiting_live_gesture_confirmation", "summary": "Keep the current gesture pending until confirmation."},
+                {"id": "live_gesture_cooldown", "summary": "Suppress a repeated gesture during cooldown."},
+                {"id": "no_supported_live_gesture", "summary": "Ignore the frame because no supported gesture survived gating."},
+            ],
+            context={
+                "observed_fine_hand_gesture": observation.fine_hand_gesture.value,
+                "observed_fine_hand_confidence": _coerce_confidence(observation.fine_hand_gesture_confidence),
+                "observed_gesture_event": observation.gesture_event.value,
+                "observed_gesture_confidence": _coerce_confidence(observation.gesture_confidence),
+                "candidate_key": None if candidate is None else candidate.key,
+                "pending_key": self._pending_key,
+                "pending_count": self._pending_count,
+                "last_emitted_key": self._last_emitted_key,
+            },
+            confidence=_coerce_confidence(observation.fine_hand_gesture_confidence or observation.gesture_confidence),
+            guardrails=["gesture_ack_lane"],
+            kpi_impact_estimate={"latency": "low", "user_feedback": "high"},
+        )
+
 
 def _coerce_confidence(value: object) -> float:
     """Clamp one optional gesture confidence into a bounded float."""
 
     try:
-        numeric = float(value)
+        numeric = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
     except (TypeError, ValueError):
         return 0.0
     if numeric != numeric:

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time as LocalTime, timedelta, timezone
+from datetime import datetime, time as LocalTime, timedelta
 import inspect
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -26,37 +26,12 @@ from twinr.display.presentation_cues import DisplayPresentationStore
 from .display_reserve_companion_planner import DisplayReserveCompanionPlanner
 from .display_reserve_day_plan import _DEFAULT_REFRESH_AFTER_LOCAL
 from .display_reserve_runtime import DisplayReserveRuntimePublisher, DisplayReserveRuntimeRequest
+from .display_reserve_support import default_local_now, parse_local_time as _parse_local_time
 
 _DEFAULT_ENABLED = True
 _DEFAULT_QUIET_HOURS_START = "21:00"
 _DEFAULT_QUIET_HOURS_END = "07:00"
 _SOURCE = "proactive_ambient_impulse"
-
-
-def _default_local_now() -> datetime:
-    """Return the current local wall clock as an aware datetime."""
-
-    return datetime.now().astimezone()
-
-
-def _parse_local_time(text: object, *, fallback: str) -> LocalTime:
-    """Parse one normalized local-time string."""
-
-    compact = str(text or "").strip() or fallback
-    hour_text, separator, minute_text = compact.partition(":")
-    if separator != ":":
-        hour_text, minute_text = fallback.split(":", 1)
-    try:
-        hour = int(hour_text)
-        minute = int(minute_text)
-    except ValueError:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    return LocalTime(hour=hour, minute=minute)
-
 
 def _supports_ambient_impulses(config: TwinrConfig) -> bool:
     """Return whether the current display/runtime setup should allow impulses."""
@@ -101,7 +76,7 @@ class DisplayAmbientImpulsePublisher:
     presentation_store: DisplayPresentationStore
     planner: DisplayReserveCompanionPlanner
     source: str = _SOURCE
-    local_now: Callable[[], datetime] = _default_local_now
+    local_now: Callable[[], datetime] = default_local_now
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayAmbientImpulsePublisher":

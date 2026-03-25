@@ -7,7 +7,7 @@ summary: Assemble Twinr's configured runtime provider bundle and expose the stab
 owned_concerns:
   - Validate top-level STT, LLM, and TTS provider selection from TwinrConfig
   - Assemble the runtime StreamingProviderBundle and roll back owned resources on bootstrap failure
-  - Expose the stable `twinr.providers` package-root surface, including compatibility re-exports for common OpenAI types
+  - Expose the stable `twinr.providers` package-root surface, including common OpenAI types re-exported from the active provider package
 out_of_scope:
   - Provider-specific transport, SDK, and request logic in src/twinr/providers/deepgram, src/twinr/providers/groq, and src/twinr/providers/openai
   - Hardware capture, playback, and runtime orchestration in src/twinr/hardware and src/twinr/agent/workflows
@@ -56,12 +56,10 @@ compatibility_reexports:
       - OpenAITextResponse
 primary_callers:
   - path: src/twinr/__main__.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
 tests:
   - path: test/test_main.py
   - path: test/test_provider_factory.py
   - path: test/test_realtime_runner.py
-  - path: test/test_runner.py
   - path: test/test_streaming_runner.py

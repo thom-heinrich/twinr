@@ -157,6 +157,7 @@ INTENT_CASES: tuple[IntentCase, ...] = (
         prompt="Magst du etwas über mich lernen?",
         state="idle",
         expected_actions=("start_or_resume",),
+        accepted_answer_substrings=("merk", "frage"),
     ),
     IntentCase(
         case_id="start_better_know_me",

@@ -1,8 +1,8 @@
 # conversation
 
 Internal package for the base agent's conversation micro-policies: adaptive
-listening windows, language contract helpers, turn-boundary evaluation, and
-post-response closure checks.
+listening windows, shared decision helpers, language contract helpers,
+turn-boundary evaluation, and post-response closure checks.
 
 ## Responsibility
 
@@ -24,10 +24,15 @@ post-response closure checks.
 | File | Purpose |
 |---|---|
 | `adaptive_timing.py` | Persist bounded listening profile |
+| `decision_core.py` | Shared bounded decision helpers and canonical transcript normalization |
 | `language.py` | Build language and memory instructions |
 | `turn_controller.py` | Evaluate streaming turn boundaries |
 | `closure.py` | Evaluate post-response closure and echo matched steering topics |
 | `__init__.py` | Mark package only |
+
+`normalize_turn_text()` lives in `decision_core.py` and is the canonical import
+for workflow consumers that need transcript equality checks outside the
+controller itself.
 
 ## Usage
 
@@ -57,5 +62,4 @@ closure = ToolCallingConversationClosureEvaluator(config=config, provider=provid
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
 - [runtime](../runtime/README.md)
-- [runner.py](../../workflows/runner.py)
 - [realtime_runner.py](../../workflows/realtime_runner.py)

@@ -1,16 +1,16 @@
 # runtime
 
-Proactive monitor orchestration and wakeword presence-session control for Twinr.
+Proactive monitor orchestration and voice-activation presence-session control for Twinr.
 
 This package wires the runtime-facing monitor loop, degraded sensor handling,
-and presence-session state used to arm wakeword listening and proactive checks.
+and presence-session state used to arm voice-activation listening and proactive checks.
 
 ## Responsibility
 
 `runtime` owns:
-- Coordinate proactive monitor ticks across PIR, camera, ambient audio, and wakeword policy paths
+- Coordinate proactive monitor ticks across PIR, camera, ambient audio, and voice-activation policy paths
 - Route short-window multimodal event-fusion safety claims into the active runtime trigger path while preserving the legacy social-trigger engine as fallback for non-safety and visibility-loss cases
-- Maintain wakeword presence-session state from recent sensor activity
+- Maintain voice-activation presence-session state from recent sensor activity
 - Derive conservative ReSpeaker audio-policy hooks such as quiet windows, resume windows, and overlap guards
 - Expose one runtime-faithful ReSpeaker audio-perception diagnostic path for operator checks and post-recovery sanity validation
 - Derive conservative ReSpeaker speech-delivery defer reasons such as background media or non-speech room activity
@@ -40,10 +40,11 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Keep the fast HDMI attention-refresh path non-blocking by preferring local signal-only audio snapshots over full ambient PCM windows, so gaze and gesture acknowledgement are not serialized behind one-second audio sampling
 - Keep HDMI eye-follow and HDMI gesture acknowledgements on separate local refresh paths: eye-follow should prefer a cheap attention-only camera observation and its own stabilized surface, while gesture acknowledgements may use the heavier full gesture path without clearing or delaying face-follow state
 - Keep HDMI gesture acknowledgement on its own dedicated low-latency live-gesture lane plus self-contained ack stabilizer, so user-facing symbols do not depend on the broader social camera-surface cadence or regress eye-follow when gesture policy changes
-- Derive a bounded visual gesture-wakeup decision from one configured fine-hand symbol and hand it to the workflow entry path without coupling it to HDMI emoji acknowledgement or wakeword audio policy
+- Derive a bounded visual gesture-wakeup decision from one configured fine-hand symbol and hand it to the workflow entry path without coupling it to HDMI emoji acknowledgement or voice-activation audio policy
 - Dispatch accepted visual gesture wakeups through a dedicated single-flight background worker so `listening` sessions opened by Peace-sign wake do not block HDMI attention refresh ticks on the proactive monitor thread
+- Prime one fresh compact sensor/person-state export from the accepted gesture snapshot immediately before dispatching a Peace-sign wake, so the runner gates the wake against current gesture-time context instead of a stale slower automation tick
 - Preserve the local HDMI camera-follow/gesture path even when ReSpeaker startup capture is unreadable, marking the runtime blocked while still building the bounded on-device attention monitor instead of letting the audio contract failure erase local visual HCI entirely
-- Mirror clear stabilized user camera gestures such as thumbs-up or waving into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues; motion-bearing coarse gestures like waving must outrank a simultaneous generic open-palm hand shape and briefly suppress conflicting custom-only fine-hand symbols like `👌` so `👋` does not flap into a custom false positive while the user is still waving
+- Mirror only the Pi-critical stabilized user camera gestures `thumbs_up`, `thumbs_down`, and `peace_sign` into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
 - Publish very sparse personality-driven HDMI ambient reserve impulses while the room is calmly occupied, so Twinr can show one short positive non-voice nudge from its current personality and co-attention state without spamming or overriding stronger display owners
 - Publish bounded get-to-know-you invitations into that same right-hand reserve lane when Twinr still has onboarding or lifelong profile-learning gaps, including short profile-review invites after corrections accumulate, so the visual action surface can reopen short discovery runs without inventing a second profile UI
 - Blend those HDMI reserve impulses from personality state plus durable memory hooks such as gentle follow-ups or clarification conflicts, so the right-hand reserve can help Twinr deepen and clean up its own memory without ad-hoc hacks
@@ -57,16 +58,16 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Let very fresh shown-card pickup or pushback bias the remaining day plan immediately through one short-lived reserve-bus feedback hint, so the right-hand lane adapts faster than the slower long-term learning loop alone
 - Run one explicit overnight reserve-lane maintenance step that reviews recent shown-card outcomes, triggers long-term reflection/world refresh, and prepares the next local-day reserve plan ahead of morning adoption
 - Retry a same-day reserve plan after a short backoff when the first build was empty, so late-arriving personality candidates can repopulate the right-hand reserve instead of leaving it blank until midnight
-- Keep HDMI attention-follow available on wakeword/runtime-monitor builds even when `proactive_enabled` remains off for camera-triggered proactive prompts
+- Keep HDMI attention-follow available on voice-activation/runtime-monitor builds even when `proactive_enabled` remains off for camera-triggered proactive prompts
 - Run a bounded local HDMI attention-refresh cadence that keeps gaze-follow responsive even when full proactive inspection is still PIR-gated, and keep that local cue-only path alive while the main runtime is in `error`
-- Bootstrap one bounded local vision inspection from live speech when wakeword mode is enabled, so a quiet or missing PIR does not leave presence-gated wakeword permanently idle
+- Bootstrap one bounded local vision inspection from live speech when voice-activation mode is enabled, so a quiet or missing PIR does not leave presence-gated voice activation permanently idle
 - Retry exact transient `Device or resource busy` PIR startup overlaps for a short bounded window, so runtime restarts do not flap into error while a previous Twinr process is still releasing GPIO17
-- Pause the active streaming wakeword `arecord` handle while an accepted wakeword or visual gesture wakeup opens the exclusive hands-free conversation capture, then resume streaming after the handler returns so successful wakeups do not immediately fail with ALSA `Device or resource busy`
-- Disable proactive PCM fallback and ReSpeaker readable-frame startup probes when a long-lived voice-orchestrator capture already owns the same ALSA device and no shared wakeword buffer exists, keeping ReSpeaker host-control monitoring alive without fighting that capture with a second `arecord`
+- Pause the active streaming voice activation `arecord` handle while an accepted voice activation or visual gesture wakeup opens the exclusive hands-free conversation capture, then resume streaming after the handler returns so successful wakeups do not immediately fail with ALSA `Device or resource busy`
+- Disable proactive PCM fallback and ReSpeaker readable-frame startup probes when a long-lived voice-orchestrator capture already owns the same ALSA device and no shared voice activation buffer exists, keeping ReSpeaker host-control monitoring alive without fighting that capture with a second `arecord`
 - Export normalized observation facts and ops telemetry from proactive monitoring, including raw local-camera readiness/count/gesture fields for Pi-side presence debugging
 - Export a dedicated changed-only HDMI attention-follow ops trace so Pi-side debugging can correlate camera health, stabilized person anchors, attention-target state, and cue-publish decisions without blind tuning
 - Persist a bounded continuous HDMI attention debug stream with per-refresh outcome codes and stage timings so short-lived eye-follow dropouts can be diagnosed after the fact
-- Persist a bounded continuous HDMI gesture debug stream with per-refresh outcome codes, raw gesture observations, ack-lane decisions, publish results, stage timings, and bounded pipeline provenance from the dedicated gesture lane, so Pi-side symbol latency and dropouts can be diagnosed after the fact without guessing whether the miss came from the live path, a recent-person fallback, a recent-hand fallback, or publish policy
+- Persist a bounded continuous HDMI gesture debug stream with per-refresh outcome codes, raw gesture observations, ack-lane decisions, publish results, stage timings, and bounded pipeline provenance from the dedicated gesture lane, and allow an opt-in end-to-end workflow run-pack around the gesture refresh during hard Pi repros, so symbol latency and dropouts can be diagnosed after the fact without guessing whether the miss came from the live path, a recent-person fallback, a recent-hand fallback, or publish policy
 - Export structured ReSpeaker audio-policy facts, per-claim confidence/source metadata, and presence-session IDs for bounded automation and long-term memory ingestion
 - Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
 - Keep bounded ReSpeaker audio observation alive while Twinr is already speaking so interruption facts do not go blind in `answering`
@@ -77,7 +78,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 
 `runtime` does **not** own:
 - Score social triggers or define proactive prompt content
-- Implement wakeword matching, calibration, or evaluation algorithms
+- Implement voice-activation matching, calibration, or evaluation algorithms
 - Implement raw camera, PIR, or microphone adapters
 - Enforce delivery cooldown policy after a trigger becomes a candidate
 
@@ -103,7 +104,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | `display_attention.py` | Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues, mirroring camera-space anchors into user-facing gaze, deriving bounded up/down follow from live person height, and renewing or briefly holding cues before they expire or disappear on short camera dropouts |
 | `display_attention_camera_fusion.py` | Display-only fusion helper that reuses recent richer full-observe and gesture-lane semantics so the fast HDMI attention refresh can keep `LOOKING`/`HAND_NEAR`/`INTENT_LIKELY`, including `proxy` vs `confirmed` looking provenance, and person anchors stable across short fast-path misses without paying full pose cost every tick |
 | `display_debug_signals.py` | Bounded publisher for optional HDMI header debug pills derived from current camera facts plus brief event/trigger holds such as `LOOKING_PROXY`, `LOOKING_CONFIRMED`, `ENGAGED`, `ENGAGED_PROXY`, `ATTENTION_WINDOW`, `POSITIVE_CONTACT`, or `POSSIBLE_FALL`, with unchanged-write suppression until the current snapshot actually nears expiry; `ENGAGED` is intentionally reserved for confirmed looking while proxy-only attention stays `ENGAGED_PROXY`, and the current local Pi vision path still does not emit smile evidence so `POSITIVE_CONTACT` remains upstream-limited until a smile-capable provider exists |
-| `display_gesture_emoji.py` | Conservative runtime producer that mirrors stabilized rising-edge user gestures into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues and briefly keeps motion gestures authoritative over conflicting custom-only fine-hand false positives |
+| `display_gesture_emoji.py` | Conservative runtime producer that mirrors only the Pi-critical stabilized rising-edge user gestures `thumbs_up`, `thumbs_down`, and `peace_sign` into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues |
 | `display_reserve_candidates.py` | Compatibility wrapper that preserves the historic reserve-candidate loader API while delegating to the modular ambient companion flow |
 | `display_reserve_flow.py` | Shared ambient companion orchestration that blends personality, memory, reflection, and long-horizon reserve-lane learning into one bounded candidate pool |
 | `display_reserve_learning.py` | Long-horizon reserve-lane learning profile derived from durable shown-card outcomes so future plans can reward welcome openers and cool repetitive ones generically |
@@ -115,6 +116,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | `display_reserve_generation.py` | Rewrite reserve-card copy through small bounded structured LLM batches with isolated fallback per batch, so the lane sounds personality-shaped without one large slow request or weak raw candidate anchors dominating the prompt; by default the rewrite model should follow Twinr's primary model unless operators explicitly override it, and the parser must tolerate SDK-empty `output_parsed` responses when the model still returns valid JSON text |
 | `display_reserve_day_plan.py` | Persistent current-day reserve planner that turns personality-driven reserve candidates into one calm unique rotation with cursor persistence, generic topic/source/family spacing, bounded retry for empty same-day plans, same-day looping until real user feedback retires a topic, passive fallback lookup only when no active topics remain, and short-lived feedback-driven replanning that removes answered topics without named-topic hacks |
 | `display_reserve_companion_planner.py` | Explicit overnight reserve-lane planner that runs nightly review plus long-term reflection/world refresh, stores prepared next-day plans, and lets the morning runtime adopt that reviewed plan instead of rebuilding ad hoc |
+| `display_reserve_support.py` | Shared side-effect-free text, timestamp, and local-time helpers that keep reserve publishers and planners on one normalization contract |
 | `display_reserve_runtime.py` | Shared reserve-lane runtime publisher that all right-hand text cards use so planned companion impulses and real-time social/focus prompts hit the same cue/history path, plus one visible-only publish mode for passive idle fills that must not create duplicate exposure history |
 | `display_ambient_impulses.py` | Conservative live publisher that exposes the next planned reserve item only when quiet-hours, presence, runtime state, and reserve-surface ownership all allow it, adopting prepared next-day plans when morning rollover begins and restoring passive fill after temporary overrides or exhausted plans instead of leaving the right lane blank |
 | `display_social_reserve.py` | Route visual-first proactive social prompts into the same right-hand reserve lane and the same shared reserve publish path instead of taking over the fullscreen presentation surface |
@@ -131,7 +133,9 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | `sensitive_behavior_gate.py` | Conservative gate that blocks sensitive proactive behavior on ambiguous multi-person or low-confidence audio context |
 | `governor_inputs.py` | Focused governor-facing packaging of current ReSpeaker presence/audio facts |
 | `presence.py` | Presence-session state machine |
-| `service.py` | Monitor orchestration, unreadable-capture blocking, lifecycle, streaming-wakeword capture pause/resume around accepted hands-free turns, shared attention-target fanout to HDMI plus optional body-follow servo, and changed-only attention-follow pipeline/servo-decision traces for Pi root-cause forensics |
+| `service_attention_helpers.py` | Focused HDMI attention-follow, live-context export, servo-trace, and attention-debug helper surface used by `service.py` so the monitor loop stays orchestration-first |
+| `service_gesture_helpers.py` | Focused HDMI gesture acknowledgement, wakeup dispatch, and gesture-trace helper surface used by `service.py` so gesture policy stays out of the main monitor loop |
+| `service.py` | Thin monitor orchestration, unreadable-capture blocking, lifecycle, streaming-voice activation capture pause/resume around accepted hands-free turns, and assembly of the shared attention/gesture helper surfaces into the active runtime |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
 
@@ -161,4 +165,3 @@ if monitor is not None:
 - [Pi Gesture Baseline](../../../../docs/PI_GESTURE_BASELINE.md)
 - [../governance/README.md](../governance/README.md)
 - [../social/README.md](../social/README.md)
-- [../wakeword/README.md](../wakeword/README.md)

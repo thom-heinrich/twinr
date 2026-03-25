@@ -24,6 +24,17 @@ files:
       - AdaptiveTimingProfile
       - AdaptiveTimingBounds
       - AdaptiveTimingStore
+  - path: decision_core.py
+    role: Shared bounded decision helpers and canonical transcript normalization
+    exports:
+      - coerce_text
+      - coerce_int
+      - coerce_float
+      - coerce_probability
+      - compact_conversation
+      - extract_json_object
+      - normalize_turn_text
+      - detect_provider_timeout_kwarg
   - path: language.py
     role: Spoken-language display and instruction helpers
     exports:
@@ -39,7 +50,6 @@ files:
       - TurnDecisionEvaluator
       - ToolCallingTurnDecisionEvaluator
       - StreamingTurnController
-      - _normalize_turn_text
   - path: closure.py
     role: Post-response closure evaluation plus matched turn-steering topic echo
     exports:
@@ -48,15 +58,6 @@ files:
       - ConversationClosureEvaluation
       - StructuredConversationClosureEvaluator
       - ToolCallingConversationClosureEvaluator
-legacy_wrappers:
-  - path: src/twinr/agent/base_agent/adaptive_timing.py
-    forwards_to: src/twinr/agent/base_agent/conversation/adaptive_timing.py
-  - path: src/twinr/agent/base_agent/language.py
-    forwards_to: src/twinr/agent/base_agent/conversation/language.py
-  - path: src/twinr/agent/base_agent/turn_controller.py
-    forwards_to: src/twinr/agent/base_agent/conversation/turn_controller.py
-  - path: src/twinr/agent/base_agent/conversation_closure.py
-    forwards_to: src/twinr/agent/base_agent/conversation/closure.py
 root_exports:
   path: src/twinr/agent/base_agent/__init__.py
   names:
@@ -74,9 +75,10 @@ tests:
 consumers:
   - path: src/twinr/agent/base_agent/runtime/base.py
   - path: src/twinr/agent/base_agent/runtime/context.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_speculation.py
   - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/agent/workflows/streaming_transcript_verifier.py
   - path: src/twinr/agent/workflows/realtime_runtime/support.py
   - path: src/twinr/providers/openai/base.py
   - path: src/twinr/providers/openai/adapters.py

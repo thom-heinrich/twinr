@@ -15,7 +15,7 @@ from twinr.memory.longterm.ingestion.propositions import (
     _turn_proposition_schema,
     structured_turn_program_from_config,
 )
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 
 
 class LongTermTurnPropositionTests(unittest.TestCase):

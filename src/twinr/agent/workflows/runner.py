@@ -1,3 +1,0 @@
-"""Compatibility shim for the classic hardware loop legacy implementation."""
-
-from twinr.agent.legacy.classic_hardware_loop import *  # noqa: F401,F403

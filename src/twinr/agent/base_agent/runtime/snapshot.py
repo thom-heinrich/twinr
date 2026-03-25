@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
+from twinr.agent.workflows.forensics import workflow_event
 
 
 LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#1): Capture snapshot failures without crashing the device.
@@ -19,6 +22,14 @@ class TwinrRuntimeSnapshotMixin:
     def _persist_snapshot(self, *, error_message: str | None = None) -> None:
         """Save the current runtime state through RuntimeSnapshotStore."""
 
+        caller = "unknown"
+        frame = inspect.currentframe()
+        try:
+            if frame is not None and frame.f_back is not None:
+                caller = str(frame.f_back.f_code.co_name or "unknown")
+        finally:
+            del frame
+        persist_started = time.monotonic()
         try:
             self.snapshot_store.save(
                 status=self.status.value,
@@ -37,7 +48,32 @@ class TwinrRuntimeSnapshotMixin:
                 user_voice_user_display_name=self.user_voice_user_display_name,
                 user_voice_match_source=self.user_voice_match_source,
             )
+            workflow_event(
+                kind="metric",
+                msg="runtime_snapshot_persist_completed",
+                details={
+                    "caller": caller,
+                    "status": getattr(getattr(self, "status", None), "value", None),
+                    "error_message_present": bool(error_message),
+                    "memory_turns": len(tuple(self.memory.turns)),
+                    "memory_raw_tail": len(tuple(self.memory.raw_tail)),
+                    "memory_ledger": len(tuple(self.memory.ledger)),
+                    "memory_search_results": len(tuple(self.memory.search_results)),
+                },
+                kpi={"duration_ms": round((time.monotonic() - persist_started) * 1000.0, 3)},
+            )
         except Exception:
+            workflow_event(
+                kind="warning",
+                level="WARN",
+                msg="runtime_snapshot_persist_failed",
+                details={
+                    "caller": caller,
+                    "status": getattr(getattr(self, "status", None), "value", None),
+                    "error_message_present": bool(error_message),
+                },
+                kpi={"duration_ms": round((time.monotonic() - persist_started) * 1000.0, 3)},
+            )
             LOGGER.exception("Failed to persist runtime snapshot")  # AUDIT-FIX(#2): Persistence must never take down the runtime.
 
     def _restore_snapshot_context(self) -> None:

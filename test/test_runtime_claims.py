@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.portrait_match import PortraitMatchObservation
 from twinr.proactive.runtime.affect_proxy import derive_affect_proxy
 from twinr.proactive.runtime.ambiguous_room_guard import derive_ambiguous_room_guard
@@ -71,6 +71,29 @@ class AmbiguousRoomGuardTests(unittest.TestCase):
         self.assertIsNone(snapshot.reason)
         self.assertEqual(snapshot.policy_recommendation, "clear")
         self.assertGreater(snapshot.claim.confidence, 0.8)
+
+    def test_infers_single_visible_person_from_person_count_when_flag_is_missing(self) -> None:
+        snapshot = derive_ambiguous_room_guard(
+            observed_at=12.0,
+            live_facts={
+                "camera": {
+                    "person_count": 1,
+                    "person_count_unknown": False,
+                },
+                "audio_policy": {
+                    "presence_audio_active": False,
+                    "recent_follow_up_speech": False,
+                    "resume_window_open": False,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+        )
+
+        self.assertTrue(snapshot.person_visible)
+        self.assertFalse(snapshot.guard_active)
+        self.assertTrue(snapshot.clear)
 
 
 class KnownUserHintTests(unittest.TestCase):

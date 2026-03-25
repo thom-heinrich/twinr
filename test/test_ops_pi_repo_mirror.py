@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Any
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -75,9 +76,16 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--itemize-changes", joined)
         self.assertIn("--no-specials", joined)
         self.assertIn("--no-devices", joined)
+        self.assertIn("--exclude=**/__pycache__/", commands[0])
+        self.assertIn("--exclude=**/*.pyc", commands[0])
+        self.assertIn("--exclude=**/*.pyo", commands[0])
+        self.assertIn("--exclude=**/node_modules/", commands[0])
         self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])
-        self.assertEqual(envs[0]["SSHPASS"], "chaos")
+        env = envs[0]
+        self.assertIsNotNone(env)
+        assert env is not None
+        self.assertEqual(env["SSHPASS"], "chaos")
 
     def test_probe_once_excludes_local_special_files_from_rsync_args(self) -> None:
         commands: list[list[str]] = []
@@ -191,9 +199,56 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--dry-run", commands[0])
         self.assertIn("--checksum", commands[0])
 
+    def test_probe_once_prunes_cache_only_stale_dirs_and_retries_sync(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            responses = iter(
+                (
+                    _completed(["rsync"], stdout=">f..t...... README.md\n"),
+                    _completed(["rsync"], stdout="*deleting   common/links/\n"),
+                    _completed(["ssh"], stdout=""),
+                    _completed(["rsync"], stdout="*deleting   common/links/\n"),
+                    _completed(["rsync"], stdout=""),
+                )
+            )
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                return next(responses)
+
+            watchdog = PiRepoMirrorWatchdog(
+                project_root=root,
+                connection_settings=PiConnectionSettings(
+                    host="192.168.1.95",
+                    user="thh",
+                    password="chaos",
+                ),
+                subprocess_runner=_runner,
+            )
+
+            result = watchdog.probe_once()
+
+        self.assertTrue(result.drift_detected)
+        self.assertTrue(result.sync_applied)
+        self.assertTrue(result.verified_clean)
+        self.assertEqual(len(commands), 5)
+        self.assertIn("sshpass", commands[2][0])
+        self.assertIn("ssh", commands[2][2])
+        rendered_prune = " ".join(commands[2])
+        self.assertIn("common/links", rendered_prune)
+        self.assertIn("__pycache__", rendered_prune)
+        self.assertIn("rm -rf", rendered_prune)
+        self.assertIn("--dry-run", commands[1])
+        self.assertNotIn("--dry-run", commands[3])
+        self.assertIn("--dry-run", commands[4])
+
     def test_run_continues_after_transient_failure(self) -> None:
         commands: list[list[str]] = []
-        cycles = []
+        cycles: list[Any] = []
         errors = []
         clock = _FakeClock()
 

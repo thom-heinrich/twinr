@@ -71,11 +71,8 @@ compatibility_reexports:
   - path: src/twinr/__init__.py
     names:
       - TwinrRuntime
-  - path: src/twinr/runtime.py
-    mode: star
 primary_callers:
   - path: src/twinr/__main__.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/agent/workflows/realtime_runtime/background.py
@@ -84,7 +81,6 @@ primary_callers:
 tests:
   - path: test/test_runtime_context.py
   - path: test/test_state_machine.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
   - path: test/test_automations.py

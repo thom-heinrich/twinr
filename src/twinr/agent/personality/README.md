@@ -39,13 +39,17 @@ and snapshot commits through remote-primary state.
 | File | Purpose |
 |---|---|
 | [models.py](./models.py) | Typed evolving-personality state and prompt-layer models |
+| [_payload_utils.py](./_payload_utils.py) | Shared payload normalization helpers reused by `models.py` and `intelligence/models.py` so remote-state decoding stays aligned |
 | [context_builder.py](./context_builder.py) | Ordered prompt-layer assembly |
 | [self_expression.py](./self_expression.py) | Conversational self-expression policy plus prompt-facing current-mindshare rendering |
+| [_display_utils.py](./_display_utils.py) | Shared text normalization, truncation, and deterministic variation helpers for ambient display copy/candidate generation |
 | [display_impulse_copy.py](./display_impulse_copy.py) | Deterministic question-first fallback copy for ambient display impulses when the bounded reserve-lane LLM rewrite is unavailable |
 | [display_impulses.py](./display_impulses.py) | Silent ambient display-impulse candidates derived generically from mindshare and positive-engagement state, including structured generation context plus a generic candidate-family label for reserve-bus planning mix |
 | [ambient_feedback.py](./ambient_feedback.py) | Correlate shown reserve-card exposures with later structured turn evidence and turn those reactions into generic engagement signals |
 | [positive_engagement.py](./positive_engagement.py) | Explicit positive-engagement actions derived generically from appetite, ongoing interest, and co-attention |
 | [steering.py](./steering.py) | Authoritative turn-steering cues plus runtime follow-up resolution derived from co-attention and conversation appetite |
+| [profile_defaults.py](./profile_defaults.py) | Shared baseline style/humor profiles used by the runtime evolution loop and evaluation tooling |
+| [_remote_state_utils.py](./_remote_state_utils.py) | Shared remote-primary adapter resolution used by the personality and world-intelligence snapshot stores |
 | [store.py](./store.py) | Remote snapshot persistence seam for prompt state, signals, and deltas |
 | [evolution.py](./evolution.py) | Policy-gated background learning loop, contradiction/sensitivity gates, and decay maintenance |
 | [signals.py](./signals.py) | Structured signal taxonomy plus extraction for style, humor, topic, continuity, place, and world evidence |

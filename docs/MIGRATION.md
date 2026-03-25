@@ -113,7 +113,7 @@ Responsibilities:
 - button-triggered listen window
 - VAD-based start/end-of-speech detection
 - adaptive pause handling
-- wakeword/proactive gating
+- voice-activation/proactive gating
 - microphone capture and playback locking
 
 This remains under:

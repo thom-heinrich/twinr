@@ -3,9 +3,9 @@ name: runtime
 path: src/twinr/proactive/runtime
 kind: python-package
 visibility: internal
-summary: Coordinate proactive monitor ticks, wakeword presence sessions, and bounded monitor lifecycle for Twinr runtime workflows.
+summary: Coordinate proactive monitor ticks, activation presence sessions, and bounded monitor lifecycle for Twinr runtime workflows.
 owned_concerns:
-  - Maintain wakeword presence-session state from camera, PIR, and speech activity
+  - Maintain activation presence-session state from camera, PIR, and speech activity
   - Derive conservative ReSpeaker policy hooks such as quiet windows, resume windows, and overlap guards
   - Expose one runtime-faithful ReSpeaker audio-perception diagnostic and guard surface for operator checks and post-recovery sanity validation
   - Derive conservative ReSpeaker speech-delivery defer reasons for display-first proactive routing
@@ -38,14 +38,15 @@ owned_concerns:
   - Publish guided user-discovery start, resume, and short profile-review invitations into the same reserve lane so lifelong profile learning stays visible without a second profile UI
   - Derive direct reserve-lane world candidates from active RSS subscriptions and condensed awareness threads so seeded world breadth still reaches the right-hand lane when other sources are temporarily sparse
   - Rewrite reserve-lane wording through one bounded structured LLM pass at plan-build time so the visible text can reflect Twinr's current personality and structured shared-thread or memory-follow-up context without templated phrasing
+  - Keep reserve-lane text, timestamp, and local-time normalization in one shared support module so the planner and live publishers do not drift apart on small helper rules
   - Record shown reserve cards into a bounded exposure history so later learning code can tell which visual prompts were actually seen before it scores user reactions
   - Run one explicit overnight reserve-lane maintenance step that reviews recent shown-card outcomes, triggers long-term reflection/world refresh, and prepares the next local-day plan before morning adoption
   - Persist a bounded continuous HDMI gesture debug stream with raw observations, ack-lane decisions, publish outcomes, and stage timings so Pi-side symbol latency and missed acknowledgements leave first-run evidence
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
-  - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
+  - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and activation-presence policy paths
   - Retry exact transient GPIO busy overlaps for PIR startup over a short bounded handover window so runtime restarts do not flap into error while a previous Twinr process is still releasing GPIO17
-  - Pause and resume the streaming wakeword capture path around accepted hands-free turns so exclusive ALSA conversation capture can reuse the same microphone device safely
+  - Preserve proactive audio ownership boundaries around accepted hands-free turns so exclusive ALSA conversation capture can reuse the same microphone device safely
   - Export normalized observation facts and ops telemetry from runtime monitoring
   - Route short-window multimodal event-fusion safety claims into the active runtime trigger path while preserving engine cooldowns, visibility-loss fallback, and downstream review/suppression policy
   - Export structured ReSpeaker audio-policy facts plus presence-session metadata for bounded automation and long-term memory ingestion
@@ -57,7 +58,7 @@ owned_concerns:
   - Open and close monitor resources and the bounded worker thread safely
 out_of_scope:
   - Social trigger scoring thresholds, evidence rules, or prompt content
-  - Wakeword calibration, matching, and evaluation algorithms
+  - Voice-activation transcript policy and gateway contracts
   - Raw hardware adapter implementations outside the runtime-facing orchestration
   - Delivery-governance cooldown policy in src/twinr/proactive/governance
 files:
@@ -238,6 +239,15 @@ files:
       - DisplayReserveNightlyMaintenanceState
       - DisplayReserveNightlyMaintenanceStateStore
       - DisplayReserveNightlyOutcomeSummary
+  - path: display_reserve_support.py
+    role: Shared reserve-lane text, timestamp, and local-time normalization helpers reused by the planner and live publishers
+    exports:
+      - compact_text
+      - default_local_now
+      - format_timestamp
+      - parse_local_time
+      - parse_timestamp
+      - utc_now
   - path: display_reserve_runtime.py
     role: Shared right-lane reserve publisher that all text-card producers reuse so cue persistence and exposure history stay on one common runtime path
     exports:
@@ -307,17 +317,46 @@ files:
       - ReSpeakerSpeakerAssociationSnapshot
       - derive_respeaker_speaker_association
   - path: presence.py
-    role: Wakeword presence-session controller and snapshot model
+    role: Activation presence-session controller and snapshot model
     exports:
       - PresenceSessionController
       - PresenceSessionSnapshot
   - path: service.py
-    role: Proactive monitor orchestration, lifecycle, assembly, and shared attention-target fanout to HDMI plus optional body-follow servo
+    role: Thin proactive monitor orchestration, lifecycle, and assembly of the extracted attention/gesture helper surfaces into the active runtime
     exports:
       - ProactiveCoordinator
       - ProactiveMonitorService
       - ProactiveTickResult
       - build_default_proactive_monitor
+  - path: service_attention_helpers.py
+    role: Focused HDMI attention-follow live-context export, servo follow, changed-only tracing, and attention-debug packaging used by the proactive coordinator
+    exports:
+      - attention_servo_source_is_authoritative
+      - build_attention_servo_decision_ledger
+      - publish_display_attention_live_context
+      - record_attention_debug_tick
+      - record_attention_follow_pipeline_if_changed
+      - record_attention_servo_follow_if_changed
+      - record_attention_servo_forensic_tick
+      - record_display_attention_follow_if_changed
+      - summarize_visible_persons
+      - update_attention_servo_follow
+      - update_display_attention_follow
+      - update_display_debug_signals
+  - path: service_gesture_helpers.py
+    role: Focused HDMI gesture acknowledgement publish, accepted wakeup dispatch, and gesture-debug trace packaging used by the proactive coordinator
+    exports:
+      - dispatch_gesture_wakeup_with_fresh_context
+      - gesture_observation_trace_details
+      - handle_gesture_wakeup_decision
+      - prime_gesture_wakeup_sensor_context
+      - publish_display_gesture_decision
+      - record_gesture_debug_tick
+      - run_gesture_wakeup_handler
+      - trace_gesture_ack_lane_decision
+      - trace_gesture_publish_decision
+      - trace_gesture_wakeup_lane_decision
+      - update_display_gesture_emoji_ack
 public_api:
   module: twinr.proactive.runtime
   exports:
@@ -349,9 +388,7 @@ compatibility_reexports:
       - derive_respeaker_speaker_association
       - evaluate_respeaker_sensitive_behavior_gate
 primary_callers:
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
-  - path: src/twinr/proactive/wakeword/stream.py
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_display_attention.py
@@ -368,10 +405,12 @@ tests:
   - path: test/test_display_reserve_day_plan.py
   - path: test/test_display_reserve_companion_planner.py
   - path: test/test_display_reserve_bus_feedback.py
+  - path: test/test_display_reserve_support.py
   - path: test/test_attention_targeting.py
   - path: test/test_person_state.py
   - path: test/test_pir_open_gate.py
   - path: test/test_proactive_monitor.py
+  - path: test/test_proactive_runtime_service.py
   - path: test/test_smart_home_context.py
   - path: test/test_display_gesture_emoji.py
   - path: test/test_governor_inputs.py
@@ -380,6 +419,5 @@ tests:
   - path: test/test_portrait_match.py
   - path: test/test_respeaker_sensitive_behavior_gate.py
   - path: test/test_respeaker_scheduled_provider.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_config.py

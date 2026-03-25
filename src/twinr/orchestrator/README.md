@@ -39,6 +39,11 @@ contracts used by the Alexa-like hybrid voice path.
 | [server.py](./server.py) | FastAPI websocket server |
 | [session.py](./session.py) | Tool-loop bridge |
 | [remote_asr.py](./remote_asr.py) | Bounded HTTP client for the thh1986 remote ASR service |
+| [remote_asr_service.py](./remote_asr_service.py) | Embedded `/v1/transcribe` HTTP surface when the remote-ASR URL points back to the local orchestrator server |
+| [voice_gateway_guardrails.py](./voice_gateway_guardrails.py) | Fail-closed startup checks for the remote-only live voice gateway contract |
+| [voice_activation.py](./voice_activation.py) | Transcript-first wake phrase matching and continuation extraction |
+| [voice_forensics.py](./voice_forensics.py) | Bounded voice-frame telemetry shared by the edge and host-side voice path |
+| [voice_audio_debug_store.py](./voice_audio_debug_store.py) | Opt-in rolling WAV artifact store for forensic-only voice debugging |
 | [voice_transcript_debug_stream.py](./voice_transcript_debug_stream.py) | Bounded JSONL store for raw transcript-first gateway decisions |
 | [voice_contracts.py](./voice_contracts.py) | Streaming voice websocket contracts |
 | [voice_runtime_intent.py](./voice_runtime_intent.py) | Compact person-state projection for voice-gateway bias |
@@ -69,22 +74,19 @@ app = create_app(".env")
 ```
 
 Twinr's live voice gateway now has one supported activation path only:
-`TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=remote_asr` with
-`TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` pointing at the thh1986 ASR service.
+`TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` must point at the thh1986 ASR service.
 The Pi streams room audio continuously to thh1986, thh1986 keeps a rolling
 transcript/ringbuffer over that live stream, and the same stream stays open
 until the spoken turn reaches a pause/end so the post-wake tail is committed as
-the request input. The server rejects startup if somebody tries to relaunch the
-old `backend/openwakeword/wekws` rescue path, enables any generic wakeword
-backend in the gateway process, or silently routes the turn back into a second
-local Pi wake/listen phase. Once that transcript-first gateway is running, it
-must also keep stage one on `remote_asr`; no hidden `wekws/openwakeword`
-frame-detector fallback is allowed behind the same live session.
+the request input. The server rejects startup if somebody tries to relaunch
+retired local voice selectors, reintroduce any selectable stage-one backend, or
+silently routes the turn back into a second Pi wake/listen phase. Once that
+transcript-first gateway is running, there is no alternate local detector or
+fallback voice path behind the same live session.
 
-Twinr also keeps generic follow-up and barge-in transcription on that same
-remote `remote_asr` path; the live gateway must not require an
-`OpenAIBackend` or `OPENAI_API_KEY` just to build the websocket session and
-emit `voice_ready`.
+Twinr also keeps follow-up and barge-in decisions on that same remote
+`remote_asr` path; the live gateway must not require an `OpenAIBackend` or
+`OPENAI_API_KEY` just to build the websocket session and emit `voice_ready`.
 
 In that transcript-first mode the ASR service owns the primary speech/VAD gate.
 Twinr keeps the extra candidate active-ratio gate open by default so quiet
@@ -104,13 +106,34 @@ The practical rules for that utterance scanner are:
   utterance budget is reached
 - transcribe that utterance once and route it as either `wake_confirmed`,
   `follow_up` transcript commit, or ignore
-- do not call any deleted local-detector tail extractor path
+- accept wake matches only from the utterance head, aside from bounded leading
+  generic greeting words such as `okay` or `hey`; do not treat a later
+  mid-sentence `... Twinna` mention as a fresh wake
+- do not route the turn into any retired local detector or rescue capture path
 
 That keeps the websocket frame loop stable because the gateway performs one
 decode per utterance instead of multiple overlapping synchronous ASR calls on
 consecutive frames. The remote ASR adapter still keeps a narrow retry budget for
 transient `429 stt busy` contention so one brief remote decode spike does
 not immediately drop an utterance candidate.
+
+When `TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` points back to the same
+orchestrator host/port, Twinr now mounts the bounded `/v1/transcribe` route in
+that same FastAPI process instead of expecting a second hidden localhost-only
+ASR daemon on another port. The live gateway still uses the same HTTP contract
+through [`remote_asr.py`](./remote_asr.py), but the concrete transcription
+surface is colocated with the websocket server and protected by the dedicated
+remote-ASR bearer token.
+
+When the Pi explicitly re-enters a fresh same-stream `listening` or
+`follow_up_open` window, the server now clears stale wake/beep/answer history
+before buffering the next utterance. That keeps the next transcript-first
+commit focused on the new user speech instead of poisoning the first ASR window
+with older playback audio that still sits in the rolling buffer. There is one
+explicit exception for the `waiting -> listening` handoff: if the same stream
+already has one still-active waiting-origin utterance in flight when the Pi
+opens explicit `listening`, the server carries that utterance into
+`listening` instead of deleting it with the stale history reset.
 
 Every real transcript-first decision window is now also persisted as bounded
 text-only JSONL evidence under
@@ -119,6 +142,13 @@ raw STT text, matched wake alias, remaining post-wake text, and window-level
 speech metrics for wake-stage scans plus follow-up/barge-in transcriptions so
 operators can inspect what thh1986 actually heard after a failed live test
 without persisting room audio.
+
+For forensic-only live incidents, operators can also opt in to bounded WAV
+artifacts with `TWINR_VOICE_ORCHESTRATOR_AUDIO_DEBUG_ENABLED=1`. When enabled,
+the gateway stores only a short rolling set of the same bounded decision
+windows under `artifacts/stores/ops/voice_gateway_audio/` and links each file
+back from the matching transcript-debug JSONL entry. Keep that disabled outside
+targeted debugging because it persists raw room audio by design.
 
 The edge runtime now also projects the latest compact `person_state` summary
 into each `voice_runtime_state` update: `attention_state`,
@@ -129,16 +159,36 @@ transcript-first wake window a bit richer or the follow-up window open a bit
 longer when the runtime already sees speech-directed intent. It must never
 manufacture a wake from vision alone.
 
-When the runtime is already in `follow_up_open`, Twinr now keeps the same
-stage-one wake detector alive before it considers the generic follow-up STT
-path. That matters for repeated turns such as `Twinna, ...` right after a
-successful answer: the first few 100 ms frames are often too short for a full
-transcript match, so Twinr buffers until the configured follow-up window is
-actually full instead of transcribing an immature partial window and routing
-that partial text into a second Pi-local capture. If the user really is
-starting a new wake turn, stage one now gets first claim on the same stream;
-otherwise a mature, wake-free follow-up window is committed directly as
-`transcript_committed` on that same remote stream.
+The edge runtime now also primes one explicit idle `waiting` runtime-state as
+soon as the voice websocket comes up, and `voice_hello` now carries that
+attested initial state plus the compact `person_state` projection. That matters
+because later sensor-observation refreshes can only replay changed intent
+context after the gateway has seen at least one concrete runtime state.
+Without that attested initial `waiting` state, the server would keep scanning
+room audio with `intent_* = null` until the first real turn transition. The
+gateway now fails closed until it receives that attested state. In `waiting`,
+the transcript-first scanner still honors explicit no-local-presence blocks,
+but it also keeps one short recent-visibility grace so a camera flicker cannot
+kill an already buffered explicit wake burst mid-utterance. When the camera
+stack itself is temporarily unavailable, the compact voice-intent projection no
+longer converts that outage into a hard `person_visible=false` wake block. It
+may still elevate attested local `near_device_presence` to a positive hold, but
+otherwise it degrades to visibility-unknown so explicit audio wake stays
+possible even with the camera offline. The broader room-clarity and channel
+hints stay advisory for idle wake scanning, because the explicit wake phrase
+itself is what establishes the speech turn and should not require proactive
+targeting guards to classify the room first.
+
+When the runtime is already in `follow_up_open`, the gateway stays on the same
+utterance buffer path it uses in `waiting` and `listening`: keep buffering the
+same remote stream until bounded endpoint silence, then run one transcript-
+first decision over that utterance. That matters for repeated turns such as
+`Twinna, ...` right after a successful answer because the first few 100 ms
+frames are often too short for a stable transcript. Buffering the full
+utterance keeps the follow-up lane deterministic: repeated wake phrases still
+route as `wake_confirmed`, and ordinary continuation speech commits directly as
+`transcript_committed`, without reviving any second local capture or generic
+alternate STT stage.
 
 ## See also
 

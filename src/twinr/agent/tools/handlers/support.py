@@ -199,20 +199,20 @@ def optional_float(arguments: dict[str, object], key: str, *, default: float) ->
     if raw_value is None:
         return default
 
-    candidate: object = raw_value
-    if isinstance(raw_value, str):
+    if isinstance(raw_value, bool):
+        raise ArgumentValidationError(f"{key} must be a number")
+    if isinstance(raw_value, (int, float)):
+        value = float(raw_value)
+    elif isinstance(raw_value, str):
         stripped = raw_value.strip()
         if stripped == "":
             return default
-        candidate = stripped
-
-    if isinstance(candidate, bool):
+        try:
+            value = float(stripped)
+        except ValueError as exc:
+            raise ArgumentValidationError(f"{key} must be a number") from exc
+    else:
         raise ArgumentValidationError(f"{key} must be a number")
-
-    try:
-        value = float(candidate)
-    except (TypeError, ValueError) as exc:
-        raise ArgumentValidationError(f"{key} must be a number") from exc
 
     if not isfinite(value):
         raise ArgumentValidationError(f"{key} must be a finite number")

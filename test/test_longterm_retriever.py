@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PromptContextStore
 from twinr.memory.longterm import (

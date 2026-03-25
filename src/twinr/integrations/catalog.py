@@ -6,6 +6,8 @@ serves defensive clones so callers cannot mutate shared registry state.
 
 from __future__ import annotations
 
+# pylint: disable=undefined-all-variable
+
 from collections.abc import Mapping  # AUDIT-FIX(#3): Type immutable lookup indexes precisely in Python 3.11.2.
 from copy import deepcopy  # AUDIT-FIX(#2): Defensive-copy manifests before exposing them outside this module.
 from types import MappingProxyType  # AUDIT-FIX(#3): Freeze registry indexes against accidental mutation.
@@ -21,11 +23,10 @@ from twinr.integrations.models import (
     RiskLevel,
     SafetyProfile,
     SecretReference,
-    SecretStorage,  # AUDIT-FIX(#5): Kept intentionally per compatibility constraint; storage policy stays schema-driven.
 )
 
 __all__ = (
-    "BUILTIN_MANIFESTS",
+    "BUILTIN_MANIFESTS",  # noqa: F822 - exported lazily via __getattr__ to preserve defensive copies.
     "builtin_manifests",
     "manifest_for_id",
     "manifests_for_domain",

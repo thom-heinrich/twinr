@@ -13,9 +13,8 @@ families with personality and reflection candidates without topic hardcoding.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate

@@ -75,7 +75,6 @@ compatibility_reexports:
       - build_tool_agent_instructions
       - tool_agent_time_context
 primary_callers:
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
   - path: src/twinr/orchestrator/acks.py
@@ -84,6 +83,5 @@ tests:
   - path: test/test_tool_instructions.py
   - path: test/test_user_discovery.py
   - path: test/run_user_discovery_intent_live_acceptance.py
-  - path: test/test_runner.py
   - path: test/test_streaming_runner.py
   - path: test/test_openai_realtime.py

@@ -14,9 +14,9 @@ from typing import Sequence
 
 import numpy as np
 
-from .bootstrap import compute_label_centroids
+from .centroids import compute_label_centroids
+from .inference import OnnxSentenceEncoder
 from .linear_head import fit_multiclass_linear_head
-from .service import OnnxSentenceEncoder
 from .user_intent import USER_INTENT_LABEL_VALUES
 from .user_intent_bundle import UserIntentBundleMetadata
 from .user_intent_evaluation import (

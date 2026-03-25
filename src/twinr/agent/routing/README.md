@@ -7,6 +7,10 @@ backend `parametric | web | memory | tool` router with normal authority gating.
 The package keeps bundle formats, ONNX inference, authority policy, and offline
 evaluation/calibration code out of the workflow loops.
 
+Internally, the package keeps shared ONNX inference helpers, shared centroid
+math, and the synthetic recipe registry in dedicated modules so runtime,
+offline training, and dataset-definition concerns stay separated.
+
 ## Responsibility
 
 `routing` owns:
@@ -18,6 +22,7 @@ evaluation/calibration code out of the workflow loops.
 - run a shared-embedding two-stage classifier when both stages are configured
 - apply calibrated authority thresholds and margin gates before a route may bypass the supervisor lane
 - evaluate scored route decisions against labeled transcript datasets
+- keep shared encoder/numeric helpers and centroid math isolated from route-specific runtime code
 - build centroid-based or trained linear-head bundles from labeled transcript corpora without pulling training logic into the live workflow path
 - build centroid-based or trained linear-head user-intent bundles from labeled transcript corpora
 - generate and curate dual-labeled synthetic bootstrap corpora for both stages

@@ -7,7 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.workflows.rendered_audio_clip import RenderedAudioClipSpec, build_rendered_audio_clip_wav_bytes
 
 

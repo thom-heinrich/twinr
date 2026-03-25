@@ -65,7 +65,7 @@ Today Twinr already carries these raw or fused states in the proactive path:
 - `hand_or_object_near_camera`
 - `speech_detected`
 - `distress_detected`
-- presence-session arming for wakeword
+- presence-session arming for voice activation
 - weighted trigger candidates such as `person_returned`, `attention_window`, `showing_intent`, `slumped_quiet`, `possible_fall`, and `floor_stillness`
 - optional OpenAI frame-buffer review before image-driven proactive prompts
 
@@ -95,7 +95,7 @@ This table is the target field for the existing hardware only.
 | `room_motion_recent` | PIR | High | Direct | Cheap and robust. Best wake/gate signal. |
 | `room_likely_occupied` | PIR + camera + audio | High | Direct | Strong when recent motion, person visible, or room speech exists. |
 | `person_visible` | Camera | Medium to High | Direct | Better with a local person detector than with prompt-only vision classification. |
-| `person_recently_visible` | Camera + history | High | Direct | Very useful for grace windows and wakeword arming. |
+| `person_recently_visible` | Camera + history | High | Direct | Very useful for grace windows and voice-activation arming. |
 | `person_near_device` | Camera | Medium | Prompt | Can be estimated from face/body size and object proximity. |
 | `looking_toward_device` | Camera | Medium | Prompt | Good enough for engagement detection, not precise gaze tracking. |
 | `engaged_with_device` | Camera + audio | Medium | Prompt | Useful for "Can I help?" when presence, gaze, and quiet line up. |
@@ -104,7 +104,7 @@ This table is the target field for the existing hardware only.
 | `speaking_in_room` | Audio | High | Direct | VAD should be strong locally. |
 | `room_quiet` | Audio | High | Direct | Good for timing and cooldown logic. |
 | `speech_directed_to_device_likely` | Audio + camera + history | Medium | Prompt | Useful for attentiveness, but still a heuristic. |
-| `wakeword_candidate` | Audio + presence gating | Medium to High | Direct | Good if kept short and fully local. |
+| `voice_activation_candidate` | Audio + presence gating | Medium to High | Direct | Good if kept short and fully local. |
 | `upright / seated / slumped / lying_low` | Camera | Medium | Prompt | Coarse posture is realistic. Fine posture semantics are not. |
 | `possible_fall` | Camera + PIR + audio + history | Medium | Prompt or Review | Good enough to ask "Is everything okay?". Not good enough for hard emergency claims. |
 | `floor_stillness_after_drop` | Camera + audio + history | Medium | Prompt or Review | Stronger than raw fall suspicion, still not a diagnosis. |
@@ -131,14 +131,14 @@ These are realistic on a Pi 4 and should carry most of the system:
 
 - PIR-based motion and recent-presence windows
 - continuous VAD
-- local wakeword
+- local voice activation
 - person detection
 - coarse pose / body posture
 - simple object-near-camera detection
 
 This tier should drive:
 
-- wakeword arming
+- voice-activation arming
 - presence sessions
 - showing-intent prompts
 - returned-after-absence prompts
@@ -302,7 +302,7 @@ This is the most realistic near-term stack for the existing hardware.
 - `Silero VAD`
   Strong local speech/not-speech gate.
 - `openWakeWord`
-  Local wakeword only, with a short primary wakeword such as `hey twinna`.
+  Local voice activation only, with a short primary voice activation such as `hey twinna`.
 - `YAMNet` or a small `Edge Impulse` audio classifier
   For a few event classes like cough-like, shout-like, alarm-like, water-like, and TV/noise rejection.
 
@@ -412,7 +412,7 @@ With the current hardware, Twinr can realistically become good at:
 - coarse posture
 - object-showing intent
 - speech activity
-- wakeword readiness
+- voice activation readiness
 - basic concern prompts
 
 It cannot realistically become good at:
@@ -442,7 +442,7 @@ External references, accessed March 15, 2026:
 - Silero VAD: https://github.com/snakers4/silero-vad
 - YAMNet: https://www.tensorflow.org/hub/tutorials/yamnet
 - openWakeWord: https://github.com/dscripka/openWakeWord
-- Home Assistant custom wakeword training: https://www.home-assistant.io/voice_control/create_wake_word/
+- Home Assistant custom voice activation training: https://www.home-assistant.io/voice_control/create_wake_word/
 - Edge Impulse sound recognition: https://docs.edgeimpulse.com/tutorials/end-to-end/sound-recognition
 - TinyM2Net multimodal edge paper: https://arxiv.org/abs/2202.04303
 

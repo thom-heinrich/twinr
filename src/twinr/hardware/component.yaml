@@ -5,14 +5,14 @@ kind: python-package
 visibility: internal
 summary: Provide bounded audio, GPIO, servo, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
-  - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
-  - Lift under-driven PCM16 wakeword-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
+  - Capture and play bounded audio for conversation, ambient sensing, and activation flows
+  - Lift under-driven PCM16 activation-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
   - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
   - Wait a short bounded window for transient XVF3800 USB/ALSA re-enumeration to clear before live capture paths fail a turn
   - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends
-  - Drive one bounded body-orientation servo from an already-derived normalized attention target, including calibrated center/invert controls, soft end-stop margins, and calm idle release near neutral
-  - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes
+  - Drive one bounded body-orientation servo from an already-derived normalized attention target, including calibrated center/invert controls, soft end-stop margins, calm idle release near neutral, and a dedicated open-loop continuous-rotation mode with bounded virtual-heading estimation for 360-degree servos
+  - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes or a bounded peer-Pi HTTP snapshot proxy when the main host has no local still camera
   - Persist local portrait identities with multiple reference images per user
   - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
   - Persist and assess multi-user local household voice identities on device
@@ -128,14 +128,18 @@ files:
       - edge_name
       - edge_to_action
   - path: servo_follow.py
-    role: Bounded servo pulse adapter for normalized body-orientation follow on one GPIO line, with calibrated soft limits and calm idle release
+    role: Bounded servo pulse adapter for normalized body-orientation follow, with calibrated soft limits, calm idle release, continuous-rotation control-mode selection, and driver selection across Pi GPIO and focused external writers
     exports:
       - AttentionServoConfig
       - AttentionServoController
       - AttentionServoDecision
       - LGPIOServoPulseWriter
+  - path: servo_continuous.py
+    role: Focused virtual-heading planner for continuous-rotation servos so open-loop speed control stays separate from the higher follow-state machine
+  - path: servo_maestro.py
+    role: Focused Pololu Mini Maestro command-port adapter for bounded USB serial servo output, stale-path recovery, ttyACM fallback discovery, and command-port auto-baud initialization
   - path: camera.py
-    role: still camera adapter with bounded ffmpeg/V4L2 capture, Pi rpicam fallback, and bounded persistence
+    role: still camera adapter with bounded ffmpeg/V4L2 capture, Pi rpicam fallback, optional peer-Pi HTTP snapshot fetches, and bounded persistence
     exports:
       - CameraError
       - CameraConfigurationError
@@ -315,12 +319,10 @@ public_api:
 primary_callers:
   - path: src/twinr/ops/checks.py
   - path: src/twinr/ops/devices.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/proactive/runtime/service.py
   - path: src/twinr/proactive/social/observers.py
-  - path: src/twinr/proactive/wakeword/spotter.py
   - path: src/twinr/web/app.py
   - path: src/twinr/web/viewmodels_voice.py
   - path: src/twinr/ops/self_test.py
@@ -339,6 +341,5 @@ tests:
   - path: test/test_printer.py
   - path: test/test_respeaker.py
   - path: test/test_voice_profile.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py

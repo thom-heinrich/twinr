@@ -23,6 +23,7 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingAgentProvider,
     ToolCallingTurnResponse,
 )
+from .loop_support import raise_if_should_stop as _raise_if_should_stop
 
 # AUDIT-FIX(#7): Widen the handler type so static typing matches both supported invocation modes.
 ToolHandler = Callable[[dict[str, Any] | AgentToolCall], Any]
@@ -327,19 +328,6 @@ def _append_round_text(existing: str, addition: str) -> str:
     if existing[-1] in ".!?:":
         return f"{existing}\n{addition}"
     return f"{existing} {addition}"
-
-
-def _raise_if_should_stop(
-    should_stop: Callable[[], bool] | None,
-    *,
-    context: str,
-) -> None:
-    """Abort cooperative tool-loop work once the owning turn was stopped."""
-
-    if should_stop is None:
-        return
-    if should_stop():
-        raise InterruptedError(f"tool loop stopped during {context}")
 
 
 def _serialize_tool_output(output: Any) -> str:

@@ -6,17 +6,19 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.agent.base_agent.conversation.decision_core import normalize_turn_text
 from twinr.agent.base_agent.conversation.turn_controller import (
     StreamingTurnController,
     ToolCallingTurnDecisionEvaluator,
     TurnEvaluationCandidate,
+    _normalize_turn_text,
 )
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
     StreamingSpeechEndpointEvent,
     ToolCallingTurnResponse,
 )
-from twinr.config import TwinrConfig
 
 
 class FakeTurnToolAgentProvider:
@@ -62,8 +64,27 @@ class FakeTurnToolAgentProvider:
             ),
         )
 
+    def continue_turn_streaming(
+        self,
+        *,
+        continuation_token: str,
+        tool_results=(),
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del continuation_token, tool_results, instructions, tool_schemas, allow_web_search, on_text_delta
+        raise NotImplementedError
+
 
 class TurnControllerTests(unittest.TestCase):
+    def test_public_normalize_turn_text_matches_legacy_turn_controller_alias(self) -> None:
+        transcript = "  Hallo \n  Welt  "
+
+        self.assertEqual(normalize_turn_text(transcript), "hallo welt")
+        self.assertEqual(_normalize_turn_text(transcript), normalize_turn_text(transcript))
+
     def test_tool_call_evaluator_returns_structured_decision(self) -> None:
         config = TwinrConfig(
             openai_api_key="test-key",

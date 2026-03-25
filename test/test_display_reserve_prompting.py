@@ -83,6 +83,35 @@ class DisplayReservePromptingTests(unittest.TestCase):
         self.assertNotIn("fallback_headline", prompt)
         self.assertNotIn("fallback_body", prompt)
 
+    def test_candidate_prompt_payload_does_not_backfill_raw_visible_copy_without_anchor(self) -> None:
+        candidate = AmbientDisplayImpulseCandidate(
+            topic_key="green button",
+            title="Green button",
+            source="reflection_midterm",
+            action="hint",
+            attention_state="forming",
+            salience=0.41,
+            eyebrow="",
+            headline="Zu Green button wuerde ich gern kurz anknuepfen.",
+            body="Ein kleiner Nachtrag dazu waere schon hilfreich.",
+            symbol="sparkles",
+            accent="info",
+            reason="reflection_midterm",
+            candidate_family="reflection",
+            generation_context={
+                "summary": "Internal packet summary only.",
+                "details": "Internal packet details only.",
+            },
+        )
+
+        payload = build_candidate_prompt_payload(candidate)
+
+        self.assertEqual(payload["topic_anchor"], "")
+        self.assertEqual(payload["hook_hint"], "")
+        self.assertNotIn("Green button", payload["context_summary"])
+        self.assertNotIn("Zu Green button", payload["context_summary"])
+        self.assertNotIn("Ein kleiner Nachtrag", payload["context_summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -94,7 +94,7 @@ next cycle. Example:
 
 ```bash
 PYTHONPATH=src python3 - <<'PY'
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display import (
     DisplayFaceBrowStyle,
     DisplayFaceExpressionController,
@@ -129,7 +129,7 @@ controller instead of hand-writing raw JSON. Example:
 
 ```bash
 PYTHONPATH=src python3 - <<'PY'
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display import DisplayPresentationController
 
 config = TwinrConfig.from_env(".env")
@@ -150,7 +150,7 @@ For fullscreen image validation:
 
 ```bash
 PYTHONPATH=src python3 - <<'PY'
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display import DisplayPresentationController
 
 config = TwinrConfig.from_env(".env")
@@ -172,7 +172,7 @@ For prioritized multi-card scene validation:
 
 ```bash
 PYTHONPATH=src python3 - <<'PY'
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display import DisplayPresentationCardCue, DisplayPresentationController
 
 config = TwinrConfig.from_env(".env")

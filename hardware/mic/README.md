@@ -13,7 +13,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 
 `mic` does **not** own:
 - runtime audio capture logic in `src/twinr/hardware/audio.py`
-- wakeword or proactive policy
+- voice activation or proactive policy
 - printer, display, or GPIO setup
 
 ## Key files
@@ -52,7 +52,7 @@ profile.
 When it can resolve the target capture card by name, it also persists
 `TWINR_AUDIO_INPUT_DEVICE` as an explicit `plughw:CARD=...,DEV=...` path so
 the normal conversation recorder does not drift back onto a stale generic
-`default` alias while wakeword/proactive capture already uses the real
+`default` alias while voice-activation/proactive capture already uses the real
 ReSpeaker device.
 The same setup flow now also persists `TWINR_AUDIO_OUTPUT_DEVICE` as an
 explicit Twinr-owned playback PCM, preferring `twinr_playback_softvol` when

@@ -13,7 +13,7 @@ from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
@@ -254,7 +254,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertTrue(panel.prompt_mode)
         self.assertEqual(len(draw.rounded_rectangles), 1)
         text_sizes = {call["font"].size for call in draw.text_calls}
-        self.assertEqual(text_sizes, {36})
+        self.assertEqual(text_sizes, {31})
         self.assertTrue(any("Denkst du" in call["text"] for call in draw.text_calls))
         self.assertTrue(any("draufschauen" in call["text"] for call in draw.text_calls))
 
@@ -277,7 +277,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         )
 
         rendered_lines = tuple(call["text"] for call in draw.text_calls)
-        self.assertEqual(rendered_lines, ("H1", "H2", "H3", "H4", "B1", "B2", "B3"))
+        self.assertEqual(rendered_lines, ("H1", "H2", "H3", "H4", "B1", "B2", "B3", "B4"))
         self.assertGreater(len(rendered_lines), 5)
 
     def test_render_status_image_hides_bottom_news_ticker_in_extended_view(self) -> None:

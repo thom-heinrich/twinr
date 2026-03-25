@@ -12,22 +12,24 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 import logging
 import math
-import os
-import tempfile
 import time
+import uuid
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monitor
+from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
 from twinr.hardware.audio import (
-    AmbientAudioCaptureWindow,
-    AmbientAudioSampler,
     AudioCaptureReadinessError,
     AudioCaptureReadinessProbe,
-    pcm16_to_wav_bytes,
+    AmbientAudioSampler,
+    capture_device_identity,
+    resolve_capture_device,
 )
+from twinr.hardware.camera import V4L2StillCamera
+from twinr.hardware.camera_ai.gesture_forensics import GestureForensics
+from twinr.hardware.pir import GpioPirMonitor, configured_pir_monitor
 from twinr.hardware.servo_follow import AttentionServoController, AttentionServoDecision
 from twinr.hardware.respeaker import (
     build_respeaker_claim_payloads,
@@ -37,12 +39,15 @@ from twinr.hardware.respeaker import (
 )
 from twinr.hardware.portrait_match import PortraitMatchProvider
 from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
-from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.providers.openai import OpenAIBackend
 
 from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurface, ProactiveCameraSurfaceUpdate
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from ..social.local_camera_provider import LocalAICameraObservationProvider
+from ..social.remote_camera_provider import (
+    RemoteAICameraObservationProvider,
+    RemoteFrameAICameraObservationProvider,
+)
 from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider, ReSpeakerAudioObservationProvider
 from ..social.observers import ProactiveAudioSnapshot
 from ..social.vision_review import (
@@ -109,17 +114,16 @@ from .speaker_association import (
     ReSpeakerSpeakerAssociationSnapshot,
     derive_respeaker_speaker_association,
 )
+from . import service_attention_helpers
+from . import service_gesture_helpers
 
 if TYPE_CHECKING:
     from twinr.agent.base_agent.runtime import TwinrRuntime
 
-_WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS = frozenset(
+_VISION_REVIEW_FAIL_OPEN_TRIGGERS = frozenset(
     {"possible_fall", "floor_stillness", "distress_possible"}
 )
-_VISION_REVIEW_FAIL_OPEN_TRIGGERS = _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS
-_MAX_WAKEWORD_STREAM_EVENTS_PER_CYCLE = 8
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
-_MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
 _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
 _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES = frozenset({"error"})
 _ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S = 2.0
@@ -232,40 +236,32 @@ def _normalize_optional_text(*values: Any) -> str:
 def _proactive_audio_capture_device(config: TwinrConfig) -> str:
     """Return the device used by proactive ambient PCM sampling."""
 
-    return (
-        _normalize_optional_text(
-            getattr(config, "proactive_audio_input_device", None),
-            getattr(config, "audio_input_device", None),
-        )
-        or "default"
+    return resolve_capture_device(
+        getattr(config, "proactive_audio_input_device", None),
+        getattr(config, "audio_input_device", None),
     )
 
 
 def _voice_orchestrator_capture_device(config: TwinrConfig) -> str:
     """Return the device used by the long-lived voice-orchestrator capture."""
 
-    return (
-        _normalize_optional_text(
-            getattr(config, "voice_orchestrator_audio_device", None),
-            getattr(config, "proactive_audio_input_device", None),
-            getattr(config, "audio_input_device", None),
-        )
-        or "default"
+    return resolve_capture_device(
+        getattr(config, "voice_orchestrator_audio_device", None),
+        getattr(config, "proactive_audio_input_device", None),
+        getattr(config, "audio_input_device", None),
     )
 
 
 def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
     config: TwinrConfig,
-    *,
-    wakeword_stream: object | None,
 ) -> bool:
     """Return whether proactive PCM fallback would fight a shared voice capture."""
 
-    if wakeword_stream is not None:
-        return False
     if not bool(getattr(config, "voice_orchestrator_enabled", False)):
         return False
-    return _proactive_audio_capture_device(config) == _voice_orchestrator_capture_device(config)
+    return capture_device_identity(_proactive_audio_capture_device(config)) == capture_device_identity(
+        _voice_orchestrator_capture_device(config)
+    )
 
 
 # AUDIT-FIX(#8): Normalize sequence-like config inputs from older env schemas before using them.
@@ -282,18 +278,6 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
-
-
-def _resolve_openwakeword_inference_framework(*, models: tuple[str, ...], configured: str) -> str:
-    """Pick the framework that matches the configured local openWakeWord models."""
-
-    normalized_models = tuple(model.strip().lower() for model in models if model.strip())
-    normalized_framework = (configured or "tflite").strip().lower() or "tflite"
-    if normalized_models and all(model.endswith(".onnx") for model in normalized_models):
-        return "onnx"
-    if normalized_models and all(model.endswith(".tflite") for model in normalized_models):
-        return "tflite"
-    return normalized_framework
 
 
 def _round_optional_seconds(value: float | None) -> float | None:
@@ -475,49 +459,6 @@ def _assistant_output_active(runtime: TwinrRuntime) -> bool:
     except Exception:
         return False
 
-
-# AUDIT-FIX(#7): Refuse obviously unsafe capture directories and require the final path to stay under artifacts_root.
-def _ensure_safe_capture_directory(artifacts_root: Path) -> Path:
-    """Create and validate the wakeword capture directory under artifacts root."""
-
-    captures_dir = artifacts_root / "ops" / "wakeword_captures"
-    captures_dir.mkdir(parents=True, exist_ok=True)
-    for candidate in (artifacts_root, artifacts_root / "ops", captures_dir):
-        if candidate.exists() and candidate.is_symlink():
-            raise RuntimeError(f"refusing symlinked capture directory component: {candidate}")
-    resolved_root = artifacts_root.resolve(strict=False)
-    resolved_dir = captures_dir.resolve(strict=False)
-    try:
-        resolved_dir.relative_to(resolved_root)
-    except ValueError as exc:
-        raise RuntimeError("wakeword capture directory escapes artifacts root") from exc
-    return captures_dir
-
-
-# AUDIT-FIX(#7): Write captures atomically so partial files or power loss do not leave corrupt artifacts behind.
-def _write_bytes_atomic(path: Path, payload: bytes) -> None:
-    """Persist bytes atomically to one existing directory."""
-
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            _LOGGER.warning("Failed to remove proactive capture temp file after write error.", exc_info=True)
-        raise
-
-
 # AUDIT-FIX(#4): Log degraded-mode component startup instead of failing the whole monitor for optional hardware or provider issues.
 def _record_component_warning(
     *,
@@ -547,12 +488,11 @@ class ProactiveTickResult:
     """Describe the externally relevant outcome of one monitor tick."""
 
     decision: SocialTriggerDecision | None = None
-    wakeword_match: object | None = None
     inspected: bool = False
     person_visible: bool = False
 
 
-# AUDIT-FIX(#4): Provide a no-op trigger engine so wakeword/audio monitoring can still run when proactive triggers are disabled or engine setup fails.
+# AUDIT-FIX(#4): Provide a no-op trigger engine so audio/camera monitoring can still run when proactive triggers are disabled or engine setup fails.
 class _NullSocialTriggerEngine:
     """Provide a no-op trigger engine when proactive triggers are disabled."""
 
@@ -584,15 +524,12 @@ class ProactiveCoordinator:
         pir_monitor: GpioPirMonitor | None = None,
         audio_observer=None,
         presence_session: PresenceSessionController | None = None,
-        wakeword_spotter: object | None = None,
-        wakeword_stream: object | None = None,
-        wakeword_policy: object | None = None,
         vision_reviewer: OpenAIProactiveVisionReviewer | None = None,
         portrait_match_provider: PortraitMatchProvider | None = None,
-        wakeword_handler: Callable[[object], bool] | None = None,
         gesture_wakeup_handler: Callable[[GestureWakeupDecision], bool] | None = None,
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
+        live_context_handler: Callable[[dict[str, Any]], None] | None = None,
         display_attention_publisher: DisplayAttentionCuePublisher | None = None,
         display_debug_signal_publisher: DisplayDebugSignalPublisher | None = None,
         display_gesture_emoji_publisher: DisplayGestureEmojiPublisher | None = None,
@@ -616,15 +553,12 @@ class ProactiveCoordinator:
         self.audio_observer = audio_observer or self._null_audio_observer
         self._audio_observer_fallback_factory = audio_observer_fallback_factory
         self.presence_session = presence_session
-        self.wakeword_spotter = wakeword_spotter
-        self.wakeword_stream = wakeword_stream
-        self.wakeword_policy = wakeword_policy
         self.vision_reviewer = vision_reviewer
         self.portrait_match_provider = portrait_match_provider
-        self.wakeword_handler = wakeword_handler
         self.gesture_wakeup_handler = gesture_wakeup_handler
         self.idle_predicate = idle_predicate
         self.observation_handler = observation_handler
+        self.live_context_handler = live_context_handler
         self.display_attention_publisher = display_attention_publisher or DisplayAttentionCuePublisher.from_config(
             config
         )
@@ -646,7 +580,16 @@ class ProactiveCoordinator:
         )
         self.emit = emit or (lambda _line: None)
         self.clock = clock
-        self._normalized_wakeword_backend = "disabled"
+        project_root = Path(getattr(config, "project_root", Path(__file__).resolve().parents[3])).expanduser()
+        self._gesture_forensics = GestureForensics.from_env(
+            project_root=project_root,
+            service="ProactiveGestureRefresh",
+        )
+        self._attention_servo_forensic_trace_enabled = bool(
+            getattr(config, "attention_servo_forensic_trace_enabled", False)
+        )
+        self._attention_servo_forensic_run_id = uuid.uuid4().hex
+        self._attention_servo_forensic_tick_index = 0
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
         self._last_display_attention_refresh_at: float | None = None
@@ -673,7 +616,6 @@ class ProactiveCoordinator:
         self._gesture_wakeup_dispatcher = GestureWakeupDispatcher(
             handle_decision=self._run_gesture_wakeup_handler,
         )
-        self._wakeword_stream_resume_enabled = True
         self._last_sensor_flags: dict[str, bool] = {}
         self._speech_detected_since: float | None = None
         self._quiet_since: float | None = None
@@ -684,7 +626,6 @@ class ProactiveCoordinator:
             getattr(config, "audio_input_device", None),
             getattr(config, "proactive_audio_input_device", None),
         )
-        self._last_wakeword_attempt_at: float | None = None
         self._last_possible_fall_prompted_session_id: int | None = None
         self.latest_presence_snapshot: PresenceSessionSnapshot | None = None
         self.latest_audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None
@@ -802,8 +743,9 @@ class ProactiveCoordinator:
 
         fast_observe = getattr(self.audio_observer, "observe_signal_only", None)
         if callable(fast_observe):
+            fast_observe_fn = cast(Callable[[], ProactiveAudioSnapshot], fast_observe)
             try:
-                snapshot = fast_observe()
+                snapshot = fast_observe_fn()  # pylint: disable=not-callable
             except Exception as exc:
                 self._last_attention_audio_refresh_mode = "signal_only_failed_fallback"
                 self._record_fault(
@@ -876,7 +818,7 @@ class ProactiveCoordinator:
             )
             return None
 
-    # AUDIT-FIX(#6): Vision observation faults should fall back to an uninspected tick so wakeword/presence logic can continue.
+    # AUDIT-FIX(#6): Vision observation faults should fall back to an uninspected tick so presence logic can continue.
     def _observe_vision_safe(self):
         """Collect one vision snapshot or return None on failure/unavailability."""
 
@@ -921,7 +863,7 @@ class ProactiveCoordinator:
 
         return decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS
 
-    # AUDIT-FIX(#6): Keep decision suppression logic centralized after wakeword/presence checks.
+    # AUDIT-FIX(#6): Keep decision suppression logic centralized after presence checks.
     def _process_decision(
         self,
         *,
@@ -935,16 +877,6 @@ class ProactiveCoordinator:
         """Apply final suppression, review, and dispatch to one trigger decision."""
 
         if decision is None:
-            return ProactiveTickResult(
-                inspected=inspected,
-                person_visible=observation.vision.person_visible,
-            )
-        suppressed_age_s = self._recent_wakeword_attempt_age_s(now, decision)
-        if suppressed_age_s is not None:
-            self._record_trigger_skipped_recent_wakeword_attempt(
-                decision,
-                wakeword_attempt_age_s=suppressed_age_s,
-            )
             return ProactiveTickResult(
                 inspected=inspected,
                 person_visible=observation.vision.person_visible,
@@ -1273,7 +1205,7 @@ class ProactiveCoordinator:
                 if evaluate_trigger
                 else None
             ),
-        )  # AUDIT-FIX(#5): bypass trigger evaluation in wakeword-only/privacy-disabled proactive mode.
+        )  # AUDIT-FIX(#5): bypass trigger evaluation in activation-only/privacy-disabled proactive mode.
 
     def _observe_presence(
         self,
@@ -1284,7 +1216,7 @@ class ProactiveCoordinator:
         audio_observation: SocialAudioObservation,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
     ) -> PresenceSessionSnapshot:
-        """Update and publish the current wakeword presence-session snapshot."""
+        """Update and publish the current voice-activation presence snapshot."""
 
         if self.presence_session is None:
             snapshot = PresenceSessionSnapshot(
@@ -1356,305 +1288,7 @@ class ProactiveCoordinator:
         )
         self.latest_presence_snapshot = snapshot
         self._record_presence_if_changed(snapshot)
-        if self.wakeword_stream is not None and hasattr(self.wakeword_stream, "update_presence"):
-            self.wakeword_stream.update_presence(snapshot)
         return snapshot
-
-    def poll_wakeword_stream(self) -> object | None:
-        """Local wakeword streaming was removed; proactive no longer drains it."""
-
-        return None
-
-    # AUDIT-FIX(#6): Replace a failed streaming wakeword path with a secondary audio observer when available so the monitor degrades instead of repeatedly faulting.
-    def _handle_wakeword_stream_failure(self, error: BaseException | object) -> None:
-        """Disable the broken wakeword stream and try to enable audio fallback."""
-
-        failed_stream = self.wakeword_stream
-        if failed_stream is None:
-            return
-        self.wakeword_stream = None
-        self._record_fault(
-            event="wakeword_stream_failed",
-            message="openWakeWord streaming failed; switching to a degraded audio path when available.",
-            error=error,
-        )
-        try:
-            failed_stream.close()
-        except Exception as close_exc:
-            self._record_fault(
-                event="wakeword_stream_close_failed",
-                message="Failed to close the broken wakeword stream cleanly.",
-                error=close_exc,
-            )
-        fallback_factory = self._audio_observer_fallback_factory
-        if fallback_factory is None:
-            self.audio_observer = self._null_audio_observer
-            self._append_ops_event(
-                event="proactive_audio_fallback_unavailable",
-                level="warning",
-                message="Wakeword streaming failed and no secondary audio observer was configured.",
-                data={},
-            )
-            return
-        try:
-            fallback_observer = fallback_factory()
-            self.audio_observer = fallback_observer or self._null_audio_observer
-        except Exception as exc:
-            self.audio_observer = self._null_audio_observer
-            self._record_fault(
-                event="proactive_audio_fallback_init_failed",
-                message="Wakeword streaming failed and the secondary audio observer could not be started.",
-                error=exc,
-            )
-            return
-        self._append_ops_event(
-            event="proactive_audio_fallback_enabled",
-            message="Wakeword streaming failed and a secondary audio observer was started.",
-            data={},
-        )
-
-    # AUDIT-FIX(#6): Callback isolation for wakeword handlers prevents a bad downstream action from aborting wakeword detection.
-    def _dispatch_wakeword_match(self, match: WakewordMatch, *, source: str) -> bool:
-        """Send one accepted wakeword match to the downstream handler safely."""
-
-        if self.wakeword_handler is None:
-            return False
-        should_pause_stream = source == "streaming_spotter"
-        def _run_handler() -> bool:
-            try:
-                return bool(self.wakeword_handler(match))
-            except Exception as exc:
-                self._record_fault(
-                    event="wakeword_handler_failed",
-                    message="Wakeword handler failed.",
-                    error=exc,
-                    data={
-                        "source": source,
-                        "matched_phrase": match.matched_phrase,
-                        "detector_label": match.detector_label,
-                    },
-                )
-                return False
-        handled = self._run_with_paused_wakeword_stream(
-            enabled=should_pause_stream,
-            pause_fault_event="wakeword_stream_pause_failed",
-            pause_fault_message="Wakeword handler could not pause the active streaming capture path.",
-            pause_fault_data={
-                "source": source,
-                "matched_phrase": match.matched_phrase,
-                "detector_label": match.detector_label,
-            },
-            handler=_run_handler,
-        )
-        if handled:
-            self._emit("wakeword_detected=true")
-        return handled
-
-    def _maybe_detect_wakeword(
-        self,
-        *,
-        now: float,
-        audio_snapshot,
-        presence_snapshot: PresenceSessionSnapshot,
-    ) -> WakewordMatch | None:
-        """Run one ambient-audio wakeword attempt when the session is armed."""
-
-        if self.wakeword_stream is not None:
-            return None
-        if self.wakeword_spotter is None or self.wakeword_handler is None:
-            return None
-        if not presence_snapshot.armed:
-            return None
-        if not self._wakeword_audio_candidate(audio_snapshot):
-            return None
-        if self._last_wakeword_attempt_at is not None:
-            if (now - self._last_wakeword_attempt_at) < self.config.wakeword_attempt_cooldown_s:
-                return None
-        self._last_wakeword_attempt_at = now
-        capture_window = AmbientAudioCaptureWindow(
-            sample=audio_snapshot.sample,
-            pcm_bytes=audio_snapshot.pcm_bytes,
-            sample_rate=audio_snapshot.sample_rate,
-            channels=audio_snapshot.channels,
-        )
-        try:  # AUDIT-FIX(#6): wakeword detector faults must degrade cleanly instead of aborting the entire cycle.
-            match = self.wakeword_spotter.detect(capture_window)
-        except Exception as exc:
-            self._record_fault(
-                event="wakeword_detect_failed",
-                message="Wakeword phrase detection failed.",
-                error=exc,
-            )
-            return None
-        return self._handle_wakeword_decision(
-            match=match,
-            capture_window=capture_window,
-            presence_snapshot=presence_snapshot,
-            source="ambient_spotter",
-        )
-
-    def _handle_stream_detection(self, detection: WakewordStreamDetection) -> WakewordMatch | None:
-        """Finalize one streaming wakeword detection through the normal policy path."""
-
-        self._last_wakeword_attempt_at = self.clock()
-        return self._handle_wakeword_decision(
-            match=detection.match,
-            capture_window=detection.capture_window,
-            presence_snapshot=detection.presence_snapshot,
-            source="streaming_spotter",
-        )
-
-    def _handle_wakeword_decision(
-        self,
-        *,
-        match: WakewordMatch,
-        capture_window: AmbientAudioCaptureWindow | None,
-        presence_snapshot: PresenceSessionSnapshot,
-        source: str,
-    ) -> WakewordMatch | None:
-        """Persist and dispatch one wakeword policy decision."""
-
-        decision = self._decide_wakeword(match=match, capture_window=capture_window, source=source)
-        capture_path = self._persist_wakeword_capture(
-            decision.match,
-            capture_window=capture_window,
-            outcome=decision.outcome,
-        )
-        if capture_path is not None:
-            decision = replace(decision, capture_path=capture_path)
-        self._record_wakeword_attempt(
-            decision.match,
-            presence_snapshot=presence_snapshot,
-            decision=decision,
-        )
-        self._record_wakeword_decision(
-            decision=decision,
-            presence_snapshot=presence_snapshot,
-        )
-        if not decision.detected:
-            return None
-        if self._dispatch_wakeword_match(decision.match, source=source):
-            return decision.match
-        return None
-
-    def _decide_wakeword(
-        self,
-        *,
-        match: WakewordMatch,
-        capture_window: AmbientAudioCaptureWindow | None,
-        source: str,
-    ) -> WakewordDecision:
-        """Run the configured wakeword policy or a trivial pass-through fallback."""
-
-        if self.wakeword_policy is None:
-            return WakewordDecision(
-                detected=match.detected,
-                outcome="detected" if match.detected else "rejected",
-                match=match,
-                source=source,
-                backend_used=match.backend,
-                primary_backend=self._normalized_wakeword_backend,
-                fallback_backend=None,
-                verifier_mode="disabled",
-                verifier_used=False,
-                verifier_status="not_needed",
-            )
-        return self.wakeword_policy.decide(
-            match=match,
-            capture=capture_window,
-            source=source,
-        )
-
-    def _persist_wakeword_capture(
-        self,
-        match: WakewordMatch,
-        *,
-        capture_window: AmbientAudioCaptureWindow,
-        outcome: str,
-    ) -> str | None:
-        """Persist one evaluated wakeword audio window and return its path."""
-
-        if capture_window is None or not capture_window.pcm_bytes:
-            return None
-        try:
-            captures_dir = _ensure_safe_capture_directory(
-                Path(resolve_ops_paths_for_config(self.config).artifacts_root)
-            )  # AUDIT-FIX(#7): validate the capture directory before writing local artifacts.
-            timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            unique_token = f"{time.time_ns():019d}"  # AUDIT-FIX(#7): add a monotonic-unique suffix so same-second detections cannot overwrite each other.
-            try:
-                score_value = 0.0 if match.score is None else max(0.0, float(match.score))
-            except (TypeError, ValueError):
-                score_value = 0.0
-            score_token = f"{score_value:.4f}".replace(".", "_")
-            phrase_token = (match.matched_phrase or match.detector_label or "unknown").strip().replace(" ", "_")
-            safe_phrase = (
-                "".join(char for char in phrase_token if char.isalnum() or char in {"_", "-"})
-                or "unknown"
-            )[:_MAX_CAPTURE_PHRASE_TOKEN_LEN]
-            safe_outcome = "".join(char for char in outcome.strip() if char.isalnum() or char in {"_", "-"}) or "unknown"
-            path = captures_dir / f"{timestamp}__{unique_token}__{safe_outcome}__score-{score_token}__{safe_phrase}.wav"
-            wav_bytes = pcm16_to_wav_bytes(
-                capture_window.pcm_bytes,
-                sample_rate=capture_window.sample_rate,
-                channels=capture_window.channels,
-            )
-            _write_bytes_atomic(path, wav_bytes)
-        except Exception as exc:
-            self._record_fault(
-                event="wakeword_capture_persist_failed",
-                message="Failed to persist the wakeword capture window.",
-                error=exc,
-            )
-            return None
-
-        sample = getattr(capture_window, "sample", None)
-        data: dict[str, Any] = {
-            "path": str(path),
-            "outcome": outcome,
-            "matched_phrase": match.matched_phrase,
-            "detector_label": match.detector_label,
-            "score": match.score,
-        }
-        if sample is not None:
-            data.update(
-                {
-                    "duration_ms": getattr(sample, "duration_ms", None),
-                    "peak_rms": getattr(sample, "peak_rms", None),
-                }
-            )
-        self._append_ops_event(
-            event="wakeword_capture_saved",
-            message="Saved the local audio window that was evaluated by the wakeword policy.",
-            data=data,
-        )
-        return str(path)
-
-    def _wakeword_audio_candidate(self, audio_snapshot) -> bool:
-        """Return whether one audio snapshot is worth wakeword evaluation."""
-
-        sample = getattr(audio_snapshot, "sample", None)
-        if sample is None:
-            return False
-        if not getattr(audio_snapshot, "pcm_bytes", None):
-            return False
-        if getattr(audio_snapshot, "sample_rate", None) is None:
-            return False
-        if getattr(audio_snapshot, "channels", None) is None:
-            return False
-        if self._normalized_wakeword_backend in {"openwakeword", "kws", "wekws"}:  # AUDIT-FIX(#9): normalized comparison avoids config case/whitespace mismatches.
-            if sample.active_chunk_count >= max(1, self.config.wakeword_min_active_chunks):
-                return True
-            if audio_snapshot.observation.speech_detected is True:
-                return True
-            peak_threshold = max(1400, int(self.config.audio_speech_threshold * 2))
-            return sample.peak_rms >= peak_threshold
-        if sample.active_chunk_count < max(1, self.config.wakeword_min_active_chunks):
-            return False
-        if sample.active_ratio >= self.config.wakeword_min_active_ratio:
-            return True
-        peak_threshold = max(1400, int(self.config.audio_speech_threshold * 2))
-        return sample.peak_rms >= peak_threshold
 
     def _handle_decision(
         self,
@@ -1746,24 +1380,6 @@ class ProactiveCoordinator:
             self._record_trigger_skipped_vision_review(decision, review=review)
             return None, review
         return decision, review
-
-    def _recent_wakeword_attempt_age_s(
-        self,
-        now: float,
-        decision: SocialTriggerDecision,
-    ) -> float | None:
-        """Return the age of a recent wakeword attempt that should suppress prompts."""
-
-        if decision.trigger_id in _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS:
-            return None
-        if self._last_wakeword_attempt_at is None:
-            return None
-        age_s = now - self._last_wakeword_attempt_at
-        if age_s < 0:
-            return None
-        if age_s > self.config.wakeword_block_proactive_after_attempt_s:
-            return None
-        return age_s
 
     def _update_motion(self, now: float) -> bool:
         """Poll PIR state and return whether motion is currently active."""
@@ -1948,13 +1564,12 @@ class ProactiveCoordinator:
             audio_observation=audio_snapshot.observation,
         )
         stage_ms["audio_policy"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        observation = SocialObservation(
+        self._publish_display_attention_live_context(
             observed_at=now,
-            inspected=True,
-            pir_motion_detected=False,
-            low_motion=False,
-            vision=fused_vision,
-            audio=audio_snapshot.observation,
+            vision_observation=fused_vision,
+            camera_snapshot=camera_update.snapshot,
+            audio_snapshot=audio_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
         stage_started_ns = time.monotonic_ns()
         publish_result = self._update_display_attention_follow(
@@ -2042,71 +1657,250 @@ class ProactiveCoordinator:
                 stage_ms=stage_ms,
             )
             return False
-        stage_started_ns = time.monotonic_ns()
-        snapshot = self._observe_vision_for_gesture_refresh()
-        stage_ms["vision_observe"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        if snapshot is None:
-            stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
-            self._record_gesture_debug_tick(
-                observed_at=now,
-                outcome="vision_snapshot_missing",
-                runtime_status_value=runtime_status_value,
-                stage_ms=stage_ms,
-            )
-            return False
-        self._last_display_gesture_refresh_at = now
-        self._record_vision_snapshot_safe(snapshot)
-        self._remember_display_attention_camera_semantics(
+        with self._gesture_forensics.bind_refresh(
             observed_at=now,
-            observation=snapshot.observation,
-            source="gesture",
-        )
-        stage_started_ns = time.monotonic_ns()
-        decision = self._gesture_ack_lane.observe(
-            observed_at=now,
-            observation=snapshot.observation,
-        )
-        stage_ms["ack_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        stage_started_ns = time.monotonic_ns()
-        wakeup_decision = self._gesture_wakeup_lane.observe(
-            observed_at=now,
-            observation=snapshot.observation,
-        )
-        stage_ms["wakeup_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        if wakeup_decision.active:
-            stage_started_ns = time.monotonic_ns()
-            wakeup_priority = decide_gesture_wakeup_priority(
-                runtime_status_value=runtime_status_value,
-                voice_path_enabled=bool(getattr(self.config, "voice_orchestrator_enabled", False)),
-                presence_snapshot=self.latest_presence_snapshot,
-                recent_speech_guard_s=_ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S,
-            )
-            if not wakeup_priority.allow:
-                wakeup_decision = replace(
-                    wakeup_decision,
-                    active=False,
-                    reason=wakeup_priority.reason,
-                )
-            stage_ms["wakeup_priority"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        stage_started_ns = time.monotonic_ns()
-        publish_result = self._publish_display_gesture_decision(decision)
-        stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        stage_started_ns = time.monotonic_ns()
-        wakeup_handled = self._handle_gesture_wakeup_decision(wakeup_decision)
-        stage_ms["wakeup_handler"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
-        stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
-        self._record_gesture_debug_tick(
-            observed_at=now,
-            outcome=("publish_failed" if publish_result is None else publish_result.action),
             runtime_status_value=runtime_status_value,
-            observation=snapshot.observation,
+            vision_mode=self._last_gesture_vision_refresh_mode,
+            refresh_interval_s=interval_s,
+        ):
+            workflow_decision(
+                msg="gesture_refresh_runtime_status_gate",
+                question="Should the dedicated HDMI gesture refresh run on this tick?",
+                selected={
+                    "id": "allowed",
+                    "summary": "The runtime state allows the dedicated gesture refresh to execute.",
+                },
+                options=[
+                    {"id": "allowed", "summary": "Proceed with the dedicated gesture refresh."},
+                    {"id": "blocked", "summary": "Skip the gesture refresh because the runtime state forbids it."},
+                ],
+                context={
+                    "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+                    "refresh_interval_s": interval_s,
+                },
+                confidence="forensic",
+                guardrails=["display_gesture_runtime_status_gate"],
+                kpi_impact_estimate={"latency": "low", "user_feedback": "high"},
+            )
+            with workflow_span(
+                name="proactive_display_gesture_refresh",
+                kind="turn",
+                details={
+                    "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+                    "refresh_interval_s": interval_s,
+                },
+            ):
+                stage_started_ns = time.monotonic_ns()
+                with workflow_span(
+                    name="proactive_display_gesture_observe_vision",
+                    kind="io",
+                    details={"vision_observer_type": type(self.vision_observer).__name__},
+                ):
+                    snapshot = self._observe_vision_for_gesture_refresh()
+                stage_ms["vision_observe"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                if snapshot is None:
+                    stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
+                    workflow_event(
+                        kind="branch",
+                        msg="gesture_refresh_snapshot_missing",
+                        details={"stage_ms": dict(stage_ms)},
+                        reason={
+                            "selected": {
+                                "id": "snapshot_missing",
+                                "justification": "The gesture refresh could not continue because the vision observer returned no snapshot.",
+                                "expected_outcome": "Abort the current refresh without touching HDMI gesture state.",
+                            },
+                            "options": [
+                                {"id": "snapshot_present", "summary": "Continue with the captured snapshot."},
+                                {"id": "snapshot_missing", "summary": "Abort because no snapshot was returned."},
+                            ],
+                            "confidence": "forensic",
+                            "guardrails": ["vision_snapshot_required"],
+                            "kpi_impact_estimate": {"latency": "low", "display_side_effect": "none"},
+                        },
+                    )
+                    self._record_gesture_debug_tick(
+                        observed_at=now,
+                        outcome="vision_snapshot_missing",
+                        runtime_status_value=runtime_status_value,
+                        stage_ms=stage_ms,
+                    )
+                    return False
+                self._last_display_gesture_refresh_at = now
+                self._record_vision_snapshot_safe(snapshot)
+                self._remember_display_attention_camera_semantics(
+                    observed_at=now,
+                    observation=snapshot.observation,
+                    source="gesture",
+                )
+                workflow_event(
+                    kind="io",
+                    msg="gesture_refresh_observation",
+                    details=self._gesture_observation_trace_details(snapshot.observation),
+                )
+                stage_started_ns = time.monotonic_ns()
+                with workflow_span(
+                    name="proactive_display_gesture_ack_lane_observe",
+                    kind="decision",
+                ):
+                    decision = self._gesture_ack_lane.observe(
+                        observed_at=now,
+                        observation=snapshot.observation,
+                    )
+                stage_ms["ack_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                self._trace_gesture_ack_lane_decision(
+                    observation=snapshot.observation,
+                    decision=decision,
+                )
+                stage_started_ns = time.monotonic_ns()
+                with workflow_span(
+                    name="proactive_display_gesture_wakeup_lane_observe",
+                    kind="decision",
+                ):
+                    wakeup_decision = self._gesture_wakeup_lane.observe(
+                        observed_at=now,
+                        observation=snapshot.observation,
+                    )
+                stage_ms["wakeup_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                self._trace_gesture_wakeup_lane_decision(decision=wakeup_decision)
+                if wakeup_decision.active:
+                    stage_started_ns = time.monotonic_ns()
+                    with workflow_span(
+                        name="proactive_display_gesture_wakeup_priority",
+                        kind="decision",
+                    ):
+                        wakeup_priority = decide_gesture_wakeup_priority(
+                            runtime_status_value=runtime_status_value,
+                            voice_path_enabled=bool(getattr(self.config, "voice_orchestrator_enabled", False)),
+                            presence_snapshot=self.latest_presence_snapshot,
+                            recent_speech_guard_s=_ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S,
+                        )
+                    if not wakeup_priority.allow:
+                        wakeup_decision = replace(
+                            wakeup_decision,
+                            active=False,
+                            reason=wakeup_priority.reason,
+                        )
+                    stage_ms["wakeup_priority"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                    workflow_decision(
+                        msg="gesture_wakeup_priority_gate",
+                        question="Should the active gesture wake candidate be allowed to start the voice path now?",
+                        selected={
+                            "id": "allow" if wakeup_priority.allow else wakeup_priority.reason,
+                            "summary": (
+                                "Allow the wake request to proceed."
+                                if wakeup_priority.allow
+                                else "Suppress the wake request because the current runtime priority forbids it."
+                            ),
+                        },
+                        options=[
+                            {"id": "allow", "summary": "Allow the wake request to proceed."},
+                            {"id": "block", "summary": "Block the wake request due to current runtime policy."},
+                        ],
+                        context={
+                            "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+                            "voice_path_enabled": bool(getattr(self.config, "voice_orchestrator_enabled", False)),
+                            "wakeup_reason": wakeup_decision.reason,
+                        },
+                        confidence="forensic",
+                        guardrails=["gesture_wakeup_priority"],
+                        kpi_impact_estimate={"voice_turn": "high"},
+                    )
+                stage_started_ns = time.monotonic_ns()
+                with workflow_span(
+                    name="proactive_display_gesture_publish",
+                    kind="mutation",
+                    details={"decision_reason": decision.reason, "decision_active": decision.active},
+                ):
+                    publish_result = self._publish_display_gesture_decision(decision)
+                stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                stage_started_ns = time.monotonic_ns()
+                with workflow_span(
+                    name="proactive_display_gesture_wakeup_handler",
+                    kind="mutation",
+                    details={"wakeup_reason": wakeup_decision.reason, "wakeup_active": wakeup_decision.active},
+                ):
+                    wakeup_handled = self._dispatch_gesture_wakeup_with_fresh_context(
+                        observed_at=now,
+                        vision_snapshot=snapshot,
+                        decision=wakeup_decision,
+                    )
+                stage_ms["wakeup_handler"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
+                self._trace_gesture_publish_decision(
+                    decision=decision,
+                    publish_result=publish_result,
+                    wakeup_decision=wakeup_decision,
+                    wakeup_handled=wakeup_handled,
+                )
+                workflow_event(
+                    kind="metric",
+                    msg="gesture_refresh_stage_metrics",
+                    details={"stage_ms": dict(stage_ms)},
+                    kpi={f"stage_{key}_ms": value for key, value in stage_ms.items()},
+                )
+                self._record_gesture_debug_tick(
+                    observed_at=now,
+                    outcome=("publish_failed" if publish_result is None else publish_result.action),
+                    runtime_status_value=runtime_status_value,
+                    observation=snapshot.observation,
+                    decision=decision,
+                    publish_result=publish_result,
+                    wakeup_decision=wakeup_decision,
+                    wakeup_handled=wakeup_handled,
+                    stage_ms=stage_ms,
+                )
+                return True
+
+    def _dispatch_gesture_wakeup_with_fresh_context(
+        self,
+        *,
+        observed_at: float,
+        vision_snapshot,
+        decision: GestureWakeupDecision,
+    ) -> bool:
+        """Prime current gesture facts before dispatching an accepted wakeup."""
+
+        return service_gesture_helpers.dispatch_gesture_wakeup_with_fresh_context(
+            self,
+            observed_at=observed_at,
+            vision_snapshot=vision_snapshot,
             decision=decision,
-            publish_result=publish_result,
-            wakeup_decision=wakeup_decision,
-            wakeup_handled=wakeup_handled,
-            stage_ms=stage_ms,
         )
-        return True
+
+    def _prime_gesture_wakeup_sensor_context(
+        self,
+        *,
+        observed_at: float,
+        vision_snapshot,
+    ) -> None:
+        """Export one fresh sensor/person-state payload from the active gesture tick."""
+
+        service_gesture_helpers.prime_gesture_wakeup_sensor_context(
+            self,
+            observed_at=observed_at,
+            vision_snapshot=vision_snapshot,
+        )
+
+    def _publish_display_attention_live_context(
+        self,
+        *,
+        observed_at: float,
+        vision_observation: SocialVisionObservation,
+        camera_snapshot: ProactiveCameraSnapshot,
+        audio_snapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+    ) -> None:
+        """Export authoritative HDMI-attention facts to the live voice context."""
+
+        service_attention_helpers.publish_display_attention_live_context(
+            self,
+            observed_at=observed_at,
+            vision_observation=vision_observation,
+            camera_snapshot=camera_snapshot,
+            audio_snapshot=audio_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
+        )
 
     def _is_low_motion(self, now: float, *, motion_active: bool) -> bool:
         """Return whether recent PIR history qualifies as low motion."""
@@ -2130,8 +1924,9 @@ class ProactiveCoordinator:
         callback = getattr(self.audio_observer, "note_runtime_context", None)
         if not callable(callback):
             return
+        note_runtime_context = cast(Callable[..., None], callback)
         presence_snapshot = self.latest_presence_snapshot
-        callback(
+        note_runtime_context(  # pylint: disable=not-callable
             observed_at=now,
             motion_active=motion_active,
             inspect_requested=inspect_requested,
@@ -2417,8 +2212,8 @@ class ProactiveCoordinator:
             return
         self._last_presence_key = key
         self._append_ops_event(
-            event="wakeword_presence_changed",
-            message="Wakeword presence session changed.",
+            event="voice_activation_presence_changed",
+            message="Voice-activation presence session changed.",
             data={
                 "armed": snapshot.armed,
                 "reason": snapshot.reason,
@@ -2536,90 +2331,6 @@ class ProactiveCoordinator:
         )
         self._last_respeaker_runtime_alert_code = "capture_unknown"
         self._last_respeaker_runtime_blocker_code = "dead_capture"
-
-    def _record_wakeword_attempt(
-        self,
-        match: WakewordMatch,
-        *,
-        presence_snapshot: PresenceSessionSnapshot,
-        decision: WakewordDecision | None = None,
-    ) -> None:
-        """Record one wakeword attempt and optional policy outcome."""
-
-        data = {
-            "detected": match.detected,
-            "matched_phrase": match.matched_phrase,
-            "remaining_text": match.remaining_text,
-            "presence_reason": presence_snapshot.reason,
-            "wakeword_armed": presence_snapshot.armed,
-            "backend": match.backend,
-            "detector_label": match.detector_label,
-            "score": match.score,
-        }
-        if decision is not None:
-            data.update(
-                {
-                    "outcome": decision.outcome,
-                    "source": decision.source,
-                    "primary_backend": decision.primary_backend,
-                    "backend_used": decision.backend_used,
-                    "fallback_backend": decision.fallback_backend,
-                    "verifier_mode": decision.verifier_mode,
-                    "verifier_used": decision.verifier_used,
-                    "verifier_status": decision.verifier_status,
-                    "local_verifier_used": decision.local_verifier_used,
-                    "local_verifier_status": decision.local_verifier_status,
-                    "capture_path": decision.capture_path,
-                }
-            )
-            if decision.verifier_reason:
-                data["verifier_reason"] = decision.verifier_reason
-            if decision.local_verifier_reason:
-                data["local_verifier_reason"] = decision.local_verifier_reason
-        if match.transcript:
-            data["transcript_preview"] = match.transcript[:160]
-        if match.normalized_transcript:
-            data["normalized_transcript_preview"] = match.normalized_transcript[:160]
-        self._append_ops_event(
-            event="wakeword_attempted",
-            message="Wakeword phrase spotting inspected recent ambient speech.",
-            data=data,
-        )
-
-    def _record_wakeword_decision(
-        self,
-        *,
-        decision: WakewordDecision,
-        presence_snapshot: PresenceSessionSnapshot,
-    ) -> None:
-        """Record the final wakeword policy decision for one attempt."""
-
-        self._append_ops_event(
-            event="wakeword_decision",
-            message="Wakeword policy decided whether Twinr should open a turn.",
-            data={
-                "detected": decision.detected,
-                "outcome": decision.outcome,
-                "source": decision.source,
-                "primary_backend": decision.primary_backend,
-                "backend_used": decision.backend_used,
-                "fallback_backend": decision.fallback_backend,
-                "verifier_mode": decision.verifier_mode,
-                "verifier_used": decision.verifier_used,
-                "verifier_status": decision.verifier_status,
-                "verifier_reason": decision.verifier_reason,
-                "local_verifier_used": decision.local_verifier_used,
-                "local_verifier_status": decision.local_verifier_status,
-                "local_verifier_reason": decision.local_verifier_reason,
-                "matched_phrase": decision.match.matched_phrase,
-                "remaining_text": decision.match.remaining_text,
-                "detector_label": decision.match.detector_label,
-                "score": decision.match.score,
-                "capture_path": decision.capture_path,
-                "presence_reason": presence_snapshot.reason,
-                "wakeword_armed": presence_snapshot.armed,
-            },
-        )
 
     def _record_trigger_detected(
         self,
@@ -2749,28 +2460,6 @@ class ProactiveCoordinator:
             },
         )
 
-    def _record_trigger_skipped_recent_wakeword_attempt(
-        self,
-        decision: SocialTriggerDecision,
-        *,
-        wakeword_attempt_age_s: float,
-    ) -> None:
-        """Record that a recent wakeword attempt suppressed one trigger."""
-
-        self._emit("social_trigger_skipped=recent_wakeword_attempt")
-        self._append_ops_event(
-            event="social_trigger_skipped",
-            message="Social trigger prompt was skipped because a wakeword attempt was seen recently.",
-            data={
-                "trigger": decision.trigger_id,
-                "reason": "recent_wakeword_attempt",
-                "wakeword_attempt_age_s": round(wakeword_attempt_age_s, 3),
-                "priority": int(decision.priority),
-                "score": decision.score,
-                "threshold": decision.threshold,
-            },
-        )
-
     def _presence_session_block_reason(
         self,
         decision: SocialTriggerDecision,
@@ -2825,7 +2514,7 @@ class ProactiveCoordinator:
         """Return a conservative ReSpeaker-driven suppression reason for one trigger."""
 
         del presence_snapshot
-        if decision.trigger_id in _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS:
+        if decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS:
             return None
         if audio_policy_snapshot is None:
             return None
@@ -2958,26 +2647,11 @@ class ProactiveCoordinator:
     ) -> None:
         """Persist HDMI debug pills from current camera state and recent triggers."""
 
-        publisher = self.display_debug_signal_publisher
-        if publisher is None:
-            return
-        try:
-            publisher.publish_from_camera_facts(
-                camera_facts=camera_update.snapshot.to_automation_facts(),
-                event_names=camera_update.event_names,
-                trigger_ids=detected_trigger_ids,
-            )
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_display_debug_signals_publish_failed",
-                message="Failed to publish HDMI debug-signal state.",
-                error=exc,
-                data={
-                    "camera_event_names": list(camera_update.event_names),
-                    "trigger_ids": list(detected_trigger_ids),
-                },
-                level="warning",
-            )
+        service_attention_helpers.update_display_debug_signals(
+            self,
+            camera_update,
+            detected_trigger_ids=detected_trigger_ids,
+        )
 
     def _update_display_attention_follow(
         self,
@@ -2990,126 +2664,89 @@ class ProactiveCoordinator:
     ) -> DisplayAttentionCuePublishResult | None:
         """Update the HDMI face and body-follow servo from the current attention target."""
 
-        presence_snapshot = self.latest_presence_snapshot
-        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
-        live_facts = {
-            "camera": camera_snapshot.to_automation_facts(),
-            "vad": {
-                "speech_detected": getattr(audio_observation, "speech_detected", None),
-            },
-            "respeaker": {
-                "azimuth_deg": getattr(audio_observation, "azimuth_deg", None),
-                "direction_confidence": getattr(audio_observation, "direction_confidence", None),
-            },
-            "audio_policy": {
-                "speaker_direction_stable": (
-                    None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
-                ),
-            },
-        }
-        speaker_association = derive_respeaker_speaker_association(
-            observed_at=observed_at,
-            live_facts=live_facts,
-        )
-        self.latest_speaker_association_snapshot = speaker_association
-        attention_target = self.attention_target_tracker.observe(
-            observed_at=observed_at,
-            live_facts=live_facts,
-            runtime_status=getattr(getattr(self.runtime, "status", None), "value", None),
-            presence_session_id=presence_session_id,
-            speaker_association=speaker_association,
-            identity_fusion=self.latest_identity_fusion_snapshot,
-        )
-        self.latest_attention_target_snapshot = attention_target
-        live_facts["speaker_association"] = speaker_association.to_automation_facts()
-        live_facts["attention_target"] = attention_target.to_automation_facts()
-        self._record_attention_follow_pipeline_if_changed(
+        return service_attention_helpers.update_display_attention_follow(
+            self,
             source=source,
             observed_at=observed_at,
             camera_snapshot=camera_snapshot,
-            attention_target=attention_target,
+            audio_observation=audio_observation,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
-        self._update_attention_servo_follow(
-            source=source,
-            observed_at=observed_at,
-            camera_person_visible=camera_snapshot.person_visible,
-            attention_target=attention_target,
-        )
-        publisher = self.display_attention_publisher
-        if publisher is None:
-            return None
-        try:
-            return publisher.publish_from_facts(
-                config=self.config,
-                live_facts=live_facts,
-            )
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_display_attention_follow_failed",
-                message="Failed to update the HDMI face attention-follow cue.",
-                error=exc,
-                data={"observed_at": observed_at},
-            )
-            return None
 
     def _update_attention_servo_follow(
         self,
         *,
         source: str,
         observed_at: float,
-        camera_person_visible: bool,
+        camera_snapshot: ProactiveCameraSnapshot,
         attention_target: MultimodalAttentionTargetSnapshot | None,
+        attention_target_debug: dict[str, object] | None = None,
     ) -> None:
         """Update the optional body-orientation servo from the current attention target."""
 
-        controller = self.attention_servo_controller
-        if controller is None:
-            return
-        if not self._attention_servo_source_is_authoritative(source=source):
-            self._record_attention_servo_follow_if_changed(
-                source=source,
-                observed_at=observed_at,
-                attention_target=attention_target,
-                decision=AttentionServoDecision(
-                    observed_at=observed_at,
-                    active=False,
-                    reason="ignored_non_authoritative_source",
-                    confidence=0.0 if attention_target is None else attention_target.confidence,
-                    target_center_x=None if attention_target is None else attention_target.target_center_x,
-                ),
-            )
-            return
-        try:
-            decision = controller.update(
-                observed_at=observed_at,
-                active=False if attention_target is None else attention_target.active,
-                target_center_x=None if attention_target is None else attention_target.target_center_x,
-                confidence=0.0 if attention_target is None else attention_target.confidence,
-                visible_target_present=camera_person_visible,
-            )
-            self._record_attention_servo_follow_if_changed(
-                source=source,
-                observed_at=observed_at,
-                attention_target=attention_target,
-                decision=decision,
-            )
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_attention_servo_follow_failed",
-                message="Failed to update the attention-follow servo output.",
-                error=exc,
-                data={"observed_at": observed_at},
-            )
+        service_attention_helpers.update_attention_servo_follow(
+            self,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=attention_target,
+            attention_target_debug=attention_target_debug,
+        )
+
+    def _record_attention_servo_forensic_tick(
+        self,
+        *,
+        source: str,
+        observed_at: float,
+        camera_snapshot: ProactiveCameraSnapshot,
+        attention_target: MultimodalAttentionTargetSnapshot | None,
+        attention_target_debug: dict[str, object] | None,
+        decision: AttentionServoDecision,
+    ) -> None:
+        """Record one per-tick forensic servo ledger when scoped instrumentation is enabled."""
+
+        service_attention_helpers.record_attention_servo_forensic_tick(
+            self,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=attention_target,
+            attention_target_debug=attention_target_debug,
+            decision=decision,
+        )
+
+    def _summarize_visible_persons(self, camera_snapshot: ProactiveCameraSnapshot) -> list[dict[str, object]]:
+        """Return one bounded summary of current visible-person anchors."""
+
+        return service_attention_helpers.summarize_visible_persons(camera_snapshot)
+
+    def _build_attention_servo_decision_ledger(
+        self,
+        *,
+        source: str,
+        camera_snapshot: ProactiveCameraSnapshot,
+        attention_target: MultimodalAttentionTargetSnapshot | None,
+        controller_debug: dict[str, object] | None,
+        decision: AttentionServoDecision,
+    ) -> dict[str, object]:
+        """Build one compact decision-ledger payload for forensic servo debugging."""
+
+        return service_attention_helpers.build_attention_servo_decision_ledger(
+            self,
+            source=source,
+            camera_snapshot=camera_snapshot,
+            attention_target=attention_target,
+            controller_debug=controller_debug,
+            decision=decision,
+        )
 
     def _attention_servo_source_is_authoritative(self, *, source: str) -> bool:
         """Prefer the dedicated HDMI attention-refresh path over automation snapshots for physical servo control."""
 
-        if not display_attention_refresh_supported(
-            config=self.config,
-            vision_observer=self.vision_observer,
-        ):
-            return True
-        return source == "display_attention_refresh"
+        return service_attention_helpers.attention_servo_source_is_authoritative(
+            self,
+            source=source,
+        )
 
     def _record_attention_follow_pipeline_if_changed(
         self,
@@ -3121,87 +2758,12 @@ class ProactiveCoordinator:
     ) -> None:
         """Record one changed runtime attention-follow pipeline state before servo gating."""
 
-        controller = self.attention_servo_controller
-        controller_config = None if controller is None else getattr(controller, "config", None)
-        key = (
-            source,
-            camera_snapshot.person_visible,
-            camera_snapshot.person_count,
-            camera_snapshot.camera_ready,
-            camera_snapshot.camera_ai_ready,
-            _round_optional_ratio(camera_snapshot.primary_person_center_x),
-            None if attention_target is None else attention_target.state,
-            None if attention_target is None else attention_target.active,
-            None if attention_target is None else attention_target.target_track_id,
-            _round_optional_ratio(None if attention_target is None else attention_target.target_center_x),
-            _round_optional_ratio(None if attention_target is None else attention_target.target_velocity_x),
-            None if attention_target is None else attention_target.focus_source,
-            _round_optional_ratio(None if attention_target is None else attention_target.confidence),
-            None if controller is None else True,
-            None if controller_config is None else getattr(controller_config, "enabled", None),
-            None if controller_config is None else getattr(controller_config, "follow_exit_only", None),
-            None if controller_config is None else getattr(controller_config, "driver", None),
-            None if controller_config is None else getattr(controller_config, "gpio", None),
-        )
-        if key == self._last_attention_follow_pipeline_key:
-            return
-        self._last_attention_follow_pipeline_key = key
-        data = {
-            "observed_at": observed_at,
-            "follow_source": source,
-            "camera_person_visible": camera_snapshot.person_visible,
-            "camera_person_count": camera_snapshot.person_count,
-            "camera_visible_person_count": len(camera_snapshot.visible_persons),
-            "camera_ready": camera_snapshot.camera_ready,
-            "camera_ai_ready": camera_snapshot.camera_ai_ready,
-            "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
-            "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
-            "attention_target_state": None if attention_target is None else attention_target.state,
-            "attention_target_active": None if attention_target is None else attention_target.active,
-            "attention_target_track_id": None if attention_target is None else attention_target.target_track_id,
-            "attention_target_center_x": _round_optional_ratio(
-                None if attention_target is None else attention_target.target_center_x
-            ),
-            "attention_target_velocity_x": _round_optional_ratio(
-                None if attention_target is None else attention_target.target_velocity_x
-            ),
-            "attention_target_focus_source": None if attention_target is None else attention_target.focus_source,
-            "attention_target_confidence": _round_optional_ratio(
-                None if attention_target is None else attention_target.confidence
-            ),
-            "servo_controller_present": controller is not None,
-            "servo_config_enabled": None if controller_config is None else getattr(controller_config, "enabled", None),
-            "servo_follow_exit_only": (
-                None if controller_config is None else getattr(controller_config, "follow_exit_only", None)
-            ),
-            "servo_driver": None if controller_config is None else getattr(controller_config, "driver", None),
-            "servo_gpio": None if controller_config is None else getattr(controller_config, "gpio", None),
-        }
-        self._append_ops_event(
-            event="proactive_attention_follow_pipeline",
-            message="Recorded one changed attention-follow pipeline state before servo gating.",
-            data=data,
-        )
-        self._emit(
-            _emit_key_value_line(
-                "attention_follow_pipeline",
-                source=source,
-                person_visible=camera_snapshot.person_visible,
-                person_count=camera_snapshot.person_count,
-                camera_ready=camera_snapshot.camera_ready,
-                camera_ai_ready=camera_snapshot.camera_ai_ready,
-                target_state=None if attention_target is None else attention_target.state,
-                target_active=None if attention_target is None else attention_target.active,
-                target_center_x=_round_optional_ratio(
-                    None if attention_target is None else attention_target.target_center_x
-                ),
-                target_confidence=_round_optional_ratio(
-                    None if attention_target is None else attention_target.confidence
-                ),
-                servo_enabled=None if controller_config is None else getattr(controller_config, "enabled", None),
-                follow_exit_only=None if controller_config is None else getattr(controller_config, "follow_exit_only", None),
-                servo_driver=None if controller_config is None else getattr(controller_config, "driver", None),
-            )
+        service_attention_helpers.record_attention_follow_pipeline_if_changed(
+            self,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=attention_target,
         )
 
     def _record_attention_servo_follow_if_changed(
@@ -3214,55 +2776,12 @@ class ProactiveCoordinator:
     ) -> None:
         """Record only materially changed servo-follow decisions for Pi root-cause tracing."""
 
-        key = (
-            source,
-            decision.reason,
-            decision.active,
-            _round_optional_ratio(decision.target_center_x),
-            _round_optional_ratio(decision.applied_center_x),
-            decision.target_pulse_width_us,
-            decision.commanded_pulse_width_us,
-            None if attention_target is None else attention_target.state,
-            None if attention_target is None else attention_target.target_track_id,
-            _round_optional_ratio(None if attention_target is None else attention_target.target_center_x),
-            None if attention_target is None else attention_target.focus_source,
-        )
-        if key == self._last_attention_servo_follow_key:
-            return
-        self._last_attention_servo_follow_key = key
-        self._append_ops_event(
-            event="proactive_attention_servo_follow",
-            message="Updated the bounded body-orientation servo trace.",
-            data={
-                "observed_at": observed_at,
-                "follow_source": source,
-                "attention_target_state": None if attention_target is None else attention_target.state,
-                "attention_target_active": None if attention_target is None else attention_target.active,
-                "attention_target_track_id": None if attention_target is None else attention_target.target_track_id,
-                "attention_target_center_x": _round_optional_ratio(
-                    None if attention_target is None else attention_target.target_center_x
-                ),
-                "attention_target_focus_source": None if attention_target is None else attention_target.focus_source,
-                "decision_reason": decision.reason,
-                "decision_active": decision.active,
-                "decision_confidence": _round_optional_ratio(decision.confidence),
-                "decision_target_center_x": _round_optional_ratio(decision.target_center_x),
-                "decision_applied_center_x": _round_optional_ratio(decision.applied_center_x),
-                "decision_target_pulse_width_us": decision.target_pulse_width_us,
-                "decision_commanded_pulse_width_us": decision.commanded_pulse_width_us,
-            },
-        )
-        self._emit(
-            _emit_key_value_line(
-                "attention_servo_decision",
-                source=source,
-                reason=decision.reason,
-                active=decision.active,
-                target_center_x=_round_optional_ratio(decision.target_center_x),
-                applied_center_x=_round_optional_ratio(decision.applied_center_x),
-                target_pulse_us=decision.target_pulse_width_us,
-                commanded_pulse_us=decision.commanded_pulse_width_us,
-            )
+        service_attention_helpers.record_attention_servo_follow_if_changed(
+            self,
+            source=source,
+            observed_at=observed_at,
+            attention_target=attention_target,
+            decision=decision,
         )
 
     def _update_display_gesture_emoji_ack(
@@ -3271,18 +2790,7 @@ class ProactiveCoordinator:
     ) -> None:
         """Mirror clear stabilized user gestures into the HDMI emoji reserve area."""
 
-        publisher = self.display_gesture_emoji_publisher
-        if publisher is None:
-            return
-        try:
-            publisher.publish_update(camera_update)
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_display_gesture_emoji_failed",
-                message="Failed to update the HDMI gesture-emoji acknowledgement cue.",
-                error=exc,
-                data={"event_names": list(camera_update.event_names)},
-            )
+        service_gesture_helpers.update_display_gesture_emoji_ack(self, camera_update)
 
     def _publish_display_gesture_decision(
         self,
@@ -3290,19 +2798,7 @@ class ProactiveCoordinator:
     ) -> DisplayGestureEmojiPublishResult | None:
         """Persist one direct gesture-ack decision through the emoji publisher."""
 
-        publisher = self.display_gesture_emoji_publisher
-        if publisher is None:
-            return None
-        try:
-            return publisher.publish(decision)
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_display_gesture_emoji_failed",
-                message="Failed to update the HDMI gesture-emoji acknowledgement cue.",
-                error=exc,
-                data={"reason": decision.reason},
-            )
-            return None
+        return service_gesture_helpers.publish_display_gesture_decision(self, decision)
 
     def _maybe_publish_display_ambient_impulse(
         self,
@@ -3317,7 +2813,7 @@ class ProactiveCoordinator:
         publisher = self.display_ambient_impulse_publisher
         if publisher is None:
             return None
-        if tick_result.decision is not None or tick_result.wakeword_match is not None:
+        if tick_result.decision is not None:
             return None
         try:
             return publisher.publish_if_due(
@@ -3341,11 +2837,10 @@ class ProactiveCoordinator:
     def open_background_lanes(self) -> None:
         """Re-enable background runtime helpers after monitor startup."""
 
-        self._wakeword_stream_resume_enabled = True
         self._gesture_wakeup_dispatcher.open()
 
     def close_background_lanes(self, *, timeout_s: float = 0.25) -> bool:
-        """Stop background helpers and prevent wakeword-stream reopen on close.
+        """Stop background helpers while shutting the monitor down.
 
         Args:
             timeout_s: Join budget for any in-flight visual wakeup worker.
@@ -3355,7 +2850,6 @@ class ProactiveCoordinator:
             window, False when a worker is still running in the background.
         """
 
-        self._wakeword_stream_resume_enabled = False
         return self._gesture_wakeup_dispatcher.close(timeout_s=timeout_s)
 
     def _handle_gesture_wakeup_decision(
@@ -3364,19 +2858,7 @@ class ProactiveCoordinator:
     ) -> bool:
         """Dispatch one accepted visual wake decision without blocking refresh."""
 
-        if not decision.active or self.gesture_wakeup_handler is None:
-            return False
-        dispatched = self._gesture_wakeup_dispatcher.submit(decision)
-        if not dispatched:
-            self._append_ops_event(
-                event="gesture_wakeup_dispatch_skipped",
-                message="Visual wakeup was skipped because another visual wakeup is already active.",
-                data={
-                    "gesture": decision.trigger_gesture.value,
-                    "reason": decision.reason,
-                },
-            )
-        return dispatched
+        return service_gesture_helpers.handle_gesture_wakeup_decision(self, decision)
 
     def _run_gesture_wakeup_handler(
         self,
@@ -3384,78 +2866,7 @@ class ProactiveCoordinator:
     ) -> bool:
         """Run one visual wakeup handler on the dedicated dispatcher thread."""
 
-        def _run_handler() -> bool:
-            try:
-                return bool(self.gesture_wakeup_handler(decision))
-            except Exception as exc:
-                self._record_fault(
-                    event="gesture_wakeup_handler_failed",
-                    message="Gesture wakeup handler failed.",
-                    error=exc,
-                    data={"reason": decision.reason, "gesture": decision.trigger_gesture.value},
-                )
-                return False
-        handled = self._run_with_paused_wakeword_stream(
-            enabled=True,
-            pause_fault_event="gesture_wakeup_stream_pause_failed",
-            pause_fault_message="Gesture wakeup could not pause the active streaming wakeword capture path.",
-            pause_fault_data={"reason": decision.reason, "gesture": decision.trigger_gesture.value},
-            handler=_run_handler,
-        )
-        if handled:
-            self._append_ops_event(
-                event="gesture_wakeup_triggered",
-                message="A configured visual wake gesture opened a hands-free conversation path.",
-                data={
-                    "gesture": decision.trigger_gesture.value,
-                    "confidence": _round_optional_ratio(decision.confidence),
-                    "request_source": decision.request_source,
-                },
-            )
-        return handled
-
-    def _run_with_paused_wakeword_stream(
-        self,
-        *,
-        enabled: bool,
-        pause_fault_event: str,
-        pause_fault_message: str,
-        pause_fault_data: dict[str, Any],
-        handler: Callable[[], bool],
-    ) -> bool:
-        """Run one exclusive-audio handler after pausing any active wakeword stream.
-
-        The streaming wakeword monitor owns a long-lived ``arecord`` handle on the
-        same ALSA capture device that hands-free listening opens next. Visual
-        wakeup and streaming wakeword success both need the same pause/resume
-        handoff so they do not fail immediately with ``Device or resource busy``.
-        """
-
-        paused_stream = None
-        if enabled and self.wakeword_stream is not None:
-            paused_stream = self.wakeword_stream
-            try:
-                paused_stream.close()
-            except Exception as exc:
-                self._record_fault(
-                    event=pause_fault_event,
-                    message=pause_fault_message,
-                    error=exc,
-                    data=dict(pause_fault_data),
-                )
-                return False
-        try:
-            return bool(handler())
-        finally:
-            if (
-                paused_stream is not None
-                and self._wakeword_stream_resume_enabled
-                and self.wakeword_stream is paused_stream
-            ):
-                try:
-                    paused_stream.open()
-                except Exception as exc:
-                    self._handle_wakeword_stream_failure(exc)
+        return service_gesture_helpers.run_gesture_wakeup_handler(self, decision)
 
     def _record_display_attention_follow_if_changed(
         self,
@@ -3467,92 +2878,12 @@ class ProactiveCoordinator:
     ) -> None:
         """Persist one bounded changed-only trace of the HDMI attention-follow path."""
 
-        decision = None if publish_result is None else publish_result.decision
-        key = (
-            str(runtime_status_value or "").strip().lower(),
-            camera_snapshot.camera_online,
-            camera_snapshot.camera_ready,
-            camera_snapshot.camera_ai_ready,
-            camera_snapshot.camera_error,
-            camera_snapshot.person_visible,
-            camera_snapshot.person_visible_unknown,
-            camera_snapshot.person_count,
-            camera_snapshot.person_count_unknown,
-            len(camera_snapshot.visible_persons),
-            camera_snapshot.primary_person_zone.value,
-            _round_optional_ratio(camera_snapshot.primary_person_center_x),
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_track_id,
-            _round_optional_ratio(
-                None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_center_x
-            ),
-            None if publish_result is None else publish_result.action,
-            None if decision is None else decision.reason,
-            None if decision is None else decision.gaze.value,
-            None if decision is None else decision.cue_gaze_x,
-            None if decision is None else decision.cue_gaze_y,
-            None if decision is None else decision.head_dx,
-            None if decision is None else decision.speaker_locked,
-        )
-        if key == self._last_display_attention_follow_key:
-            return
-        self._last_display_attention_follow_key = key
-        self._append_ops_event(
-            event="proactive_display_attention_follow",
-            message="Updated the bounded HDMI attention-follow trace.",
-            data={
-                "observed_at": observed_at,
-                "runtime_status": str(runtime_status_value or "").strip().lower() or None,
-                "camera_online": camera_snapshot.camera_online,
-                "camera_ready": camera_snapshot.camera_ready,
-                "camera_ai_ready": camera_snapshot.camera_ai_ready,
-                "camera_error": camera_snapshot.camera_error,
-                "person_visible": camera_snapshot.person_visible,
-                "person_visible_unknown": camera_snapshot.person_visible_unknown,
-                "camera_person_count": camera_snapshot.person_count,
-                "camera_person_count_unknown": camera_snapshot.person_count_unknown,
-                "camera_visible_person_count": len(camera_snapshot.visible_persons),
-                "camera_visible_persons_unknown": camera_snapshot.visible_persons_unknown,
-                "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
-                "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
-                "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
-                "camera_frame_age_s": _round_optional_seconds(
-                    None
-                    if camera_snapshot.last_camera_frame_at is None
-                    else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
-                ),
-                "attention_target_state": (
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state
-                ),
-                "attention_target_active": (
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.active
-                ),
-                "attention_target_horizontal": (
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal
-                ),
-                "attention_target_track_id": (
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_track_id
-                ),
-                "attention_target_center_x": _round_optional_ratio(
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_center_x
-                ),
-                "attention_target_velocity_x": _round_optional_ratio(
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_velocity_x
-                ),
-                "attention_target_focus_source": (
-                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source
-                ),
-                "publish_action": None if publish_result is None else publish_result.action,
-                "publish_owner": None if publish_result is None else publish_result.owner,
-                "decision_reason": None if decision is None else decision.reason,
-                "decision_gaze": None if decision is None else decision.gaze.value,
-                "decision_cue_gaze_x": None if decision is None else decision.cue_gaze_x,
-                "decision_cue_gaze_y": None if decision is None else decision.cue_gaze_y,
-                "decision_head_dx": None if decision is None else decision.head_dx,
-                "decision_head_dy": None if decision is None else decision.head_dy,
-                "decision_speaker_locked": None if decision is None else decision.speaker_locked,
-            },
+        service_attention_helpers.record_display_attention_follow_if_changed(
+            self,
+            observed_at=observed_at,
+            runtime_status_value=runtime_status_value,
+            camera_snapshot=camera_snapshot,
+            publish_result=publish_result,
         )
 
     def _record_attention_debug_tick(
@@ -3568,108 +2899,16 @@ class ProactiveCoordinator:
     ) -> None:
         """Append one continuous bounded attention-debug tick."""
 
-        stream = self.display_attention_debug_stream
-        if stream is None:
-            return
-        decision = None if publish_result is None else publish_result.decision
-        payload: dict[str, Any] = {
-            "runtime_status": str(runtime_status_value or "").strip().lower() or None,
-            "vision_mode": self._last_attention_vision_refresh_mode,
-            "audio_mode": self._last_attention_audio_refresh_mode,
-            "stage_ms": dict(stage_ms),
-        }
-        if camera_snapshot is not None:
-            payload.update(
-                {
-                    "camera_online": camera_snapshot.camera_online,
-                    "camera_ready": camera_snapshot.camera_ready,
-                    "camera_ai_ready": camera_snapshot.camera_ai_ready,
-                    "camera_error": camera_snapshot.camera_error,
-                    "person_visible": camera_snapshot.person_visible,
-                    "person_visible_unknown": camera_snapshot.person_visible_unknown,
-                    "camera_person_count": camera_snapshot.person_count,
-                    "camera_visible_person_count": len(camera_snapshot.visible_persons),
-                    "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
-                    "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
-                    "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
-                    "camera_looking_signal_state": camera_snapshot.looking_signal_state,
-                    "camera_looking_signal_source": camera_snapshot.looking_signal_source,
-                    "camera_frame_age_s": _round_optional_seconds(
-                        None
-                        if camera_snapshot.last_camera_frame_at is None
-                        else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
-                    ),
-                }
-            )
-        if self.latest_attention_target_snapshot is not None:
-            payload.update(
-                {
-                    "attention_target_state": self.latest_attention_target_snapshot.state,
-                    "attention_target_active": self.latest_attention_target_snapshot.active,
-                    "attention_target_horizontal": self.latest_attention_target_snapshot.target_horizontal,
-                    "attention_target_vertical": self.latest_attention_target_snapshot.target_vertical,
-                    "attention_target_track_id": self.latest_attention_target_snapshot.target_track_id,
-                    "attention_target_center_x": _round_optional_ratio(
-                        self.latest_attention_target_snapshot.target_center_x
-                    ),
-                    "attention_target_center_y": _round_optional_ratio(
-                        self.latest_attention_target_snapshot.target_center_y
-                    ),
-                    "attention_target_focus_source": self.latest_attention_target_snapshot.focus_source,
-                    "attention_target_speaker_locked": self.latest_attention_target_snapshot.speaker_locked,
-                }
-            )
-        if audio_observation is not None:
-            payload.update(
-                {
-                    "audio_speech_detected": audio_observation.speech_detected,
-                    "audio_azimuth_deg": audio_observation.azimuth_deg,
-                    "audio_direction_confidence": _round_optional_ratio(audio_observation.direction_confidence),
-                    "audio_signal_source": audio_observation.signal_source,
-                }
-            )
-        if publish_result is not None:
-            payload.update(
-                {
-                    "publish_action": publish_result.action,
-                    "publish_owner": publish_result.owner,
-                }
-            )
-        if decision is not None:
-            payload.update(
-                {
-                    "decision_reason": decision.reason,
-                    "decision_gaze": decision.gaze.value,
-                    "decision_cue_gaze_x": decision.cue_gaze_x,
-                    "decision_cue_gaze_y": decision.cue_gaze_y,
-                    "decision_head_dx": decision.head_dx,
-                    "decision_head_dy": decision.head_dy,
-                    "decision_speaker_locked": decision.speaker_locked,
-                }
-            )
-        attention_debug_details_getter = getattr(self.vision_observer, "attention_debug_details", None)
-        if callable(attention_debug_details_getter):
-            try:
-                attention_debug_details = attention_debug_details_getter()
-            except Exception:
-                attention_debug_details = None
-            if attention_debug_details:
-                payload["pipeline_debug"] = attention_debug_details
-        if self._last_display_attention_fusion_debug:
-            payload["display_camera_fusion"] = dict(self._last_display_attention_fusion_debug)
-        try:
-            stream.append_tick(
-                outcome=outcome,
-                observed_at=observed_at,
-                data=payload,
-            )
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_attention_debug_stream_failed",
-                message="Failed to append the bounded attention debug tick.",
-                error=exc,
-                data={"outcome": outcome},
-            )
+        service_attention_helpers.record_attention_debug_tick(
+            self,
+            observed_at=observed_at,
+            outcome=outcome,
+            runtime_status_value=runtime_status_value,
+            stage_ms=stage_ms,
+            camera_snapshot=camera_snapshot,
+            audio_observation=audio_observation,
+            publish_result=publish_result,
+        )
 
     def _record_gesture_debug_tick(
         self,
@@ -3686,82 +2925,62 @@ class ProactiveCoordinator:
     ) -> None:
         """Append one continuous bounded gesture-debug tick."""
 
-        stream = self.display_gesture_debug_stream
-        if stream is None:
-            return
-        payload: dict[str, Any] = {
-            "runtime_status": str(runtime_status_value or "").strip().lower() or None,
-            "vision_mode": self._last_gesture_vision_refresh_mode,
-            "stage_ms": dict(stage_ms),
-        }
-        if observation is not None:
-            payload.update(
-                {
-                    "camera_online": observation.camera_online,
-                    "camera_ready": observation.camera_ready,
-                    "camera_ai_ready": observation.camera_ai_ready,
-                    "camera_error": observation.camera_error,
-                    "camera_person_count": observation.person_count,
-                    "camera_fine_hand_gesture": observation.fine_hand_gesture.value,
-                    "camera_fine_hand_gesture_confidence": _round_optional_ratio(
-                        observation.fine_hand_gesture_confidence
-                    ),
-                    "camera_gesture_event": observation.gesture_event.value,
-                    "camera_gesture_confidence": _round_optional_ratio(observation.gesture_confidence),
-                    "camera_hand_or_object_near": observation.hand_or_object_near_camera,
-                    "camera_showing_intent_likely": observation.showing_intent_likely,
-                }
-            )
-        gesture_debug_details_getter = getattr(self.vision_observer, "gesture_debug_details", None)
-        if callable(gesture_debug_details_getter):
-            try:
-                gesture_debug_details = gesture_debug_details_getter()
-            except Exception:
-                gesture_debug_details = None
-            if gesture_debug_details:
-                payload["pipeline_debug"] = gesture_debug_details
-        if decision is not None:
-            payload.update(
-                {
-                    "decision_active": decision.active,
-                    "decision_reason": decision.reason,
-                    "decision_symbol": decision.symbol.value,
-                    "decision_accent": decision.accent,
-                    "decision_hold_seconds": round(decision.hold_seconds, 3),
-                }
-            )
-        if publish_result is not None:
-            payload.update(
-                {
-                    "publish_action": publish_result.action,
-                    "publish_owner": publish_result.owner,
-                }
-            )
-        if wakeup_decision is not None:
-            payload.update(
-                {
-                    "gesture_wakeup_active": wakeup_decision.active,
-                    "gesture_wakeup_reason": wakeup_decision.reason,
-                    "gesture_wakeup_trigger_gesture": wakeup_decision.trigger_gesture.value,
-                    "gesture_wakeup_observed_gesture": wakeup_decision.observed_gesture.value,
-                    "gesture_wakeup_confidence": _round_optional_ratio(wakeup_decision.confidence),
-                    "gesture_wakeup_request_source": wakeup_decision.request_source,
-                    "gesture_wakeup_handled": wakeup_handled,
-                }
-            )
-        try:
-            stream.append_tick(
-                outcome=outcome,
-                observed_at=observed_at,
-                data=payload,
-            )
-        except Exception as exc:
-            self._record_fault(
-                event="proactive_gesture_debug_stream_failed",
-                message="Failed to append the bounded gesture debug tick.",
-                error=exc,
-                data={"outcome": outcome},
-            )
+        service_gesture_helpers.record_gesture_debug_tick(
+            self,
+            observed_at=observed_at,
+            outcome=outcome,
+            runtime_status_value=runtime_status_value,
+            stage_ms=stage_ms,
+            observation=observation,
+            decision=decision,
+            publish_result=publish_result,
+            wakeup_decision=wakeup_decision,
+            wakeup_handled=wakeup_handled,
+        )
+
+    def _gesture_observation_trace_details(
+        self,
+        observation: SocialVisionObservation,
+    ) -> dict[str, object]:
+        """Return one bounded trace summary for the current gesture observation."""
+
+        return service_gesture_helpers.gesture_observation_trace_details(observation)
+
+    def _trace_gesture_ack_lane_decision(
+        self,
+        *,
+        observation: SocialVisionObservation,
+        decision: DisplayGestureEmojiDecision,
+    ) -> None:
+        """Emit one decision ledger entry for the HDMI ack lane result."""
+
+        service_gesture_helpers.trace_gesture_ack_lane_decision(observation, decision)
+
+    def _trace_gesture_wakeup_lane_decision(
+        self,
+        *,
+        decision: GestureWakeupDecision,
+    ) -> None:
+        """Emit one decision ledger entry for the visual wake lane."""
+
+        service_gesture_helpers.trace_gesture_wakeup_lane_decision(decision)
+
+    def _trace_gesture_publish_decision(
+        self,
+        *,
+        decision: DisplayGestureEmojiDecision,
+        publish_result: DisplayGestureEmojiPublishResult | None,
+        wakeup_decision: GestureWakeupDecision,
+        wakeup_handled: bool,
+    ) -> None:
+        """Emit one decision ledger entry for the final publish/dispatch outcome."""
+
+        service_gesture_helpers.trace_gesture_publish_decision(
+            decision=decision,
+            publish_result=publish_result,
+            wakeup_decision=wakeup_decision,
+            wakeup_handled=wakeup_handled,
+        )
 
     def _observe_camera_surface(
         self,
@@ -4114,14 +3333,12 @@ class ProactiveMonitorService:
         coordinator: ProactiveCoordinator,
         *,
         poll_interval_s: float,
-        wakeword_stream: object | None = None,
         emit: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize one monitor service around a configured coordinator."""
 
         self.coordinator = coordinator
         self.poll_interval_s = max(0.2, poll_interval_s)
-        self.wakeword_stream = wakeword_stream
         self.emit = emit or (lambda _line: None)
         self._stop_event = Event()
         self._thread: Thread | None = None
@@ -4184,7 +3401,6 @@ class ProactiveMonitorService:
         if self._resources_open:
             return
         opened_pir = False
-        opened_stream = False
         try:
             if self.coordinator.pir_monitor is not None:
                 pir_open_result = open_pir_monitor_with_busy_retry(self.coordinator.pir_monitor)
@@ -4198,13 +3414,8 @@ class ProactiveMonitorService:
                         },
                     )
                 opened_pir = True
-            if self.wakeword_stream is not None:
-                self.wakeword_stream.open()
-                opened_stream = True
             self._resources_open = True
         except Exception as exc:
-            if opened_stream:
-                self._safe_close_resource(self.wakeword_stream, name="wakeword_stream")
             if opened_pir:
                 self._safe_close_resource(self.coordinator.pir_monitor, name="pir_monitor")
             self._resources_open = False
@@ -4227,7 +3438,6 @@ class ProactiveMonitorService:
             self.coordinator.attention_servo_controller,
             name="attention_servo_controller",
         )
-        self._safe_close_resource(self.wakeword_stream, name="wakeword_stream")
         self._safe_close_resource(self.coordinator.pir_monitor, name="pir_monitor")
         self._resources_open = False
 
@@ -4260,10 +3470,7 @@ class ProactiveMonitorService:
             self._append_ops_event(
                 event="proactive_monitor_started",
                 message="Proactive monitor started.",
-                data={
-                    "poll_interval_s": self.poll_interval_s,
-                    "wakeword_streaming": self.wakeword_stream is not None,
-                },
+                data={"poll_interval_s": self.poll_interval_s},
             )
             self._emit("proactive_monitor=started")
             return self
@@ -4310,7 +3517,7 @@ class ProactiveMonitorService:
         self.close()
 
     def _run(self) -> None:
-        """Run the wakeword drain and proactive tick loop until stopped."""
+        """Run the proactive tick loop until stopped."""
 
         next_tick_at = 0.0
         next_attention_refresh_at = 0.0
@@ -4403,6 +3610,7 @@ def build_default_proactive_monitor(
     gesture_wakeup_handler: Callable[[GestureWakeupDecision], bool] | None = None,
     idle_predicate: Callable[[], bool] | None = None,
     observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
+    live_context_handler: Callable[[dict[str, Any]], None] | None = None,
     emit: Callable[[str], None] | None = None,
 ) -> ProactiveMonitorService | None:
     """Build the default proactive monitor stack from Twinr runtime services."""
@@ -4463,9 +3671,6 @@ def build_default_proactive_monitor(
         )
 
     presence_session = None
-    wakeword_spotter = None
-    wakeword_stream = None
-    wakeword_policy = None
     if config.voice_orchestrator_enabled:
         presence_session = PresenceSessionController(
             presence_grace_s=config.voice_orchestrator_follow_up_timeout_s,
@@ -4478,10 +3683,7 @@ def build_default_proactive_monitor(
     distress_enabled = bool(
         config.proactive_enabled and config.proactive_audio_distress_enabled
     )  # AUDIT-FIX(#5): do not run proactive distress classification when proactive mode is disabled.
-    shared_voice_capture_conflict = _proactive_pcm_capture_conflicts_with_voice_orchestrator(
-        config,
-        wakeword_stream=wakeword_stream,
-    )
+    shared_voice_capture_conflict = _proactive_pcm_capture_conflicts_with_voice_orchestrator(config)
     if shared_voice_capture_conflict and config.proactive_audio_enabled:
         _record_component_warning(
             runtime=runtime,
@@ -4494,35 +3696,7 @@ def build_default_proactive_monitor(
             ),
         )
     if config.proactive_audio_enabled:
-        if wakeword_stream is not None:
-            try:
-                audio_observer = AmbientAudioObservationProvider(
-                    sampler=wakeword_stream,
-                    audio_lock=None,
-                    sample_ms=config.proactive_audio_sample_ms,
-                    distress_enabled=distress_enabled,
-                )
-            except Exception as exc:
-                _record_component_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="audio_observer_init_failed",
-                    detail=f"Streaming audio observer initialization failed: {_exception_text(exc)}",
-                )
-                audio_observer = NullAudioObservationProvider()
-
-            # AUDIT-FIX(#6): prepare a secondary non-streaming observer so runtime stream failures can recover to a working audio path.
-            def _fallback_audio_observer_factory() -> Any:
-                sampler = AmbientAudioSampler.from_config(config)
-                return AmbientAudioObservationProvider(
-                    sampler=sampler,
-                    audio_lock=audio_lock,
-                    sample_ms=config.proactive_audio_sample_ms,
-                    distress_enabled=distress_enabled,
-                )
-
-            audio_observer_fallback_factory = _fallback_audio_observer_factory
-        elif shared_voice_capture_conflict:
+        if shared_voice_capture_conflict:
             audio_observer = NullAudioObservationProvider()
         else:
             try:
@@ -4634,9 +3808,6 @@ def build_default_proactive_monitor(
                 )
                 audio_observer = NullAudioObservationProvider()
                 audio_observer_fallback_factory = None
-                wakeword_stream = None
-                wakeword_spotter = None
-                wakeword_policy = None
             else:
                 _record_component_warning(
                     runtime=runtime,
@@ -4645,7 +3816,7 @@ def build_default_proactive_monitor(
                     detail=f"ReSpeaker signal-provider initialization failed: {_exception_text(exc)}",
                 )
 
-    vision_observer = None
+    vision_observer: Any | None = None
     if config.proactive_enabled or display_attention_enabled or display_gesture_enabled:
         try:
             provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
@@ -4655,6 +3826,10 @@ def build_default_proactive_monitor(
                     camera=camera,
                     camera_lock=camera_lock,
                 )
+            elif provider_name == "remote_proxy":
+                vision_observer = RemoteAICameraObservationProvider.from_config(config)
+            elif provider_name == "remote_frame":
+                vision_observer = RemoteFrameAICameraObservationProvider.from_config(config)
             else:
                 vision_observer = LocalAICameraObservationProvider.from_config(config)
         except Exception as exc:
@@ -4703,7 +3878,6 @@ def build_default_proactive_monitor(
 
     if (
         pir_monitor is None
-        and wakeword_stream is None
         and isinstance(audio_observer, NullAudioObservationProvider)
         and vision_observer is None
     ):
@@ -4712,7 +3886,7 @@ def build_default_proactive_monitor(
             emit=emit,
             reason="no_operational_sensor_path",
             detail=(
-                "No operational PIR, streaming wakeword, ambient audio, or HDMI attention camera path could be initialized. "
+                "No operational PIR, ambient audio, or HDMI attention camera path could be initialized. "
                 "The proactive monitor was not started."
             ),
         )
@@ -4727,21 +3901,18 @@ def build_default_proactive_monitor(
         audio_observer=audio_observer,
         audio_observer_fallback_factory=audio_observer_fallback_factory,
         presence_session=presence_session,
-        wakeword_spotter=wakeword_spotter,
-        wakeword_stream=wakeword_stream,
-        wakeword_policy=wakeword_policy,
         vision_reviewer=vision_reviewer,
         portrait_match_provider=portrait_match_provider,
         gesture_wakeup_handler=gesture_wakeup_handler,
         pir_monitor=pir_monitor,
         idle_predicate=idle_predicate,
         observation_handler=observation_handler,
+        live_context_handler=live_context_handler,
         emit=emit,
     )
     return ProactiveMonitorService(
         coordinator,
         poll_interval_s=config.proactive_poll_interval_s,
-        wakeword_stream=wakeword_stream,
         emit=emit,
     )
 

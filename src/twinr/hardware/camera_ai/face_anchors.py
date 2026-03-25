@@ -16,7 +16,7 @@ from pathlib import Path
 import logging
 import math
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 
 from .detection import DetectionResult
 from .models import AICameraBox, AICameraVisiblePerson, AICameraZone

@@ -7,8 +7,9 @@ preferences, plans, and profile-context updates at the runtime boundary.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping  # AUDIT-FIX(#5): Add runtime-safe collection checks for arguments and runtime payloads.
-from typing import Any
+from typing import Any, Literal, overload
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import require_sensitive_voice_confirmation
 
 
@@ -23,11 +24,33 @@ _MAX_EMIT_VALUE_LENGTH = 160
 _MAX_EVENT_METADATA_LENGTH = 512
 
 
-def _ensure_arguments_mapping(arguments: dict[str, object]) -> Mapping[str, object]:
+def _ensure_arguments_mapping(arguments: dict[str, object]) -> dict[str, object]:
     # AUDIT-FIX(#5): Reject non-object tool arguments early instead of relying on AttributeError from `.get()`.
     if not isinstance(arguments, Mapping):
         raise RuntimeError("Tool arguments must be an object.")
-    return arguments
+    return dict(arguments)
+
+
+@overload
+def _get_text_argument(
+    arguments: Mapping[str, object],
+    key: str,
+    *,
+    required: Literal[True],
+    default: str | None = ...,
+    max_length: int = ...,
+) -> str: ...
+
+
+@overload
+def _get_text_argument(
+    arguments: Mapping[str, object],
+    key: str,
+    *,
+    required: Literal[False] = ...,
+    default: str | None = ...,
+    max_length: int = ...,
+) -> str | None: ...
 
 
 def _get_text_argument(
@@ -153,19 +176,13 @@ def _sanitize_event_metadata_value(value: object) -> object:
 
 def _safe_emit(owner: Any, key: str, value: object) -> None:
     # AUDIT-FIX(#1,#7): Treat telemetry emission as best-effort so a committed write is not reported as failed.
-    try:
-        owner.emit(f"{key}={_sanitize_emit_value(value)}")
-    except Exception:
-        return
+    emit_best_effort(owner, f"{key}={_sanitize_emit_value(value)}")
 
 
 def _safe_record_event(owner: Any, event_name: str, message: str, **metadata: object) -> None:
     # AUDIT-FIX(#1): Prevent audit logging failures from aborting successful durable state changes.
     safe_metadata = {key: _sanitize_event_metadata_value(value) for key, value in metadata.items()}
-    try:
-        owner._record_event(event_name, message, **safe_metadata)
-    except Exception:
-        return
+    record_event_best_effort(owner, event_name, message, safe_metadata)
 
 
 def _safe_remember_note(

@@ -1,10 +1,14 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from tempfile import TemporaryDirectory
 import unittest
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.agent.workflows.forensics import WorkflowForensics, bind_workflow_forensics
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
 from twinr.hardware.camera_ai.live_gesture_pipeline import LiveGesturePipeline, _crop_hand_box
 from twinr.hardware.camera_ai.models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
@@ -132,8 +136,8 @@ class _StubHandLandmarkWorker:
 class _RecordingHandLandmarkWorker(_StubHandLandmarkWorker):
     def __init__(self, result) -> None:
         super().__init__(result)
-        self.calls = []
-        self.full_frame_calls = []
+        self.calls: list[dict[str, object]] = []
+        self.full_frame_calls: list[dict[str, object]] = []
 
     def analyze(self, **kwargs):
         self.calls.append(dict(kwargs))
@@ -142,6 +146,28 @@ class _RecordingHandLandmarkWorker(_StubHandLandmarkWorker):
     def analyze_full_frame(self, **kwargs):
         self.full_frame_calls.append(dict(kwargs))
         return super().analyze_full_frame(**kwargs)
+
+
+class _ImageSelectiveRoiRuntime(_StubRuntime):
+    def __init__(self, *, builtin_results, image_to_result) -> None:
+        super().__init__(builtin_results=builtin_results)
+        self.image_to_result = dict(image_to_result)
+        self.roi_inputs: list[object] = []
+
+    def ensure_roi_gesture_recognizer(self, runtime):
+        outer = self
+
+        class _Recognizer:
+            def recognize(self, image):
+                outer.roi_inputs.append(image)
+                return outer.image_to_result.get(
+                    image,
+                    _GestureResult(gestures=[], hand_landmarks=[]),
+                )
+
+        if self._roi_builtin is None:
+            self._roi_builtin = _Recognizer()
+        return self._roi_builtin
 
 
 class LiveGesturePipelineTests(unittest.TestCase):
@@ -169,7 +195,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(observation.gesture_event, AICameraGestureEvent.NONE)
         self.assertEqual(observation.hand_count, 1)
 
-    def test_observe_uses_live_stream_custom_result_for_custom_symbol(self) -> None:
+    def test_observe_ignores_live_stream_custom_symbol_outside_three_gesture_path(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
                 pose_model_path="pose.task",
@@ -182,7 +208,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             builtin_results=[
                 _GestureResult(
                     gestures=[[ _Category("none", 0.95) ]],
-                    hand_landmarks=[[ _Landmark(0.42), _Landmark(0.44) ]],
+                    hand_landmarks=[],
                 )
             ],
             custom_results=[
@@ -191,18 +217,35 @@ class LiveGesturePipelineTests(unittest.TestCase):
                     hand_landmarks=[[ _Landmark(0.43), _Landmark(0.46) ]],
                 )
             ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.95)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("ok_sign", 0.91)]],
+                    hand_landmarks=[],
+                )
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(),
+                final_timestamp_ms=10000,
+            )
         )
 
         observation = pipeline.observe(frame_rgb="frame", observed_at=10.0)
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.OK_SIGN)
-        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.91, places=3)
-        self.assertEqual(observation.hand_count, 1)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
         debug_snapshot = pipeline.debug_snapshot()
         self.assertTrue(debug_snapshot["live_custom_enabled"])
-        self.assertEqual(debug_snapshot["resolved_source"], "live_stream")
+        self.assertEqual(debug_snapshot["resolved_source"], "none")
+        self.assertIsNotNone(pipeline._runtime._custom)
 
-    def test_observe_recovers_custom_ok_sign_from_person_roi_when_live_path_stays_generic(self) -> None:
+    def test_observe_ignores_custom_person_roi_symbol_outside_three_gesture_path(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
                 pose_model_path="pose.task",
@@ -245,10 +288,109 @@ class LiveGesturePipelineTests(unittest.TestCase):
             person_count=1,
         )
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.OK_SIGN)
-        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.91, places=3)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertTrue(debug_snapshot["live_custom_enabled"])
+        self.assertEqual(debug_snapshot["resolved_source"], "none")
+        self.assertIsNotNone(pipeline._runtime._roi_custom)
 
-    def test_observe_detects_wave_from_open_palm_motion_sequence(self) -> None:
+    def test_observe_prefers_custom_three_gesture_live_result_over_conflicting_builtin(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                custom_gesture_model_path="custom.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("thumbs_down", 0.61)]],
+                    hand_landmarks=[[_Landmark(0.45), _Landmark(0.49)]],
+                )
+            ],
+            custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("peace_sign", 0.88)]],
+                    hand_landmarks=[[_Landmark(0.45), _Landmark(0.49)]],
+                )
+            ],
+        )
+
+        observation = pipeline.observe(frame_rgb="frame", observed_at=10.0)
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertTrue(debug_snapshot["live_custom_enabled"])
+
+    def test_observe_writes_person_roi_decisions_into_bound_forensics_trace(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                custom_gesture_model_path="custom.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.94)]],
+                    hand_landmarks=[[_Landmark(0.55), _Landmark(0.59)]],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.25)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("ok_sign", 0.91)]],
+                    hand_landmarks=[],
+                )
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(SimpleNamespace(roi_frame_rgb="roi-frame"),),
+                final_timestamp_ms=4000,
+            )
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            trace_dir = Path(temp_dir) / "state" / "forensics" / "workflow"
+            tracer = WorkflowForensics(
+                project_root=Path(temp_dir),
+                service="live-gesture-test",
+                enabled=True,
+                mode="forensic",
+                base_dir=trace_dir,
+            )
+            with bind_workflow_forensics(tracer, trace_id="gesture-trace-test"):
+                observation = pipeline.observe(
+                    frame_rgb="frame",
+                    observed_at=4.0,
+                    primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+                    person_count=1,
+                )
+            tracer.close()
+
+            self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+            run_id = (trace_dir / "LATEST").read_text(encoding="utf-8").strip()
+            records = [
+                json.loads(line)
+                for line in (trace_dir / run_id / "run.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            msgs = {record["msg"] for record in records}
+            self.assertIn("live_gesture_pipeline_person_roi_selection", msgs)
+            self.assertIn("live_gesture_pipeline_resolution", msgs)
+
+    def test_observe_does_not_emit_wave_from_open_palm_motion_in_three_gesture_path(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
                 pose_model_path="pose.task",
@@ -270,15 +412,27 @@ class LiveGesturePipelineTests(unittest.TestCase):
                     gestures=[[ _Category("Open_Palm", 0.91) ]],
                     hand_landmarks=[[ _Landmark(0.31), _Landmark(0.33) ]],
                 ),
-            ]
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.95) ]],
+                    hand_landmarks=[],
+                )
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(),
+                final_timestamp_ms=2000,
+            )
         )
 
         pipeline.observe(frame_rgb="frame", observed_at=1.0)
         pipeline.observe(frame_rgb="frame", observed_at=1.2)
         observation = pipeline.observe(frame_rgb="frame", observed_at=1.4)
 
-        self.assertEqual(observation.gesture_event, AICameraGestureEvent.WAVE)
-        self.assertGreater(observation.gesture_confidence or 0.0, 0.6)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertEqual(observation.gesture_event, AICameraGestureEvent.NONE)
 
     def test_observe_recovers_symbol_from_tight_hand_roi_when_live_label_is_none(self) -> None:
         pipeline = LiveGesturePipeline(
@@ -350,6 +504,304 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(debug_snapshot["resolved_source"], "person_roi")
         self.assertEqual(debug_snapshot["person_roi_detection_count"], 1)
 
+    def test_observe_person_roi_debug_lists_per_hand_crop_classification(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.94) ]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("None", 0.82) ]],
+                    hand_landmarks=[],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("Thumb_Down", 0.41) ]],
+                    hand_landmarks=[],
+                ),
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-frame-0",
+                        roi_source=SimpleNamespace(value="primary_person_upper_body"),
+                        handedness="right",
+                        handedness_score=0.98,
+                    ),
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-frame-1",
+                        roi_source=SimpleNamespace(value="primary_person_full_body"),
+                        handedness="right",
+                        handedness_score=0.97,
+                    ),
+                ),
+                final_timestamp_ms=7100,
+            )
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.1,
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            person_count=1,
+        )
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertIsNone(debug_snapshot["person_roi_builtin_detection_index"])
+        self.assertEqual(len(debug_snapshot["person_roi_detection_debug"]), 2)
+        self.assertEqual(
+            debug_snapshot["person_roi_detection_debug"][0]["builtin_categories"][0]["normalized_label"],
+            "none",
+        )
+        self.assertEqual(
+            debug_snapshot["person_roi_detection_debug"][1]["builtin_categories"][0]["normalized_label"],
+            "thumb_down",
+        )
+        self.assertEqual(
+            debug_snapshot["person_roi_detection_debug"][1]["builtin_raw_gesture"],
+            AICameraFineHandGesture.THUMBS_DOWN.value,
+        )
+        self.assertFalse(debug_snapshot["person_roi_detection_debug"][1]["builtin_source_accepted"])
+        self.assertEqual(
+            debug_snapshot["person_roi_detection_debug"][1]["builtin_source_min_confidence"],
+            0.82,
+        )
+
+    def test_observe_prefers_tighter_wrist_person_roi_over_broader_body_crop_when_scores_are_close(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.94) ]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("Thumb_Down", 0.79) ]],
+                    hand_landmarks=[],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("Victory", 0.71) ]],
+                    hand_landmarks=[],
+                ),
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-frame-0",
+                        roi_source=SimpleNamespace(value="primary_person_upper_body"),
+                        handedness="right",
+                        handedness_score=0.98,
+                    ),
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-frame-1",
+                        roi_source=SimpleNamespace(value="right_wrist"),
+                        handedness="right",
+                        handedness_score=0.98,
+                    ),
+                ),
+                final_timestamp_ms=7150,
+            )
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.15,
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            person_count=1,
+        )
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(debug_snapshot["person_roi_builtin_detection_index"], 1)
+        self.assertEqual(debug_snapshot["person_roi_combined_source"], "right_wrist")
+
+    def test_observe_person_roi_retries_with_looser_hand_context_when_tight_crop_stays_none(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.94) ]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.95) ]],
+                    hand_landmarks=[],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("Victory", 0.84) ]],
+                    hand_landmarks=[],
+                ),
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-tight",
+                        gesture_context_frame_rgb="roi-context",
+                        roi_source=SimpleNamespace(value="right_wrist"),
+                        handedness="right",
+                        handedness_score=0.98,
+                    ),
+                ),
+                final_timestamp_ms=7160,
+            )
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.16,
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            person_count=1,
+        )
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(debug_snapshot["person_roi_combined_source"], "right_wrist")
+        self.assertTrue(debug_snapshot["person_roi_detection_debug"][0]["builtin_context_retry_used"])
+        self.assertEqual(
+            debug_snapshot["person_roi_detection_debug"][0]["builtin_context_gesture"],
+            AICameraFineHandGesture.PEACE_SIGN.value,
+        )
+
+    def test_observe_prefers_full_frame_landmark_crop_for_person_roi_symbol_read(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        runtime = _ImageSelectiveRoiRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.94) ]],
+                    hand_landmarks=[],
+                )
+            ],
+            image_to_result={
+                "gesture-frame": _GestureResult(
+                    gestures=[[ _Category("Victory", 0.87) ]],
+                    hand_landmarks=[],
+                ),
+                "roi-frame": _GestureResult(
+                    gestures=[[ _Category("none", 0.99) ]],
+                    hand_landmarks=[],
+                ),
+            },
+        )
+        pipeline._runtime = runtime
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(
+                    SimpleNamespace(
+                        roi_frame_rgb="roi-frame",
+                        gesture_frame_rgb="gesture-frame",
+                        gesture_context_frame_rgb="gesture-context",
+                        roi_source=SimpleNamespace(value="right_wrist"),
+                        handedness="right",
+                        handedness_score=0.98,
+                    ),
+                ),
+                final_timestamp_ms=7165,
+            )
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.165,
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            person_count=1,
+        )
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertEqual(runtime.roi_inputs, ["gesture-frame"])
+        detection_debug = pipeline.debug_snapshot()["person_roi_detection_debug"][0]
+        self.assertEqual(detection_debug["gesture_frame_source"], "full_frame_landmark_crop")
+
+    def test_observe_handles_numpy_full_frame_landmark_crop_in_debug_summary(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.94)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("Victory", 0.87)]],
+                    hand_landmarks=[],
+                )
+            ],
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(
+                    SimpleNamespace(
+                        roi_frame_rgb=np.zeros((12, 10, 3), dtype=np.uint8),
+                        gesture_frame_rgb=np.zeros((20, 18, 3), dtype=np.uint8),
+                        gesture_context_frame_rgb=np.zeros((24, 22, 3), dtype=np.uint8),
+                        roi_source=SimpleNamespace(value="right_wrist"),
+                        handedness="right",
+                        handedness_score=0.98,
+                        confidence=0.93,
+                    ),
+                ),
+                final_timestamp_ms=7165,
+            )
+        )
+
+        observation = pipeline.observe(
+            frame_rgb=np.zeros((32, 32, 3), dtype=np.uint8),
+            observed_at=7.165,
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            person_count=1,
+        )
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        detection_debug = pipeline.debug_snapshot()["person_roi_detection_debug"][0]
+        self.assertEqual(detection_debug["gesture_frame_source"], "full_frame_landmark_crop")
+        self.assertEqual(detection_debug["roi_frame_shape"], (12, 10, 3))
+        self.assertEqual(detection_debug["gesture_frame_shape"], (20, 18, 3))
+        self.assertEqual(detection_debug["gesture_context_frame_shape"], (24, 22, 3))
+
     def test_observe_recovers_symbol_from_secondary_visible_person_roi_when_primary_box_stays_empty(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -367,7 +819,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             ],
             roi_builtin_results=[
                 _GestureResult(
-                    gestures=[[_Category("Pointing_Up", 0.89)]],
+                    gestures=[[_Category("Victory", 0.89)]],
                     hand_landmarks=[],
                 )
             ],
@@ -396,7 +848,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             person_count=2,
         )
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.POINTING)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         debug_snapshot = pipeline.debug_snapshot()
         self.assertEqual(debug_snapshot["resolved_source"], "visible_person_roi")
         self.assertEqual(debug_snapshot["person_roi_candidate_count"], 2)
@@ -420,7 +872,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             ],
             roi_builtin_results=[
                 _GestureResult(
-                    gestures=[[_Category("Pointing_Up", 0.89)]],
+                    gestures=[[_Category("Victory", 0.89)]],
                     hand_landmarks=[],
                 )
             ],
@@ -454,7 +906,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             sparse_keypoints=sparse_keypoints,
         )
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.POINTING)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         self.assertEqual(worker.calls[0]["sparse_keypoints"], sparse_keypoints)
         self.assertEqual(worker.calls[1]["sparse_keypoints"], {})
         self.assertEqual(pipeline.debug_snapshot()["person_roi_pose_hint_match_index"], 0)
@@ -597,7 +1049,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             ],
             roi_builtin_results=[
                 _GestureResult(
-                    gestures=[[ _Category("Pointing_Up", 0.87) ]],
+                    gestures=[[ _Category("Victory", 0.87) ]],
                     hand_landmarks=[],
                 )
             ],
@@ -606,7 +1058,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         pipeline.observe(frame_rgb="frame", observed_at=2.0)
         observation = pipeline.observe(frame_rgb="frame", observed_at=2.2)
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.POINTING)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         self.assertEqual(pipeline.debug_snapshot()["resolved_source"], "recent_live_hand_roi")
 
     def test_observe_recovers_symbol_from_full_frame_hand_landmarks_when_no_person_or_live_hand_box_exists(self) -> None:
@@ -615,7 +1067,6 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 pose_model_path="pose.task",
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
-                custom_gesture_model_path="custom.task",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -627,13 +1078,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             ],
             roi_builtin_results=[
                 _GestureResult(
-                    gestures=[[_Category("none", 0.20)]],
-                    hand_landmarks=[],
-                )
-            ],
-            roi_custom_results=[
-                _GestureResult(
-                    gestures=[[_Category("middle_finger", 0.93)]],
+                    gestures=[[_Category("Thumb_Down", 0.93)]],
                     hand_landmarks=[],
                 )
             ],
@@ -655,7 +1100,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(observation.hand_count, 1)
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.MIDDLE_FINGER)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_DOWN)
         self.assertEqual(len(worker.calls), 0)
         self.assertEqual(len(worker.full_frame_calls), 1)
         debug_snapshot = pipeline.debug_snapshot()
@@ -669,7 +1114,6 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 pose_model_path="pose.task",
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
-                custom_gesture_model_path="custom.task",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -681,13 +1125,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             ],
             roi_builtin_results=[
                 _GestureResult(
-                    gestures=[[_Category("none", 0.20)]],
-                    hand_landmarks=[],
-                ),
-            ],
-            roi_custom_results=[
-                _GestureResult(
-                    gestures=[[_Category("ok_sign", 0.92)]],
+                    gestures=[[_Category("Victory", 0.92)]],
                     hand_landmarks=[],
                 ),
             ],
@@ -717,7 +1155,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(observation.hand_count, 1)
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.OK_SIGN)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         self.assertEqual(len(worker.calls), 1)
         self.assertEqual(len(worker.full_frame_calls), 1)
         debug_snapshot = pipeline.debug_snapshot()

@@ -316,6 +316,12 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
     # AUDIT-FIX(#4): Snapshot dynamic capability providers once per build so every schema in the
     # returned list is internally consistent even if the provider is mutable or generator-backed.
     sensor_trigger_kinds = _unique_strings(supported_sensor_trigger_kinds())
+    sensor_trigger_kind_help = (
+        "Supported sensor trigger type. "
+        "Use pir_no_motion when no motion or no presence/activity should be detected for hold_seconds. "
+        "Use vad_quiet only when the room microphone should stay quiet for hold_seconds. "
+        "Use camera_person_visible when a person should be visible in the camera view."
+    )
     setting_names = _unique_strings(supported_setting_names())
     spoken_voices = _unique_strings(supported_spoken_voices())
     spoken_voice_catalog = str(spoken_voice_options_context()).strip()
@@ -365,7 +371,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "name": "search_live_info",
                 "description": (
                     "Look up fresh or externally verifiable web information for the user. "
-                    "Use this for broad web research, not only a fixed list of example domains."
+                    "Use this for broad web research, not only a fixed list of example domains. "
+                    "Do not use it for the user's own smart-home inventory, room/device state, or recent in-home smart-home events; those belong to the smart-home tools."
                 ),
                 "parameters": {
                     "type": "object",
@@ -537,7 +544,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                             min_length=1,
                         ),
                         "trigger_kind": _string_property(
-                            "Supported sensor trigger type.",
+                            sensor_trigger_kind_help,
                             enum=sensor_trigger_kinds,
                         ),
                         "hold_seconds": _number_property(
@@ -654,6 +661,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "Update an existing supported sensor-triggered automation. "
                     "You may replace the trigger kind, hold_seconds, delivery, and content in one update. "
+                    "Resolve pir_no_motion as inactivity or no motion/presence, and use vad_quiet only for room-audio silence. "
                     "Use list_automations first if you need to identify it."
                 ),
                 "parameters": {
@@ -669,7 +677,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                             min_length=1,
                         ),
                         "trigger_kind": _string_property(
-                            "Optional new supported sensor trigger type.",
+                            sensor_trigger_kind_help,
                             enum=sensor_trigger_kinds,
                         ),
                         "hold_seconds": _number_property(
@@ -741,6 +749,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "List bounded smart-home entities such as lights, scenes, motion sensors, and device-health endpoints. "
                     "This tool supports generic selectors, exact scalar state filters, pagination, and simple aggregations, so it can answer both exact device discovery questions and broader house-status queries without a special-case summary tool. "
+                    "Use this instead of web search when the user asks about the devices, areas, grouped counts, or filtered current state in their own smart home. "
                     "Broad live status answers will often call this tool more than once with different selectors or aggregations, for example lights that are on, offline devices, grouped counts by area, or alarm/device-health entities. "
                     "Avoid using one truncated catch-all listing as the whole house status when narrower filters or grouped counts are available. "
                     "When a later exact state read is needed, use the returned entity_id values verbatim."
@@ -853,7 +862,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "Read the current state for one or more exact smart-home entities after they are already known. "
                     "Use this for precise questions like whether a light is on, how bright it is, or whether a motion sensor recently fired. "
-                    "entity_ids must be exact routed identifiers copied verbatim from smart-home tool results, not IDs invented from labels or classes."
+                    "entity_ids must be exact routed identifiers copied verbatim from smart-home tool results or directly from the user's exact routed IDs, not IDs invented from labels or classes."
                 ),
                 "parameters": {
                     "type": "object",
@@ -919,6 +928,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "Read a bounded batch of recent normalized smart-home events such as motion detections, button presses, connectivity changes, or alarm state changes. "
                     "Use this for explicit inspection or debugging of the current stream. "
+                    "Use this instead of web search when the user asks about recent in-home smart-home activity. "
                     "It supports generic event selectors and simple aggregations instead of a hardcoded status-summary path. "
                     "For broader live house-status answers, pair this with list_smart_home_entities instead of treating the recent event batch as the whole current state."
                 ),
@@ -1507,7 +1517,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                     "Manage Twinr's guided get-to-know-you flow across the initial setup and later short lifelong-learning follow-ups. "
                     "Use this when the user wants to start or continue the setup, offers to tell Twinr something about themselves, freely volunteers stable profile details that should enter the bounded discovery flow, answers an active get-to-know-you question, asks to pause or skip a topic, or says not now to a visible discovery invitation. "
                     "When the user answered, include compact learned_facts in canonical English as durable summaries, not raw transcript quotes, and use one learned_fact or memory_route per distinct learned detail. "
-                    "Direct first-person profile statements or direct profile corrections from an identified speaker already count as approval for discovery saves or mutations."
+                    "Direct first-person profile statements, wish-form self-statements about preferred name or form of address, or direct profile corrections from an identified speaker already count as approval for discovery saves or mutations. "
+                    "If the user explicitly corrects or deletes a previously learned detail, use review_profile and then replace_fact or delete_fact in the same turn when needed, even if discovery setup is still active."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1597,7 +1608,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                             integer=True,
                         ),
                         "confirmed": _boolean_property(
-                            "Set true only after the user clearly confirmed the persistent save when speaker confirmation is required."
+                            "Set true when the user already gave the needed approval for this persistent save, including direct first-person stable profile statements, preferred-name or address-preference self-statements, or direct corrections from an identified speaker; leave false only when extra speaker confirmation is still required."
                         ),
                     },
                     "required": ["action"],

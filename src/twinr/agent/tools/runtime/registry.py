@@ -11,8 +11,6 @@ from __future__ import annotations
 from inspect import Parameter, signature  # AUDIT-FIX(#3): Validate handler signatures during binding.
 from typing import Any, Callable
 
-from twinr.agent.tools.runtime.broker_policy import default_automation_tool_broker_policy
-
 _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("print_receipt", "handle_print_receipt"),
     ("search_live_info", "handle_search_live_info"),
@@ -110,18 +108,6 @@ _REALTIME_TOOL_NAMES: tuple[str, ...] = _validate_realtime_tool_bindings()  # AU
 def realtime_tool_names() -> tuple[str, ...]:
     """Return the validated canonical realtime tool names."""
     return _REALTIME_TOOL_NAMES
-
-
-def automation_safe_tool_names() -> tuple[str, ...]:
-    """Return the tool names that background automations may execute directly."""
-
-    return default_automation_tool_broker_policy().allowed_tool_names
-
-
-def is_automation_safe_tool_name(tool_name: str) -> bool:
-    """Return whether one tool may be executed from background automations."""
-
-    return default_automation_tool_broker_policy().is_allowed(tool_name)
 
 
 def _handler_accepts_payload(handler: Callable[..., Any]) -> bool:

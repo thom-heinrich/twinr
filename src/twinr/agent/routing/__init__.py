@@ -11,8 +11,8 @@ from .bootstrap import (
     build_centroid_router_bundle_from_jsonl,
     build_linear_router_bundle,
     build_linear_router_bundle_from_jsonl,
-    compute_label_centroids,
 )
+from .centroids import compute_label_centroids
 from .bundle import (
     SemanticRouterBundle,
     SemanticRouterBundleMetadata,
@@ -34,8 +34,9 @@ from .evaluation import (
     split_labeled_route_samples,
     tune_policy_thresholds,
 )
+from .inference import OnnxSentenceEncoder
 from .policy import SemanticRouterPolicy
-from .service import LocalSemanticRouter, OnnxSentenceEncoder
+from .service import LocalSemanticRouter
 from .synthetic_corpus import (
     SyntheticRouteCurationReport,
     SyntheticRouteSample,

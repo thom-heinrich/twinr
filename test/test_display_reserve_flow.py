@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.agent.personality.intelligence.models import (
     WorldFeedSubscription,
@@ -191,6 +191,10 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                 query_hints=("Melitta", "morning coffee"),
                 sensitivity="normal",
                 updated_at=now - timedelta(hours=3),
+                attributes={
+                    "display_anchor": "Dein Kaffee am Morgen",
+                    "transcript_excerpt": "Mein Kaffee am Morgen ist mir wichtig.",
+                },
             )
             fake_memory = _FakeMemoryService(
                 proactive_candidates=(follow_up,),
@@ -220,7 +224,7 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
         topic_keys = [candidate.topic_key for candidate in filtered_candidates]
         self.assertEqual(topic_keys[0], "ai companions")
         self.assertIn("thread:person:janina", topic_keys)
-        self.assertIn("morning coffee", topic_keys)
+        self.assertIn("dein kaffee am morgen", topic_keys)
         janina_candidate = next(
             candidate
             for candidate in candidates
@@ -228,7 +232,7 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
         )
         self.assertLess(janina_candidate.salience, 0.8)
         ai_candidate = next(candidate for candidate in candidates if candidate.topic_key == "ai companions")
-        preference_candidate = next(candidate for candidate in candidates if candidate.topic_key == "morning coffee")
+        preference_candidate = next(candidate for candidate in candidates if candidate.topic_key == "dein kaffee am morgen")
         self.assertIn("ambient_learning", ai_candidate.generation_context or {})
         self.assertEqual(preference_candidate.candidate_family, "reflection_preference")
 

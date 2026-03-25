@@ -226,9 +226,10 @@ the visible copy may be generated ahead of time from Twinr's current
 personality state plus structured reserve context such as a shared thread, a
 gentle follow-up, or a memory clarification need, but it must still stay
 bounded, readable, and calm. On the real Pi surface that means no left accent
-rail in prompt mode, one large text scale for the full reserve message, and
-wording that sounds like a natural conversation opener rather than a tiny
-topic label with helper chrome. Prompt-mode cards should also consume the
+rail in prompt mode, one still-large but slightly reduced text scale for the
+full reserve message so the box keeps more breathing room, and wording that
+sounds like a natural conversation opener rather than a tiny topic label with
+helper chrome. Prompt-mode cards should also consume the
 actual visible card height instead of stopping after a fixed two-line budget,
 so longer right-lane prompts do not appear cut off halfway down the box.
 

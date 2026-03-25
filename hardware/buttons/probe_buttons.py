@@ -34,7 +34,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.hardware.buttons import GpioButtonMonitor, build_button_bindings, build_probe_bindings
 
 

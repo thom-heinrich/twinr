@@ -27,6 +27,14 @@ from twinr.display.reserve_bus_feedback import (
 )
 
 from .display_reserve_candidates import load_display_reserve_candidates
+from .display_reserve_support import (
+    compact_text,
+    default_local_now,
+    format_timestamp,
+    parse_local_time as _parse_local_time,
+    parse_timestamp as _parse_timestamp,
+    utc_now,
+)
 
 _DEFAULT_PLAN_PATH = "artifacts/stores/ops/display_reserve_bus_plan.json"
 _DEFAULT_REFRESH_AFTER_LOCAL = "05:30"
@@ -55,72 +63,6 @@ _ATTENTION_BONUS_S = {
 }
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _default_local_now() -> datetime:
-    """Return the current local wall clock as an aware datetime."""
-
-    return datetime.now().astimezone()
-
-
-def _utc_now() -> datetime:
-    """Return the current UTC wall clock."""
-
-    return datetime.now(timezone.utc)
-
-
-def _compact_text(value: object | None, *, max_len: int) -> str:
-    """Return one bounded single-line text field."""
-
-    if value is None:
-        return ""
-    compact = " ".join(str(value).split()).strip()
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
-
-
-def _parse_timestamp(value: object | None) -> datetime | None:
-    """Parse one optional ISO-8601 timestamp into an aware datetime."""
-
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _format_timestamp(value: datetime) -> str:
-    """Serialize one aware timestamp as UTC ISO-8601 text."""
-
-    return value.astimezone(timezone.utc).isoformat()
-
-
-def _parse_local_time(value: object | None, *, fallback: str) -> LocalTime:
-    """Parse one ``HH:MM`` local time string with a stable fallback."""
-
-    text = str(value or "").strip() or fallback
-    hour_text, separator, minute_text = text.partition(":")
-    if separator != ":":
-        hour_text, minute_text = fallback.split(":", 1)
-    try:
-        hour = int(hour_text)
-        minute = int(minute_text)
-    except ValueError:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        fallback_hour, fallback_minute = fallback.split(":", 1)
-        return LocalTime(hour=int(fallback_hour), minute=int(fallback_minute))
-    return LocalTime(hour=hour, minute=minute)
-
 
 def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
     """Return one finite bounded integer config value."""
@@ -152,7 +94,7 @@ def _normalize_topic_keys(values: Sequence[object] | None) -> tuple[str, ...]:
     ordered: list[str] = []
     seen: set[str] = set()
     for value in values:
-        compact = _compact_text(value, max_len=96).casefold()
+        compact = compact_text(value, max_len=96).casefold()
         if not compact or compact in seen:
             continue
         seen.add(compact)
@@ -164,7 +106,7 @@ def _stable_fraction(*parts: object) -> float:
     """Return one deterministic fraction in the inclusive 0..1 range."""
 
     digest = hashlib.sha1(
-        "::".join(_compact_text(part, max_len=160) for part in parts).encode("utf-8")
+        "::".join(compact_text(part, max_len=160) for part in parts).encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:4], "big") / 4_294_967_295.0
 
@@ -208,18 +150,18 @@ class DisplayReservePlannedItem:
         """Build one planned item from JSON-style persisted data."""
 
         return cls(
-            topic_key=_compact_text(payload.get("topic_key"), max_len=96).casefold(),
-            title=_compact_text(payload.get("title"), max_len=72),
-            source=_compact_text(payload.get("source"), max_len=48),
-            action=_compact_text(payload.get("action"), max_len=24).lower() or "hint",
-            attention_state=_compact_text(payload.get("attention_state"), max_len=24).lower() or "background",
-            eyebrow=_compact_text(payload.get("eyebrow"), max_len=36),
-            headline=_compact_text(payload.get("headline"), max_len=128),
-            body=_compact_text(payload.get("body"), max_len=128),
-            symbol=_compact_text(payload.get("symbol"), max_len=24) or "sparkles",
-            accent=_compact_text(payload.get("accent"), max_len=24).lower() or "info",
-            reason=_compact_text(payload.get("reason"), max_len=120),
-            candidate_family=_compact_text(payload.get("candidate_family"), max_len=40).casefold() or "general",
+            topic_key=compact_text(payload.get("topic_key"), max_len=96).casefold(),
+            title=compact_text(payload.get("title"), max_len=72),
+            source=compact_text(payload.get("source"), max_len=48),
+            action=compact_text(payload.get("action"), max_len=24).lower() or "hint",
+            attention_state=compact_text(payload.get("attention_state"), max_len=24).lower() or "background",
+            eyebrow=compact_text(payload.get("eyebrow"), max_len=36),
+            headline=compact_text(payload.get("headline"), max_len=128),
+            body=compact_text(payload.get("body"), max_len=128),
+            symbol=compact_text(payload.get("symbol"), max_len=24) or "sparkles",
+            accent=compact_text(payload.get("accent"), max_len=24).lower() or "info",
+            reason=compact_text(payload.get("reason"), max_len=120),
+            candidate_family=compact_text(payload.get("candidate_family"), max_len=40).casefold() or "general",
             salience=float(payload.get("salience", 0.0) or 0.0),
             hold_seconds=_bounded_seconds(
                 payload.get("hold_seconds"),
@@ -240,18 +182,18 @@ class DisplayReservePlannedItem:
         """Build one planned item from a live candidate plus planned timing."""
 
         return cls(
-            topic_key=_compact_text(candidate.topic_key, max_len=96).casefold(),
-            title=_compact_text(candidate.title, max_len=72),
-            source=_compact_text(candidate.source, max_len=48),
-            action=_compact_text(candidate.action, max_len=24).lower() or "hint",
-            attention_state=_compact_text(candidate.attention_state, max_len=24).lower() or "background",
-            eyebrow=_compact_text(candidate.eyebrow, max_len=36),
-            headline=_compact_text(candidate.headline, max_len=128),
-            body=_compact_text(candidate.body, max_len=128),
-            symbol=_compact_text(candidate.symbol, max_len=24) or "sparkles",
-            accent=_compact_text(candidate.accent, max_len=24).lower() or "info",
-            reason=_compact_text(reason, max_len=120),
-            candidate_family=_compact_text(candidate.candidate_family, max_len=40).casefold() or "general",
+            topic_key=compact_text(candidate.topic_key, max_len=96).casefold(),
+            title=compact_text(candidate.title, max_len=72),
+            source=compact_text(candidate.source, max_len=48),
+            action=compact_text(candidate.action, max_len=24).lower() or "hint",
+            attention_state=compact_text(candidate.attention_state, max_len=24).lower() or "background",
+            eyebrow=compact_text(candidate.eyebrow, max_len=36),
+            headline=compact_text(candidate.headline, max_len=128),
+            body=compact_text(candidate.body, max_len=128),
+            symbol=compact_text(candidate.symbol, max_len=24) or "sparkles",
+            accent=compact_text(candidate.accent, max_len=24).lower() or "info",
+            reason=compact_text(reason, max_len=120),
+            candidate_family=compact_text(candidate.candidate_family, max_len=40).casefold() or "general",
             salience=max(0.0, float(candidate.salience)),
             hold_seconds=_bounded_seconds(
                 hold_seconds,
@@ -284,7 +226,7 @@ class DisplayReserveDayPlan:
 
         return cls(
             local_day=local_day.isoformat(),
-            generated_at=_format_timestamp(generated_at or _utc_now()),
+            generated_at=format_timestamp(generated_at or utc_now()),
             cursor=0,
             items=(),
             candidate_count=0,
@@ -295,10 +237,10 @@ class DisplayReserveDayPlan:
     def from_dict(cls, payload: Mapping[str, object]) -> "DisplayReserveDayPlan":
         """Build one day plan from persisted JSON-style data."""
 
-        local_day = _compact_text(payload.get("local_day"), max_len=16)
+        local_day = compact_text(payload.get("local_day"), max_len=16)
         if not local_day:
             raise ValueError("display reserve day plan requires local_day")
-        generated_at = _parse_timestamp(payload.get("generated_at")) or _utc_now()
+        generated_at = _parse_timestamp(payload.get("generated_at")) or utc_now()
         cursor = max(0, int(payload.get("cursor", 0) or 0))
         raw_items = payload.get("items")
         if not isinstance(raw_items, Sequence):
@@ -310,7 +252,7 @@ class DisplayReserveDayPlan:
         )
         return cls(
             local_day=local_day,
-            generated_at=_format_timestamp(generated_at),
+            generated_at=format_timestamp(generated_at),
             cursor=cursor,
             items=items,
             candidate_count=max(0, int(payload.get("candidate_count", len(items)) or len(items))),
@@ -453,7 +395,7 @@ class DisplayReserveDayPlanner:
     store: DisplayReserveDayPlanStore
     feedback_store: DisplayReserveBusFeedbackStore | None = None
     candidate_loader: Callable[..., tuple[AmbientDisplayImpulseCandidate, ...]] = _default_candidate_loader
-    local_now: Callable[[], datetime] = _default_local_now
+    local_now: Callable[[], datetime] = default_local_now
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayReserveDayPlanner":
@@ -685,7 +627,7 @@ class DisplayReserveDayPlanner:
         )
         return DisplayReserveDayPlan(
             local_day=local_day.isoformat(),
-            generated_at=_format_timestamp(local_now.astimezone(timezone.utc)),
+            generated_at=format_timestamp(local_now.astimezone(timezone.utc)),
             cursor=0,
             items=items,
             candidate_count=len(candidates),
@@ -834,10 +776,10 @@ class DisplayReserveDayPlanner:
     def _candidate_family(self, candidate: AmbientDisplayImpulseCandidate) -> str:
         """Return one generic family token for reserve-plan mixing."""
 
-        family = _compact_text(getattr(candidate, "candidate_family", None), max_len=40).casefold()
+        family = compact_text(getattr(candidate, "candidate_family", None), max_len=40).casefold()
         if family:
             return family
-        return _compact_text(candidate.source, max_len=40).casefold() or "general"
+        return compact_text(candidate.source, max_len=40).casefold() or "general"
 
     def _candidate_weight(
         self,

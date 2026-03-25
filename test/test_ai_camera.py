@@ -36,7 +36,8 @@ from twinr.hardware.camera_ai.pose_features import support_pose_confidence as _s
 from twinr.hardware.camera_ai.pose_selection import rank_pose_candidates as _rank_pose_candidates
 from twinr.hardware.ai_camera_diagnostics import capture_pose_probe
 from twinr.hardware.hand_landmarks import HandLandmarkWorkerConfig
-from twinr.config import TwinrConfig
+from twinr.agent.workflows.forensics import WorkflowForensics, bind_workflow_forensics
+from twinr.agent.base_agent.config import TwinrConfig
 
 
 class AICameraTests(unittest.TestCase):
@@ -266,6 +267,121 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(debug["attention_face_anchor_count"], 1)
         self.assertEqual(debug["attention_looking_reason"], "matched_face_anchor_geometry_meets_threshold")
 
+    def test_adapter_attention_from_frame_reuses_fast_attention_logic(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        face_box = AICameraBox(top=0.26, left=0.42, bottom=0.40, right=0.56)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            ),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.CENTER,
+                            confidence=0.93,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+
+        observation = adapter.observe_attention_from_frame(
+            detection=detection,
+            frame_rgb=object(),
+            observed_at=45.0,
+            frame_at=44.5,
+        )
+
+        self.assertTrue(observation.camera_ready)
+        self.assertAlmostEqual(observation.last_camera_frame_at or 0.0, 44.5, places=3)
+        self.assertTrue(observation.looking_toward_device)
+        self.assertEqual(observation.looking_signal_state, "confirmed")
+        debug = adapter.get_last_attention_debug_details()
+        self.assertEqual(debug["attention_face_anchor_state"], "ok")
+
+    def test_adapter_gesture_from_frame_runs_live_pipeline_without_local_runtime(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        primary_box = AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68)
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._resolve_gesture_pose_hints = lambda **kwargs: (  # type: ignore[method-assign]
+            {
+                9: (0.36, 0.41, 0.91),
+                10: (0.58, 0.39, 0.93),
+            },
+            "fresh_mediapipe",
+            0.83,
+        )
+        adapter._resolve_gesture_pose_fallback = lambda *args, **kwargs: (None, None)  # type: ignore[method-assign]
+        live_calls = []
+
+        def _observe_live(**kwargs):
+            live_calls.append(dict(kwargs))
+            return SimpleNamespace(
+                hand_count=1,
+                fine_hand_gesture=AICameraFineHandGesture.PEACE_SIGN,
+                fine_hand_gesture_confidence=0.88,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            )
+
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(  # type: ignore[method-assign]
+            observe=_observe_live,
+            debug_snapshot=lambda: {"resolved_source": "live_stream"},
+        )
+
+        observation = adapter.observe_gesture_from_frame(
+            detection=detection,
+            frame_rgb="frame",
+            observed_at=88.0,
+            frame_at=87.5,
+        )
+
+        self.assertTrue(observation.camera_ready)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(observation.last_camera_frame_at or 0.0, 87.5, places=3)
+        self.assertEqual(live_calls[0]["frame_rgb"], "frame")
+        self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_source"], "fresh_mediapipe")
+
     def test_adapter_attention_observe_keeps_side_glance_face_anchor_below_looking_threshold(self) -> None:
         primary_box = AICameraBox(top=0.18, left=0.28, bottom=0.86, right=0.92)
         face_box = AICameraBox(top=0.26, left=0.66, bottom=0.40, right=0.82)
@@ -425,7 +541,7 @@ class AICameraTests(unittest.TestCase):
         self.assertIsNotNone(person.attention_hint_score)
         self.assertLess(person.attention_hint_score or 0.0, 0.62)
 
-    def test_adapter_gesture_observe_uses_full_mediapipe_fallback_when_fast_lane_returns_none(self) -> None:
+    def test_adapter_gesture_observe_keeps_pose_fallback_fine_gesture_out_of_dedicated_hot_path(self) -> None:
         adapter = LocalAICameraAdapter(
             config=AICameraAdapterConfig(
                 pose_backend="mediapipe",
@@ -476,10 +592,13 @@ class AICameraTests(unittest.TestCase):
 
         observation = adapter.observe_gesture()
 
-        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.POINTING)
-        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.86, places=3)
-        self.assertEqual(observation.model, "local-imx500+mediapipe-live-gesture+pose-fallback")
-        self.assertEqual(adapter.get_last_gesture_debug_details()["final_resolved_source"], "mediapipe_pose_fallback")
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertIsNone(observation.fine_hand_gesture_confidence)
+        self.assertEqual(observation.model, "local-imx500+mediapipe-live-gesture")
+        debug = adapter.get_last_gesture_debug_details()
+        self.assertEqual(debug["final_resolved_source"], "none")
+        self.assertEqual(debug["pose_fallback_fine_hand_gesture"], AICameraFineHandGesture.POINTING.value)
+        self.assertAlmostEqual(debug["pose_fallback_fine_hand_gesture_confidence"] or 0.0, 0.86, places=3)
 
     def test_adapter_gesture_observe_promotes_unmatched_face_anchor_over_false_primary_person(self) -> None:
         chair_box = AICameraBox(top=0.20, left=0.58, bottom=0.98, right=0.96)
@@ -610,6 +729,67 @@ class AICameraTests(unittest.TestCase):
             debug = adapter.get_last_gesture_debug_details()
             self.assertTrue(debug["candidate_capture_saved"])
             self.assertEqual(debug["candidate_capture_reasons"], ["pose_hint"])
+            self.assertTrue(Path(debug["candidate_capture_image_path"]).is_file())
+            self.assertTrue(Path(debug["candidate_capture_metadata_path"]).is_file())
+
+    def test_adapter_gesture_observe_records_zero_signal_capture_when_forensics_is_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_dir = Path(tmpdir) / "trace"
+            adapter = LocalAICameraAdapter(
+                config=AICameraAdapterConfig(
+                    pose_backend="mediapipe",
+                    gesture_candidate_capture_dir=tmpdir,
+                    gesture_candidate_capture_cooldown_s=0.0,
+                    gesture_candidate_capture_max_images=4,
+                )
+            )
+            adapter._load_detection_runtime = lambda: {}
+            adapter._probe_online = lambda runtime: None
+            adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+                person_count=0,
+                primary_person_box=None,
+                primary_person_zone=AICameraZone.UNKNOWN,
+                visible_persons=(),
+                person_near_device=False,
+                hand_or_object_near_camera=False,
+                objects=(),
+            )
+            adapter._capture_rgb_frame = lambda runtime, observed_at: np.full((12, 16, 3), 48, dtype=np.uint8)
+            adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+                analyze_pose_hints=lambda **_: MediaPipeVisionResult(
+                    pose_confidence=None,
+                    sparse_keypoints={},
+                )
+            )
+            adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+                observe=lambda **_: SimpleNamespace(
+                    hand_count=0,
+                    fine_hand_gesture=AICameraFineHandGesture.NONE,
+                    fine_hand_gesture_confidence=None,
+                    gesture_event=AICameraGestureEvent.NONE,
+                    gesture_confidence=None,
+                ),
+                debug_snapshot=lambda: {"resolved_source": "none", "live_hand_count": 0},
+            )
+            tracer = WorkflowForensics(
+                project_root=Path(tmpdir),
+                service="gesture-test",
+                enabled=True,
+                mode="forensic",
+                base_dir=trace_dir,
+            )
+            try:
+                with bind_workflow_forensics(tracer, trace_id="trace-zero-signal"):
+                    adapter.observe_gesture()
+            finally:
+                tracer.close()
+
+            debug = adapter.get_last_gesture_debug_details()
+            self.assertTrue(debug["forensics_active"])
+            self.assertEqual(debug["forensics_trace_id"], "trace-zero-signal")
+            self.assertTrue(debug["forensics_zero_signal_capture_requested"])
+            self.assertTrue(debug["candidate_capture_saved"])
+            self.assertEqual(debug["candidate_capture_reasons"], ["forensics_zero_signal"])
             self.assertTrue(Path(debug["candidate_capture_image_path"]).is_file())
             self.assertTrue(Path(debug["candidate_capture_metadata_path"]).is_file())
 

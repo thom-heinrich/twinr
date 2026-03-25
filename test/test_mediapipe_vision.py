@@ -12,6 +12,7 @@ from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
 from twinr.hardware.camera_ai.mediapipe_runtime import MediaPipeTaskRuntime
 from twinr.hardware.camera_ai.fine_hand_gestures import (
     combine_builtin_and_custom_gesture_choice as _combine_builtin_and_custom_gesture_choice,
+    combine_task_specific_custom_gesture_choice as _combine_task_specific_custom_gesture_choice,
     prefer_gesture_choice as _prefer_gesture_choice,
     resolve_fine_hand_gesture as _resolve_fine_hand_gesture,
 )
@@ -134,6 +135,32 @@ class MediaPipeVisionTests(unittest.TestCase):
 
         self.assertEqual(gesture, AICameraFineHandGesture.NONE)
         self.assertIsNone(confidence)
+
+    def test_task_specific_custom_choice_prefers_custom_three_gesture_over_conflicting_builtin(self) -> None:
+        choice = _combine_task_specific_custom_gesture_choice(
+            (AICameraFineHandGesture.THUMBS_DOWN, 0.61),
+            (AICameraFineHandGesture.PEACE_SIGN, 0.88),
+            preferred_custom_gestures={
+                AICameraFineHandGesture.THUMBS_UP,
+                AICameraFineHandGesture.THUMBS_DOWN,
+                AICameraFineHandGesture.PEACE_SIGN,
+            },
+        )
+
+        self.assertEqual(choice, (AICameraFineHandGesture.PEACE_SIGN, 0.88))
+
+    def test_task_specific_custom_choice_keeps_builtin_when_custom_label_is_not_preferred(self) -> None:
+        choice = _combine_task_specific_custom_gesture_choice(
+            (AICameraFineHandGesture.THUMBS_UP, 0.84),
+            (AICameraFineHandGesture.OK_SIGN, 0.93),
+            preferred_custom_gestures={
+                AICameraFineHandGesture.THUMBS_UP,
+                AICameraFineHandGesture.THUMBS_DOWN,
+                AICameraFineHandGesture.PEACE_SIGN,
+            },
+        )
+
+        self.assertEqual(choice, (AICameraFineHandGesture.THUMBS_UP, 0.84))
 
     def test_runtime_configures_official_gesture_classifier_filters_for_none_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

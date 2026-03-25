@@ -1,0 +1,21 @@
+[Unit]
+Description=Twinr Peer Camera Snapshot Proxy
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+ConditionPathExists=/proc/device-tree/model
+
+[Service]
+Type=simple
+ExecCondition=/usr/bin/env bash -lc 'grep -qa "Raspberry Pi" /proc/device-tree/model'
+ExecStartPre=/usr/bin/env bash -lc 'for _ in $(seq 1 50); do ip -4 addr show dev eth0 | grep -Fq "10.42.0.2/" && exit 0; sleep 0.2; done; exit 1'
+ExecStart=/usr/bin/python3 /opt/twinr-peer-camera-proxy/peer_camera_snapshot_proxy.py --bind 10.42.0.2 --port 8766 --default-width 640 --default-height 480 --default-timeout-ms 4000 --cache-ttl-ms 500
+Restart=always
+RestartSec=1
+TimeoutStopSec=10
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

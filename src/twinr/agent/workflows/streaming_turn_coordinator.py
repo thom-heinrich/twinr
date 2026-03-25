@@ -452,21 +452,43 @@ class _DeferredFollowUpClosureEvaluation:
             name="twinr-streaming-follow-up-closure",
         ).start()
 
-    def result(self, *, timeout_s: float | None = None) -> ConversationClosureEvaluation:
+    def result(
+        self,
+        *,
+        timeout_s: float | None = None,
+        should_abort: Callable[[], bool] | None = None,
+        poll_interval_s: float = 0.05,
+    ) -> ConversationClosureEvaluation:
         """Return the finished closure evaluation without waiting indefinitely."""
 
         wait_started = time.monotonic()
-        ready = self._ready.wait(timeout=timeout_s)
+        deadline_at = None if timeout_s is None else wait_started + max(0.0, timeout_s)
+        interval_s = max(0.01, float(poll_interval_s))
+        while True:
+            remaining_s = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+            wait_s = interval_s if remaining_s is None else min(interval_s, remaining_s)
+            if self._ready.wait(timeout=wait_s):
+                break
+            if callable(should_abort) and should_abort():
+                wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
+                self.trace_event(
+                    "streaming_follow_up_closure_eval_join_interrupted",
+                    kind="branch",
+                    details={"timeout_s": timeout_s},
+                    kpi={"wait_ms": wait_ms},
+                )
+                return ConversationClosureEvaluation(error_type="closure_eval_interrupted")
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
+                self.trace_event(
+                    "streaming_follow_up_closure_eval_join_timeout",
+                    kind="warning",
+                    level="WARN",
+                    details={"timeout_s": timeout_s},
+                    kpi={"wait_ms": wait_ms},
+                )
+                return ConversationClosureEvaluation(error_type="closure_eval_timeout")
         wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
-        if not ready:
-            self.trace_event(
-                "streaming_follow_up_closure_eval_join_timeout",
-                kind="warning",
-                level="WARN",
-                details={"timeout_s": timeout_s},
-                kpi={"wait_ms": wait_ms},
-            )
-            return ConversationClosureEvaluation(error_type="closure_eval_timeout")
         evaluation = self._evaluation or ConversationClosureEvaluation(error_type="closure_eval_missing")
         self.trace_event(
             "streaming_follow_up_closure_eval_joined",
@@ -708,6 +730,7 @@ class StreamingTurnCoordinator:
             resume_processing_after_bridge=self._resume_processing_after_bridge_wait,
             stop_final_lane_feedback=self.hooks.stop_search_feedback,
             emit=self.hooks.emit,
+            trace_event=self.hooks.trace_event,
             should_stop=self.hooks.should_stop,
             request_final_lane_stop=self.hooks.request_turn_stop,
         )
@@ -797,14 +820,31 @@ class StreamingTurnCoordinator:
             self.hooks.emit_status()
             self.speech_lifecycle.answer_started = True
             self.hooks.trace_event("streaming_print_resume_answering", kind="mutation", details={})
+        finalize_started = time.monotonic()
         answer = self.runtime.finalize_agent_turn(response.text)
+        self.hooks.trace_event(
+            "streaming_runtime_finalize_agent_turn_completed",
+            kind="metric",
+            details={"response_text_len": len(response.text)},
+            kpi={"duration_ms": round((time.monotonic() - finalize_started) * 1000.0, 3)},
+        )
         tool_calls = tuple(getattr(response, "tool_calls", ()) or ())
         tool_results = tuple(getattr(response, "tool_results", ()) or ())
         record_tool_history = getattr(self.runtime, "record_personality_tool_history", None)
         if callable(record_tool_history):
+            tool_history_started = time.monotonic()
             record_tool_history(
                 tool_calls=tool_calls,
                 tool_results=tool_results,
+            )
+            self.hooks.trace_event(
+                "streaming_runtime_tool_history_recorded",
+                kind="metric",
+                details={
+                    "tool_calls": len(tool_calls),
+                    "tool_results": len(tool_results),
+                },
+                kpi={"duration_ms": round((time.monotonic() - tool_history_started) * 1000.0, 3)},
             )
         self.hooks.trace_event(
             "streaming_agent_turn_finalized",
@@ -815,6 +855,7 @@ class StreamingTurnCoordinator:
                 "tool_calls": len(tool_calls),
                 "tool_results": len(tool_results),
             },
+            kpi={"duration_ms": round((time.monotonic() - finalize_started) * 1000.0, 3)},
         )
         return answer
 
@@ -925,6 +966,8 @@ class StreamingTurnCoordinator:
         if deferred_closure_evaluation is not None:
             return deferred_closure_evaluation.result(
                 timeout_s=self._closure_evaluation_join_timeout_s(),
+                should_abort=lambda: self.hooks.should_stop()
+                or getattr(getattr(self.runtime, "status", None), "value", None) == "error",
             )
         return self.hooks.evaluate_follow_up_closure(
             user_transcript=self.request.transcript,
@@ -974,12 +1017,14 @@ class StreamingTurnCoordinator:
             answer=answer,
             deferred_closure_evaluation=deferred_closure_evaluation,
         )
+        self._raise_if_interrupted(phase_reason="during_closure_eval")
         force_close = end_conversation or self.hooks.apply_follow_up_closure_evaluation(
             evaluation=closure_evaluation,
             request_source=self.request.listen_source,
             proactive_trigger=self.request.proactive_trigger,
         )
         self.speech_lifecycle.stop_snapshot_heartbeat()
+        self._raise_if_interrupted(phase_reason="before_runtime_finish")
         if not force_close and self.request.allow_follow_up_rearm:
             self.runtime.rearm_follow_up(request_source="follow_up")
         else:
@@ -1023,12 +1068,16 @@ class StreamingTurnCoordinator:
     def _raise_if_interrupted(self, *, phase_reason: str) -> None:
         """Abort the turn immediately when the active turn was interrupted."""
 
-        if not self.hooks.should_stop():
+        runtime_status = getattr(getattr(self.runtime, "status", None), "value", None)
+        if not self.hooks.should_stop() and runtime_status != "error":
             return
         self.hooks.trace_event(
             f"streaming_turn_interrupted_{phase_reason}",
             kind="branch",
-            details={},
+            details={
+                "runtime_status": runtime_status,
+                "stop_requested": self.hooks.should_stop(),
+            },
         )
         self._interrupt_turn(phase_reason)
         raise InterruptedError("streaming turn interrupted")

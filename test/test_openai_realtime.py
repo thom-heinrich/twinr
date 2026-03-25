@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.providers.openai.realtime import OpenAIRealtimeSession
 
 
@@ -383,24 +383,50 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             tools_by_name["print_receipt"]["parameters"]["properties"]["text"]["description"],
         )
         self.assertIn("question", tools_by_name["search_live_info"]["parameters"]["properties"])
+        self.assertIn(
+            "Do not use it for the user's own smart-home inventory",
+            tools_by_name["search_live_info"]["description"],
+        )
         self.assertIn("due_at", tools_by_name["schedule_reminder"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["schedule_reminder"]["parameters"]["properties"])
         self.assertIn("include_disabled", tools_by_name["list_automations"]["parameters"]["properties"])
         self.assertIn("content", tools_by_name["create_time_automation"]["parameters"]["properties"])
         self.assertIn("trigger_kind", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
+        self.assertIn(
+            "Use pir_no_motion when no motion or no presence/activity should be detected",
+            tools_by_name["create_sensor_automation"]["parameters"]["properties"]["trigger_kind"]["description"],
+        )
+        self.assertIn(
+            "Use vad_quiet only when the room microphone should stay quiet",
+            tools_by_name["create_sensor_automation"]["parameters"]["properties"]["trigger_kind"]["description"],
+        )
         self.assertIn("automation_ref", tools_by_name["update_time_automation"]["parameters"]["properties"])
         self.assertIn("automation_ref", tools_by_name["update_sensor_automation"]["parameters"]["properties"])
+        self.assertIn(
+            "Resolve pir_no_motion as inactivity or no motion/presence",
+            tools_by_name["update_sensor_automation"]["description"],
+        )
+        self.assertIn(
+            "use vad_quiet only for room-audio silence",
+            tools_by_name["update_sensor_automation"]["description"],
+        )
         self.assertIn("entity_class", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("entity_classes", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("state_filters", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("aggregate_by", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("call this tool more than once", tools_by_name["list_smart_home_entities"]["description"])
+        self.assertIn("instead of web search", tools_by_name["list_smart_home_entities"]["description"])
         self.assertIn("entity_ids", tools_by_name["read_smart_home_state"]["parameters"]["properties"])
+        self.assertIn(
+            "directly from the user's exact routed IDs",
+            tools_by_name["read_smart_home_state"]["description"],
+        )
         self.assertIn("command", tools_by_name["control_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("limit", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("event_kinds", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("aggregate_by", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("pair this with list_smart_home_entities", tools_by_name["read_smart_home_sensor_stream"]["description"])
+        self.assertIn("instead of web search", tools_by_name["read_smart_home_sensor_stream"]["description"])
         self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
@@ -548,6 +574,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
     def test_run_audio_turn_handles_function_call_and_continues_response(self) -> None:
         tool_calls: list[dict] = []
+        def _handle_print(arguments: dict) -> dict[str, str]:
+            tool_calls.append(arguments)
+            return {"status": "printed"}
         session, connection, _manager = self.make_session(
             SimpleNamespace(
                 type="response.done",
@@ -580,9 +609,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={
-                "print_receipt": lambda arguments: tool_calls.append(arguments) or {"status": "printed"}
-            },
+            tool_handlers={"print_receipt": _handle_print},
         )
 
         with session:
@@ -596,6 +623,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
     def test_run_audio_turn_uses_end_conversation_spoken_reply_without_second_response(self) -> None:
         end_calls: list[dict] = []
+        def _handle_end(arguments: dict) -> dict[str, str]:
+            end_calls.append(arguments)
+            return {"status": "ending"}
         session, connection, _manager = self.make_session(
             SimpleNamespace(
                 type="response.done",
@@ -615,9 +645,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={
-                "end_conversation": lambda arguments: end_calls.append(arguments) or {"status": "ending"}
-            },
+            tool_handlers={"end_conversation": _handle_end},
         )
 
         with session:
@@ -633,6 +661,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
     def test_run_audio_turn_continues_after_end_conversation_tool_without_spoken_reply(self) -> None:
         end_calls: list[dict] = []
+        def _handle_end(arguments: dict) -> dict[str, str]:
+            end_calls.append(arguments)
+            return {"status": "ending"}
         session, connection, _manager = self.make_session(
             SimpleNamespace(
                 type="response.done",
@@ -665,9 +696,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={
-                "end_conversation": lambda arguments: end_calls.append(arguments) or {"status": "ending"}
-            },
+            tool_handlers={"end_conversation": _handle_end},
         )
 
         with session:
@@ -680,6 +709,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
     def test_run_audio_turn_handles_search_function_call_and_continues_response(self) -> None:
         search_calls: list[dict] = []
+        def _handle_search(arguments: dict) -> dict[str, str]:
+            search_calls.append(arguments)
+            return {"status": "ok", "answer": "11 Grad"}
         session, connection, _manager = self.make_session(
             SimpleNamespace(
                 type="response.done",
@@ -712,9 +744,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={
-                "search_live_info": lambda arguments: search_calls.append(arguments) or {"status": "ok", "answer": "11 Grad"}
-            },
+            tool_handlers={"search_live_info": _handle_search},
         )
 
         with session:
@@ -730,6 +760,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
     def test_run_audio_turn_handles_schedule_reminder_tool_call(self) -> None:
         reminder_calls: list[dict] = []
+        def _handle_reminder(arguments: dict) -> dict[str, str]:
+            reminder_calls.append(arguments)
+            return {"status": "scheduled"}
         session, connection, _manager = self.make_session(
             SimpleNamespace(
                 type="response.done",
@@ -766,9 +799,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={
-                "schedule_reminder": lambda arguments: reminder_calls.append(arguments) or {"status": "scheduled"}
-            },
+            tool_handlers={"schedule_reminder": _handle_reminder},
         )
 
         with session:

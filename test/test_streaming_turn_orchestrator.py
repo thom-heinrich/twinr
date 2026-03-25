@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import FirstWordReply
-from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 from twinr.agent.workflows.streaming_turn_orchestrator import (
     FinalLaneTimeoutError,
@@ -16,6 +16,61 @@ from twinr.agent.workflows.streaming_turn_orchestrator import (
 
 
 class StreamingTurnOrchestratorTests(unittest.TestCase):
+    def test_bridge_completion_traces_still_running_final_lane_snapshot(self) -> None:
+        trace_events: list[tuple[str, dict[str, object]]] = []
+        idle_after = [False]
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=200,
+                final_lane_hard_timeout_ms=1000,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lambda delta: None,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            wait_until_idle=lambda *, timeout_s=None: True,
+            is_output_idle=lambda: idle_after[0],
+            ensure_processing_feedback=lambda: None,
+            resume_processing_after_bridge=lambda: None,
+            trace_event=lambda name, **kwargs: trace_events.append((name, kwargs)),
+        )
+
+        def _slow_final_lane() -> StreamingToolLoopResult:
+            idle_after[0] = True
+            time.sleep(0.05)
+            return StreamingToolLoopResult(
+                text="Hier ist die finale Antwort.",
+                rounds=1,
+                tool_calls=(),
+                tool_results=(),
+                response_id="resp_final",
+                request_id="req_final",
+                model="gpt-4o-mini",
+                token_usage=None,
+                used_web_search=True,
+            )
+
+        outcome = orchestrator.execute(
+            prefetched_first_word=FirstWordReply(mode="filler", spoken_text="Ich schaue kurz nach."),
+            prefetched_first_word_source="prefetched",
+            generate_first_word=None,
+            bridge_fallback_reply=None,
+            run_final_lane=_slow_final_lane,
+            recover_final_lane_response=None,
+        )
+
+        self.assertEqual(outcome.response.text, "Hier ist die finale Antwort.")
+        event = next(
+            payload
+            for name, payload in trace_events
+            if name == "streaming_final_lane_still_running_after_bridge"
+        )
+        final_lane = event["details"]["final_lane"]
+        self.assertEqual(final_lane["name"], "final-lane")
+        self.assertFalse(final_lane["done"])
+        self.assertEqual(final_lane["thread"]["name"], "twinr-final-lane")
+        self.assertTrue(final_lane["thread"]["stack_present"])
+
     def test_final_response_waits_for_bridge_idle_after_first_audio(self) -> None:
         lane_events: list[SpeechLaneDelta] = []
         waits: list[tuple[str, float | None]] = []
@@ -216,6 +271,7 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
 
     def test_final_lane_timeout_requests_cooperative_stop_signal(self) -> None:
         requested: list[str] = []
+        trace_events: list[tuple[str, dict[str, object]]] = []
         orchestrator = StreamingTurnOrchestrator(
             timeout_policy=StreamingTurnTimeoutPolicy(
                 bridge_reply_timeout_ms=10,
@@ -227,6 +283,7 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
             wait_for_first_audio=lambda *, timeout_s=None: True,
             ensure_processing_feedback=lambda: None,
             request_final_lane_stop=requested.append,
+            trace_event=lambda name, **kwargs: trace_events.append((name, kwargs)),
         )
 
         def _blocking_final_lane() -> StreamingToolLoopResult:
@@ -254,6 +311,22 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
             )
 
         self.assertEqual(requested, ["timeout"])
+        watchdog_event = next(
+            payload
+            for name, payload in trace_events
+            if name == "streaming_final_lane_watchdog_triggered"
+        )
+        timeout_event = next(
+            payload for name, payload in trace_events if name == "streaming_final_lane_timeout"
+        )
+        self.assertEqual(watchdog_event["level"], "WARN")
+        self.assertEqual(timeout_event["level"], "ERROR")
+        final_lane = timeout_event["details"]["final_lane"]
+        self.assertEqual(final_lane["name"], "final-lane")
+        self.assertFalse(final_lane["done"])
+        self.assertEqual(final_lane["thread"]["name"], "twinr-final-lane")
+        self.assertTrue(final_lane["thread"]["stack_present"])
+        self.assertEqual(final_lane["thread"]["top_frame"]["func"], "_blocking_final_lane")
 
 
 if __name__ == "__main__":

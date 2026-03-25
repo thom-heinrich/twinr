@@ -14,14 +14,20 @@ so the servo does not keep buzzing against a loaded mount.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import subprocess
 import time
-from typing import Protocol
+from typing import Callable, Protocol, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.servo_continuous import (
+    ContinuousRotationServoConfig,
+    ContinuousRotationServoPlanner,
+)
+from twinr.hardware.servo_maestro import PololuMaestroServoPulseWriter
+from twinr.hardware.servo_peer import PeerPololuMaestroServoPulseWriter
 
 
 _DEFAULT_SERVO_FREQUENCY_HZ = 50
@@ -49,15 +55,27 @@ _DEFAULT_SOFT_LIMIT_MARGIN_US = 70
 _DEFAULT_IDLE_RELEASE_S = 1.0
 _DEFAULT_SETTLED_RELEASE_S = 0.0
 _DEFAULT_FOLLOW_EXIT_ONLY = False
+_DEFAULT_VISIBLE_RECENTER_INTERVAL_S = 30.0
+_DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE = 0.12
 _DEFAULT_MECHANICAL_RANGE_DEGREES = 270.0
 _DEFAULT_EXIT_FOLLOW_MAX_DEGREES = 60.0
 _DEFAULT_EXIT_ACTIVATION_DELAY_S = 0.75
 _DEFAULT_EXIT_SETTLE_HOLD_S = 0.6
 _DEFAULT_EXIT_REACQUIRE_CENTER_TOLERANCE = 0.08
-_DEFAULT_EXIT_VISIBLE_EDGE_THRESHOLD = 0.74
+_DEFAULT_EXIT_VISIBLE_EDGE_THRESHOLD = 0.62
+_DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD = 0.92
 _DEFAULT_EXIT_COOLDOWN_S = 30.0
+_DEFAULT_CONTROL_MODE = "position"
+_DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S = 120.0
+_DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES = 45.0
+_DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES = 4.0
+_DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US = 70
+_DEFAULT_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US = 160
 _MIN_RELEASE_TOLERANCE_US = 12
 _MAX_RELEASE_TOLERANCE_US = 48
+_SERVO_PRECHECK_TIMEOUT_S = 2.0
+_RECOVERABLE_SERVO_FAULT_RETRY_S = 1.0
+_CONFLICTING_GPIO_OVERLAY_NAMES = frozenset({"pwm-pio"})
 
 
 def _clamp_ratio(value: float) -> float:
@@ -67,25 +85,116 @@ def _clamp_ratio(value: float) -> float:
 
 
 def _bounded_float(value: object, *, default: float, minimum: float, maximum: float) -> float:
-    try:
-        normalized = float(value if value is not None else default)
-    except (TypeError, ValueError):
+    raw_value = default if value is None else value
+    if not isinstance(raw_value, (int, float, str)):
         normalized = default
-    if not math.isfinite(normalized):
+    else:
+        try:
+            normalized = float(raw_value)
+        except (TypeError, ValueError):
+            normalized = default
+    if not isinstance(normalized, float) or not math.isfinite(normalized):
         normalized = default
     return max(minimum, min(maximum, normalized))
 
 
 def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
-    try:
-        normalized = int(value if value is not None else default)
-    except (TypeError, ValueError):
+    raw_value = default if value is None else value
+    if not isinstance(raw_value, (int, float, str)):
         normalized = default
+    else:
+        try:
+            normalized = int(raw_value)
+        except (TypeError, ValueError):
+            normalized = default
     return max(minimum, min(maximum, normalized))
 
 
 def _clamp(value: float, *, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def _run_best_effort_text_command(args: list[str], *, timeout_s: float = _SERVO_PRECHECK_TIMEOUT_S) -> str | None:
+    """Return stdout for one short best-effort probe command."""
+
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_s),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _detect_conflicting_servo_gpio_environment(
+    *,
+    gpio: int,
+    run_text_command: Callable[[list[str]], str | None] = _run_best_effort_text_command,
+) -> list[str]:
+    """Describe live GPIO conflict evidence that makes servo startup unsafe."""
+
+    checked_gpio = int(gpio)
+    gpio_token = f"gpio={checked_gpio}"
+    pin_token = f"pin={checked_gpio}"
+    conflicts: list[str] = []
+    overlay_output = run_text_command(["dtoverlay", "-l"])
+    if overlay_output:
+        for raw_line in overlay_output.splitlines():
+            line = raw_line.strip()
+            if ":" not in line:
+                continue
+            descriptor = line.split(":", 1)[1].strip()
+            if not descriptor or (gpio_token not in descriptor and pin_token not in descriptor):
+                continue
+            overlay_name = descriptor.split()[0].strip().lower()
+            if overlay_name in _CONFLICTING_GPIO_OVERLAY_NAMES:
+                conflicts.append(f"overlay {descriptor}")
+    process_output = run_text_command(["ps", "-eo", "pid=,stat=,args="])
+    if process_output:
+        for raw_line in process_output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, stat, args = parts
+            lowered_args = args.lower()
+            if "dtoverlay" not in lowered_args:
+                continue
+            if "pwm-pio" in lowered_args:
+                if gpio_token in lowered_args or pin_token in lowered_args:
+                    conflicts.append(f"process pid={pid} stat={stat} args={args}")
+                continue
+            if "dtoverlay -r" in lowered_args and conflicts:
+                conflicts.append(f"process pid={pid} stat={stat} args={args}")
+    return conflicts
+
+
+def _assert_servo_gpio_environment_ready(config: "AttentionServoConfig") -> None:
+    """Fail closed when a proven conflicting GPIO overlay/process state is present."""
+
+    driver = str(config.driver or _DEFAULT_SERVO_DRIVER).strip().lower() or _DEFAULT_SERVO_DRIVER
+    if driver in {"pololu_maestro", "peer_pololu_maestro"}:
+        return
+    if not config.enabled or config.gpio is None:
+        return
+    conflicts = _detect_conflicting_servo_gpio_environment(gpio=int(config.gpio))
+    if not conflicts:
+        return
+    rendered_conflicts = "; ".join(conflicts[:4])
+    if len(conflicts) > 4:
+        rendered_conflicts += f"; +{len(conflicts) - 4} more"
+    raise RuntimeError(
+        f"Refusing attention servo startup on GPIO{int(config.gpio)} due to conflicting overlay/process state: "
+        f"{rendered_conflicts}"
+    )
 
 
 def _normalize_chip_index(chip_name: str) -> int:
@@ -107,6 +216,9 @@ def _normalize_chip_index(chip_name: str) -> int:
 class ServoPulseWriter(Protocol):
     """Write servo pulse widths to one GPIO line."""
 
+    def probe(self, gpio: int) -> None:
+        """Validate one output line/channel before runtime startup when supported."""
+
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         """Start or update the pulse train for one GPIO line."""
 
@@ -120,18 +232,38 @@ class ServoPulseWriter(Protocol):
         """Return the most recent known pulse width for one GPIO line when available."""
 
 
+class _NoopServoPulseWriter:
+    """Allow fail-closed servo startup without touching GPIO state."""
+
+    def probe(self, gpio: int) -> None:
+        del gpio
+
+    def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
+        del gpio_chip, gpio, pulse_width_us
+
+    def disable(self, *, gpio_chip: str, gpio: int) -> None:
+        del gpio_chip, gpio
+
+    def close(self) -> None:
+        return
+
+    def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
+        del gpio_chip, gpio
+        return None
+
+
 class LGPIOServoPulseWriter:
     """Drive one Pi servo line through `lgpio.tx_servo`."""
 
     def __init__(self) -> None:
-        self._lgpio = None
+        self._lgpio: object | None = None
         self._handles: dict[int, int] = {}
         self._claimed_outputs: dict[int, set[int]] = {}
 
     def _module(self):
         if self._lgpio is None:
             try:
-                import lgpio
+                import lgpio  # pylint: disable=import-error
             except Exception as exc:  # pragma: no cover - import path depends on host image
                 raise RuntimeError("python3-lgpio is required for attention servo output") from exc
             self._lgpio = lgpio
@@ -156,6 +288,10 @@ class LGPIOServoPulseWriter:
             claim_output(handle, int(gpio), 0)
         claimed_outputs.add(int(gpio))
 
+    def probe(self, gpio: int) -> None:
+        del gpio
+        self._module()
+
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         module, handle = self._handle_for_chip(gpio_chip)
         self._claim_output_if_needed(
@@ -164,7 +300,10 @@ class LGPIOServoPulseWriter:
             gpio_chip=gpio_chip,
             gpio=int(gpio),
         )
-        module.tx_servo(
+        tx_servo = getattr(module, "tx_servo", None)
+        if not callable(tx_servo):
+            raise RuntimeError("python3-lgpio with tx_servo support is required for attention servo output")
+        tx_servo(  # pylint: disable=not-callable
             handle,
             int(gpio),
             int(pulse_width_us),
@@ -174,14 +313,17 @@ class LGPIOServoPulseWriter:
     def disable(self, *, gpio_chip: str, gpio: int) -> None:
         module, handle = self._handle_for_chip(gpio_chip)
         chip_index = _normalize_chip_index(gpio_chip)
-        module.tx_servo(
+        tx_servo = getattr(module, "tx_servo", None)
+        if not callable(tx_servo):
+            raise RuntimeError("python3-lgpio with tx_servo support is required for attention servo output")
+        tx_servo(  # pylint: disable=not-callable
             handle,
             int(gpio),
             0,
             servo_frequency=_DEFAULT_SERVO_FREQUENCY_HZ,
         )
-        claim_input = getattr(module, "gpio_claim_input", None)
-        if callable(claim_input):
+        claim_input = cast(Callable[[int, int], None] | None, getattr(module, "gpio_claim_input", None))
+        if claim_input is not None:
             claim_input(handle, int(gpio))
         claimed_outputs = self._claimed_outputs.get(chip_index)
         if claimed_outputs is not None:
@@ -200,6 +342,10 @@ class LGPIOServoPulseWriter:
                 continue
         self._handles.clear()
         self._claimed_outputs.clear()
+
+    def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
+        del gpio_chip, gpio
+        return None
 
 
 class LGPIOPWMServoPulseWriter(LGPIOServoPulseWriter):
@@ -251,8 +397,8 @@ class LGPIOPWMServoPulseWriter(LGPIOServoPulseWriter):
             pwm_frequency=0.0,
             duty_cycle=0.0,
         )
-        claim_input = getattr(module, "gpio_claim_input", None)
-        if callable(claim_input):
+        claim_input = cast(Callable[[int, int], None] | None, getattr(module, "gpio_claim_input", None))
+        if claim_input is not None:
             claim_input(handle, checked_gpio)
         claimed_outputs = self._claimed_outputs.get(chip_index)
         if claimed_outputs is not None:
@@ -265,14 +411,14 @@ class PigpioServoPulseWriter:
     """Drive one Pi servo line through pigpio's hardware-timed servo pulses."""
 
     def __init__(self) -> None:
-        self._pigpio = None
+        self._pigpio: object | None = None
         self._pi = None
         self._claimed_outputs: set[int] = set()
 
     def _module(self):
         if self._pigpio is None:
             try:
-                import pigpio
+                import pigpio  # pylint: disable=import-error
             except Exception as exc:  # pragma: no cover - depends on host image
                 raise RuntimeError("python3-pigpio is required for hardware-timed attention servo output") from exc
             self._pigpio = pigpio
@@ -294,6 +440,10 @@ class PigpioServoPulseWriter:
                 raise RuntimeError("pigpiod is required for hardware-timed attention servo output")
             self._pi = pi
         return module, self._pi
+
+    def probe(self, gpio: int) -> None:
+        del gpio
+        self._connection()
 
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         self._assert_supported_chip(gpio_chip)
@@ -325,6 +475,10 @@ class PigpioServoPulseWriter:
             finally:
                 self._pi = None
         self._claimed_outputs.clear()
+
+    def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
+        del gpio_chip, gpio
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,6 +624,10 @@ class SysfsPWMServoPulseWriter:
                 continue
         self._enabled_gpios.clear()
 
+    def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
+        del gpio_chip, gpio
+        return None
+
 
 class TwinrKernelServoPulseWriter:
     """Drive one Pi servo line through Twinr's custom kernel servo module."""
@@ -582,17 +740,27 @@ class TwinrKernelServoPulseWriter:
 
 
 def _default_pulse_writer_for_config(config: "AttentionServoConfig") -> ServoPulseWriter:
+    _assert_servo_gpio_environment_ready(config)
     driver = str(config.driver or _DEFAULT_SERVO_DRIVER).strip().lower() or _DEFAULT_SERVO_DRIVER
+    if driver == "pololu_maestro":
+        # Keep Maestro startup lazy so transient USB re-enumeration or a stale
+        # by-id path does not permanently disable the servo until a full restart.
+        return PololuMaestroServoPulseWriter(device_path=config.maestro_device)
+    if driver == "peer_pololu_maestro":
+        return PeerPololuMaestroServoPulseWriter(
+            base_url=config.peer_base_url or "",
+            timeout_s=config.peer_timeout_s,
+        )
     if driver == "twinr_kernel":
         writer = TwinrKernelServoPulseWriter()
         if config.gpio is not None:
             writer.probe(config.gpio)
         return writer
     if driver == "sysfs_pwm":
-        writer = SysfsPWMServoPulseWriter()
+        sysfs_writer: ServoPulseWriter = SysfsPWMServoPulseWriter()
         if config.gpio is not None:
-            writer.probe(config.gpio)
-        return writer
+            sysfs_writer.probe(config.gpio)
+        return sysfs_writer
     if driver == "pigpio":
         return PigpioServoPulseWriter()
     if driver == "lgpio_pwm":
@@ -609,16 +777,16 @@ def _default_pulse_writer_for_config(config: "AttentionServoConfig") -> ServoPul
     except RuntimeError:
         pass
     try:
-        writer = SysfsPWMServoPulseWriter()
+        auto_sysfs_writer: ServoPulseWriter = SysfsPWMServoPulseWriter()
         if config.gpio is not None:
-            writer.probe(config.gpio)
-        return writer
+            auto_sysfs_writer.probe(config.gpio)
+        return auto_sysfs_writer
     except RuntimeError:
         pass
     try:
-        writer = PigpioServoPulseWriter()
-        writer._connection()
-        return writer
+        pigpio_writer = PigpioServoPulseWriter()
+        pigpio_writer._connection()
+        return pigpio_writer
     except RuntimeError:
         pass
     return LGPIOPWMServoPulseWriter()
@@ -630,6 +798,10 @@ class AttentionServoConfig:
 
     enabled: bool = False
     driver: str = _DEFAULT_SERVO_DRIVER
+    control_mode: str = _DEFAULT_CONTROL_MODE
+    maestro_device: str | None = None
+    peer_base_url: str | None = None
+    peer_timeout_s: float = 1.5
     gpio_chip: str = "gpiochip0"
     gpio: int | None = None
     invert_direction: bool = False
@@ -656,13 +828,25 @@ class AttentionServoConfig:
     idle_release_s: float = _DEFAULT_IDLE_RELEASE_S
     settled_release_s: float = _DEFAULT_SETTLED_RELEASE_S
     follow_exit_only: bool = _DEFAULT_FOLLOW_EXIT_ONLY
+    visible_recenter_interval_s: float = _DEFAULT_VISIBLE_RECENTER_INTERVAL_S
+    visible_recenter_center_tolerance: float = _DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE
     mechanical_range_degrees: float = _DEFAULT_MECHANICAL_RANGE_DEGREES
     exit_follow_max_degrees: float = _DEFAULT_EXIT_FOLLOW_MAX_DEGREES
     exit_activation_delay_s: float = _DEFAULT_EXIT_ACTIVATION_DELAY_S
     exit_settle_hold_s: float = _DEFAULT_EXIT_SETTLE_HOLD_S
     exit_reacquire_center_tolerance: float = _DEFAULT_EXIT_REACQUIRE_CENTER_TOLERANCE
     exit_visible_edge_threshold: float = _DEFAULT_EXIT_VISIBLE_EDGE_THRESHOLD
+    exit_visible_box_edge_threshold: float = _DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD
     exit_cooldown_s: float = _DEFAULT_EXIT_COOLDOWN_S
+    continuous_max_speed_degrees_per_s: float = _DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S
+    continuous_slow_zone_degrees: float = _DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES
+    continuous_stop_tolerance_degrees: float = _DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES
+    continuous_min_speed_pulse_delta_us: int = _DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US
+    continuous_max_speed_pulse_delta_us: int = _DEFAULT_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US
+
+    @property
+    def uses_continuous_rotation(self) -> bool:
+        return str(self.control_mode or _DEFAULT_CONTROL_MODE).strip().lower() == "continuous_rotation"
 
     @property
     def safe_min_pulse_width_us(self) -> int:
@@ -699,6 +883,14 @@ class AttentionServoConfig:
     def from_config(cls, config: TwinrConfig) -> "AttentionServoConfig":
         """Build one bounded servo config from the global Twinr config."""
 
+        driver = str(getattr(config, "attention_servo_driver", _DEFAULT_SERVO_DRIVER) or _DEFAULT_SERVO_DRIVER)
+        control_mode = str(getattr(config, "attention_servo_control_mode", _DEFAULT_CONTROL_MODE) or _DEFAULT_CONTROL_MODE)
+        maestro_device = getattr(config, "attention_servo_maestro_device", None)
+        peer_base_url = getattr(config, "attention_servo_peer_base_url", None)
+        peer_timeout_s = getattr(config, "attention_servo_peer_timeout_s", 1.5)
+        configured_gpio = getattr(config, "attention_servo_gpio", None)
+        if str(driver).strip().lower() in {"pololu_maestro", "peer_pololu_maestro"}:
+            configured_gpio = getattr(config, "attention_servo_maestro_channel", None)
         min_pulse = _bounded_int(
             getattr(config, "attention_servo_min_pulse_width_us", _DEFAULT_MIN_PULSE_WIDTH_US),
             default=_DEFAULT_MIN_PULSE_WIDTH_US,
@@ -737,9 +929,18 @@ class AttentionServoConfig:
         )
         return cls(
             enabled=bool(getattr(config, "attention_servo_enabled", False)),
-            driver=str(getattr(config, "attention_servo_driver", _DEFAULT_SERVO_DRIVER) or _DEFAULT_SERVO_DRIVER),
+            driver=driver,
+            control_mode=control_mode,
+            maestro_device=None if maestro_device is None else (str(maestro_device).strip() or None),
+            peer_base_url=None if peer_base_url is None else (str(peer_base_url).strip().rstrip("/") or None),
+            peer_timeout_s=_bounded_float(
+                peer_timeout_s,
+                default=1.5,
+                minimum=0.1,
+                maximum=30.0,
+            ),
             gpio_chip=str(getattr(config, "gpio_chip", "gpiochip0") or "gpiochip0"),
-            gpio=getattr(config, "attention_servo_gpio", None),
+            gpio=configured_gpio,
             invert_direction=bool(getattr(config, "attention_servo_invert_direction", False)),
             target_hold_s=target_hold_s,
             loss_extrapolation_s=_bounded_float(
@@ -876,6 +1077,26 @@ class AttentionServoConfig:
             follow_exit_only=bool(
                 getattr(config, "attention_servo_follow_exit_only", _DEFAULT_FOLLOW_EXIT_ONLY)
             ),
+            visible_recenter_interval_s=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_visible_recenter_interval_s",
+                    _DEFAULT_VISIBLE_RECENTER_INTERVAL_S,
+                ),
+                default=_DEFAULT_VISIBLE_RECENTER_INTERVAL_S,
+                minimum=0.0,
+                maximum=600.0,
+            ),
+            visible_recenter_center_tolerance=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_visible_recenter_center_tolerance",
+                    _DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE,
+                ),
+                default=_DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE,
+                minimum=0.0,
+                maximum=0.3,
+            ),
             mechanical_range_degrees=mechanical_range_degrees,
             exit_follow_max_degrees=_bounded_float(
                 getattr(
@@ -927,6 +1148,16 @@ class AttentionServoConfig:
                 minimum=0.55,
                 maximum=0.95,
             ),
+            exit_visible_box_edge_threshold=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_exit_visible_box_edge_threshold",
+                    _DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD,
+                ),
+                default=_DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD,
+                minimum=0.75,
+                maximum=0.99,
+            ),
             exit_cooldown_s=_bounded_float(
                 getattr(
                     config,
@@ -936,6 +1167,56 @@ class AttentionServoConfig:
                 default=_DEFAULT_EXIT_COOLDOWN_S,
                 minimum=0.0,
                 maximum=300.0,
+            ),
+            continuous_max_speed_degrees_per_s=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_continuous_max_speed_degrees_per_s",
+                    _DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S,
+                ),
+                default=_DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S,
+                minimum=1.0,
+                maximum=720.0,
+            ),
+            continuous_slow_zone_degrees=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_continuous_slow_zone_degrees",
+                    _DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES,
+                ),
+                default=_DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES,
+                minimum=0.5,
+                maximum=max(1.0, mechanical_range_degrees * 0.5),
+            ),
+            continuous_stop_tolerance_degrees=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_continuous_stop_tolerance_degrees",
+                    _DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES,
+                ),
+                default=_DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES,
+                minimum=0.0,
+                maximum=max(1.0, mechanical_range_degrees * 0.5),
+            ),
+            continuous_min_speed_pulse_delta_us=_bounded_int(
+                getattr(
+                    config,
+                    "attention_servo_continuous_min_speed_pulse_delta_us",
+                    _DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US,
+                ),
+                default=_DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US,
+                minimum=0,
+                maximum=max(1, min(center_pulse - min_pulse, max_pulse - center_pulse)),
+            ),
+            continuous_max_speed_pulse_delta_us=_bounded_int(
+                getattr(
+                    config,
+                    "attention_servo_continuous_max_speed_pulse_delta_us",
+                    _DEFAULT_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US,
+                ),
+                default=_DEFAULT_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US,
+                minimum=0,
+                maximum=max(1, min(center_pulse - min_pulse, max_pulse - center_pulse)),
             ),
         )
 
@@ -965,6 +1246,7 @@ class AttentionServoController:
     ) -> None:
         self.config = config
         self._pulse_writer = pulse_writer or _default_pulse_writer_for_config(config)
+        self._continuous_planner = self._build_continuous_planner()
         self._last_target_center_x: float | None = None
         self._last_target_at: float | None = None
         self._last_target_velocity_x_per_s = 0.0
@@ -981,13 +1263,20 @@ class AttentionServoController:
         self._visible_target_pulse_width_us: int | None = None
         self._last_exit_hold_center_x: float | None = None
         self._recent_visible_targets: deque[tuple[float, float]] = deque()
+        self._recent_visible_target_boxes: deque[tuple[float, float, float]] = deque()
         self._exit_pursuit_target_pulse_width_us: int | None = None
         self._exit_pursuit_center_x: float | None = None
         self._exit_pursuit_settled_at: float | None = None
         self._exit_cooldown_until_at: float | None = None
         self._visible_edge_departure_since_at: float | None = None
+        self._visible_recenter_since_at: float | None = None
+        self._visible_recenter_target_pulse_width_us: int | None = None
+        self._visible_recenter_center_x: float | None = None
+        self._visible_recenter_settled_at: float | None = None
         self._startup_rest_alignment_pending = False
         self._fault_reason: str | None = None
+        self._disabled_due_to_fault = False
+        self._fault_retry_after_at: float | None = None
         self._prime_last_physical_pulse_width_from_writer()
         self._release_stale_output_if_disabled()
 
@@ -995,7 +1284,32 @@ class AttentionServoController:
     def from_config(cls, config: TwinrConfig) -> "AttentionServoController":
         """Build one servo controller from the global Twinr config."""
 
-        return cls(config=AttentionServoConfig.from_config(config))
+        servo_config = AttentionServoConfig.from_config(config)
+        try:
+            return cls(config=servo_config)
+        except Exception as exc:
+            disabled_config = replace(servo_config, enabled=False)
+            controller = cls(config=disabled_config, pulse_writer=_NoopServoPulseWriter())
+            controller._fault_reason = f"startup_preflight_failed: {exc.__class__.__name__}: {exc}"
+            controller._disabled_due_to_fault = True
+            return controller
+
+    def _build_continuous_planner(self) -> ContinuousRotationServoPlanner | None:
+        if not self.config.uses_continuous_rotation:
+            return None
+        return ContinuousRotationServoPlanner(
+            ContinuousRotationServoConfig(
+                center_pulse_width_us=self.config.center_pulse_width_us,
+                min_pulse_width_us=self.config.safe_min_pulse_width_us,
+                max_pulse_width_us=self.config.safe_max_pulse_width_us,
+                max_heading_degrees=self._maximum_target_heading_degrees(),
+                max_speed_degrees_per_s=self.config.continuous_max_speed_degrees_per_s,
+                slow_zone_degrees=self.config.continuous_slow_zone_degrees,
+                stop_tolerance_degrees=self.config.continuous_stop_tolerance_degrees,
+                min_speed_pulse_delta_us=self.config.continuous_min_speed_pulse_delta_us,
+                max_speed_pulse_delta_us=self.config.continuous_max_speed_pulse_delta_us,
+            )
+        )
 
     def update(
         self,
@@ -1005,6 +1319,8 @@ class AttentionServoController:
         target_center_x: float | None,
         confidence: float | None,
         visible_target_present: bool | None = None,
+        visible_target_box_left: float | None = None,
+        visible_target_box_right: float | None = None,
     ) -> AttentionServoDecision:
         """Apply one bounded servo update from a pre-derived attention target."""
 
@@ -1028,7 +1344,7 @@ class AttentionServoController:
             if visible_target_present is None
             else (active and bool(visible_target_present))
         )
-        if not self.config.enabled:
+        if not self.config.enabled and not self._disabled_due_to_fault:
             return AttentionServoDecision(
                 observed_at=observed_at,
                 active=False,
@@ -1044,7 +1360,7 @@ class AttentionServoController:
                 confidence=checked_confidence,
                 target_center_x=target_center_x,
             )
-        if self._fault_reason is not None:
+        if self._fault_reason is not None and not self._maybe_recover_from_fault(observed_at=checked_at):
             return AttentionServoDecision(
                 observed_at=observed_at,
                 active=False,
@@ -1058,6 +1374,8 @@ class AttentionServoController:
                 target_center_x=target_center_x,
                 confidence=checked_confidence,
                 visible_target_present=checked_visible_target_present,
+                visible_target_box_left=visible_target_box_left,
+                visible_target_box_right=visible_target_box_right,
             )
         if self.config.follow_exit_only and checked_visible_target_present:
             return self._update_visible_target_for_exit_only(
@@ -1084,7 +1402,10 @@ class AttentionServoController:
             observed_at=checked_at,
             target_center_x=applied_center_x,
         )
-        target_pulse_width_us = self._pulse_width_for_center_x(applied_center_x)
+        target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=applied_center_x,
+            observed_at=checked_at,
+        )
         target_pulse_width_us = self._stabilize_visible_target_pulse_width(
             target_pulse_width_us=target_pulse_width_us,
             reason=reason,
@@ -1165,6 +1486,11 @@ class AttentionServoController:
                     gpio=self.config.gpio,
                     pulse_width_us=commanded_pulse_width_us,
                 )
+                if self._continuous_planner is not None:
+                    self._continuous_planner.note_commanded_pulse_width(
+                        commanded_pulse_width_us,
+                        observed_at=checked_at,
+                    )
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
                 self._last_physical_pulse_width_us = commanded_pulse_width_us
             self._last_update_at = checked_at
@@ -1190,6 +1516,8 @@ class AttentionServoController:
         target_center_x: float | None,
         confidence: float,
         visible_target_present: bool,
+        visible_target_box_left: float | None,
+        visible_target_box_right: float | None,
     ) -> AttentionServoDecision:
         normalized_target_center_x = None if target_center_x is None else _clamp_ratio(float(target_center_x))
         if (
@@ -1228,7 +1556,10 @@ class AttentionServoController:
                 confidence=confidence,
                 target_center_x=target_center_x,
                 normalized_target_center_x=normalized_target_center_x,
+                visible_target_box_left=visible_target_box_left,
+                visible_target_box_right=visible_target_box_right,
             )
+        self._clear_visible_recenter(reset_timer=True)
         if self._exit_pursuit_target_pulse_width_us is not None:
             if self._should_return_to_rest_from_exit_pursuit(
                 observed_at=observed_at,
@@ -1260,7 +1591,7 @@ class AttentionServoController:
             loss_elapsed_s = max(0.0, observed_at - self._last_target_at)
             if loss_elapsed_s < self.config.exit_activation_delay_s:
                 self._last_exit_hold_center_x = None
-                self._release_active_output()
+                self._release_active_output(observed_at=observed_at)
                 self._last_update_at = observed_at
                 return AttentionServoDecision(
                     observed_at=observed_at,
@@ -1293,7 +1624,14 @@ class AttentionServoController:
         confidence: float,
         target_center_x: float | None,
         normalized_target_center_x: float,
+        visible_target_box_left: float | None,
+        visible_target_box_right: float | None,
     ) -> AttentionServoDecision:
+        self._remember_visible_target_box(
+            observed_at=observed_at,
+            box_left=visible_target_box_left,
+            box_right=visible_target_box_right,
+        )
         self._remember_visible_target(
             observed_at=observed_at,
             target_center_x=normalized_target_center_x,
@@ -1318,8 +1656,39 @@ class AttentionServoController:
                     target_center_x=target_center_x,
                     reason="pursuing_edge_departure",
                 )
+            if self._visible_recenter_target_pulse_width_us is not None:
+                return self._drive_visible_recenter_target(
+                    observed_at=observed_at,
+                    confidence=confidence,
+                    target_center_x=target_center_x,
+                    normalized_target_center_x=normalized_target_center_x,
+                )
+            if self._target_is_visible_recenter_centered(normalized_target_center_x):
+                self._clear_visible_recenter(reset_timer=True)
+                self._exit_pursuit_settled_at = None
+                self._release_active_output(observed_at=observed_at)
+                self._last_update_at = observed_at
+                return AttentionServoDecision(
+                    observed_at=observed_at,
+                    active=False,
+                    reason="waiting_for_exit",
+                    confidence=confidence,
+                    target_center_x=target_center_x,
+                    applied_center_x=normalized_target_center_x,
+                    target_pulse_width_us=None,
+                    commanded_pulse_width_us=None,
+                )
+            if self._should_begin_visible_recenter(observed_at=observed_at):
+                if self._begin_visible_recenter(normalized_target_center_x=normalized_target_center_x):
+                    return self._drive_visible_recenter_target(
+                        observed_at=observed_at,
+                        confidence=confidence,
+                        target_center_x=target_center_x,
+                        normalized_target_center_x=normalized_target_center_x,
+                    )
+                self._clear_visible_recenter(reset_timer=True)
             self._exit_pursuit_settled_at = None
-            self._release_active_output()
+            self._release_active_output(observed_at=observed_at)
             self._last_update_at = observed_at
             return AttentionServoDecision(
                 observed_at=observed_at,
@@ -1340,7 +1709,7 @@ class AttentionServoController:
             )
         target_pulse_width_us = self._exit_pursuit_target_pulse_width_us
         self._start_exit_cooldown(observed_at=observed_at)
-        self._release_active_output()
+        self._release_active_output(observed_at=observed_at)
         self._last_update_at = observed_at
         return AttentionServoDecision(
             observed_at=observed_at,
@@ -1374,7 +1743,7 @@ class AttentionServoController:
             self._last_target_center_x = normalized_target_center_x
             self._last_target_at = observed_at
             self._smoothed_center_x = normalized_target_center_x
-        self._release_active_output()
+        self._release_active_output(observed_at=observed_at)
         self._last_update_at = observed_at
         return AttentionServoDecision(
             observed_at=observed_at,
@@ -1395,14 +1764,18 @@ class AttentionServoController:
         target_center_x: float | None,
         reason: str,
     ) -> AttentionServoDecision:
-        target_pulse_width_us = self._exit_pursuit_target_pulse_width_us
         applied_center_x = self._exit_pursuit_center_x
-        if target_pulse_width_us is None or applied_center_x is None:
+        if applied_center_x is None:
             return self._drive_rest_position(
                 observed_at=observed_at,
                 confidence=confidence,
                 target_center_x=target_center_x,
             )
+        target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=applied_center_x,
+            observed_at=observed_at,
+        )
+        self._exit_pursuit_target_pulse_width_us = target_pulse_width_us
         if (
             self._exit_pursuit_settled_at is not None
             and self._last_commanded_pulse_width_us is None
@@ -1431,7 +1804,7 @@ class AttentionServoController:
                 and observed_at >= self._exit_pursuit_settled_at
                 and (observed_at - self._exit_pursuit_settled_at) >= self.config.exit_settle_hold_s
             ):
-                self._release_active_output()
+                self._release_active_output(observed_at=observed_at)
                 self._last_update_at = observed_at
                 return AttentionServoDecision(
                     observed_at=observed_at,
@@ -1453,6 +1826,108 @@ class AttentionServoController:
             observed_at=observed_at,
             active=True,
             reason=reason,
+            confidence=confidence,
+            target_center_x=target_center_x,
+            applied_center_x=applied_center_x,
+            target_pulse_width_us=target_pulse_width_us,
+            commanded_pulse_width_us=commanded_pulse_width_us,
+        )
+
+    def _drive_visible_recenter_target(
+        self,
+        *,
+        observed_at: float | None,
+        confidence: float,
+        target_center_x: float | None,
+        normalized_target_center_x: float,
+    ) -> AttentionServoDecision:
+        applied_center_x = self._visible_recenter_center_x
+        if applied_center_x is None:
+            self._clear_visible_recenter(reset_timer=True)
+            self._release_active_output(observed_at=observed_at)
+            self._last_update_at = observed_at
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=False,
+                reason="waiting_for_exit",
+                confidence=confidence,
+                target_center_x=target_center_x,
+                applied_center_x=normalized_target_center_x,
+                target_pulse_width_us=None,
+                commanded_pulse_width_us=None,
+            )
+        target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=applied_center_x,
+            observed_at=observed_at,
+        )
+        self._visible_recenter_target_pulse_width_us = target_pulse_width_us
+        if self._target_is_visible_recenter_centered(normalized_target_center_x):
+            self._clear_visible_recenter(reset_timer=True)
+            self._release_active_output(observed_at=observed_at)
+            self._last_update_at = observed_at
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=False,
+                reason="waiting_for_exit",
+                confidence=confidence,
+                target_center_x=target_center_x,
+                applied_center_x=normalized_target_center_x,
+                target_pulse_width_us=target_pulse_width_us,
+                commanded_pulse_width_us=None,
+            )
+        target_side = self._exit_side_for_center_x(normalized_target_center_x)
+        latched_side = self._exit_side_for_center_x(applied_center_x)
+        if target_side != 0 and latched_side != 0 and target_side != latched_side:
+            self._clear_visible_recenter(reset_timer=True)
+            self._release_active_output(observed_at=observed_at)
+            self._last_update_at = observed_at
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=False,
+                reason="waiting_for_exit",
+                confidence=confidence,
+                target_center_x=target_center_x,
+                applied_center_x=normalized_target_center_x,
+                target_pulse_width_us=None,
+                commanded_pulse_width_us=None,
+            )
+        commanded_pulse_width_us = self._write_target_pulse_width(
+            observed_at=observed_at,
+            target_pulse_width_us=target_pulse_width_us,
+            motion_profile="tracking",
+        )
+        tolerance_us = self._release_tolerance_us()
+        if abs(target_pulse_width_us - commanded_pulse_width_us) <= tolerance_us:
+            if (
+                observed_at is not None
+                and self._visible_recenter_settled_at is not None
+                and observed_at >= self._visible_recenter_settled_at
+                and (observed_at - self._visible_recenter_settled_at) >= self.config.settled_release_s
+            ):
+                self._clear_visible_recenter(reset_timer=True)
+                self._release_active_output(observed_at=observed_at)
+                self._last_update_at = observed_at
+                return AttentionServoDecision(
+                    observed_at=observed_at,
+                    active=False,
+                    reason="waiting_for_exit",
+                    confidence=confidence,
+                    target_center_x=target_center_x,
+                    applied_center_x=normalized_target_center_x,
+                    target_pulse_width_us=target_pulse_width_us,
+                    commanded_pulse_width_us=None,
+                )
+            if observed_at is not None and (
+                self._visible_recenter_settled_at is None
+                or observed_at < self._visible_recenter_settled_at
+            ):
+                self._visible_recenter_settled_at = observed_at
+        else:
+            self._visible_recenter_settled_at = None
+        return AttentionServoDecision(
+            observed_at=observed_at,
+            active=True,
+            reason="pursuing_visible_recenter",
             confidence=confidence,
             target_center_x=target_center_x,
             applied_center_x=applied_center_x,
@@ -1518,6 +1993,8 @@ class AttentionServoController:
             motion_profile=motion_profile,
         )
         try:
+            if self.config.gpio is None:
+                raise RuntimeError("Attention servo output is enabled without a configured output channel")
             if (
                 self._last_commanded_pulse_width_us is None
                 or commanded_pulse_width_us != self._last_commanded_pulse_width_us
@@ -1527,6 +2004,11 @@ class AttentionServoController:
                     gpio=self.config.gpio,
                     pulse_width_us=commanded_pulse_width_us,
                 )
+                if self._continuous_planner is not None:
+                    self._continuous_planner.note_commanded_pulse_width(
+                        commanded_pulse_width_us,
+                        observed_at=observed_at,
+                    )
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
                 self._last_physical_pulse_width_us = commanded_pulse_width_us
             if (
@@ -1549,8 +2031,12 @@ class AttentionServoController:
             return None
         exit_sign = 1.0 if anchor_offset > 0.0 else -1.0
         exit_center_x = _clamp_ratio(0.5 + (0.5 * self.config.exit_follow_offset_limit * exit_sign))
+        self._clear_visible_recenter(reset_timer=True)
         self._exit_pursuit_center_x = exit_center_x
-        self._exit_pursuit_target_pulse_width_us = self._pulse_width_for_center_x(exit_center_x)
+        self._exit_pursuit_target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=exit_center_x,
+            observed_at=observed_at,
+        )
         self._exit_pursuit_settled_at = None
         self._last_exit_hold_center_x = exit_center_x
         return exit_center_x
@@ -1571,8 +2057,10 @@ class AttentionServoController:
         self._exit_pursuit_settled_at = None
         self._last_exit_hold_center_x = None
         self._visible_edge_departure_since_at = None
+        self._clear_visible_recenter(reset_timer=True)
         if clear_recent_visible_targets:
             self._recent_visible_targets.clear()
+            self._recent_visible_target_boxes.clear()
 
     def _should_return_to_rest_from_exit_pursuit(
         self,
@@ -1602,13 +2090,17 @@ class AttentionServoController:
         finally:
             self._last_commanded_pulse_width_us = None
             self._reset_motion_state()
+            if self._continuous_planner is not None:
+                self._continuous_planner.reset()
             self._last_target_velocity_x_per_s = 0.0
             self._recent_visible_targets.clear()
+            self._recent_visible_target_boxes.clear()
             self._exit_pursuit_target_pulse_width_us = None
             self._exit_pursuit_center_x = None
             self._exit_pursuit_settled_at = None
             self._exit_cooldown_until_at = None
             self._visible_edge_departure_since_at = None
+            self._clear_visible_recenter(reset_timer=True)
             self._smoothed_center_x = None
             self._last_update_at = None
             self._centered_since = None
@@ -1619,6 +2111,95 @@ class AttentionServoController:
             self._last_exit_hold_center_x = None
             self._pulse_writer.close()
 
+    def debug_snapshot(self, *, observed_at: float | None) -> dict[str, object]:
+        """Return one bounded debug snapshot of the controller's internal state."""
+
+        checked_at = None if observed_at is None else float(observed_at)
+        recent_targets: list[dict[str, object]] = []
+        for sample_at, sample_center_x in list(self._recent_visible_targets)[-6:]:
+            age_s = None if checked_at is None else round(max(0.0, checked_at - sample_at), 3)
+            recent_targets.append(
+                {
+                    "age_s": age_s,
+                    "center_x": round(sample_center_x, 4),
+                }
+            )
+        last_target_age_s = None
+        if checked_at is not None and self._last_target_at is not None:
+            last_target_age_s = round(max(0.0, checked_at - self._last_target_at), 3)
+        visible_departure_age_s = None
+        if checked_at is not None and self._visible_edge_departure_since_at is not None:
+            visible_departure_age_s = round(max(0.0, checked_at - self._visible_edge_departure_since_at), 3)
+        visible_recenter_age_s = None
+        if checked_at is not None and self._visible_recenter_since_at is not None:
+            visible_recenter_age_s = round(max(0.0, checked_at - self._visible_recenter_since_at), 3)
+        visible_recenter_settled_age_s = None
+        if checked_at is not None and self._visible_recenter_settled_at is not None:
+            visible_recenter_settled_age_s = round(max(0.0, checked_at - self._visible_recenter_settled_at), 3)
+        exit_cooldown_remaining_s = None
+        if checked_at is not None and self._exit_cooldown_until_at is not None:
+            exit_cooldown_remaining_s = round(max(0.0, self._exit_cooldown_until_at - checked_at), 3)
+        recent_exit_anchor_center_x = (
+            None if checked_at is None else self._recent_exit_anchor_center_x(observed_at=checked_at)
+        )
+        recent_exit_box_edge = (
+            None if checked_at is None else self._recent_exit_anchor_box_edge(observed_at=checked_at)
+        )
+        return {
+            "last_target_center_x": None if self._last_target_center_x is None else round(self._last_target_center_x, 4),
+            "last_target_age_s": last_target_age_s,
+            "last_target_velocity_x_per_s": round(self._last_target_velocity_x_per_s, 4),
+            "recent_visible_targets": recent_targets,
+            "recent_exit_anchor_center_x": (
+                None if recent_exit_anchor_center_x is None else round(recent_exit_anchor_center_x, 4)
+            ),
+            "recent_exit_box_edge": None if recent_exit_box_edge is None else round(recent_exit_box_edge, 4),
+            "visible_edge_departure_age_s": visible_departure_age_s,
+            "visible_recenter_age_s": visible_recenter_age_s,
+            "visible_recenter_center_x": (
+                None if self._visible_recenter_center_x is None else round(self._visible_recenter_center_x, 4)
+            ),
+            "visible_recenter_target_pulse_width_us": self._visible_recenter_target_pulse_width_us,
+            "visible_recenter_settled_age_s": visible_recenter_settled_age_s,
+            "exit_pursuit_center_x": None if self._exit_pursuit_center_x is None else round(self._exit_pursuit_center_x, 4),
+            "exit_pursuit_target_pulse_width_us": self._exit_pursuit_target_pulse_width_us,
+            "exit_pursuit_settled_at": self._exit_pursuit_settled_at,
+            "exit_cooldown_remaining_s": exit_cooldown_remaining_s,
+            "last_commanded_pulse_width_us": self._last_commanded_pulse_width_us,
+            "last_physical_pulse_width_us": self._last_physical_pulse_width_us,
+            "released_pulse_width_us": self._released_pulse_width_us,
+            "visible_target_pulse_width_us": self._visible_target_pulse_width_us,
+            "startup_rest_alignment_pending": self._startup_rest_alignment_pending,
+            "continuous_estimated_heading_degrees": (
+                None
+                if self._continuous_planner is None
+                else round(self._continuous_planner.estimated_heading_degrees, 3)
+            ),
+            "continuous_desired_heading_degrees": (
+                None
+                if self._continuous_planner is None
+                else round(self._continuous_planner.desired_heading_degrees, 3)
+            ),
+            "fault_reason": self._fault_reason,
+            "disabled_due_to_fault": self._disabled_due_to_fault,
+            "config": {
+                "control_mode": self.config.control_mode,
+                "follow_exit_only": self.config.follow_exit_only,
+                "visible_recenter_interval_s": round(self.config.visible_recenter_interval_s, 3),
+                "visible_recenter_center_tolerance": round(
+                    self.config.visible_recenter_center_tolerance,
+                    4,
+                ),
+                "exit_visible_edge_threshold": round(self.config.exit_visible_edge_threshold, 4),
+                "exit_visible_box_edge_threshold": round(self.config.exit_visible_box_edge_threshold, 4),
+                "exit_activation_delay_s": round(self.config.exit_activation_delay_s, 3),
+                "exit_reacquire_center_tolerance": round(self.config.exit_reacquire_center_tolerance, 4),
+                "exit_cooldown_s": round(self.config.exit_cooldown_s, 3),
+                "exit_follow_offset_limit": round(self.config.exit_follow_offset_limit, 4),
+                "deadband": round(self.config.deadband, 4),
+            },
+        }
+
     def _prime_last_physical_pulse_width_from_writer(self) -> None:
         """Seed the motion planner from the kernel's remembered pulse width on controller startup.
 
@@ -1627,6 +2208,12 @@ class AttentionServoController:
         the servo is already centered and yanking loaded hardware back to rest.
         """
 
+        if self._continuous_planner is not None:
+            self._continuous_planner.reset()
+            self._last_physical_pulse_width_us = self.config.center_pulse_width_us
+            self._released_pulse_width_us = self.config.center_pulse_width_us
+            self._reset_motion_state(self.config.center_pulse_width_us)
+            return
         if self.config.gpio is None:
             return
         current_pulse_reader = getattr(self._pulse_writer, "current_pulse_width_us", None)
@@ -1672,8 +2259,10 @@ class AttentionServoController:
     ) -> bool:
         return active and target_center_x is not None
 
-    def _release_active_output(self) -> None:
+    def _release_active_output(self, *, observed_at: float | None = None) -> None:
         if self._last_commanded_pulse_width_us is None:
+            if self._continuous_planner is not None:
+                self._continuous_planner.note_stopped(observed_at=observed_at)
             return
         try:
             self._pulse_writer.disable(
@@ -1683,6 +2272,8 @@ class AttentionServoController:
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_stopped(observed_at=observed_at)
         self._released_pulse_width_us = self._last_commanded_pulse_width_us
         self._last_physical_pulse_width_us = self._last_commanded_pulse_width_us
         self._last_commanded_pulse_width_us = None
@@ -1700,6 +2291,50 @@ class AttentionServoController:
             )
         except Exception:
             return
+
+    def _driver_supports_fault_recovery(self) -> bool:
+        return str(self.config.driver or _DEFAULT_SERVO_DRIVER).strip().lower() in {
+            "pololu_maestro",
+            "peer_pololu_maestro",
+        }
+
+    def _maybe_recover_from_fault(self, *, observed_at: float | None) -> bool:
+        if self._fault_reason is None:
+            return True
+        if not self._driver_supports_fault_recovery():
+            return False
+        retry_anchor_at = time.monotonic() if observed_at is None else observed_at
+        if self._fault_retry_after_at is not None and retry_anchor_at < self._fault_retry_after_at:
+            return False
+        close_writer = getattr(self._pulse_writer, "close", None)
+        if callable(close_writer):
+            try:
+                close_writer()
+            except Exception:
+                pass
+        try:
+            if self.config.gpio is not None:
+                self._pulse_writer.probe(self.config.gpio)
+            self._fault_reason = None
+            self._disabled_due_to_fault = False
+            self._fault_retry_after_at = None
+            self._last_commanded_pulse_width_us = None
+            self._last_target_center_x = None
+            self._last_target_at = None
+            self._last_target_velocity_x_per_s = 0.0
+            self._smoothed_center_x = None
+            if self._continuous_planner is not None:
+                self._continuous_planner.reset()
+                self._last_physical_pulse_width_us = self.config.center_pulse_width_us
+                self._released_pulse_width_us = self.config.center_pulse_width_us
+                self._reset_motion_state(self.config.center_pulse_width_us)
+            else:
+                self._prime_last_physical_pulse_width_from_writer()
+            return True
+        except Exception as exc:
+            self._fault_reason = f"{exc.__class__.__name__}: {exc}"
+            self._fault_retry_after_at = retry_anchor_at + _RECOVERABLE_SERVO_FAULT_RETRY_S
+            return False
 
     def _update_visible_target_for_exit_only(
         self,
@@ -1726,7 +2361,7 @@ class AttentionServoController:
         self._visible_target_pulse_width_us = None
         self._centered_since = None
         self._settled_since = None
-        self._release_active_output()
+        self._release_active_output(observed_at=observed_at)
         self._last_update_at = observed_at
         return AttentionServoDecision(
             observed_at=observed_at,
@@ -1809,33 +2444,74 @@ class AttentionServoController:
             self._recent_visible_targets.popleft()
         self._recent_visible_targets.append((checked_at, _clamp_ratio(target_center_x)))
 
+    def _remember_visible_target_box(
+        self,
+        *,
+        observed_at: float | None,
+        box_left: float | None,
+        box_right: float | None,
+    ) -> None:
+        """Keep a short visible-box history so edge pursuit keys off real frame boundaries."""
+
+        if observed_at is None or box_left is None or box_right is None:
+            return
+        checked_at = float(observed_at)
+        normalized_left = _clamp_ratio(float(box_left))
+        normalized_right = _clamp_ratio(float(box_right))
+        if normalized_right < normalized_left:
+            normalized_left, normalized_right = normalized_right, normalized_left
+        history_window_s = max(
+            self.config.target_hold_s,
+            self.config.loss_extrapolation_s,
+            self.config.exit_activation_delay_s,
+        )
+        cutoff_at = checked_at - max(0.0, history_window_s)
+        while self._recent_visible_target_boxes and self._recent_visible_target_boxes[0][0] < cutoff_at:
+            self._recent_visible_target_boxes.popleft()
+        self._recent_visible_target_boxes.append((checked_at, normalized_left, normalized_right))
+
     def _visible_edge_departure_confirmed(
         self,
         *,
         observed_at: float | None,
         target_center_x: float,
     ) -> bool:
-        """Return whether one visible edge-stuck target should trigger monotone pursuit.
+        """Return whether one visible side-departure should trigger monotone pursuit.
 
         The HDMI fast path can keep a user weakly visible as a small edge anchor
-        while they are already leaving the frame. In exit-only mode that should
-        still unlock the same one-direction pursuit after a short confirmation
-        delay instead of blocking forever on a broad `person_visible=true`.
+        while they are already leaving the frame, and the attention target can
+        briefly snap inward again before the exit delay elapses. In exit-only
+        mode that should still unlock the same one-direction pursuit after a
+        short confirmation delay instead of blocking forever on a broad
+        `person_visible=true` or a single centered wobble.
         """
 
         if observed_at is None:
             self._visible_edge_departure_since_at = None
             return False
+        checked_at = float(observed_at)
+        candidate_center_x = self._recent_exit_anchor_center_x(observed_at=checked_at)
+        if candidate_center_x is None:
+            candidate_center_x = float(target_center_x)
+        exit_side = self._exit_side_for_center_x(candidate_center_x)
         edge_threshold = self.config.exit_visible_edge_threshold
         if edge_threshold <= 0.5:
             self._visible_edge_departure_since_at = None
             return False
-        distance_from_center = abs(float(target_center_x) - 0.5)
+        distance_from_center = abs(candidate_center_x - 0.5)
         required_distance = max(0.0, edge_threshold - 0.5)
         if distance_from_center < required_distance:
             self._visible_edge_departure_since_at = None
             return False
-        checked_at = float(observed_at)
+        edge_position = self._recent_exit_anchor_box_edge(observed_at=checked_at)
+        if edge_position is not None and exit_side != 0:
+            box_edge_threshold = self.config.exit_visible_box_edge_threshold
+            if exit_side > 0 and edge_position < box_edge_threshold:
+                self._visible_edge_departure_since_at = None
+                return False
+            if exit_side < 0 and edge_position > (1.0 - box_edge_threshold):
+                self._visible_edge_departure_since_at = None
+                return False
         if self._visible_edge_departure_since_at is None:
             self._visible_edge_departure_since_at = checked_at
             return False
@@ -1845,6 +2521,43 @@ class AttentionServoController:
         """Return whether one visible target is centered enough to end exit pursuit."""
 
         return abs(float(target_center_x) - 0.5) <= self.config.exit_reacquire_center_tolerance
+
+    def _target_is_visible_recenter_centered(self, target_center_x: float) -> bool:
+        """Return whether one visible target is close enough to center to skip periodic recentering."""
+
+        return abs(float(target_center_x) - 0.5) <= self.config.visible_recenter_center_tolerance
+
+    def _clear_visible_recenter(self, *, reset_timer: bool) -> None:
+        self._visible_recenter_target_pulse_width_us = None
+        self._visible_recenter_center_x = None
+        self._visible_recenter_settled_at = None
+        if reset_timer:
+            self._visible_recenter_since_at = None
+
+    def _should_begin_visible_recenter(self, *, observed_at: float | None) -> bool:
+        if self._visible_recenter_target_pulse_width_us is not None:
+            return True
+        checked_at = time.monotonic() if observed_at is None else float(observed_at)
+        interval_s = max(0.0, self.config.visible_recenter_interval_s)
+        if interval_s <= 0.0:
+            self._visible_recenter_since_at = checked_at
+            return True
+        since_at = self._visible_recenter_since_at
+        if since_at is None or checked_at < since_at:
+            self._visible_recenter_since_at = checked_at
+            return False
+        return (checked_at - since_at) >= interval_s
+
+    def _begin_visible_recenter(self, *, normalized_target_center_x: float) -> bool:
+        if self._target_is_visible_recenter_centered(normalized_target_center_x):
+            return False
+        self._visible_recenter_center_x = normalized_target_center_x
+        self._visible_recenter_target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=normalized_target_center_x,
+            observed_at=self._last_update_at,
+        )
+        self._visible_recenter_settled_at = None
+        return True
 
     def _recent_exit_anchor_center_x(self, *, observed_at: float | None) -> float | None:
         """Return the furthest recent visible point on the current exit side."""
@@ -1862,20 +2575,7 @@ class AttentionServoController:
             cutoff_at = checked_at - max(0.0, history_window_s)
             while self._recent_visible_targets and self._recent_visible_targets[0][0] < cutoff_at:
                 self._recent_visible_targets.popleft()
-        last_offset = last_target_center_x - 0.5
-        last_side = 0
-        if last_offset > 0.0:
-            last_side = 1
-        elif last_offset < 0.0:
-            last_side = -1
-        velocity_side = 0
-        if self._last_target_velocity_x_per_s > 1e-4:
-            velocity_side = 1
-        elif self._last_target_velocity_x_per_s < -1e-4:
-            velocity_side = -1
-        exit_side = velocity_side or last_side
-        if last_side != 0 and velocity_side != 0 and velocity_side != last_side:
-            exit_side = last_side
+        exit_side = self._current_exit_side(last_target_center_x)
         if exit_side == 0:
             return last_target_center_x
         anchor_center_x = last_target_center_x
@@ -1892,6 +2592,68 @@ class AttentionServoController:
                 anchor_offset = sample_distance
         return anchor_center_x
 
+    def _recent_exit_anchor_box_edge(self, *, observed_at: float | None) -> float | None:
+        """Return the furthest recent visible box edge on the current exit side."""
+
+        last_target_center_x = self._last_target_center_x
+        if last_target_center_x is None:
+            return None
+        checked_at = None if observed_at is None else float(observed_at)
+        history_window_s = max(
+            self.config.target_hold_s,
+            self.config.loss_extrapolation_s,
+            self.config.exit_activation_delay_s,
+        )
+        if checked_at is not None:
+            cutoff_at = checked_at - max(0.0, history_window_s)
+            while self._recent_visible_target_boxes and self._recent_visible_target_boxes[0][0] < cutoff_at:
+                self._recent_visible_target_boxes.popleft()
+        exit_side = self._current_exit_side(last_target_center_x)
+        if exit_side == 0:
+            return None
+        anchor_edge = None
+        for _, sample_left, sample_right in self._recent_visible_target_boxes:
+            sample_center_x = (sample_left + sample_right) * 0.5
+            if exit_side > 0:
+                if sample_center_x <= 0.5:
+                    continue
+                candidate_edge = sample_right
+                if anchor_edge is None or candidate_edge > anchor_edge:
+                    anchor_edge = candidate_edge
+            else:
+                if sample_center_x >= 0.5:
+                    continue
+                candidate_edge = sample_left
+                if anchor_edge is None or candidate_edge < anchor_edge:
+                    anchor_edge = candidate_edge
+        return anchor_edge
+
+    def _current_exit_side(self, last_target_center_x: float) -> int:
+        """Return the most plausible exit side from recent target position and velocity."""
+
+        last_side = self._exit_side_for_center_x(last_target_center_x)
+        velocity_side = 0
+        if self._last_target_velocity_x_per_s > 1e-4:
+            velocity_side = 1
+        elif self._last_target_velocity_x_per_s < -1e-4:
+            velocity_side = -1
+        exit_side = velocity_side or last_side
+        if last_side != 0 and velocity_side != 0 and velocity_side != last_side:
+            exit_side = last_side
+        return exit_side
+
+    def _exit_side_for_center_x(self, center_x: float | None) -> int:
+        """Return the horizontal side token for one normalized target center."""
+
+        if center_x is None:
+            return 0
+        offset = float(center_x) - 0.5
+        if offset > 0.0:
+            return 1
+        if offset < 0.0:
+            return -1
+        return 0
+
     def _await_exit_confirmation(
         self,
         *,
@@ -1905,7 +2667,7 @@ class AttentionServoController:
         self._visible_target_pulse_width_us = None
         self._centered_since = None
         self._settled_since = None
-        self._release_active_output()
+        self._release_active_output(observed_at=observed_at)
         self._last_update_at = observed_at
         return AttentionServoDecision(
             observed_at=observed_at,
@@ -1933,6 +2695,8 @@ class AttentionServoController:
             confidence=confidence,
         )
         if target_available:
+            if target_center_x is None:
+                raise RuntimeError("Target availability requires a concrete normalized target center")
             normalized_center_x = _clamp_ratio(float(target_center_x))
             self._update_target_velocity(
                 observed_at=checked_at,
@@ -2052,6 +2816,28 @@ class AttentionServoController:
             maximum=self.config.exit_follow_offset_limit,
         )
         return _clamp_ratio(0.5 + (limited_offset * 0.5))
+
+    def _maximum_target_heading_degrees(self) -> float:
+        if self.config.follow_exit_only:
+            return max(1.0, float(self.config.exit_follow_max_degrees))
+        return max(1.0, float(self.config.mechanical_range_degrees) * 0.5)
+
+    def _desired_heading_degrees_for_center_x(self, center_x: float) -> float:
+        normalized_center_x = self._clamped_follow_center_x(center_x)
+        normalized_offset = (normalized_center_x - 0.5) * 2.0
+        if self.config.invert_direction:
+            normalized_offset *= -1.0
+        if abs(normalized_offset) <= self.config.deadband:
+            normalized_offset = 0.0
+        return normalized_offset * self._maximum_target_heading_degrees()
+
+    def _target_pulse_width_for_center_x(self, *, center_x: float, observed_at: float | None) -> int:
+        if self._continuous_planner is None:
+            return self._pulse_width_for_center_x(center_x)
+        return self._continuous_planner.target_pulse_width_for_heading(
+            self._desired_heading_degrees_for_center_x(center_x),
+            observed_at=observed_at,
+        )
 
     def _pulse_width_for_center_x(self, center_x: float) -> int:
         normalized_center_x = self._clamped_follow_center_x(center_x)
@@ -2317,6 +3103,8 @@ class AttentionServoController:
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_stopped(observed_at=observed_at)
         self._last_commanded_pulse_width_us = None
         self._last_physical_pulse_width_us = self.config.center_pulse_width_us
         self._reset_motion_state(self.config.center_pulse_width_us)
@@ -2375,7 +3163,8 @@ class AttentionServoController:
         """Release the servo after it reaches the projected exit endpoint."""
 
         if (
-            not self.config.follow_exit_only
+            self._continuous_planner is not None
+            or not self.config.follow_exit_only
             or reason not in {"holding_projected_trajectory", "holding_exit_position"}
             or self._last_commanded_pulse_width_us is None
         ):
@@ -2391,6 +3180,8 @@ class AttentionServoController:
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_stopped(observed_at=observed_at)
         self._released_pulse_width_us = commanded_pulse_width_us
         self._last_commanded_pulse_width_us = None
         self._last_physical_pulse_width_us = commanded_pulse_width_us
@@ -2417,7 +3208,8 @@ class AttentionServoController:
         """Release a stable off-center target so loaded servos can relax quietly."""
 
         if (
-            observed_at is None
+            self._continuous_planner is not None
+            or observed_at is None
             or self.config.settled_release_s <= 0.0
             or self._last_commanded_pulse_width_us is None
         ):
@@ -2446,6 +3238,8 @@ class AttentionServoController:
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_stopped(observed_at=observed_at)
         self._released_pulse_width_us = commanded_pulse_width_us
         self._last_commanded_pulse_width_us = None
         self._last_physical_pulse_width_us = commanded_pulse_width_us

@@ -2,7 +2,7 @@
 
 The proactive root re-exports proactive governance, runtime orchestration, and
 social-trigger types. Remote voice activation now lives in
-``twinr.orchestrator``; deleted local wakeword packages are intentionally not
+``twinr.orchestrator``; retired alternative voice-activation packages are intentionally not
 re-exported here.
 """
 

@@ -11,9 +11,11 @@ owned_concerns:
   - Overlay direct ReSpeaker XVF3800 signal facts onto normalized audio observations
   - Preserve conservative ReSpeaker busy-state and direction-quality facts for downstream policy consumers
   - Map the local-first IMX500 adapter onto the normalized social vision contract
+  - Map the same normalized social vision contract onto peer-LAN IMX500 observations served by a dedicated helper Pi
   - Stabilize automation-facing camera snapshots, bounded visible-person anchors, coarse motion, and rising-edge coarse/fine gesture events
   - Confirm explicit fine-hand symbols conservatively before the UI or policy layers see them, so random single-frame positives do not become user-facing acknowledgements
   - Load bounded per-symbol fine-hand calibration so ambiguous symbols such as `ok_sign` or `middle_finger` can be stricter than `thumbs_up` or `pointing`
+  - Share low-risk social-contract normalization helpers across modules without duplicating hot-path coercion logic
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
 out_of_scope:
@@ -27,8 +29,8 @@ files:
     exports:
       - AmbientAudioObservationProvider
       - NullAudioObservationProvider
-      - OpenAIProactiveVisionReviewer
       - OpenAIVisionObservationProvider
+      - OpenAIProactiveVisionReviewer
       - ProactiveAudioSnapshot
       - ProactiveVisionFrameBuffer
       - ProactiveVisionReview
@@ -63,8 +65,8 @@ files:
       - SocialAudioObservation
       - SocialBodyPose
       - SocialDetectedObject
-      - SocialGestureEvent
       - SocialFineHandGesture
+      - SocialGestureEvent
       - SocialMotionState
       - SocialObservation
       - SocialPersonZone
@@ -92,6 +94,18 @@ files:
     exports:
       - LocalAICameraObservationProvider
       - LocalAICameraProviderConfig
+  - path: remote_camera_provider.py
+    role: Peer-LAN IMX500 providers that either consume helper-Pi observation JSON directly or run the hot attention/gesture lifting on the main Pi from remote frames
+    exports:
+      - RemoteAICameraObservationProvider
+      - RemoteAICameraProviderConfig
+      - RemoteFrameAICameraObservationProvider
+  - path: normalization.py
+    role: Shared low-risk enum, box, and integer coercion helpers reused by social hot paths
+    exports:
+      - coerce_enum_member
+      - coerce_non_negative_int_or_default
+      - coerce_spatial_box_coordinates
   - path: observers.py
     role: Ambient-audio, ReSpeaker-overlay, and still-camera observation providers
     exports:
@@ -131,8 +145,8 @@ public_api:
   exports:
     - AmbientAudioObservationProvider
     - NullAudioObservationProvider
-    - OpenAIProactiveVisionReviewer
     - OpenAIVisionObservationProvider
+    - OpenAIProactiveVisionReviewer
     - ProactiveAudioSnapshot
     - ProactiveVisionFrameBuffer
     - ProactiveVisionReview
@@ -166,8 +180,8 @@ compatibility_reexports:
     names:
       - AmbientAudioObservationProvider
       - NullAudioObservationProvider
-      - OpenAIProactiveVisionReviewer
       - OpenAIVisionObservationProvider
+      - OpenAIProactiveVisionReviewer
       - ProactiveAudioSnapshot
       - ProactiveVisionFrameBuffer
       - ProactiveVisionReview
@@ -198,16 +212,15 @@ compatibility_reexports:
       - weighted_trigger_score
 primary_callers:
   - path: src/twinr/proactive/runtime/service.py
-  - path: src/twinr/agent/workflows/social_triggers.py
   - path: src/twinr/agent/workflows/__init__.py
   - path: src/twinr/__main__.py
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_local_ai_camera_provider.py
+  - path: test/test_remote_ai_camera_provider.py
   - path: test/test_gesture_calibration.py
   - path: test/test_proactive_camera_surface.py
   - path: test/test_social_triggers.py
   - path: test/test_proactive_vision_review.py
   - path: test/test_proactive_monitor.py
-  - path: test/test_runner.py
   - path: test/test_realtime_runner.py

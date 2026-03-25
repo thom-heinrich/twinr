@@ -15,7 +15,7 @@ from twinr.agent.base_agent.settings.simple_settings import (
     update_simple_setting,
     write_env_updates,
 )
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 
 
 class SimpleSettingsTests(unittest.TestCase):

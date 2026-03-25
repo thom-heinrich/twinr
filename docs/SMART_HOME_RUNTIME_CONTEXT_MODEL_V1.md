@@ -39,7 +39,7 @@ Twinr has two very different jobs:
 Those jobs cannot share one undifferentiated `presence` state.
 
 If a hallway motion sensor or a remote room button can directly arm local
-wakeword behavior, Twinr becomes noisy and surprising. If on-device sensing
+voice-activation behavior, Twinr becomes noisy and surprising. If on-device sensing
 ignores configured environment context entirely, Twinr loses useful household
 awareness such as `someone is elsewhere in the home`, `alarm active`, or
 `smart-home stream unhealthy`.
@@ -62,13 +62,13 @@ This is the live local interaction layer. It answers:
 - is someone likely near Twinr now
 - is a person visible or recently visible
 - is room speech aligned with recent local presence
-- should wakeword, gesture wakeup, or display-first engagement be armed
+- should voice activation, gesture wakeup, or display-first engagement be armed
 
 Primary sources:
 
 - local PIR
 - local camera
-- local microphone / VAD / wakeword path
+- local microphone / VAD / voice-activation path
 
 Allowed derived states:
 
@@ -77,14 +77,14 @@ Allowed derived states:
 - `person_visible`
 - `person_recently_visible`
 - `speaking_in_room`
-- `wakeword_candidate`
+- `voice_activation_candidate`
 - presence sessions and local attention windows
 
 Rules:
 
 - `near_device_presence` is authoritative for local HCI.
 - `smart_home` must not create `person_visible`.
-- `smart_home` must not directly arm wakeword or speaker-targeted attention.
+- `smart_home` must not directly arm voice activation or speaker-targeted attention.
 - `smart_home` may only bias timing or caution through higher layers.
 
 ### 2. `room_context`
@@ -321,7 +321,7 @@ Safe influence areas:
 
 Unsafe influence areas:
 
-- local wakeword arming by itself
+- local voice-activation arming by itself
 - `person_visible`
 - hard user identity
 - direct speech targeting of a specific person

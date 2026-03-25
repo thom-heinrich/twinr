@@ -1,8 +1,9 @@
-"""Capture bounded still photos from local camera devices.
+"""Capture bounded still photos from local devices or a peer snapshot proxy.
 
-This module wraps ``ffmpeg`` for Twinr's camera use cases, normalizes failures
-into user-safe exceptions, and optionally confines persisted photos to an
-allowed output tree.
+This module wraps ``ffmpeg`` for direct V4L2 capture, falls back to
+``rpicam-still`` on Raspberry Pi camera stacks when needed, and can also fetch
+one bounded still frame from a peer HTTP snapshot proxy while preserving the
+same upstream ``CapturedPhoto`` contract.
 """
 
 from __future__ import annotations
@@ -13,9 +14,13 @@ from typing import ClassVar, Sequence
 import asyncio
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -29,6 +34,8 @@ _RPICAM_STILL_INPUT_FORMAT = "rpicam-still"
 _RPICAM_STILL_MIN_TIMEOUT_MS = 1000
 _RPICAM_STILL_MAX_TIMEOUT_MS = 5000
 _UNICAM_IMAGE_MARKER = "unicam-image"
+_HTTP_SNAPSHOT_INPUT_FORMAT = "http-snapshot"
+_HTTP_ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 
 class CameraError(RuntimeError):  # AUDIT-FIX(#6): Use structured camera exceptions so callers can recover differently from config, timeout, and capture failures.
@@ -108,6 +115,17 @@ class V4L2StillCamera:
     def from_config(cls, config: TwinrConfig) -> "V4L2StillCamera":
         """Build a still camera from ``TwinrConfig`` values."""
 
+        snapshot_url = getattr(config, "camera_proxy_snapshot_url", None)
+        if isinstance(snapshot_url, str) and snapshot_url.strip():
+            return SnapshotProxyStillCamera(
+                snapshot_url=snapshot_url,
+                width=config.camera_width,
+                height=config.camera_height,
+                capture_timeout_seconds=getattr(
+                    config, "camera_capture_timeout_seconds", _DEFAULT_CAPTURE_TIMEOUT_SECONDS
+                ),
+                output_root=getattr(config, "camera_capture_output_dir", None),
+            )
         return cls(
             device=config.camera_device,
             width=config.camera_width,
@@ -177,7 +195,7 @@ class V4L2StillCamera:
                         stdin=subprocess.DEVNULL,
                         timeout=self.capture_timeout_seconds,
                     )
-                except subprocess.TimeoutExpired as exc:
+                except subprocess.TimeoutExpired:
                     timeout_error = CameraCaptureTimeoutError(
                         (
                             f"Camera capture timed out for {self.device} using format {label} "
@@ -316,11 +334,19 @@ class V4L2StillCamera:
 
         if not errors:
             return False
-        if not any("resource busy" in error.casefold() or "timeout" in error.casefold() for error in errors):
-            return False
         if Path(self.device).name != "video0":
             return False
-        return self._device_sysfs_name().casefold() == _UNICAM_IMAGE_MARKER
+        normalized_errors = tuple(error.casefold() for error in errors)
+        if any("resource busy" in error or "timeout" in error for error in normalized_errors):
+            return self._device_sysfs_name().casefold() == _UNICAM_IMAGE_MARKER
+        # On Pi camera stacks that rely on libcamera/rpicam, the default V4L2
+        # node can be absent even though the camera is otherwise healthy.
+        if any(
+            "cannot open video device" in error and "no such file or directory" in error
+            for error in normalized_errors
+        ):
+            return not self._device_sysfs_name()
+        return False
 
     def _device_sysfs_name(self) -> str:
         """Return the current V4L2 sysfs node name, if available."""
@@ -547,3 +573,146 @@ class V4L2StillCamera:
         else:
             raise CameraConfigurationError("output_root must be a path-like value")
         return candidate.expanduser().resolve(strict=False)
+
+
+class SnapshotProxyStillCamera(V4L2StillCamera):
+    """Fetch bounded still images from a peer HTTP snapshot proxy.
+
+    The proxy preserves Twinr's still-photo interface on the main Pi while the
+    actual camera stays attached to a second peer-connected Raspberry Pi.
+    """
+
+    def __init__(
+        self,
+        *,
+        snapshot_url: str,
+        width: int,
+        height: int,
+        capture_timeout_seconds: float = _DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+        output_root: str | Path | None = None,
+    ) -> None:
+        self.snapshot_url = self._validate_snapshot_url(snapshot_url)
+        self.device = self.snapshot_url
+        self.width = self._validate_positive_int("width", width)
+        self.height = self._validate_positive_int("height", height)
+        self.framerate = 1
+        self.ffmpeg_path = "http"
+        self.input_format = _HTTP_SNAPSHOT_INPUT_FORMAT
+        self.capture_timeout_seconds = self._validate_positive_float(
+            "capture_timeout_seconds", capture_timeout_seconds
+        )
+        self.output_root = self._normalize_output_root(output_root)
+        self._capture_lock = threading.Lock()
+
+    def capture_photo(
+        self,
+        *,
+        output_path: str | Path | None = None,
+        filename: str = _DEFAULT_CAPTURE_FILENAME,
+    ) -> CapturedPhoto:
+        """Fetch one still photo from the configured peer snapshot endpoint."""
+
+        safe_filename = self._sanitize_filename(filename)
+        request_url = self._build_snapshot_request_url()
+        request = Request(
+            request_url,
+            headers={
+                "Accept": "image/png",
+                "User-Agent": "twinr-peer-camera-client/1",
+            },
+            method="GET",
+        )
+        with self._capture_lock:
+            try:
+                with urlopen(request, timeout=self.capture_timeout_seconds) as response:
+                    payload = response.read()
+                    content_type = self._normalize_content_type(response.headers.get("Content-Type", ""))
+            except HTTPError as exc:
+                detail = self._summarize_process_error(exc.read())
+                raise CameraCaptureFailedError(
+                    f"Camera snapshot proxy returned HTTP {exc.code} for {self.snapshot_url}: {detail}",
+                    user_safe_message="The proxy camera could not take a photo right now. Please try again.",
+                ) from exc
+            except URLError as exc:
+                reason = getattr(exc, "reason", exc)
+                reason_text = self._summarize_reason(reason)
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    raise CameraCaptureTimeoutError(
+                        f"Camera snapshot proxy timed out for {self.snapshot_url} after {self.capture_timeout_seconds:.1f}s",
+                        user_safe_message="The proxy camera took too long to respond. Please try again.",
+                    ) from exc
+                raise CameraCaptureFailedError(
+                    f"Camera snapshot proxy request failed for {self.snapshot_url}: {reason_text}",
+                    user_safe_message="The proxy camera is currently unavailable. Please try again.",
+                ) from exc
+            except TimeoutError as exc:
+                raise CameraCaptureTimeoutError(
+                    f"Camera snapshot proxy timed out for {self.snapshot_url} after {self.capture_timeout_seconds:.1f}s",
+                    user_safe_message="The proxy camera took too long to respond. Please try again.",
+                ) from exc
+            except OSError as exc:
+                raise CameraCaptureFailedError(
+                    f"Camera snapshot proxy request failed for {self.snapshot_url}: {exc}",
+                    user_safe_message="The proxy camera is currently unavailable. Please try again.",
+                ) from exc
+
+        if content_type != "image/png" or not self._is_png_bytes(payload):
+            raise CameraCaptureFailedError(
+                f"Camera snapshot proxy returned unexpected content type {content_type!r} for {self.snapshot_url}",
+                user_safe_message="The proxy camera returned an invalid photo. Please try again.",
+            )
+
+        capture = CapturedPhoto(
+            data=payload,
+            content_type=content_type,
+            filename=safe_filename,
+            source_device=self.snapshot_url,
+            input_format=_HTTP_SNAPSHOT_INPUT_FORMAT,
+        )
+        if output_path is not None:
+            self._write_output_file(output_path, safe_filename, capture.data)
+        return capture
+
+    def _build_snapshot_request_url(self) -> str:
+        """Return the proxied snapshot URL with bounded capture parameters."""
+
+        parsed = urlsplit(self.snapshot_url)
+        params = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+            if key not in {"width", "height", "timeout_ms"}
+        ]
+        params.extend(
+            (
+                ("width", str(self.width)),
+                ("height", str(self.height)),
+                ("timeout_ms", str(int(self.capture_timeout_seconds * 1000.0))),
+            )
+        )
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), ""))
+
+    @classmethod
+    def _validate_snapshot_url(cls, snapshot_url: str) -> str:
+        """Validate one operator-provided peer snapshot endpoint URL."""
+
+        normalized = cls._validate_non_empty_text("snapshot_url", snapshot_url)
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in _HTTP_ALLOWED_SCHEMES:
+            raise CameraConfigurationError("snapshot_url must use http or https")
+        if not parsed.netloc:
+            raise CameraConfigurationError("snapshot_url must include a host")
+        return normalized
+
+    @staticmethod
+    def _normalize_content_type(content_type: str) -> str:
+        """Normalize one HTTP content type for strict image validation."""
+
+        return content_type.split(";", 1)[0].strip().casefold()
+
+    @classmethod
+    def _summarize_reason(cls, reason: object) -> str:
+        """Return one short printable reason string for transport failures."""
+
+        if isinstance(reason, bytes):
+            return cls._summarize_process_error(reason)
+        return cls._summarize_process_error(str(reason).encode("utf-8", errors="replace"))

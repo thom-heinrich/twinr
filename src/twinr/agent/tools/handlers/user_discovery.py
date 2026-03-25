@@ -7,6 +7,7 @@ from typing import Any
 
 from twinr.memory.user_discovery import UserDiscoveryFact, UserDiscoveryMemoryRoute
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import require_sensitive_voice_confirmation
 
 _ALLOWED_ACTIONS = frozenset(
@@ -32,10 +33,10 @@ _MAX_FACT_TEXT_LENGTH = 220
 _MAX_EVENT_VALUE_LENGTH = 160
 
 
-def _ensure_mapping(arguments: dict[str, object]) -> Mapping[str, object]:
+def _ensure_mapping(arguments: dict[str, object]) -> dict[str, object]:
     if not isinstance(arguments, Mapping):
         raise RuntimeError("Tool arguments must be an object.")
-    return arguments
+    return dict(arguments)
 
 
 def _get_optional_text(
@@ -76,10 +77,21 @@ def _get_optional_int(
     raw_value = arguments.get(key)
     if raw_value is None:
         return None
-    try:
+    if isinstance(raw_value, bool):
+        raise RuntimeError(f"Invalid `{key}` value.")
+    if isinstance(raw_value, int):
+        number = raw_value
+    elif isinstance(raw_value, float):
+        if not raw_value.is_integer():
+            raise RuntimeError(f"Invalid `{key}` value.")
         number = int(raw_value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid `{key}` value.") from exc
+    elif isinstance(raw_value, str):
+        try:
+            number = int(raw_value)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid `{key}` value.") from exc
+    else:
+        raise RuntimeError(f"Invalid `{key}` value.")
     if number < minimum or number > maximum:
         raise RuntimeError(f"`{key}` must be between {minimum} and {maximum}.")
     return number
@@ -132,26 +144,14 @@ def _parse_memory_routes(arguments: Mapping[str, object]) -> tuple[UserDiscovery
 
 
 def _safe_emit(owner: Any, key: str, value: object) -> None:
-    emit = getattr(owner, "emit", None)
-    if not callable(emit):
-        return
     compact = " ".join(str(value).split()).strip()
     if len(compact) > _MAX_EVENT_VALUE_LENGTH:
         compact = compact[: _MAX_EVENT_VALUE_LENGTH - 3].rstrip() + "..."
-    try:
-        emit(f"{key}={compact or '-'}")
-    except Exception:
-        return
+    emit_best_effort(owner, f"{key}={compact or '-'}")
 
 
 def _safe_record_event(owner: Any, event_name: str, message: str, **metadata: object) -> None:
-    record_event = getattr(owner, "_record_event", None)
-    if not callable(record_event):
-        return
-    try:
-        record_event(event_name, message, **metadata)
-    except Exception:
-        return
+    record_event_best_effort(owner, event_name, message, dict(metadata))
 
 
 def handle_manage_user_discovery(owner: Any, arguments: dict[str, object]) -> dict[str, object]:

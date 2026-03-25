@@ -13,6 +13,7 @@ from datetime import datetime, timezone  # AUDIT-FIX(#6): Normalize datetime val
 from numbers import Integral
 from typing import Any
 
+from .handler_telemetry import emit_best_effort, record_event_best_effort
 from .support import require_current_turn_audio, require_sensitive_voice_confirmation
 
 LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#2): Secondary telemetry failures must not turn a committed change into an apparent hard failure.
@@ -57,7 +58,7 @@ def _coerce_non_negative_int(value: Any, *, default: int = 0) -> int:
 
 def _current_turn_audio_sample_rate(owner: Any) -> int:
     sample_rate = getattr(owner, "_current_turn_audio_sample_rate", None)
-    if _is_positive_int(sample_rate):
+    if isinstance(sample_rate, Integral) and not isinstance(sample_rate, bool) and int(sample_rate) > 0:
         return int(sample_rate)
     configured = getattr(getattr(owner, "config", None), "openai_realtime_input_sample_rate", None)
     return _coerce_positive_int(
@@ -128,18 +129,24 @@ def _json_scalar(value: Any) -> object:
 
 
 def _safe_emit(owner: Any, message: str) -> None:
-    try:
-        owner.emit(message)
-    except Exception:
-        LOGGER.warning("Voice-profile telemetry emit failed.", exc_info=True)  # AUDIT-FIX(#2): Telemetry must never turn a successful state change into an apparent failure.
+    emit_best_effort(
+        owner,
+        message,
+        logger=LOGGER,
+        failure_message="Voice-profile telemetry emit failed.",
+    )
 
 
 def _safe_record_event(owner: Any, event_name: str, message: str, **fields: object) -> None:
     safe_fields = {key: _json_scalar(value) for key, value in fields.items()}  # AUDIT-FIX(#6): Event fields should be scalar/serialized before they reach generic log sinks.
-    try:
-        owner._record_event(event_name, message, **safe_fields)
-    except Exception:
-        LOGGER.warning("Voice-profile event recording failed.", exc_info=True)  # AUDIT-FIX(#2): Audit logging is best-effort after the primary action commits.
+    record_event_best_effort(
+        owner,
+        event_name,
+        message,
+        safe_fields,
+        logger=LOGGER,
+        failure_message="Voice-profile event recording failed.",
+    )
 
 
 def _append_warning(result: dict[str, object], warning: str) -> None:

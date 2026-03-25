@@ -99,7 +99,11 @@ class GestureCandidateCaptureStore:
         if not reasons:
             return GestureCandidateCaptureResult(saved=False, skipped_reason="no_candidate_signal")
         with self._lock:
-            now = _finite_float_or_default(observed_at, default=self._clock())
+            fallback_now = _finite_float_or_default(self._clock(), default=0.0)
+            now = _finite_float_or_default(observed_at, default=fallback_now)
+            if now is None:
+                now = fallback_now
+            assert now is not None
             last_capture_at = self._last_capture_at
             if (
                 last_capture_at is not None
@@ -178,6 +182,8 @@ def _candidate_reasons(debug_details: Mapping[str, object] | None) -> tuple[str,
 
     details = debug_details or {}
     reasons: list[str] = []
+    if bool(details.get("forensics_zero_signal_capture_requested")):
+        reasons.append("forensics_zero_signal")
     if _coerce_non_negative_int(details.get("live_hand_count")) > 0:
         reasons.append("live_hand")
     if _normalized_label(details.get("live_fine_hand_gesture")) not in _NEGATIVE_LABELS:
@@ -247,9 +253,18 @@ def _normalized_label(value: object) -> str:
 
 
 def _finite_float_or_default(value: object, *, default: float | None) -> float | None:
-    try:
+    if value is None:
+        return default
+    if isinstance(value, bool):
         number = float(value)
-    except (TypeError, ValueError, OverflowError):
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+    else:
         return default
     if not math.isfinite(number):
         return default
@@ -257,9 +272,22 @@ def _finite_float_or_default(value: object, *, default: float | None) -> float |
 
 
 def _coerce_non_negative_int(value: object) -> int:
-    try:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
         number = int(value)
-    except (TypeError, ValueError, OverflowError):
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return 0
+        number = int(value)
+    elif isinstance(value, str):
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    else:
         return 0
     return max(0, number)
 

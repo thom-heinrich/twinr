@@ -13,11 +13,12 @@ from dataclasses import dataclass
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 _SubprocessRunner = Any
 _SleepFn = Callable[[float], None]
@@ -34,7 +35,6 @@ if _SELF_CODING_PI_SPEC is None or _SELF_CODING_PI_SPEC.loader is None:
 _SELF_CODING_PI_MODULE = importlib.util.module_from_spec(_SELF_CODING_PI_SPEC)
 sys.modules[_SELF_CODING_PI_SPEC.name] = _SELF_CODING_PI_MODULE
 _SELF_CODING_PI_SPEC.loader.exec_module(_SELF_CODING_PI_MODULE)
-PiConnectionSettings = _SELF_CODING_PI_MODULE.PiConnectionSettings
 load_pi_connection_settings = _SELF_CODING_PI_MODULE.load_pi_connection_settings
 
 DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
@@ -51,6 +51,12 @@ DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
     "/state/",
     "/src/twinr/channels/whatsapp/worker/state/",
     "/__legacy__/",
+)
+DEFAULT_IGNORED_PATTERNS: tuple[str, ...] = (
+    "**/__pycache__/",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/node_modules/",
 )
 
 
@@ -79,6 +85,19 @@ class PiRepoMirrorRunResult:
     last_cycle: PiRepoMirrorCycleResult | None
 
 
+class _PiConnectionSettingsLike(Protocol):
+    """Describe the SSH settings shape required by the mirror watchdog."""
+
+    @property
+    def host(self) -> str: ...
+
+    @property
+    def user(self) -> str: ...
+
+    @property
+    def password(self) -> str: ...
+
+
 class PiRepoMirrorWatchdog:
     """Keep the Pi runtime checkout aligned with the leading repo."""
 
@@ -86,7 +105,7 @@ class PiRepoMirrorWatchdog:
         self,
         *,
         project_root: str | Path,
-        connection_settings: PiConnectionSettings,
+        connection_settings: _PiConnectionSettingsLike,
         remote_root: str = "/twinr",
         protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
         timeout_s: float = 120.0,
@@ -179,6 +198,11 @@ class PiRepoMirrorWatchdog:
             verified_clean = True
         elif self.verify_with_checksum_on_sync:
             verification_changes = self._run_rsync(dry_run=True, checksum=True)
+            if verification_changes:
+                verification_changes = self._recover_from_cache_only_directory_drift(
+                    verification_changes,
+                    checksum=checksum,
+                )
             if verification_changes:
                 preview = ", ".join(verification_changes[:3])
                 raise RuntimeError(
@@ -287,6 +311,69 @@ class PiRepoMirrorWatchdog:
             raise RuntimeError(message)
         return _parse_rsync_change_lines(completed.stdout)
 
+    def _recover_from_cache_only_directory_drift(
+        self,
+        verification_changes: list[str],
+        *,
+        checksum: bool,
+    ) -> list[str]:
+        """Retry once when remaining delete drift is blocked by ignored caches."""
+
+        stale_directories = _stale_directory_deletion_targets(verification_changes)
+        if not stale_directories:
+            return verification_changes
+        self._prune_remote_cache_only_directories(stale_directories)
+        self._run_rsync(dry_run=False, checksum=checksum)
+        return self._run_rsync(dry_run=True, checksum=True)
+
+    def _prune_remote_cache_only_directories(self, relative_paths: Sequence[str]) -> None:
+        """Remove remote stale directories when they contain only Python caches."""
+
+        normalized_paths = tuple(
+            dict.fromkeys(path.strip("/").strip() for path in relative_paths if path.strip("/"))
+        )
+        if not normalized_paths:
+            return
+        remote_targets = " ".join(
+            shlex.quote(f"{self.remote_root}/{path}")
+            for path in normalized_paths
+        )
+        script = f"""
+for target in {remote_targets}; do
+  [ -e "$target" ] || continue
+  if find "$target" -mindepth 1 ! \\( -type d -name '__pycache__' -o -type f \\( -name '*.pyc' -o -name '*.pyo' \\) \\) -print -quit | grep -q .; then
+    continue
+  fi
+  rm -rf "$target" || true
+done
+"""
+        completed = self._subprocess_runner(
+            [
+                "sshpass",
+                "-e",
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "ConnectTimeout=10",
+                f"{self.connection_settings.user}@{self.connection_settings.host}",
+                "bash -lc " + shlex.quote("set -euo pipefail; " + script),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=_sshpass_env(self.connection_settings.password),
+            timeout=self.timeout_s,
+            cwd=str(self.project_root),
+        )
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "").strip()
+            if not message:
+                message = "remote stale-directory prune failed"
+            raise RuntimeError(message)
+
     def _build_rsync_args(self, *, dry_run: bool, checksum: bool) -> list[str]:
         args = [
             "sshpass",
@@ -301,6 +388,12 @@ class PiRepoMirrorWatchdog:
             "-e",
             "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
         ]
+        # Python bytecode and nested node dependency trees are local runtime or
+        # build artefacts. Keeping them outside the authoritative mirror avoids
+        # sync failures when productive processes or local SDK installs mutate
+        # those trees independently of the source-managed repo content.
+        for pattern in DEFAULT_IGNORED_PATTERNS:
+            args.append(f"--exclude={pattern}")
         # Repo mirroring should only carry ordinary files, symlinks, and
         # directories. Transient local FIFOs/devices from tools or root-owned
         # helpers must not enter the Pi checkout or block sync cycles.
@@ -387,6 +480,21 @@ def _parse_rsync_change_lines(text: str) -> list[str]:
         if len(line) > 11 and line[11] == " ":
             lines.append(line)
     return lines
+
+
+def _stale_directory_deletion_targets(change_lines: Sequence[str]) -> tuple[str, ...]:
+    """Return delete-only directory drift candidates from rsync itemized lines."""
+
+    targets: list[str] = []
+    for raw_line in change_lines:
+        line = str(raw_line or "").strip()
+        if not line.startswith("*deleting"):
+            return ()
+        path = line.removeprefix("*deleting").strip()
+        if not path.endswith("/"):
+            return ()
+        targets.append(path.rstrip("/"))
+    return tuple(targets)
 
 
 __all__ = [

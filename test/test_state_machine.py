@@ -1,14 +1,18 @@
+from datetime import timedelta
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
+# pylint: disable=no-name-in-module
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.memory import ConversationTurn, OnDeviceMemory
-from twinr.runtime import TwinrRuntime
-from twinr.state_machine import TwinrEvent, TwinrStatus
+from twinr.memory.reminders import now_in_timezone
+from twinr.agent.base_agent import TwinrRuntime
+from twinr.agent.base_agent import TwinrEvent, TwinrStatus
 
 
 class TwinrRuntimeTests(unittest.TestCase):
@@ -230,6 +234,35 @@ class TwinrRuntimeTests(unittest.TestCase):
 
         self.assertEqual(restarted.memory.ledger[-1].kind, "preference")
         self.assertIn("Keep answers very short and calm.", restarted.memory.turns[0].content)
+
+    def test_mark_reminder_failed_records_error_event_without_mro_helper_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    runtime_state_path=str(snapshot_path),
+                )
+            )
+            try:
+                due_at = (now_in_timezone(runtime.config.local_timezone_name) - timedelta(seconds=1)).isoformat()
+                created = runtime.schedule_reminder(
+                    due_at=due_at,
+                    summary="Tabletten nehmen",
+                )
+                reserved = runtime.reserve_due_reminders(limit=1)
+                failed = runtime.mark_reminder_failed(created.reminder_id, error="speaker offline")
+                events = runtime.ops_events.tail(limit=10)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+        self.assertEqual([entry.reminder_id for entry in reserved], [created.reminder_id])
+        self.assertEqual(failed.reminder_id, created.reminder_id)
+        self.assertEqual(failed.last_error, "speaker offline")
+        failure_event = next(event for event in events if event.get("event") == "reminder_delivery_failed")
+        self.assertEqual(failure_event.get("level"), "error")
+        self.assertEqual(failure_event.get("data", {}).get("reminder_id"), created.reminder_id)
+        self.assertEqual(failure_event.get("data", {}).get("error"), "speaker offline")
 
 
 if __name__ == "__main__":

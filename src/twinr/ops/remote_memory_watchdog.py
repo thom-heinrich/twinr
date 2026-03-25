@@ -10,8 +10,6 @@ prints one JSON line per sample for journald/systemd.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Protocol
@@ -26,77 +24,32 @@ from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops.events import TwinrOpsEventStore, compact_text
-from twinr.ops.paths import resolve_ops_paths_for_config
+from twinr.ops.remote_memory_watchdog_state import (
+    DEFAULT_HISTORY_LIMIT as _DEFAULT_HISTORY_LIMIT,
+    DEFAULT_WATCHDOG_INTERVAL_S as _DEFAULT_WATCHDOG_INTERVAL_S,
+    PERSISTED_RECENT_SAMPLE_LIMIT as _PERSISTED_RECENT_SAMPLE_LIMIT,
+    RemoteMemoryWatchdogSample,
+    RemoteMemoryWatchdogSnapshot,
+    RemoteMemoryWatchdogStore,
+    SNAPSHOT_SCHEMA_VERSION as _SNAPSHOT_SCHEMA_VERSION,
+    build_remote_memory_watchdog_bootstrap_snapshot,
+    build_starting_sample as _build_starting_sample,
+    coerce_history_limit as _coerce_history_limit,
+    coerce_interval_s as _coerce_interval_s,
+    compact_history_sample as _compact_history_sample,
+    utc_now_iso as _utc_now_iso,
+)
 
 
-_DEFAULT_WATCHDOG_INTERVAL_S = 1.0
-_DEFAULT_HISTORY_LIMIT = 3600
-_SNAPSHOT_SCHEMA_VERSION = 1
 _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S = 5.0
-_PERSISTED_RECENT_SAMPLE_LIMIT = 64
 
 
-def _utc_now_iso() -> str:
-    """Return the current UTC timestamp in a stable ISO-8601 form."""
+def _copy_object_dict(value: object) -> dict[str, object] | None:
+    """Copy one generic dict payload into a plain object dict."""
 
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _coerce_interval_s(value: object, *, default: float) -> float:
-    """Normalize the watchdog interval to a finite positive float."""
-
-    try:
-        interval_s = float(value)
-    except (TypeError, ValueError):
-        return default
-    if interval_s <= 0.0:
-        return default
-    return interval_s
-
-
-def _coerce_history_limit(value: object, *, default: int) -> int:
-    """Normalize the rolling sample-history length."""
-
-    try:
-        history_limit = int(value)
-    except (TypeError, ValueError):
-        return default
-    if history_limit <= 0:
-        return default
-    return history_limit
-
-
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    """Write one JSON payload atomically to disk."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    encoded = (json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    file_mode = 0o644
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0), file_mode)
-    try:
-        os.write(fd, encoded)
-        os.fsync(fd)
-        os.fchmod(fd, file_mode)
-    finally:
-        os.close(fd)
-    os.replace(tmp_path, path)
-    os.chmod(path, file_mode)
-
-
-def _compact_history_sample(sample: "RemoteMemoryWatchdogSample") -> "RemoteMemoryWatchdogSample":
-    """Drop heavy nested probe payloads from persisted history samples.
-
-    The live watchdog only needs recent sample timestamps/status metadata to
-    bridge healthy quiet windows between deep probes. Persisting every
-    historical probe payload inside every heartbeat snapshot turns one cheap
-    heartbeat into a multi-megabyte fsync on the Pi, which then delays later
-    heartbeats enough to create false stale flaps.
-    """
-
-    if sample.probe is None:
-        return sample
-    return replace(sample, probe=None)
+    if not isinstance(value, dict):
+        return None
+    return {str(key): item for key, item in value.items()}
 
 
 class _RemoteMemoryService(Protocol):
@@ -116,227 +69,6 @@ class _RemoteMemoryService(Protocol):
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         """Shut down any owned background workers."""
-
-
-@dataclass(frozen=True, slots=True)
-class RemoteMemoryWatchdogSample:
-    """Capture one remote-memory probe result."""
-
-    seq: int
-    captured_at: str
-    status: str
-    ready: bool
-    mode: str
-    required: bool
-    latency_ms: float
-    consecutive_ok: int
-    consecutive_fail: int
-    detail: str | None = None
-    probe: dict[str, object] | None = None
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "RemoteMemoryWatchdogSample":
-        """Hydrate one sample from persisted JSON data."""
-
-        return cls(
-            seq=int(payload.get("seq", 0) or 0),
-            captured_at=str(payload.get("captured_at", "") or ""),
-            status=str(payload.get("status", "unknown") or "unknown"),
-            ready=bool(payload.get("ready", False)),
-            mode=str(payload.get("mode", "unknown") or "unknown"),
-            required=bool(payload.get("required", False)),
-            latency_ms=float(payload.get("latency_ms", 0.0) or 0.0),
-            consecutive_ok=int(payload.get("consecutive_ok", 0) or 0),
-            consecutive_fail=int(payload.get("consecutive_fail", 0) or 0),
-            detail=cls._coerce_optional_text(payload.get("detail")),
-            probe=dict(payload.get("probe")) if isinstance(payload.get("probe"), dict) else None,
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable representation."""
-
-        return asdict(self)
-
-    @staticmethod
-    def _coerce_optional_text(value: object) -> str | None:
-        text = compact_text(str(value or "").strip(), limit=240)
-        return text or None
-
-
-@dataclass(frozen=True, slots=True)
-class RemoteMemoryWatchdogSnapshot:
-    """Persisted rolling watchdog state."""
-
-    schema_version: int
-    started_at: str
-    updated_at: str
-    hostname: str
-    pid: int
-    interval_s: float
-    history_limit: int
-    sample_count: int
-    failure_count: int
-    last_ok_at: str | None
-    last_failure_at: str | None
-    artifact_path: str
-    current: RemoteMemoryWatchdogSample
-    recent_samples: tuple[RemoteMemoryWatchdogSample, ...]
-    heartbeat_at: str | None = None
-    probe_inflight: bool = False
-    probe_started_at: str | None = None
-    probe_age_s: float | None = None
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "RemoteMemoryWatchdogSnapshot":
-        """Hydrate one persisted snapshot from JSON data."""
-
-        current_payload = payload.get("current")
-        if not isinstance(current_payload, dict):
-            raise ValueError("Remote memory watchdog snapshot is missing `current`.")
-        raw_recent_samples = payload.get("recent_samples")
-        if raw_recent_samples is None:
-            raw_recent_samples = ()
-        if not isinstance(raw_recent_samples, list):
-            raise ValueError("Remote memory watchdog snapshot has malformed `recent_samples`.")
-        return cls(
-            schema_version=int(payload.get("schema_version", 0) or 0),
-            started_at=str(payload.get("started_at", "") or ""),
-            updated_at=str(payload.get("updated_at", "") or ""),
-            hostname=str(payload.get("hostname", "") or ""),
-            pid=int(payload.get("pid", 0) or 0),
-            interval_s=float(payload.get("interval_s", 0.0) or 0.0),
-            history_limit=int(payload.get("history_limit", 0) or 0),
-            sample_count=int(payload.get("sample_count", 0) or 0),
-            failure_count=int(payload.get("failure_count", 0) or 0),
-            last_ok_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("last_ok_at")),
-            last_failure_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("last_failure_at")),
-            artifact_path=str(payload.get("artifact_path", "") or ""),
-            current=RemoteMemoryWatchdogSample.from_dict(current_payload),
-            recent_samples=tuple(
-                RemoteMemoryWatchdogSample.from_dict(item)
-                for item in raw_recent_samples
-                if isinstance(item, dict)
-            ),
-            heartbeat_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("heartbeat_at")),
-            probe_inflight=bool(payload.get("probe_inflight", False)),
-            probe_started_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("probe_started_at")),
-            probe_age_s=cls._coerce_optional_float(payload.get("probe_age_s")),
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable representation."""
-
-        payload = asdict(self)
-        payload["current"] = self.current.to_dict()
-        payload["recent_samples"] = [sample.to_dict() for sample in self.recent_samples]
-        return payload
-
-    @staticmethod
-    def _coerce_optional_float(value: object) -> float | None:
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not parsed >= 0.0:
-            return None
-        return parsed
-
-
-class RemoteMemoryWatchdogStore:
-    """Persist the current rolling watchdog snapshot to disk."""
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path).expanduser()
-
-    @classmethod
-    def from_config(cls, config: TwinrConfig) -> "RemoteMemoryWatchdogStore":
-        """Build the canonical watchdog-state store for one Twinr config."""
-
-        ops_paths = resolve_ops_paths_for_config(config)
-        return cls(ops_paths.ops_store_root / "remote_memory_watchdog.json")
-
-    def save(self, snapshot: RemoteMemoryWatchdogSnapshot) -> None:
-        """Persist the latest rolling snapshot atomically."""
-
-        _atomic_write_json(self.path, snapshot.to_dict())
-
-    def load(self) -> RemoteMemoryWatchdogSnapshot | None:
-        """Load the persisted rolling snapshot when it exists."""
-
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Remote memory watchdog snapshot is not valid JSON: {self.path}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"Remote memory watchdog snapshot is unreadable: {self.path}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Remote memory watchdog snapshot has an invalid top-level payload: {self.path}")
-        try:
-            return RemoteMemoryWatchdogSnapshot.from_dict(payload)
-        except ValueError as exc:
-            raise RuntimeError(f"Remote memory watchdog snapshot is malformed: {self.path}") from exc
-
-
-def build_remote_memory_watchdog_bootstrap_snapshot(
-    config: TwinrConfig,
-    *,
-    pid: int,
-    artifact_path: str | Path,
-    started_at: str | None = None,
-    captured_at: str | None = None,
-) -> RemoteMemoryWatchdogSnapshot:
-    """Build the supervisor-seeded startup snapshot for a fresh watchdog child."""
-
-    resolved_started_at = str(started_at or _utc_now_iso())
-    resolved_captured_at = str(captured_at or resolved_started_at)
-    required = bool(
-        config.long_term_memory_enabled
-        and config.long_term_memory_mode == "remote_primary"
-        and config.long_term_memory_remote_required
-    )
-    current = RemoteMemoryWatchdogSample(
-        seq=0,
-        captured_at=resolved_captured_at,
-        status="starting",
-        ready=False,
-        mode="remote_primary" if required else "disabled",
-        required=required,
-        latency_ms=0.0,
-        consecutive_ok=0,
-        consecutive_fail=0,
-        detail="Remote memory watchdog is starting.",
-        probe=None,
-    )
-    interval_s = _coerce_interval_s(
-        getattr(config, "long_term_memory_remote_watchdog_interval_s", _DEFAULT_WATCHDOG_INTERVAL_S),
-        default=_DEFAULT_WATCHDOG_INTERVAL_S,
-    )
-    history_limit = _coerce_history_limit(
-        getattr(config, "long_term_memory_remote_watchdog_history_limit", _DEFAULT_HISTORY_LIMIT),
-        default=_DEFAULT_HISTORY_LIMIT,
-    )
-    return RemoteMemoryWatchdogSnapshot(
-        schema_version=_SNAPSHOT_SCHEMA_VERSION,
-        started_at=resolved_started_at,
-        updated_at=resolved_captured_at,
-        hostname=socket.gethostname(),
-        pid=int(pid),
-        interval_s=interval_s,
-        history_limit=history_limit,
-        sample_count=0,
-        failure_count=0,
-        last_ok_at=None,
-        last_failure_at=None,
-        artifact_path=str(artifact_path),
-        current=current,
-        recent_samples=(),
-        heartbeat_at=resolved_captured_at,
-        probe_inflight=True,
-        probe_started_at=resolved_captured_at,
-        probe_age_s=0.0,
-    )
 
 
 class RemoteMemoryWatchdog:
@@ -853,29 +585,18 @@ class RemoteMemoryWatchdog:
     def _starting_sample(self, *, captured_at: str) -> RemoteMemoryWatchdogSample:
         """Synthesize the startup state before the first real probe sample exists."""
 
-        required = bool(
-            self.config.long_term_memory_enabled
-            and self.config.long_term_memory_mode == "remote_primary"
-            and self.config.long_term_memory_remote_required
-        )
-        return RemoteMemoryWatchdogSample(
-            seq=0,
-            captured_at=captured_at,
-            status="starting",
-            ready=False,
-            mode="remote_primary" if required else "disabled",
-            required=required,
-            latency_ms=0.0,
-            consecutive_ok=0,
-            consecutive_fail=0,
-            detail="Remote memory watchdog is starting.",
-        )
+        return _build_starting_sample(self.config, captured_at=captured_at)
 
     def _emit_transition_event(self, sample: RemoteMemoryWatchdogSample) -> None:
         previous_status = self._last_status
         previous_detail = self._last_detail
         self._last_status = sample.status
         self._last_detail = sample.detail
+        remote_write_context = (
+            _copy_object_dict(sample.probe.get("remote_write_context"))
+            if isinstance(sample.probe, dict)
+            else None
+        )
         if previous_status == sample.status and previous_detail == sample.detail:
             return
         if previous_status is None:
@@ -901,8 +622,15 @@ class RemoteMemoryWatchdog:
                 "detail": sample.detail,
                 "consecutive_ok": sample.consecutive_ok,
                 "consecutive_fail": sample.consecutive_fail,
-                "remote_write_context": dict(sample.probe.get("remote_write_context"))
-                if isinstance(sample.probe, dict) and isinstance(sample.probe.get("remote_write_context"), dict)
-                else None,
+                "remote_write_context": remote_write_context,
             },
         )
+
+
+__all__ = [
+    "RemoteMemoryWatchdog",
+    "RemoteMemoryWatchdogSample",
+    "RemoteMemoryWatchdogSnapshot",
+    "RemoteMemoryWatchdogStore",
+    "build_remote_memory_watchdog_bootstrap_snapshot",
+]

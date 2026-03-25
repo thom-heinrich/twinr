@@ -18,23 +18,7 @@ from .display_reserve_runtime import (
     DisplayReserveRuntimePublisher,
     DisplayReserveRuntimeRequest,
 )
-
-
-def _utc_now() -> datetime:
-    """Return the current UTC wall clock."""
-
-    return datetime.now(timezone.utc)
-
-
-def _compact_text(value: object | None, *, max_len: int) -> str:
-    """Collapse one value into bounded single-line text."""
-
-    if value is None:
-        return ""
-    compact = " ".join(str(value).split()).strip()
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
+from .display_reserve_support import compact_text, utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +64,7 @@ class DisplaySocialReservePublisher:
         surface. The later learning path still gets one exposure history entry.
         """
 
-        effective_now = (now or _utc_now()).astimezone(timezone.utc)
+        effective_now = (now or utc_now()).astimezone(timezone.utc)
         normalized_trigger = " ".join(str(trigger_id or "").strip().split()).lower().replace(" ", "_") or "social"
         published = self.runtime_publisher.publish(
             DisplayReserveRuntimeRequest(
@@ -96,7 +80,7 @@ class DisplaySocialReservePublisher:
                 symbol="question",
                 accent="warm",
                 hold_seconds=float(hold_seconds or 0.0),
-                reason=_compact_text(display_reason, max_len=120) or "social_trigger_display_first",
+                reason=compact_text(display_reason, max_len=120) or "social_trigger_display_first",
                 candidate_family="social",
                 match_anchors=(prompt_text, normalized_trigger),
                 metadata={

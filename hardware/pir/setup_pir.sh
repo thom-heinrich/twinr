@@ -188,7 +188,7 @@ PY
 
 cd "$REPO_ROOT"
 PYTHONPATH=src "$PYTHON_BIN" - <<PY
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 config = TwinrConfig.from_env(r'''$ENV_FILE''')
 print(f"chip={config.gpio_chip}")
 print(f"pir=GPIO{config.pir_motion_gpio}")

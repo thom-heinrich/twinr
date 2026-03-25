@@ -10,9 +10,11 @@ owned_concerns:
   - Expose one smart-home tool surface for entity discovery, filtered state queries, low-risk control, and bounded stream inspection
   - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
   - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
+  - Share automation-specific delivery, tag, weekday, and timezone parsing across handler and background boundaries
   - Return structured portrait-enrollment guidance so the model can drive camera retries naturally
   - Return structured shared household-identity guidance for local face, voice, status, and explicit confirm or deny feedback flows
   - Bridge the self-coding front-stage learning flow into deterministic ASE modules
+  - Share self-coding runtime/cache/signature construction outside the tool-entrypoint file
   - Keep the guided get-to-know-you flow bounded while persisting, reviewing, correcting, and deleting high-value discovery facts across Twinr memory surfaces
   - Expose one explicit tool handler for RSS/world-intelligence subscription setup and occasional recalibration
 out_of_scope:
@@ -23,8 +25,19 @@ out_of_scope:
 files:
   - path: __init__.py
     role: Package marker with package-level summary
+  - path: automation_support.py
+    role: Shared automation-specific parsing and delivery helpers used by handler and background paths
+    exports:
+      - automation_name_key
+      - resolve_timezone_name
+      - validate_non_negative_finite
+      - parse_delivery
+      - parse_content_mode
+      - normalize_delivery
+      - parse_weekdays
+      - parse_tags
   - path: automations.py
-    role: Automation CRUD handlers and delivery normalization helpers
+    role: Automation CRUD handlers
     exports:
       - handle_list_automations
       - handle_create_time_automation
@@ -32,7 +45,12 @@ files:
       - handle_update_time_automation
       - handle_update_sensor_automation
       - handle_delete_automation
-      - normalize_delivery
+  - path: handler_telemetry.py
+    role: Shared best-effort telemetry, event, and usage callback helpers
+    exports:
+      - emit_best_effort
+      - record_event_best_effort
+      - record_usage_best_effort
   - path: smarthome.py
     role: Smart-home entity discovery, filtered state read, control, and stream handlers
     exports:
@@ -82,10 +100,25 @@ files:
     exports:
       - handle_schedule_reminder
   - path: self_coding.py
-    role: Self-coding feasibility and requirements-dialogue handlers
+    role: Self-coding learning, activation, and hidden runtime-entry handlers
     exports:
       - handle_propose_skill_learning
       - handle_answer_skill_question
+      - handle_confirm_skill_activation
+      - handle_rollback_skill_activation
+      - handle_pause_skill_activation
+      - handle_reactivate_skill_activation
+      - handle_run_self_coding_skill_scheduled
+      - handle_run_self_coding_skill_sensor
+      - ensure_self_coding_runtime
+  - path: self_coding_support.py
+    role: Shared self-coding runtime/cache/signature support for handler entrypoints
+    exports:
+      - SELF_CODING_RUNTIME_LOCK
+      - ensure_confirm_activation_job_ready
+      - ensure_self_coding_runtime
+      - resolve_activation_service
+      - resolve_learning_flow
   - path: settings.py
     role: Bounded simple-setting mutation handler
     exports:
@@ -110,7 +143,6 @@ files:
 primary_callers:
   - path: src/twinr/agent/tools/runtime/executor.py
   - path: src/twinr/agent/workflows/realtime_runner.py
-  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/agent/workflows/realtime_runtime/background.py
   - path: src/twinr/__main__.py
@@ -124,7 +156,7 @@ tests:
   - path: test/test_simple_settings.py
   - path: test/test_voice_profile.py
   - path: test/test_household_identity.py
+  - path: test/test_self_coding_handler_support.py
   - path: test/test_user_discovery.py
-  - path: test/test_runner.py
   - path: test/test_streaming_tool_loop.py
   - path: test/run_pi_tool_matrix.py

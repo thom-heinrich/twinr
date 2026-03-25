@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore, parse_respeaker_hci_state
 from twinr.ops.events import TwinrOpsEventStore
 

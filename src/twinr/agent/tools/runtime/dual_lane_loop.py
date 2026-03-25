@@ -10,11 +10,9 @@ finishes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha1
+from functools import partial
 from typing import Any, Callable, Sequence
-import json
 import logging  # AUDIT-FIX(#1,#7,#13): Log guarded failures instead of letting provider/tool/callback errors crash the turn.
-from uuid import uuid4  # AUDIT-FIX(#6): Generate unique fallback call IDs for deterministic tool/result correlation.
 
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
@@ -26,68 +24,44 @@ from twinr.agent.base_agent.contracts import (
     supervisor_decision_requires_full_context,
 )
 from twinr.agent.base_agent.prompting.personality import merge_instructions
+from .forensics import (
+    conversation_summary as _conversation_summary,
+    decision_summary as _decision_summary,
+    handoff_summary as _handoff_summary,
+    loop_result_summary as _loop_result_summary,
+    text_summary as _text_summary,
+)
+from .handoff import (
+    _HANDOFF_TOOL_SCHEMA,
+    decision_fallback_handoff as _decision_fallback_handoff,
+    handoff_allow_web_search as _handoff_allow_web_search,
+    merge_handoff_items as _merge_handoff_items,
+    merge_tool_schemas as _merge_tool_schemas,
+    normalize_decision_action as _normalize_decision_action,
+    normalize_handoff_arguments as _normalize_handoff_arguments,
+    specialist_handoff_context as _specialist_handoff_context,
+    supervisor_decision_has_required_user_reply as _supervisor_decision_has_required_user_reply,
+)
+from .loop_support import (
+    first_non_none as _first_non_none,
+    make_call_id as _make_call_id,
+    make_loop_result as _make_loop_result,
+    merge_token_usage as _merge_token_usage,
+    raise_if_should_stop,
+    safe_json_dumps as _safe_json_dumps,
+    strip_text as _strip_text,
+)
 from .recovery_reply import LLMRecoveryResponder
+from .speech_lane import (
+    SpeechLaneDelta,
+    safe_emit_speech_delta as _safe_emit_speech_delta,
+    safe_emit_text_delta as _safe_emit_text_delta,
+)
 from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
 
 
 logger = logging.getLogger(__name__)  # AUDIT-FIX(#1): Preserve root-cause visibility while returning senior-safe fallbacks.
-_ALLOWED_HANDOFF_KINDS = frozenset({"general", "search", "memory", "automation"})  # AUDIT-FIX(#12): Normalize handoff kind across both supervisor paths.
-
-
-_HANDOFF_TOOL_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "name": "handoff_specialist_worker",
-    "description": (
-        "Use the slower specialist worker when the answer needs fresh web research, more synthesis, "
-        "or a deeper multi-step tool pass than the fast supervisor should handle directly."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["general", "search", "memory", "automation"],
-                "description": "Short handoff category that best describes why the specialist is needed.",
-            },
-            "goal": {
-                "type": "string",
-                "description": "Short description of what the specialist should achieve for this turn.",
-            },
-            "spoken_ack": {
-                "type": ["string", "null"],
-                "description": (
-                    "Optional short user-facing acknowledgement in the configured language that can be spoken "
-                    "immediately before the specialist work starts. Use null when no immediate progress line "
-                    "should be spoken."
-                ),
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Optional rewritten task for the specialist worker. Omit to reuse the original user prompt.",
-            },
-            "allow_web_search": {
-                "type": "boolean",
-                "description": "Set true when the specialist should be allowed to use live web search.",
-            },
-            "location_hint": {
-                "type": "string",
-                "description": (
-                    "Optional explicit place already named by the user, for example a city, district, or street. "
-                    "Use this for search handoffs when the target location matters."
-                ),
-            },
-            "date_context": {
-                "type": "string",
-                "description": (
-                    "Optional absolute date or local date/time context for search handoffs when the user referred "
-                    "to relative dates such as today or tomorrow."
-                ),
-            },
-        },
-        "required": ["kind", "goal"],
-        "additionalProperties": False,
-    },
-}
+_raise_if_should_stop = partial(raise_if_should_stop, actor="dual-lane work")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,24 +69,6 @@ class _SpecialistRecord:
     """Store one specialist result for later chronological merging."""
 
     result: StreamingToolLoopResult  # AUDIT-FIX(#14): Remove the unused always-empty trigger field so merge state cannot lie about provenance.
-
-
-@dataclass(frozen=True, slots=True)
-class SpeechLaneDelta:
-    """Describe one speech-output event emitted by the dual-lane loop.
-
-    Attributes:
-        text: Spoken text fragment to emit.
-        lane: Output lane label such as ``direct``, ``filler``, or ``final``.
-        replace_current: Whether this delta should replace the currently spoken
-            filler content.
-        atomic: Whether the delta should be treated as one indivisible segment.
-    """
-
-    text: str
-    lane: str
-    replace_current: bool = False
-    atomic: bool = False
 
 
 class DualLaneToolLoop:
@@ -988,402 +944,3 @@ class DualLaneToolLoop:
             token_usage=token_usage,
             used_web_search=used_web_search,
         )
-
-
-def _make_loop_result(
-    *,
-    text: str,
-    rounds: int,
-    tool_calls: Sequence[AgentToolCall],
-    tool_results: Sequence[AgentToolResult],
-    response_id: str | None,
-    request_id: str | None,
-    model: str | None,
-    token_usage: Any,
-    used_web_search: bool,
-) -> StreamingToolLoopResult:
-    """Build an immutable loop result from the collected turn state."""
-    return StreamingToolLoopResult(
-        text=text,
-        rounds=rounds,
-        tool_calls=tuple(tool_calls),
-        tool_results=tuple(tool_results),
-        response_id=response_id,
-        request_id=request_id,
-        model=model,
-        token_usage=token_usage,
-        used_web_search=used_web_search,
-    )
-
-
-def _raise_if_should_stop(
-    should_stop: Callable[[], bool] | None,
-    *,
-    context: str,
-) -> None:
-    """Abort cooperative dual-lane work once the owning turn was stopped."""
-
-    if should_stop is None:
-        return
-    if should_stop():
-        raise InterruptedError(f"dual-lane work stopped during {context}")
-
-
-def _safe_emit_text_delta(
-    on_text_delta: Callable[[str], None] | None,
-    text: str,
-) -> None:
-    """Emit a plain text delta while swallowing callback failures."""
-    raw = _coerce_text(text)
-    if not raw or on_text_delta is None:
-        return
-    try:
-        on_text_delta(raw)
-    except Exception:
-        logger.exception("on_text_delta callback failed.")  # AUDIT-FIX(#1): Treat output-channel faults as non-fatal so the loop can still return a final result.
-
-
-def _safe_emit_speech_delta(
-    on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None,
-    on_text_delta: Callable[[str], None] | None,
-    delta: SpeechLaneDelta,
-) -> None:
-    """Prefer lane-aware speech emission and fall back to plain text callbacks."""
-    raw = _coerce_text(delta.text)
-    if not raw:
-        return
-    if on_lane_text_delta is not None:
-        try:
-            on_lane_text_delta(
-                SpeechLaneDelta(
-                    text=raw,
-                    lane=_strip_text(delta.lane) or "direct",
-                    replace_current=bool(delta.replace_current),
-                    atomic=bool(delta.atomic),
-                )
-            )
-            return
-        except Exception:
-            logger.exception("on_lane_text_delta callback failed.")
-    _safe_emit_text_delta(on_text_delta, raw)
-
-
-def _safe_json_dumps(value: Any) -> str:
-    """Serialize arbitrary diagnostic payloads into JSON for tool envelopes."""
-    try:
-        return json.dumps(value, ensure_ascii=False, default=str)
-    except Exception:
-        logger.exception("Failed to serialize tool output to JSON.")  # AUDIT-FIX(#7): Prevent diagnostics serialization from crashing otherwise successful turns.
-        return json.dumps(
-            {"status": "serialization_error", "type": type(value).__name__},
-            ensure_ascii=False,
-        )
-
-
-def _first_non_none(*values: Any) -> Any:
-    """Return the first non-``None`` value from the provided candidates."""
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _make_call_id(prefix: str) -> str:
-    """Create a deterministic-looking unique tool call identifier."""
-    safe_prefix = _strip_text(prefix) or "tool"
-    return f"{safe_prefix}_{uuid4().hex}"
-
-
-def _text_summary(value: Any) -> dict[str, Any]:
-    """Describe text safely for forensics without storing raw content."""
-
-    normalized = _strip_text(value)
-    if not normalized:
-        return {"present": False, "chars": 0, "words": 0, "sha12": None}
-    return {
-        "present": True,
-        "chars": len(normalized),
-        "words": len(normalized.split()),
-        "sha12": sha1(normalized.encode("utf-8")).hexdigest()[:12],
-    }
-
-
-def _conversation_summary(conversation: ConversationLike | None) -> dict[str, Any]:
-    """Summarize conversation context shape without leaking raw text."""
-
-    if not conversation:
-        return {"present": False, "messages": 0, "tail": []}
-    tail: list[dict[str, Any]] = []
-    total_chars = 0
-    for item in conversation:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            role = _strip_text(item[0]) or "unknown"
-            content = _coerce_text(item[1])
-        else:
-            role = "unknown"
-            content = _coerce_text(item)
-        total_chars += len(content.strip())
-        tail.append({"role": role, "content": _text_summary(content)})
-    return {
-        "present": True,
-        "messages": len(tail),
-        "total_chars": total_chars,
-        "tail": tail[-3:],
-    }
-
-
-def _decision_summary(decision: Any | None) -> dict[str, Any]:
-    """Summarize a supervisor decision for branch forensics."""
-
-    if decision is None:
-        return {"present": False}
-    return {
-        "present": True,
-        "action": _normalize_decision_action(getattr(decision, "action", None)),
-        "kind": _normalize_handoff_kind(getattr(decision, "kind", None)),
-        "context_scope": _strip_text(getattr(decision, "context_scope", None)) or None,
-        "allow_web_search": getattr(decision, "allow_web_search", None),
-        "spoken_ack": _text_summary(getattr(decision, "spoken_ack", None)),
-        "spoken_reply": _text_summary(getattr(decision, "spoken_reply", None)),
-        "goal": _text_summary(getattr(decision, "goal", None)),
-        "prompt": _text_summary(getattr(decision, "prompt", None)),
-        "location_hint": _text_summary(getattr(decision, "location_hint", None)),
-        "date_context": _text_summary(getattr(decision, "date_context", None)),
-    }
-
-
-def _handoff_summary(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Summarize a normalized handoff payload without raw user text."""
-
-    return {
-        "kind": _normalize_handoff_kind(arguments.get("kind")),
-        "goal": _text_summary(arguments.get("goal")),
-        "spoken_ack": _text_summary(arguments.get("spoken_ack")),
-        "prompt": _text_summary(arguments.get("prompt")),
-        "allow_web_search": arguments.get("allow_web_search"),
-        "location_hint": _text_summary(arguments.get("location_hint")),
-        "date_context": _text_summary(arguments.get("date_context")),
-    }
-
-
-def _loop_result_summary(result: StreamingToolLoopResult | None) -> dict[str, Any]:
-    """Summarize a loop result for branch-level forensic trace output."""
-
-    if result is None:
-        return {"present": False}
-    return {
-        "present": True,
-        "text": _text_summary(result.text),
-        "rounds": result.rounds,
-        "tool_calls": len(result.tool_calls),
-        "tool_results": len(result.tool_results),
-        "used_web_search": bool(result.used_web_search),
-        "response_id_present": bool(_strip_text(result.response_id)),
-        "request_id_present": bool(_strip_text(result.request_id)),
-        "model_present": bool(_strip_text(result.model)),
-    }
-
-
-def _merge_token_usage(base: Any, extra: Any) -> Any:
-    """Merge provider token-usage payloads across supervisor and specialist work."""
-    if base is None:
-        return extra
-    if extra is None:
-        return base
-    if isinstance(base, (int, float)) and isinstance(extra, (int, float)):
-        return base + extra
-    if isinstance(base, dict) and isinstance(extra, dict):
-        merged = dict(base)
-        for key, value in extra.items():
-            if key in merged:
-                merged[key] = _merge_token_usage(merged[key], value)
-            else:
-                merged[key] = value
-        return merged
-    return base
-
-
-def _merge_tool_schemas(
-    primary: Sequence[dict[str, Any]],
-    extra: Sequence[dict[str, Any]],
-) -> tuple[dict[str, Any], ...]:
-    """Merge tool schemas while de-duplicating by declared tool name."""
-    merged: list[dict[str, Any]] = []
-    seen_names: set[str] = set()
-    for schema in (*primary, *extra):
-        name = _tool_schema_name(schema)
-        if name is not None:
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-        merged.append(schema)
-    return tuple(merged)
-
-
-def _tool_schema_name(schema: dict[str, Any]) -> str | None:
-    """Extract a tool name from either accepted schema format."""
-    name = schema.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    function_schema = schema.get("function")
-    if isinstance(function_schema, dict):
-        function_name = function_schema.get("name")
-        if isinstance(function_name, str) and function_name.strip():
-            return function_name.strip()
-    return None
-
-
-def _merge_handoff_items(
-    supervisor_items: Sequence[Any],
-    specialist_records: Sequence[_SpecialistRecord],
-    attribute: str,
-) -> list[Any]:
-    """Interleave specialist items immediately after their handoff marker."""
-    merged: list[Any] = []
-    specialist_index = 0
-    for item in supervisor_items:
-        merged.append(item)
-        if getattr(item, "name", None) == "handoff_specialist_worker":
-            if specialist_index < len(specialist_records):
-                merged.extend(getattr(specialist_records[specialist_index].result, attribute))
-            else:
-                logger.warning(
-                    "Missing specialist record for supervisor handoff item %d.",
-                    specialist_index,
-                )
-            specialist_index += 1
-
-    if specialist_index < len(specialist_records):
-        logger.warning(
-            "Found %d specialist record(s) without a matching supervisor handoff item.",
-            len(specialist_records) - specialist_index,
-        )
-        for record in specialist_records[specialist_index:]:
-            merged.extend(getattr(record.result, attribute))
-    return merged
-
-
-def _normalize_decision_action(value: Any) -> str:
-    """Normalize the supervisor action into one of Twinr's supported modes."""
-    normalized = _strip_text(value).lower()
-    if normalized in {"direct", "end_conversation"}:
-        return normalized
-    return "handoff"
-
-
-def _coerce_text(value: Any) -> str:
-    """Coerce arbitrary callback payloads into text."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return str(value)
-
-
-def _strip_text(value: Any) -> str:
-    """Coerce text and strip surrounding whitespace."""
-    return _coerce_text(value).strip()
-
-
-def _normalize_handoff_kind(value: Any) -> str:
-    """Normalize the handoff kind to the supported specialist categories."""
-    normalized = _strip_text(value).lower()
-    if normalized in _ALLOWED_HANDOFF_KINDS:
-        return normalized
-    return "general"
-
-
-def _normalize_handoff_arguments(
-    arguments: dict[str, Any],
-    *,
-    fallback_prompt: str,
-) -> dict[str, Any]:
-    """Normalize a supervisor handoff payload into the canonical shape."""
-    normalized: dict[str, Any] = {
-        "kind": _normalize_handoff_kind(arguments.get("kind")),
-        "goal": _strip_text(arguments.get("goal")) or fallback_prompt,
-        "spoken_ack": _normalize_spoken_ack(arguments),
-    }
-    prompt = _strip_text(arguments.get("prompt"))
-    if prompt:
-        normalized["prompt"] = prompt
-    if "allow_web_search" in arguments:
-        normalized["allow_web_search"] = arguments.get("allow_web_search")
-    location_hint = _strip_text(arguments.get("location_hint"))
-    if location_hint:
-        normalized["location_hint"] = location_hint
-    date_context = _strip_text(arguments.get("date_context"))
-    if date_context:
-        normalized["date_context"] = date_context
-    return normalized
-
-
-def _handoff_allow_web_search(arguments: dict[str, Any], default: bool | None) -> bool | None:
-    """Resolve the handoff web-search flag from booleans or common string forms."""
-    if "allow_web_search" not in arguments:
-        return default
-    value = arguments.get("allow_web_search")
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    normalized = _strip_text(value).lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _specialist_handoff_context(arguments: dict[str, Any]) -> str:
-    """Build a short instruction suffix that explains the handoff intent."""
-    goal = _strip_text(arguments.get("goal"))
-    kind = _normalize_handoff_kind(arguments.get("kind"))
-    prompt = _strip_text(arguments.get("prompt"))
-    context_parts = [f"Specialist handoff kind: {kind}."]
-    if goal:
-        context_parts.append(f"Specialist goal: {goal}")
-    if prompt:
-        context_parts.append(f"Specialist rewritten prompt: {prompt}")
-    return " ".join(context_parts)  # AUDIT-FIX(#16): This helper always returns a string, so the type now matches runtime behaviour.
-
-
-def _normalize_spoken_ack(arguments: dict[str, Any]) -> str:
-    """Return the spoken acknowledgement exactly as provided by the supervisor."""
-    raw = _strip_text(arguments.get("spoken_ack"))
-    return raw
-
-
-def _decision_fallback_handoff(
-    decision: Any,
-    *,
-    prompt: str,
-) -> dict[str, Any]:
-    """Convert a full-context direct decision into a safe handoff payload."""
-
-    kind = _normalize_handoff_kind(getattr(decision, "kind", None))
-    if kind == "general":
-        kind = "memory"
-    fallback_arguments = {
-        "kind": kind,
-        "goal": _strip_text(getattr(decision, "goal", None)) or prompt,
-        "spoken_ack": _strip_text(getattr(decision, "spoken_ack", None)),
-        "prompt": _strip_text(getattr(decision, "prompt", None)),
-        "allow_web_search": getattr(decision, "allow_web_search", None),
-        "location_hint": _strip_text(getattr(decision, "location_hint", None)),
-        "date_context": _strip_text(getattr(decision, "date_context", None)),
-        "response_id": getattr(decision, "response_id", None),
-        "request_id": getattr(decision, "request_id", None),
-        "model": getattr(decision, "model", None),
-        "token_usage": getattr(decision, "token_usage", None),
-    }
-    return fallback_arguments
-
-
-def _supervisor_decision_has_required_user_reply(decision: Any) -> bool:
-    """Return whether the decision satisfies the user-facing reply contract."""
-
-    action = _normalize_decision_action(getattr(decision, "action", None))
-    if action == "handoff":
-        return True
-    return bool(_strip_text(getattr(decision, "spoken_reply", None)))

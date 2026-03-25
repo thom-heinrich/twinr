@@ -28,17 +28,22 @@ class StreamingLanePlanner:
         self,
         *,
         decision_hint=None,
+        assume_unresolved_supervisor_handoff: bool = False,
     ) -> StreamingTurnTimeoutPolicy:
         """Build the bounded timeout policy for one parallel dual-lane turn.
 
-        Search handoffs can legitimately take longer than parametric direct
-        replies because they still need to reach the search tool path and wait
-        for live results. Keep those turns bounded, but give them a dedicated
-        wider envelope instead of reusing the generic 15s final-lane deadline.
+        Tool/search handoffs can legitimately take longer than parametric
+        direct replies because they still need to reach a specialist/tool path
+        and wait for the result. Keep those turns bounded, but give them a
+        dedicated wider envelope instead of reusing the generic 15s final-lane
+        deadline.
         """
 
         loop = self._loop
-        use_search_budget = _decision_requires_search_timeout(decision_hint)
+        use_search_budget = _decision_requires_extended_timeout(
+            decision_hint,
+            assume_unresolved_supervisor_handoff=assume_unresolved_supervisor_handoff,
+        )
         watchdog_ms = max(
             25,
             int(
@@ -148,6 +153,10 @@ class StreamingLanePlanner:
                     bridge_fallback_reply=None,
                     timeout_policy=loop._streaming_turn_timeout_policy(
                         decision_hint=prefetched_decision,
+                        assume_unresolved_supervisor_handoff=(
+                            prefetched_decision is None
+                            and getattr(loop.streaming_turn_loop, "supervisor_decision_provider", None) is not None
+                        ),
                     ),
                     recover_final_lane_response=None,
                 )
@@ -268,11 +277,10 @@ class StreamingLanePlanner:
             return _search_context() if kind == "search" else _tool_context()
 
         def _run_with_search_feedback(decision, callback):
-            stop_search_feedback = lambda: None
-            if _decision_wants_search_feedback(decision):
-                stop_working_feedback = getattr(loop, "_stop_working_feedback", None)
-                if callable(stop_working_feedback):
-                    stop_working_feedback()
+            def stop_search_feedback() -> None:
+                return None
+
+            if _decision_wants_search_feedback(decision) and not _working_feedback_active(loop):
                 stop_search_feedback = loop._start_search_feedback_loop()
             try:
                 _raise_if_turn_stopped("search_feedback_start")
@@ -362,13 +370,19 @@ class StreamingLanePlanner:
                         should_stop=loop._active_turn_stop_requested,
                     )
                     action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
-                if action == "handoff" and str(getattr(resolved_decision, "kind", "") or "").strip().lower() == "search":
+                if action == "handoff":
+                    handoff_kind = str(getattr(resolved_decision, "kind", "") or "").strip().lower() or "general"
+                    handoff_context = _handoff_context(resolved_decision)
+                    context_source = "search" if handoff_kind == "search" else "tool"
                     loop._trace_decision(
                         "dual_lane_final_path_selected",
                         question="Which final-lane execution path should run?",
-                        selected={"id": "resolved_search_handoff", "summary": "Run direct search handoff"},
+                        selected={
+                            "id": f"resolved_{handoff_kind}_handoff",
+                            "summary": f"Run direct {handoff_kind} handoff",
+                        },
                         options=[
-                            {"id": "resolved_search_handoff", "summary": "Run search handoff only"},
+                            {"id": "resolved_handoff", "summary": "Run specialist handoff only"},
                             {"id": "resolved_direct", "summary": "Run resolved direct reply"},
                             {"id": "generic_tool_loop", "summary": "Run generic tool loop"},
                         ],
@@ -376,17 +390,17 @@ class StreamingLanePlanner:
                             "transcript": _text_summary(transcript),
                             "action": action,
                             "decision": _decision_summary(resolved_decision),
-                            "context_source": "search",
-                            "context": _conversation_summary(_search_context()),
+                            "context_source": context_source,
+                            "context": _conversation_summary(handoff_context),
                         },
-                        guardrails=["search_handoff_short_path"],
+                        guardrails=["handoff_short_path"],
                     )
                     return _run_with_search_feedback(
                         resolved_decision,
                         lambda: loop.streaming_turn_loop.run_handoff_only(
                             transcript,
-                            conversation=_search_context(),
-                            specialist_conversation=_search_context(),
+                            conversation=handoff_context,
+                            specialist_conversation=handoff_context,
                             handoff=resolved_decision,
                             instructions=turn_instructions,
                             allow_web_search=False,
@@ -553,18 +567,23 @@ def _decision_wants_search_feedback(decision) -> bool:
     return bool(getattr(decision, "allow_web_search", False))
 
 
-def _decision_requires_search_timeout(decision) -> bool:
-    """Return whether the final lane should use the wider search timeout budget."""
+def _decision_requires_extended_timeout(
+    decision,
+    *,
+    assume_unresolved_supervisor_handoff: bool,
+) -> bool:
+    """Return whether the final lane should use the wider handoff timeout budget."""
 
     if decision is None:
-        return False
+        return assume_unresolved_supervisor_handoff
     action = str(getattr(decision, "action", "") or "").strip().lower()
-    if action != "handoff":
-        return False
-    kind = str(getattr(decision, "kind", "") or "").strip().lower()
-    if kind == "search":
-        return True
-    return bool(getattr(decision, "allow_web_search", False))
+    return action == "handoff"
+
+
+def _working_feedback_active(loop) -> bool:
+    """Return whether the default processing-feedback loop is still active."""
+
+    return callable(getattr(loop, "_working_feedback_stop", None))
 
 
 def _shared_supervisor_decision_wait_ms(loop) -> int:

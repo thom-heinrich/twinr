@@ -3,13 +3,14 @@ name: routing
 path: src/twinr/agent/routing
 kind: python-package
 visibility: internal
-summary: Local two-stage transcript router bundle formats, ONNX inference runtime, labeling handbook, and offline calibration helpers for Twinr's streaming path.
+summary: Local two-stage transcript router bundle formats, shared ONNX inference helpers, labeling handbook, and offline calibration helpers for Twinr's streaming path.
 owned_concerns:
   - Define the canonical parametric/web/memory/tool routing label set and scored decision contract
   - Define the canonical user-centered wissen/nachschauen/persoenlich/machen_oder_pruefen label set and two-stage mapping contract
   - Load and validate versioned local router bundles from disk
   - Load and validate versioned local user-intent bundles from disk
   - Run lazy ONNX sentence-encoder inference plus centroid or linear-head scoring on local hardware
+  - Keep shared encoder/numeric helpers and centroid math separated from route-specific runtime modules
   - Run a shared-embedding user-intent stage plus constrained backend route stage when both bundles are configured
   - Apply calibrated confidence and margin gates before a route may bypass the supervisor lane
   - Evaluate labeled transcript datasets and tune safe local authority thresholds
@@ -44,12 +45,20 @@ files:
       - score_semantic_router
       - score_user_intent_router
       - tune_policy_thresholds
+  - path: inference.py
+    role: Shared lazy ONNX sentence encoder plus reusable routing numeric helpers
+    exports:
+      - OnnxSentenceEncoder
   - path: contracts.py
     role: Canonical route labels and scored route-decision dataclass
     exports:
       - RouteLabel
       - SemanticRouteDecision
       - normalize_route_label
+  - path: centroids.py
+    role: Shared label-centroid computation for routing bundle builders
+    exports:
+      - compute_label_centroids
   - path: user_intent.py
     role: Canonical user-centered labels and two-stage routing contracts
     exports:
@@ -76,10 +85,9 @@ files:
     exports:
       - SemanticRouterPolicy
   - path: service.py
-    role: Lazy ONNX/tokenizer sentence encoder and local routing runtime
+    role: Backend-route runtime built on shared inference helpers
     exports:
       - LocalSemanticRouter
-      - OnnxSentenceEncoder
   - path: two_stage.py
     role: Shared-embedding first-stage user intent router plus constrained backend route runtime
     exports:
@@ -113,7 +121,6 @@ files:
       - build_centroid_router_bundle_from_jsonl
       - build_linear_router_bundle
       - build_linear_router_bundle_from_jsonl
-      - compute_label_centroids
   - path: linear_head.py
     role: Offline multinomial linear-head fitting over frozen sentence embeddings
     exports:
@@ -126,8 +133,10 @@ files:
       - build_centroid_user_intent_bundle_from_jsonl
       - build_linear_user_intent_bundle
       - build_linear_user_intent_bundle_from_jsonl
+  - path: synthetic_recipe_bank.py
+    role: Static synthetic transcript family registry for router bootstrap generation
   - path: synthetic_corpus.py
-    role: Deterministic dual-labeled synthetic transcript generator and curation filters for router bootstrap datasets
+    role: Deterministic dual-labeled synthetic transcript generator, curation filters, and CLI for router bootstrap datasets
     exports:
       - SyntheticRouteSample
       - SyntheticRouteCurationReport

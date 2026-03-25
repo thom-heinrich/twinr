@@ -8,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.camera_ai.models import AICameraBox
 from twinr.hardware.hand_landmarks import (
-    HandLandmarkResult,
     HandLandmarkWorkerConfig,
     HandRoiSource,
     MediaPipeHandLandmarkWorker,
@@ -80,6 +79,51 @@ class HandLandmarkWorkerTests(unittest.TestCase):
         self.assertEqual(candidates[0].source, HandRoiSource.PRIMARY_PERSON_UPPER_BODY)
         self.assertEqual(candidates[1].source, HandRoiSource.PRIMARY_PERSON_FULL_BODY)
         self.assertGreater(candidates[1].box.height, candidates[0].box.height)
+
+    def test_analyze_retries_with_wide_context_candidates_after_initial_person_rois_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "hand_landmarker.task"
+            model_path.write_bytes(b"hand")
+            worker = MediaPipeHandLandmarkWorker(
+                config=HandLandmarkWorkerConfig(
+                    model_path=str(model_path),
+                    num_hands=1,
+                    max_roi_candidates=2,
+                )
+            )
+            detect_calls: list[int] = []
+
+            def _detect(_image):
+                detect_calls.append(1)
+                if len(detect_calls) != 3:
+                    return SimpleNamespace(hand_landmarks=[], handedness=[])
+                return SimpleNamespace(
+                    hand_landmarks=[[SimpleNamespace(x=0.48, y=0.40, z=0.0)]],
+                    handedness=[[SimpleNamespace(category_name="Right", score=0.94)]],
+                )
+
+            worker._hand_landmarker = SimpleNamespace(detect=_detect)
+            runtime = {
+                "mp": SimpleNamespace(
+                    ImageFormat=SimpleNamespace(SRGB="srgb"),
+                    Image=lambda image_format, data: SimpleNamespace(image_format=image_format, data=data),
+                ),
+                "vision": SimpleNamespace(),
+                "BaseOptions": object,
+            }
+
+            result = worker.analyze(
+                runtime=runtime,
+                frame_rgb=_FakeFrame(120, 160),
+                timestamp_ms=3,
+                primary_person_box=AICameraBox(top=0.14, left=0.20, bottom=0.96, right=0.78),
+                sparse_keypoints={},
+            )
+
+        self.assertEqual(len(detect_calls), 4)
+        self.assertEqual(len(result.detections), 1)
+        self.assertEqual(result.detections[0].roi_source, HandRoiSource.PRIMARY_PERSON_WIDE_UPPER_BODY)
+        self.assertEqual(result.final_timestamp_ms, 6)
 
     def test_project_landmark_to_full_frame_maps_roi_local_coords(self) -> None:
         point = _project_landmark_to_full_frame(
@@ -201,10 +245,11 @@ class HandLandmarkWorkerTests(unittest.TestCase):
             runtime = {
                 "mp": SimpleNamespace(
                     ImageFormat=SimpleNamespace(SRGB="srgb"),
-                    Image=lambda image_format, data: (
-                        observed.append((getattr(getattr(data, "flags", None), "c_contiguous", None), getattr(data, "dtype", None))),
-                        SimpleNamespace(image_format=image_format, data=data),
-                    )[1],
+                    Image=lambda image_format, data: _record_image(
+                        observed=observed,
+                        image_format=image_format,
+                        data=data,
+                    ),
                 ),
                 "vision": SimpleNamespace(),
                 "BaseOptions": object,
@@ -219,7 +264,7 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 sparse_keypoints={},
             )
 
-        self.assertEqual(observed, [(True, "uint8")])
+        self.assertEqual(observed, [(True, "uint8"), (True, "uint8")])
 
     def test_analyze_uses_image_mode_detection_across_roi_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -234,10 +279,10 @@ class HandLandmarkWorkerTests(unittest.TestCase):
             )
             detect_calls: list[int] = []
             worker._hand_landmarker = SimpleNamespace(
-                detect=lambda image: (
-                    detect_calls.append(1),
-                    SimpleNamespace(hand_landmarks=[], handedness=[]),
-                )[1],
+                detect=lambda image: _count_detect_call(
+                    detect_calls=detect_calls,
+                    result=SimpleNamespace(hand_landmarks=[], handedness=[]),
+                ),
                 detect_for_video=lambda image, timestamp_ms: (_ for _ in ()).throw(
                     AssertionError("ROI hand worker must not use VIDEO-mode detection")
                 ),
@@ -266,8 +311,8 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(len(detect_calls), 3)
-        self.assertEqual(result.final_timestamp_ms, 9)
+        self.assertEqual(len(detect_calls), 6)
+        self.assertEqual(result.final_timestamp_ms, 12)
 
     def test_analyze_full_frame_uses_single_image_mode_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -282,10 +327,10 @@ class HandLandmarkWorkerTests(unittest.TestCase):
             )
             detect_calls: list[int] = []
             worker._hand_landmarker = SimpleNamespace(
-                detect=lambda image: (
-                    detect_calls.append(1),
-                    SimpleNamespace(hand_landmarks=[], handedness=[]),
-                )[1],
+                detect=lambda image: _count_detect_call(
+                    detect_calls=detect_calls,
+                    result=SimpleNamespace(hand_landmarks=[], handedness=[]),
+                ),
                 detect_for_video=lambda image, timestamp_ms: (_ for _ in ()).throw(
                     AssertionError("Full-frame hand rescue must stay in IMAGE mode")
                 ),
@@ -308,8 +353,9 @@ class HandLandmarkWorkerTests(unittest.TestCase):
         self.assertEqual(len(detect_calls), 1)
         self.assertEqual(result.final_timestamp_ms, 12)
 
-    def test_parse_hand_landmark_result_tightens_roi_frame_to_local_hand_crop(self) -> None:
+    def test_parse_hand_landmark_result_tightens_roi_frame_but_keeps_full_frame_gesture_crop(self) -> None:
         roi_frame = _FakeFrame(100, 120)
+        full_frame = _FakeFrame(480, 640)
 
         detections = _parse_hand_landmark_result(
             result=SimpleNamespace(
@@ -325,11 +371,16 @@ class HandLandmarkWorkerTests(unittest.TestCase):
             roi=AICameraBox(top=0.20, left=0.20, bottom=0.80, right=0.80),
             roi_source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
             roi_frame_rgb=roi_frame,
+            full_frame_rgb=full_frame,
         )
 
         self.assertEqual(len(detections), 1)
         self.assertLess(detections[0].roi_frame_rgb.shape[0], roi_frame.shape[0])
         self.assertLess(detections[0].roi_frame_rgb.shape[1], roi_frame.shape[1])
+        self.assertGreater(detections[0].gesture_frame_rgb.shape[0], detections[0].roi_frame_rgb.shape[0])
+        self.assertGreater(detections[0].gesture_frame_rgb.shape[1], detections[0].roi_frame_rgb.shape[1])
+        self.assertGreater(detections[0].gesture_context_frame_rgb.shape[0], detections[0].roi_frame_rgb.shape[0])
+        self.assertGreater(detections[0].gesture_context_frame_rgb.shape[1], detections[0].roi_frame_rgb.shape[1])
         self.assertEqual(detections[0].handedness, "right")
 
     def test_crop_local_hand_from_roi_frame_keeps_minimum_context_window(self) -> None:
@@ -348,3 +399,18 @@ class HandLandmarkWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _record_image(
+    *,
+    observed: list[tuple[bool | None, object]],
+    image_format: object,
+    data: object,
+) -> SimpleNamespace:
+    observed.append((getattr(getattr(data, "flags", None), "c_contiguous", None), getattr(data, "dtype", None)))
+    return SimpleNamespace(image_format=image_format, data=data)
+
+
+def _count_detect_call(*, detect_calls: list[int], result: object) -> object:
+    detect_calls.append(1)
+    return result

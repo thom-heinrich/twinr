@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.proactive.runtime.service import ProactiveCoordinator
 from twinr.proactive.social.camera_surface import ProactiveCameraSurface, ProactiveCameraSurfaceConfig
 from twinr.proactive.social.engine import (
@@ -21,7 +21,7 @@ from twinr.proactive.social.engine import (
     SocialVisionObservation,
 )
 from twinr.proactive.social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
-from twinr.runtime import TwinrRuntime
+from twinr.agent.base_agent import TwinrRuntime
 
 from test.test_proactive_monitor import FakeAudioObserver, FakePirMonitor, FakeVisionObserver, MutableClock
 
@@ -960,6 +960,59 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
 
 
 class ProactiveCameraCoordinatorIntegrationTest(unittest.TestCase):
+    def test_display_attention_refresh_exports_authoritative_live_context(self) -> None:
+        class _AttentionVisionObserver(FakeVisionObserver):
+            supports_attention_refresh = True
+
+            def observe_attention(self):
+                return self.observe()
+
+        config = TwinrConfig(
+            project_root="/tmp/twinr-display-attention-context-test",
+            proactive_enabled=True,
+            display_driver="hdmi_fbdev",
+            display_attention_refresh_interval_s=0.2,
+        )
+        runtime = TwinrRuntime(config=config)
+        live_contexts: list[dict[str, object]] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=_AttentionVisionObserver(
+                [
+                    SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        primary_person_zone=SocialPersonZone.LEFT,
+                        primary_person_center_x=0.22,
+                        primary_person_center_y=0.5,
+                        person_near_device=True,
+                        looking_toward_device=True,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                        camera_online=True,
+                        camera_ready=True,
+                        camera_ai_ready=True,
+                    )
+                ]
+            ),
+            audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+            live_context_handler=lambda facts: live_contexts.append(facts),
+            emit=lambda _line: None,
+            clock=MutableClock(0.0),
+        )
+
+        refreshed = coordinator.refresh_display_attention()
+
+        self.assertTrue(refreshed)
+        self.assertEqual(len(live_contexts), 1)
+        live_facts = live_contexts[0]
+        self.assertTrue(live_facts["sensor"]["inspected"])
+        self.assertTrue(live_facts["camera"]["person_visible"])
+        self.assertEqual(live_facts["camera"]["person_count"], 1)
+        self.assertTrue(live_facts["person_state"]["presence_active"])
+
     def test_coordinator_keeps_camera_presence_facts_during_uninspected_gap(self) -> None:
         config = TwinrConfig(
             project_root="/tmp/twinr-camera-surface-test",

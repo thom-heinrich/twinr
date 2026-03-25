@@ -24,8 +24,6 @@ from twinr.agent.tools import (
     build_compact_agent_tool_schemas,
     build_supervisor_decision_instructions,
     build_specialist_tool_agent_instructions,
-    bind_realtime_tool_handlers,
-    realtime_tool_names,
 )
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.streaming_capture import (
@@ -140,12 +138,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             **kwargs,
         )
         self.tool_agent_provider = resolved_tool_agent
-        self._tool_handlers = bind_realtime_tool_handlers(self.tool_executor)
-        tool_schemas = (
-            build_compact_agent_tool_schemas(realtime_tool_names())
-            if (self.config.llm_provider or "").strip().lower() == "groq"
-            else build_agent_tool_schemas(realtime_tool_names())
-        )
+        tool_schemas = self._build_runtime_tool_schemas()
         self.streaming_turn_loop = streaming_turn_loop or self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
         )
@@ -291,12 +284,9 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             if self.turn_tool_agent_provider is not None and updated_config.turn_controller_enabled
             else None
         )
+        self._refresh_runtime_tool_surface()
         self.realtime_session.config = updated_config
-        tool_schemas = (
-            build_compact_agent_tool_schemas(realtime_tool_names())
-            if (self.config.llm_provider or "").strip().lower() == "groq"
-            else build_agent_tool_schemas(realtime_tool_names())
-        )
+        tool_schemas = self._build_runtime_tool_schemas()
         self.streaming_turn_loop = self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
         )
@@ -306,6 +296,12 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._first_word_cache_prewarmed = False
         self._prime_supervisor_decision_cache()
         self._prime_first_word_cache()
+
+    def _build_runtime_tool_schemas(self):
+        tool_names = self._runtime_tool_names
+        if (self.config.llm_provider or "").strip().lower() == "groq":
+            return build_compact_agent_tool_schemas(tool_names)
+        return build_agent_tool_schemas(tool_names)
 
     def _reset_speculative_supervisor_decision(self) -> None:
         self._streaming_speculation.reset()
@@ -401,9 +397,11 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self,
         *,
         decision_hint=None,
+        assume_unresolved_supervisor_handoff: bool = False,
     ) -> StreamingTurnTimeoutPolicy:
         return self._streaming_lane_planner.streaming_turn_timeout_policy(
             decision_hint=decision_hint,
+            assume_unresolved_supervisor_handoff=assume_unresolved_supervisor_handoff,
         )
 
     def _dual_lane_bridge_reply_from_decision(

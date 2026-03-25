@@ -1,0 +1,38 @@
+# ============================================================================
+# Legacy code extracted from: src/twinr/memory/longterm/ingestion/environment_profile.py
+# Extracted on: 2026-03-24
+# Reason: _quantile() and _iqr() were dead local duplicates after the module
+# already switched to the shared helpers in environment_stats.py.
+# Recovery: Copy the relevant block back into environment_profile.py and restore
+# any call sites if this module ever needs private local variants again.
+# ============================================================================
+
+# --- From: environment_profile.py::_quantile (lines 156-169) ---
+# Status: DEAD / REDUNDANT
+# Replacement: twinr.memory.longterm.ingestion.environment_stats.quantile
+
+def _quantile(values: Sequence[float], q: float) -> float:
+    """Return one bounded linear-interpolated quantile."""
+
+    if not values:
+        raise ValueError("values must not be empty.")
+    if len(values) == 1:
+        return float(values[0])
+    ordered = sorted(float(value) for value in values)
+    position = max(0.0, min(1.0, q)) * (len(ordered) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    weight = position - lower_index
+    return ordered[lower_index] + ((ordered[upper_index] - ordered[lower_index]) * weight)
+
+
+# --- From: environment_profile.py::_iqr (lines 172-176) ---
+# Status: DEAD / REDUNDANT
+# Replacement: twinr.memory.longterm.ingestion.environment_stats.iqr
+
+def _iqr(values: Sequence[float]) -> float:
+    """Return the interquartile range for one non-empty sample."""
+
+    return _quantile(values, 0.75) - _quantile(values, 0.25)
