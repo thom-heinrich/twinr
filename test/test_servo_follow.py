@@ -19,6 +19,7 @@ from twinr.hardware.servo_follow import (
     SysfsPWMServoPulseWriter,
     TwinrKernelServoPulseWriter,
 )
+from twinr.hardware.servo_state import AttentionServoRuntimeState, AttentionServoStateStore
 
 
 class FakeServoPulseWriter:
@@ -664,7 +665,8 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(decisions[-1].commanded_pulse_width_us, 1500)
         self.assertEqual(writer.writes[-1], ("gpiochip0", 18, 1500))
         self.assertIsNotNone(debug["continuous_estimated_heading_degrees"])
-        self.assertEqual(debug["config"]["control_mode"], "continuous_rotation")
+        debug_config = cast(dict[str, object], debug["config"])
+        self.assertEqual(debug_config["control_mode"], "continuous_rotation")
 
     def test_pololu_fault_recovers_on_later_update_when_writer_probe_succeeds(self) -> None:
         writer = RecoveringFakeServoPulseWriter()
@@ -773,6 +775,136 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(servo_config.continuous_stop_tolerance_degrees, 3.5)
         self.assertEqual(servo_config.continuous_min_speed_pulse_delta_us, 72)
         self.assertEqual(servo_config.continuous_max_speed_pulse_delta_us, 165)
+
+    def test_from_config_resolves_attention_servo_state_path_against_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                attention_servo_enabled=True,
+                attention_servo_control_mode="continuous_rotation",
+                attention_servo_state_path="state/custom-attention-servo.json",
+            )
+
+            servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
+
+        self.assertEqual(
+            servo_config.state_path,
+            str(Path(temp_dir) / "state" / "custom-attention-servo.json"),
+        )
+
+    def test_continuous_rotation_manual_hold_anchors_persisted_startup_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            AttentionServoStateStore(state_path).save(
+                AttentionServoRuntimeState(
+                    heading_degrees=17.25,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=True,
+                    updated_at=123.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=True,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                ),
+                pulse_writer=writer,
+            )
+
+            decision = controller.update(
+                observed_at=10.0,
+                active=True,
+                target_center_x=1.0,
+                confidence=0.95,
+                visible_target_present=True,
+            )
+            debug = controller.debug_snapshot(observed_at=10.0)
+            persisted_state = AttentionServoStateStore(state_path).load()
+
+        self.assertEqual(decision.reason, "manual_hold")
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.commanded_pulse_width_us, 1500)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1500)])
+        self.assertEqual(debug["continuous_estimated_heading_degrees"], 17.25)
+        self.assertTrue(debug["startup_hold_until_armed"])
+        self.assertTrue(debug["zero_reference_confirmed"])
+        self.assertIsNotNone(persisted_state)
+        if persisted_state is None:
+            self.fail("expected persisted attention-servo state to exist")
+        self.assertEqual(persisted_state.heading_degrees, 17.25)
+        self.assertTrue(persisted_state.hold_until_armed)
+        self.assertTrue(persisted_state.zero_reference_confirmed)
+
+    def test_continuous_rotation_runtime_reloads_arm_state_without_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=0.0,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                ),
+                pulse_writer=writer,
+            )
+
+            held_decision = controller.update(
+                observed_at=10.0,
+                active=True,
+                target_center_x=1.0,
+                confidence=0.95,
+                visible_target_present=True,
+            )
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=0.0,
+                    hold_until_armed=False,
+                    zero_reference_confirmed=True,
+                    updated_at=101.0,
+                )
+            )
+
+            armed_decision = controller.update(
+                observed_at=10.5,
+                active=True,
+                target_center_x=1.0,
+                confidence=0.95,
+                visible_target_present=True,
+            )
+            debug = controller.debug_snapshot(observed_at=10.5)
+
+        self.assertEqual(held_decision.reason, "manual_hold")
+        self.assertEqual(held_decision.commanded_pulse_width_us, 1500)
+        self.assertNotEqual(armed_decision.reason, "manual_hold")
+        self.assertIsNotNone(armed_decision.commanded_pulse_width_us)
+        self.assertFalse(debug["startup_hold_until_armed"])
 
     def test_exit_only_recentering_starts_from_writer_seed_instead_of_blind_center(self) -> None:
         writer = FakeServoPulseWriter()

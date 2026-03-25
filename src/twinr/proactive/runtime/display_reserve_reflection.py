@@ -62,6 +62,8 @@ def _mapping(value: Mapping[str, object] | None) -> Mapping[str, object]:
 def _coerce_days(value: object, *, default: float, minimum: float, maximum: float) -> float:
     """Coerce one config-like day value into a bounded float."""
 
+    if not isinstance(value, (int, float, str)):
+        return default
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -197,17 +199,17 @@ def _summary_display_copy(item: LongTermMemoryObjectV1, *, title: str) -> tuple[
     anchor = _sentence_label(title, max_len=72) or "das"
     if summary_type == "thread" or _compact_text(attributes.get("person_name"), max_len=80):
         return (
-            _compact_text(f"Wollen wir bei {anchor} kurz anknuepfen?", max_len=112),
-            _compact_text("Da haengt zwischen uns noch ein kleiner Faden.", max_len=112),
+            _compact_text(f"Bei {anchor} ist zwischen uns noch etwas offen.", max_len=112),
+            _compact_text("Wollen wir kurz darueber reden?", max_len=112),
         )
     if memory_domain == "smart_home_environment" or summary_type == "environment_reflection":
         return (
             _compact_text(f"Rund um {anchor} schaue ich heute noch einmal hin.", max_len=112),
-            _compact_text("Ein kurzer Blick darauf reicht mir erstmal.", max_len=112),
+            _compact_text("Magst du kurz was dazu sagen?", max_len=112),
         )
     return (
-        _compact_text(f"Zu {anchor} wuerde ich gern kurz anknuepfen.", max_len=112),
-        _compact_text("Ein kleiner Nachtrag dazu waere schon gut.", max_len=112),
+        _compact_text(f"Zu {anchor} habe ich noch einen kleinen Nachtrag im Kopf.", max_len=112),
+        _compact_text("Wollen wir kurz darueber reden?", max_len=112),
     )
 
 
@@ -401,26 +403,26 @@ def _packet_display_copy(
     if candidate_family == "reflection_thread":
         if action == "ask_one":
             return (
-                _compact_text(f"Wollen wir bei {anchor} kurz anknuepfen?", max_len=112),
-                _compact_text("Da ist zwischen uns noch etwas offen.", max_len=112),
+                _compact_text(f"Bei {anchor} ist zwischen uns noch etwas offen.", max_len=112),
+                _compact_text("Wollen wir kurz darueber reden?", max_len=112),
             )
         return (
             _compact_text(f"Bei {anchor} bleibe ich noch kurz dran.", max_len=112),
-            _compact_text("Der Faden ist noch nicht ganz zu Ende.", max_len=112),
+            _compact_text("Magst du kurz was dazu sagen?", max_len=112),
         )
     if candidate_family == "reflection_preference":
         return (
             _compact_text(f"Bei {anchor} moechte ich dich noch etwas besser verstehen.", max_len=112),
-            _compact_text("Ein kleiner Hinweis reicht mir da schon.", max_len=112),
+            _compact_text("Magst du mir kurz mehr dazu sagen?", max_len=112),
         )
     if attention_state == "growing":
         return (
             _compact_text(f"Rund um {anchor} schaue ich heute noch einmal hin.", max_len=112),
-            _compact_text("Ein kurzer Blick darauf waere gut.", max_len=112),
+            _compact_text("Wollen wir kurz draufschauen?", max_len=112),
         )
     return (
-        _compact_text(f"Zu {anchor} wuerde ich gern kurz anknuepfen.", max_len=112),
-        _compact_text("Ein kleiner Nachtrag dazu waere schon hilfreich.", max_len=112),
+        _compact_text(f"Zu {anchor} habe ich noch einen kleinen Nachtrag im Kopf.", max_len=112),
+        _compact_text("Magst du kurz was dazu sagen?", max_len=112),
     )
 
 

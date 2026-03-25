@@ -22,6 +22,7 @@ Out of scope:
 - `mic/setup_audio.sh` - configure ALSA or PipeWire playback/capture defaults and proactive audio env
 - `mic/setup_respeaker_access.sh` - install the XVF3800 udev rule so the runtime user can read host-control without sudo
 - `servo/setup_pololu_maestro.sh` - install the official Pololu USB rule and switch one Maestro into `USB_DUAL_PORT` for Twinr's command-port runtime path
+- `servo/attention_servo_state.py` - inspect or flip the persisted startup hold/arm state for the continuous attention-servo path
 - `piaicam/fetch_mediapipe_models.py` - stage the official MediaPipe pose, hand-landmarker, and gesture task bundles for Pi runtime use
 - `piaicam/capture_custom_gesture_dataset.py` - capture bounded labeled stills for custom gesture datasets
 - `piaicam/train_custom_gesture_model.py` - train and export a custom MediaPipe gesture task bundle on the leading repo
@@ -65,6 +66,7 @@ After any edit in this directory, run:
 ```bash
 bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/servo/setup_pololu_maestro.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
 PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
+PYTHONPATH=src python3 -m py_compile hardware/servo/attention_servo_state.py
 ```
 
 If `hardware/ops/deploy_pi_runtime.py` changed, also run:
@@ -121,6 +123,11 @@ python3 hardware/display/display_test.py --env-file .env
 
 `servo/setup_pololu_maestro.sh` changes -> also check:
 - `src/twinr/hardware/servo_maestro.py`
+- `src/twinr/hardware/servo_follow.py`
+- `hardware/servo/README.md`
+
+`servo/attention_servo_state.py` changes -> also check:
+- `src/twinr/hardware/servo_state.py`
 - `src/twinr/hardware/servo_follow.py`
 - `hardware/servo/README.md`
 

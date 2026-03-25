@@ -249,4 +249,5 @@ export TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767
 That high-level mode keeps still capture on the helper Pi via
 `/snapshot.png` and defaults the proactive camera path to `remote_frame`, so
 the helper Pi holds the physical camera while the main Pi can do the hot
-gesture/attention lifting locally.
+gesture/attention lifting locally from one coherent helper detection-plus-frame
+bundle instead of separate live detection and snapshot fetches.

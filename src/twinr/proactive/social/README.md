@@ -77,8 +77,9 @@ For a friendlier peer-camera setup, `TwinrConfig.from_env()` now supports the
 high-level topology env pair `TWINR_CAMERA_HOST_MODE=onboard|second_pi` plus
 `TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767`. In `second_pi` mode,
 Twinr derives the still-photo snapshot proxy and defaults proactive live
-vision to `remote_frame` while still allowing the older low-level camera envs
-to override behavior explicitly.
+vision to `remote_frame`, where both the fast attention lane and the gesture
+lane consume one coherent helper-side detection-plus-frame bundle while still
+allowing the older low-level camera envs to override behavior explicitly.
 
 ## See also
 

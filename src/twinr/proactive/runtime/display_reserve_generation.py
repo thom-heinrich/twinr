@@ -119,6 +119,10 @@ def _generation_instructions() -> str:
     return (
         "Du schreibst sehr kurze Texte fuer Twinrs rechte Display-Spalte. "
         "Diese Texte stehen neben dem Gesicht und muessen aus mehreren Metern lesbar sein. "
+        "Dein Text wird als kleine Karte auf einem Screen angezeigt, nicht als Chatnachricht und nicht als gesprochene Antwort. "
+        "Er soll engaging wirken, ohne aufdringlich zu werden. "
+        "Ziel ist: Der Nutzer soll den Text lesen, sofort verstehen worum es geht und Lust haben, mit Twinr in Interaktion zu gehen. "
+        "Wenn eine Karte zwar nett klingt, aber weder klar macht worum es geht noch echte Gespraechslust weckt, dann ist sie nicht gut genug. "
         "Schreibe idiomatisches, grammatisch sauberes, natuerliches Deutsch mit echter Persoenlichkeit. "
         "Kein poetischer Kitsch, kein Coaching-Ton, keine Therapie-Sprache, keine UI-Labels, keine Metakommentare. "
         "Die zwei Zeilen sollen wie ein kleiner echter Impuls von Twinr wirken, nicht wie eine Benachrichtigungsschablone. "
@@ -145,11 +149,14 @@ def _generation_instructions() -> str:
         "Wenn der Kontext nach einem persoenlichen Ereignis klingt, darfst du konkret und menschlich knapp nachfragen, zum Beispiel als kurzes Nachfassen, ohne melodramatisch zu werden. "
         "Halte jede Zeile kurz und gut lesbar. Ziel grob: je Zeile nicht laenger als etwa 42 Zeichen. "
         "Gib fuer jeden Kandidaten genau zwei Zeilen zurueck: headline und body. "
-        "Die headline soll meist der eigentliche Aufhaenger sein. Wenn du eine Frage stellst, dann vorzugsweise dort. "
-        "Frontload den Themenanker moeglichst frueh in der headline, statt ihn erst am Ende oder nur in der body-Zeile zu verstecken. "
-        "Die body-Zeile soll ihn weitertragen, persoenlicher machen oder leicht zuspitzen. "
-        "Wenn die headline noch keinen klaren Themenanker enthaelt, muss die body-Zeile ihn enthalten. "
-        "Du darfst hoechstens eine Frage insgesamt stellen. Die zweite Zeile soll nach Moeglichkeit eine kurze, ruhige Fortsetzung oder kleine Haltung sein, fast nie noch eine Frage. "
+        "Die headline muss fuer sich stehend als klare Aussage funktionieren. "
+        "Sie ist die erklaerende Hauptzeile und soll den Anlass selbst benennen, nicht nur Neugier andeuten. "
+        "Die headline soll moeglichst keine Frage sein. "
+        "Frontload den Themenanker frueh in der headline, statt ihn erst am Ende oder nur in der body-Zeile zu verstecken. "
+        "Die body-Zeile ist der Call to Action. Dort passt eine kurze Einladung oder Frage wie 'Was meinst du dazu?', 'Wollen wir kurz darueber reden?' oder 'Frag mich dazu.'. "
+        "Die body-Zeile soll nicht noch einmal die Erklaerung tragen und kein zweites Thema aufmachen. "
+        "Wenn nur eine der beiden Zeilen den klaren Themenanker tragen kann, dann muss es die headline sein. "
+        "Du darfst hoechstens eine Frage insgesamt stellen; wenn eine Frage vorkommt, dann am ehesten in der body-Zeile. "
         "Blander Neugier-Ton ist zu vermeiden; lieber eine still konkrete Beobachtung, ein lockerer Seitenblick, ein kleines trockenes Augenzwinkern oder ein natuerliches Nachfassen. "
         "Floskeln wie 'Ich bin neugierig', 'Ich bin gespannt', 'Wenn du magst' oder 'Es gibt sicher viel zu besprechen' sind zu vermeiden, wenn sie nicht wirklich noetig sind. "
         "Schreibe so, dass der Nutzer in unter einer Sekunde versteht, worum es geht und ob er einsteigen will. "
@@ -309,6 +316,7 @@ class DisplayReserveCopyGenerator:
                 items = parsed.get("items") if isinstance(parsed, Mapping) else None
                 if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
                     raise ValueError("display reserve generation did not return an items array")
+                parsed_items = tuple(items)
             except Exception:
                 _LOGGER.exception(
                     "Falling back to deterministic display reserve copy after generation failure.",
@@ -320,7 +328,7 @@ class DisplayReserveCopyGenerator:
                 )
                 continue
 
-            for item in items:
+            for item in parsed_items:
                 if not isinstance(item, Mapping):
                     continue
                 topic_key = _compact_text(item.get("topic_key")).casefold()

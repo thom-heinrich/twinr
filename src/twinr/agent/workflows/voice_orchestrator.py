@@ -23,7 +23,8 @@ from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.hardware.audio import resolve_capture_device
 from twinr.hardware.audio_env import build_audio_subprocess_env
 from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
-from twinr.orchestrator import (
+from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
+from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceBargeInInterruptEvent,
     OrchestratorVoiceErrorEvent,
@@ -33,7 +34,6 @@ from twinr.orchestrator import (
     OrchestratorVoiceRuntimeStateEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
     OrchestratorVoiceWakeConfirmedEvent,
-    OrchestratorVoiceWebSocketClient,
 )
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.orchestrator.voice_forensics import VoiceFrameTelemetryBucket
@@ -226,6 +226,7 @@ class EdgeVoiceOrchestrator:
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
+        presence_active: bool | None = None,
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
@@ -239,6 +240,7 @@ class EdgeVoiceOrchestrator:
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
+            presence_active=presence_active,
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
@@ -265,6 +267,7 @@ class EdgeVoiceOrchestrator:
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
+        presence_active: bool | None = None,
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
@@ -285,6 +288,7 @@ class EdgeVoiceOrchestrator:
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
+            presence_active=presence_active,
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
@@ -334,6 +338,7 @@ class EdgeVoiceOrchestrator:
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
+        presence_active: bool | None = None,
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
@@ -347,6 +352,7 @@ class EdgeVoiceOrchestrator:
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
+            presence_active=presence_active,
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
@@ -372,6 +378,7 @@ class EdgeVoiceOrchestrator:
                 runtime_state.interaction_intent_state if runtime_state is not None else None
             ),
             person_visible=runtime_state.person_visible if runtime_state is not None else None,
+            presence_active=runtime_state.presence_active if runtime_state is not None else None,
             interaction_ready=runtime_state.interaction_ready if runtime_state is not None else None,
             targeted_inference_blocked=(
                 runtime_state.targeted_inference_blocked if runtime_state is not None else None
@@ -493,7 +500,8 @@ class EdgeVoiceOrchestrator:
                     del pending_pcm[: self._frame_bytes]
                     self._send_frame(frame_bytes)
                     sent_any_frame = True
-            self._drain_stderr(process)
+            if process is not None:
+                self._drain_stderr(process)
         except Exception as exc:
             if not self._stop_event.is_set():
                 self._trace_event(
@@ -529,8 +537,14 @@ class EdgeVoiceOrchestrator:
                 )
             return
         try:
+            with self._state_lock:
+                latest_runtime_state = self._last_runtime_state
             self._client.send_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=self._sequence, pcm_bytes=pcm_bytes)
+                OrchestratorVoiceAudioFrame(
+                    sequence=self._sequence,
+                    pcm_bytes=pcm_bytes,
+                    runtime_state=latest_runtime_state,
+                )
             )
             self._skipped_frame_count = 0
             self._sent_frame_bucket.add_frame(sequence=self._sequence, pcm_bytes=pcm_bytes)

@@ -443,11 +443,13 @@ class EdgeOrchestratorVoiceSession:
     ) -> VoiceActivationMatch | None:
         """Run one activation-detector pass and surface backend errors as buffered evidence."""
 
+        origin_state_value = None if details is None else details.get("origin_state")
+        origin_state = str(origin_state_value).strip() or None
         try:
             with self._backend_request_context(
                 stage=stage,
                 capture=capture,
-                origin_state=(details or {}).get("origin_state"),
+                origin_state=origin_state,
             ):
                 return self._wake_phrase_spotter.detect(capture)
         except Exception as exc:
@@ -554,6 +556,21 @@ class EdgeOrchestratorVoiceSession:
     def handle_runtime_state(self, event: OrchestratorVoiceRuntimeStateEvent) -> list[dict[str, Any]]:
         """Update explicit edge runtime state and drain any timeout-based events."""
 
+        return self._apply_runtime_state(
+            event,
+            trace_event_name="voice_runtime_state_received",
+            trace_kind="mutation",
+        )
+
+    def _apply_runtime_state(
+        self,
+        event: OrchestratorVoiceRuntimeStateEvent,
+        *,
+        trace_event_name: str,
+        trace_kind: str,
+    ) -> list[dict[str, Any]]:
+        """Apply one runtime-state snapshot and drain any timeout-based events."""
+
         previous_state = self._state
         raw_state = event.state or "waiting"
         self._state = self._normalize_runtime_state(raw_state)
@@ -585,8 +602,8 @@ class EdgeOrchestratorVoiceSession:
         if self._state not in self._ACTIVE_STATES:
             self._pending_transcript_utterance = None
         self._trace_event(
-            "voice_runtime_state_received",
-            kind="mutation",
+            trace_event_name,
+            kind=trace_kind,
             details={
                 "previous_state": previous_state,
                 "new_state": self._state,
@@ -598,6 +615,17 @@ class EdgeOrchestratorVoiceSession:
             },
         )
         return self._drain_timeouts()
+
+    def _runtime_state_event_matches_current(self, event: OrchestratorVoiceRuntimeStateEvent) -> bool:
+        """Return whether one incoming runtime snapshot matches current session state."""
+
+        if not self._runtime_state_attested:
+            return False
+        if self._normalize_runtime_state(event.state or "waiting") != self._state:
+            return False
+        if bool(event.follow_up_allowed) != self._follow_up_allowed:
+            return False
+        return VoiceRuntimeIntentContext.from_runtime_event(event) == self._intent_context
 
     def _normalize_runtime_state(self, state: str | None) -> str:
         """Map retired runtime-state labels onto the supported remote-only set."""
@@ -741,6 +769,17 @@ class EdgeOrchestratorVoiceSession:
         """Process one streamed PCM frame and emit any server-side decisions."""
 
         events = self._drain_timeouts()
+        if (
+            isinstance(frame.runtime_state, OrchestratorVoiceRuntimeStateEvent)
+            and not self._runtime_state_event_matches_current(frame.runtime_state)
+        ):
+            events.extend(
+                self._apply_runtime_state(
+                    frame.runtime_state,
+                    trace_event_name="voice_runtime_state_received_audio_frame",
+                    trace_kind="branch",
+                )
+            )
         pcm_bytes = bytes(frame.pcm_bytes or b"")
         if not pcm_bytes:
             return events

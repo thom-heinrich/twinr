@@ -26,139 +26,177 @@ So if you are a builder, UX person, maker… and want to join add me on LinkedIn
 
 ---
 
+**CAPABILITIES**
+
+- Voice-first interaction with simple physical buttons for listening and printing
+- Short back-and-forth conversations without pressing a button for every single reply
+- Live answers for everyday questions, including web-backed information when needed
+- Built-in thermal printer for small notes, reminders, summaries, and take-away answers
+- Calm eye-display feedback so users can instantly see whether Twinr is waiting, listening, thinking, speaking, printing, or needs attention
+- Spoken reminders and timers for everyday support
+- Scheduled automations for recurring tasks like daily weather, news, or printed morning briefings
+- Sensor-triggered automations based on motion, sound, or camera events
+- Experimental self-programming for turning new routines into reviewed, sandboxed skills and automations
+- Integration-friendly architecture with conservative adapters for mail and calendar, plus a WhatsApp prototype path for experimentation
+- Multi-sensor awareness that combines motion, audio, and camera signals for presence, attention, and cautious incident cues
+- Optional proactive nudges when Twinr notices situations like someone returning, prolonged stillness, or possible distress
+- Optional camera understanding for visual requests such as “What am I showing you?” or “How do I look today?”
+- Optional body rotation via servo so Twinr can gently follow the user’s position
+- On-device memory for recent conversations, preferences, reminders, and things the user explicitly wants Twinr to remember
+- Optional long-term memory for durable recall of people, preferences, plans, and past conversations
+- Caregiver-friendly local dashboard for settings, devices, memory, automations, and system health
+
+**ROADMAP**
+
+- TWINR App Store with voice discovery and voice-guided installation of reviewed skills
+- Real-time TWINR-to-TWINR and TWINR-to-device audio/video communication
+- Android and iPhone companion app for family members, caregivers, and operators
+- Integration with health trackers and connected health devices
+- Proactive companion mode that stays supportive without becoming intrusive or annoying
+- Integrated autonomous indoor drone based on Crazyflie for wellbeing checks and other supportive tasks
+
+**PROTOTYPE ASSETS**
+
+This repo already includes a few practical prototype assets:
+
+- `3dprint/` contains simple prototype-body parts as `.stl` and `.scad` files, including `main_panel`, `top_panel`, `respeaker`, and `thermal_printer`
+- `media/` contains basic state sounds such as `boot.mp3` and `waiting.mp3`
+
 **SHOPPING LIST**
 
 ![twinr_shopping-list](twinr_shopping-list.png)
 
-*TWINR Hardware (Prototype)*
+*TWINR Hardware (current prototype direction)*
 
-1 x Raspberry Pi (I used a Raspi4)
+*Core compute and sensing*
 
-1 x SSD Card for Raspberry Pi
+1 x Raspberry Pi 4 or newer
 
-2 x Buttons (I used 12mm SPST-NO from Same-Sky)
+1 x microSD card or SSD for OS, runtime state, and artifacts
+
+1 x Raspberry Pi AI Camera (IMX500) for person, gesture, and presence-related vision
 
 1 x PIR motion sensor with 3.3V-safe GPIO output
 
-1 x Thermal-Printer (DFRobot DFR0503-EN)
+2 x buttons (I used 12mm SPST-NO from Same-Sky)
 
-1 x Power for the Termal-Printer (9-24V/2,5A)
+*Audio and feedback*
 
-1 x Mic/Speaker (I used a old Jabra-Device)
+1 x ReSpeaker XVF3800 4-Mic Array as the main microphone/audio front-end
 
-1 x e-Ink Display (I used Waveshare 4.2 Inch)
+1 x small speaker compatible with your chosen ReSpeaker playback path
 
-*Total ~200 USD*
+1 x 4" HDMI mini-screen for Twinr's animated face and status UI
+
+1 x thermal printer (DFRobot DFR0503-EN / GP-58-compatible path)
+
+1 x dedicated 9-24V / 2.5A power supply for the thermal printer
+
+*Optional body movement*
+
+1 x digital servo for body rotation; my prototype uses a 360-degree 20 kg model
+
+1 x servo controller / driver, preferably a Pololu Mini Maestro
+
+*Power and build extras*
+
+Optional: a DC-DC converter / buck converter for cleaner power distribution inside the body
+
+Optional: a separate helper Pi if you want to offload the AI-camera or servo path
+
+Plenty of jumper wires, Dupont leads, USB cables, power leads, cable clamps / terminals, and general mounting hardware
+
+Optional: 3D-printed body parts from `3dprint/`
+
+The repo still contains an older Waveshare 4.2" e-paper path for a more minimal build, but the richer current prototype direction is centered on HDMI, Pi AI Camera, ReSpeaker audio, and optional body rotation.
 
 ---
 
 
+**POWER & SAFETY**
+
+For the richer HDMI + camera + audio + printer build, clean power and careful wiring matter a lot more than in the earliest minimal prototype.
+
+- Power the Raspberry Pi through its normal USB-C input with a stable `5V / 3A+` supply
+- Give the thermal printer its own `9-24V` supply; do not try to run it from Pi GPIO or weak USB power
+- Give a large body servo its own supply matched to the servo vendor spec; do not power a `20kg` servo from the Pi
+- If you distribute power inside the body from one larger source, use proper regulators / buck converters for the separate rails instead of improvised direct taps
+- Never feed more than `3.3V` into Raspberry Pi GPIO pins
+- Share ground where control signals need a common reference, for example Pi and PIR, or Pi / Maestro / servo supply
+- Disconnect power before rewiring, double-check polarity before first boot, and secure cables so movement does not pull on GPIO or CSI connectors
+- Treat brownouts, random reboots, printer glitches, and twitching servos as likely power-distribution problems first
+
 **HOW TO WIRE**
 
-Assumptions: Raspberry Pi 4, DFRobot DFR0503-EN thermal printer, a Waveshare 4.2-inch e-Paper module, two SPST-NO push buttons, and an older Jabra USB audio device. Raspberry Pi 4 has a 40-pin GPIO header, USB ports, USB-C power, and typically boots from microSD, though recent Pi models can also boot from USB storage.
+The current prototype direction is centered on a Raspberry Pi, HDMI mini-screen, ReSpeaker XVF3800 audio, Raspberry Pi AI Camera, two buttons, PIR motion sensing, a thermal printer, and an optional body-rotation servo. The older e-paper path still exists in the repo, but it is no longer the best default for the richer embodied prototype.
+
+See also: [docs/WIRING_DIAGRAM.md](./docs/WIRING_DIAGRAM.md) for a compact Markdown diagram of the current wiring layout.
 
 *1. Prepare the Raspberry Pi*
 
-Install Raspberry Pi OS on a microSD card first. That is the simplest boot medium for a prototype. On recent Pi models, USB storage also works, but microSD is the standard starting point.
+Install Raspberry Pi OS first. A microSD card is the easiest starting point, though SSD boot also works on recent Pi setups. Before mounting everything into the body, do at least one bench boot with network, keyboard, and screen attached so you can confirm the base system is healthy.
 
-*2. Power layout*
+*2. Connect the HDMI mini-screen*
 
-Use two separate power paths:
+Connect the display to one of the Pi's HDMI outputs with the cable or adapter your screen requires. Many small HDMI screens also need separate `5V` power over USB; if yours does, power it from a suitable regulated `5V` line rather than assuming HDMI alone is enough. Mount the screen so it is readable head-on and leave enough slack in the HDMI cable that opening the body later does not stress the port.
 
-Raspberry Pi 4: power it through its USB-C power input
+*3. Connect the Raspberry Pi AI Camera*
 
-Thermal printer: power it through its own printer power port
+Connect the Pi AI Camera to the Pi's CSI camera connector with the correct ribbon cable orientation and lock the connector before powering up. Do not hot-plug the camera ribbon. Mount the camera facing forward with a stable field of view, because Twinr uses this path for person, gesture, attention, and presence-related cues.
 
-Do not try to power the printer from the Pi’s GPIO pins or from the Pi’s USB power alone
+*4. Connect the ReSpeaker XVF3800 and speaker*
 
-The DFRobot printer is specified for 9–24 V and about 0.5–2.5 A, with instantaneous current up to 2.5 A, so it needs its own external supply. The Pi 4 itself uses 5 V / 3 A over USB-C.
+Connect the ReSpeaker XVF3800 to the Pi through its supported USB path so Twinr can use it as the main microphone/audio front-end. Then connect a compatible speaker or powered speaker path for playback. The exact speaker wiring depends on your ReSpeaker board variant: some setups want a powered speaker or small amplifier stage, so do not assume the board can safely drive an arbitrary passive speaker directly. If you prefer, Twinr can also keep ReSpeaker as the microphone path while using a different playback sink such as HDMI audio.
 
-*3. Connect the thermal printer*
+*5. Connect the two buttons*
 
-For the simplest prototype setup, use the printer over USB, not TTL serial.
-
-Connect the printer’s USB data cable to a free USB port on the Raspberry Pi
-
-Connect the printer’s power connector to the external 9–24 V / 2.5 A power supply
-
-Follow the + / - markings on the printer connector or harness for polarity
-
-Do not connect printer power to the Pi GPIO header
-
-DFRobot states that the printer supports USB and TTL communication, has a dedicated power port, and is compatible with Raspberry Pi.
-
-*4. Connect the Jabra microphone/speaker*
-
-Connect the Jabra device by USB to a free USB port on the Raspberry Pi. In this setup, the single USB connection carries both audio input and audio output. Raspberry Pi supports audio over USB, and Jabra notes that on Linux their USB devices generally work at the audio level, while more advanced call-control features depend on the exact model and software.
-
-*5. Connect the Waveshare 4.2" e-Paper display*
-
-The Waveshare module uses SPI. Some versions can plug directly onto the Pi’s 40-pin header. If yours uses the 8-pin cable, wire it like this:
-
-VCC → 3.3 V on the Pi
-
-GND → GND on the Pi
-
-DIN / MOSI → physical pin 19 (GPIO10 / SPI0 MOSI)
-
-CLK / SCLK → physical pin 23 (GPIO11 / SPI0 SCLK)
-
-CS / CE0 → physical pin 24 (GPIO8 / SPI0 CE0)
-
-DC → physical pin 22 (GPIO25)
-
-RST → physical pin 11 (GPIO17)
-
-BUSY → physical pin 18 (GPIO24)
-
-Waveshare documents the Pi connection through the 40-pin header and gives this SPI mapping; Raspberry Pi documents SPI0 as MOSI on GPIO10, SCLK on GPIO11, and CE0 on GPIO8. Raspberry Pi GPIO works at 3.3 V, and inputs must not exceed 3.3 V.
-
-*6. Connect the two buttons*
-
-Use the buttons as simple GPIO inputs with the Pi’s internal pull-up resistors. That is the cleanest wiring for SPST-NO buttons.
+Use the buttons as simple GPIO inputs with the Pi's internal pull-ups.
 
 Current Twinr mapping:
 
-“Hey” button: one side to GPIO23 (physical pin 16)
+- Green / "Hey" button: one side to `GPIO23` (`physical pin 16`)
+- Yellow / "Print" button: one side to `GPIO22` (`physical pin 15`)
+- The other side of both buttons goes to `GND`
 
-“Print” button: one side to GPIO22 (physical pin 15)
+No external resistor is required when the software uses the normal pull-up configuration. Do not connect these button inputs to `5V`.
 
-The other side of both buttons goes to GND
+*6. Connect the PIR motion sensor*
 
-No external resistor is required for this setup if your software uses the normal pull-up configuration. In gpiozero, the Button class defaults to pull_up=True, which means one side of the button goes to ground and the other to a GPIO pin. Ground pins on the Pi are electrically common, so any convenient GND pin is fine. Never connect a button input to 5 V; Pi GPIO inputs must stay at 3.3 V max.
+Current Twinr prototype mapping:
 
-*7. Connect the PIR motion sensor*
+- `OUT -> GPIO26` (`physical pin 37`)
+- `GND -> GND`
+- `VCC ->` the supply voltage required by your PIR module
 
-Twinr now has a dedicated PIR motion input.
+Software defaults assume `active_high=true` and `bias=pull-down`. The signal presented to the Raspberry Pi must stay at or below `3.3V`. If your PIR module is not explicitly GPIO-safe, add level shifting before connecting it to the Pi.
 
-Current Twinr mapping:
+*7. Connect the thermal printer*
 
-PIR `OUT` -> GPIO26 (physical pin 37)
+For the current printer path, connect the DFRobot `DFR0503-EN` to the Pi over USB and power it from its own external `9-24V / 2.5A` supply. Keep printer power physically separate from the Pi's GPIO power pins. USB carries the data path; the external supply handles the real heating and paper feed load.
 
-PIR `GND` -> GND
+*8. Optional: connect the body-rotation servo*
 
-PIR `VCC` -> the supply voltage expected by your PIR module
+There are two practical paths:
 
-Software defaults assume:
+- Preferred path: use a `Pololu Mini Maestro` as the servo controller. Connect the Maestro to the Pi over USB, switch it into `USB_DUAL_PORT`, then connect the servo to the Maestro rather than directly to the Pi. Power the servo from its own supply matched to the servo's requirements.
+- Simpler direct path: connect servo `SIG -> GPIO18` (`physical pin 12`), `GND -> GND`, and `V+ ->` the servo supply recommended by the vendor. This is workable for direct experiments, but the calmer hardware path is usually the external controller.
 
-- `active_high=true`
-- `bias=pull-down`
+If you use an external servo supply, keep a common ground between the control side and the servo side. For continuous-rotation or high-torque servos, bench-test motion before mounting the mechanism into the body.
 
-Important guardrail: the signal arriving at the Raspberry Pi GPIO input must never exceed `3.3V`. Many PIR breakout boards work safely, but do not assume that blindly. If your module is not explicitly GPIO-safe, add level shifting before wiring `OUT` to the Pi.
+*9. First bring-up and configuration*
 
-Some breakout boards or notes label this line as `IO26`. In Twinr that means BCM `GPIO26`.
-
-Current Twinr config variables for the PIR path:
-
-- `TWINR_PIR_MOTION_GPIO`
-- `TWINR_PIR_ACTIVE_HIGH`
-- `TWINR_PIR_BIAS`
-- `TWINR_PIR_DEBOUNCE_MS`
-
-Useful local commands:
+After wiring, configure and smoke-test each subsystem separately before closing the body:
 
 ```bash
 cd /twinr
+sudo hardware/display/setup_display.sh --env-file /twinr/.env --driver hdmi_wayland
+sudo hardware/mic/setup_audio.sh --env-file /twinr/.env --test
+sudo hardware/mic/setup_respeaker_access.sh
+hardware/buttons/setup_buttons.sh --green 23 --yellow 22
 hardware/pir/setup_pir.sh --motion 26 --probe
-./.venv/bin/python hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+sudo hardware/printer/setup_printer.sh --default --test
+python3 hardware/piaicam/smoke_piaicam.py
+sudo hardware/servo/setup_pololu_maestro.sh
 ```
+
+That staged approach is worth the time. It makes it much easier to catch a bad GPIO mapping, weak power rail, loose camera ribbon, muted audio path, or wrong printer polarity before everything is buried inside the enclosure.

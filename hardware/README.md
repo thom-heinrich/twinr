@@ -25,7 +25,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 | [buttons/](./buttons) | Button setup and GPIO probe |
 | [display/](./display) | Display backend setup and smoke tests |
 | [mic/](./mic) | Audio default-device setup, playback loudness normalization/softvol, and XVF3800 USB-access rule |
-| [servo/](./servo) | Pololu Maestro USB access and `USB_DUAL_PORT` setup for Twinr's command-port servo runtime |
+| [servo/](./servo) | Pololu Maestro USB access, `USB_DUAL_PORT` setup, and operator hold/arm state control for Twinr's continuous attention-servo runtime |
 | [ops/](./ops) | Pi-side productive systemd units plus Pi bootstrap helpers |
 | [piaicam/](./piaicam) | Pi AI Camera smoke tests, custom gesture dataset capture, and MediaPipe model staging/training |
 | [pir/](./pir) | PIR setup and motion probe |
@@ -44,6 +44,7 @@ python3 hardware/display/display_test.py --env-file .env
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match reSpeaker --test
 sudo ./hardware/mic/setup_respeaker_access.sh
 sudo ./hardware/servo/setup_pololu_maestro.sh
+python3 hardware/servo/attention_servo_state.py status
 python3 hardware/piaicam/fetch_mediapipe_models.py
 python3 hardware/piaicam/import_public_seed_dataset.py --count-per-label 128
 python3 hardware/piaicam/capture_custom_gesture_dataset.py --label none --count 24

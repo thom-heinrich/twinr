@@ -264,6 +264,8 @@ This repository defines the foundation for:
 
 ## Hardware bootstrap
 
+For one compact current-build overview, see [WIRING_DIAGRAM.md](./WIRING_DIAGRAM.md).
+
 ### Buttons
 
 The current Raspberry Pi setup does not expose the physical Twinr buttons as dedicated Linux input devices. They should be handled as GPIO lines on `gpiochip0`.
@@ -367,6 +369,7 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_STOP_TOLERANCE_DEGREES`
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US`
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US`
+- `TWINR_ATTENTION_SERVO_STATE_PATH`
 - `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
 - `TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S`
 
@@ -406,6 +409,13 @@ In continuous-rotation mode, Twinr cannot read an absolute shaft angle back
 from the servo. The controller therefore treats the physically current pose at
 startup as virtual `0°`. If an operator hand-sets a forward-facing neutral
 pose, start or restart the runtime only after that pose is in place.
+
+Twinr now persists that virtual heading in `TWINR_ATTENTION_SERVO_STATE_PATH`.
+When the persisted state says `hold_until_armed`, startup keeps the Maestro
+at the neutral stop pulse and returns `manual_hold` instead of immediately
+leaving the operator-set `0°` pose. Operators can flip that persisted
+continuous-servo state explicitly with `python3 hardware/servo/attention_servo_state.py`
+using `hold-current-zero`, `hold`, and `arm`.
 
 ### Social trigger engine
 

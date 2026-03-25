@@ -75,6 +75,8 @@ class DisplayReserveWorldTests(unittest.TestCase):
         self.assertIn("agentic ai", by_topic)
         self.assertEqual(by_topic["hamburg local politics"].candidate_family, "world_awareness")
         self.assertEqual(by_topic["agentic ai"].candidate_family, "world_subscription")
+        self.assertFalse(by_topic["agentic ai"].headline.endswith("?"))
+        self.assertTrue(by_topic["agentic ai"].body.endswith("?"))
         self.assertGreater(
             by_topic["hamburg local politics"].salience,
             by_topic["schwarzenbek civic life"].salience,

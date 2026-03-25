@@ -109,6 +109,7 @@ class RemoteAICameraProviderTests(unittest.TestCase):
         class _FakeProcessor:
             def __init__(self) -> None:
                 self.gesture_calls: list[dict[str, object]] = []
+                self.attention_calls: list[dict[str, object]] = []
 
             def _coerce_detection_result(self, detection):
                 return detection
@@ -131,7 +132,16 @@ class RemoteAICameraProviderTests(unittest.TestCase):
                 )
 
             def observe_attention_from_frame(self, **kwargs):
-                raise AssertionError("attention path should not run in this test")
+                self.attention_calls.append(dict(kwargs))
+                return AICameraObservation(
+                    observed_at=71.0,
+                    camera_online=True,
+                    camera_ready=True,
+                    camera_ai_ready=True,
+                    person_count=1,
+                    primary_person_zone="center",
+                    model="local-imx500+mediapipe",
+                )
 
             def get_last_gesture_debug_details(self):
                 return {"resolved_source": "live_stream"}
@@ -184,6 +194,83 @@ class RemoteAICameraProviderTests(unittest.TestCase):
         assert gesture_debug is not None
         self.assertEqual(gesture_debug["transport_mode"], "remote_frame_local_gesture")
         self.assertEqual(cast(dict[str, object], gesture_debug["remote_debug"])["cache_state"], "busy_reused")
+        self.assertIn("provider_stage_ms", gesture_debug)
+
+    def test_remote_frame_provider_runs_attention_hot_path_from_bundle(self) -> None:
+        class _FakeProcessor:
+            def __init__(self) -> None:
+                self.attention_calls: list[dict[str, object]] = []
+
+            def _coerce_detection_result(self, detection):
+                return detection
+
+            def _needs_rgb_frame_for_attention(self, *, detection):
+                return True
+
+            def observe_attention_from_frame(self, **kwargs):
+                self.attention_calls.append(dict(kwargs))
+                return AICameraObservation(
+                    observed_at=73.0,
+                    camera_online=True,
+                    camera_ready=True,
+                    camera_ai_ready=True,
+                    person_count=0,
+                    primary_person_zone=AICameraZone.UNKNOWN,
+                    model="local-imx500+mediapipe",
+                )
+
+            def observe_gesture_from_frame(self, **kwargs):
+                raise AssertionError("gesture path should not run in this test")
+
+            def get_last_attention_debug_details(self):
+                return {"attention_face_anchor_state": "no_face_detected"}
+
+            def get_last_gesture_debug_details(self):
+                return None
+
+            def close(self):
+                return None
+
+        processor = _FakeProcessor()
+        provider = RemoteFrameAICameraObservationProvider(
+            config=RemoteAICameraProviderConfig(
+                base_url="http://10.42.0.2:8767",
+                input_format="remote-ai-frame",
+            ),
+            processor=cast(Any, processor),
+        )
+        remote_observation = AICameraObservation(
+            observed_at=72.0,
+            camera_online=True,
+            camera_ready=True,
+            camera_ai_ready=True,
+            person_count=0,
+            primary_person_zone=AICameraZone.UNKNOWN,
+            model="local-imx500+mediapipe",
+        )
+
+        with patch.object(
+            provider,
+            "_fetch_remote_frame_bundle",
+            return_value=(
+                remote_observation,
+                71.5,
+                "local-imx500+mediapipe",
+                {"bundle_mode": "detection_frame"},
+                "rgb-frame",
+            ),
+        ):
+            snapshot = provider.observe_attention()
+
+        self.assertEqual(processor.attention_calls[0]["frame_rgb"], "rgb-frame")
+        self.assertEqual(snapshot.input_format, "remote-ai-frame")
+        self.assertTrue(snapshot.observation.camera_ready)
+        attention_debug = provider.attention_debug_details()
+        self.assertIsNotNone(attention_debug)
+        assert attention_debug is not None
+        self.assertEqual(attention_debug["transport_mode"], "remote_frame_local_attention")
+        self.assertEqual(attention_debug["remote_route"], "observe_frame_bundle")
+        self.assertIn("provider_stage_ms", attention_debug)
 
     def test_remote_frame_provider_preserves_explicit_helper_faults(self) -> None:
         class _FakeProcessor:
@@ -224,13 +311,14 @@ class RemoteAICameraProviderTests(unittest.TestCase):
         )
 
         with patch.object(
-            provider._proxy_provider,
-            "_fetch_remote_observation",
+            provider,
+            "_fetch_remote_frame_bundle",
             return_value=(
                 remote_observation,
                 80.0,
                 "local-imx500+mediapipe",
                 {"proxy_state": "offline"},
+                None,
             ),
         ):
             snapshot = provider.observe_attention()
@@ -242,6 +330,7 @@ class RemoteAICameraProviderTests(unittest.TestCase):
         assert attention_debug is not None
         self.assertEqual(attention_debug["transport_mode"], "remote_frame_passthrough_fault")
         self.assertEqual(cast(dict[str, object], attention_debug["remote_debug"])["proxy_state"], "offline")
+        self.assertEqual(attention_debug["remote_route"], "observe_frame_bundle")
 
     def test_remote_frame_bundle_requires_frame_png_when_helper_is_healthy(self) -> None:
         class _FakeProcessor:

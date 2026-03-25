@@ -356,6 +356,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.attention_servo_enabled)
         self.assertTrue(config.attention_servo_forensic_trace_enabled)
         self.assertEqual(config.attention_servo_driver, "lgpio_pwm")
+        self.assertEqual(
+            config.attention_servo_state_path,
+            str(Path(temp_dir) / "state" / "attention_servo_state.json"),
+        )
         self.assertEqual(config.attention_servo_gpio, 18)
         self.assertTrue(config.attention_servo_invert_direction)
         self.assertEqual(config.attention_servo_target_hold_s, 1.6)
@@ -456,6 +460,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_PEER_BASE_URL=http://10.42.0.2:8768/",
                         "TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S=2.25",
                         "TWINR_ATTENTION_SERVO_MAESTRO_CHANNEL=1",
+                        "TWINR_ATTENTION_SERVO_STATE_PATH=/tmp/custom-attention-servo-state.json",
                     ]
                 )
                 + "\n",
@@ -469,6 +474,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_peer_base_url, "http://10.42.0.2:8768")
         self.assertEqual(config.attention_servo_peer_timeout_s, 2.25)
         self.assertEqual(config.attention_servo_maestro_channel, 1)
+        self.assertEqual(config.attention_servo_state_path, "/tmp/custom-attention-servo-state.json")
 
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

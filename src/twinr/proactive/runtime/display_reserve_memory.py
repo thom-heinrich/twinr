@@ -58,12 +58,21 @@ def _stable_fraction(*parts: object) -> float:
 
 
 def _ensure_question(text: object | None, *, fallback: str) -> str:
-    """Return one normalized question-shaped headline."""
+    """Return one normalized CTA/question line."""
 
     compact = _truncate_text(text, max_len=112) or fallback
     if compact.endswith("?"):
         return compact
     return compact.rstrip(".! ") + "?"
+
+
+def _ensure_statement(text: object | None, *, fallback: str) -> str:
+    """Return one normalized statement-shaped headline."""
+
+    compact = _truncate_text(text, max_len=112) or fallback
+    if compact.endswith("?"):
+        compact = compact[:-1].rstrip()
+    return compact.rstrip(".! ") + "."
 
 
 def _pick_variant(seed: float, variants: tuple[str, ...]) -> str:
@@ -75,40 +84,63 @@ def _pick_variant(seed: float, variants: tuple[str, ...]) -> str:
     return variants[index]
 
 
-def _memory_conflict_body(item: LongTermConflictQueueItemV1) -> str:
-    """Render one calm helper line for a memory-clarification question."""
+def _memory_conflict_headline(item: LongTermConflictQueueItemV1) -> str:
+    """Render one explanatory statement for a memory-conflict card."""
 
+    fallback = "Da habe ich gerade zwei moegliche Versionen im Kopf."
     seed = _stable_fraction(item.slot_key, item.question, item.reason)
     if len(item.options) >= 2:
         variants = (
-            "Da klingen fuer mich gerade noch zwei Versionen gleichzeitig an.",
-            "Ich habe dazu im Moment noch zwei unterschiedliche Bilder im Kopf.",
+            "Da habe ich gerade zwei moegliche Versionen im Kopf.",
+            "Da passen fuer mich gerade zwei Versionen noch nicht zusammen.",
         )
     else:
         variants = (
-            "Da ist fuer mich noch ein kleines Fragezeichen offen.",
-            "Da wuerde mir ein kurzer Anker helfen.",
+            "Da ist fuer mich noch etwas offen.",
+            "Da fehlt mir noch ein klares Bild.",
         )
-    return _truncate_text(_pick_variant(seed, variants), max_len=112)
+    return _ensure_statement(_pick_variant(seed, variants), fallback=fallback)
+
+
+def _memory_conflict_body(item: LongTermConflictQueueItemV1) -> str:
+    """Render one CTA line for a memory-clarification card."""
+
+    seed = _stable_fraction(item.slot_key, item.question, item.reason)
+    variants: tuple[str, ...]
+    if len(item.options) >= 2:
+        variants = (
+            "Magst du mir kurz sagen, was stimmt?",
+            "Wollen wir das kurz klaeren?",
+            "Magst du mir kurz helfen, das einzuordnen?",
+        )
+    else:
+        variants = (
+            "Magst du mir kurz mehr dazu sagen?",
+            "Wollen wir kurz darueber reden?",
+        )
+    return _ensure_question(_pick_variant(seed, variants), fallback="Wollen wir das kurz klaeren?")
 
 
 def _follow_up_headline(candidate: LongTermProactiveCandidateV1) -> str:
-    """Render one generic question-first headline for a memory follow-up."""
+    """Render one explanatory statement headline for a memory follow-up."""
 
     seed = _stable_fraction(candidate.candidate_id, candidate.summary, candidate.confidence)
+    context = _clean_follow_up_summary(candidate.summary)
+    if context:
+        return _ensure_statement(context, fallback="Da fehlt mir noch ein kleines Stueck.")
     if candidate.confidence >= 0.78:
         variants = (
-            "Wie ist es damit weitergegangen?",
-            "Magst du mir dazu noch etwas erzählen?",
-            "Ist da inzwischen etwas klarer geworden?",
+            "Da fehlt mir noch ein kleines Stueck.",
+            "Da ist fuer mich noch etwas offen geblieben.",
+            "Ich bin gedanklich noch nicht ganz fertig damit.",
         )
     else:
         variants = (
-            "Soll ich mir das etwas genauer merken?",
-            "Magst du mir dazu spaeter noch etwas sagen?",
-            "Willst du mir dazu noch einen kleinen Hinweis geben?",
+            "Dazu waere ein kleiner Nachtrag gut.",
+            "Da koennte ich noch etwas mehr Kontext gebrauchen.",
+            "Da ist fuer mich noch ein kleines Fragezeichen offen.",
         )
-    return _ensure_question(_pick_variant(seed, variants), fallback="Magst du mir dazu noch etwas erzählen?")
+    return _ensure_statement(_pick_variant(seed, variants), fallback="Da fehlt mir noch ein kleines Stueck.")
 
 
 def _clean_follow_up_summary(value: object | None) -> str:
@@ -122,21 +154,25 @@ def _clean_follow_up_summary(value: object | None) -> str:
 
 
 def _follow_up_body(candidate: LongTermProactiveCandidateV1) -> str:
-    """Render one calm helper/context line for a gentle follow-up."""
+    """Render one CTA line for a gentle follow-up."""
 
     seed = _stable_fraction(candidate.candidate_id, candidate.summary, candidate.rationale)
-    context = _clean_follow_up_summary(candidate.summary)
-    helper = _pick_variant(
-        seed,
-        (
-            "Das ist mir gerade wieder eingefallen.",
-            "Da bin ich innerlich noch nicht ganz fertig damit.",
-            "Ich haenge da gedanklich noch ein wenig dran.",
-        ),
+    if candidate.confidence >= 0.78:
+        variants = (
+            "Magst du mir kurz sagen, wie es weiterging?",
+            "Wollen wir kurz darueber reden?",
+            "Magst du mich kurz auf Stand bringen?",
+        )
+    else:
+        variants = (
+            "Magst du mir kurz mehr dazu sagen?",
+            "Wollen wir spaeter kurz darueber reden?",
+            "Magst du mir einen kleinen Hinweis geben?",
+        )
+    return _ensure_question(
+        _pick_variant(seed, variants),
+        fallback="Magst du mir kurz mehr dazu sagen?",
     )
-    if context:
-        return _truncate_text(f"{context} {helper}", max_len=112)
-    return _truncate_text(helper, max_len=112)
 
 
 def _conflict_generation_context(item: LongTermConflictQueueItemV1) -> dict[str, object]:
@@ -144,7 +180,7 @@ def _conflict_generation_context(item: LongTermConflictQueueItemV1) -> dict[str,
 
     options: list[dict[str, object]] = []
     for option in item.options[:3]:
-        option_payload = {
+        option_payload: dict[str, object] = {
             "summary": _truncate_text(option.summary, max_len=120),
             "status": _truncate_text(option.status, max_len=24),
         }
@@ -198,10 +234,7 @@ def build_memory_conflict_candidate(
         attention_state="forming",
         salience=0.98,
         eyebrow="",
-        headline=_ensure_question(
-            item.question,
-            fallback="Magst du mir dabei kurz helfen?",
-        ),
+        headline=_memory_conflict_headline(item),
         body=_memory_conflict_body(item),
         symbol="question",
         accent="warm",

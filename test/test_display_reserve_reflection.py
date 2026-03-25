@@ -178,6 +178,8 @@ class DisplayReserveReflectionTests(unittest.TestCase):
         self.assertEqual(by_topic["arzttermin gestern"].attention_state, "shared_thread")
         self.assertEqual(by_topic["arzttermin gestern"].candidate_family, "reflection_thread")
         self.assertEqual(by_topic["dein kaffee am morgen"].candidate_family, "reflection_preference")
+        self.assertFalse(by_topic["dein kaffee am morgen"].headline.endswith("?"))
+        self.assertTrue(by_topic["dein kaffee am morgen"].body.endswith("?"))
         self.assertNotIn("Recent conversation continuity", by_topic["arzttermin gestern"].headline)
         self.assertNotIn("Immediate continuity only", by_topic["arzttermin gestern"].body)
         self.assertEqual(

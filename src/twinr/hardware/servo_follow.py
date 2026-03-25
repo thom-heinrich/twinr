@@ -28,6 +28,7 @@ from twinr.hardware.servo_continuous import (
 )
 from twinr.hardware.servo_maestro import PololuMaestroServoPulseWriter
 from twinr.hardware.servo_peer import PeerPololuMaestroServoPulseWriter
+from twinr.hardware.servo_state import AttentionServoRuntimeState, AttentionServoStateStore
 
 
 _DEFAULT_SERVO_FREQUENCY_HZ = 50
@@ -66,6 +67,7 @@ _DEFAULT_EXIT_VISIBLE_EDGE_THRESHOLD = 0.62
 _DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD = 0.92
 _DEFAULT_EXIT_COOLDOWN_S = 30.0
 _DEFAULT_CONTROL_MODE = "position"
+_DEFAULT_STATE_PATH = "state/attention_servo_state.json"
 _DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S = 120.0
 _DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES = 45.0
 _DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES = 4.0
@@ -802,6 +804,7 @@ class AttentionServoConfig:
     maestro_device: str | None = None
     peer_base_url: str | None = None
     peer_timeout_s: float = 1.5
+    state_path: str = _DEFAULT_STATE_PATH
     gpio_chip: str = "gpiochip0"
     gpio: int | None = None
     invert_direction: bool = False
@@ -888,6 +891,11 @@ class AttentionServoConfig:
         maestro_device = getattr(config, "attention_servo_maestro_device", None)
         peer_base_url = getattr(config, "attention_servo_peer_base_url", None)
         peer_timeout_s = getattr(config, "attention_servo_peer_timeout_s", 1.5)
+        raw_state_path = getattr(config, "attention_servo_state_path", _DEFAULT_STATE_PATH)
+        resolved_state_path = Path(str(raw_state_path or _DEFAULT_STATE_PATH)).expanduser()
+        if not resolved_state_path.is_absolute():
+            project_root = Path(str(getattr(config, "project_root", ".") or ".")).expanduser().resolve(strict=False)
+            resolved_state_path = (project_root / resolved_state_path).resolve(strict=False)
         configured_gpio = getattr(config, "attention_servo_gpio", None)
         if str(driver).strip().lower() in {"pololu_maestro", "peer_pololu_maestro"}:
             configured_gpio = getattr(config, "attention_servo_maestro_channel", None)
@@ -939,6 +947,7 @@ class AttentionServoConfig:
                 minimum=0.1,
                 maximum=30.0,
             ),
+            state_path=str(resolved_state_path),
             gpio_chip=str(getattr(config, "gpio_chip", "gpiochip0") or "gpiochip0"),
             gpio=configured_gpio,
             invert_direction=bool(getattr(config, "attention_servo_invert_direction", False)),
@@ -1247,6 +1256,19 @@ class AttentionServoController:
         self.config = config
         self._pulse_writer = pulse_writer or _default_pulse_writer_for_config(config)
         self._continuous_planner = self._build_continuous_planner()
+        self._state_store = self._build_state_store()
+        startup_state = self._load_runtime_state()
+        self._continuous_startup_heading_degrees = (
+            0.0
+            if startup_state is None or not startup_state.zero_reference_confirmed
+            else startup_state.heading_degrees
+        )
+        self._startup_hold_until_armed = bool(startup_state and startup_state.hold_until_armed)
+        self._zero_reference_confirmed = bool(startup_state and startup_state.zero_reference_confirmed)
+        self._last_saved_runtime_state = startup_state
+        self._last_runtime_state_mtime_ns = (
+            None if self._state_store is None else self._state_store.mtime_ns()
+        )
         self._last_target_center_x: float | None = None
         self._last_target_at: float | None = None
         self._last_target_velocity_x_per_s = 0.0
@@ -1311,6 +1333,136 @@ class AttentionServoController:
             )
         )
 
+    def _build_state_store(self) -> AttentionServoStateStore | None:
+        if not self.config.uses_continuous_rotation:
+            return None
+        return AttentionServoStateStore(self.config.state_path)
+
+    def _load_runtime_state(self) -> AttentionServoRuntimeState | None:
+        if self._state_store is None:
+            return None
+        return self._state_store.load()
+
+    def _current_runtime_state(self, *, observed_at: float | None) -> AttentionServoRuntimeState | None:
+        if self._continuous_planner is None:
+            return None
+        return AttentionServoRuntimeState(
+            heading_degrees=round(self._continuous_planner.estimated_heading_degrees, 3),
+            hold_until_armed=self._startup_hold_until_armed,
+            zero_reference_confirmed=self._zero_reference_confirmed,
+            updated_at=observed_at,
+        )
+
+    def _persist_runtime_state(self, *, observed_at: float | None, force: bool = False) -> None:
+        current_state = self._current_runtime_state(observed_at=observed_at)
+        if current_state is None or self._state_store is None:
+            return
+        previous_state = self._last_saved_runtime_state
+        state_changed = (
+            previous_state is None
+            or previous_state.heading_degrees != current_state.heading_degrees
+            or previous_state.hold_until_armed != current_state.hold_until_armed
+            or previous_state.zero_reference_confirmed != current_state.zero_reference_confirmed
+        )
+        if not force and not state_changed:
+            return
+        self._state_store.save(current_state)
+        self._last_saved_runtime_state = current_state
+        self._last_runtime_state_mtime_ns = self._state_store.mtime_ns()
+
+    def _clear_tracking_state_for_external_override(self) -> None:
+        """Drop transient follow latches before a live operator state override."""
+
+        self._last_target_center_x = None
+        self._last_target_at = None
+        self._last_target_velocity_x_per_s = 0.0
+        self._smoothed_center_x = None
+        self._centered_since = None
+        self._settled_since = None
+        self._visible_target_pulse_width_us = None
+        self._exit_cooldown_until_at = None
+        self._clear_exit_pursuit(clear_recent_visible_targets=True)
+
+    def _apply_loaded_runtime_state(
+        self,
+        state: AttentionServoRuntimeState,
+        *,
+        observed_at: float | None,
+    ) -> None:
+        """Adopt one externally updated state snapshot into the live controller."""
+
+        previous_hold = self._startup_hold_until_armed
+        previous_zero_reference = self._zero_reference_confirmed
+        previous_heading_degrees = self._continuous_startup_heading_degrees
+        refreshed_heading_degrees = (
+            0.0 if not state.zero_reference_confirmed else state.heading_degrees
+        )
+        self._startup_hold_until_armed = bool(state.hold_until_armed)
+        self._zero_reference_confirmed = bool(state.zero_reference_confirmed)
+        self._continuous_startup_heading_degrees = refreshed_heading_degrees
+        self._last_saved_runtime_state = state
+        entering_manual_hold = not previous_hold and self._startup_hold_until_armed
+        heading_changed = not math.isclose(
+            previous_heading_degrees,
+            refreshed_heading_degrees,
+            abs_tol=0.001,
+        )
+        zero_reference_changed = previous_zero_reference != self._zero_reference_confirmed
+        if entering_manual_hold or heading_changed or zero_reference_changed:
+            self._clear_tracking_state_for_external_override()
+        if self._continuous_planner is None:
+            return
+        if not heading_changed and not zero_reference_changed:
+            return
+        self._continuous_planner.reset(
+            heading_degrees=refreshed_heading_degrees,
+            observed_at=observed_at,
+        )
+        self._last_physical_pulse_width_us = self.config.center_pulse_width_us
+        self._released_pulse_width_us = (
+            self.config.center_pulse_width_us
+            if self._last_commanded_pulse_width_us is None
+            else None
+        )
+        self._reset_motion_state(self.config.center_pulse_width_us)
+
+    def _refresh_runtime_state_from_store(self, *, observed_at: float | None) -> None:
+        """Reload the persisted runtime state when an operator changes it live."""
+
+        if self._state_store is None:
+            return
+        refreshed_state = self._state_store.load()
+        self._last_runtime_state_mtime_ns = self._state_store.mtime_ns()
+        if refreshed_state is None or refreshed_state == self._last_saved_runtime_state:
+            return
+        self._apply_loaded_runtime_state(refreshed_state, observed_at=observed_at)
+
+    def _command_manual_hold_center(self, *, observed_at: float | None) -> int:
+        """Drive the neutral stop pulse continuously while startup hold is active."""
+
+        target_pulse_width_us = self.config.center_pulse_width_us
+        try:
+            if self._last_commanded_pulse_width_us != target_pulse_width_us:
+                self._pulse_writer.write(
+                    gpio_chip=self.config.gpio_chip,
+                    gpio=self.config.gpio if self.config.gpio is not None else 0,
+                    pulse_width_us=target_pulse_width_us,
+                )
+            if self._continuous_planner is not None:
+                self._continuous_planner.note_commanded_pulse_width(
+                    target_pulse_width_us,
+                    observed_at=observed_at,
+                )
+        except Exception as exc:
+            self._fault_reason = f"{exc.__class__.__name__}: {exc}"
+            raise
+        self._last_commanded_pulse_width_us = target_pulse_width_us
+        self._last_physical_pulse_width_us = target_pulse_width_us
+        self._released_pulse_width_us = None
+        self._reset_motion_state(target_pulse_width_us)
+        self._persist_runtime_state(observed_at=observed_at, force=True)
+        return target_pulse_width_us
+
     def update(
         self,
         *,
@@ -1367,6 +1519,20 @@ class AttentionServoController:
                 reason="faulted",
                 confidence=checked_confidence,
                 target_center_x=target_center_x,
+            )
+        self._refresh_runtime_state_from_store(observed_at=checked_at)
+        if self._startup_hold_until_armed and self._continuous_planner is not None:
+            commanded_pulse_width_us = self._command_manual_hold_center(observed_at=checked_at)
+            self._last_update_at = checked_at
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=False,
+                reason="manual_hold",
+                confidence=checked_confidence,
+                target_center_x=target_center_x,
+                applied_center_x=0.5,
+                target_pulse_width_us=self.config.center_pulse_width_us,
+                commanded_pulse_width_us=commanded_pulse_width_us,
             )
         if self.config.follow_exit_only:
             return self._update_follow_exit_only(
@@ -1493,6 +1659,7 @@ class AttentionServoController:
                     )
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
                 self._last_physical_pulse_width_us = commanded_pulse_width_us
+                self._persist_runtime_state(observed_at=checked_at)
             self._last_update_at = checked_at
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
@@ -2011,6 +2178,7 @@ class AttentionServoController:
                     )
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
                 self._last_physical_pulse_width_us = commanded_pulse_width_us
+                self._persist_runtime_state(observed_at=observed_at)
             if (
                 str(motion_profile or "").strip().lower() == "rest"
                 and commanded_pulse_width_us == self.config.center_pulse_width_us
@@ -2170,6 +2338,8 @@ class AttentionServoController:
             "released_pulse_width_us": self._released_pulse_width_us,
             "visible_target_pulse_width_us": self._visible_target_pulse_width_us,
             "startup_rest_alignment_pending": self._startup_rest_alignment_pending,
+            "startup_hold_until_armed": self._startup_hold_until_armed,
+            "zero_reference_confirmed": self._zero_reference_confirmed,
             "continuous_estimated_heading_degrees": (
                 None
                 if self._continuous_planner is None
@@ -2197,6 +2367,7 @@ class AttentionServoController:
                 "exit_cooldown_s": round(self.config.exit_cooldown_s, 3),
                 "exit_follow_offset_limit": round(self.config.exit_follow_offset_limit, 4),
                 "deadband": round(self.config.deadband, 4),
+                "state_path": self.config.state_path,
             },
         }
 
@@ -2209,7 +2380,7 @@ class AttentionServoController:
         """
 
         if self._continuous_planner is not None:
-            self._continuous_planner.reset()
+            self._continuous_planner.reset(heading_degrees=self._continuous_startup_heading_degrees)
             self._last_physical_pulse_width_us = self.config.center_pulse_width_us
             self._released_pulse_width_us = self.config.center_pulse_width_us
             self._reset_motion_state(self.config.center_pulse_width_us)
@@ -2263,6 +2434,7 @@ class AttentionServoController:
         if self._last_commanded_pulse_width_us is None:
             if self._continuous_planner is not None:
                 self._continuous_planner.note_stopped(observed_at=observed_at)
+                self._persist_runtime_state(observed_at=observed_at, force=True)
             return
         try:
             self._pulse_writer.disable(
@@ -2278,6 +2450,7 @@ class AttentionServoController:
         self._last_physical_pulse_width_us = self._last_commanded_pulse_width_us
         self._last_commanded_pulse_width_us = None
         self._reset_motion_state(self._released_pulse_width_us)
+        self._persist_runtime_state(observed_at=observed_at, force=True)
 
     def _release_stale_output_if_disabled(self) -> None:
         """Best-effort release for outputs left active by an earlier process when this controller starts disabled."""
@@ -2324,7 +2497,10 @@ class AttentionServoController:
             self._last_target_velocity_x_per_s = 0.0
             self._smoothed_center_x = None
             if self._continuous_planner is not None:
-                self._continuous_planner.reset()
+                self._continuous_planner.reset(
+                    heading_degrees=self._continuous_planner.estimated_heading_degrees,
+                    observed_at=observed_at,
+                )
                 self._last_physical_pulse_width_us = self.config.center_pulse_width_us
                 self._released_pulse_width_us = self.config.center_pulse_width_us
                 self._reset_motion_state(self.config.center_pulse_width_us)
@@ -3108,6 +3284,7 @@ class AttentionServoController:
         self._last_commanded_pulse_width_us = None
         self._last_physical_pulse_width_us = self.config.center_pulse_width_us
         self._reset_motion_state(self.config.center_pulse_width_us)
+        self._persist_runtime_state(observed_at=observed_at, force=True)
         return True
 
     def _maybe_hold_released_target(
@@ -3187,6 +3364,7 @@ class AttentionServoController:
         self._last_physical_pulse_width_us = commanded_pulse_width_us
         self._reset_motion_state(commanded_pulse_width_us)
         self._settled_since = None
+        self._persist_runtime_state(observed_at=observed_at, force=True)
         return AttentionServoDecision(
             observed_at=observed_at,
             active=False,
@@ -3245,6 +3423,7 @@ class AttentionServoController:
         self._last_physical_pulse_width_us = commanded_pulse_width_us
         self._reset_motion_state(commanded_pulse_width_us)
         self._settled_since = None
+        self._persist_runtime_state(observed_at=observed_at, force=True)
         return True
 
 

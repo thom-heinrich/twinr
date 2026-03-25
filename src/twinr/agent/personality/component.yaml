@@ -8,7 +8,7 @@ responsibilities:
   - Render a bounded conversational self-expression and current-mindshare layer so Twinr can speak naturally from ongoing themes.
   - Derive bounded per-topic conversation appetite cues so surfaced themes carry explicit depth, follow-up, and proactivity guidance.
   - Derive explicit positive-engagement actions from appetite, ongoing interest, and co-attention so Twinr can foster welcomed interaction without hardcoded topic logic.
-  - Derive calm ambient display-impulse candidates and question-first reserve-card copy from the same structured state so Twinr's evolving tone, shared topics, and memory-follow-up needs can surface visually without speech.
+  - Derive calm ambient display-impulse candidates and reserve-card copy with an explanatory headline plus a separate CTA line from the same structured state so Twinr's evolving tone, shared topics, and memory-follow-up needs can surface visually without speech.
   - Correlate shown reserve-card exposures with later structured turn evidence so visual prompts feed back into the same bounded engagement and personality-learning loop.
   - Distinguish immediate reserve-card pickup or pushback from slower reactions so Twinr can remember how directly a shown card landed and optionally bias the same-day reserve plan faster.
   - Derive authoritative per-turn steering cues from co-attention and appetite so shared-thread topics can shape brief updates, follow-ups, and observation behavior.
@@ -43,7 +43,7 @@ files:
   - path: _display_utils.py
     role: Shared text normalization, truncation, and deterministic variation helpers for ambient display generation.
   - path: display_impulse_copy.py
-    role: Question-first reserve-card copy builder that keeps topic context and memory-follow-up helper text generic and policy-driven.
+    role: Reserve-card copy builder that keeps the large headline explanatory, the smaller second line as CTA, and the topic context generic and policy-driven.
   - path: display_impulses.py
     role: Generic ambient display-impulse candidate generation from mindshare and positive-engagement state.
   - path: ambient_feedback.py

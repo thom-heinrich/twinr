@@ -360,17 +360,22 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
         return self._proxy_provider.observe()
 
     def observe_attention(self) -> ProactiveVisionSnapshot:
-        """Fetch remote person facts and run the fast attention path locally."""
+        """Fetch one coherent helper bundle and run the fast attention path locally."""
 
-        observation, captured_at, _model, remote_debug = self._proxy_provider._fetch_remote_observation(
-            "observe_attention"
-        )
+        provider_started_ns = time.monotonic_ns()
+        remote_fetch_started_ns = provider_started_ns
+        observation, captured_at, _model, remote_debug, frame_rgb = self._fetch_remote_frame_bundle()
+        remote_fetch_ms = _elapsed_ms(remote_fetch_started_ns)
         if not _camera_observation_ready(observation):
-            self._last_attention_debug_details = _merge_debug_details(
-                None,
-                remote_debug=remote_debug,
-                transport_mode="remote_frame_passthrough_fault",
-                remote_route="observe_attention",
+            self._last_attention_debug_details = _append_provider_stage_ms(
+                _merge_debug_details(
+                    None,
+                    remote_debug=remote_debug,
+                    transport_mode="remote_frame_passthrough_fault",
+                    remote_route="observe_frame_bundle",
+                ),
+                remote_fetch_ms=remote_fetch_ms,
+                provider_total_ms=_elapsed_ms(provider_started_ns),
             )
             return self._snapshot_from_observation(
                 observation,
@@ -378,25 +383,31 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
                 model=observation.model,
             )
 
+        process_started_ns = time.monotonic_ns()
         detection = self._processor._coerce_detection_result(observation)
-        frame_rgb = None
-        if self._processor._needs_rgb_frame_for_attention(detection=detection):
-            frame_rgb = self._request_frame_rgb()
+        if not self._processor._needs_rgb_frame_for_attention(detection=detection):
+            frame_rgb = None
         processed_observation = self._processor.observe_attention_from_frame(
             detection=detection,
             frame_rgb=frame_rgb,
             observed_at=time.time(),
             frame_at=captured_at,
         )
+        local_process_ms = _elapsed_ms(process_started_ns)
         processed_observation = replace(
             processed_observation,
             model="remote-imx500-detection+local-attention-fast",
         )
-        self._last_attention_debug_details = _merge_debug_details(
-            self._processor.get_last_attention_debug_details(),
-            remote_debug=remote_debug,
-            transport_mode="remote_frame_local_attention",
-            remote_route="observe_attention",
+        self._last_attention_debug_details = _append_provider_stage_ms(
+            _merge_debug_details(
+                self._processor.get_last_attention_debug_details(),
+                remote_debug=remote_debug,
+                transport_mode="remote_frame_local_attention",
+                remote_route="observe_frame_bundle",
+            ),
+            remote_fetch_ms=remote_fetch_ms,
+            local_process_ms=local_process_ms,
+            provider_total_ms=_elapsed_ms(provider_started_ns),
         )
         return self._snapshot_from_observation(
             processed_observation,
@@ -407,13 +418,20 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
     def observe_gesture(self) -> ProactiveVisionSnapshot:
         """Fetch one coherent helper bundle and run the heavy gesture path locally."""
 
+        provider_started_ns = time.monotonic_ns()
+        remote_fetch_started_ns = provider_started_ns
         observation, captured_at, _model, remote_debug, frame_rgb = self._fetch_remote_frame_bundle()
+        remote_fetch_ms = _elapsed_ms(remote_fetch_started_ns)
         if not _camera_observation_ready(observation):
-            self._last_gesture_debug_details = _merge_debug_details(
-                None,
-                remote_debug=remote_debug,
-                transport_mode="remote_frame_passthrough_fault",
-                remote_route="observe_frame_bundle",
+            self._last_gesture_debug_details = _append_provider_stage_ms(
+                _merge_debug_details(
+                    None,
+                    remote_debug=remote_debug,
+                    transport_mode="remote_frame_passthrough_fault",
+                    remote_route="observe_frame_bundle",
+                ),
+                remote_fetch_ms=remote_fetch_ms,
+                provider_total_ms=_elapsed_ms(provider_started_ns),
             )
             return self._snapshot_from_observation(
                 observation,
@@ -421,21 +439,28 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
                 model=observation.model,
             )
 
+        process_started_ns = time.monotonic_ns()
         processed_observation = self._processor.observe_gesture_from_frame(
             detection=self._processor._coerce_detection_result(observation),
             frame_rgb=frame_rgb,
             observed_at=time.time(),
             frame_at=captured_at,
         )
+        local_process_ms = _elapsed_ms(process_started_ns)
         processed_observation = replace(
             processed_observation,
             model=_remote_frame_gesture_model_name(processed_observation.model),
         )
-        self._last_gesture_debug_details = _merge_debug_details(
-            self._processor.get_last_gesture_debug_details(),
-            remote_debug=remote_debug,
-            transport_mode="remote_frame_local_gesture",
-            remote_route="observe_frame_bundle",
+        self._last_gesture_debug_details = _append_provider_stage_ms(
+            _merge_debug_details(
+                self._processor.get_last_gesture_debug_details(),
+                remote_debug=remote_debug,
+                transport_mode="remote_frame_local_gesture",
+                remote_route="observe_frame_bundle",
+            ),
+            remote_fetch_ms=remote_fetch_ms,
+            local_process_ms=local_process_ms,
+            provider_total_ms=_elapsed_ms(provider_started_ns),
         )
         return self._snapshot_from_observation(
             processed_observation,
@@ -456,21 +481,6 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
         if self._last_attention_debug_details is None:
             return None
         return dict(self._last_attention_debug_details)
-
-    def _request_frame_rgb(self) -> Any:
-        """Fetch one bounded RGB frame from the helper Pi snapshot endpoint."""
-
-        timeout_ms = max(250, min(int(round(self.config.timeout_s * 1000.0)), 10000))
-        frame_bytes = self._request_bytes(
-            "snapshot.png",
-            accept="image/png",
-            query={
-                "width": self.config.snapshot_width,
-                "height": self.config.snapshot_height,
-                "timeout_ms": timeout_ms,
-            },
-        )
-        return _decode_rgb_frame(frame_bytes)
 
     def _fetch_remote_frame_bundle(
         self,
@@ -627,6 +637,29 @@ def _merge_debug_details(
     if remote_debug:
         payload["remote_debug"] = dict(remote_debug)
     return payload
+
+
+def _append_provider_stage_ms(
+    debug_details: dict[str, object] | None,
+    **stage_values: float | None,
+) -> dict[str, object]:
+    """Attach bounded provider-side stage timings to the current debug payload."""
+
+    payload = dict(debug_details or {})
+    provider_stage_ms = {
+        key: round(float(value), 3)
+        for key, value in stage_values.items()
+        if value is not None
+    }
+    if provider_stage_ms:
+        payload["provider_stage_ms"] = provider_stage_ms
+    return payload
+
+
+def _elapsed_ms(started_ns: int) -> float:
+    """Return one bounded monotonic elapsed duration in milliseconds."""
+
+    return round((time.monotonic_ns() - started_ns) / 1_000_000.0, 3)
 
 
 def _bounded_dimension(value: object, *, minimum: int, maximum: int, fallback: int) -> int:

@@ -19,7 +19,7 @@ refreshing. The output stays bounded and topic-generic:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
@@ -89,7 +89,7 @@ def _awareness_candidate(thread: SituationalAwarenessThread) -> AmbientDisplayIm
         salience=salience,
         eyebrow="",
         headline=_compact_text(thread.title, max_len=112),
-        body=_compact_text(thread.summary, max_len=120),
+        body=_compact_text(_world_call_to_action(action=action, attention_state=attention_state), max_len=112),
         symbol="sparkles",
         accent="warm" if attention_state == "growing" else "info",
         reason="world_awareness_thread",
@@ -178,6 +178,16 @@ def _subscription_action(aggregate: _SubscriptionTopicAggregate) -> tuple[str, s
     return ("hint", "forming")
 
 
+def _world_call_to_action(*, action: str, attention_state: str) -> str:
+    """Return one short CTA line for world-derived reserve candidates."""
+
+    if action == "brief_update":
+        return "Wollen wir kurz darueber reden?"
+    if attention_state == "growing":
+        return "Was meinst du dazu?"
+    return "Magst du kurz was dazu sagen?"
+
+
 def _subscription_candidate(aggregate: _SubscriptionTopicAggregate) -> AmbientDisplayImpulseCandidate:
     """Convert one grouped world topic into a reserve-lane candidate."""
 
@@ -210,12 +220,6 @@ def _subscription_candidate(aggregate: _SubscriptionTopicAggregate) -> AmbientDi
     }
     if aggregate.regions:
         context["regions"] = tuple(sorted(aggregate.regions))[:4]
-    helper = ""
-    if source_labels:
-        helper = _compact_text(
-            f"Ich lese dazu gerade mit {', '.join(source_labels[:2])}.",
-            max_len=120,
-        )
     return AmbientDisplayImpulseCandidate(
         topic_key=aggregate.topic_key,
         title=topic_title,
@@ -224,8 +228,8 @@ def _subscription_candidate(aggregate: _SubscriptionTopicAggregate) -> AmbientDi
         attention_state=attention_state,
         salience=salience,
         eyebrow="",
-        headline=_compact_text(f"Was tut sich gerade bei {topic_title}?", max_len=112),
-        body=helper or _compact_text("Ich habe das gerade ruhig im Blick.", max_len=112),
+        headline=_compact_text(f"Bei {topic_title} ist gerade etwas in Bewegung.", max_len=112),
+        body=_compact_text(_world_call_to_action(action=action, attention_state=attention_state), max_len=112),
         symbol="sparkles",
         accent="info",
         reason="world_subscription_seed",

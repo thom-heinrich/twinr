@@ -215,8 +215,8 @@ extra chrome so the surface stays readable at a glance.
 Gesture acknowledgements should mirror clear symbols like `👍`, `👎`, `👋`,
 `✌️`, `👌`, or `👉` directly instead of inventing extra text, while still
 keeping face emotions in the face channel and not in emoji-only surrogates.
-Calm companion impulses may use a bounded question-first reserve card there
-too, but that card must stay short, positive, and subordinate to stronger
+Calm companion impulses may use a bounded reserve card there too, but that
+card must stay short, positive, and subordinate to stronger
 reserve-surface owners such as gesture acknowledgements or fullscreen
 presentations. On the 800x480 Pi surface that means readable main text first,
 minimal chrome, and a prompt-mode reserve card that reads like one large
@@ -229,7 +229,9 @@ bounded, readable, and calm. On the real Pi surface that means no left accent
 rail in prompt mode, one still-large but slightly reduced text scale for the
 full reserve message so the box keeps more breathing room, and wording that
 sounds like a natural conversation opener rather than a tiny topic label with
-helper chrome. Prompt-mode cards should also consume the
+helper chrome. The large headline should stand on its own as the explanatory
+statement, while the smaller second line should act as the CTA. Prompt-mode
+cards should also consume the
 actual visible card height instead of stopping after a fixed two-line budget,
 so longer right-lane prompts do not appear cut off halfway down the box.
 

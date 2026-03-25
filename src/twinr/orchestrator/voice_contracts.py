@@ -103,6 +103,7 @@ class OrchestratorVoiceHelloRequest:
     attention_state: str | None = None
     interaction_intent_state: str | None = None
     person_visible: bool | None = None
+    presence_active: bool | None = None
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
@@ -129,6 +130,8 @@ class OrchestratorVoiceHelloRequest:
             payload["interaction_intent_state"] = self.interaction_intent_state
         if self.person_visible is not None:
             payload["person_visible"] = self.person_visible
+        if self.presence_active is not None:
+            payload["presence_active"] = self.presence_active
         if self.interaction_ready is not None:
             payload["interaction_ready"] = self.interaction_ready
         if self.targeted_inference_blocked is not None:
@@ -158,6 +161,11 @@ class OrchestratorVoiceHelloRequest:
                 if payload_dict.get("person_visible") is not None
                 else None
             ),
+            presence_active=(
+                _coerce_bool(payload_dict.get("presence_active"))
+                if payload_dict.get("presence_active") is not None
+                else None
+            ),
             interaction_ready=(
                 _coerce_bool(payload_dict.get("interaction_ready"))
                 if payload_dict.get("interaction_ready") is not None
@@ -179,20 +187,30 @@ class OrchestratorVoiceAudioFrame:
 
     sequence: int
     pcm_bytes: bytes
+    runtime_state: OrchestratorVoiceRuntimeStateEvent | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "type": "voice_audio_frame",
             "sequence": self.sequence,
             "pcm_s16le_b64": _encode_audio_bytes(self.pcm_bytes),
         }
+        if self.runtime_state is not None:
+            payload["runtime_state"] = self.runtime_state.to_payload()
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorVoiceAudioFrame:
         payload_dict = _coerce_dict(payload)
+        runtime_state_payload = payload_dict.get("runtime_state")
         return cls(
             sequence=max(0, _coerce_positive_int(payload_dict.get("sequence"), default=0)),
             pcm_bytes=_decode_audio_bytes(payload_dict.get("pcm_s16le_b64")),
+            runtime_state=(
+                OrchestratorVoiceRuntimeStateEvent.from_payload(runtime_state_payload)
+                if isinstance(runtime_state_payload, dict)
+                else None
+            ),
         )
 
 
@@ -206,16 +224,18 @@ class OrchestratorVoiceRuntimeStateEvent:
     attention_state: str | None = None
     interaction_intent_state: str | None = None
     person_visible: bool | None = None
+    presence_active: bool | None = None
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
 
-    def to_payload(self) -> dict[str, Any]:
+    def to_payload(self, *, include_type: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "type": "voice_runtime_state",
             "state": self.state,
             "follow_up_allowed": self.follow_up_allowed,
         }
+        if include_type:
+            payload["type"] = "voice_runtime_state"
         if self.detail is not None:
             payload["detail"] = self.detail
         if self.attention_state is not None:
@@ -224,6 +244,8 @@ class OrchestratorVoiceRuntimeStateEvent:
             payload["interaction_intent_state"] = self.interaction_intent_state
         if self.person_visible is not None:
             payload["person_visible"] = self.person_visible
+        if self.presence_active is not None:
+            payload["presence_active"] = self.presence_active
         if self.interaction_ready is not None:
             payload["interaction_ready"] = self.interaction_ready
         if self.targeted_inference_blocked is not None:
@@ -246,6 +268,11 @@ class OrchestratorVoiceRuntimeStateEvent:
             person_visible=(
                 _coerce_bool(payload_dict.get("person_visible"))
                 if payload_dict.get("person_visible") is not None
+                else None
+            ),
+            presence_active=(
+                _coerce_bool(payload_dict.get("presence_active"))
+                if payload_dict.get("presence_active") is not None
                 else None
             ),
             interaction_ready=(

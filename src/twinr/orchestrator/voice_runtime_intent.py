@@ -99,6 +99,7 @@ class VoiceRuntimeIntentContext:
     attention_state: str | None = None
     interaction_intent_state: str | None = None
     person_visible: bool | None = None
+    presence_active: bool | None = None
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
@@ -148,6 +149,7 @@ class VoiceRuntimeIntentContext:
             attention_state=_axis_state(person_state, "attention_state"),
             interaction_intent_state=_axis_state(person_state, "interaction_intent_state"),
             person_visible=person_visible,
+            presence_active=presence_active,
             interaction_ready=_coerce_optional_bool(person_state.get("interaction_ready")),
             targeted_inference_blocked=_coerce_optional_bool(
                 person_state.get("targeted_inference_blocked")
@@ -165,6 +167,7 @@ class VoiceRuntimeIntentContext:
                 getattr(event, "interaction_intent_state", None)
             ),
             person_visible=_coerce_optional_bool(getattr(event, "person_visible", None)),
+            presence_active=_coerce_optional_bool(getattr(event, "presence_active", None)),
             interaction_ready=_coerce_optional_bool(getattr(event, "interaction_ready", None)),
             targeted_inference_blocked=_coerce_optional_bool(
                 getattr(event, "targeted_inference_blocked", None)
@@ -179,6 +182,7 @@ class VoiceRuntimeIntentContext:
             "attention_state": self.attention_state,
             "interaction_intent_state": self.interaction_intent_state,
             "person_visible": self.person_visible,
+            "presence_active": self.presence_active,
             "interaction_ready": self.interaction_ready,
             "targeted_inference_blocked": self.targeted_inference_blocked,
             "recommended_channel": self.recommended_channel,
@@ -191,6 +195,7 @@ class VoiceRuntimeIntentContext:
             "intent_attention_state": self.attention_state,
             "intent_interaction_intent_state": self.interaction_intent_state,
             "intent_person_visible": self.person_visible,
+            "intent_presence_active": self.presence_active,
             "intent_interaction_ready": self.interaction_ready,
             "intent_targeted_inference_blocked": self.targeted_inference_blocked,
             "intent_recommended_channel": self.recommended_channel,
@@ -210,12 +215,17 @@ class VoiceRuntimeIntentContext:
         """Return whether idle transcript-first activation may scan this context.
 
         Remote-only wake scanning should still accept audio when the camera
-        context is temporarily unknown. Once the runtime sees any visible
-        person, the explicit wake phrase must be allowed to establish the
-        speech turn itself instead of requiring upstream person-state guards to
-        pre-classify the scene as a safe targeted inference already.
+        context is temporarily unknown. The explicit wake phrase should only be
+        blocked when the Pi explicitly attests there is no local presence; a
+        visible-person miss alone must not veto an explicit wake when the
+        broader person-state aggregate still says someone is currently at the
+        device.
         """
 
+        if self.presence_active is True:
+            return True
+        if self.presence_active is False:
+            return False
         if self.person_visible is False:
             return False
         return True

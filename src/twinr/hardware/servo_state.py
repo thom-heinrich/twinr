@@ -60,16 +60,46 @@ class AttentionServoRuntimeState:
         """Build one normalized runtime state from JSON-safe payload data."""
 
         return cls(
-            heading_degrees=payload.get("heading_degrees", 0.0),
+            heading_degrees=_bounded_heading_degrees(payload.get("heading_degrees", 0.0)),
             hold_until_armed=bool(payload.get("hold_until_armed", False)),
             zero_reference_confirmed=bool(payload.get("zero_reference_confirmed", False)),
-            updated_at=payload.get("updated_at"),
+            updated_at=_optional_timestamp(payload.get("updated_at")),
         )
 
     def to_payload(self) -> dict[str, object]:
         """Return one JSON-safe payload for persistence."""
 
         return asdict(self)
+
+    def hold_current_heading(self, *, updated_at: float | None = None) -> "AttentionServoRuntimeState":
+        """Return one hold snapshot that preserves the current virtual heading."""
+
+        return AttentionServoRuntimeState(
+            heading_degrees=self.heading_degrees,
+            hold_until_armed=True,
+            zero_reference_confirmed=self.zero_reference_confirmed,
+            updated_at=updated_at,
+        )
+
+    def adopt_current_as_zero(self, *, updated_at: float | None = None) -> "AttentionServoRuntimeState":
+        """Return one hold snapshot that reanchors the current pose as zero."""
+
+        return AttentionServoRuntimeState(
+            heading_degrees=0.0,
+            hold_until_armed=True,
+            zero_reference_confirmed=True,
+            updated_at=updated_at,
+        )
+
+    def arm_follow(self, *, updated_at: float | None = None) -> "AttentionServoRuntimeState":
+        """Return one runtime snapshot that resumes follow motion from this heading."""
+
+        return AttentionServoRuntimeState(
+            heading_degrees=self.heading_degrees,
+            hold_until_armed=False,
+            zero_reference_confirmed=self.zero_reference_confirmed,
+            updated_at=updated_at,
+        )
 
 
 class AttentionServoStateStore:
@@ -90,6 +120,22 @@ class AttentionServoStateStore:
         if not isinstance(payload, dict):
             raise ValueError(f"attention servo state file must contain a JSON object: {self.path}")
         return AttentionServoRuntimeState.from_payload(payload)
+
+    def load_or_default(self) -> AttentionServoRuntimeState:
+        """Return the saved runtime state, or one default snapshot when absent."""
+
+        loaded_state = self.load()
+        if loaded_state is None:
+            return AttentionServoRuntimeState()
+        return loaded_state
+
+    def mtime_ns(self) -> int | None:
+        """Return the current state-file mtime in nanoseconds when present."""
+
+        try:
+            return self.path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return None
 
     def save(self, state: AttentionServoRuntimeState) -> None:
         """Persist one normalized state snapshot atomically."""

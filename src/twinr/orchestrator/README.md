@@ -152,7 +152,7 @@ targeted debugging because it persists raw room audio by design.
 
 The edge runtime now also projects the latest compact `person_state` summary
 into each `voice_runtime_state` update: `attention_state`,
-`interaction_intent_state`, `person_visible`, `interaction_ready`,
+`interaction_intent_state`, `person_visible`, `presence_active`, `interaction_ready`,
 `targeted_inference_blocked`, and `recommended_channel`. The gateway may use
 that summary only as an audio-owned bias, for example by keeping the
 transcript-first wake window a bit richer or the follow-up window open a bit
@@ -177,7 +177,18 @@ otherwise it degrades to visibility-unknown so explicit audio wake stays
 possible even with the camera offline. The broader room-clarity and channel
 hints stay advisory for idle wake scanning, because the explicit wake phrase
 itself is what establishes the speech turn and should not require proactive
-targeting guards to classify the room first.
+targeting guards to classify the room first. That same rule now also applies
+when the camera is online but misses the person: if the broader person-state
+aggregate still attests `presence_active=true`, the gateway treats that as
+local presence and does not hard-block explicit wake on `person_visible=false`
+alone.
+
+That compact runtime-state snapshot now also rides on each streamed
+`voice_audio_frame`. The websocket still accepts standalone
+`voice_runtime_state` messages, but the inline copy keeps wake scanning bounded
+to the freshest edge context even when the server is busy draining queued audio
+frames and a separate control message would arrive too late to prevent a stale
+`person_visible=false` cancellation.
 
 When the runtime is already in `follow_up_open`, the gateway stays on the same
 utterance buffer path it uses in `waiting` and `listening`: keep buffering the

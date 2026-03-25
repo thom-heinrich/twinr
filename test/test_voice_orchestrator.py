@@ -145,6 +145,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             attention_state="attending_to_device",
             interaction_intent_state="showing_intent",
             person_visible=True,
+            presence_active=True,
             interaction_ready=True,
             targeted_inference_blocked=False,
             recommended_channel="speech",
@@ -155,9 +156,40 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(event.attention_state, "attending_to_device")
         self.assertEqual(event.interaction_intent_state, "showing_intent")
         self.assertTrue(event.person_visible)
+        self.assertTrue(event.presence_active)
         self.assertTrue(event.interaction_ready)
         self.assertFalse(event.targeted_inference_blocked)
         self.assertEqual(event.recommended_channel, "speech")
+
+    def test_send_frame_embeds_latest_runtime_state_snapshot(self) -> None:
+        orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
+
+        orchestrator.notify_runtime_state(
+            state="waiting",
+            detail="idle",
+            follow_up_allowed=False,
+            attention_state="attending_to_device",
+            interaction_intent_state="showing_intent",
+            person_visible=True,
+            presence_active=True,
+            interaction_ready=True,
+            targeted_inference_blocked=False,
+            recommended_channel="speech",
+        )
+
+        orchestrator._send_frame(b"\x00" * orchestrator._frame_bytes)
+
+        frame = fake_client.audio_frames[-1]
+        self.assertIsNotNone(frame.runtime_state)
+        self.assertEqual(frame.runtime_state.state, "waiting")
+        self.assertEqual(frame.runtime_state.detail, "idle")
+        self.assertEqual(frame.runtime_state.attention_state, "attending_to_device")
+        self.assertEqual(frame.runtime_state.interaction_intent_state, "showing_intent")
+        self.assertTrue(frame.runtime_state.person_visible)
+        self.assertTrue(frame.runtime_state.presence_active)
+        self.assertTrue(frame.runtime_state.interaction_ready)
+        self.assertFalse(frame.runtime_state.targeted_inference_blocked)
+        self.assertEqual(frame.runtime_state.recommended_channel, "speech")
 
     def test_connect_client_embeds_cached_runtime_state_in_hello(self) -> None:
         orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
@@ -167,6 +199,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             detail="idle",
             follow_up_allowed=False,
             person_visible=False,
+            presence_active=True,
             interaction_ready=False,
             targeted_inference_blocked=True,
             recommended_channel="display",
@@ -181,6 +214,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertFalse(hello.follow_up_allowed)
         self.assertTrue(hello.state_attested)
         self.assertFalse(hello.person_visible)
+        self.assertTrue(hello.presence_active)
         self.assertFalse(hello.interaction_ready)
         self.assertTrue(hello.targeted_inference_blocked)
         self.assertEqual(hello.recommended_channel, "display")

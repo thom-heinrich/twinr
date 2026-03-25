@@ -562,6 +562,7 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
 
         self.assertTrue(context.person_visible)
+        self.assertTrue(context.presence_active)
         self.assertTrue(context.waiting_activation_allowed())
         self.assertFalse(context.audio_bias_allowed())
 
@@ -601,6 +602,7 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
 
         self.assertTrue(context.person_visible)
+        self.assertTrue(context.presence_active)
         self.assertTrue(context.waiting_activation_allowed())
         self.assertFalse(context.audio_bias_allowed())
 
@@ -641,10 +643,13 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
 
         self.assertIsNone(context.person_visible)
+        self.assertTrue(context.presence_active)
         self.assertTrue(context.waiting_activation_allowed())
         self.assertFalse(context.audio_bias_allowed())
 
-    def test_from_sensor_facts_keeps_waiting_activation_blocked_without_focus_hold(self) -> None:
+    def test_from_sensor_facts_keeps_waiting_activation_allowed_with_attested_presence_without_visible_person(
+        self,
+    ) -> None:
         facts = {
             "camera": {
                 "person_visible": False,
@@ -668,6 +673,34 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
 
         self.assertFalse(context.person_visible)
+        self.assertTrue(context.presence_active)
+        self.assertTrue(context.waiting_activation_allowed())
+
+    def test_from_sensor_facts_keeps_waiting_activation_blocked_without_local_presence(self) -> None:
+        facts = {
+            "camera": {
+                "person_visible": False,
+                "person_recently_visible": False,
+            },
+            "attention_target": {
+                "active": False,
+                "state": "inactive",
+                "session_focus_active": False,
+            },
+            "person_state": {
+                "presence_active": False,
+                "interaction_ready": False,
+                "targeted_inference_blocked": True,
+                "recommended_channel": "display",
+                "attention_state": {"state": "inactive"},
+                "interaction_intent_state": {"state": "passive"},
+            },
+        }
+
+        context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
+
+        self.assertFalse(context.person_visible)
+        self.assertFalse(context.presence_active)
         self.assertFalse(context.waiting_activation_allowed())
 
 
@@ -831,6 +864,39 @@ class OrchestratorServerTests(unittest.TestCase):
                 create_orchestrator_app(env_path)
 
 class OrchestratorClientTests(unittest.TestCase):
+    def test_voice_audio_frame_round_trips_embedded_runtime_state(self) -> None:
+        frame = OrchestratorVoiceAudioFrame(
+            sequence=7,
+            pcm_bytes=b"\x01\x00" * 160,
+            runtime_state=OrchestratorVoiceRuntimeStateEvent(
+                state="waiting",
+                detail="idle",
+                follow_up_allowed=False,
+                attention_state="attending_to_device",
+                interaction_intent_state="showing_intent",
+                person_visible=True,
+                presence_active=True,
+                interaction_ready=True,
+                targeted_inference_blocked=False,
+                recommended_channel="speech",
+            ),
+        )
+
+        decoded = OrchestratorVoiceAudioFrame.from_payload(frame.to_payload())
+
+        self.assertEqual(decoded.sequence, 7)
+        self.assertEqual(decoded.pcm_bytes, b"\x01\x00" * 160)
+        self.assertIsNotNone(decoded.runtime_state)
+        self.assertEqual(decoded.runtime_state.state, "waiting")
+        self.assertEqual(decoded.runtime_state.detail, "idle")
+        self.assertEqual(decoded.runtime_state.attention_state, "attending_to_device")
+        self.assertEqual(decoded.runtime_state.interaction_intent_state, "showing_intent")
+        self.assertTrue(decoded.runtime_state.person_visible)
+        self.assertTrue(decoded.runtime_state.presence_active)
+        self.assertTrue(decoded.runtime_state.interaction_ready)
+        self.assertFalse(decoded.runtime_state.targeted_inference_blocked)
+        self.assertEqual(decoded.runtime_state.recommended_channel, "speech")
+
     def test_client_handles_ack_tool_request_and_completion(self) -> None:
         class _FakeSocket:
             def __init__(self):
@@ -1762,6 +1828,7 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                     attention_state="attending_to_device",
                     interaction_intent_state="showing_intent",
                     person_visible=True,
+                    presence_active=True,
                     interaction_ready=True,
                     targeted_inference_blocked=False,
                     recommended_channel="speech",
@@ -1826,6 +1893,7 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                     attention_state="inactive",
                     interaction_intent_state="passive",
                     person_visible=False,
+                    presence_active=False,
                     interaction_ready=False,
                     targeted_inference_blocked=True,
                     recommended_channel="display",
@@ -1882,6 +1950,65 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                     attention_state="engaged_with_device",
                     interaction_intent_state="passive",
                     person_visible=True,
+                    presence_active=True,
+                    interaction_ready=False,
+                    targeted_inference_blocked=True,
+                    recommended_channel="display",
+                )
+            )
+
+            first = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+            )
+            second = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(2))
+            )
+            third = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+            )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(third[0]["type"], "wake_confirmed")
+        self.assertEqual(third[0]["matched_phrase"], "twinna")
+
+    def test_voice_session_waiting_activation_allows_attested_presence_without_visible_person(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1,
+                voice_orchestrator_remote_asr_min_wake_duration_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(transcribe=lambda *args, **kwargs: "ignored"),
+                wake_phrase_spotter=_MinDurationWakePhraseSpotter(min_duration_ms=100),
+            )
+            session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="inactive",
+                    interaction_intent_state="passive",
+                    person_visible=False,
+                    presence_active=True,
                     interaction_ready=False,
                     targeted_inference_blocked=True,
                     recommended_channel="display",
@@ -1943,6 +2070,88 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                 )
 
         self.assertEqual(transcribe_calls, [])
+
+    def test_voice_session_audio_frame_runtime_state_refresh_allows_wake_despite_stale_blocked_state(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1,
+                voice_orchestrator_remote_asr_min_wake_duration_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(transcribe=lambda *args, **kwargs: "ignored"),
+                wake_phrase_spotter=_MinDurationWakePhraseSpotter(min_duration_ms=100),
+            )
+            session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="inactive",
+                    interaction_intent_state="passive",
+                    person_visible=False,
+                    presence_active=False,
+                    interaction_ready=False,
+                    targeted_inference_blocked=True,
+                    recommended_channel="display",
+                )
+            )
+
+            refreshed_state = OrchestratorVoiceRuntimeStateEvent(
+                state="waiting",
+                detail="idle",
+                follow_up_allowed=False,
+                attention_state="attending_to_device",
+                interaction_intent_state="showing_intent",
+                person_visible=True,
+                presence_active=True,
+                interaction_ready=True,
+                targeted_inference_blocked=False,
+                recommended_channel="speech",
+            )
+            first = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=0,
+                    pcm_bytes=_pcm_frame(2),
+                    runtime_state=refreshed_state,
+                )
+            )
+            second = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=1,
+                    pcm_bytes=_pcm_frame(2),
+                    runtime_state=refreshed_state,
+                )
+            )
+            third = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=2,
+                    pcm_bytes=_pcm_frame(0),
+                    runtime_state=refreshed_state,
+                )
+            )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(third[0]["type"], "wake_confirmed")
+        self.assertEqual(third[0]["matched_phrase"], "twinna")
 
     def test_voice_session_attested_hello_blocks_waiting_activation_before_any_runtime_state_refresh(self) -> None:
         with TemporaryDirectory() as temp_dir:

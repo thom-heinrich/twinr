@@ -3,8 +3,9 @@
 The display reserve should feel like a living conversational opening, not like
 an internal topic label. This module therefore turns structured mindshare items
 plus positive-engagement policy into short, readable prompts that carry a clear
-topic anchor and at least a little of Twinr's own tone. The output should stay
-calm and legible, but it should not read like a blank notification template.
+topic anchor and at least a little of Twinr's own tone. The visible contract is
+explicit: the large headline should stand on its own as the explanatory
+statement, while the smaller second line acts as the call to action.
 
 The logic stays generic and policy-driven:
 
@@ -88,120 +89,137 @@ def _symbol_for_policy(
     return "sparkles"
 
 
-def _memory_question(
+def _memory_statement(
     topic: str,
     *,
     policy: PositiveEngagementTopicPolicy,
     seed: float,
 ) -> str:
-    """Render one personal-thread question that helps Twinr remember better."""
+    """Render one personal-thread statement for the main reserve headline."""
 
     if policy.action == "hint":
         variants = (
-            f"Soll ich bei {topic} weiter hinschauen?",
-            f"Bei {topic} ist fuer mich noch etwas offen. Soll ich dranbleiben?",
+            f"Bei {topic} ist fuer mich noch etwas offen.",
+            f"Zu {topic} fehlt mir noch ein kleines Stueck.",
         )
     elif policy.action == "brief_update":
         variants = (
-            f"Sollen wir bei {topic} spaeter kurz anknuepfen?",
-            f"Zu {topic} wuerde ich spaeter gern noch einmal kurz zurueckkommen.",
+            f"Zu {topic} habe ich noch einen kleinen Nachtrag im Kopf.",
+            f"Bei {topic} bin ich gedanklich noch nicht ganz fertig.",
         )
     elif policy.action == "ask_one":
         variants = (
-            f"Wie ist es bei {topic} weitergegangen?",
-            f"Zu {topic} fehlt mir noch etwas. Magst du mich kurz auf Stand bringen?",
+            f"Zu {topic} fehlt mir noch etwas.",
+            f"Bei {topic} habe ich noch ein kleines Fragezeichen.",
         )
     else:
         variants = (
-            f"Bei {topic} habe ich noch ein Fragezeichen. Wie ging es weiter?",
-            f"Zu {topic} fehlt mir noch ein Stueck. Magst du mich kurz auf Stand bringen?",
+            f"Bei {topic} habe ich noch ein kleines Fragezeichen.",
+            f"Zu {topic} fehlt mir noch ein Stueck.",
         )
     return variants[1 if seed >= 0.5 else 0]
 
 
-def _world_question(
+def _world_statement(
     topic: str,
     *,
     policy: PositiveEngagementTopicPolicy,
     source_family: str,
     seed: float,
 ) -> str:
-    """Render one world/place-style conversational opening."""
+    """Render one world/place-style statement for the main reserve headline."""
 
     if policy.action == "hint":
         variants = (
-            f"Soll ich {topic} heute weiter im Blick behalten?",
-            f"Bei {topic} schaue ich gerade noch einmal hin. Soll ich dranbleiben?",
+            f"Bei {topic} bleibe ich heute kurz dran.",
+            f"Zu {topic} schaue ich gerade noch einmal hin.",
         )
     elif policy.action == "brief_update":
         variants = (
-            f"Bei {topic} tut sich gerade etwas. Soll ich spaeter kurz updaten?",
-            f"Zu {topic} koennte ich spaeter ein kurzes Update geben. Waere das gut?",
+            f"Bei {topic} tut sich gerade etwas.",
+            f"Rund um {topic} ist heute etwas in Bewegung.",
         )
     elif source_family == "world":
         variants = (
-            f"Bei {topic} ist gerade wieder Bewegung drin. Wie siehst du das?",
-            f"{topic} laesst mich heute nicht ganz los. Wie schaust du darauf?",
+            f"Bei {topic} ist gerade wieder Bewegung drin.",
+            f"{topic} laesst mich heute nicht ganz los.",
         )
     else:
         variants = (
-            f"Rund um {topic} ist gerade etwas in Bewegung. Wie siehst du das?",
-            f"Bei {topic} lohnt heute ein zweiter Blick. Was meinst du?",
+            f"Rund um {topic} ist gerade etwas in Bewegung.",
+            f"Bei {topic} lohnt heute ein zweiter Blick.",
         )
     return variants[1 if seed >= 0.5 else 0]
 
 
-def _general_question(
+def _general_statement(
     topic: str,
     *,
     policy: PositiveEngagementTopicPolicy,
     seed: float,
 ) -> str:
-    """Render one generic but still concrete conversational opening."""
+    """Render one generic but still concrete statement for the main headline."""
 
     if policy.action == "brief_update":
         variants = (
-            f"Soll ich bei {topic} spaeter noch einmal kurz nachfassen?",
-            f"Zu {topic} waere spaeter ein kleiner zweiter Blick gut. Passt das?",
+            f"Zu {topic} waere spaeter ein kleiner zweiter Blick gut.",
+            f"Bei {topic} haenge ich gedanklich noch kurz dran.",
         )
     else:
         variants = (
-            f"Bei {topic} habe ich noch ein kleines Fragezeichen. Wie siehst du das?",
-            f"Zu {topic} wuerde ich gern kurz deine Sicht hoeren. Was meinst du?",
+            f"Bei {topic} habe ich noch ein kleines Fragezeichen.",
+            f"Zu {topic} ist mir noch etwas offen geblieben.",
         )
     return variants[1 if seed >= 0.5 else 0]
 
 
-def _helper_text(
+def _call_to_action(
     topic: str,
     *,
     policy: PositiveEngagementTopicPolicy,
     source_family: str,
     seed: float,
 ) -> str:
-    """Render one short supportive helper line under the main question."""
+    """Render one short CTA line under the explanatory headline."""
 
     if source_family == "memory":
+        if policy.action == "brief_update":
+            variants = (
+                "Wollen wir spaeter kurz darueber reden?",
+                "Magst du spaeter kurz mehr dazu sagen?",
+            )
+        elif policy.action == "hint":
+            variants = (
+                "Magst du mir kurz etwas dazu sagen?",
+                "Wollen wir kurz darueber reden?",
+            )
+        else:
+            variants = (
+                "Magst du mich kurz auf Stand bringen?",
+                "Wollen wir kurz darueber reden?",
+            )
+        return variants[1 if seed >= 0.5 else 0]
+    if policy.action == "brief_update":
         variants = (
-            "Da fehlt mir noch ein klares Bild.",
-            "Da habe ich noch ein kleines Fragezeichen.",
+            "Soll ich dir spaeter kurz mehr dazu sagen?",
+            "Wollen wir spaeter kurz darueber reden?",
         )
         return variants[1 if seed >= 0.5 else 0]
     if policy.action == "hint":
         variants = (
-            "Ein kurzer Hinweis reicht mir da schon.",
-            "Ein kleiner Kompass waere dafuer schon genug.",
+            "Magst du kurz was dazu sagen?",
+            "Wollen wir kurz darueber reden?",
         )
         return variants[1 if seed >= 0.5 else 0]
     if policy.attention_state == "shared_thread":
         variants = (
-            "Das ist gerade so ein kleiner Faden zwischen uns.",
-            "Da bleibe ich ruhig, aber ziemlich wach dran.",
+            "Wollen wir kurz darueber reden?",
+            "Was meinst du dazu?",
         )
         return variants[1 if seed >= 0.5 else 0]
     variants = (
-        "Dein Blick darauf interessiert mich mehr als die Schlagzeile.",
-        "Da wuerde ich gern kurz deine Sicht hoeren.",
+        "Was meinst du dazu?",
+        "Magst du kurz was dazu sagen?",
     )
     return variants[1 if seed >= 0.5 else 0]
 
@@ -212,7 +230,7 @@ def build_ambient_display_impulse_copy(
     *,
     local_now: datetime | None,
 ) -> AmbientDisplayImpulseCopy:
-    """Build one question-first display impulse from current companion state."""
+    """Build one statement-first display impulse from current companion state."""
 
     topic = _topic_phrase(item)
     source_family = _source_family(item.source)
@@ -224,21 +242,21 @@ def build_ambient_display_impulse_copy(
         local_now.date() if local_now else "",
     )
     if source_family == "memory":
-        headline = _memory_question(topic, policy=policy, seed=seed)
+        headline = _memory_statement(topic, policy=policy, seed=seed)
     elif source_family in {"world", "place"}:
-        headline = _world_question(
+        headline = _world_statement(
             topic,
             policy=policy,
             source_family=source_family,
             seed=seed,
         )
     else:
-        headline = _general_question(topic, policy=policy, seed=seed)
+        headline = _general_statement(topic, policy=policy, seed=seed)
     return AmbientDisplayImpulseCopy(
         eyebrow="",
         headline=_truncate_text(headline, max_len=112),
         body=_truncate_text(
-            _helper_text(topic, policy=policy, source_family=source_family, seed=seed),
+            _call_to_action(topic, policy=policy, source_family=source_family, seed=seed),
             max_len=96,
         ),
         symbol=_symbol_for_policy(policy, source_family=source_family),
