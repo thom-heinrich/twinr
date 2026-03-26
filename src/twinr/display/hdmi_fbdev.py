@@ -36,6 +36,7 @@ from twinr.display.hdmi_default_scene import (
     time_value,
 )
 from twinr.display.presentation_cues import DisplayPresentationCue
+from twinr.display.service_connect_cues import DisplayServiceConnectCue
 
 
 _FBIOGET_VSCREENINFO = 0x4600
@@ -185,6 +186,7 @@ class HdmiFramebufferDisplay:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame."""
@@ -201,6 +203,7 @@ class HdmiFramebufferDisplay:
             face_cue=face_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
+            service_connect_cue=service_connect_cue,
             presentation_cue=presentation_cue,
         )
         self.show_image(image)
@@ -274,6 +277,7 @@ class HdmiFramebufferDisplay:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ):
@@ -323,6 +327,7 @@ class HdmiFramebufferDisplay:
             face_cue=face_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
+            service_connect_cue=service_connect_cue,
             presentation_cue=presentation_cue,
             render_now=render_now,
         )
@@ -364,6 +369,7 @@ class HdmiFramebufferDisplay:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ) -> None:
@@ -382,6 +388,7 @@ class HdmiFramebufferDisplay:
             face_cue=face_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
+            service_connect_cue=service_connect_cue,
             presentation_cue=presentation_cue,
             ambient_now=render_now,
         )
@@ -498,7 +505,7 @@ class HdmiFramebufferDisplay:
         state_fields: DisplayStateFields,
         compact: bool = False,
     ) -> None:
-        filtered = tuple(field for field in state_fields if field[0] in _STATE_CARD_ORDER)
+        filtered = tuple(state_field for state_field in state_fields if state_field[0] in _STATE_CARD_ORDER)
         if not filtered:
             return
         columns = 2 if compact or len(filtered) > 3 else len(filtered)
@@ -509,18 +516,18 @@ class HdmiFramebufferDisplay:
         card_height = (height - (gap * (rows - 1))) // rows
         label_font = self._font(16 if compact else 15, bold=True)
         value_font = self._font(18 if compact else 22, bold=False)
-        for index, field in enumerate(filtered):
+        for index, state_field in enumerate(filtered):
             column = index % columns
             row = index // columns
             card_left = left + column * (card_width + gap)
             card_top = top + row * (card_height + gap)
             card_right = card_left + card_width
             card_bottom = card_top + card_height
-            color = self._state_value_color(field[1])
+            color = self._state_value_color(state_field[1])
             draw.rounded_rectangle((card_left, card_top, card_right, card_bottom), radius=18, fill=(255, 252, 247))
             draw.rounded_rectangle((card_left + 14, card_top + 14, card_left + 46, card_top + 46), radius=12, fill=color)
-            draw.text((card_left + 58, card_top + 15), field[0], fill=(96, 101, 112), font=label_font)
-            value = self._truncate_text(draw, field[1], max_width=card_width - 74, font=value_font)
+            draw.text((card_left + 58, card_top + 15), state_field[0], fill=(96, 101, 112), font=label_font)
+            value = self._truncate_text(draw, state_field[1], max_width=card_width - 74, font=value_font)
             draw.text((card_left + 58, card_top + 43), value, fill=(23, 34, 45), font=value_font)
 
     def _ordered_state_fields(
@@ -824,8 +831,8 @@ class HdmiFramebufferDisplay:
             raise RuntimeError(
                 f"Framebuffer `{self.framebuffer_path}` uses unsupported {geometry.bits_per_pixel} bpp; expected 16 or 32."
             )
-        for field in (geometry.red, geometry.green, geometry.blue, geometry.transp):
-            if field.msb_right != 0:
+        for color_field in (geometry.red, geometry.green, geometry.blue, geometry.transp):
+            if color_field.msb_right != 0:
                 raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` exposes an unsupported channel layout.")
         return geometry
 
@@ -838,16 +845,16 @@ class HdmiFramebufferDisplay:
             for column in range(geometry.width):
                 red, green, blue, alpha = pixels[column, row]
                 packed = 0
-                for value, field in (
+                for value, color_field in (
                     (red, geometry.red),
                     (green, geometry.green),
                     (blue, geometry.blue),
                     (alpha, geometry.transp),
                 ):
-                    if field.length <= 0:
+                    if color_field.length <= 0:
                         continue
-                    scaled = ((int(value) * ((1 << field.length) - 1)) + 127) // 255
-                    packed |= scaled << field.offset
+                    scaled = ((int(value) * ((1 << color_field.length) - 1)) + 127) // 255
+                    packed |= scaled << color_field.offset
                 byte_offset = target_start + (column * geometry.bytes_per_pixel)
                 output[byte_offset : byte_offset + geometry.bytes_per_pixel] = packed.to_bytes(
                     geometry.bytes_per_pixel,

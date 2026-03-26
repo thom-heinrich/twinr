@@ -45,6 +45,7 @@ scored proactive trigger candidates and optional visual second opinions.
 | `camera_surface.py` | Debounced camera snapshot, bounded multi-person anchor surface, coarse motion, and rising-edge coarse/fine gesture event surface |
 | `gesture_calibration.py` | Bounded per-symbol fine-hand calibration profile loaded from `state/mediapipe/gesture_calibration.json` |
 | `engine.py` | Stateful social-trigger scoring engine and normalized vision contract, including visible-person anchor payloads |
+| `aideck_camera_provider.py` | Bounded continuous AI-Deck still-camera provider that feeds the OpenAI proactive vision classifier from `aideck://` captures |
 | `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and coarse/fine gesture output |
 | `remote_camera_provider.py` | Fetches bounded IMX500 observations from the helper Pi over the direct-link HTTP proxy and also supports a `remote_frame` mode where the main Pi runs the hot attention/gesture lifting locally from a coherent helper-side detection-plus-frame bundle |
 | `normalization.py` | Shared low-risk enum, box, and integer coercion helpers reused by `engine.py` and `camera_surface.py` |
@@ -80,6 +81,12 @@ Twinr derives the still-photo snapshot proxy and defaults proactive live
 vision to `remote_frame`, where both the fast attention lane and the gesture
 lane consume one coherent helper-side detection-plus-frame bundle while still
 allowing the older low-level camera envs to override behavior explicitly.
+
+For a direct Bitcraze AI-Deck camera, set `TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000`.
+When no explicit proactive provider override is set, `TwinrConfig.from_env()`
+now derives `proactive_vision_provider=aideck_openai`, which routes continuous
+proactive inspect frames through the bounded OpenAI still-image classifier while
+leaving low-latency local IMX500-specific attention/gesture paths disabled.
 
 ## See also
 

@@ -80,6 +80,23 @@ class LongTermTurnExtractorTests(unittest.TestCase):
         self.assertNotEqual(first.turn_id, second.turn_id)
         self.assertNotEqual(first.episode.memory_id, second.episode.memory_id)
 
+    def test_text_channel_turn_preserves_channel_source_and_text_modality(self) -> None:
+        extractor = make_test_extractor()
+
+        result = extractor.extract_conversation_turn(
+            transcript="Janina schreibt mir gerade bei WhatsApp wegen des Arzttermins.",
+            response="Ich behalte den WhatsApp-Hinweis zu Janinas Termin im Blick.",
+            occurred_at=datetime(2026, 3, 25, 20, 5, tzinfo=ZoneInfo("Europe/Berlin")),
+            turn_id="turn:whatsapp",
+            source="whatsapp",
+            modality="text",
+        )
+
+        self.assertEqual(result.episode.source.source_type, "whatsapp")
+        self.assertEqual(result.episode.source.modality, "text")
+        self.assertEqual(result.episode.attributes["request_source"], "whatsapp")
+        self.assertEqual(result.episode.attributes["input_modality"], "text")
+
 
 if __name__ == "__main__":
     unittest.main()

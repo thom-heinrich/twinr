@@ -8,10 +8,11 @@ session in ``answering``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 import logging
 
 from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
@@ -21,7 +22,7 @@ from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, Play
 class StreamingTextToSpeechProviderLike(Protocol):
     """Describe the streaming TTS interface required by speech output."""
 
-    def synthesize_stream(self, text: str, **kwargs) -> object:
+    def synthesize_stream(self, text: str, **kwargs) -> Iterable[bytes]:
         ...
 
 
@@ -81,7 +82,7 @@ class _TTSChunkPump:
         self._done = Event()
         self._stop = Event()
         self._stream_lock = Lock()
-        self._stream = None
+        self._stream: Iterable[bytes] | None = None
         self._close_lock = Lock()
         self._close_thread: Thread | None = None
         self._error: Exception | None = None
@@ -119,10 +120,16 @@ class _TTSChunkPump:
         *,
         should_stop: Callable[[], bool],
         on_first_chunk: Callable[[], None],
+        prefetched_first_chunk: bytes | None = None,
     ):
         """Yield queued chunks while polling for cancellation."""
 
         first_chunk_seen = False
+        if prefetched_first_chunk is not None:
+            first_chunk_seen = True
+            on_first_chunk()
+            self._trace("tts_chunk_pump_first_chunk_delivered", text_len=len(self._text))
+            yield prefetched_first_chunk
         while True:
             if should_stop():
                 self.stop()
@@ -145,7 +152,37 @@ class _TTSChunkPump:
                 self._trace("tts_chunk_pump_first_chunk_delivered", text_len=len(self._text))
             yield item
 
+    def await_first_chunk(
+        self,
+        *,
+        should_stop: Callable[[], bool],
+    ) -> bytes | None:
+        """Return the first queued chunk before playback preempts other owners.
+
+        This keeps coordinator-backed TTS from displacing processing feedback
+        until real speech audio is actually available to stream.
+        """
+
+        while True:
+            if should_stop():
+                self.stop()
+                return None
+            try:
+                item = self._queue.get(timeout=_TTS_CHUNK_POLL_TIMEOUT_SECONDS)
+            except Empty:
+                if self._done.is_set():
+                    if self._error is not None:
+                        raise self._error
+                    return None
+                continue
+            if item is _QUEUE_SENTINEL:
+                if self._error is not None:
+                    raise self._error
+                return None
+            return cast(bytes, item)
+
     def _run(self) -> None:
+        stream: Iterable[bytes] | None = None
         try:
             stream = self._tts_provider.synthesize_stream(
                 self._text,
@@ -166,9 +203,9 @@ class _TTSChunkPump:
             self._trace("tts_chunk_pump_failed", error_type=type(exc).__name__)
         finally:
             with self._stream_lock:
-                stream = self._stream
+                stream_to_close = self._stream
                 self._stream = None
-            self._request_stream_close(stream)
+            self._request_stream_close(stream_to_close)
             self._done.set()
             self._queue.put(_QUEUE_SENTINEL)
             self._trace("tts_chunk_pump_finished", has_error=self._error is not None)
@@ -484,12 +521,17 @@ class InterruptibleSpeechOutput:
         pump.start()
         if self.playback_coordinator is not None:
             try:
+                first_chunk = pump.await_first_chunk(should_stop=stop_requested)
+                if first_chunk is None:
+                    self._trace("speech_output_play_item_completed_without_audio", generation=item.generation)
+                    return
                 self.playback_coordinator.play_wav_chunks(
                     owner="streaming_tts",
                     priority=PlaybackPriority.SPEECH,
                     chunks=pump.iter_chunks(
                         should_stop=stop_requested,
                         on_first_chunk=emit_first_chunk,
+                        prefetched_first_chunk=first_chunk,
                     ),
                     should_stop=stop_requested,
                     atomic=item.atomic,

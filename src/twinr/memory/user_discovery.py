@@ -21,12 +21,16 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
-import math
 import os
 from pathlib import Path
 import tempfile
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.context_store import ManagedContextFileStore
+from twinr.memory.user_discovery_authoritative_profile import (
+    UserDiscoveryAuthoritativeCoverage,
+    UserDiscoveryAuthoritativeProfileReader,
+)
 from twinr.memory.user_discovery_policy import (
     UserDiscoveryEngagementSignals,
     UserDiscoveryPolicyEngine,
@@ -37,6 +41,8 @@ LOGGER = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
 _DEFAULT_STATE_PATH = "state/user_discovery.json"
+_DEFAULT_USER_PROFILE_PATH = "personality/USER.md"
+_DEFAULT_USER_PROFILE_SECTION_TITLE = "Twinr managed user updates"
 _INITIAL_SESSION_MINUTES = 15
 _LIFELONG_SESSION_MINUTES = 5
 _INITIAL_SESSION_ANSWER_LIMIT = 5
@@ -74,6 +80,8 @@ def _normalize_bool(value: object | None) -> bool:
 
 
 def _normalize_int(value: object | None, *, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -82,6 +90,28 @@ def _normalize_int(value: object | None, *, default: int, minimum: int = 0, maxi
     if maximum is not None:
         number = min(maximum, number)
     return number
+
+
+def _mapping_or_none(value: object | None) -> Mapping[str, object] | None:
+    if isinstance(value, Mapping):
+        return value
+    return None
+
+
+def _text_tuple(value: object | None) -> tuple[str, ...]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(str(item) for item in value)
+    return ()
+
+
+def _stored_fact_payloads(value: object | None) -> tuple[UserDiscoveryStoredFact | Mapping[str, object], ...]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(
+            item
+            for item in value
+            if isinstance(item, (UserDiscoveryStoredFact, Mapping))
+        )
+    return ()
 
 
 def _normalize_timestamp(value: object | None) -> str | None:
@@ -615,11 +645,11 @@ class UserDiscoveryStoredFact:
             fact_id=_compact_text(payload.get("fact_id"), max_len=40),
             route_kind=_compact_text(payload.get("route_kind"), max_len=32),
             review_text=_compact_text(payload.get("review_text"), max_len=_MAX_FACT_TEXT_LENGTH),
-            payload=payload.get("payload") if isinstance(payload.get("payload"), Mapping) else None,
-            commit_ref=payload.get("commit_ref") if isinstance(payload.get("commit_ref"), Mapping) else None,
+            payload=_mapping_or_none(payload.get("payload")),
+            commit_ref=_mapping_or_none(payload.get("commit_ref")),
             status=_compact_text(payload.get("status"), max_len=24),
-            created_at=payload.get("created_at"),
-            updated_at=payload.get("updated_at"),
+            created_at=_normalize_timestamp(payload.get("created_at")),
+            updated_at=_normalize_timestamp(payload.get("updated_at")),
         )
 
     @classmethod
@@ -795,19 +825,22 @@ class UserDiscoveryTopicState:
     def from_dict(cls, payload: Mapping[str, object]) -> "UserDiscoveryTopicState":
         return cls(
             topic_id=_compact_text(payload.get("topic_id"), max_len=48),
-            question_count=payload.get("question_count", 0),
-            visit_count=payload.get("visit_count", 0),
-            completed_once=payload.get("completed_once", False),
-            skip_count=payload.get("skip_count", 0),
-            correction_count=payload.get("correction_count", 0),
-            deletion_count=payload.get("deletion_count", 0),
-            permission_state=payload.get("permission_state", "unknown"),
-            profile_facts=tuple(payload.get("profile_facts", ()) or ()),
-            personality_facts=tuple(payload.get("personality_facts", ()) or ()),
-            stored_facts=tuple(payload.get("stored_facts", ()) or ()),
-            last_question_at=payload.get("last_question_at"),
-            last_answer_at=payload.get("last_answer_at"),
-            last_completed_at=payload.get("last_completed_at"),
+            question_count=_normalize_int(payload.get("question_count"), default=0, minimum=0),
+            visit_count=_normalize_int(payload.get("visit_count"), default=0, minimum=0),
+            completed_once=_normalize_bool(payload.get("completed_once", False)),
+            skip_count=_normalize_int(payload.get("skip_count"), default=0, minimum=0),
+            correction_count=_normalize_int(payload.get("correction_count"), default=0, minimum=0),
+            deletion_count=_normalize_int(payload.get("deletion_count"), default=0, minimum=0),
+            permission_state=_normalize_permission_state(payload.get("permission_state", "unknown")),
+            profile_facts=_text_tuple(payload.get("profile_facts")),
+            personality_facts=_text_tuple(payload.get("personality_facts")),
+            stored_facts=tuple(
+                UserDiscoveryStoredFact.from_dict(item) if isinstance(item, Mapping) else item
+                for item in _stored_fact_payloads(payload.get("stored_facts"))
+            ),
+            last_question_at=_normalize_timestamp(payload.get("last_question_at")),
+            last_answer_at=_normalize_timestamp(payload.get("last_answer_at")),
+            last_completed_at=_normalize_timestamp(payload.get("last_completed_at")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -897,21 +930,26 @@ class UserDiscoveryState:
                     except Exception:
                         continue
         return cls(
-            schema_version=payload.get("schema_version", _SCHEMA_VERSION),
-            phase=payload.get("phase", "initial_setup"),
-            session_state=payload.get("session_state", "idle"),
-            active_topic_id=payload.get("active_topic_id"),
-            session_started_at=payload.get("session_started_at"),
-            session_answer_count=payload.get("session_answer_count", 0),
-            session_answer_limit=payload.get("session_answer_limit", _INITIAL_SESSION_ANSWER_LIMIT),
-            last_interaction_at=payload.get("last_interaction_at"),
-            last_session_closed_at=payload.get("last_session_closed_at"),
-            next_invite_after=payload.get("next_invite_after"),
-            setup_completed_at=payload.get("setup_completed_at"),
-            accepted_session_count=payload.get("accepted_session_count", 0),
-            review_count=payload.get("review_count", 0),
-            last_reviewed_at=payload.get("last_reviewed_at"),
-            snooze_count=payload.get("snooze_count", 0),
+            schema_version=_normalize_int(payload.get("schema_version"), default=_SCHEMA_VERSION, minimum=1),
+            phase=_normalize_phase(payload.get("phase", "initial_setup")),
+            session_state=_normalize_session_state(payload.get("session_state", "idle")),
+            active_topic_id=_compact_text(payload.get("active_topic_id"), max_len=48) or None,
+            session_started_at=_normalize_timestamp(payload.get("session_started_at")),
+            session_answer_count=_normalize_int(payload.get("session_answer_count"), default=0, minimum=0),
+            session_answer_limit=_normalize_int(
+                payload.get("session_answer_limit"),
+                default=_INITIAL_SESSION_ANSWER_LIMIT,
+                minimum=1,
+                maximum=8,
+            ),
+            last_interaction_at=_normalize_timestamp(payload.get("last_interaction_at")),
+            last_session_closed_at=_normalize_timestamp(payload.get("last_session_closed_at")),
+            next_invite_after=_normalize_timestamp(payload.get("next_invite_after")),
+            setup_completed_at=_normalize_timestamp(payload.get("setup_completed_at")),
+            accepted_session_count=_normalize_int(payload.get("accepted_session_count"), default=0, minimum=0),
+            review_count=_normalize_int(payload.get("review_count"), default=0, minimum=0),
+            last_reviewed_at=_normalize_timestamp(payload.get("last_reviewed_at")),
+            snooze_count=_normalize_int(payload.get("snooze_count"), default=0, minimum=0),
             topics=tuple(topics),
         )
 
@@ -1003,6 +1041,7 @@ class UserDiscoveryInvite:
     body: str
     salience: float
     reason: str
+    display_prompt_stage: str = "opener"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1051,19 +1090,43 @@ class UserDiscoveryService:
     """Own the lifecycle of Twinr's bounded discovery sessions."""
 
     store: UserDiscoveryStateStore
+    user_profile_store: ManagedContextFileStore | None = None
     policy_engine: UserDiscoveryPolicyEngine | None = None
+    authoritative_profile_reader: UserDiscoveryAuthoritativeProfileReader | None = None
     initial_session_minutes: int = _INITIAL_SESSION_MINUTES
     lifelong_session_minutes: int = _LIFELONG_SESSION_MINUTES
+    _authoritative_coverage_cache: UserDiscoveryAuthoritativeCoverage | None = field(
+        init=False,
+        default=None,
+        repr=False,
+    )
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "UserDiscoveryService":
+        project_root = Path(config.project_root).expanduser().resolve()
+        configured_personality_dir = Path(config.personality_dir or "personality")
+        personality_dir = (
+            configured_personality_dir
+            if configured_personality_dir.is_absolute()
+            else project_root / configured_personality_dir
+        )
         return cls(
             store=UserDiscoveryStateStore.from_config(config),
+            user_profile_store=ManagedContextFileStore(
+                personality_dir / Path(_DEFAULT_USER_PROFILE_PATH).name,
+                section_title=_DEFAULT_USER_PROFILE_SECTION_TITLE,
+                root_dir=config.project_root,
+            ),
             policy_engine=UserDiscoveryPolicyEngine.from_config(config),
+            authoritative_profile_reader=UserDiscoveryAuthoritativeProfileReader.from_config(config),
         )
 
     def load_state(self) -> UserDiscoveryState:
-        return self._refresh_phase(self.store.load(), now=_utc_now())
+        self._authoritative_coverage_cache = None
+        try:
+            return self._refresh_phase(self.store.load(), now=_utc_now())
+        finally:
+            self._authoritative_coverage_cache = None
 
     def manage(
         self,
@@ -1079,6 +1142,7 @@ class UserDiscoveryService:
         callbacks: UserDiscoveryCommitCallbacks | None = None,
         now: datetime | None = None,
     ) -> UserDiscoveryResult:
+        self._authoritative_coverage_cache = None
         effective_now = (now or _utc_now()).astimezone(timezone.utc)
         normalized_action = _compact_text(action, max_len=32).lower().replace("-", "_").replace(" ", "_")
         normalized_topic_id = self._normalize_topic_id(topic_id)
@@ -1089,130 +1153,145 @@ class UserDiscoveryService:
             if not fact.is_empty()
         )
         state = self._refresh_phase(self.store.load(), now=effective_now)
-
-        if normalized_action == "status":
-            self.store.save(state)
-            return self._build_status_result(state, topic_id=normalized_topic_id, now=effective_now)
-        if normalized_action == "start_or_resume":
-            return self._start_or_resume(state, now=effective_now, topic_id=normalized_topic_id)
-        if normalized_action == "pause_session":
-            return self._pause_session(state, now=effective_now)
-        if normalized_action == "snooze":
-            return self._snooze(state, now=effective_now, snooze_days=snooze_days)
-        if normalized_action == "skip_topic":
-            return self._skip_topic(state, now=effective_now, topic_id=normalized_topic_id)
-        if normalized_action == "answer":
-            return self._record_answer(
-                state,
-                now=effective_now,
-                topic_id=normalized_topic_id,
-                memory_routes=normalized_routes,
-                topic_complete=_normalize_bool(topic_complete),
-                permission_granted=permission_granted,
-                callbacks=callbacks,
-            )
-        if normalized_action == "review_profile":
-            return self._review_profile(state, now=effective_now, topic_id=normalized_topic_id)
-        if normalized_action == "delete_fact":
-            if normalized_fact_id is None:
-                raise ValueError("delete_fact requires a fact_id.")
-            return self._delete_fact(state, now=effective_now, fact_id=normalized_fact_id, callbacks=callbacks)
-        if normalized_action == "replace_fact":
-            if normalized_fact_id is None:
-                raise ValueError("replace_fact requires a fact_id.")
-            return self._replace_fact(
-                state,
-                now=effective_now,
-                fact_id=normalized_fact_id,
-                replacement_routes=normalized_routes,
-                callbacks=callbacks,
-            )
-        raise ValueError(f"Unsupported user discovery action: {action!r}")
+        try:
+            if normalized_action == "status":
+                self.store.save(state)
+                return self._build_status_result(state, topic_id=normalized_topic_id, now=effective_now)
+            if normalized_action == "start_or_resume":
+                return self._start_or_resume(state, now=effective_now, topic_id=normalized_topic_id)
+            if normalized_action == "pause_session":
+                return self._pause_session(state, now=effective_now)
+            if normalized_action == "snooze":
+                return self._snooze(state, now=effective_now, snooze_days=snooze_days)
+            if normalized_action == "skip_topic":
+                return self._skip_topic(state, now=effective_now, topic_id=normalized_topic_id)
+            if normalized_action == "answer":
+                return self._record_answer(
+                    state,
+                    now=effective_now,
+                    topic_id=normalized_topic_id,
+                    memory_routes=normalized_routes,
+                    topic_complete=_normalize_bool(topic_complete),
+                    permission_granted=permission_granted,
+                    callbacks=callbacks,
+                )
+            if normalized_action == "review_profile":
+                return self._review_profile(state, now=effective_now, topic_id=normalized_topic_id)
+            if normalized_action == "delete_fact":
+                if normalized_fact_id is None:
+                    raise ValueError("delete_fact requires a fact_id.")
+                return self._delete_fact(state, now=effective_now, fact_id=normalized_fact_id, callbacks=callbacks)
+            if normalized_action == "replace_fact":
+                if normalized_fact_id is None:
+                    raise ValueError("replace_fact requires a fact_id.")
+                return self._replace_fact(
+                    state,
+                    now=effective_now,
+                    fact_id=normalized_fact_id,
+                    replacement_routes=normalized_routes,
+                    callbacks=callbacks,
+                )
+            raise ValueError(f"Unsupported user discovery action: {action!r}")
+        finally:
+            self._authoritative_coverage_cache = None
 
     def build_invitation(self, *, now: datetime | None = None) -> UserDiscoveryInvite | None:
+        self._authoritative_coverage_cache = None
         effective_now = (now or _utc_now()).astimezone(timezone.utc)
         state = self._refresh_phase(self.store.load(), now=effective_now)
-        if state.session_state == "active":
-            return None
-        next_invite_after = _parse_timestamp(state.next_invite_after)
-        if next_invite_after is not None and effective_now < next_invite_after:
-            return None
-
-        if state.phase != "initial_setup" and self._review_due(state, now=effective_now):
-            review_topic_id = self._select_review_topic(state, now=effective_now) or "basics"
-            return UserDiscoveryInvite(
-                invite_kind="review_profile",
-                phase=state.phase,
-                topic_id=review_topic_id,
-                topic_label="Profile Review",
-                display_topic_label="Gelerntes",
-                session_minutes=self.lifelong_session_minutes,
-                headline="Ich kann dir zeigen, was ich schon ueber dich gelernt habe.",
-                body="Dann kannst du bestaetigen, aendern oder loeschen, was nicht mehr passt.",
-                salience=0.9,
-                reason="user_discovery_review_due",
-            )
-
-        if state.phase == "initial_setup":
-            topic_id = state.active_topic_id or self._select_initial_topic(state)
-            if topic_id is None:
+        try:
+            if state.session_state == "active":
                 return None
-            definition = _TOPICS_BY_ID[topic_id]
-            if state.accepted_session_count <= 0:
+            next_invite_after = _parse_timestamp(state.next_invite_after)
+            if next_invite_after is not None and effective_now < next_invite_after:
+                return None
+
+            if state.phase != "initial_setup" and self._review_due(state, now=effective_now):
+                review_topic_id = self._select_review_topic(state, now=effective_now) or "basics"
                 return UserDiscoveryInvite(
-                    invite_kind="start_setup",
+                    invite_kind="review_profile",
+                    phase=state.phase,
+                    topic_id=review_topic_id,
+                    topic_label="Profile Review",
+                    display_topic_label="Gelerntes",
+                    session_minutes=self.lifelong_session_minutes,
+                    headline="Ich kann dir zeigen, was ich schon ueber dich gelernt habe.",
+                    body="Dann kannst du bestaetigen, aendern oder loeschen, was nicht mehr passt.",
+                    salience=0.9,
+                    reason="user_discovery_review_due",
+                    display_prompt_stage="review",
+                )
+
+            if state.phase == "initial_setup":
+                topic_id = state.active_topic_id or self._select_initial_topic(state)
+                if topic_id is None:
+                    return None
+                definition = _TOPICS_BY_ID[topic_id]
+                display_prompt_stage = self._display_prompt_stage(state, topic_id)
+                if state.accepted_session_count <= 0:
+                    return UserDiscoveryInvite(
+                        invite_kind="start_setup",
+                        phase=state.phase,
+                        topic_id=topic_id,
+                        topic_label=definition.label,
+                        display_topic_label=definition.display_label,
+                        session_minutes=self.initial_session_minutes,
+                        headline="Hast du 15 Minuten? Lass uns die Einrichtung starten.",
+                        body=_compact_text(
+                            f"Wir koennen jederzeit pausieren. Ich beginne mit {definition.display_label}.",
+                            max_len=112,
+                        ),
+                        salience=0.98,
+                        reason="user_discovery_initial_setup_due",
+                        display_prompt_stage=display_prompt_stage,
+                    )
+                return UserDiscoveryInvite(
+                    invite_kind="resume_setup",
                     phase=state.phase,
                     topic_id=topic_id,
                     topic_label=definition.label,
                     display_topic_label=definition.display_label,
                     session_minutes=self.initial_session_minutes,
-                    headline="Hast du 15 Minuten? Lass uns die Einrichtung starten.",
+                    headline="Wollen wir bei deiner Einrichtung weitermachen?",
                     body=_compact_text(
-                        f"Wir koennen jederzeit pausieren. Ich beginne mit {definition.display_label}.",
+                        f"Als Naechstes waere {definition.display_label} dran. Das geht in kleinen Schritten.",
                         max_len=112,
                     ),
-                    salience=0.98,
-                    reason="user_discovery_initial_setup_due",
+                    salience=0.94,
+                    reason="user_discovery_resume_due",
+                    display_prompt_stage=display_prompt_stage,
                 )
+
+            topic_id = state.active_topic_id or self._select_lifelong_topic(state, now=effective_now)
+            if topic_id is None:
+                return None
+            definition = _TOPICS_BY_ID[topic_id]
+            policy = self._topic_policy(state, topic_id, now=effective_now)
+            display_prompt_stage = self._display_prompt_stage(state, topic_id)
+            if policy.question_style == "gentle_optional":
+                body = (
+                    f"Nur wenn es fuer dich gerade passt. Ich haette heute ein paar leichte Fragen zu "
+                    f"{definition.display_label}."
+                )
+            elif policy.question_style == "deeper_follow_up":
+                body = f"Ich haette heute ein paar kurze Folgefragen zu {definition.display_label}."
+            else:
+                body = f"Ich haette heute ein paar kurze Fragen zu {definition.display_label}."
             return UserDiscoveryInvite(
-                invite_kind="resume_setup",
+                invite_kind="lifelong_learning",
                 phase=state.phase,
                 topic_id=topic_id,
                 topic_label=definition.label,
                 display_topic_label=definition.display_label,
-                session_minutes=self.initial_session_minutes,
-                headline="Wollen wir bei deiner Einrichtung weitermachen?",
-                body=_compact_text(
-                    f"Als Naechstes waere {definition.display_label} dran. Das geht in kleinen Schritten.",
-                    max_len=112,
-                ),
-                salience=0.94,
-                reason="user_discovery_resume_due",
+                session_minutes=self.lifelong_session_minutes,
+                headline="Ich wuerde dich gern noch besser kennenlernen. Hast du 5 Minuten?",
+                body=_compact_text(body, max_len=112),
+                salience=max(0.62, min(0.94, 0.84 + policy.invite_salience_adjustment)),
+                reason="user_discovery_lifelong_due",
+                display_prompt_stage=display_prompt_stage,
             )
-
-        topic_id = state.active_topic_id or self._select_lifelong_topic(state, now=effective_now)
-        if topic_id is None:
-            return None
-        definition = _TOPICS_BY_ID[topic_id]
-        policy = self._topic_policy(state, topic_id, now=effective_now)
-        if policy.question_style == "gentle_optional":
-            body = f"Nur wenn es fuer dich gerade passt. Ich haette heute ein paar leichte Fragen zu {definition.display_label}."
-        elif policy.question_style == "deeper_follow_up":
-            body = f"Ich haette heute ein paar kurze Folgefragen zu {definition.display_label}."
-        else:
-            body = f"Ich haette heute ein paar kurze Fragen zu {definition.display_label}."
-        return UserDiscoveryInvite(
-            invite_kind="lifelong_learning",
-            phase=state.phase,
-            topic_id=topic_id,
-            topic_label=definition.label,
-            display_topic_label=definition.display_label,
-            session_minutes=self.lifelong_session_minutes,
-            headline="Ich wuerde dich gern noch besser kennenlernen. Hast du 5 Minuten?",
-            body=_compact_text(body, max_len=112),
-            salience=max(0.62, min(0.94, 0.84 + policy.invite_salience_adjustment)),
-            reason="user_discovery_lifelong_due",
-        )
+        finally:
+            self._authoritative_coverage_cache = None
 
     def _start_or_resume(
         self,
@@ -2215,7 +2294,7 @@ class UserDiscoveryService:
     def _setup_topics_completed(self, state: UserDiscoveryState) -> int:
         completed = 0
         for topic_id in _TOPIC_ORDER:
-            topic_state = self._topic_state(state, topic_id)
+            topic_state = self._effective_topic_state(state, topic_id)
             if topic_state.completed_once or topic_state.skip_count > 0:
                 completed += 1
         return completed
@@ -2250,7 +2329,7 @@ class UserDiscoveryService:
 
     def _select_initial_topic(self, state: UserDiscoveryState) -> str | None:
         for topic_id in _TOPIC_ORDER:
-            topic_state = self._topic_state(state, topic_id)
+            topic_state = self._effective_topic_state(state, topic_id)
             if topic_state.completed_once or topic_state.skip_count > 0:
                 continue
             if _TOPICS_BY_ID[topic_id].sensitive and topic_state.permission_state == "declined":
@@ -2262,7 +2341,7 @@ class UserDiscoveryService:
         signals = self.policy_engine.load_signals(now=now) if self.policy_engine is not None else {}
         candidates: list[tuple[tuple[object, ...], str]] = []
         for definition in _TOPIC_DEFINITIONS:
-            topic_state = self._topic_state(state, definition.topic_id)
+            topic_state = self._effective_topic_state(state, definition.topic_id)
             if definition.sensitive and topic_state.permission_state == "declined":
                 continue
             policy = self._topic_policy(state, definition.topic_id, now=now, signals=signals)
@@ -2272,6 +2351,75 @@ class UserDiscoveryService:
             return None
         candidates.sort(key=lambda entry: entry[0])
         return candidates[0][1]
+
+    def _display_prompt_stage(self, state: UserDiscoveryState, topic_id: str) -> str:
+        """Return whether the next visible discovery card is an opener or follow-up."""
+
+        topic_state = self._effective_topic_state(state, topic_id)
+        if topic_state.fact_count > 0 or topic_state.last_answer_at is not None:
+            return "follow_up"
+        return "opener"
+
+    def _effective_topic_state(self, state: UserDiscoveryState, topic_id: str) -> UserDiscoveryTopicState:
+        """Return topic state plus authoritative profile-coverage overlays."""
+
+        topic_state = self._topic_state(state, topic_id)
+        if topic_state.completed_once or topic_state.fact_count > 0 or topic_state.last_answer_at is not None:
+            return topic_state
+        curated_coverage = topic_id == "basics" and self._curated_user_profile_has_name()
+        authoritative_coverage = self._authoritative_profile_coverage().covers(topic_id)
+        if not curated_coverage and not authoritative_coverage:
+            return topic_state
+        coverage_timestamp = _utc_now().isoformat()
+        return replace(
+            topic_state,
+            completed_once=True,
+            last_answer_at=topic_state.last_answer_at or coverage_timestamp,
+            last_completed_at=topic_state.last_completed_at or coverage_timestamp,
+        )
+
+    def _authoritative_profile_coverage(self) -> UserDiscoveryAuthoritativeCoverage:
+        """Load authoritative discovery coverage once per public service call."""
+
+        if self._authoritative_coverage_cache is None:
+            if self.authoritative_profile_reader is None:
+                self._authoritative_coverage_cache = UserDiscoveryAuthoritativeCoverage()
+            else:
+                self._authoritative_coverage_cache = self.authoritative_profile_reader.load()
+        return self._authoritative_coverage_cache
+
+    def _curated_user_profile_has_name(self) -> bool:
+        """Return whether the curated USER.md base text already names the user."""
+
+        return self._curated_user_profile_name() is not None
+
+    def _curated_user_profile_name(self) -> str | None:
+        """Return the curated USER.md display name when one explicit `User:` line exists."""
+
+        base_text = self._curated_user_profile_base_text()
+        if not base_text:
+            return None
+        for raw_line in base_text.splitlines():
+            field, separator, value = raw_line.partition(":")
+            if separator != ":":
+                continue
+            if field.strip().casefold() != "user":
+                continue
+            name = _compact_text(value, max_len=80).strip().strip(".")
+            if name:
+                return name
+        return None
+
+    def _curated_user_profile_base_text(self) -> str:
+        """Load the authored USER.md base text outside Twinr-managed updates."""
+
+        if self.user_profile_store is None:
+            return ""
+        try:
+            return self.user_profile_store.load_base_text()
+        except Exception:
+            LOGGER.warning("Failed to read curated USER.md base text for discovery coverage.", exc_info=True)
+            return ""
 
     def _question_brief(
         self,
@@ -2338,7 +2486,7 @@ class UserDiscoveryService:
                 invite_salience_adjustment=0.0,
             )
         definition = _TOPICS_BY_ID[normalized_topic_id]
-        topic_state = self._topic_state(state, normalized_topic_id)
+        topic_state = self._effective_topic_state(state, normalized_topic_id)
         return self.policy_engine.topic_policy(
             topic_id=normalized_topic_id,
             completed_once=topic_state.completed_once,

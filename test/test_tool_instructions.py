@@ -25,6 +25,15 @@ class ToolInstructionTests(unittest.TestCase):
 
         self.assertIn("do not call search_live_info again", instructions)
         self.assertIn("exact requested detail could not be verified", instructions)
+        self.assertIn("clearly resolved the real question", instructions)
+        self.assertIn("do not treat that unresolved search result as a final resolution", instructions)
+        self.assertIn("verification_status partial or unverified", instructions)
+        self.assertIn("question_resolved false", instructions)
+        self.assertIn("Do not answer a freshness-sensitive external question from memory", instructions)
+        self.assertIn("connect_service_integration tool", instructions)
+        self.assertIn("right info panel shows the QR", instructions)
+        self.assertIn("send_whatsapp_message tool", instructions)
+        self.assertIn("confirmation_required", instructions)
 
     def test_compact_tool_instructions_prevent_repeated_search_calls_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -34,6 +43,15 @@ class ToolInstructionTests(unittest.TestCase):
 
         self.assertIn("do not call it again", instructions)
         self.assertIn("exact requested detail", instructions)
+        self.assertIn("clearly resolved the real question", instructions)
+        self.assertIn("do not treat that unresolved search result as final", instructions)
+        self.assertIn("verification_status partial or unverified", instructions)
+        self.assertIn("question_resolved false", instructions)
+        self.assertIn("Do not answer a freshness-sensitive external question from memory", instructions)
+        self.assertIn("connect_service_integration", instructions)
+        self.assertIn("right info panel shows the QR", instructions)
+        self.assertIn("send_whatsapp_message", instructions)
+        self.assertIn("confirmation_required", instructions)
 
     def test_tool_instructions_require_exact_retrieval_tools_before_answering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -72,6 +90,11 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Use vad_quiet only", instructions)
         self.assertIn("no-motion trigger", instructions)
         self.assertIn("mutation request, not a request to end the conversation", instructions)
+        self.assertIn("manage_voice_quiet_mode", instructions)
+        self.assertIn("temporary stay quiet", instructions)
+        self.assertIn("manual button path still remains available", instructions)
+        self.assertIn("ask one short follow-up question for the quiet duration", instructions)
+        self.assertIn("Do not answer a quiet-mode status question from conversational memory", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -96,6 +119,10 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Use vad_quiet only", instructions)
         self.assertIn("no-motion trigger", instructions)
         self.assertIn("not as end_conversation", instructions)
+        self.assertIn("manage_voice_quiet_mode", instructions)
+        self.assertIn("manual button path still works", instructions)
+        self.assertIn("ask one short follow-up question for the duration", instructions)
+        self.assertIn("Do not answer a quiet-mode status question from reassurance", instructions)
 
     def test_discovery_instructions_cover_semantic_intents_and_self_disclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -187,6 +214,9 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Open smart-home or house-status questions usually need handoff_specialist_worker", instructions)
         self.assertIn("do not frame it as web research", instructions)
         self.assertIn("prefer an automation handoff over a search handoff", instructions)
+        self.assertIn("stay quiet for a bounded time", instructions)
+        self.assertIn("must call handoff_specialist_worker instead of answering directly", instructions)
+        self.assertIn("Do not answer those voice-quiet control turns", instructions)
 
     def test_supervisor_decision_instructions_use_structured_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,6 +227,7 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("three structured actions", instructions)
         self.assertIn("Choose handoff", instructions)
         self.assertIn("Choose handoff for open smart-home or house-status questions", instructions)
+        self.assertIn("counts as fresh web information and must be handoff", instructions)
         self.assertIn("spoken_ack is optional", instructions)
         self.assertIn("leave spoken_ack null", instructions)
         self.assertIn("generic stock phrase", instructions)
@@ -204,6 +235,16 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("short conversational follow-up", instructions)
         self.assertIn("calm companion voice", instructions)
         self.assertIn("context_scope", instructions)
+        self.assertIn("runtime-local handoffs", instructions)
+        self.assertIn("current runtime-status checks", instructions)
+        self.assertIn("Choose handoff, not direct", instructions)
+        self.assertIn("Those runtime-local control turns must inspect or mutate the real runtime state", instructions)
+        self.assertIn("bounded voice-quiet set", instructions)
+        self.assertIn("runtime_tool_name", instructions)
+        self.assertIn("runtime_tool_arguments_json", instructions)
+        self.assertIn("manage_voice_quiet_mode", instructions)
+        self.assertIn('{"action":"status"}', instructions)
+        self.assertIn('{"action":"clear"}', instructions)
         self.assertIn("location_hint", instructions)
         self.assertIn("date_context", instructions)
         self.assertIn("plain spoken language only", instructions)

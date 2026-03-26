@@ -11,6 +11,10 @@ owned_concerns:
   - Derive realtime-safe schema variants for provider APIs with stricter top-level limits
   - Keep the guided user-discovery schema aligned with semantic start/continue intents, review, correction, deletion, and structured memory-routing contracts
   - Keep smart-home discovery, filtered-state, control, aggregation, and stream schemas aligned with the generic integration contracts
+  - Keep browser-automation schema descriptions aligned with the policy that generic web research stays on search_live_info and deeper site checks require explicit site intent or user-approved follow-up
+  - Keep the bounded external service-connect schema aligned with spoken pairing requests and the right-info-panel QR/status contract
+  - Keep the bounded WhatsApp-send schema aligned with remembered-contact lookup, explicit final confirmation, and phone-suffix clarification
+  - Keep the temporary voice-quiet schema aligned with bounded stay-quiet requests that suppress transcript-first wake without becoming a persistent setting
 out_of_scope:
   - Tool handler execution or runtime-side side effects
   - Prompt instruction authoring or tool selection policy

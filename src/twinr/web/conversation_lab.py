@@ -14,14 +14,13 @@ from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from inspect import signature
 from pathlib import Path
-from typing import Any
 import json
 import secrets
 import threading
 
-from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
-from twinr.agent.base_agent.runtime import TwinrRuntime
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.agent.tools import (
     DualLaneToolLoop,
     RealtimeToolExecutor,
@@ -33,6 +32,7 @@ from twinr.agent.tools import (
     build_tool_agent_instructions,
     bind_realtime_tool_handlers,
 )
+from twinr.agent.tools.runtime.availability import available_realtime_tool_names
 from twinr.memory.longterm.retrieval.operator_search import run_long_term_operator_search
 from twinr.ops import TwinrUsageStore
 from twinr.ops.paths import TwinrOpsPaths
@@ -45,6 +45,7 @@ from twinr.web.support.store import read_text_file, write_text_file
 
 _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "search_live_info",
+    "browser_automation",
     "schedule_reminder",
     "list_automations",
     "create_time_automation",
@@ -63,6 +64,7 @@ _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "update_personality",
     "configure_world_intelligence",
     "update_simple_setting",
+    "manage_voice_quiet_mode",
     "list_smart_home_entities",
     "read_smart_home_state",
     "control_smart_home_entities",
@@ -670,16 +672,20 @@ def _build_tool_loop(
 ) -> tuple[object, tuple[object, ...]]:
     provider_bundle = build_streaming_provider_bundle(config)
     tool_executor = RealtimeToolExecutor(owner)
+    available_tool_names = available_realtime_tool_names(
+        config,
+        tool_names=_CONVERSATION_LAB_TOOL_NAMES,
+    )
     tool_handlers = bind_realtime_tool_handlers(tool_executor)
     tool_handlers = {
         name: handler
         for name, handler in tool_handlers.items()
-        if name in _CONVERSATION_LAB_TOOL_NAMES
+        if name in available_tool_names
     }
     tool_schemas = (
-        build_compact_agent_tool_schemas(_CONVERSATION_LAB_TOOL_NAMES)
+        build_compact_agent_tool_schemas(available_tool_names)
         if (config.llm_provider or "").strip().lower() == "groq"
-        else build_agent_tool_schemas(_CONVERSATION_LAB_TOOL_NAMES)
+        else build_agent_tool_schemas(available_tool_names)
     )
     loop_resources: list[object] = [provider_bundle.print_backend, provider_bundle.tool_agent, provider_bundle.support_backend]
     if (

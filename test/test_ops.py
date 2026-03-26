@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import base64
 import json
 import socket
 import sys
@@ -11,7 +12,8 @@ from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import RuntimeSnapshotStore, TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.memory import ConversationTurn
 from twinr.ops import (
@@ -25,6 +27,10 @@ from twinr.ops import (
 )
 from twinr.ops.locks import loop_instance_lock
 from twinr.ops.runtime_scope import build_scoped_runtime_config, resolve_scoped_runtime_state_path
+
+_TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl9l2sAAAAASUVORK5CYII="
+)
 
 
 def _fake_respeaker_snapshot(
@@ -140,8 +146,8 @@ class OpsModuleTests(unittest.TestCase):
 
         self.assertEqual(summary.requests_total, 2)
         self.assertEqual(summary.total_tokens, 250)
-        self.assertEqual(summary.by_kind["conversation"], 1)
-        self.assertEqual(summary.by_kind["search"], 1)
+        self.assertEqual((summary.by_kind or {})["conversation"], 1)
+        self.assertEqual((summary.by_kind or {})["search"], 1)
         self.assertEqual(records[-1].request_id, "req_2")
 
     def test_build_support_bundle_redacts_secrets_and_includes_snapshot(self) -> None:
@@ -527,6 +533,145 @@ class OpsModuleTests(unittest.TestCase):
         self.assertIn("Queue: Thermal_GP58", result.details)
         self.assertIn("CUPS response: request id is Thermal_GP58-31 (1 file(s))", result.details)
         self.assertIn("Physical paper output must be confirmed at the printer.", result.details)
+
+    def test_aideck_camera_self_test_reports_image_sanity(self) -> None:
+        class FakeCamera:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def capture_photo(self, *, output_path, filename: str):
+                self.calls.append(
+                    {
+                        "output_path": output_path,
+                        "filename": filename,
+                    }
+                )
+                return SimpleNamespace(
+                    data=_TINY_PNG,
+                    content_type="image/png",
+                    filename=filename,
+                    source_device="aideck://192.168.4.1:5000",
+                    input_format="aideck-cpx-raw-bayer",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                camera_device="aideck://192.168.4.1:5000",
+            )
+            fake_camera = FakeCamera()
+            runner = TwinrSelfTestRunner(
+                config,
+                camera_factory=lambda _config: fake_camera,
+            )
+            result = runner.run("aideck_camera")
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.summary, "AI-Deck frame captured.")
+        self.assertIn("AI-Deck stream became reachable and returned one frame.", result.details)
+        self.assertIn("Input format: aideck-cpx-raw-bayer", result.details)
+        self.assertIn("Image size: 1x1", result.details)
+
+    def test_aideck_camera_self_test_writes_artifact_from_in_memory_capture(self) -> None:
+        class FakeCamera:
+            def __init__(self) -> None:
+                self.output_paths: list[object] = []
+
+            def capture_photo(self, *, output_path, filename: str):
+                self.output_paths.append(output_path)
+                return SimpleNamespace(
+                    data=_TINY_PNG,
+                    content_type="image/png",
+                    filename=filename,
+                    source_device="aideck://192.168.4.1:5000",
+                    input_format="aideck-cpx-raw-bayer",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                camera_device="aideck://192.168.4.1:5000",
+            )
+            fake_camera = FakeCamera()
+            runner = TwinrSelfTestRunner(
+                config,
+                camera_factory=lambda _config: fake_camera,
+            )
+
+            result = runner.run("aideck_camera")
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(fake_camera.output_paths, [None])
+
+    def test_aideck_camera_self_test_requires_aideck_device_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, camera_device="/dev/video0")
+            runner = TwinrSelfTestRunner(config)
+
+            result = runner.run("aideck_camera")
+
+        self.assertEqual(result.status, "fail")
+        self.assertIn("aideck://", result.summary)
+
+    def test_drone_stack_self_test_queues_and_cancels_pending_manual_arm_mission(self) -> None:
+        class FakeDroneMission:
+            def __init__(self, *, mission_id: str, state: str, summary: str) -> None:
+                self.mission_id = mission_id
+                self.state = state
+                self.summary = summary
+
+        class FakeDroneState:
+            def __init__(self) -> None:
+                self.service_status = "ready"
+                self.skill_layer_mode = "stationary_observe_only"
+                self.pose = SimpleNamespace(tracking_state="tracking")
+                self.safety = SimpleNamespace(
+                    radio_ready=True,
+                    pose_ready=True,
+                    can_arm=True,
+                    reasons=(),
+                )
+
+        class FakeDroneClient:
+            def __init__(self, *, base_url: str, timeout_s: float) -> None:
+                self.base_url = base_url
+                self.timeout_s = timeout_s
+
+            def health_payload(self) -> dict[str, object]:
+                return {"ok": True, "can_arm": True}
+
+            def state(self) -> FakeDroneState:
+                return FakeDroneState()
+
+            def create_inspect_mission(self, **kwargs) -> FakeDroneMission:
+                self.last_request = kwargs
+                return FakeDroneMission(
+                    mission_id="DRN-123",
+                    state="pending_manual_arm",
+                    summary="queued",
+                )
+
+            def cancel_mission(self, mission_id: str) -> FakeDroneMission:
+                return FakeDroneMission(
+                    mission_id=mission_id,
+                    state="cancelled",
+                    summary="cancelled",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                drone_enabled=True,
+                drone_base_url="http://127.0.0.1:8791",
+            )
+            runner = TwinrSelfTestRunner(config)
+            with patch("twinr.ops.self_test.RemoteDroneServiceClient", FakeDroneClient):
+                result = runner.run("drone_stack")
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.summary, "Drone daemon reached and bounded inspect mission queued safely.")
+        self.assertIn("Mission state: pending_manual_arm", result.details)
+        self.assertIn("Cancel state: cancelled", result.details)
 
 
 if __name__ == "__main__":

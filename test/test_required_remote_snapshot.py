@@ -3,12 +3,13 @@ from pathlib import Path
 import os
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.required_remote_snapshot import (
     assess_required_remote_watchdog_snapshot,
     ensure_required_remote_watchdog_snapshot_ready,
@@ -25,8 +26,8 @@ class _FakeStore:
         self._snapshot = snapshot
         self.path = Path(path)
 
-    def load(self):
-        return self._snapshot
+    def load(self) -> RemoteMemoryWatchdogSnapshot | None:
+        return cast(RemoteMemoryWatchdogSnapshot | None, self._snapshot)
 
 
 class _SequencedStore:
@@ -35,14 +36,14 @@ class _SequencedStore:
         self._index = 0
         self.path = Path(path)
 
-    def load(self):
+    def load(self) -> RemoteMemoryWatchdogSnapshot | None:
         if not self._snapshots:
             return None
         if self._index >= len(self._snapshots):
-            return self._snapshots[-1]
+            return cast(RemoteMemoryWatchdogSnapshot | None, self._snapshots[-1])
         snapshot = self._snapshots[self._index]
         self._index += 1
-        return snapshot
+        return cast(RemoteMemoryWatchdogSnapshot | None, snapshot)
 
 
 def _iso_utc(value: datetime) -> str:
@@ -62,6 +63,7 @@ def _build_snapshot(
     probe_inflight: bool = False,
     probe_age_s: float | None = None,
     previous_sample_ages_s: tuple[float, ...] = (),
+    probe: dict[str, object] | None = None,
 ) -> RemoteMemoryWatchdogSnapshot:
     captured_at = now - timedelta(seconds=age_s)
     heartbeat_at = captured_at if heartbeat_age_s is None else now - timedelta(seconds=heartbeat_age_s)
@@ -76,6 +78,7 @@ def _build_snapshot(
         consecutive_ok=1 if status == "ok" else 0,
         consecutive_fail=1 if status == "fail" else 0,
         detail=None if status == "ok" else "remote unavailable",
+        probe=probe,
     )
     recent_samples = []
     for seq, previous_age_s in enumerate(sorted(previous_sample_ages_s, reverse=True), start=1):
@@ -132,6 +135,31 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertTrue(assessment.ready)
         self.assertTrue(assessment.pid_alive)
         self.assertEqual(assessment.sample_status, "ok")
+
+    def test_assess_rejects_non_archive_safe_ok_snapshot(self) -> None:
+        now = datetime.now(timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=2.0,
+            probe={
+                "warm_result": {
+                    "archive_safe": False,
+                    "health_tier": "degraded",
+                }
+            },
+        )
+        config = TwinrConfig()
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertFalse(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertIn("archive-safe", assessment.detail.lower())
 
     def test_assess_rejects_missing_snapshot(self) -> None:
         config = TwinrConfig()
@@ -483,6 +511,37 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
 
         self.assertTrue(assessment.ready)
         self.assertEqual(assessment.sample_status, "ok")
+
+    def test_ensure_recovers_dead_external_watchdog_owner_before_waiting_for_ready_snapshot(self) -> None:
+        now = datetime.now(timezone.utc)
+        dead = _build_snapshot(now=now, pid=999999, age_s=1.0)
+        starting = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            status="starting",
+            ready=False,
+            probe_inflight=True,
+            probe_age_s=0.0,
+        )
+        ok = _build_snapshot(now=now, pid=os.getpid(), status="ok", ready=True)
+        config = TwinrConfig(long_term_memory_remote_watchdog_startup_wait_s=1.0)
+        starter_calls: list[str] = []
+
+        def _starter(_config: TwinrConfig, env_file: str) -> int | None:
+            starter_calls.append(env_file)
+            return 4321
+
+        with mock.patch("twinr.agent.workflows.required_remote_snapshot.time.sleep", return_value=None):
+            assessment = ensure_required_remote_watchdog_snapshot_ready(
+                config,
+                store=_SequencedStore((dead, starting, ok)),
+                env_file="/twinr/.env",
+                recovery_starter=_starter,
+            )
+
+        self.assertTrue(assessment.ready)
+        self.assertEqual(assessment.sample_status, "ok")
+        self.assertEqual(starter_calls, ["/twinr/.env"])
 
 
 class TwinrConfigRemoteRuntimeCheckModeTests(unittest.TestCase):

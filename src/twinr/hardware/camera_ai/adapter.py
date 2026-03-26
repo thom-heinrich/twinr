@@ -510,6 +510,7 @@ class LocalAICameraAdapter:
         frame_rgb: Any,
         observed_at: float | None = None,
         frame_at: float | None = None,
+        allow_pose_fallback: bool = True,
     ) -> AICameraObservation:
         """Run the hot gesture lane on an externally supplied RGB frame.
 
@@ -539,6 +540,7 @@ class LocalAICameraAdapter:
                 detection=self._coerce_detection_result(detection),
                 frame_rgb=frame_rgb,
                 frame_at=resolved_frame_at,
+                allow_pose_fallback=allow_pose_fallback,
             )
         finally:
             self._lock.release()
@@ -685,6 +687,7 @@ class LocalAICameraAdapter:
         detection: DetectionResult,
         frame_rgb: Any,
         frame_at: float | None,
+        allow_pose_fallback: bool = True,
     ) -> AICameraObservation:
         """Run the dedicated gesture lane from one supplied detection/frame pair."""
 
@@ -757,18 +760,23 @@ class LocalAICameraAdapter:
                     sparse_keypoints=sparse_keypoints,
                 )
                 gesture_debug = gesture_pipeline.debug_snapshot()
-            with workflow_span(
-                name="camera_adapter_gesture_pose_fallback",
-                kind="decision",
-            ):
-                pose_fallback, pose_fallback_error = self._resolve_gesture_pose_fallback(
-                    runtime,
-                    observed_at=observed_at,
-                    observed_monotonic=observed_monotonic,
-                    detection=gesture_detection,
-                    frame_rgb=frame_rgb,
-                    gesture_observation=gesture_observation,
-                )
+            pose_fallback: PoseResult | None
+            pose_fallback_error: str | None
+            if allow_pose_fallback:
+                with workflow_span(
+                    name="camera_adapter_gesture_pose_fallback",
+                    kind="decision",
+                ):
+                    pose_fallback, pose_fallback_error = self._resolve_gesture_pose_fallback(
+                        runtime,
+                        observed_at=observed_at,
+                        observed_monotonic=observed_monotonic,
+                        detection=gesture_detection,
+                        frame_rgb=frame_rgb,
+                        gesture_observation=gesture_observation,
+                    )
+            else:
+                pose_fallback, pose_fallback_error = None, None
             final_resolved_source = str(gesture_debug.get("resolved_source", "none") or "none")
             if (
                 pose_fallback is not None
@@ -813,6 +821,7 @@ class LocalAICameraAdapter:
                     None if pose_hint_confidence is None else round(float(pose_hint_confidence), 3)
                 ),
                 "pose_fallback_used": pose_fallback is not None,
+                "pose_fallback_disabled_by_caller": not allow_pose_fallback,
                 "pose_fallback_error": pose_fallback_error,
                 "pose_fallback_fine_hand_gesture": (
                     None if pose_fallback is None else pose_fallback.fine_hand_gesture.value

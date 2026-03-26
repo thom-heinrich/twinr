@@ -41,6 +41,9 @@ from twinr.memory.longterm.storage.remote_state import (
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.query_normalization import LongTermQueryProfile
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+
 
 class _StaticQueryRewriter:
     def __init__(self, mapping: dict[str, str]) -> None:
@@ -653,8 +656,6 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 personality_dir="personality",
                 memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
                 long_term_memory_enabled=True,
-                long_term_memory_mode="remote_primary",
-                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
             )
             prompt_context_store = PromptContextStore.from_config(config)
             graph_store = TwinrPersonalGraphStore(
@@ -696,8 +697,6 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 personality_dir="personality",
                 memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
                 long_term_memory_enabled=True,
-                long_term_memory_mode="remote_primary",
-                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
             )
             prompt_context_store = PromptContextStore.from_config(config)
             graph_store = TwinrPersonalGraphStore(
@@ -742,7 +741,6 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 personality_dir="personality",
                 memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
                 long_term_memory_enabled=True,
-                long_term_memory_mode="remote_primary",
                 long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
             )
             prompt_context_store = PromptContextStore.from_config(config)
@@ -808,6 +806,86 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         ]
         self.assertEqual(len(summary_objects), 1)
         self.assertEqual(summary_objects[0].memory_id, reflection_summary.memory_id)
+
+    def test_persist_longterm_turn_preserves_text_channel_provenance_for_memory_and_personality(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            personality_learning = _RecordingPersonalityLearningService()
+            turn = LongTermConversationTurn(
+                transcript="Janina hat mir bei WhatsApp geschrieben, dass der Arzttermin verschoben wurde.",
+                response="Ich merke mir die WhatsApp-Nachricht zu Janinas Termin.",
+                source="whatsapp",
+                modality="text",
+            )
+            try:
+                LongTermMemoryService._persist_longterm_turn(
+                    config=config,
+                    store=service.prompt_context_store,
+                    graph_store=service.graph_store,
+                    object_store=service.object_store,
+                    midterm_store=service.midterm_store,
+                    extractor=service.extractor,
+                    consolidator=service.consolidator,
+                    reflector=service.reflector,
+                    sensor_memory=service.sensor_memory,
+                    retention_policy=service.retention_policy,
+                    personality_learning=personality_learning,
+                    item=turn,
+                )
+                stored_objects = service.object_store.load_objects()
+            finally:
+                service.shutdown()
+
+        self.assertEqual(len(personality_learning.conversation_calls), 1)
+        recorded_turn, _recorded_result = personality_learning.conversation_calls[0]
+        self.assertEqual(recorded_turn.source, "whatsapp")
+        self.assertEqual(recorded_turn.modality, "text")
+        episode = next(item for item in stored_objects if item.kind == "episode")
+        self.assertEqual(episode.source.source_type, "whatsapp")
+        self.assertEqual(episode.source.modality, "text")
+        self.assertEqual(episode.attributes["request_source"], "whatsapp")
+        self.assertEqual(episode.attributes["input_modality"], "text")
+
+    def test_import_external_conversation_turn_preserves_timestamp_without_personality_learning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            personality_learning = _RecordingPersonalityLearningService()
+            service.personality_learning = personality_learning
+            occurred_at = datetime(2026, 3, 1, 9, 30, tzinfo=timezone.utc)
+            try:
+                service.import_external_conversation_turn(
+                    transcript="Ich komme heute etwas später.",
+                    response="WhatsApp contact Anna replied: Alles klar.",
+                    source="whatsapp_history",
+                    modality="text",
+                    created_at=occurred_at,
+                )
+                service.run_retention()
+                stored_objects = service.object_store.load_objects()
+            finally:
+                service.shutdown()
+
+        self.assertEqual(personality_learning.conversation_calls, [])
+        episode = next(item for item in stored_objects if item.kind == "episode")
+        self.assertEqual(episode.source.source_type, "whatsapp_history")
+        self.assertEqual(episode.attributes["request_source"], "whatsapp_history")
+        self.assertEqual(episode.attributes["input_modality"], "text")
+        self.assertEqual(episode.attributes["retention_policy"], "preserve")
+        self.assertEqual(episode.created_at.date().isoformat(), "2026-03-01")
 
     def test_record_personality_tool_history_routes_tool_calls_to_learning_service(self) -> None:
         service = object.__new__(LongTermMemoryService)
@@ -2185,12 +2263,12 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                         LongTermMemoryObjectV1(
                             memory_id="fact:corinna_phone_old",
                             kind="contact_method_fact",
-                            summary="Corinna Maier can be reached at +491761234.",
+                            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                             source=self._source("turn:1"),
                             status="active",
                             confidence=0.95,
                             slot_key="contact:person:corinna_maier:phone",
-                            value_key="+491761234",
+                            value_key=_TEST_CORINNA_PHONE_OLD,
                             attributes={"person_ref": "person:corinna_maier"},
                         ),
                     ),
@@ -2198,12 +2276,12 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                         LongTermMemoryObjectV1(
                             memory_id="fact:corinna_phone_new",
                             kind="contact_method_fact",
-                            summary="Corinna Maier can be reached at +4940998877.",
+                            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                             source=self._source("turn:2"),
                             status="uncertain",
                             confidence=0.92,
                             slot_key="contact:person:corinna_maier:phone",
-                            value_key="+4940998877",
+                            value_key=_TEST_CORINNA_PHONE_NEW,
                             attributes={"person_ref": "person:corinna_maier"},
                         ),
                     ),

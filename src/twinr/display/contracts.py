@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from twinr.display.emoji_cues import DisplayEmojiCue
     from twinr.display.face_cues import DisplayFaceCue
     from twinr.display.presentation_cues import DisplayPresentationCue
+    from twinr.display.service_connect_cues import DisplayServiceConnectCue
 
 
 DisplayStateFields = tuple[tuple[str, str], ...]
@@ -46,6 +47,7 @@ class TwinrDisplayAdapter(Protocol):
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None: ...
 

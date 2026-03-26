@@ -17,6 +17,7 @@ and runtime snapshot durability.
 - surface the currently visible reserve-lane card as bounded grounding context for supervisor/search lanes when the user is clearly reacting to what Twinr is showing, including a stronger per-turn authoritative overlay for fast supervisor decisions
 - keep the first-word lane on bounded local context so direct replies never block on remote long-term retrieval
 - keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
+- keep runtime-local tool turns on a bounded tiny-recent context when broader long-term memory is not needed, so status/control handoffs do not block the streaming final lane on remote retrieval
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
 - expose reminder-reservation release semantics so workflow races can unwind a reserved reminder before speech starts without forcing a fake failure retry delay
 - expose the runtime-side guided user-discovery flow so Twinr can persist, review, correct, and delete high-value get-to-know-you facts across managed context, graph memory, and durable memory without bloating orchestration code
@@ -24,6 +25,7 @@ and runtime snapshot durability.
 - forward completed tool history into long-term-backed personality learning after a turn is finalized
 - keep the explicit best-effort `flush_long_term_memory()` API bounded to the caller's timeout while reserving the stricter remote-primary minimum only for long-term object/graph/midterm durability paths, not already-attested prompt-context writes
 - expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape Twinr's calm place/world awareness
+- own the bounded temporary voice-quiet window so Twinr can suppress transcript-first wake and automatic follow-up for a user-requested period without changing the button/manual path
 
 `runtime` does **not** own:
 - workflow loops or hardware/audio orchestration
@@ -44,6 +46,7 @@ and runtime snapshot durability.
 | [display_grounding.py](./display_grounding.py) | Read the active reserve-lane cue and turn it into bounded provider-grounding messages plus an authoritative per-turn supervisor overlay |
 | [memory.py](./memory.py) | Mutate structured and durable memory |
 | [automation.py](./automation.py) | Manage reminders and automations, including releasing reserved reminders when delivery is aborted before output starts |
+| [voice_quiet.py](./voice_quiet.py) | Runtime-owned temporary voice-quiet window state |
 | [snapshot.py](./snapshot.py) | Persist and restore runtime state |
 | [component.yaml](./component.yaml) | Structured package metadata |
 

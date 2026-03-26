@@ -9,6 +9,7 @@ owned_concerns:
   - Expose the websocket client, FastAPI server, and local session bridge used by edge-orchestrator deployments
   - Correlate remote tool calls and results while keeping fast ack phrases mapped to stable transport IDs
   - Define bounded streaming voice contracts for edge audio frames, runtime-state updates, wake confirmations, same-stream transcript commits, follow-up windows, and barge-in interrupts
+  - Carry the runtime-owned temporary voice-quiet deadline through the voice contracts and fail closed for idle wake/follow-up while that bounded quiet window is active
   - Host the server-side voice session that evaluates activation candidates and emits same-stream transcript or barge-in decisions
   - Adapt the thh1986 remote ASR HTTP service into bounded transcript calls for the server-side voice session
   - Host the embedded `/v1/transcribe` HTTP surface when the remote-ASR URL points back to the local orchestrator server

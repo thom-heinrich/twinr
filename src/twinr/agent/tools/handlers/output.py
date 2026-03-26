@@ -16,6 +16,7 @@ from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo
 
 from .handler_telemetry import emit_best_effort, record_event_best_effort, record_usage_best_effort
+from ..runtime.browser_follow_up import remember_pending_browser_follow_up_hint
 
 _T = TypeVar("_T")
 
@@ -535,6 +536,17 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         requested_model = _normalize_optional_text(getattr(result, "requested_model", None))
         actual_model = _normalize_optional_text(getattr(result, "model", None))
         fallback_reason = _normalize_optional_text(getattr(result, "fallback_reason", None))
+        verification_status = _normalize_optional_text(getattr(result, "verification_status", None)).lower() or None
+        question_resolved_raw = getattr(result, "question_resolved", None)
+        question_resolved = question_resolved_raw if isinstance(question_resolved_raw, bool) else None
+        site_follow_up_recommended = bool(getattr(result, "site_follow_up_recommended", False))
+        site_follow_up_reason = _normalize_optional_text(getattr(result, "site_follow_up_reason", None))
+        site_follow_up_url = _normalize_optional_text(getattr(result, "site_follow_up_url", None))
+        site_follow_up_domain = _normalize_optional_text(getattr(result, "site_follow_up_domain", None)).lower()
+        if not site_follow_up_recommended:
+            site_follow_up_reason = ""
+            site_follow_up_url = ""
+            site_follow_up_domain = ""
         search_attempts = _search_attempts_payload(getattr(result, "attempt_log", ()))
         search_budget = _search_budget_payload(search_attempts)
     except Exception as exc:
@@ -556,6 +568,29 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         _emit_kv_safe(owner, "search_actual_model", actual_model)
     if fallback_reason:
         _emit_kv_safe(owner, "search_fallback_reason", fallback_reason)
+    if verification_status:
+        _emit_kv_safe(owner, "search_verification_status", verification_status)
+    if question_resolved is not None:
+        _emit_kv_safe(owner, "search_question_resolved", str(question_resolved).lower())
+    if site_follow_up_recommended:
+        _emit_kv_safe(owner, "search_site_follow_up_recommended", "true")
+    if site_follow_up_reason:
+        _emit_kv_safe(owner, "search_site_follow_up_reason", site_follow_up_reason)
+    if site_follow_up_url:
+        _emit_kv_safe(owner, "search_site_follow_up_url", site_follow_up_url)
+    if site_follow_up_domain:
+        _emit_kv_safe(owner, "search_site_follow_up_domain", site_follow_up_domain)
+    remember_pending_browser_follow_up_hint(
+        getattr(owner, "runtime", None),
+        question=question,
+        follow_up_url=site_follow_up_url or None,
+        follow_up_domain=site_follow_up_domain or None,
+        site_follow_up_recommended=site_follow_up_recommended,
+        question_resolved=question_resolved,
+        verification_status=verification_status,
+        reason=site_follow_up_reason or None,
+        sources=tuple(sources),
+    )
     if search_attempts:
         _emit_kv_safe(owner, "search_attempt_count", len(search_attempts))
     search_budget_trace = search_budget.get("search_budget_trace")
@@ -590,6 +625,12 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
             requested_model=requested_model or None,
             actual_model=actual_model or None,
             fallback_reason=fallback_reason or None,
+            verification_status=verification_status or None,
+            question_resolved=question_resolved,
+            site_follow_up_recommended=site_follow_up_recommended,
+            site_follow_up_reason=site_follow_up_reason or None,
+            site_follow_up_url=site_follow_up_url or None,
+            site_follow_up_domain=site_follow_up_domain or None,
             **search_budget,
         ),
         event_name="search_usage_store_failed",
@@ -607,6 +648,12 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
             requested_model=requested_model or None,
             actual_model=actual_model or None,
             fallback_reason=fallback_reason or None,
+            verification_status=verification_status or None,
+            question_resolved=question_resolved,
+            site_follow_up_recommended=site_follow_up_recommended,
+            site_follow_up_reason=site_follow_up_reason or None,
+            site_follow_up_url=site_follow_up_url or None,
+            site_follow_up_domain=site_follow_up_domain or None,
             search_attempts=search_attempts,
             **search_budget,
         ),
@@ -636,6 +683,12 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         "requested_model": requested_model or None,
         "actual_model": actual_model or None,
         "fallback_reason": fallback_reason or None,
+        "verification_status": verification_status or None,
+        "question_resolved": question_resolved,
+        "site_follow_up_recommended": site_follow_up_recommended,
+        "site_follow_up_reason": site_follow_up_reason or None,
+        "site_follow_up_url": site_follow_up_url or None,
+        "site_follow_up_domain": site_follow_up_domain or None,
         "response_id": response_id or None,
         "request_id": request_id or None,
         "model": actual_model or None,

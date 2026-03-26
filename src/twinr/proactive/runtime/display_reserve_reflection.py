@@ -31,6 +31,7 @@ _DEFAULT_CANDIDATE_LIMIT = 3
 _DEFAULT_MAX_AGE_DAYS = 14.0
 _ALLOWED_SENSITIVITY = frozenset({"low", "normal"})
 _CONTINUITY_PACKET_KINDS = frozenset({"recent_turn_continuity", "conversation_context"})
+_HIDDEN_CONTINUITY_PACKET_KINDS = frozenset({"recent_turn_continuity"})
 _DEVICE_PACKET_KINDS = frozenset({"device_context", "device_interaction"})
 _SUPPRESSED_PACKET_KINDS = frozenset({"interaction_quality"})
 _META_PACKET_KINDS = frozenset({"conversation_state", "policy_context"})
@@ -190,6 +191,35 @@ def _summary_hook_hint(item: LongTermMemoryObjectV1) -> str:
     return ""
 
 
+def _summary_card_intent(item: LongTermMemoryObjectV1, *, title: str) -> dict[str, str]:
+    """Return structured semantic card intent for one reflection summary."""
+
+    attributes = _mapping(item.attributes)
+    summary_type = _compact_text(attributes.get("summary_type"), max_len=32).casefold()
+    memory_domain = _compact_text(attributes.get("memory_domain"), max_len=48).casefold()
+    anchor = _compact_text(title, max_len=96) or "dem Thema"
+    if summary_type == "thread" or _compact_text(attributes.get("person_name"), max_len=80):
+        return {
+            "topic_semantics": f"frueherer gemeinsamer Faden zu {anchor}",
+            "statement_intent": f"Twinr soll ruhig daran erinnern, dass es zu {anchor} noch einen gemeinsamen Gespraechsfaden gibt.",
+            "cta_intent": "Zu einem kurzen Rueckblick, Update oder Weiterreden einladen.",
+            "relationship_stance": "ruhiger Rueckbezug statt Befund oder Ticket",
+        }
+    if memory_domain == "smart_home_environment" or summary_type == "environment_reflection":
+        return {
+            "topic_semantics": f"kuerzlich beobachteter Kontext rund um {anchor}",
+            "statement_intent": f"Twinr soll einen konkreten kuerzlichen Kontext zu {anchor} ruhig ansprechen.",
+            "cta_intent": "Zu einer kurzen Einordnung oder Reaktion einladen.",
+            "relationship_stance": "sachlich, alltagsnah und nicht technisch",
+        }
+    return {
+        "topic_semantics": f"reflektierter Nachtrag zu {anchor}",
+        "statement_intent": f"Twinr soll einen ruhigen Nachtrag oder Rueckbezug zu {anchor} anstossen.",
+        "cta_intent": "Zu einer kurzen Reaktion oder Ergaenzung einladen.",
+        "relationship_stance": "ruhig und persoenlich statt meta oder abstrakt",
+    }
+
+
 def _summary_display_copy(item: LongTermMemoryObjectV1, *, title: str) -> tuple[str, str]:
     """Return one deterministic display-safe fallback copy for reflection summaries."""
 
@@ -264,6 +294,7 @@ def _summary_candidate(item: LongTermMemoryObjectV1, *, now: datetime, max_age_d
             "candidate_family": "reflection_summary",
             "display_anchor": title,
             "hook_hint": _summary_hook_hint(item),
+            "card_intent": _summary_card_intent(item, title=title),
             "reflection_kind": _compact_text(_mapping(item.attributes).get("summary_type"), max_len=40) or "summary",
             "topic_title": title,
             "summary": _compact_text(item.summary, max_len=180),
@@ -314,6 +345,27 @@ def _packet_explicit_display_anchor(packet: LongTermMidtermPacketV1) -> str:
     return ""
 
 
+def _packet_structured_topic_anchor(packet: LongTermMidtermPacketV1) -> str:
+    """Return one structured topic anchor for visible continuity callbacks.
+
+    Raw transcript excerpts can preserve useful conversational texture, but
+    they are too close to immediate turn residue to serve as the visible topic
+    on the right lane. Continuity callbacks should therefore surface only when
+    reflection already carries a structured user-recognizable topic anchor.
+    """
+
+    attributes = _mapping(packet.attributes)
+    for value in (
+        attributes.get("display_anchor"),
+        attributes.get("person_name"),
+        attributes.get("environment_id"),
+    ):
+        label = _sentence_label(value, max_len=72)
+        if label:
+            return label
+    return ""
+
+
 def _packet_action(packet: LongTermMidtermPacketV1) -> tuple[str, str]:
     """Return one bounded action/attention pair for a midterm packet."""
 
@@ -343,12 +395,28 @@ def _continuity_packet_has_displayable_anchor(packet: LongTermMidtermPacketV1) -
     """Return whether one continuity packet has a display-worthy semantic anchor.
 
     Continuity packets are useful only when they preserve a concrete thread the
-    user could still recognize later. Token-only turn residue like farewells or
+    user could still recognize later. Raw transcript residue, farewells, or
     generic closure cues should stay in memory, but they should not become
-    visible reserve-lane conversation openers.
+    visible reserve-lane conversation openers without a structured topic
+    anchor.
     """
 
-    return bool(_packet_explicit_display_anchor(packet))
+    return bool(_packet_structured_topic_anchor(packet))
+
+
+def _packet_allowed_for_visible_lane(packet: LongTermMidtermPacketV1) -> bool:
+    """Return whether one packet may surface on the visible right lane.
+
+    Immediate turn-continuity packets exist so spoken follow-up can preserve the
+    just-finished exchange until slower memory enrichment catches up. On the
+    right lane, that same immediacy reads like Twinr echoing the conversation
+    that only just happened, which is noisy rather than meaningfully proactive.
+    The visible lane therefore skips raw latest-turn continuity and waits for
+    slower, more durable continuity artifacts instead.
+    """
+
+    kind = _compact_text(packet.kind, max_len=40).casefold()
+    return kind not in _HIDDEN_CONTINUITY_PACKET_KINDS
 
 
 def _packet_candidate_family(packet: LongTermMidtermPacketV1) -> str:
@@ -370,7 +438,24 @@ def _packet_display_anchor(packet: LongTermMidtermPacketV1, *, title: str) -> st
     """Return one compact user-facing anchor for a reflection packet."""
 
     del title
+    if _compact_text(packet.kind, max_len=40).casefold() in _CONTINUITY_PACKET_KINDS:
+        return _packet_structured_topic_anchor(packet)
     return _packet_explicit_display_anchor(packet)
+
+
+def _packet_anchor_origin(packet: LongTermMidtermPacketV1) -> str:
+    """Describe which structured field supplied the visible anchor."""
+
+    attributes = _mapping(packet.attributes)
+    if _sentence_label(attributes.get("display_anchor"), max_len=72):
+        return "display_anchor"
+    if _sentence_label(attributes.get("transcript_excerpt"), max_len=72):
+        return "transcript_excerpt"
+    if _sentence_label(attributes.get("person_name"), max_len=72):
+        return "person_name"
+    if _sentence_label(attributes.get("environment_id"), max_len=72):
+        return "environment_id"
+    return "unknown"
 
 
 def _packet_hook_hint(packet: LongTermMidtermPacketV1) -> str:
@@ -387,6 +472,87 @@ def _packet_hook_hint(packet: LongTermMidtermPacketV1) -> str:
         if text:
             return text
     return ""
+
+
+def _packet_display_goal(candidate_family: str) -> str:
+    """Return one prompt-facing goal label for reflection-derived copy."""
+
+    if candidate_family == "reflection_thread":
+        return "call_back_to_earlier_conversation"
+    if candidate_family == "reflection_preference":
+        return "surface_personal_preference"
+    if candidate_family == "reflection_context":
+        return "raise_recent_context"
+    return "raise_reflection_follow_up"
+
+
+def _packet_topic_summary(
+    *,
+    candidate_family: str,
+    display_anchor: str,
+    anchor_origin: str,
+) -> str:
+    """Return one compact prompt hint about how the reflection topic should feel."""
+
+    anchor = _compact_text(display_anchor, max_len=96) or "das Thema"
+    if candidate_family == "reflection_thread":
+        if anchor_origin in {"display_anchor", "transcript_excerpt"}:
+            return _compact_text(
+                f"Frueherer Gespraechsfaden zu {anchor}; ruhig daran anknuepfen, nicht wie neue Diagnose oder Stoerungsmeldung formulieren.",
+                max_len=180,
+            )
+        return _compact_text(
+            f"Frueherer offener Gespraechsfaden zu {anchor}; eher wie natuerliches Nachfassen als wie neue Meldung formulieren.",
+            max_len=180,
+        )
+    if candidate_family == "reflection_preference":
+        return _compact_text(
+            f"Gelerntes ueber {anchor}; alltagsnah und persoenlich, nicht technisch oder etikettenhaft formulieren.",
+            max_len=180,
+        )
+    return _compact_text(
+        f"Reflektierter Anlass zu {anchor}; alltagsnah und konkret formulieren.",
+        max_len=180,
+    )
+
+
+def _packet_card_intent(
+    *,
+    candidate_family: str,
+    display_anchor: str,
+    anchor_origin: str,
+) -> dict[str, str]:
+    """Return structured semantic card intent for one reflection packet."""
+
+    del anchor_origin
+    anchor = _compact_text(display_anchor, max_len=96) or "dem Thema"
+    if candidate_family == "reflection_thread":
+        return {
+            "topic_semantics": f"frueherer Gespraechsfaden zu {anchor}",
+            "statement_intent": f"Twinr soll ruhig an einen frueheren Gespraechsfaden zu {anchor} anknuepfen.",
+            "cta_intent": "Zu einem kurzen Weiterreden, Update oder Nachfassen einladen.",
+            "relationship_stance": "ruhiger Rueckbezug statt Diagnose, Stoerung oder Supportfall",
+        }
+    if candidate_family == "reflection_preference":
+        return {
+            "topic_semantics": f"gelerntes persoenliches Detail zu {anchor}",
+            "statement_intent": f"Twinr soll ein gelerntes persoenliches Detail zu {anchor} alltagsnah ansprechen.",
+            "cta_intent": "Zu einer kurzen Bestaetigung, Ergaenzung oder Nuancierung einladen.",
+            "relationship_stance": "persoenlich und aufmerksam statt etikettenhaft",
+        }
+    if candidate_family == "reflection_context":
+        return {
+            "topic_semantics": f"kuerzlicher Kontext rund um {anchor}",
+            "statement_intent": f"Twinr soll einen kuerzlichen Kontext zu {anchor} ruhig und konkret ansprechen.",
+            "cta_intent": "Zu einer kurzen Einordnung oder Reaktion einladen.",
+            "relationship_stance": "alltagsnah und nicht technisch",
+        }
+    return {
+        "topic_semantics": f"reflektierter Anlass zu {anchor}",
+        "statement_intent": f"Twinr soll einen reflektierten Anlass zu {anchor} natuerlich und konkret ansprechen.",
+        "cta_intent": "Zu einer kurzen Reaktion oder Ergaenzung einladen.",
+        "relationship_stance": "ruhig und konkret statt meta",
+    }
 
 
 def _packet_display_copy(
@@ -480,6 +646,8 @@ def _packet_candidate(packet: LongTermMidtermPacketV1, *, now: datetime, max_age
 
     if _compact_text(packet.sensitivity, max_len=24).casefold() not in _ALLOWED_SENSITIVITY:
         return None
+    if not _packet_allowed_for_visible_lane(packet):
+        return None
     if packet.updated_at.astimezone(timezone.utc) < now - timedelta(days=max_age_days):
         return None
     action, attention_state = _packet_action(packet)
@@ -508,6 +676,9 @@ def _packet_candidate(packet: LongTermMidtermPacketV1, *, now: datetime, max_age
         candidate_family=candidate_family,
     )
     packet_attributes = _mapping(packet.attributes)
+    anchor_origin = _packet_anchor_origin(packet)
+    transcript_excerpt = _compact_text(packet_attributes.get("transcript_excerpt"), max_len=160)
+    response_excerpt = _compact_text(packet_attributes.get("response_excerpt"), max_len=160)
     return AmbientDisplayImpulseCandidate(
         topic_key=topic_key,
         title=title,
@@ -524,8 +695,22 @@ def _packet_candidate(packet: LongTermMidtermPacketV1, *, now: datetime, max_age
         candidate_family=candidate_family,
         generation_context={
             "candidate_family": candidate_family,
+            "display_goal": _packet_display_goal(candidate_family),
             "display_anchor": display_anchor,
             "hook_hint": _packet_hook_hint(packet),
+            "card_intent": _packet_card_intent(
+                candidate_family=candidate_family,
+                display_anchor=display_anchor,
+                anchor_origin=anchor_origin,
+            ),
+            "topic_summary": _packet_topic_summary(
+                candidate_family=candidate_family,
+                display_anchor=display_anchor,
+                anchor_origin=anchor_origin,
+            ),
+            "display_anchor_origin": anchor_origin,
+            "transcript_excerpt": transcript_excerpt,
+            "response_excerpt": response_excerpt,
             "reflection_kind": _compact_text(packet.kind, max_len=48),
             "topic_title": title,
             "summary": _compact_text(packet.summary, max_len=180),

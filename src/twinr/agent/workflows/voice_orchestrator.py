@@ -230,6 +230,7 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Send the current edge runtime state to the server."""
 
@@ -244,6 +245,7 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
             self._last_runtime_state = event
@@ -271,6 +273,7 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Cache one runtime state before the websocket opens.
 
@@ -292,6 +295,7 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
             self._last_runtime_state = event
@@ -342,6 +346,7 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        voice_quiet_until_utc: str | None = None,
     ) -> OrchestratorVoiceRuntimeStateEvent:
         """Construct one normalized runtime-state event for caching and send."""
 
@@ -356,6 +361,7 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            voice_quiet_until_utc=voice_quiet_until_utc,
         )
 
     def _build_hello_request(
@@ -384,6 +390,7 @@ class EdgeVoiceOrchestrator:
                 runtime_state.targeted_inference_blocked if runtime_state is not None else None
             ),
             recommended_channel=runtime_state.recommended_channel if runtime_state is not None else None,
+            voice_quiet_until_utc=runtime_state.voice_quiet_until_utc if runtime_state is not None else None,
             state_attested=runtime_state is not None,
         )
 

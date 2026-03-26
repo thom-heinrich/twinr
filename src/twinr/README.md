@@ -10,11 +10,13 @@ set of shared helpers that multiple subsystems reuse.
 - expose the canonical `twinr` import surface
 - bootstrap `python -m twinr` and the installed `twinr` script
 - gate `/twinr`-only runtime sidecars such as the display companion and remote-memory watchdog so the acceptance instance stays authoritative, while allowing explicit per-env display-companion overrides
+- define the versioned package boundary around optional browser automation contracts and its local unversioned workspace hook
 - keep shared root helpers for text normalization, local-date parsing, and structured JSON response handling
 - define the boundary around the documented child packages
 
 `twinr` does **not** own:
 - workflow-loop behavior in [`agent/workflows`](./agent/workflows/README.md)
+- browser-agent implementation details in [`browser_automation`](./browser_automation/README.md)
 - long-lived external messaging transports in [`channels`](./channels/README.md)
 - provider transport logic in [`providers`](./providers/README.md)
 - memory internals in [`memory`](./memory/README.md)
@@ -27,6 +29,7 @@ set of shared helpers that multiple subsystems reuse.
 |---|---|
 | [__init__.py](./__init__.py) | Lazy root exports |
 | [__main__.py](./__main__.py) | CLI bootstrap and dispatch |
+| [browser_automation/README.md](./browser_automation/README.md) | Optional browser-automation API boundary |
 | [channels/README.md](./channels/README.md) | External text-channel package |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [llm_json.py](./llm_json.py) | Structured-response helper |
@@ -55,6 +58,7 @@ PYTHONPATH=src python3 -m twinr --env-file .env --run-streaming-loop --loop-dura
 
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
+- [browser_automation](./browser_automation/README.md)
 - [channels](./channels/README.md)
 - [agent](./agent/README.md)
 - [memory](./memory/README.md)

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from threading import RLock
+from threading import Condition, RLock
+from time import monotonic
 from typing import Any, cast
 import math
 
@@ -44,6 +45,8 @@ from .models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
 
 _DEFAULT_MAX_RESULT_AGE_S = 0.75
+_DEFAULT_CURRENT_RESULT_WAIT_S = 0.2
+_LIVE_CUSTOM_MIN_SCORE_FLOOR = 0.6
 _WAVE_WINDOW_S = 0.55
 _WAVE_MIN_SAMPLES = 3
 _WAVE_MIN_SPAN_X = 0.10
@@ -212,6 +215,7 @@ class LiveGesturePipeline:
         self.config = config
         self._runtime = MediaPipeTaskRuntime(config=config)
         self._lock = RLock()
+        self._result_condition = Condition(self._lock)
         self._latest_builtin: _RecognizerSnapshot | None = None
         self._latest_custom: _RecognizerSnapshot | None = None
         self._wave_tracker = _WaveGestureTracker()
@@ -274,23 +278,37 @@ class LiveGesturePipeline:
             runtime = self._runtime.load_runtime()
             image = self._runtime.build_image(runtime, frame_rgb=frame_rgb)
             timestamp_ms = self._runtime.timestamp_ms(observed_at)
+            live_custom_enabled = _live_custom_gesture_enabled(self.config)
             builtin_recognizer = self._runtime.ensure_live_gesture_recognizer(
                 runtime,
                 result_callback=self._handle_builtin_result,
                 num_hands_override=_LIVE_GESTURE_NUM_HANDS,
             )
             builtin_recognizer.recognize_async(image, timestamp_ms)
-            if _live_custom_gesture_enabled(self.config):
+            if live_custom_enabled:
                 custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
                     runtime,
                     result_callback=self._handle_custom_result,
                 )
                 custom_recognizer.recognize_async(image, timestamp_ms)
+            (
+                live_result_wait_s,
+                current_live_builtin_ready,
+                current_live_custom_ready,
+            ) = self._await_current_live_results(
+                timestamp_ms=timestamp_ms,
+                expect_custom=live_custom_enabled,
+            )
             return self._build_observation(
                 runtime=runtime,
                 frame_rgb=frame_rgb,
                 observed_at=observed_at,
                 timestamp_ms=timestamp_ms,
+                live_result_wait_s=live_result_wait_s,
+                current_live_builtin_ready=current_live_builtin_ready,
+                current_live_custom_ready=(
+                    current_live_custom_ready if live_custom_enabled else None
+                ),
                 primary_person_box=primary_person_box,
                 visible_person_boxes=visible_person_boxes,
                 person_count=person_count,
@@ -304,6 +322,9 @@ class LiveGesturePipeline:
         frame_rgb: Any,
         observed_at: float,
         timestamp_ms: int,
+        live_result_wait_s: float,
+        current_live_builtin_ready: bool,
+        current_live_custom_ready: bool | None,
         primary_person_box: AICameraBox | None,
         visible_person_boxes: tuple[AICameraBox, ...],
         person_count: int,
@@ -382,6 +403,12 @@ class LiveGesturePipeline:
         result_age_s = None
         if freshest_timestamp_ms > 0:
             result_age_s = max(0.0, observed_at - (freshest_timestamp_ms / 1000.0))
+        fresh_live_results_confirm_no_hand = _fresh_live_results_confirm_no_hand(
+            builtin_ready=current_live_builtin_ready,
+            custom_ready=current_live_custom_ready,
+            hand_count=hand_count,
+            live_hand_box_count=len(current_hand_boxes),
+        )
         if fine_hand_gesture == AICameraFineHandGesture.NONE:
             debug_snapshot: dict[str, object] = {
                 "resolved_source": "none",
@@ -395,6 +422,10 @@ class LiveGesturePipeline:
                 "effective_live_hand_box_count": len(effective_hand_boxes),
                 "live_hand_box_source": hand_box_source,
                 "live_result_age_s": _round_optional_confidence(result_age_s),
+                "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
+                "current_live_builtin_ready": current_live_builtin_ready,
+                "current_live_custom_ready": current_live_custom_ready,
+                "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
                 "input_person_count": max(0, int(person_count)),
                 "primary_person_box_available": primary_person_box is not None,
                 "effective_primary_person_box_available": effective_primary_person_box is not None,
@@ -406,27 +437,30 @@ class LiveGesturePipeline:
             }
             person_roi_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
             if effective_visible_person_boxes:
-                person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
-                    runtime=runtime,
-                    frame_rgb=frame_rgb,
-                    timestamp_ms=timestamp_ms,
-                    primary_person_box=effective_primary_person_box,
-                    person_boxes=effective_visible_person_boxes,
-                    sparse_keypoints=sparse_keypoints,
-                )
-                debug_snapshot.update(person_roi_debug)
-                if person_roi_choice[0] != AICameraFineHandGesture.NONE:
-                    fine_hand_gesture, fine_hand_confidence = person_roi_choice
-                    if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
-                        debug_snapshot["resolved_source"] = (
-                            "visible_person_roi"
-                            if visible_person_box_source == "live"
-                            else "recent_visible_person_roi"
-                        )
-                    else:
-                        debug_snapshot["resolved_source"] = (
-                            "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
-                        )
+                if fresh_live_results_confirm_no_hand:
+                    debug_snapshot["person_roi_skipped_reason"] = "fresh_live_no_hand_evidence"
+                else:
+                    person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
+                        runtime=runtime,
+                        frame_rgb=frame_rgb,
+                        timestamp_ms=timestamp_ms,
+                        primary_person_box=effective_primary_person_box,
+                        person_boxes=effective_visible_person_boxes,
+                        sparse_keypoints=sparse_keypoints,
+                    )
+                    debug_snapshot.update(person_roi_debug)
+                    if person_roi_choice[0] != AICameraFineHandGesture.NONE:
+                        fine_hand_gesture, fine_hand_confidence = person_roi_choice
+                        if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
+                            debug_snapshot["resolved_source"] = (
+                                "visible_person_roi"
+                                if visible_person_box_source == "live"
+                                else "recent_visible_person_roi"
+                            )
+                        else:
+                            debug_snapshot["resolved_source"] = (
+                                "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
+                            )
             if fine_hand_gesture == AICameraFineHandGesture.NONE:
                 rescue_choice, live_roi_debug = self._recognize_from_live_hand_rois(
                     runtime=runtime,
@@ -456,20 +490,23 @@ class LiveGesturePipeline:
                 ),
             )
             if full_frame_rescue_reason is not None:
-                full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
-                    runtime=runtime,
-                    frame_rgb=frame_rgb,
-                    timestamp_ms=timestamp_ms,
-                )
-                debug_snapshot.update(full_frame_debug)
-                debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
-                hand_count = max(
-                    hand_count,
-                    _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
-                )
-                if full_frame_choice[0] != AICameraFineHandGesture.NONE:
-                    fine_hand_gesture, fine_hand_confidence = full_frame_choice
-                    debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+                if fresh_live_results_confirm_no_hand:
+                    debug_snapshot["full_frame_hand_skipped_reason"] = "fresh_live_no_hand_evidence"
+                else:
+                    full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                        runtime=runtime,
+                        frame_rgb=frame_rgb,
+                        timestamp_ms=timestamp_ms,
+                    )
+                    debug_snapshot.update(full_frame_debug)
+                    debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
+                    hand_count = max(
+                        hand_count,
+                        _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
+                    )
+                    if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                        fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                        debug_snapshot["resolved_source"] = "full_frame_hand_roi"
         else:
             debug_snapshot = {
                 "resolved_source": "live_stream",
@@ -481,6 +518,10 @@ class LiveGesturePipeline:
                 "live_hand_count": hand_count,
                 "live_hand_box_count": len(current_hand_boxes),
                 "live_result_age_s": _round_optional_confidence(result_age_s),
+                "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
+                "current_live_builtin_ready": current_live_builtin_ready,
+                "current_live_custom_ready": current_live_custom_ready,
+                "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
                 "input_person_count": max(0, int(person_count)),
                 "primary_person_box_available": primary_person_box is not None,
                 "effective_primary_person_box_available": effective_primary_person_box is not None,
@@ -802,7 +843,7 @@ class LiveGesturePipeline:
                 frame_rgb=gesture_frame,
                 context_frame_rgb=gesture_context_frame,
                 category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-                min_score=self.config.custom_gesture_min_score,
+                min_score=_live_custom_min_score(self.config),
             )
             custom_candidate = _guard_person_roi_gesture_choice(
                 candidate=custom_raw_candidate,
@@ -861,8 +902,10 @@ class LiveGesturePipeline:
             ),
             hand_boxes=_extract_hand_boxes(result),
         )
-        with self._lock:
-            self._latest_builtin = snapshot
+        with self._result_condition:
+            if self._latest_builtin is None or snapshot.timestamp_ms >= self._latest_builtin.timestamp_ms:
+                self._latest_builtin = snapshot
+            self._result_condition.notify_all()
 
     def _handle_custom_result(
         self,
@@ -875,7 +918,7 @@ class LiveGesturePipeline:
         gesture, confidence = resolve_fine_hand_gesture(
             result=result,
             category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-            min_score=self.config.custom_gesture_min_score,
+            min_score=_live_custom_min_score(self.config),
         )
         snapshot = _RecognizerSnapshot(
             timestamp_ms=max(1, int(timestamp_ms)),
@@ -885,8 +928,10 @@ class LiveGesturePipeline:
             open_palm_center_x=None,
             hand_boxes=_extract_hand_boxes(result),
         )
-        with self._lock:
-            self._latest_custom = snapshot
+        with self._result_condition:
+            if self._latest_custom is None or snapshot.timestamp_ms >= self._latest_custom.timestamp_ms:
+                self._latest_custom = snapshot
+            self._result_condition.notify_all()
 
     def _recognize_from_live_hand_rois(
         self,
@@ -973,7 +1018,7 @@ class LiveGesturePipeline:
             custom_candidate = resolve_fine_hand_gesture(
                 result=custom_result,
                 category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-                min_score=self.config.custom_gesture_min_score,
+                min_score=_live_custom_min_score(self.config),
             )
             custom_choice = prefer_gesture_choice(
                 custom_choice,
@@ -1179,6 +1224,50 @@ class LiveGesturePipeline:
         if not math.isfinite(age_s) or age_s < 0.0 or age_s > _DEFAULT_MAX_RESULT_AGE_S:
             return None
         return snapshot
+
+    def _await_current_live_results(
+        self,
+        *,
+        timestamp_ms: int,
+        expect_custom: bool,
+    ) -> tuple[float, bool, bool]:
+        """Wait briefly for the current frame's async live callbacks to land."""
+
+        wait_started_at = monotonic()
+        with self._result_condition:
+            builtin_ready = _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
+            custom_ready = (
+                not expect_custom
+                or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
+            )
+            if not (builtin_ready and custom_ready):
+                self._result_condition.wait_for(
+                    lambda: (
+                        _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
+                        and (
+                            not expect_custom
+                            or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
+                        )
+                    ),
+                    timeout=_DEFAULT_CURRENT_RESULT_WAIT_S,
+                )
+                builtin_ready = _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
+                custom_ready = (
+                    not expect_custom
+                    or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
+                )
+        return monotonic() - wait_started_at, builtin_ready, custom_ready
+
+
+def _snapshot_matches_timestamp(
+    snapshot: _RecognizerSnapshot | None,
+    timestamp_ms: int,
+) -> bool:
+    """Report whether one live snapshot belongs to the requested frame or newer."""
+
+    if snapshot is None:
+        return False
+    return snapshot.timestamp_ms >= max(1, int(timestamp_ms))
 
 
 def _count_hand_landmarks(result: object) -> int:
@@ -1463,6 +1552,35 @@ def _live_custom_gesture_enabled(config: MediaPipeVisionConfig) -> bool:
     """Return whether the live lane should load the custom recognizer at all."""
 
     return bool(getattr(config, "custom_gesture_model_path", None)) and bool(_LIVE_CUSTOM_FINE_GESTURE_MAP)
+
+
+def _live_custom_min_score(config: MediaPipeVisionConfig) -> float:
+    """Clamp live custom-gesture acceptance to a stricter HCI-specific floor."""
+
+    configured = _coerce_unit_interval(getattr(config, "custom_gesture_min_score", None))
+    return max(_LIVE_CUSTOM_MIN_SCORE_FLOOR, configured or 0.0)
+
+
+def _fresh_live_results_confirm_no_hand(
+    *,
+    builtin_ready: bool,
+    custom_ready: bool | None,
+    hand_count: int,
+    live_hand_box_count: int,
+) -> bool:
+    """Report when fresh live callbacks explicitly found no hand evidence.
+
+    When the dedicated live-stream recognizers are current for this frame and
+    still produce zero hands/boxes, broader person/full-frame rescues become
+    much more likely to hallucinate than to help. The low-latency HCI lane
+    should trust that fresh `no hand` signal and fail closed.
+    """
+
+    if not builtin_ready:
+        return False
+    if custom_ready is not True:
+        return False
+    return hand_count <= 0 and live_hand_box_count <= 0
 
 
 def _summarize_gesture_categories(

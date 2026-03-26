@@ -30,6 +30,11 @@ from twinr.web.presenters.integrations import (
 from twinr.web.presenters.memory import _memory_sections
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _health_card_detail
 from twinr.web.presenters.self_coding import build_self_coding_ops_page_context
+from twinr.web.presenters.social_history import (
+    _build_social_history_learning_record,
+    _social_history_learning_panel,
+    _social_history_learning_sections,
+)
 from twinr.web.presenters.settings import _adaptive_timing_view, _settings_sections
 from twinr.web.presenters.voice import (
     _capture_voice_profile_sample,
@@ -60,7 +65,10 @@ __all__ = [
     "_recent_named_files",
     "_reminder_rows",
     "_resolve_named_file",
+    "_build_social_history_learning_record",
     "_settings_sections",
+    "_social_history_learning_panel",
+    "_social_history_learning_sections",
     "_whatsapp_integration_context",
     "build_ops_debug_page_context",
     "build_self_coding_ops_page_context",

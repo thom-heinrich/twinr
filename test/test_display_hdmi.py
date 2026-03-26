@@ -13,7 +13,7 @@ from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
@@ -33,7 +33,11 @@ from twinr.display.hdmi_default_scene import HdmiDefaultSceneRenderer
 from twinr.display.hdmi_default_scene import HdmiStatusPanelModel
 from twinr.display.hdmi_wayland import HdmiWaylandDisplay
 from twinr.display.presentation_cues import DisplayPresentationCardCue, DisplayPresentationCue
+from twinr.display.service_connect_cues import DisplayServiceConnectCue
 from twinr.display.wayland_env import apply_wayland_environment, resolve_wayland_socket
+
+
+_QR_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aW7cAAAAASUVORK5CYII="
 
 
 class _FakeFont:
@@ -227,6 +231,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         draw = _RecordingDraw()
         panel = renderer._build_panel_model(
             reserve_bus=types.SimpleNamespace(
+                service_connect_cue=None,
                 ambient_impulse_cue=DisplayAmbientImpulseCue(
                     topic_key="ai companions",
                     headline="Denkst du, dass das heute kippt?",
@@ -258,6 +263,31 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertTrue(any("Denkst du" in call["text"] for call in draw.text_calls))
         self.assertTrue(any("draufschauen" in call["text"] for call in draw.text_calls))
 
+    def test_service_connect_panel_model_uses_qr_payload_and_service_copy(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+
+        panel = renderer._build_panel_model(
+            reserve_bus=types.SimpleNamespace(
+                service_connect_cue=DisplayServiceConnectCue(
+                    service_id="whatsapp",
+                    service_label="WhatsApp",
+                    phase="qr",
+                    summary="Scan the QR",
+                    detail="Open Linked Devices on your phone.",
+                    qr_image_data_url=_QR_DATA_URL,
+                    accent="warm",
+                ),
+                ambient_impulse_cue=None,
+                owner="service_connect",
+            )
+        )
+
+        self.assertEqual(panel.eyebrow, "WHATSAPP")
+        self.assertEqual(panel.headline, "Scan the QR")
+        self.assertEqual(panel.helper_text, "Open Linked Devices on your phone.")
+        self.assertEqual(panel.image_data_url, _QR_DATA_URL)
+        self.assertEqual(panel.accent, "warm")
+
     def test_prompt_mode_panel_uses_available_height_for_long_copy(self) -> None:
         renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
         draw = _RecordingDraw()
@@ -279,6 +309,52 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         rendered_lines = tuple(call["text"] for call in draw.text_calls)
         self.assertEqual(rendered_lines, ("H1", "H2", "H3", "H4", "B1", "B2", "B3", "B4"))
         self.assertGreater(len(rendered_lines), 5)
+
+    def test_prompt_mode_panel_shrinks_text_to_keep_copy_inside_shorter_box(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+        draw = _RecordingDraw()
+        panel = HdmiStatusPanelModel(
+            eyebrow="",
+            headline="H1|H2",
+            helper_text="B1|B2",
+            cards=(),
+            prompt_mode=True,
+        )
+
+        renderer._draw_status_panel(
+            draw,
+            box=(400, 80, 780, 250),
+            panel=panel,
+            compact=False,
+        )
+
+        rendered_lines = tuple(call["text"] for call in draw.text_calls)
+        text_sizes = {call["font"].size for call in draw.text_calls}
+        self.assertEqual(rendered_lines, ("H1", "H2", "B1", "B2"))
+        self.assertEqual(text_sizes, {28})
+
+    def test_prompt_mode_panel_clips_on_min_size_before_overflowing_box(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+        draw = _RecordingDraw()
+        panel = HdmiStatusPanelModel(
+            eyebrow="",
+            headline="H1|H2",
+            helper_text="B1|B2",
+            cards=(),
+            prompt_mode=True,
+        )
+
+        renderer._draw_status_panel(
+            draw,
+            box=(400, 80, 780, 190),
+            panel=panel,
+            compact=False,
+        )
+
+        rendered_lines = tuple(call["text"] for call in draw.text_calls)
+        text_sizes = {call["font"].size for call in draw.text_calls}
+        self.assertEqual(rendered_lines, ("H1", "H2", "B1"))
+        self.assertEqual(text_sizes, {20})
 
     def test_render_status_image_hides_bottom_news_ticker_in_extended_view(self) -> None:
         display = self.make_display()
@@ -1040,6 +1116,76 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             scene.layout.panel_box[2] - scene.layout.panel_box[0],
             base_scene.layout.panel_box[2] - base_scene.layout.panel_box[0],
         )
+
+    def test_default_scene_renders_service_connect_qr_card_into_reserved_area(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            service_connect_cue=DisplayServiceConnectCue(
+                service_id="whatsapp",
+                service_label="WhatsApp",
+                phase="qr",
+                summary="Scan the QR",
+                detail="Open Linked Devices on your phone.",
+                qr_image_data_url=_QR_DATA_URL,
+                accent="warm",
+            ),
+        )
+        base = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+        with_service_connect = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            service_connect_cue=DisplayServiceConnectCue(
+                service_id="whatsapp",
+                service_label="WhatsApp",
+                phase="qr",
+                summary="Scan the QR",
+                detail="Open Linked Devices on your phone.",
+                qr_image_data_url=_QR_DATA_URL,
+                accent="warm",
+            ),
+        )
+
+        panel_diff = ImageChops.difference(base.crop(scene.layout.panel_box), with_service_connect.crop(scene.layout.panel_box))
+
+        self.assertEqual(scene.panel.image_data_url, _QR_DATA_URL)
+        self.assertIsNotNone(panel_diff.getbbox())
+        self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 3000)
 
     def test_render_emoji_glyph_emits_once_when_font_is_missing(self) -> None:
         emitted: list[str] = []

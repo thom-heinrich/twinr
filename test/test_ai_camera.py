@@ -26,6 +26,7 @@ from twinr.hardware.camera_ai.face_anchors import (
     merge_detection_with_face_anchors,
 )
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
+from twinr.hardware.camera_ai.adapter import PoseResult
 from twinr.hardware.camera_ai.mediapipe_pipeline import MediaPipeVisionResult
 from twinr.hardware.camera_ai.motion import infer_motion_state as _infer_motion_state
 from twinr.hardware.camera_ai.pose_classification import (
@@ -172,6 +173,76 @@ class AICameraTests(unittest.TestCase):
         )
         self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_source"], "fresh_mediapipe")
         self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_confidence"], 0.83)
+
+    def test_adapter_gesture_observe_from_frame_can_skip_pose_fallback(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        primary_box = AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68)
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._resolve_gesture_pose_hints = lambda **kwargs: ({}, "none", None)  # type: ignore[method-assign]
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(  # type: ignore[method-assign]
+            observe=lambda **_: SimpleNamespace(
+                hand_count=0,
+                fine_hand_gesture=AICameraFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            ),
+            debug_snapshot=lambda: {"resolved_source": "none"},
+        )
+        fallback_calls = []
+
+        def _resolve_pose_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return (
+                PoseResult(
+                    body_pose=AICameraBodyPose.UNKNOWN,
+                    pose_confidence=0.71,
+                    looking_toward_device=False,
+                    visual_attention_score=0.0,
+                    hand_near_camera=False,
+                    showing_intent_likely=False,
+                    gesture_event=AICameraGestureEvent.WAVE,
+                    gesture_confidence=0.71,
+                ),
+                None,
+            )
+
+        adapter._resolve_gesture_pose_fallback = _resolve_pose_fallback  # type: ignore[method-assign]
+
+        observation = adapter.observe_gesture_from_frame(
+            detection=detection,
+            frame_rgb="frame",
+            observed_at=88.0,
+            frame_at=87.5,
+            allow_pose_fallback=False,
+        )
+
+        self.assertEqual(fallback_calls, [])
+        self.assertEqual(observation.gesture_event, AICameraGestureEvent.NONE)
+        debug = adapter.get_last_gesture_debug_details()
+        self.assertTrue(debug["pose_fallback_disabled_by_caller"])
+        self.assertFalse(debug["pose_fallback_used"])
 
     def test_adapter_attention_observe_records_fast_path_gate_reasons(self) -> None:
         adapter = LocalAICameraAdapter(

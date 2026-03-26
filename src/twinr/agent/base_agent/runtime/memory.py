@@ -529,15 +529,22 @@ class TwinrRuntimeMemoryMixin:
         name: str,
         family_name: str | None = None,
         role: str | None = None,
+        contact_label: str | None = None,
     ):
         """Look up a stored contact in graph memory."""
 
         name = self._normalize_required_text("name", name)  # AUDIT-FIX(#7)
         family_name = self._normalize_optional_text("family_name", family_name)  # AUDIT-FIX(#7)
         role = self._normalize_optional_text("role", role)  # AUDIT-FIX(#7)
+        contact_label = self._normalize_optional_text("contact_label", contact_label)  # AUDIT-FIX(#7)
 
         with self._memory_runtime_lock():  # AUDIT-FIX(#9)
-            return self.graph_memory.lookup_contact(name=name, family_name=family_name, role=role)
+            return self.graph_memory.lookup_contact(
+                name=name,
+                family_name=family_name,
+                role=role,
+                contact_label=contact_label,
+            )
 
     def remember_preference(
         self,

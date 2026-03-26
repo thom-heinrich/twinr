@@ -175,6 +175,9 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         ).probe_operational()
 
         self.assertTrue(result.ready)
+        self.assertEqual(result.health_tier, "ready")
+        self.assertTrue(result.archive_checked)
+        self.assertTrue(result.archive_safe)
         for state in (prompt_state, object_state, graph_state, midterm_state):
             self.assertTrue(all(call["prefer_cached_document_id"] for call in state.probe_calls))
 
@@ -204,6 +207,9 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         ).probe_operational(include_archive=False)
 
         self.assertTrue(result.ready)
+        self.assertEqual(result.health_tier, "degraded")
+        self.assertFalse(result.archive_checked)
+        self.assertFalse(result.archive_safe)
         self.assertNotIn("archive", result.checked_snapshots)
         self.assertEqual(
             [call["snapshot_kind"] for call in object_state.probe_calls],

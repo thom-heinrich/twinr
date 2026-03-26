@@ -21,6 +21,10 @@ from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+
+
 def _config(root: str) -> TwinrConfig:
     return TwinrConfig(
         project_root=root,
@@ -44,13 +48,13 @@ def _existing_phone() -> LongTermMemoryObjectV1:
     return LongTermMemoryObjectV1(
         memory_id="fact:corinna_phone_old",
         kind="contact_method_fact",
-        summary="Corinna Maier can be reached at +491761234.",
+        summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
         details="Use the mobile number ending in 1234.",
         source=_source("turn:1"),
         status="active",
         confidence=0.95,
         slot_key="contact:person:corinna_maier:phone",
-        value_key="+491761234",
+        value_key=_TEST_CORINNA_PHONE_OLD,
         attributes={"person_ref": "person:corinna_maier"},
     )
 
@@ -59,13 +63,13 @@ def _candidate_phone() -> LongTermMemoryObjectV1:
     return LongTermMemoryObjectV1(
         memory_id="fact:corinna_phone_new",
         kind="contact_method_fact",
-        summary="Corinna Maier can be reached at +4940998877.",
+        summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
         details="Use the office number ending in 8877.",
         source=_source("turn:2"),
         status="uncertain",
         confidence=0.92,
         slot_key="contact:person:corinna_maier:phone",
-        value_key="+4940998877",
+        value_key=_TEST_CORINNA_PHONE_NEW,
         attributes={"person_ref": "person:corinna_maier"},
     )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 from types import SimpleNamespace
@@ -187,6 +187,36 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_snapshot_restore_preserves_temporary_voice_quiet_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            quiet_until = (datetime.now(timezone.utc) + timedelta(minutes=25)).replace(microsecond=0)
+            RuntimeSnapshotStore(config.runtime_state_path).save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Ich bleibe kurz ruhig.",
+                voice_quiet_until_utc=quiet_until.isoformat(),
+                voice_quiet_reason="tv news",
+            )
+
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                    runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                    restore_runtime_state_on_startup=True,
+                )
+            )
+            try:
+                state = runtime.voice_quiet_state()
+                self.assertTrue(state.active)
+                self.assertEqual(state.reason, "tv news")
+                self.assertEqual(state.until_utc, quiet_until.isoformat().replace("+00:00", "Z"))
+                self.assertGreater(state.remaining_seconds, 0)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_search_provider_context_skips_long_term_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -363,6 +393,37 @@ class RuntimeContextTests(unittest.TestCase):
                         for message in system_messages
                     )
                 )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tiny_recent_tool_context_skips_remote_lookup_and_keeps_bounded_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Bitte sei kurz ruhig.")
+                runtime.memory.remember_note(
+                    kind="fact",
+                    content="Twinr memory summary: Die Nutzerin wollte vorhin Ruhe beim Fernsehen.",
+                    source="memory",
+                )
+                runtime.manage_user_discovery(action="start_or_resume", topic_id="basics")
+
+                class _FailingLongTermMemory:
+                    def build_tool_provider_context(self, query_text):
+                        raise AssertionError("tiny recent tool context must not query remote long-term memory")
+
+                runtime.long_term_memory = _FailingLongTermMemory()
+
+                context = runtime.tool_provider_tiny_recent_conversation_context()
+
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any("Guided user-discovery state for this turn." in message for message in system_messages)
+                )
+                self.assertTrue(
+                    any("Twinr memory summary:" in message for message in system_messages)
+                )
+                self.assertIn(("user", "Bitte sei kurz ruhig."), context)
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

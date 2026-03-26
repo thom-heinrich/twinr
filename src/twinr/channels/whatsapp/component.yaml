@@ -3,13 +3,16 @@ name: twinr.channels.whatsapp
 path: src/twinr/channels/whatsapp
 kind: python-package
 visibility: internal
-summary: Baileys-backed consumer WhatsApp transport for Twinr internal messaging tests.
+summary: Baileys-backed consumer WhatsApp transport for Twinr messaging, shared tool-capable text turns, pairing, bounded outbound delivery, and bounded portal-triggered history import.
 owned_concerns:
   - Adapt the global Twinr config into focused WhatsApp runtime settings.
   - Resolve relative auth, worker, and Node runtime paths against Twinr's project root before the worker changes cwd.
   - Enforce allowlist, self-chat, and outbound-echo policy for the WhatsApp channel.
   - Supervise the Node/Baileys worker and relay normalized inbound and outbound messages.
-  - Emit pairing QR updates for both terminal fallback use and portal rendering.
+  - Emit pairing QR updates for terminal fallback, web dashboard rendering, and runtime display reserve cues.
+  - Share bounded WhatsApp runtime probing and pairing coordination across web and voice-triggered service-connect surfaces.
+  - Queue bounded proactive outbound WhatsApp sends so the long-lived channel service stays the only linked-device socket owner.
+  - Queue bounded WhatsApp history-import requests so the same long-lived channel service can temporarily reopen the worker in history mode and import approved history into shared Twinr memory.
 out_of_scope:
   - Generic external text-channel contracts in `src/twinr/channels`
   - Core Twinr runtime turn execution in `src/twinr/agent/base_agent`
@@ -23,11 +26,24 @@ files:
     role: Resolve the pinned local Node.js runtime under state/tools for the Baileys worker
   - path: policy.py
     role: Allowlist, self-chat, and outbound-echo policy
+  - path: pairing.py
+    role: Shared WhatsApp runtime probes and bounded pairing coordination for web and voice surfaces
+  - path: outbound.py
+    role: File-backed outbound send queue shared between the main runtime and the long-lived WhatsApp channel service
+  - path: history_import.py
+    role: File-backed bounded history-import queue shared between the portal/runtime and the long-lived WhatsApp channel service
+  - path: history_learning.py
+    role: Temporary history-sync import service that converts approved WhatsApp history batches into shared Twinr memory turns
   - path: worker_bridge.py
-    role: JSONL stdio bridge to the Node/Baileys worker, including QR status payloads
+    role: JSONL stdio bridge to the Node/Baileys worker, including QR SVG/image payloads and history-batch events
   - path: loop.py
-    role: Long-lived WhatsApp listener loop
+    role: Long-lived WhatsApp listener loop with bounded outbound and history-import queue processing
   - path: worker/index.mjs
-    role: Node/Baileys worker process with terminal and portal QR emission
+    role: Node/Baileys worker process with terminal, dashboard, display-ready QR emission, and opt-in history-batch emission
+  - path: worker/incoming_messages.mjs
+    role: Filter Baileys upserts and normalize inbound self-chat-capable message payloads
+  - path: worker/history_messages.mjs
+    role: Normalize Baileys messaging-history payloads into bounded history-batch events for Twinr's import service
 tests:
   - path: test/test_channels_whatsapp.py
+  - path: worker/incoming_messages.test.mjs

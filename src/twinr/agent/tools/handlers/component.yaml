@@ -3,11 +3,15 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, smart-home, memory, reminder, guided user-discovery, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, smart-home, memory, reminder, browser automation, external service-connect, WhatsApp sending, guided user-discovery, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
+  - Bridge the optional versioned browser-automation boundary into the realtime tool surface without importing concrete browser stacks into src/
+  - Expose one bounded service-connect handler so spoken requests can start supported external pairing flows and surface QR/status state on Twinr displays
+  - Expose one bounded WhatsApp-send handler that resolves remembered contacts and hands delivery off to the running channel service after explicit final confirmation
   - Expose one smart-home tool surface for entity discovery, filtered state queries, low-risk control, and bounded stream inspection
+  - Expose one temporary voice-quiet tool surface that suppresses transcript-first wake and automatic follow-up for a bounded runtime window without mutating persistent settings
   - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
   - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
   - Share automation-specific delivery, tag, weekday, and timezone parsing across handler and background boundaries
@@ -45,6 +49,18 @@ files:
       - handle_update_time_automation
       - handle_update_sensor_automation
       - handle_delete_automation
+  - path: browser.py
+    role: Optional browser-automation handler that validates tool payloads and bridges to the local browser boundary
+    exports:
+      - handle_browser_automation
+  - path: service_connect.py
+    role: External service-connect handler that validates the target service and starts a bounded pairing flow
+    exports:
+      - handle_connect_service_integration
+  - path: whatsapp.py
+    role: Bounded WhatsApp-send handler that resolves remembered contacts, asks for explicit final confirmation, and queues delivery through the running channel service
+    exports:
+      - handle_send_whatsapp_message
   - path: handler_telemetry.py
     role: Shared best-effort telemetry, event, and usage callback helpers
     exports:
@@ -123,6 +139,10 @@ files:
     role: Bounded simple-setting mutation handler
     exports:
       - handle_update_simple_setting
+  - path: voice_quiet.py
+    role: Temporary runtime-only voice quiet-window handler
+    exports:
+      - handle_manage_voice_quiet_mode
   - path: support.py
     role: Shared voice guards and primitive argument coercion
     exports:
@@ -147,7 +167,10 @@ primary_callers:
   - path: src/twinr/agent/workflows/realtime_runtime/background.py
   - path: src/twinr/__main__.py
 tests:
+  - path: test/test_browser_automation.py
+  - path: test/test_browser_dual_lane_loop.py
   - path: test/test_realtime_runner.py
+  - path: test/test_realtime_runner_helpers.py
   - path: test/test_self_coding_dialogue.py
   - path: test/test_openai_realtime.py
   - path: test/test_tool_broker_policy.py

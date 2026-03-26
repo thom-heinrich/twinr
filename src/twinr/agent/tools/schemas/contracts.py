@@ -372,6 +372,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "Look up fresh or externally verifiable web information for the user. "
                     "Use this for broad web research, not only a fixed list of example domains. "
+                    "Do not use it for page interaction, booking flows, forms, checkout/cart state, or social profile/post/story checks that may require opening the live site; those belong to browser_automation or a permission question for deeper site checking. "
                     "Do not use it for the user's own smart-home inventory, room/device state, or recent in-home smart-home events; those belong to the smart-home tools."
                 ),
                 "parameters": {
@@ -391,6 +392,89 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                         ),
                     },
                     "required": ["question"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "browser_automation" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "browser_automation",
+                "description": (
+                    "Use bounded live browser automation for a specific website when the task requires page interaction, "
+                    "multi-step navigation, form filling, or verifying live page state that generic web research cannot answer reliably. "
+                    "Prefer search_live_info for broad web research or fresh questions that do not require site interaction. "
+                    "If this would only be a deeper follow-up after ordinary web research, prefer asking the user before starting the browser run unless the user already explicitly asked for site interaction. "
+                    "If ordinary web research said the exact detail could not be verified or that no current evidence was found, treat that as unresolved rather than as a final answer when a specific site check could still clarify it. "
+                    "A short follow-up assent to an already proposed deeper site check counts as explicit approval for that browser run. "
+                    "A freshness-sensitive question about a place, business, organization, or event does not by itself count as explicit browser authorization. "
+                    "Do not use this tool just to add optional extra checking after ordinary web research already answered the real question sufficiently."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal": _string_property(
+                            "Short task the browser run should complete on the site, for example verify opening hours or extract a result after interaction.",
+                            min_length=1,
+                        ),
+                        "start_url": _string_property(
+                            "Optional exact URL to open first when the user already named a specific page or site entry point.",
+                            min_length=1,
+                        ),
+                        "allowed_domains": _array_property(
+                            "Narrow host allowlist for this run. Keep it specific to the site you need.",
+                            _string_property(
+                                "One allowed host name for this browser run.",
+                                min_length=1,
+                            ),
+                            min_items=1,
+                            max_items=16,
+                            unique_items=True,
+                        ),
+                        "max_steps": _number_property(
+                            "Optional upper bound on browser actions for this run. Keep it small unless the page flow clearly needs more steps.",
+                            minimum=1,
+                            maximum=32,
+                            integer=True,
+                        ),
+                        "max_runtime_s": _number_property(
+                            "Optional upper bound on total runtime in seconds.",
+                            minimum=0.1,
+                            maximum=900.0,
+                        ),
+                        "capture_screenshot": _boolean_property(
+                            "Set true when a screenshot artifact should be kept for verification or operator review."
+                        ),
+                        "capture_html": _boolean_property(
+                            "Set true when an HTML snapshot should be kept for later inspection."
+                        ),
+                    },
+                    "required": ["goal", "allowed_domains"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "connect_service_integration" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "connect_service_integration",
+                "description": (
+                    "Start a bounded service-connect or pairing flow for a named external service. "
+                    "Use this when the user asks Twinr to connect, link, pair, or set up a service such as WhatsApp. "
+                    "The follow-up status or QR appears on Twinr's right info panel. "
+                    "If the user did not clearly name the target service, ask a short follow-up question instead of guessing."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": _string_property(
+                            "The exact service name the user wants to connect, for example whatsapp.",
+                            min_length=1,
+                        ),
+                    },
+                    "required": ["service"],
                     "additionalProperties": False,
                 },
             }
@@ -1326,6 +1410,55 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "send_whatsapp_message" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "send_whatsapp_message",
+                "description": (
+                    "Send a WhatsApp message to one remembered contact after an explicit final confirmation. "
+                    "Use this when the user asks Twinr to write or send a WhatsApp message to someone already remembered in contact memory. "
+                    "Resolve the recipient through remembered-contact lookup instead of inventing or guessing a number. "
+                    "If the user has not told you the exact message text yet, call the tool anyway so it can ask the bounded follow-up question. "
+                    "If the contact is ambiguous or has multiple phone numbers, the tool returns a clarification question. "
+                    "If the tool returns confirmation_required, ask that exact confirmation question and call it again with confirmed=true only after the user clearly says yes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": _string_property(
+                            "Name or short first name of the remembered contact who should receive the WhatsApp message.",
+                            min_length=1,
+                        ),
+                        "family_name": _string_property(
+                            "Optional family name when it helps choose the right remembered contact.",
+                            min_length=1,
+                        ),
+                        "role": _string_property(
+                            "Optional role or relation such as daughter, neighbor, caregiver, or physiotherapist.",
+                            min_length=1,
+                        ),
+                        "contact_label": _string_property(
+                            "Optional exact remembered contact label copied verbatim from a prior clarification option when disambiguating an ambiguous recipient.",
+                            min_length=1,
+                        ),
+                        "phone_last4": _string_property(
+                            "Optional last digits of the chosen remembered phone number when the contact has multiple phone numbers and the tool asked for a suffix choice.",
+                            min_length=2,
+                        ),
+                        "message": _string_property(
+                            "The exact WhatsApp message text that Twinr should send.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this exact WhatsApp send."
+                        ),
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "get_memory_conflicts" in available:
         tools.append(
             {
@@ -1740,6 +1873,47 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                     },
                     "allOf": _simple_setting_rules(spoken_voices),
                     "required": ["setting", "action"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "manage_voice_quiet_mode" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "manage_voice_quiet_mode",
+                "description": (
+                    "Manage Twinr's temporary voice quiet window. "
+                    "Use this when the user wants Twinr to stay quiet for a bounded time so TV, radio, or room speech does not reopen the transcript-first wake or automatic follow-up path. "
+                    "Use action status when the user asks whether Twinr is currently quiet or still listening. "
+                    "If the user wants quiet but did not give a clear duration yet, ask a short follow-up question instead of pretending the quiet window is active. "
+                    "This is temporary runtime state, not a persistent setting."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": _string_property(
+                            "Choose set to start a temporary quiet window, clear to end it early, or status to inspect the current window.",
+                            enum=["set", "clear", "status"],
+                        ),
+                        "duration_minutes": _number_property(
+                            "Required for action=set. Bounded quiet duration in whole minutes.",
+                            minimum=1,
+                            maximum=720,
+                            integer=True,
+                        ),
+                        "reason": _string_property(
+                            "Optional short reason such as TV news, radio, or background audio.",
+                            min_length=1,
+                        ),
+                    },
+                    "allOf": [
+                        {
+                            "if": {"properties": {"action": {"const": "set"}}, "required": ["action"]},
+                            "then": {"required": ["duration_minutes"]},
+                        }
+                    ],
+                    "required": ["action"],
                     "additionalProperties": False,
                 },
             }

@@ -535,6 +535,8 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(request["max_output_tokens"], 80)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertIn("location_hint", request["text"]["format"]["schema"]["properties"])
+        self.assertIn("runtime_tool_name", request["text"]["format"]["schema"]["properties"])
+        self.assertIn("runtime_tool_arguments_json", request["text"]["format"]["schema"]["properties"])
         self.assertEqual(
             set(request["text"]["format"]["schema"]["required"]),
             set(request["text"]["format"]["schema"]["properties"]),
@@ -572,6 +574,37 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertIn("date_context", request["text"]["format"]["schema"]["properties"])
         self.assertIn("context_scope", request["text"]["format"]["schema"]["properties"])
         self.assertIn("prompt", request["text"]["format"]["schema"]["properties"])
+
+    def test_decide_parses_runtime_local_tool_handoff_fields(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_runtime_tool",
+                _request_id="req_decide_runtime_tool",
+                model="gpt-4o-mini",
+                output_text=(
+                    '{"action":"handoff","spoken_ack":"Ich schalte mich kurz stumm.","spoken_reply":null,'
+                    '"kind":"automation","goal":"Set temporary quiet mode.","prompt":null,"allow_web_search":false,'
+                    '"location_hint":null,"date_context":null,"context_scope":"tiny_recent",'
+                    '"runtime_tool_name":"manage_voice_quiet_mode",'
+                    '"runtime_tool_arguments_json":"{\\"action\\":\\"set\\",\\"duration_minutes\\":2}"}'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-4o-mini",
+        )
+
+        decision = provider.decide("Sei bitte 2 Minuten ruhig.")
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "automation")
+        self.assertEqual(decision.context_scope, "tiny_recent")
+        self.assertEqual(decision.runtime_tool_name, "manage_voice_quiet_mode")
+        self.assertEqual(decision.runtime_tool_arguments, {"action": "set", "duration_minutes": 2})
 
     def test_decide_retries_once_when_structured_response_hits_max_output_tokens(self) -> None:
         backend = FakeToolBackend(self.config)

@@ -211,7 +211,9 @@ class LongTermTurnExtractor:
         response: str,
         occurred_at: datetime | None = None,
         turn_id: str | None = None,
-        source: str = "conversation_turn",
+        source: str = "conversation",
+        modality: str = "voice",
+        episode_attributes: Mapping[str, object] | None = None,
     ) -> LongTermTurnExtractionV1:
         """Extract the episode and candidate memories for one turn.
 
@@ -221,7 +223,11 @@ class LongTermTurnExtractor:
             occurred_at: Optional event time. Naive datetimes are interpreted in
                 the configured local timezone.
             turn_id: Optional stable turn identifier override.
-            source: Source label stored on the generated source reference.
+            source: Provenance label for the turn origin such as
+                ``conversation`` or ``whatsapp``.
+            modality: Input modality such as ``voice`` or ``text``.
+            episode_attributes: Optional extra episode-level attributes merged
+                into the generated episode object before persistence.
 
         Returns:
             A normalized turn extraction containing the episode object plus any
@@ -235,7 +241,9 @@ class LongTermTurnExtractor:
         if not clean_transcript:
             raise ValueError("transcript is required.")
         occurred = self._resolve_occurred_at(occurred_at)  # AUDIT-FIX(#2): Return timezone-aware datetimes in the configured zone.
-        clean_source = _normalize_identifier(source, limit=_MAX_SOURCE_LEN, fallback="conversation_turn")  # AUDIT-FIX(#8)
+        clean_source = _normalize_identifier(source, limit=_MAX_SOURCE_LEN, fallback="conversation")  # AUDIT-FIX(#8)
+        clean_modality = _normalize_identifier(modality, limit=_MAX_SOURCE_LEN, fallback="voice")  # AUDIT-FIX(#8)
+        source_ref_type = clean_source if clean_modality != "voice" else "conversation_turn"
 
         generated_turn_id = self._build_turn_id(
             transcript=clean_transcript,
@@ -250,16 +258,23 @@ class LongTermTurnExtractor:
         )
 
         source_ref = LongTermSourceRefV1(
-            source_type=clean_source,
+            source_type=source_ref_type,
             event_ids=(resolved_turn_id,),
             speaker="user",
-            modality="voice",
+            modality=clean_modality,
         )
-        episode_attributes: dict[str, object] = {
+        episode_metadata: dict[str, object] = {
             "raw_transcript": clean_transcript,
             "raw_response": clean_response,
+            "request_source": clean_source,
+            "input_modality": clean_modality,
             "structured_extraction_status": "disabled" if self.program is None else "ready",
         }
+        if episode_attributes is not None:
+            for raw_key, raw_value in episode_attributes.items():
+                clean_key = _normalize_text(raw_key, limit=_MAX_ATTRIBUTE_KEY_LEN)
+                if clean_key:
+                    episode_metadata[clean_key] = raw_value
         candidate_objects: tuple[LongTermMemoryObjectV1, ...] = ()
         graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] = ()
         if self.program is not None:
@@ -293,8 +308,8 @@ class LongTermTurnExtractor:
                     exc,
                     exc_info=True,
                 )
-                episode_attributes["structured_extraction_status"] = "failed"
-                episode_attributes["structured_extraction_error"] = _normalize_text(str(exc), limit=220)
+                episode_metadata["structured_extraction_status"] = "failed"
+                episode_metadata["structured_extraction_error"] = _normalize_text(str(exc), limit=220)
         episode = LongTermMemoryObjectV1(
             memory_id=_stable_memory_id("episode", resolved_turn_id, fallback="turn"),  # AUDIT-FIX(#5)
             kind="episode",
@@ -308,7 +323,9 @@ class LongTermTurnExtractor:
             value_key=slugify_identifier(clean_transcript, fallback="episode"),
             valid_from=None,
             valid_to=None,
-            attributes=episode_attributes,
+            created_at=occurred,
+            updated_at=occurred,
+            attributes=episode_metadata,
         )
         return LongTermTurnExtractionV1(
             turn_id=resolved_turn_id,
@@ -462,14 +479,14 @@ class LongTermTurnExtractor:
             return normalized
         if not isinstance(value, Mapping):
             return {}
-        normalized: dict[str, str] = {}
+        normalized_mapping: dict[str, str] = {}
         for key, raw in islice(value.items(), _MAX_ATTRIBUTES):
             # AUDIT-FIX(#3): Cap attribute fan-out to bound payload size on constrained hardware.
             clean_key = _normalize_text(key, limit=_MAX_ATTRIBUTE_KEY_LEN)
             clean_value = self._optional_text(raw)
             if clean_key and clean_value:
-                normalized[clean_key] = clean_value
-        return normalized
+                normalized_mapping[clean_key] = clean_value
+        return normalized_mapping
 
     def _optional_text(self, value: object) -> str | None:
         """Return normalized text or ``None`` when empty."""

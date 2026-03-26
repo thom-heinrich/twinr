@@ -16,6 +16,10 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.ops.locks import loop_lock_owner
+from twinr.ops.remote_memory_watchdog_state import (
+    RemoteMemoryWatchdogStore,
+    build_remote_memory_watchdog_bootstrap_snapshot,
+)
 
 
 EmitFn = Callable[[str], None]
@@ -46,6 +50,38 @@ def _python_executable_for_runtime(config: TwinrConfig) -> str:
     return sys.executable
 
 
+def _seed_watchdog_bootstrap_snapshot(config: TwinrConfig, *, owner_pid: int) -> None:
+    """Persist a fresh startup snapshot when the owner PID changed."""
+
+    store = RemoteMemoryWatchdogStore.from_config(config)
+    try:
+        snapshot = store.load()
+    except Exception:
+        snapshot = None
+    if snapshot is not None and int(getattr(snapshot, "pid", 0) or 0) == int(owner_pid):
+        return
+    bootstrap = build_remote_memory_watchdog_bootstrap_snapshot(
+        config,
+        pid=owner_pid,
+        artifact_path=store.path,
+    )
+    store.save(bootstrap)
+
+
+def _maybe_seed_watchdog_bootstrap_snapshot(
+    config: TwinrConfig,
+    *,
+    owner_pid: int,
+    emit: EmitFn,
+) -> None:
+    """Best-effort seed for external-watchdog handoffs."""
+
+    try:
+        _seed_watchdog_bootstrap_snapshot(config, owner_pid=owner_pid)
+    except Exception as exc:
+        emit(f"remote_memory_watchdog=bootstrap_seed_failed:{type(exc).__name__}:{exc}")
+
+
 def ensure_remote_memory_watchdog_process(
     config: TwinrConfig,
     *,
@@ -60,6 +96,7 @@ def ensure_remote_memory_watchdog_process(
 
     owner = loop_lock_owner(config, "remote-memory-watchdog")
     if owner is not None:
+        _maybe_seed_watchdog_bootstrap_snapshot(config, owner_pid=owner, emit=emit)
         emit(f"remote_memory_watchdog=running:{owner}")
         return owner
 
@@ -93,9 +130,9 @@ def ensure_remote_memory_watchdog_process(
     while time.monotonic() < deadline:
         owner = loop_lock_owner(config, "remote-memory-watchdog")
         if owner is not None:
+            _maybe_seed_watchdog_bootstrap_snapshot(config, owner_pid=owner, emit=emit)
             emit(f"remote_memory_watchdog=ready:{owner}")
             return owner
         time.sleep(0.1)
     emit("remote_memory_watchdog=startup_timeout")
     return None
-

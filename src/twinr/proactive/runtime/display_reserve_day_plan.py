@@ -1,16 +1,19 @@
 """Plan one full local day of calm HDMI reserve impulses.
 
 The live proactive monitor should not improvise reserve-card timing on every
-tick. This module turns the current personality-driven reserve candidates into
-one persistent per-day sequence that can be replayed calmly throughout the
-day. That keeps scheduling, candidate weighting, and cursor persistence out of
-the hot runtime loop while preserving a visible, personality-shaped reserve
-surface beside the face.
+tick. This module turns the current expanded reserve card surfaces into one
+persistent per-day sequence that can be replayed calmly throughout the day.
+That keeps scheduling, candidate weighting, and cursor persistence out of the
+hot runtime loop while preserving a visible, personality-shaped reserve
+surface beside the face. The planner spaces cards by grouped semantic topics,
+normalized seed families, and coarse public/personal/setup axes instead of
+only raw source tokens, so sibling cards do not clump and the right lane stays
+broader and less repetitive.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date as LocalDate, datetime, time as LocalTime, timedelta, timezone
 import hashlib
@@ -27,6 +30,7 @@ from twinr.display.reserve_bus_feedback import (
 )
 
 from .display_reserve_candidates import load_display_reserve_candidates
+from .display_reserve_diversity import reserve_seed_axis, reserve_seed_family
 from .display_reserve_support import (
     compact_text,
     default_local_now,
@@ -38,11 +42,12 @@ from .display_reserve_support import (
 
 _DEFAULT_PLAN_PATH = "artifacts/stores/ops/display_reserve_bus_plan.json"
 _DEFAULT_REFRESH_AFTER_LOCAL = "05:30"
-_DEFAULT_CANDIDATE_LIMIT = 8
-_DEFAULT_ITEMS_PER_DAY = 30
+_DEFAULT_CANDIDATE_LIMIT = 20
+_DEFAULT_ITEMS_PER_DAY = 20
 _DEFAULT_TOPIC_GAP = 2
 _DEFAULT_SOURCE_GAP = 1
 _DEFAULT_FAMILY_GAP = 1
+_DEFAULT_AXIS_GAP = 1
 _EMPTY_PLAN_RETRY_S = 60.0
 _DEFAULT_MIN_HOLD_S = 4.0 * 60.0
 _DEFAULT_BASE_HOLD_S = 8.0 * 60.0
@@ -67,6 +72,8 @@ _LOGGER = logging.getLogger(__name__)
 def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
     """Return one finite bounded integer config value."""
 
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -77,6 +84,8 @@ def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> 
 def _bounded_seconds(value: object, *, default: float, minimum: float, maximum: float) -> float:
     """Return one finite bounded duration."""
 
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -86,10 +95,10 @@ def _bounded_seconds(value: object, *, default: float, minimum: float, maximum: 
     return max(minimum, min(maximum, number))
 
 
-def _normalize_topic_keys(values: Sequence[object] | None) -> tuple[str, ...]:
+def _normalize_topic_keys(values: Iterable[object] | None) -> tuple[str, ...]:
     """Normalize one ordered set of retired topic keys."""
 
-    if not values:
+    if values is None:
         return ()
     ordered: list[str] = []
     seen: set[str] = set()
@@ -144,6 +153,7 @@ class DisplayReservePlannedItem:
     candidate_family: str
     salience: float
     hold_seconds: float
+    semantic_topic_key: str = ""
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "DisplayReservePlannedItem":
@@ -162,13 +172,19 @@ class DisplayReservePlannedItem:
             accent=compact_text(payload.get("accent"), max_len=24).lower() or "info",
             reason=compact_text(payload.get("reason"), max_len=120),
             candidate_family=compact_text(payload.get("candidate_family"), max_len=40).casefold() or "general",
-            salience=float(payload.get("salience", 0.0) or 0.0),
+            salience=_bounded_seconds(
+                payload.get("salience"),
+                default=0.0,
+                minimum=0.0,
+                maximum=8.0,
+            ),
             hold_seconds=_bounded_seconds(
                 payload.get("hold_seconds"),
                 default=_DEFAULT_BASE_HOLD_S,
                 minimum=_DEFAULT_MIN_HOLD_S,
                 maximum=_DEFAULT_MAX_HOLD_S,
             ),
+            semantic_topic_key=compact_text(payload.get("semantic_topic_key"), max_len=96).casefold(),
         )
 
     @classmethod
@@ -201,12 +217,18 @@ class DisplayReservePlannedItem:
                 minimum=_DEFAULT_MIN_HOLD_S,
                 maximum=_DEFAULT_MAX_HOLD_S,
             ),
+            semantic_topic_key=candidate.semantic_key(),
         )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the planned item into JSON-safe data."""
 
         return asdict(self)
+
+    def semantic_key(self) -> str:
+        """Return the grouped semantic topic key for this planned item."""
+
+        return compact_text(self.semantic_topic_key, max_len=96).casefold() or self.topic_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +263,9 @@ class DisplayReserveDayPlan:
         if not local_day:
             raise ValueError("display reserve day plan requires local_day")
         generated_at = _parse_timestamp(payload.get("generated_at")) or utc_now()
-        cursor = max(0, int(payload.get("cursor", 0) or 0))
+        cursor = _bounded_int(payload.get("cursor"), default=0, minimum=0, maximum=10_000)
         raw_items = payload.get("items")
+        raw_retired_topic_keys = payload.get("retired_topic_keys")
         if not isinstance(raw_items, Sequence):
             raise ValueError("display reserve day plan items must be a sequence")
         items = tuple(
@@ -255,8 +278,18 @@ class DisplayReserveDayPlan:
             generated_at=format_timestamp(generated_at),
             cursor=cursor,
             items=items,
-            candidate_count=max(0, int(payload.get("candidate_count", len(items)) or len(items))),
-            retired_topic_keys=_normalize_topic_keys(payload.get("retired_topic_keys")),
+            candidate_count=_bounded_int(
+                payload.get("candidate_count"),
+                default=len(items),
+                minimum=0,
+                maximum=10_000,
+            ),
+            retired_topic_keys=_normalize_topic_keys(
+                raw_retired_topic_keys
+                if isinstance(raw_retired_topic_keys, Iterable)
+                and not isinstance(raw_retired_topic_keys, (str, bytes, bytearray))
+                else None,
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -277,7 +310,7 @@ class DisplayReserveDayPlan:
         if not self.retired_topic_keys:
             return self.items
         retired = set(self.retired_topic_keys)
-        return tuple(item for item in self.items if item.topic_key not in retired)
+        return tuple(item for item in self.items if item.semantic_key() not in retired)
 
     def current_item(self) -> DisplayReservePlannedItem | None:
         """Return the current rotating item for the local day."""
@@ -436,6 +469,7 @@ class DisplayReserveDayPlanner:
                 )
                 return self.store.save(rebuilt)
             if not self._should_retry_empty_current_plan(existing, local_now=effective_now):
+                assert existing is not None
                 return existing
         rebuilt = self._build_plan(
             config=config,
@@ -580,6 +614,7 @@ class DisplayReserveDayPlanner:
         )
         source_gap = _DEFAULT_SOURCE_GAP
         family_gap = _DEFAULT_FAMILY_GAP
+        axis_gap = _DEFAULT_AXIS_GAP
         candidates = tuple(
             self.candidate_loader(
                 config,
@@ -591,7 +626,7 @@ class DisplayReserveDayPlanner:
             candidates = tuple(
                 candidate
                 for candidate in candidates
-                if candidate.topic_key not in retired_topic_keys
+                if candidate.semantic_key() not in retired_topic_keys
             )
         if not candidates:
             return DisplayReserveDayPlan.empty(
@@ -615,6 +650,7 @@ class DisplayReserveDayPlanner:
             topic_gap=topic_gap,
             source_gap=source_gap,
             family_gap=family_gap,
+            axis_gap=axis_gap,
             feedback_signal=feedback_signal,
         )
         items = tuple(
@@ -730,6 +766,7 @@ class DisplayReserveDayPlanner:
         topic_gap: int,
         source_gap: int,
         family_gap: int,
+        axis_gap: int,
         feedback_signal: DisplayReserveBusFeedbackSignal | None,
     ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
         """Spread repeated candidates across the day without topic clustering."""
@@ -737,18 +774,23 @@ class DisplayReserveDayPlanner:
         remaining = {candidate.topic_key: max(0, counts.get(candidate.topic_key, 0)) for candidate in candidates}
         ordered: list[AmbientDisplayImpulseCandidate] = []
         while any(remaining.values()):
-            recent_topics = tuple(item.topic_key for item in ordered[-topic_gap:]) if topic_gap > 0 else ()
+            recent_topics = tuple(item.semantic_key() for item in ordered[-topic_gap:]) if topic_gap > 0 else ()
             recent_sources = tuple(item.source for item in ordered[-source_gap:]) if source_gap > 0 else ()
             recent_families = (
                 tuple(self._candidate_family(item) for item in ordered[-family_gap:])
                 if family_gap > 0
                 else ()
             )
+            recent_axes = (
+                tuple(self._candidate_axis(item) for item in ordered[-axis_gap:])
+                if axis_gap > 0
+                else ()
+            )
             eligible = [
                 candidate
                 for candidate in candidates
                 if remaining.get(candidate.topic_key, 0) > 0
-                and candidate.topic_key not in recent_topics
+                and candidate.semantic_key() not in recent_topics
                 and candidate.source not in recent_sources
                 and self._candidate_family(candidate) not in recent_families
             ]
@@ -756,8 +798,16 @@ class DisplayReserveDayPlanner:
                 eligible = [
                     candidate
                     for candidate in candidates
-                    if remaining.get(candidate.topic_key, 0) > 0 and candidate.topic_key not in recent_topics
+                    if remaining.get(candidate.topic_key, 0) > 0
+                    and candidate.semantic_key() not in recent_topics
                     and self._candidate_family(candidate) not in recent_families
+                ]
+            if not eligible:
+                eligible = [
+                    candidate
+                    for candidate in candidates
+                    if remaining.get(candidate.topic_key, 0) > 0
+                    and candidate.semantic_key() not in recent_topics
                 ]
             if not eligible:
                 eligible = [candidate for candidate in candidates if remaining.get(candidate.topic_key, 0) > 0]
@@ -765,7 +815,8 @@ class DisplayReserveDayPlanner:
                 eligible,
                 key=lambda item: (
                     remaining[item.topic_key],
-                    self._candidate_weight(item, feedback_signal=feedback_signal),
+                    self._candidate_weight(item, feedback_signal=feedback_signal)
+                    + self._candidate_axis_spacing_bonus(item, recent_axes=recent_axes),
                     _stable_fraction(local_day.isoformat(), item.topic_key, len(ordered)),
                 ),
             )
@@ -776,10 +827,26 @@ class DisplayReserveDayPlanner:
     def _candidate_family(self, candidate: AmbientDisplayImpulseCandidate) -> str:
         """Return one generic family token for reserve-plan mixing."""
 
-        family = compact_text(getattr(candidate, "candidate_family", None), max_len=40).casefold()
-        if family:
-            return family
-        return compact_text(candidate.source, max_len=40).casefold() or "general"
+        return reserve_seed_family(candidate)
+
+    def _candidate_axis(self, candidate: AmbientDisplayImpulseCandidate) -> str:
+        """Return one coarse conversation axis for reserve-plan spacing."""
+
+        return reserve_seed_axis(candidate)
+
+    def _candidate_axis_spacing_bonus(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        recent_axes: Sequence[str],
+    ) -> float:
+        """Prefer axis alternation when it does not fight stronger spacing rules."""
+
+        if not recent_axes:
+            return 0.0
+        if self._candidate_axis(candidate) in recent_axes:
+            return 0.0
+        return 0.08
 
     def _candidate_weight(
         self,
@@ -819,7 +886,7 @@ class DisplayReserveDayPlanner:
 
         if feedback_signal is None:
             return 0.0
-        if candidate.topic_key != feedback_signal.topic_key:
+        if candidate.semantic_key() != feedback_signal.topic_key:
             return 0.0
         intensity = max(0.0, min(1.0, float(feedback_signal.intensity)))
         if feedback_signal.reaction == "immediate_engagement":

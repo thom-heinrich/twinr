@@ -81,6 +81,7 @@ class DisplaySocialReservePublisher:
                 accent="warm",
                 hold_seconds=float(hold_seconds or 0.0),
                 reason=compact_text(display_reason, max_len=120) or "social_trigger_display_first",
+                semantic_topic_key=normalized_trigger,
                 candidate_family="social",
                 match_anchors=(prompt_text, normalized_trigger),
                 metadata={

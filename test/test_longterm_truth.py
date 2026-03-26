@@ -10,6 +10,10 @@ from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermSo
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+
+
 def _source() -> LongTermSourceRefV1:
     return LongTermSourceRefV1(
         source_type="conversation_turn",
@@ -25,23 +29,23 @@ class LongTermTruthMaintainerTests(unittest.TestCase):
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
             source=_source(),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key=_TEST_CORINNA_PHONE_OLD,
             attributes={"person_ref": "person:corinna_maier"},
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
             source=_source(),
             status="candidate",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key=_TEST_CORINNA_PHONE_NEW,
             attributes={"person_ref": "person:corinna_maier"},
         )
 

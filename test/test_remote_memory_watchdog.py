@@ -258,10 +258,14 @@ class _ProbeModeRecordingRemoteService:
         )
 
         class _ProbeResult:
-            def __init__(self, *, ready: bool) -> None:
+            def __init__(self, *, ready: bool, include_archive: bool) -> None:
                 self.ready = ready
                 self.detail = None if ready else "remote unavailable"
                 self.remote_status = SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+                self.warm_result = SimpleNamespace(
+                    archive_safe=bool(ready and include_archive),
+                    health_tier="ready" if ready and include_archive else ("degraded" if ready else "hard_down"),
+                )
 
             def to_dict(self) -> dict[str, object]:
                 return {
@@ -273,13 +277,52 @@ class _ProbeModeRecordingRemoteService:
                         "detail": None,
                     },
                     "steps": (),
+                    "warm_result": {
+                        "archive_safe": bool(self.warm_result.archive_safe),
+                        "health_tier": str(self.warm_result.health_tier),
+                    },
                 }
 
-        return _ProbeResult(ready=ready)
+        return _ProbeResult(ready=ready, include_archive=include_archive)
+
+
+class _CurrentOnlyProbeRemoteService:
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def probe_remote_ready(self, *, bootstrap: bool = True, include_archive: bool = True):
+        del bootstrap, include_archive
+
+        class _ProbeResult:
+            ready = True
+            detail = None
+            remote_status = SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+            warm_result = SimpleNamespace(archive_safe=False, health_tier="degraded")
+
+            @staticmethod
+            def to_dict() -> dict[str, object]:
+                return {
+                    "ready": True,
+                    "detail": None,
+                    "remote_status": {
+                        "mode": "remote_primary",
+                        "ready": True,
+                        "detail": None,
+                    },
+                    "steps": (),
+                    "warm_result": {
+                        "archive_safe": False,
+                        "health_tier": "degraded",
+                    },
+                }
+
+        return _ProbeResult()
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         del timeout_s
-        self.shutdown_calls += 1
 
 
 def _object_dict(value: object) -> dict[str, object]:
@@ -794,7 +837,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(snapshot.sample_count, 1)
         self.assertEqual(service.shutdown_calls, 1)
 
-    def test_probe_once_uses_full_probe_first_then_steady_state_until_failure(self) -> None:
+    def test_probe_once_keeps_archive_inclusive_probes_until_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = TwinrConfig(
@@ -826,11 +869,34 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
             service.calls,
             [
                 {"bootstrap": True, "include_archive": True},
-                {"bootstrap": False, "include_archive": False},
-                {"bootstrap": False, "include_archive": False},
+                {"bootstrap": False, "include_archive": True},
+                {"bootstrap": False, "include_archive": True},
                 {"bootstrap": True, "include_archive": True},
             ],
         )
+
+    def test_probe_once_rejects_current_only_attestation_as_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_CurrentOnlyProbeRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+
+        self.assertEqual(snapshot.current.status, "degraded")
+        self.assertFalse(snapshot.current.ready)
+        self.assertIn("archive-safe", snapshot.current.detail or "")
 
     def test_probe_once_timestamps_sample_at_probe_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

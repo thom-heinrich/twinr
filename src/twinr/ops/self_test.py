@@ -13,15 +13,18 @@ from pathlib import Path
 import errno
 import os
 import shutil
+import struct
 import tempfile
 import threading
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import AmbientAudioSampler, SilenceDetectedRecorder, WaveAudioPlayer
 from twinr.hardware.buttons import configured_button_monitor
 from twinr.hardware.camera import V4L2StillCamera
+from twinr.hardware.drone_service import DroneServiceConfig, RemoteDroneServiceClient
 from twinr.hardware.pir import configured_pir_monitor
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.ops.events import TwinrOpsEventStore
@@ -35,6 +38,11 @@ def _utc_stamp() -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_AIDECK_DEVICE_SCHEME = "aideck://"
+_AIDECK_DEFAULT_PORT = 5000
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +115,16 @@ class TwinrSelfTestRunner:
                 "Submit a short service ticket to the configured receipt printer and then confirm the paper output on the device.",
             ),
             ("camera", "Kamera-Testbild", "Capture a fresh still image and store it as a PNG artifact."),
+            (
+                "aideck_camera",
+                "AI-Deck Kamera",
+                "Probe the AI-Deck stream endpoint, capture one frame, and verify the image artifact looks sane.",
+            ),
+            (
+                "drone_stack",
+                "Drohnen-Stack",
+                "Reach the bounded drone daemon, queue one inspect mission, verify manual-arm gating, and cancel it safely.",
+            ),
             ("buttons", "Button-State", "Read the configured GPIO button levels once."),
             ("pir", "PIR motion", "Wait for a motion trigger on the configured PIR input."),
         )
@@ -183,6 +201,10 @@ class TwinrSelfTestRunner:
                     result = self._run_printer_test()
                 elif normalized == "camera":
                     result = self._run_camera_test()
+                elif normalized == "aideck_camera":
+                    result = self._run_aideck_camera_test()
+                elif normalized == "drone_stack":
+                    result = self._run_drone_stack_test()
                 elif normalized == "buttons":
                     result = self._run_button_test()
                 else:
@@ -255,7 +277,7 @@ class TwinrSelfTestRunner:
             raise RuntimeError("Microphone self-test captured no usable audio data.")
 
         artifact_name = self._make_artifact_name("mic", ".wav")
-        artifact_path = self._write_artifact_bytes(artifact_name, payload)
+        self._write_artifact_bytes(artifact_name, payload)
         return SelfTestResult(
             test_name="mic",
             status="ok",
@@ -384,6 +406,86 @@ class TwinrSelfTestRunner:
                 f"Bytes: {artifact_size}",
             ),
             artifact_name=artifact_name,
+            finished_at=_utc_now_iso(),
+        )
+
+    def _run_aideck_camera_test(self) -> SelfTestResult:
+        device = str(getattr(self.config, "camera_device", "") or "").strip()
+        self._parse_aideck_device(device)
+        camera = self.camera_factory(self.config)
+        try:
+            artifact_name = self._make_artifact_name("aideck-camera", ".png")
+            capture, artifact_path, artifact_size = self._capture_camera_artifact(camera, artifact_name)
+        finally:
+            self._close_quietly(camera)
+
+        source_device = getattr(capture, "source_device", device) if capture is not None else device
+        input_format = getattr(capture, "input_format", None) if capture is not None else None
+        image_size = self._summarize_image_dimensions(capture, artifact_path=artifact_path)
+        return SelfTestResult(
+            test_name="aideck_camera",
+            status="ok",
+            summary="AI-Deck frame captured.",
+            details=(
+                f"Saved PNG as {artifact_name}.",
+                "Stored in the self-test artifact directory.",
+                "AI-Deck stream became reachable and returned one frame.",
+                f"Source device: {source_device}",
+                f"Input format: {input_format or 'default'}",
+                f"Image size: {image_size}",
+                f"Bytes: {artifact_size}",
+            ),
+            artifact_name=artifact_name,
+            finished_at=_utc_now_iso(),
+        )
+
+    def _run_drone_stack_test(self) -> SelfTestResult:
+        drone_config = DroneServiceConfig.from_config(self.config)
+        if not drone_config.enabled:
+            raise RuntimeError("Twinr drone support is disabled. Set TWINR_DRONE_ENABLED=true first.")
+        if not drone_config.base_url:
+            raise RuntimeError("Twinr drone support requires TWINR_DRONE_BASE_URL.")
+        client = RemoteDroneServiceClient(
+            base_url=drone_config.base_url,
+            timeout_s=drone_config.request_timeout_s,
+        )
+        health = client.health_payload()
+        state = client.state()
+        mission = client.create_inspect_mission(
+            target_hint="self test",
+            capture_intent="scene",
+            max_duration_s=drone_config.mission_timeout_s,
+        )
+        try:
+            cancelled = client.cancel_mission(mission.mission_id)
+        except Exception:
+            cancelled = None
+        details = [
+            f"Base URL: {drone_config.base_url}",
+            f"Skill layer mode: {state.skill_layer_mode}",
+            f"Radio ready: {str(state.safety.radio_ready).lower()}",
+            f"Pose ready: {str(state.safety.pose_ready).lower()}",
+            f"Can arm: {str(state.safety.can_arm).lower()}",
+            f"Mission id: {mission.mission_id}",
+            f"Mission state: {mission.state}",
+            f"Health can_arm: {str(bool(health.get('can_arm'))).lower()}",
+        ]
+        if state.pose.tracking_state:
+            details.append(f"Tracking state: {state.pose.tracking_state}")
+        if state.safety.reasons:
+            details.append(f"Safety reasons: {', '.join(state.safety.reasons)}")
+        if cancelled is not None:
+            details.append(f"Cancel state: {cancelled.state}")
+        expected_state = "pending_manual_arm" if drone_config.require_manual_arm else "running"
+        if mission.state != expected_state:
+            raise RuntimeError(
+                f"Drone daemon returned mission state `{mission.state}` instead of `{expected_state}`."
+            )
+        return SelfTestResult(
+            test_name="drone_stack",
+            status="ok",
+            summary="Drone daemon reached and bounded inspect mission queued safely.",
+            details=tuple(details),
             finished_at=_utc_now_iso(),
         )
 
@@ -581,9 +683,9 @@ class TwinrSelfTestRunner:
         staging_dir = Path(tempfile.mkdtemp(prefix=".self-test-camera-", dir=str(target_path.parent)))
         staged_path = staging_dir / artifact_name
         try:
-            capture = camera.capture_photo(output_path=staged_path, filename=artifact_name)
+            capture = camera.capture_photo(output_path=None, filename=artifact_name)
             data = getattr(capture, "data", None) if capture is not None else None
-            if (not staged_path.exists() or staged_path.stat().st_size <= 0) and data:
+            if data:
                 with staged_path.open("wb") as handle:
                     handle.write(bytes(data))
                     handle.flush()
@@ -597,6 +699,41 @@ class TwinrSelfTestRunner:
             return capture, target_path, artifact_size
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _parse_aideck_device(self, device: str) -> tuple[str, int]:
+        normalized = str(device or "").strip()
+        if not normalized.lower().startswith(_AIDECK_DEVICE_SCHEME):
+            raise RuntimeError("AI-Deck self-test requires TWINR_CAMERA_DEVICE to use aideck://host[:port].")
+        parsed = urlsplit(normalized)
+        host = str(parsed.hostname or "").strip()
+        if not host:
+            raise RuntimeError("AI-Deck self-test requires an aideck://host[:port] device URI.")
+        port = int(parsed.port or _AIDECK_DEFAULT_PORT)
+        return host, port
+
+    def _summarize_image_dimensions(self, capture: Any, *, artifact_path: Path) -> str:
+        payload = b""
+        data = getattr(capture, "data", None) if capture is not None else None
+        if data:
+            payload = bytes(data)
+        elif artifact_path.exists():
+            payload = artifact_path.read_bytes()
+        dimensions = self._png_dimensions(payload)
+        if dimensions is None:
+            return "unknown"
+        width, height = dimensions
+        return f"{width}x{height}"
+
+    @staticmethod
+    def _png_dimensions(payload: bytes) -> tuple[int, int] | None:
+        if len(payload) < 24 or not payload.startswith(_PNG_SIGNATURE):
+            return None
+        if payload[12:16] != b"IHDR":
+            return None
+        width, height = struct.unpack(">II", payload[16:24])
+        if width <= 0 or height <= 0:
+            return None
+        return width, height
 
     @staticmethod
     def _bounded_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:

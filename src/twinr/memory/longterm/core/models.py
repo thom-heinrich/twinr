@@ -451,6 +451,7 @@ class LongTermConversationTurn:
     transcript: str
     response: str
     source: str = "conversation"
+    modality: str = "voice"
     created_at: datetime = field(default_factory=_utcnow)
 
     def __post_init__(self) -> None:
@@ -460,6 +461,7 @@ class LongTermConversationTurn:
         if not isinstance(self.response, str):
             raise ValueError("response must be a string.")
         object.__setattr__(self, "source", _require_str(self.source, field_name="source"))
+        object.__setattr__(self, "modality", _require_str(self.modality, field_name="modality"))
         # AUDIT-FIX(#2): Keep direct-construction timestamps comparable with persisted UTC timestamps.
         object.__setattr__(self, "created_at", _coerce_datetime(self.created_at, field_name="created_at"))
 

@@ -15,7 +15,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - keep the yellow print button latency-safe by queuing prints from local short-term context only instead of synchronously rebuilding remote provider context before the print lane starts
 - route beep, feedback, and spoken playback through one priority-aware playback coordinator instead of scattered per-call locks
 - play one bounded startup boot clip from `media/boot.mp3` through the same playback coordinator, trimmed from the calmer middle of the asset and faded so loop startup stays gentle and interruptible
-- render reusable workflow media clips such as the thinking-state waiting ambience once and replay them as bounded, interruptible chunks instead of re-running ffmpeg on every loop iteration, while letting long processing loops duck gently over time
+- render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, play it about `35 %` slower and `30 %` quieter than the prior setting, loop it without an added idle gap until the answer starts, and let long processing loops duck gently over time while bounded tone fallbacks stay available
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
 - forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized
@@ -24,6 +24,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
 - resynchronize runtime-local remote-memory cooldown state after a successful external watchdog attestation so foreground turns do not fail against a stale in-process circuit breaker while the Pi watchdog already proved the namespace healthy
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
+- keep coordinator-backed streamed TTS from preempting the processing cue until the first real speech chunk is ready, so long model/TTS startup gaps do not create dead air after only one or two thinking loops
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
 - keep the runtime snapshot fresh during long spoken playback so the Pi supervisor does not false-kill an active answer as stale
 - route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts, with display-first prompts landing in the right-hand reserve lane instead of taking over the fullscreen presentation surface
@@ -44,6 +45,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall straight through to the generic supervisor loop instead of starting another structured-decision roundtrip
 - downgrade fast-lane decisions that declare `full_context` needs into a filler-plus-final-lane handoff so conversation-recall turns do not get answered from a memory-blind bridge lane
 - route resolved or prefetched dual-lane handoffs straight into the specialist path, using full tool-provider context for memory/general work while keeping pure search handoffs on the bounded search-only context
+- route `tiny_recent` runtime-local tool handoffs onto the bounded compact tool context instead of the heavy remote-backed tool-provider context, so status/control turns do not stall the final lane on synchronous long-term retrieval
 - give tool/search handoffs their own wider final-lane timeout budget so live specialist turns are not cut off by the shorter direct-reply watchdog envelope
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
@@ -59,6 +61,9 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - reconnect the edge voice websocket after transient server or network closures and replay the last known runtime state so hands-free wake detection does not stay dead until the Pi service restarts
 - keep the live voice gateway server-only after wake: once the Pi has opened a voice turn on thh1986, the same remote stream must stay authoritative for wake, transcript commit, continuation, and follow-up closure instead of pausing capture and reopening a second Pi-local listen phase
 - keep answer-time interruption server-owned whenever the live voice gateway is active; do not reopen a second local Pi STT watcher while the remote thh1986 stream already owns barge-in
+- replay the runtime-owned temporary voice-quiet window into the live voice orchestrator and suppress automatic follow-up reopening while that bounded quiet window is active
+- fail closed on the Pi as well when a late or stale server-side wake confirmation arrives during that runtime-owned voice-quiet window, and immediately re-attest `waiting` plus the active quiet deadline back into the live gateway
+- re-check remote follow-up eligibility after streamed tool side effects such as temporary voice quiet mode, so the streaming voice path never re-arms `follow_up_open` from a stale pre-turn snapshot once the runtime has decided to stay quiet
 - treat required remote-memory failures in the streaming final lane as fatal runtime blockers instead of masking them behind dual-lane fallback speech
 - share workflow-local helpers for feedback tones, reference images, and safe background delivery
 - expose the active workflow loop entry points without eager imports that can create runtime/ops import cycles
@@ -104,12 +109,13 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including smart-home and RSS/world-intelligence wiring |
 | [button_dispatch.py](./button_dispatch.py) | Non-blocking button dispatch and busy-turn interruption |
 | [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes |
-| [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating, including bounded heartbeat bridging keyed to healthy recent steady-state probe cadence and Pi-safe heartbeat quiet windows |
+| [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating, including bounded heartbeat bridging keyed to healthy recent steady-state probe cadence, Pi-safe heartbeat quiet windows, and bounded recovery of a dead external watchdog owner |
 | [speech_output.py](./speech_output.py) | Interruptible streamed TTS |
 | [forensics.py](./forensics.py) | Queue-based forensic runpack tracing for live workflow bugs, including bounded thread snapshots for stuck workflow helpers |
 | [listen_timeout_diagnostics.py](./listen_timeout_diagnostics.py) | Shared bounded no-speech timeout diagnostics emission |
 | [print_lane.py](./print_lane.py) | Background print lane |
-| [working_feedback.py](./working_feedback.py) | Bounded tone/media feedback with coordinator-owned stop semantics so processing ambience shutdown cannot kill live TTS and long thinking loops can quiet down over time |
+| [working_feedback.py](./working_feedback.py) | Bounded tone/media feedback with coordinator-owned stop semantics so the significantly slowed quieter default processing clip can loop cleanly until speech starts and long thinking loops can quiet down over time |
+| [working_feedback_tone.py](./working_feedback_tone.py) | Optional synthesized processing-tone helper kept available for non-default workflow experiments and direct tests |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 Legacy compatibility shims that no longer belong to the active package are

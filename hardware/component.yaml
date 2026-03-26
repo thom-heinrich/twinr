@@ -3,11 +3,13 @@ name: hardware
 path: hardware
 kind: script-directory
 visibility: internal
-summary: Provide Raspberry Pi setup, probe, smoke-test scripts, Pi-side authoritative runtime supervision units, transport-only peer camera proxy services for still and live IMX500 paths, the operator-facing Pi deploy command that replaces the old manual mirror rollout step, and the self-coding Codex bootstrap entrypoint for Twinr.
+summary: Provide Raspberry Pi setup, probe, smoke-test scripts, the isolated Bitcraze Crazyradio workspace bootstrap path, Pi-side authoritative runtime supervision units, the development-host bounded drone daemon, transport-only peer camera proxy services for still and live IMX500 paths, the operator-facing Pi deploy command that replaces the old manual mirror rollout step, and the self-coding Codex bootstrap entrypoint for Twinr.
 owned_concerns:
   - Persist Raspberry Pi hardware settings into Twinr env files and OS configuration
   - Install vendor or system dependencies needed for the display, audio, and printer paths
+  - Stage the isolated Bitcraze Crazyradio/Crazyflie workspace under /twinr/bitcraze with the required USB permissions, pinned firmware assets, and vendor Python tools
   - Stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
+  - Stage the development-host bounded drone daemon that owns mission preflight, manual-arm gating, and the first stationary-observe inspection slice
   - Stage the transport-only peer camera proxy service on the dedicated AI-camera helper Pi
   - Stage the transport-only peer AI-camera observation proxy service on the dedicated AI-camera helper Pi
   - Deploy the authoritative leading-repo code plus productive runtime settings onto the Pi acceptance checkout and restart the productive services there
@@ -19,6 +21,10 @@ out_of_scope:
   - Twinr loop orchestration and product behavior policy
   - Ad-hoc runtime patches directly in /twinr without leading-repo changes
 files:
+  - path: bitcraze/setup_bitcraze.sh
+    role: Install Crazyradio access rules, stage pinned UF2 assets, provision /twinr/bitcraze, and validate the pinned Bitcraze Python workspace
+  - path: bitcraze/probe_crazyradio.py
+    role: Inspect connected Bitcraze USB devices, classify the current Crazyradio compatibility mode, and confirm whether the local workspace can open the radio through cflib
   - path: buttons/setup_buttons.sh
     role: Persist button GPIO settings and optionally run the configured button probe
   - path: buttons/probe_buttons.py
@@ -41,6 +47,8 @@ files:
     role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
   - path: ops/deploy_pi_runtime.py
     role: Mirror the leading repo to the Pi, sync the authoritative runtime env, reinstall Twinr, restart productive units, and verify post-restart health
+  - path: ops/drone_daemon.py
+    role: Serve the bounded drone mission API with preflight checks, manual-arm approval, and stationary observation evidence capture
   - path: ops/install_whatsapp_node_runtime.py
     role: Download, verify, and stage the pinned local Node.js runtime under state/tools for the WhatsApp Baileys worker
   - path: ops/peer_ai_camera_observation_proxy.py
@@ -53,6 +61,8 @@ files:
     role: Keep the peer camera snapshot proxy bound to the direct-link address on the helper Pi
   - path: ops/twinr-runtime-supervisor.service
     role: Authoritatively supervise the productive streaming loop plus remote watchdog on the Pi
+  - path: ops/twinr-drone-daemon.service
+    role: Keep the bounded drone daemon alive on the development host with a stable local HTTP endpoint for Twinr
   - path: piaicam/fetch_mediapipe_models.py
     role: Download the official MediaPipe pose, hand-landmarker, and gesture task bundles needed by the Pi runtime path
   - path: piaicam/capture_custom_gesture_dataset.py
@@ -73,5 +83,6 @@ related_runtime_packages:
   - path: src/twinr/hardware
   - path: src/twinr/display
 manual_checks:
-  - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/servo/setup_pololu_maestro.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/display/run_visual_qc.py hardware/ops/bootstrap_self_coding_pi.py hardware/ops/check_pi_openai_env_contract.py hardware/ops/deploy_pi_runtime.py hardware/ops/install_whatsapp_node_runtime.py hardware/ops/peer_ai_camera_observation_proxy.py hardware/ops/peer_camera_snapshot_proxy.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
+  - command: bash -n hardware/bitcraze/setup_bitcraze.sh hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/servo/setup_pololu_maestro.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
+  - command: PYTHONPATH=src python3 -m py_compile hardware/bitcraze/probe_crazyradio.py hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/display/run_visual_qc.py hardware/ops/bootstrap_self_coding_pi.py hardware/ops/check_pi_openai_env_contract.py hardware/ops/deploy_pi_runtime.py hardware/ops/install_whatsapp_node_runtime.py hardware/ops/peer_ai_camera_observation_proxy.py hardware/ops/peer_camera_snapshot_proxy.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
+  - command: PYTHONPATH=src ./.venv/bin/pytest test/test_bitcraze_probe.py -q

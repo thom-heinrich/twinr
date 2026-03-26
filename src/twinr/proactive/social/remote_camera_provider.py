@@ -445,6 +445,10 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
             frame_rgb=frame_rgb,
             observed_at=time.time(),
             frame_at=captured_at,
+            # The dedicated remote-frame refresh only feeds the fine-hand
+            # HDMI/wakeup lane, so the coarse-only pose fallback adds latency
+            # without improving the symbols this path can emit.
+            allow_pose_fallback=False,
         )
         local_process_ms = _elapsed_ms(process_started_ns)
         processed_observation = replace(

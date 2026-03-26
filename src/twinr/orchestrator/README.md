@@ -159,6 +159,13 @@ transcript-first wake window a bit richer or the follow-up window open a bit
 longer when the runtime already sees speech-directed intent. It must never
 manufacture a wake from vision alone.
 
+The same runtime-state payload now also carries an optional
+`voice_quiet_until_utc` deadline. When that bounded runtime-owned quiet window
+is active, the gateway must fail closed for transcript-first idle wake and
+close any currently open same-stream follow-up window with an explicit
+`voice_quiet_active` reason. This temporary quiet gate is not a second wake
+path and it does not remove the explicit manual/button listen path.
+
 The edge runtime now also primes one explicit idle `waiting` runtime-state as
 soon as the voice websocket comes up, and `voice_hello` now carries that
 attested initial state plus the compact `person_state` projection. That matters

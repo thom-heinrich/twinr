@@ -12,6 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.ops.pi_repo_mirror import PiRepoMirrorCycleResult
 from twinr.ops.pi_runtime_deploy import deploy_pi_runtime
 
+_TEST_PI_HOST = "192.0.2.10"
+_TEST_PI_SSH_USER = "pi-test-user"
+_TEST_PI_SSH_PASSWORD = "placeholder-password"
+_TEST_OPENAI_API_KEY = "placeholder-openai-key"
+
 
 def _completed(
     args: list[str],
@@ -40,7 +45,7 @@ class _FakeMirrorWatchdog:
             "max_change_lines": max_change_lines,
         }
         return PiRepoMirrorCycleResult(
-            host="192.168.1.95",
+            host=_TEST_PI_HOST,
             remote_root="/twinr",
             drift_detected=True,
             sync_applied=True,
@@ -60,14 +65,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
-            env_path.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
             pi_env_path = root / ".env.pi"
             pi_env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",
@@ -132,7 +137,74 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("systemctl daemon-reload", joined)
         self.assertIn("systemctl restart", joined)
         self.assertIn("--live-text", joined)
-        self.assertTrue(any(env and env.get("SSHPASS") == "chaos" for env in envs))
+        self.assertTrue(any(env and env.get("SSHPASS") == _TEST_PI_SSH_PASSWORD for env in envs))
+
+    def test_deploy_installs_optional_browser_automation_runtime_support(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            browser_root = root / "browser_automation"
+            browser_root.mkdir(parents=True, exist_ok=True)
+            (browser_root / "runtime_requirements.txt").write_text(
+                "playwright>=1.58,<2\n",
+                encoding="utf-8",
+            )
+            (browser_root / "playwright_browsers.txt").write_text(
+                "chromium\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "runtime_requirements.txt" in rendered:
+                    return _completed(command, stdout="Successfully installed playwright\n")
+                if "playwright install" in rendered:
+                    return _completed(command, stdout="Downloaded Chromium\n")
+                if "pip install --no-deps -e" in rendered:
+                    return _completed(command, stdout="Successfully installed twinr\n")
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                if "check_pi_openai_env_contract.py" in rendered:
+                    return _completed(command, stdout='{"ok": true}\n')
+                if "actual_sha=$(sha256sum" in rendered:
+                    return _completed(command, stdout="")
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                services=("twinr-runtime-supervisor",),
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+            )
+
+        self.assertTrue(result.ok)
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("pip install -r \"$requirements_path\"", joined)
+        self.assertIn("-m playwright install", joined)
 
     def test_deploy_skips_env_copy_when_remote_checksum_matches(self) -> None:
         commands: list[list[str]] = []
@@ -140,14 +212,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
-            env_path.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
             pi_env_path = root / ".env.pi"
             pi_env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",
@@ -192,14 +264,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
-            env_path.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
             pi_env_path = root / ".env.pi"
             pi_env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",
@@ -297,14 +369,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
-            env_path.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
             pi_env_path = root / ".env.pi"
             pi_env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",

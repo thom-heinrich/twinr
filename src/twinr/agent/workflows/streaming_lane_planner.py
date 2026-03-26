@@ -11,6 +11,8 @@ from twinr.agent.tools import (
     build_tool_agent_instructions,
 )
 from twinr.agent.base_agent.contracts import supervisor_decision_requires_full_context
+from twinr.agent.base_agent.contracts import normalize_supervisor_decision_context_scope
+from twinr.agent.base_agent.contracts import normalize_supervisor_decision_runtime_tool_name
 from twinr.agent.workflows.streaming_supervisor_context import (
     build_streaming_supervisor_turn_instructions,
 )
@@ -206,6 +208,7 @@ class StreamingLanePlanner:
         supervisor_direct_context = None
         supervisor_turn_instructions = None
         tool_context = None
+        tool_tiny_recent_context = None
         skip_structured_supervisor_decision = False
 
         def _raise_if_turn_stopped(stage: str) -> None:
@@ -266,6 +269,24 @@ class StreamingLanePlanner:
                 )
             return tool_context
 
+        def _tool_tiny_recent_context():
+            nonlocal tool_tiny_recent_context
+            if tool_tiny_recent_context is None:
+                tiny_recent_reader = getattr(
+                    loop.runtime,
+                    "tool_provider_tiny_recent_conversation_context",
+                    None,
+                )
+                tool_tiny_recent_context = _materialize_context(
+                    "tool_tiny_recent",
+                    (
+                        tiny_recent_reader()
+                        if callable(tiny_recent_reader)
+                        else loop.runtime.tool_provider_conversation_context()
+                    ),
+                )
+            return tool_tiny_recent_context
+
         def _supervisor_turn_instructions():
             nonlocal supervisor_turn_instructions
             if supervisor_turn_instructions is None:
@@ -274,7 +295,17 @@ class StreamingLanePlanner:
 
         def _handoff_context(decision):
             kind = str(getattr(decision, "kind", "") or "").strip().lower()
-            return _search_context() if kind == "search" else _tool_context()
+            if kind == "search":
+                return _search_context()
+            context_scope = normalize_supervisor_decision_context_scope(
+                getattr(decision, "context_scope", None)
+            )
+            return _tool_tiny_recent_context() if context_scope == "tiny_recent" else _tool_context()
+
+        def _has_runtime_local_tool(decision) -> bool:
+            return normalize_supervisor_decision_runtime_tool_name(
+                getattr(decision, "runtime_tool_name", None)
+            ) is not None
 
         def _run_with_search_feedback(decision, callback):
             def stop_search_feedback() -> None:
@@ -290,6 +321,37 @@ class StreamingLanePlanner:
 
         _raise_if_turn_stopped("final_path_start")
         if prefetched_decision is not None and getattr(prefetched_decision, "action", None) == "handoff":
+            if _has_runtime_local_tool(prefetched_decision):
+                loop._trace_decision(
+                    "dual_lane_final_path_selected",
+                    question="Which final-lane execution path should run?",
+                    selected={
+                        "id": "prefetched_runtime_local_tool",
+                        "summary": "Execute one direct runtime-local tool handoff",
+                    },
+                    options=[
+                        {
+                            "id": "prefetched_runtime_local_tool",
+                            "summary": "Execute the runtime-local tool directly",
+                        },
+                        {"id": "prefetched_handoff", "summary": "Run one direct handoff-only path"},
+                        {"id": "resolve_supervisor", "summary": "Resolve supervisor decision synchronously"},
+                    ],
+                    context={
+                        "transcript": _text_summary(transcript),
+                        "prefetched": True,
+                        "decision": _decision_summary(prefetched_decision),
+                    },
+                    guardrails=["runtime_local_direct_tool"],
+                )
+                return loop.streaming_turn_loop.run_runtime_local_tool_only(
+                    transcript,
+                    decision=prefetched_decision,
+                    on_text_delta=None,
+                    on_lane_text_delta=None,
+                    emit_filler=False,
+                    should_stop=loop._active_turn_stop_requested,
+                )
             handoff_kind = str(getattr(prefetched_decision, "kind", "") or "").strip().lower() or "general"
             handoff_context = _handoff_context(prefetched_decision)
             loop._trace_decision(
@@ -371,6 +433,37 @@ class StreamingLanePlanner:
                     )
                     action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
                 if action == "handoff":
+                    if _has_runtime_local_tool(resolved_decision):
+                        loop._trace_decision(
+                            "dual_lane_final_path_selected",
+                            question="Which final-lane execution path should run?",
+                            selected={
+                                "id": "resolved_runtime_local_tool",
+                                "summary": "Execute the runtime-local tool directly",
+                            },
+                            options=[
+                                {
+                                    "id": "resolved_runtime_local_tool",
+                                    "summary": "Execute the runtime-local tool directly",
+                                },
+                                {"id": "resolved_handoff", "summary": "Run specialist handoff only"},
+                                {"id": "resolved_direct", "summary": "Run resolved direct reply"},
+                            ],
+                            context={
+                                "transcript": _text_summary(transcript),
+                                "action": action,
+                                "decision": _decision_summary(resolved_decision),
+                            },
+                            guardrails=["runtime_local_direct_tool"],
+                        )
+                        return loop.streaming_turn_loop.run_runtime_local_tool_only(
+                            transcript,
+                            decision=resolved_decision,
+                            on_text_delta=None,
+                            on_lane_text_delta=None,
+                            emit_filler=False,
+                            should_stop=loop._active_turn_stop_requested,
+                        )
                     handoff_kind = str(getattr(resolved_decision, "kind", "") or "").strip().lower() or "general"
                     handoff_context = _handoff_context(resolved_decision)
                     context_source = "search" if handoff_kind == "search" else "tool"
@@ -544,6 +637,11 @@ def _decision_summary(decision) -> dict[str, Any]:
         "action": str(getattr(decision, "action", "") or "").strip().lower() or None,
         "kind": str(getattr(decision, "kind", "") or "").strip().lower() or None,
         "context_scope": str(getattr(decision, "context_scope", "") or "").strip() or None,
+        "runtime_tool_name": str(getattr(decision, "runtime_tool_name", "") or "").strip() or None,
+        "runtime_tool_arguments_present": isinstance(
+            getattr(decision, "runtime_tool_arguments", None),
+            dict,
+        ),
         "allow_web_search": getattr(decision, "allow_web_search", None),
         "spoken_ack": _text_summary(getattr(decision, "spoken_ack", None)),
         "spoken_reply": _text_summary(getattr(decision, "spoken_reply", None)),

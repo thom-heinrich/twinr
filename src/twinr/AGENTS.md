@@ -9,6 +9,7 @@ entrypoints live in [component.yaml](./component.yaml).
 
 Out of scope:
 - deep runtime, tool, and workflow behavior in `src/twinr/agent`
+- browser-agent implementation details and local workspace loading policy in `src/twinr/browser_automation`
 - long-lived external messaging transport behavior in `src/twinr/channels`
 - provider implementations in `src/twinr/providers`
 - hardware adapters in `src/twinr/hardware`
@@ -19,6 +20,7 @@ Out of scope:
 
 - `__init__.py` — lazy `twinr` export surface; treat export changes as API-impacting
 - `__main__.py` — package CLI bootstrap and command dispatch
+- `browser_automation/README.md` — versioned boundary for the optional browser automation subsystem
 - `llm_json.py` — structured JSON request and fallback schema validation helper
 - `runtime_paths.py` — scoped runtime path helper for auxiliary processes and acceptance tooling
 - `temporal.py` — timezone-aware local date parser
@@ -29,6 +31,7 @@ Out of scope:
 - Keep `src/twinr` thin. New product behavior belongs in a focused child package unless it is truly package-boundary, bootstrap, or cross-subsystem utility code.
 - `__main__.py` may parse args, guard runtime preconditions, and dispatch commands, but business logic must stay in imported subsystem modules.
 - `__init__.py` must stay import-light and side-effect free; do not add eager runtime setup there.
+- Optional browser automation must stay behind `src/twinr/browser_automation`; root-package code may only reference its documented boundary, never local vendored implementation details.
 - `llm_json.py`, `temporal.py`, and `text_utils.py` must stay generic shared helpers, not a dumping ground for subsystem-specific policy.
 - When ownership changes between the root package and a child package, update the touched module docstrings plus [README.md](./README.md), [AGENTS.md](./AGENTS.md), and [component.yaml](./component.yaml) in the same change.
 

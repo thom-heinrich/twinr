@@ -1029,6 +1029,7 @@ class LongTermMemoryService:
         transcript: str,
         response: str,
         source: str = "conversation",
+        modality: str = "voice",
     ) -> LongTermEnqueueResult | None:
         """Queue one conversation turn for bounded long-term persistence.
 
@@ -1036,6 +1037,7 @@ class LongTermMemoryService:
             transcript: Normalized user transcript to persist.
             response: Assistant response paired with the transcript.
             source: Source label recorded with the turn.
+            modality: Input modality recorded with the turn.
 
         Returns:
             Queue admission metadata when a background writer is enabled.
@@ -1046,6 +1048,7 @@ class LongTermMemoryService:
         clean_transcript = _normalize_text(transcript, limit=_TEXT_LIMIT)
         clean_response = _normalize_text(response, limit=_TEXT_LIMIT)
         clean_source = _normalize_text(source, limit=_SOURCE_LIMIT) or "conversation"
+        clean_modality = _normalize_text(modality, limit=_SOURCE_LIMIT) or "voice"
         if not clean_transcript or not clean_response:
             return None
         # AUDIT-FIX(#6): normalize source text early so queue fallback stores a bounded record.
@@ -1053,6 +1056,7 @@ class LongTermMemoryService:
             transcript=clean_transcript,
             response=clean_response,
             source=clean_source,
+            modality=clean_modality,
         )
         if self.writer is None:
             return None
@@ -1078,6 +1082,55 @@ class LongTermMemoryService:
                 item=item,
             )
             return None
+
+    def import_external_conversation_turn(
+        self,
+        *,
+        transcript: str,
+        response: str,
+        source: str,
+        modality: str,
+        created_at: datetime,
+        allow_personality_learning: bool = False,
+    ) -> PersistentMemoryEntry | None:
+        """Persist one historical or external turn directly into shared memory.
+
+        This path is intended for bounded imports from operator-approved
+        external history sources such as WhatsApp. It bypasses the async writer
+        so the original event timestamp is preserved and personality learning
+        stays opt-in for non-Twinr conversations.
+        """
+
+        item = LongTermConversationTurn(
+            transcript=_normalize_text(transcript, limit=_TEXT_LIMIT),
+            response=_normalize_text(response, limit=_TEXT_LIMIT),
+            source=_normalize_text(source, limit=_SOURCE_LIMIT) or "conversation",
+            modality=_normalize_text(modality, limit=_SOURCE_LIMIT) or "text",
+            created_at=created_at,
+        )
+        if not item.transcript or not item.response:
+            return None
+        return self._persist_longterm_turn(
+            config=self.config,
+            store=self.prompt_context_store,
+            graph_store=self.graph_store,
+            object_store=self.object_store,
+            midterm_store=self.midterm_store,
+            extractor=self.extractor,
+            consolidator=self.consolidator,
+            reflector=self.reflector,
+            turn_continuity_compiler=self.turn_continuity_compiler,
+            sensor_memory=self.sensor_memory,
+            retention_policy=self.retention_policy,
+            personality_learning=self.personality_learning if allow_personality_learning else None,
+            store_lock=self._store_lock,
+            timezone_name=self.config.local_timezone_name,
+            item=item,
+            episode_attributes={
+                "ingestion_origin": "external_history",
+                "retention_policy": "preserve",
+            },
+        )
 
     def record_personality_tool_history(
         self,
@@ -1139,12 +1192,16 @@ class LongTermMemoryService:
         *,
         transcript: str,
         response: str,
+        source: str = "conversation",
+        modality: str = "voice",
     ) -> LongTermConsolidationResultV1:
         """Run extraction and consolidation without mutating stored state."""
 
         extraction = self.extractor.extract_conversation_turn(
             transcript=transcript,
             response=response,
+            source=source,
+            modality=modality,
         )
         with self._store_lock:
             existing_objects = tuple(self.object_store.load_objects())
@@ -1891,6 +1948,7 @@ class LongTermMemoryService:
         store_lock: threading.RLock | None = None,
         timezone_name: str | None = None,
         item: LongTermConversationTurn,
+        episode_attributes: Mapping[str, object] | None = None,
     ) -> PersistentMemoryEntry | None:
         """Persist one conversation turn through the full long-term pipeline.
 
@@ -1927,6 +1985,9 @@ class LongTermMemoryService:
                     transcript=item.transcript,
                     response=item.response,
                     occurred_at=occurred_at,
+                    source=item.source,
+                    modality=item.modality,
+                    episode_attributes=episode_attributes,
                 )
                 result = consolidator.consolidate(
                     extraction=extraction,

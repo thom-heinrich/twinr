@@ -10,9 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.tools.handlers.user_discovery import handle_manage_user_discovery
 from twinr.agent.tools.runtime.registry import realtime_tool_names
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
+from twinr.display.reserve_bus_feedback import DisplayReserveBusFeedbackStore
+from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.user_discovery import (
+    UserDiscoveryCommitCallbacks,
     UserDiscoveryFact,
     UserDiscoveryMemoryRoute,
     UserDiscoveryService,
@@ -21,7 +27,23 @@ from twinr.memory.user_discovery import (
     UserDiscoveryTopicState,
 )
 from twinr.proactive.runtime.display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
-from twinr.agent.base_agent import TwinrRuntime
+
+
+def _active_preference_object(
+    *,
+    memory_id: str,
+    summary: str,
+    attributes: dict[str, object],
+) -> LongTermMemoryObjectV1:
+    return LongTermMemoryObjectV1(
+        memory_id=memory_id,
+        kind="fact",
+        summary=summary,
+        source=LongTermSourceRefV1(source_type="user_transcript", event_ids=("turn:test",)),
+        status="active",
+        confirmed_by_user=True,
+        attributes=attributes,
+    )
 
 
 class UserDiscoveryTests(unittest.TestCase):
@@ -277,6 +299,7 @@ class UserDiscoveryTests(unittest.TestCase):
             invite = service.build_invitation(now=now)
 
         self.assertIsNotNone(invite)
+        assert invite is not None
         self.assertEqual(invite.topic_id, "pets")
 
     def test_display_reserve_candidates_offer_review_when_corrections_accumulate(self) -> None:
@@ -347,8 +370,274 @@ class UserDiscoveryTests(unittest.TestCase):
             )
 
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].generation_context.get("invite_kind"), "review_profile")
-        self.assertEqual(candidates[0].generation_context.get("topic_id"), "basics")
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("invite_kind"), "review_profile")
+        self.assertEqual(context.get("topic_id"), "basics")
+
+    def test_display_reserve_discovery_candidate_uses_human_prompt_anchor_not_raw_topic_label(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            now = datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc)
+
+            candidates = load_display_reserve_user_discovery_candidates(
+                config,
+                local_now=now,
+                max_items=3,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("topic_id"), "basics")
+        self.assertEqual(context.get("display_anchor"), "dein Name")
+        self.assertEqual(
+            context.get("hook_hint"),
+            "Ich moechte wissen, wie ich dich ansprechen soll.",
+        )
+        self.assertEqual(
+            context.get("card_intent"),
+            {
+                "topic_semantics": "bevorzugte Anrede und Namensform",
+                "statement_intent": "Twinr will wissen, wie es den Nutzer ansprechen soll.",
+                "cta_intent": "Den Nutzer bitten, den passenden Namen oder die passende Anrede zu nennen.",
+                "relationship_stance": "ruhiges Kennenlernen ohne Setup-Ton",
+            },
+        )
+        self.assertNotIn("Basisinfos", str(context.get("hook_hint")))
+        self.assertNotIn("Einrichtung", str(context.get("hook_hint")))
+
+    def test_build_invitation_skips_basics_when_curated_user_profile_already_names_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("User: Thom.\nLives in Schwarzenbek.\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            service = UserDiscoveryService.from_config(config)
+
+            invite = service.build_invitation(now=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIsNotNone(invite)
+        assert invite is not None
+        self.assertEqual(invite.topic_id, "companion_style")
+        self.assertEqual(invite.invite_kind, "start_setup")
+
+    def test_display_reserve_candidates_skip_basics_when_curated_user_profile_already_names_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("User: Thom.\nLives in Schwarzenbek.\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            now = datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc)
+
+            candidates = load_display_reserve_user_discovery_candidates(
+                config,
+                local_now=now,
+                max_items=3,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("topic_id"), "companion_style")
+        self.assertEqual(candidates[0].topic_key, "user_discovery:initial_setup:companion_style")
+
+    def test_build_invitation_skips_basics_when_graph_preference_already_names_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("Base user profile\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            TwinrPersonalGraphStore.from_config(config).remember_preference(category="preferred_name", value="Thom")
+            service = UserDiscoveryService.from_config(config)
+
+            invite = service.build_invitation(now=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIsNotNone(invite)
+        assert invite is not None
+        self.assertEqual(invite.topic_id, "companion_style")
+
+    def test_display_reserve_candidates_skip_basics_when_long_term_memory_already_names_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("Base user profile\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            LongTermStructuredStore.from_config(config).write_snapshot(
+                objects=(
+                    _active_preference_object(
+                        memory_id="fact:user:main:prefers_name:thom",
+                        summary="The user wants to be called Thom.",
+                        attributes={
+                            "subject_ref": "user:main",
+                            "predicate": "prefers_name",
+                            "preference_type": "name",
+                            "preference_value": "Thom",
+                            "support_count": 1,
+                        },
+                    ),
+                ),
+            )
+
+            candidates = load_display_reserve_user_discovery_candidates(
+                config,
+                local_now=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc),
+                max_items=3,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("topic_id"), "companion_style")
+        self.assertEqual(candidates[0].topic_key, "user_discovery:initial_setup:companion_style")
+
+    def test_build_invitation_skips_companion_style_when_authoritative_style_preference_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("Base user profile\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            TwinrPersonalGraphStore.from_config(config).remember_preference(category="preferred_name", value="Thom")
+            LongTermStructuredStore.from_config(config).write_snapshot(
+                objects=(
+                    _active_preference_object(
+                        memory_id="pref:initiative:gentle",
+                        summary="The user likes gentle initiative in follow-ups.",
+                        attributes={
+                            "subject_ref": "user:main",
+                            "memory_domain": "preference",
+                            "predicate": "user_prefers_small_follow_up_when_helpful",
+                            "preference_type": "initiative",
+                            "preference_value": "gently_proactive",
+                            "support_count": 1,
+                        },
+                    ),
+                ),
+            )
+            service = UserDiscoveryService.from_config(config)
+
+            invite = service.build_invitation(now=datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIsNotNone(invite)
+        assert invite is not None
+        self.assertEqual(invite.topic_id, "social")
+
+    def test_runtime_answer_to_visible_discovery_card_retires_pending_reserve_exposure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("Base user profile\n", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Base personality\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            runtime = TwinrRuntime(config=config)
+            history_store = DisplayAmbientImpulseHistoryStore.from_config(config)
+            feedback_store = DisplayReserveBusFeedbackStore.from_config(config)
+            shown_at = datetime(2026, 3, 26, 8, 59, tzinfo=timezone.utc)
+            history_store.append_exposure(
+                source="user_discovery",
+                topic_key="user_discovery:initial_setup:basics",
+                semantic_topic_key="user_discovery:initial_setup:basics",
+                title="Basisinfos",
+                headline="Ich moechte wissen, wie ich dich ansprechen soll.",
+                body="Wenn du magst, kannst du es mir kurz sagen.",
+                action="ask_one",
+                attention_state="forming",
+                shown_at=shown_at,
+                expires_at=shown_at + timedelta(minutes=10),
+                match_anchors=("Basisinfos", "dein Name"),
+            )
+            try:
+                runtime.manage_user_discovery(
+                    action="answer",
+                    topic_id="basics",
+                    learned_facts=(
+                        UserDiscoveryFact(
+                            storage="user_profile",
+                            text="User prefers to be called Thom.",
+                        ),
+                    ),
+                    topic_complete=True,
+                    now=shown_at + timedelta(minutes=1),
+                )
+            finally:
+                runtime.shutdown(timeout_s=0.1)
+
+            history = history_store.load()
+            reserve_feedback = feedback_store.load_active(now=shown_at + timedelta(minutes=1))
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].response_status, "engaged")
+        self.assertEqual(history[0].response_mode, "voice_immediate_pickup")
+        self.assertIsNotNone(reserve_feedback)
+        assert reserve_feedback is not None
+        self.assertEqual(reserve_feedback.topic_key, "user_discovery:initial_setup:basics")
+        self.assertEqual(reserve_feedback.reaction, "immediate_engagement")
+
+    def test_display_reserve_discovery_candidate_uses_follow_up_hook_after_partial_basics_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            now = datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc)
+            service = UserDiscoveryService.from_config(config)
+            callbacks = UserDiscoveryCommitCallbacks(
+                update_user_profile=lambda category, instruction: None,
+                delete_user_profile=lambda category: None,
+                update_personality=lambda category, instruction: None,
+                delete_personality=lambda category: None,
+            )
+            service.manage(action="start_or_resume", topic_id="basics", now=now)
+            service.manage(
+                action="answer",
+                topic_id="basics",
+                learned_facts=(
+                    UserDiscoveryFact(
+                        storage="user_profile",
+                        text="User prefers to be called Thom.",
+                    ),
+                ),
+                topic_complete=False,
+                callbacks=callbacks,
+                now=now + timedelta(minutes=1),
+            )
+            service.manage(
+                action="pause_session",
+                now=now + timedelta(minutes=2),
+            )
+
+            candidates = load_display_reserve_user_discovery_candidates(
+                config,
+                local_now=now + timedelta(hours=19),
+                max_items=3,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        context = candidates[0].generation_context or {}
+        self.assertEqual(context.get("topic_id"), "basics")
+        self.assertEqual(context.get("display_prompt_stage"), "follow_up")
+        self.assertNotEqual(
+            context.get("hook_hint"),
+            "Ich moechte wissen, wie ich dich ansprechen soll.",
+        )
 
     def test_registry_exposes_manage_user_discovery_tool(self) -> None:
         self.assertIn("manage_user_discovery", realtime_tool_names())

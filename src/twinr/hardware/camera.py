@@ -1,9 +1,10 @@
-"""Capture bounded still photos from local devices or a peer snapshot proxy.
+"""Capture bounded still photos from local devices, AI-Deck streams, or a proxy.
 
 This module wraps ``ffmpeg`` for direct V4L2 capture, falls back to
 ``rpicam-still`` on Raspberry Pi camera stacks when needed, and can also fetch
-one bounded still frame from a peer HTTP snapshot proxy while preserving the
-same upstream ``CapturedPhoto`` contract.
+one bounded still frame from either a peer HTTP snapshot proxy or a Bitcraze
+AI-Deck WiFi stream while preserving the same upstream ``CapturedPhoto``
+contract.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ _RPICAM_STILL_MAX_TIMEOUT_MS = 5000
 _UNICAM_IMAGE_MARKER = "unicam-image"
 _HTTP_SNAPSHOT_INPUT_FORMAT = "http-snapshot"
 _HTTP_ALLOWED_SCHEMES = frozenset({"http", "https"})
+_AIDECK_DEVICE_SCHEME = "aideck://"
 
 
 class CameraError(RuntimeError):  # AUDIT-FIX(#6): Use structured camera exceptions so callers can recover differently from config, timeout, and capture failures.
@@ -115,6 +117,19 @@ class V4L2StillCamera:
     def from_config(cls, config: TwinrConfig) -> "V4L2StillCamera":
         """Build a still camera from ``TwinrConfig`` values."""
 
+        device = getattr(config, "camera_device", None)
+        if isinstance(device, str) and device.strip().lower().startswith(_AIDECK_DEVICE_SCHEME):
+            from twinr.hardware.aideck_camera import AIDeckStillCamera
+            from twinr.hardware.aideck_wifi import AIDeckWifiConnectionManager
+
+            return AIDeckStillCamera(
+                device=device,
+                capture_timeout_seconds=getattr(
+                    config, "camera_capture_timeout_seconds", _DEFAULT_CAPTURE_TIMEOUT_SECONDS
+                ),
+                output_root=getattr(config, "camera_capture_output_dir", None),
+                wifi_connection_manager=AIDeckWifiConnectionManager.from_config(config),
+            )
         snapshot_url = getattr(config, "camera_proxy_snapshot_url", None)
         if isinstance(snapshot_url, str) and snapshot_url.strip():
             return SnapshotProxyStillCamera(

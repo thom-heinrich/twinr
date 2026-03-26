@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Virtualized Catalog</title>
+    <style>
+      body { font-family: sans-serif; }
+      ul { padding-left: 1.2rem; }
+      li { margin-bottom: 0.5rem; }
+      .status { font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Virtualized Catalog</h1>
+      <p>Use the search box to jump to any catalog item.</p>
+      <label for="catalog-search">Search catalog</label>
+      <input id="catalog-search" name="catalog-search" placeholder="Search catalog" />
+      <ul id="catalog-list"></ul>
+    </main>
+    <script>
+      const items = Array.from({ length: 48 }, (_, index) => {
+        const number = index + 1;
+        if (number === 37) {
+          return { name: "Helios 37", status: "Standby" };
+        }
+        return { name: `Catalog Item ${number}`, status: number % 2 === 0 ? "Active" : "Queued" };
+      });
+      const input = document.getElementById("catalog-search");
+      const list = document.getElementById("catalog-list");
+      const render = () => {
+        const query = String(input.value || "").trim().toLowerCase();
+        const matches = items.filter((item) => item.name.toLowerCase().includes(query));
+        const visible = matches.slice(0, 8);
+        list.innerHTML = visible
+          .map((item) => `<li><span class="name">${item.name}</span> <span class="status">${item.status}</span></li>`)
+          .join("");
+      };
+      input.addEventListener("input", render);
+      render();
+    </script>
+  </body>
+</html>

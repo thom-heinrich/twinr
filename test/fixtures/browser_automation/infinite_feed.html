@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Infinite Feed</title>
+    <style>
+      body { font-family: sans-serif; }
+      article { border-bottom: 1px solid #ddd; padding: 1rem 0; }
+      .priority { font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Infinite Feed</h1>
+      <p>Scroll down to load more feed entries.</p>
+      <section id="feed"></section>
+      <div style="height: 1200px;"></div>
+    </main>
+    <script>
+      const allItems = Array.from({ length: 18 }, (_, index) => {
+        const number = index + 1;
+        if (number === 14) {
+          return { title: "Orbital Archive", priority: "Amber" };
+        }
+        return { title: `Feed Entry ${number}`, priority: number % 3 === 0 ? "Blue" : "Green" };
+      });
+      const feed = document.getElementById("feed");
+      let rendered = 0;
+      const renderMore = () => {
+        const nextItems = allItems.slice(rendered, rendered + 6);
+        for (const item of nextItems) {
+          const article = document.createElement("article");
+          article.innerHTML = `<h2>${item.title}</h2><p>Priority <span class="priority">${item.priority}</span></p>`;
+          feed.appendChild(article);
+        }
+        rendered += nextItems.length;
+      };
+      renderMore();
+      window.addEventListener("scroll", () => {
+        if (window.innerHeight + window.scrollY + 80 >= document.body.scrollHeight && rendered < allItems.length) {
+          renderMore();
+        }
+      });
+    </script>
+  </body>
+</html>

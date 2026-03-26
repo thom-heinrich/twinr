@@ -15,6 +15,7 @@ Command-line invocation examples::
     python3 hardware/servo/attention_servo_state.py hold-current-zero
     python3 hardware/servo/attention_servo_state.py hold
     python3 hardware/servo/attention_servo_state.py arm
+    python3 hardware/servo/attention_servo_state.py return-to-estimated-zero
 
 Inputs
 ------
@@ -27,12 +28,17 @@ Inputs
 - ``hold`` to keep startup hold enabled while preserving the current virtual
   heading estimate
 - ``arm`` to disable startup hold and let live follow resume
+- ``return-to-estimated-zero`` to ask the running runtime to drive back to the
+  stored virtual ``0°`` only when the saved uncertainty stays within the
+  configured bound
 
 Outputs
 -------
 - Prints the resolved state path plus the saved hold/heading flags
 - Exit code 0 on success
 - Exit code 2 when ``arm`` is requested before a zero reference exists
+  or when ``return-to-estimated-zero`` is requested before a zero reference
+  exists
 
 Notes
 -----
@@ -85,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
         "arm",
         help="Disable manual hold so the running runtime may resume live follow",
     )
+    subparsers.add_parser(
+        "return-to-estimated-zero",
+        help="Ask the runtime to drive back to the stored virtual 0° when uncertainty allows it",
+    )
     return parser
 
 
@@ -105,8 +115,13 @@ def _print_state(store: AttentionServoStateStore, state: AttentionServoRuntimeSt
         print("attention_servo_state=missing")
         return
     print(f"heading_degrees={state.heading_degrees:.3f}")
+    print(f"heading_uncertainty_degrees={state.heading_uncertainty_degrees:.3f}")
     print(f"hold_until_armed={'true' if state.hold_until_armed else 'false'}")
+    print(f"return_to_zero_requested={'true' if state.return_to_zero_requested else 'false'}")
     print(f"zero_reference_confirmed={'true' if state.zero_reference_confirmed else 'false'}")
+    if state.return_to_zero_requested:
+        print("attention_servo_state=returning_to_estimated_zero")
+        return
     print("attention_servo_state=manual_hold" if state.hold_until_armed else "attention_servo_state=armed")
 
 
@@ -126,6 +141,12 @@ def _updated_state_for_command(
         if not current_state.zero_reference_confirmed:
             raise ValueError("Cannot arm the continuous attention servo before a zero reference is confirmed")
         return current_state.arm_follow(updated_at=updated_at)
+    if command == "return-to-estimated-zero":
+        if not current_state.zero_reference_confirmed:
+            raise ValueError(
+                "Cannot return the continuous attention servo to estimated zero before a zero reference is confirmed"
+            )
+        return current_state.request_return_to_estimated_zero(updated_at=updated_at)
     raise ValueError(f"Unsupported command: {command}")
 
 

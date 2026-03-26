@@ -15,16 +15,14 @@ import os
 from pathlib import Path
 import sys
 from threading import Lock
-from typing import Any
+from typing import Any, Callable, cast
 
 from twinr.runtime_paths import prime_raspberry_pi_system_site_packages
 
 prime_raspberry_pi_system_site_packages()
 
-from twinr.agent.base_agent import TwinrConfig  # noqa: E402
+from twinr.agent.base_agent.config import TwinrConfig  # noqa: E402
 from twinr.ops.locks import TwinrInstanceAlreadyRunningError  # noqa: E402
-from twinr.ops.runtime_env import prime_user_session_audio_env  # noqa: E402
-
 _RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 
 
@@ -66,6 +64,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--camera-capture-output",
         type=Path,
         help="Capture a still image from the configured camera and write it to this path",
+    )
+    parser.add_argument(
+        "--self-test",
+        help="Run one bounded Twinr ops self-test by id and print the result.",
+    )
+    parser.add_argument(
+        "--drone-status",
+        action="store_true",
+        help="Read one bounded state snapshot from the configured drone daemon.",
+    )
+    parser.add_argument(
+        "--drone-inspect",
+        help="Queue one bounded inspect mission through the configured drone daemon.",
+    )
+    parser.add_argument(
+        "--drone-cancel-mission",
+        help="Cancel one existing drone mission by id.",
+    )
+    parser.add_argument(
+        "--drone-manual-arm",
+        help="Approve manual arm for one existing drone mission by id through the daemon's local ops path.",
     )
     parser.add_argument(
         "--proactive-observe-once",
@@ -283,7 +302,8 @@ def _build_runtime(config: TwinrConfig) -> Any:
 
     from twinr.agent.base_agent import TwinrRuntime
 
-    return TwinrRuntime(config=config)
+    runtime_factory = cast(Callable[..., Any], TwinrRuntime)
+    return runtime_factory(config=config)
 
 
 def _print_runtime_banner(runtime: Any, config: TwinrConfig, env_path: Path) -> None:
@@ -395,9 +415,81 @@ def _run_orchestrator_server(config: TwinrConfig, env_file: str | Path) -> int:
             "The web/orchestrator dependencies are not installed. Run `pip install -e .` in /twinr."
         ) from exc
 
-    app = create_app(Path(env_file))
+    create_app_factory = cast(Callable[[Path], Any], create_app)
+    app = create_app_factory(Path(env_file))
     uvicorn.run(app, host=config.orchestrator_host, port=config.orchestrator_port)
     return 0
+
+
+def _run_drone_cli_commands(config: TwinrConfig, args: argparse.Namespace) -> int:
+    """Dispatch the bounded drone-daemon operator commands."""
+
+    from twinr.hardware.drone_service import DroneServiceConfig, RemoteDroneServiceClient
+
+    drone_config = DroneServiceConfig.from_config(config)
+    if not drone_config.enabled:
+        raise RuntimeError("Twinr drone support is disabled. Set TWINR_DRONE_ENABLED=true.")
+    client = RemoteDroneServiceClient(
+        base_url=drone_config.base_url or "",
+        timeout_s=drone_config.request_timeout_s,
+    )
+    print(f"drone_base_url={drone_config.base_url}")
+    print(f"drone_manual_arm_required={str(drone_config.require_manual_arm).lower()}")
+    print(f"drone_mission_timeout_s={drone_config.mission_timeout_s}")
+    if args.drone_status:
+        state = client.state()
+        print(f"drone_service_status={state.service_status}")
+        print(f"drone_skill_layer_mode={state.skill_layer_mode}")
+        print(f"drone_active_mission_id={state.active_mission_id or ''}")
+        print(f"drone_radio_ready={str(state.safety.radio_ready).lower()}")
+        print(f"drone_pose_ready={str(state.safety.pose_ready).lower()}")
+        print(f"drone_can_arm={str(state.safety.can_arm).lower()}")
+        print(f"drone_tracking_state={state.pose.tracking_state}")
+        print(f"drone_pose_confidence={state.pose.confidence}")
+        if state.safety.reasons:
+            print(f"drone_safety_reasons={','.join(state.safety.reasons)}")
+        return 0
+    if args.drone_inspect:
+        mission = client.create_inspect_mission(
+            target_hint=args.drone_inspect,
+            capture_intent="scene",
+            max_duration_s=drone_config.mission_timeout_s,
+        )
+        print(f"drone_mission_id={mission.mission_id}")
+        print(f"drone_mission_state={mission.state}")
+        print(f"drone_mission_summary={mission.summary}")
+        return 0
+    if args.drone_cancel_mission:
+        mission = client.cancel_mission(args.drone_cancel_mission)
+        print(f"drone_mission_id={mission.mission_id}")
+        print(f"drone_mission_state={mission.state}")
+        print(f"drone_mission_summary={mission.summary}")
+        return 0
+    if args.drone_manual_arm:
+        mission = client.manual_arm(args.drone_manual_arm)
+        print(f"drone_mission_id={mission.mission_id}")
+        print(f"drone_mission_state={mission.state}")
+        print(f"drone_mission_summary={mission.summary}")
+        return 0
+    raise RuntimeError("No drone command was selected.")
+
+
+def _run_self_test_command(config: TwinrConfig, test_name: str) -> int:
+    """Run one bounded ops self-test without bootstrapping the live runtime."""
+
+    from twinr.ops import TwinrSelfTestRunner
+
+    result = TwinrSelfTestRunner(config).run(test_name)
+    print(f"self_test_name={result.test_name}")
+    print(f"self_test_status={result.status}")
+    print(f"self_test_summary={result.summary}")
+    if result.details:
+        print(f"self_test_details={' | '.join(result.details)}")
+    if result.artifact_name:
+        print(f"self_test_artifact={result.artifact_name}")
+    if result.finished_at:
+        print(f"self_test_finished_at={result.finished_at}")
+    return 0 if result.status == "ok" else 1
 
 
 def _run_whatsapp_channel(
@@ -405,6 +497,8 @@ def _run_whatsapp_channel(
     runtime: Any,
     backend: Any,
     *,
+    tool_agent_provider: Any = None,
+    print_backend: Any = None,
     env_file: str | Path,
     duration_s: float | None,
     lock_config: TwinrConfig | None = None,
@@ -415,7 +509,13 @@ def _run_whatsapp_channel(
     from twinr.channels.whatsapp import TwinrWhatsAppChannelLoop
     from twinr.ops import loop_instance_lock
 
-    loop = TwinrWhatsAppChannelLoop(config=config, runtime=runtime, backend=backend)
+    loop = TwinrWhatsAppChannelLoop(
+        config=config,
+        runtime=runtime,
+        backend=backend,
+        tool_agent_provider=tool_agent_provider,
+        print_backend=print_backend,
+    )
     with loop_instance_lock(lock_config or config, "whatsapp-channel"):
         return loop.run(duration_s=duration_s)
 
@@ -432,6 +532,8 @@ def _ensure_remote_watchdog_for_runtime_boot(config: TwinrConfig, env_file: str 
 
 def main() -> int:
     """Dispatch the requested Twinr CLI command and return its exit code."""
+
+    from twinr.ops.runtime_env import prime_user_session_audio_env
 
     prime_user_session_audio_env()
     args = build_parser().parse_args()
@@ -486,15 +588,21 @@ def main() -> int:
         _assert_pi_runtime_root(args.env_file, command_name="long-term-memory-live-acceptance")
         from twinr.memory.longterm.evaluation.live_memory_acceptance import run_live_memory_acceptance
 
-        result = run_live_memory_acceptance(env_path=args.env_file)
-        _print_long_term_memory_live_acceptance_result(result)
-        return 0 if getattr(result, "ready", False) else 1
+        memory_acceptance_result = run_live_memory_acceptance(env_path=args.env_file)
+        _print_long_term_memory_live_acceptance_result(memory_acceptance_result)
+        return 0 if getattr(memory_acceptance_result, "ready", False) else 1
 
     if args.run_web:
         return _run_web_server(config, args.env_file)
 
     if args.run_orchestrator_server:
         return _run_orchestrator_server(config, args.env_file)
+
+    if args.self_test:
+        return _run_self_test_command(config, args.self_test)
+
+    if args.drone_status or args.drone_inspect or args.drone_cancel_mission or args.drone_manual_arm:
+        return _run_drone_cli_commands(config, args)
 
     uses_openai = any(
         [
@@ -539,8 +647,8 @@ def main() -> int:
                         runtime = _build_runtime(config)
                         _print_runtime_banner(runtime, config, env_path)
                         try:
-                            backend = OpenAIBackend(config=config)
-                            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
+                            streaming_backend = OpenAIBackend(config=config)
+                            provider_bundle = build_streaming_provider_bundle(config, support_backend=streaming_backend)
                             loop = TwinrStreamingHardwareLoop(
                                 config=config,
                                 runtime=runtime,
@@ -565,7 +673,7 @@ def main() -> int:
             runtime_config = build_scoped_runtime_config(
                 config,
                 scope_name="whatsapp-channel",
-                restore_runtime_state_on_startup=False,
+                restore_runtime_state_on_startup=True,
             )
 
         _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
@@ -585,7 +693,7 @@ def main() -> int:
             runtime.finish_speaking()
             print(f"status={runtime.status.value}")
 
-        backend = None
+        backend: Any | None = None
         if uses_openai:
             from twinr.providers.openai import OpenAIBackend
 
@@ -620,10 +728,15 @@ def main() -> int:
         if args.run_whatsapp_channel:
             if backend is None:
                 raise RuntimeError("WhatsApp channel requires configured providers")
+            from twinr.providers import build_streaming_provider_bundle
+
+            provider_bundle = build_streaming_provider_bundle(runtime_config, support_backend=backend)
             return _run_whatsapp_channel(
                 runtime_config,
                 runtime,
                 backend,
+                tool_agent_provider=provider_bundle.tool_agent,
+                print_backend=provider_bundle.print_backend,
                 env_file=args.env_file,
                 duration_s=args.loop_duration,
                 lock_config=config,
@@ -649,13 +762,15 @@ def main() -> int:
                 tts_provider=provider_bundle.tts,
                 tool_agent_provider=provider_bundle.tool_agent,
             )
-            client = OrchestratorWebSocketClient(
+            client_factory = cast(Callable[..., Any], OrchestratorWebSocketClient)
+            request_factory = cast(Callable[..., Any], OrchestratorTurnRequest)
+            client = client_factory(
                 config.orchestrator_ws_url,
                 shared_secret=config.orchestrator_shared_secret,
             )
             deltas: list[str] = []
             result = client.run_turn(
-                OrchestratorTurnRequest(
+                request_factory(
                     prompt=args.orchestrator_probe_turn,
                     conversation=runtime.tool_provider_conversation_context(),
                     supervisor_conversation=runtime.supervisor_provider_conversation_context(),
@@ -690,6 +805,7 @@ def main() -> int:
 
         if args.proactive_observe_once:
             provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
+            observer: Any
             if provider_name == "openai":
                 if backend is None or camera is None:
                     raise RuntimeError("OpenAI proactive observation requires configured OpenAI and camera access")
@@ -700,32 +816,43 @@ def main() -> int:
                     camera=camera,
                     camera_lock=Lock(),
                 )
+            elif provider_name == "aideck_openai":
+                if backend is None or camera is None:
+                    raise RuntimeError("AI-Deck proactive observation requires configured OpenAI and camera access")
+                from twinr.proactive.social.aideck_camera_provider import AIDeckOpenAIVisionObservationProvider
+
+                observer = AIDeckOpenAIVisionObservationProvider.from_config(
+                    config,
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=Lock(),
+                )
             else:
                 from twinr.proactive.social.local_camera_provider import LocalAICameraObservationProvider
 
                 observer = LocalAICameraObservationProvider.from_config(config)
-            snapshot = observer.observe()
-            print(f"proactive_person_visible={str(snapshot.observation.person_visible).lower()}")
-            print(f"proactive_camera_ready={str(snapshot.observation.camera_ready).lower()}")
-            print(f"proactive_camera_ai_ready={str(snapshot.observation.camera_ai_ready).lower()}")
-            print(f"proactive_looking_toward_device={str(snapshot.observation.looking_toward_device).lower()}")
-            print(f"proactive_body_pose={snapshot.observation.body_pose.value}")
-            print(f"proactive_motion_state={snapshot.observation.motion_state.value}")
-            print(f"proactive_smiling={str(snapshot.observation.smiling).lower()}")
+            vision_snapshot = observer.observe()
+            print(f"proactive_person_visible={str(vision_snapshot.observation.person_visible).lower()}")
+            print(f"proactive_camera_ready={str(vision_snapshot.observation.camera_ready).lower()}")
+            print(f"proactive_camera_ai_ready={str(vision_snapshot.observation.camera_ai_ready).lower()}")
+            print(f"proactive_looking_toward_device={str(vision_snapshot.observation.looking_toward_device).lower()}")
+            print(f"proactive_body_pose={vision_snapshot.observation.body_pose.value}")
+            print(f"proactive_motion_state={vision_snapshot.observation.motion_state.value}")
+            print(f"proactive_smiling={str(vision_snapshot.observation.smiling).lower()}")
             print(
                 "proactive_hand_or_object_near_camera="
-                f"{str(snapshot.observation.hand_or_object_near_camera).lower()}"
+                f"{str(vision_snapshot.observation.hand_or_object_near_camera).lower()}"
             )
-            print(f"proactive_coarse_arm_gesture={snapshot.observation.coarse_arm_gesture.value}")
-            print(f"proactive_fine_hand_gesture={snapshot.observation.fine_hand_gesture.value}")
-            print(f"proactive_gesture_event={snapshot.observation.gesture_event.value}")
-            print(f"proactive_person_count={snapshot.observation.person_count}")
-            if snapshot.response_id:
-                print(f"proactive_response_id={snapshot.response_id}")
-            if snapshot.request_id:
-                print(f"proactive_request_id={snapshot.request_id}")
-            if snapshot.model:
-                print(f"proactive_model={snapshot.model}")
+            print(f"proactive_coarse_arm_gesture={vision_snapshot.observation.coarse_arm_gesture.value}")
+            print(f"proactive_fine_hand_gesture={vision_snapshot.observation.fine_hand_gesture.value}")
+            print(f"proactive_gesture_event={vision_snapshot.observation.gesture_event.value}")
+            print(f"proactive_person_count={vision_snapshot.observation.person_count}")
+            if vision_snapshot.response_id:
+                print(f"proactive_response_id={vision_snapshot.response_id}")
+            if vision_snapshot.request_id:
+                print(f"proactive_request_id={vision_snapshot.request_id}")
+            if vision_snapshot.model:
+                print(f"proactive_model={vision_snapshot.model}")
 
         if args.proactive_audio_observe_once:
             from twinr.proactive.runtime.audio_perception import (
@@ -733,8 +860,8 @@ def main() -> int:
                 render_audio_perception_snapshot_lines,
             )
 
-            snapshot = observe_audio_perception_once(config)
-            for line in render_audio_perception_snapshot_lines(snapshot):
+            audio_snapshot = observe_audio_perception_once(config)
+            for line in render_audio_perception_snapshot_lines(audio_snapshot):
                 print(line)
 
         if args.vision_prompt and backend is not None:

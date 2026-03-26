@@ -20,13 +20,25 @@ Relative `TWINR_WHATSAPP_*` filesystem paths are resolved against Twinr's
 - normalize inbound WhatsApp messages into the generic `channels` contract
 - enforce exactly-one-user allowlist, group blocking, and self-chat echo guards
 - deliver outbound text replies back to the originating chat
+- accept bounded outbound send requests from the main Twinr runtime through a shared on-disk queue so the long-lived channel service remains the only socket/session owner
+- accept bounded WhatsApp history-import requests from the portal/runtime through a shared on-disk queue so the same long-lived channel service can temporarily reopen the worker in history mode without creating a second linked-device socket
 
 ## Runtime contract
 
 - The worker speaks newline-delimited JSON over stdout.
-- Human-readable logs stay on stderr, while QR updates are emitted both as terminal output and as a portal-renderable SVG payload for the dashboard wizard.
+- Human-readable logs stay on stderr, while QR updates are emitted both as terminal output and as portal/runtime-renderable SVG plus data-URL payloads for the dashboard wizard and the HDMI right-lane reserve panel.
 - Only text-like WhatsApp messages are promoted into Twinr turns.
+- WhatsApp history import stays disabled by default; Twinr does not background-sync old chats into memory.
+- When the operator explicitly enables social-history learning in the portal and starts an import, the channel loop claims one bounded history-import request, temporarily restarts the worker with history sync enabled, and imports only the approved lookback window into shared Twinr memory.
+- Self-chat turns authored on the linked main account are accepted from both Baileys `notify` and `append` upserts, even when the primary phone surfaces them as account-chat traffic without `fromMe=true`, so WhatsApp's own no-notification self-chat path still reaches Twinr.
+- Twinr canonicalizes the account's own WhatsApp `@lid` self-chat identity back onto the stable account JID before Python policy checks, so allowlist and self-chat routing do not silently drop manual primary-phone self-chat messages.
+- Accepted inbound WhatsApp message IDs are short-term de-duplicated before turn execution so a `notify` plus `append` pair does not trigger two Twinr replies.
 - Outbound replies are sent back to the same chat JID that produced the accepted inbound message.
+- Accepted inbound WhatsApp turns run through Twinr's shared tool-capable text-channel agent path, so reminders, shared memory writes, contact lookup, and bounded `send_whatsapp_message` use the same core tool surface instead of a standalone chat-only completion path.
+- Inbound WhatsApp send flows keep a bounded pending draft across clarification turns, so "Schreib Anna auf WhatsApp" -> "Was soll drinstehen?" -> "<Text>" -> "Ja" stays attached to the same structured send action instead of depending on free-form history reconstruction.
+- When a `send_whatsapp_message` tool call originates from the active WhatsApp channel itself, the loop now sends through its already-open worker transport directly instead of queueing and waiting on the same loop thread; the on-disk outbound queue remains only for cross-process callers such as voice/runtime and portal flows.
+- Proactive sends to other remembered contacts go through `outbound/pending -> processing -> results` under `state/channels/whatsapp/`, so voice/runtime turns can wait for delivery without starting a second Baileys worker.
+- Portal-triggered history imports go through `history_import/pending -> processing -> results` under `state/channels/whatsapp/`, and imported historical turns are marked to survive normal episode retention because they came from an explicit bounded external-history import.
 
 ## Configuration
 
@@ -46,9 +58,11 @@ The runtime reads the following env-backed fields from `TwinrConfig`:
 
 ## Pairing
 
-Run the channel loop once, scan the QR shown in the dashboard wizard or the
-terminal fallback with WhatsApp's "Linked Devices" flow, and keep the
-persisted auth directory stable between restarts.
+Run the channel loop once, or trigger the bounded pairing flow through Twinr's
+voice/runtime service-connect path, scan the QR shown in the dashboard wizard,
+right-hand HDMI reserve panel, or terminal fallback with WhatsApp's
+"Linked Devices" flow, and keep the persisted auth directory stable between
+restarts.
 
 ## Worker Dependencies
 

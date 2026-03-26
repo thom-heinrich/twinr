@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Transaction Result</title>
+  </head>
+  <body>
+    <main id="result">
+      <h1>Transaction Result</h1>
+      <p>Preparing sandbox confirmation...</p>
+    </main>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const customer = params.get("customer") || "Unknown";
+      const delivery = params.get("delivery") || "Standard";
+      const giftWrap = params.get("gift_wrap") === "yes" ? "enabled" : "disabled";
+      const result = document.getElementById("result");
+      result.innerHTML = `
+        <h1>Sandbox order confirmed</h1>
+        <p>Customer: ${customer}</p>
+        <p>Delivery: ${delivery}</p>
+        <p>Gift wrap: ${giftWrap}</p>
+        <p>Confirmation code: TX-2048</p>
+      `;
+      document.title = "Sandbox order confirmed";
+    </script>
+  </body>
+</html>

@@ -58,6 +58,34 @@ def _awareness_action(thread: SituationalAwarenessThread) -> tuple[str, str]:
     return ("brief_update", "forming")
 
 
+def _world_cta_intent(*, action: str, attention_state: str) -> str:
+    """Return structured CTA intent for world-derived cards."""
+
+    if action == "brief_update":
+        return "Zu einer kurzen Einordnung oder Meinung einladen."
+    if attention_state == "growing":
+        return "Zu einer kurzen Reaktion oder Haltung einladen."
+    return "Zu einem kurzen Blick oder Kommentar einladen."
+
+
+def _awareness_card_intent(
+    thread: SituationalAwarenessThread,
+    *,
+    action: str,
+    attention_state: str,
+    display_anchor: str,
+) -> dict[str, str]:
+    """Return structured semantic card intent for one awareness thread."""
+
+    anchor = _compact_text(display_anchor or thread.title or thread.topic, max_len=96) or "dem Thema"
+    return {
+        "topic_semantics": f"oeffentlicher Anlass zu {anchor}",
+        "statement_intent": f"Twinr soll eine konkrete Beobachtung zu {anchor} machen und zeigen, dass dort gerade etwas passiert.",
+        "cta_intent": _world_cta_intent(action=action, attention_state=attention_state),
+        "relationship_stance": "ruhig beobachtend mit leichter eigener Haltung, nicht nachrichtensprecherhaft",
+    }
+
+
 def _awareness_candidate(thread: SituationalAwarenessThread) -> AmbientDisplayImpulseCandidate | None:
     """Convert one awareness thread into a reserve-lane world candidate."""
 
@@ -66,10 +94,17 @@ def _awareness_candidate(thread: SituationalAwarenessThread) -> AmbientDisplayIm
         return None
     action, attention_state = _awareness_action(thread)
     salience = min(0.96, max(0.48, float(thread.salience) + (min(thread.update_count, 4) * 0.04)))
+    display_anchor = _compact_text(thread.title or thread.topic, max_len=72)
     context: dict[str, object] = {
         "candidate_family": "world_awareness",
-        "display_anchor": _compact_text(thread.title or thread.topic, max_len=72),
+        "display_anchor": display_anchor,
         "hook_hint": _compact_text(thread.summary, max_len=160),
+        "card_intent": _awareness_card_intent(
+            thread,
+            action=action,
+            attention_state=attention_state,
+            display_anchor=display_anchor,
+        ),
         "topic_title": _compact_text(thread.title, max_len=72),
         "topic_summary": _compact_text(thread.summary, max_len=180),
         "topic": _compact_text(thread.topic, max_len=72),
@@ -178,6 +213,28 @@ def _subscription_action(aggregate: _SubscriptionTopicAggregate) -> tuple[str, s
     return ("hint", "forming")
 
 
+def _subscription_card_intent(
+    aggregate: _SubscriptionTopicAggregate,
+    *,
+    action: str,
+    attention_state: str,
+    topic_title: str,
+) -> dict[str, str]:
+    """Return structured semantic card intent for one subscription topic."""
+
+    anchor = _compact_text(topic_title, max_len=96) or "dem Thema"
+    if aggregate.source_count >= 2:
+        topic_semantics = f"oeffentliches Thema zu {anchor} aus mehreren Quellen"
+    else:
+        topic_semantics = f"oeffentliches Thema zu {anchor}"
+    return {
+        "topic_semantics": topic_semantics,
+        "statement_intent": f"Twinr soll eine konkrete Beobachtung dazu machen, dass {anchor} heute ein Thema ist.",
+        "cta_intent": _world_cta_intent(action=action, attention_state=attention_state),
+        "relationship_stance": "ruhig beobachtend, alltagsnah und mit eigener kleiner Haltung",
+    }
+
+
 def _world_call_to_action(*, action: str, attention_state: str) -> str:
     """Return one short CTA line for world-derived reserve candidates."""
 
@@ -211,6 +268,12 @@ def _subscription_candidate(aggregate: _SubscriptionTopicAggregate) -> AmbientDi
         "hook_hint": _compact_text(
             f"Twinr verfolgt das gerade ueber {', '.join(source_labels[:2])}.",
             max_len=120,
+        ),
+        "card_intent": _subscription_card_intent(
+            aggregate,
+            action=action,
+            attention_state=attention_state,
+            topic_title=topic_title,
         ),
         "topic_title": topic_title,
         "source_labels": source_labels,

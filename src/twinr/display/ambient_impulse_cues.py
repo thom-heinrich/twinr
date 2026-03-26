@@ -114,6 +114,7 @@ class DisplayAmbientImpulseCue:
     updated_at: str | None = None
     expires_at: str | None = None
     topic_key: str = ""
+    semantic_topic_key: str = ""
     eyebrow: str = ""
     headline: str = ""
     body: str = ""
@@ -127,6 +128,8 @@ class DisplayAmbientImpulseCue:
 
         object.__setattr__(self, "source", _compact_text(self.source, max_len=80) or "external")
         object.__setattr__(self, "topic_key", _compact_text(self.topic_key, max_len=96).casefold())
+        semantic_topic_key = _compact_text(self.semantic_topic_key, max_len=96).casefold()
+        object.__setattr__(self, "semantic_topic_key", semantic_topic_key or self.topic_key)
         object.__setattr__(self, "eyebrow", _compact_text(self.eyebrow, max_len=36))
         object.__setattr__(self, "headline", _compact_text(self.headline, max_len=128))
         object.__setattr__(self, "body", _compact_text(self.body, max_len=128))
@@ -155,6 +158,7 @@ class DisplayAmbientImpulseCue:
             updated_at=_format_timestamp(updated_at),
             expires_at=_format_timestamp(expires_at),
             topic_key=_compact_text(payload.get("topic_key"), max_len=96).casefold(),
+            semantic_topic_key=_compact_text(payload.get("semantic_topic_key"), max_len=96).casefold(),
             eyebrow=_compact_text(payload.get("eyebrow"), max_len=36),
             headline=_compact_text(payload.get("headline"), max_len=128),
             body=_compact_text(payload.get("body"), max_len=128),
@@ -185,6 +189,7 @@ class DisplayAmbientImpulseCue:
             self.updated_at,
             self.expires_at,
             self.topic_key,
+            self.semantic_topic_key,
             self.eyebrow,
             self.headline,
             self.body,
@@ -280,6 +285,7 @@ class DisplayAmbientImpulseCueStore:
             updated_at=_format_timestamp(written_at),
             expires_at=_format_timestamp(written_at + timedelta(seconds=ttl_s)),
             topic_key=cue.topic_key,
+            semantic_topic_key=cue.semantic_topic_key,
             eyebrow=cue.eyebrow,
             headline=cue.headline,
             body=cue.body,
@@ -329,6 +335,7 @@ class DisplayAmbientImpulseController:
         self,
         *,
         topic_key: str,
+        semantic_topic_key: str | None = None,
         eyebrow: str,
         headline: str,
         body: str,
@@ -345,6 +352,7 @@ class DisplayAmbientImpulseController:
         cue = DisplayAmbientImpulseCue(
             source=_compact_text(source, max_len=80) or self.default_source,
             topic_key=topic_key,
+            semantic_topic_key=_compact_text(semantic_topic_key, max_len=96).casefold(),
             eyebrow=eyebrow,
             headline=headline,
             body=body,

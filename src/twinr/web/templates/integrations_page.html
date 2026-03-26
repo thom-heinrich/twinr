@@ -46,6 +46,45 @@
   </div>
 </section>
 
+<form method="post" action="/integrations" class="stack top-gap">
+  <input type="hidden" name="_integration_id" value="social_history_learning">
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ social_history_panel.title }}</h2>
+        <p class="section-description">{{ social_history_panel.detail }}</p>
+      </div>
+      <span class="status-pill is-{{ social_history_panel.status }}">{{ social_history_panel.status_label }}</span>
+    </div>
+    <div class="check-list">
+      {% for item in social_history_panel.checks %}
+      <article class="check-row">
+        <div class="check-row-main">
+          <div class="check-row-title">{{ item.label }}</div>
+          <div class="check-row-detail">{{ item.detail }}</div>
+        </div>
+        <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+      </article>
+      {% endfor %}
+    </div>
+    {% for section in social_history_sections %}
+    <div class="panel-subsection panel-subsection-spaced">
+      <h3 class="subsection-title">{{ section.title }}</h3>
+      <p class="section-description">{{ section.description }}</p>
+      <div class="form-grid">
+        {% for field in section.fields %}
+        {{ render_setting_field(field) }}
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+    <div class="actions">
+      <button type="submit" name="_integration_action" value="save_social_history" class="button-secondary">{{ social_history_panel.primary_action }}</button>
+      <button type="submit" name="_integration_action" value="save_and_import_social_history">{{ social_history_panel.secondary_action }}</button>
+    </div>
+  </section>
+</form>
+
 <section class="panel two-column">
   <div>
     <h2>Storage</h2>

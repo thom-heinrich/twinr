@@ -7,6 +7,9 @@ summary: Generic external text-channel contracts and long-lived transport listen
 owned_concerns:
   - Define the shared inbound and outbound message contract for external text channels.
   - Host reusable runtime services that convert an external text message into one Twinr turn.
+  - Persist runtime-neutral channel-onboarding snapshots and bounded in-process pairing state outside any single UI surface.
+  - Resolve bounded WhatsApp send follow-ups inside a narrow model-guided draft lane and persist pending draft state so service restarts do not erase open sends.
+  - Expose bounded service-connect entrypoints that let voice/runtime code start a supported pairing flow and surface QR/status state on Twinr displays.
   - Delegate concrete transport session/auth/reconnect behavior to documented child packages such as `whatsapp`.
 out_of_scope:
   - Core Twinr runtime state-machine behavior in `src/twinr/agent/base_agent`
@@ -17,10 +20,23 @@ files:
     role: Package export surface for generic channel contracts and runtime helpers
   - path: contracts.py
     role: Shared external text-channel contracts
+  - path: onboarding.py
+    role: Runtime-neutral pairing snapshot persistence and in-process pairing registry shared across web and voice surfaces
+  - path: pending_actions.py
+    role: File-backed pending structured follow-up state for external text channels
+  - path: pending_whatsapp_followup.py
+    role: Bounded model-guided continuation of open WhatsApp send drafts before they can fall back into free-form chat
   - path: runtime.py
-    role: Shared Twinr text-turn execution bridge
+    role: Shared plain-text Twinr turn execution bridge
+  - path: turn_instructions.py
+    role: Channel-aware hidden instruction builder for shared external text turns
+  - path: tool_runtime.py
+    role: Shared tool-capable Twinr turn execution bridge for external text channels
+  - path: service_connect.py
+    role: Bounded service-connect entrypoint that resolves supported services and mirrors pairing status into the display reserve lane
 subpackages:
   - path: whatsapp
-    role: Baileys-backed WhatsApp listener, worker bridge, and policy
+    role: Baileys-backed WhatsApp listener, worker bridge, policy, and reusable pairing helpers
 tests:
   - path: test/test_channels_whatsapp.py
+  - path: test/test_service_connect.py

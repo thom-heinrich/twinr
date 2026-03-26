@@ -27,9 +27,12 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError, chonkydb_data_path
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteReadContext,
     LongTermRemoteWriteContext,
+    record_remote_read_diagnostic,
     record_remote_write_diagnostic,
 )
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 
 
 _LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#5): Keep operational visibility for degraded-mode events.
@@ -887,7 +890,11 @@ class LongTermRemoteStateStore:
                     document_id=candidate.document_id,
                 )
                 sort_key = (*_snapshot_updated_at_sort_key(candidate.payload.get("updated_at")), ordinal)
-                if latest is None or sort_key >= latest[0]:
+                if latest is None:
+                    latest = (sort_key, match)
+                    continue
+                latest_sort_key, _latest_candidate = latest
+                if sort_key >= latest_sort_key:
                     latest = (sort_key, match)
         return None if latest is None else latest[1]
 
@@ -986,7 +993,7 @@ class LongTermRemoteStateStore:
             except Exception as exc:  # AUDIT-FIX(#5): Convert all client-boundary failures into stable fetch results.
                 latency_ms = round(max(0.0, (time.monotonic() - attempt_started) * 1000.0), 3)
                 status_code = self._status_code_from_exception(exc)
-                if isinstance(exc, ChonkyDBError) and exc.status_code == 404:
+                if isinstance(exc, ChonkyDBError) and status_code == 404:
                     self._note_remote_success()
                     attempt_records.append(
                         LongTermRemoteFetchAttempt(
@@ -1024,6 +1031,21 @@ class LongTermRemoteStateStore:
                     )
                 )
                 if attempt + 1 >= attempts:
+                    context = self._snapshot_read_context(
+                        snapshot_kind=snapshot_kind,
+                        source=source,
+                        client=effective_client,
+                        document_id=document_id,
+                        attempt_index=attempt + 1,
+                        attempt_count=attempts,
+                    )
+                    record_remote_read_diagnostic(
+                        remote_state=self,
+                        context=context,
+                        exc=exc,
+                        started_monotonic=started,
+                        outcome="failed",
+                    )
                     _LOGGER.warning(
                         "Failed to read remote long-term snapshot %r: %s",
                         snapshot_kind,
@@ -1061,6 +1083,23 @@ class LongTermRemoteStateStore:
                     if backoff_s > 0:
                         time.sleep(backoff_s)
                     continue
+                context = self._snapshot_read_context(
+                    snapshot_kind=snapshot_kind,
+                    source=source,
+                    client=effective_client,
+                    document_id=document_id,
+                    attempt_index=attempt + 1,
+                    attempt_count=attempts,
+                )
+                record_remote_read_diagnostic(
+                    remote_state=self,
+                    context=context,
+                    exc=TypeError(
+                        f"Remote long-term snapshot {snapshot_kind!r} returned payload type {type(payload).__name__}."
+                    ),
+                    started_monotonic=started,
+                    outcome="failed",
+                )
                 return _RemoteSnapshotFetchResult(
                     status="unavailable",
                     detail=(
@@ -1075,6 +1114,21 @@ class LongTermRemoteStateStore:
             self._note_remote_success()
             direct = self._extract_snapshot_candidate(payload, snapshot_kind=snapshot_kind)
             if direct is not None:
+                context = self._snapshot_read_context(
+                    snapshot_kind=snapshot_kind,
+                    source=source,
+                    client=effective_client,
+                    document_id=document_id,
+                    attempt_index=attempt + 1,
+                    attempt_count=attempts,
+                )
+                record_remote_read_observation(
+                    remote_state=self,
+                    context=context,
+                    latency_ms=max(0.0, (time.monotonic() - started) * 1000.0),
+                    outcome="ok",
+                    classification="ok",
+                )
                 attempt_records.append(
                     LongTermRemoteFetchAttempt(
                         source=source,
@@ -1106,6 +1160,23 @@ class LongTermRemoteStateStore:
                 if backoff_s > 0:
                     time.sleep(backoff_s)
                 continue
+            context = self._snapshot_read_context(
+                snapshot_kind=snapshot_kind,
+                source=source,
+                client=effective_client,
+                document_id=document_id,
+                attempt_index=attempt + 1,
+                attempt_count=attempts,
+            )
+            record_remote_read_diagnostic(
+                remote_state=self,
+                context=context,
+                exc=ValueError(
+                    f"Remote long-term snapshot {snapshot_kind!r} returned malformed content without a parseable snapshot candidate."
+                ),
+                started_monotonic=started,
+                outcome="failed",
+            )
             return _RemoteSnapshotFetchResult(
                 status="unavailable",
                 detail=(
@@ -1124,6 +1195,54 @@ class LongTermRemoteStateStore:
             selected_source=source,
             attempts=tuple(attempt_records),
         )
+
+    def _snapshot_read_context(
+        self,
+        *,
+        snapshot_kind: str,
+        source: str,
+        client: ChonkyDBClient,
+        document_id: str | None,
+        attempt_index: int | None = None,
+        attempt_count: int | None = None,
+    ) -> LongTermRemoteReadContext:
+        """Build structured diagnostics context for one snapshot-read request."""
+
+        timeout_s = _coerce_float(
+            getattr(getattr(client, "config", None), "timeout_s", None),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+            minimum=0.1,
+            maximum=300.0,
+        )
+        return LongTermRemoteReadContext(
+            snapshot_kind=snapshot_kind,
+            operation="snapshot_load",
+            request_method="GET",
+            request_payload_kind=self._snapshot_request_payload_kind(source=source),
+            document_id_hint=document_id,
+            uri_hint=None if document_id else self._snapshot_uri(snapshot_kind),
+            request_path="/v1/external/documents/full",
+            timeout_s=timeout_s,
+            namespace=self.namespace,
+            attempt_index=attempt_index,
+            attempt_count=attempt_count,
+            retry_attempts_configured=attempt_count,
+            retry_backoff_s=self._retry_backoff_s(),
+            retry_mode="bounded_snapshot_read_retry" if (attempt_count or 0) > 1 else "single_attempt",
+        )
+
+    @staticmethod
+    def _snapshot_request_payload_kind(*, source: str) -> str:
+        """Return one bounded request-type label for snapshot-read diagnostics."""
+
+        normalized_source = str(source or "").strip().lower()
+        mapping = {
+            "cached_document": "document_id_cached_head",
+            "pointer_document": "document_id_pointer_head",
+            "pointer_lookup": "origin_uri_pointer_lookup",
+            "origin_uri": "origin_uri_snapshot_head",
+        }
+        return mapping.get(normalized_source, "snapshot_lookup")
 
     def probe_snapshot_load(
         self,

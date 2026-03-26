@@ -154,11 +154,19 @@ def _derive_snapshot_proxy_url(base_url: str | None) -> str | None:
     return f"{normalized}/snapshot.png"
 
 
+def _uses_aideck_camera_device(value: str | None) -> bool:
+    """Return whether the configured still camera uses the AI-Deck stream URI."""
+
+    normalized = str(value or "").strip().lower()
+    return normalized.startswith("aideck://")
+
+
 def _derive_proactive_vision_provider(
     raw_value: str | None,
     *,
     camera_host_mode: str,
     proactive_remote_camera_base_url: str | None,
+    camera_device: str | None,
 ) -> str:
     """Resolve the effective proactive camera provider from friendly topology config."""
 
@@ -167,6 +175,8 @@ def _derive_proactive_vision_provider(
         return explicit_value.strip().lower()
     if camera_host_mode == "second_pi" and proactive_remote_camera_base_url is not None:
         return "remote_frame"
+    if _uses_aideck_camera_device(camera_device):
+        return "aideck_openai"
     return "local_first"
 
 
@@ -632,6 +642,11 @@ class TwinrConfig:
     proactive_quiet_hours_visual_only_enabled: bool = True
     proactive_quiet_hours_start_local: str = "21:00"
     proactive_quiet_hours_end_local: str = "07:00"
+    drone_enabled: bool = False
+    drone_base_url: str | None = None
+    drone_require_manual_arm: bool = True
+    drone_mission_timeout_s: float = 45.0
+    drone_request_timeout_s: float = 2.0
     web_host: str = "0.0.0.0"
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
@@ -720,6 +735,9 @@ class TwinrConfig:
     reminder_max_entries: int = 48
     automation_poll_interval_s: float = 5.0
     automation_max_entries: int = 96
+    browser_automation_enabled: bool = False
+    browser_automation_workspace_path: str = "browser_automation"
+    browser_automation_entry_module: str = "adapter.py"
     smart_home_background_worker_enabled: bool = True
     smart_home_background_idle_sleep_s: float = 1.0
     smart_home_background_retry_delay_s: float = 2.0
@@ -759,12 +777,15 @@ class TwinrConfig:
     display_emoji_cue_ttl_s: float = 6.0
     display_ambient_impulse_path: str = "artifacts/stores/ops/display_ambient_impulse.json"
     display_ambient_impulse_ttl_s: float = 18.0
+    display_service_connect_path: str = "artifacts/stores/ops/display_service_connect.json"
     display_ambient_impulses_enabled: bool = True
     display_reserve_generation_enabled: bool = True
     display_reserve_generation_model: str = ""
     display_reserve_generation_reasoning_effort: str = "low"
-    display_reserve_generation_timeout_seconds: float = 12.0
+    display_reserve_generation_timeout_seconds: float = 20.0
     display_reserve_generation_max_output_tokens: int = 900
+    display_reserve_generation_batch_size: int = 2
+    display_reserve_generation_variants_per_candidate: int = 3
     display_reserve_bus_plan_path: str = "artifacts/stores/ops/display_reserve_bus_plan.json"
     display_reserve_bus_prepared_plan_path: str = "artifacts/stores/ops/display_reserve_bus_plan_prepared.json"
     display_reserve_bus_maintenance_state_path: str = "artifacts/stores/ops/display_reserve_bus_maintenance.json"
@@ -773,7 +794,7 @@ class TwinrConfig:
     display_reserve_bus_nightly_after_local: str = "00:30"
     display_reserve_bus_nightly_poll_interval_s: float = 300.0
     display_reserve_bus_candidate_limit: int = 20
-    display_reserve_bus_items_per_day: int = 30
+    display_reserve_bus_items_per_day: int = 20
     display_reserve_bus_topic_gap: int = 2
     display_reserve_bus_learning_window_days: float = 21.0
     display_reserve_bus_learning_half_life_days: float = 7.0
@@ -793,12 +814,20 @@ class TwinrConfig:
     attention_servo_peer_base_url: str | None = None
     attention_servo_peer_timeout_s: float = 1.5
     attention_servo_state_path: str = "state/attention_servo_state.json"
+    attention_servo_estimated_zero_max_uncertainty_degrees: float = 15.0
+    attention_servo_estimated_zero_settle_tolerance_degrees: float = 1.0
+    attention_servo_estimated_zero_speed_scale: float = 0.5
+    attention_servo_estimated_zero_move_pulse_delta_us: int = 70
+    attention_servo_estimated_zero_move_period_s: float = 0.8
+    attention_servo_estimated_zero_move_duty_cycle: float = 0.2
+    attention_servo_continuous_return_to_zero_after_s: float = 0.0
     attention_servo_gpio: int | None = None
     attention_servo_invert_direction: bool = False
     attention_servo_target_hold_s: float = 1.1
     attention_servo_loss_extrapolation_s: float = 0.8
     attention_servo_loss_extrapolation_gain: float = 0.65
     attention_servo_min_confidence: float = 0.58
+    attention_servo_hold_min_confidence: float = 0.58
     attention_servo_deadband: float = 0.045
     attention_servo_min_pulse_width_us: int = 1050
     attention_servo_center_pulse_width_us: int = 1500
@@ -942,6 +971,14 @@ class TwinrConfig:
             128,
             int(self.display_reserve_generation_max_output_tokens),
         )
+        normalized_display_reserve_generation_batch_size = max(
+            1,
+            int(self.display_reserve_generation_batch_size),
+        )
+        normalized_display_reserve_generation_variants_per_candidate = max(
+            1,
+            int(self.display_reserve_generation_variants_per_candidate),
+        )
         normalized_display_reserve_bus_candidate_limit = max(1, int(self.display_reserve_bus_candidate_limit))
         normalized_display_reserve_bus_items_per_day = max(1, int(self.display_reserve_bus_items_per_day))
         normalized_display_reserve_bus_topic_gap = max(0, int(self.display_reserve_bus_topic_gap))
@@ -1054,10 +1091,78 @@ class TwinrConfig:
             str(self.attention_servo_state_path or "state/attention_servo_state.json").strip()
             or "state/attention_servo_state.json"
         )
+        normalized_attention_servo_estimated_zero_max_uncertainty_degrees = float(
+            self.attention_servo_estimated_zero_max_uncertainty_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_estimated_zero_max_uncertainty_degrees):
+            raise ValueError("attention_servo_estimated_zero_max_uncertainty_degrees must be finite")
+        normalized_attention_servo_estimated_zero_max_uncertainty_degrees = max(
+            0.0,
+            min(180.0, normalized_attention_servo_estimated_zero_max_uncertainty_degrees),
+        )
+        normalized_attention_servo_estimated_zero_settle_tolerance_degrees = float(
+            self.attention_servo_estimated_zero_settle_tolerance_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_estimated_zero_settle_tolerance_degrees):
+            raise ValueError("attention_servo_estimated_zero_settle_tolerance_degrees must be finite")
+        normalized_attention_servo_estimated_zero_settle_tolerance_degrees = max(
+            0.0,
+            min(180.0, normalized_attention_servo_estimated_zero_settle_tolerance_degrees),
+        )
+        normalized_attention_servo_estimated_zero_speed_scale = float(
+            self.attention_servo_estimated_zero_speed_scale
+        )
+        if not math.isfinite(normalized_attention_servo_estimated_zero_speed_scale):
+            raise ValueError("attention_servo_estimated_zero_speed_scale must be finite")
+        normalized_attention_servo_estimated_zero_speed_scale = max(
+            0.0,
+            min(1.0, normalized_attention_servo_estimated_zero_speed_scale),
+        )
+        normalized_attention_servo_estimated_zero_move_pulse_delta_us = int(
+            self.attention_servo_estimated_zero_move_pulse_delta_us
+        )
+        normalized_attention_servo_estimated_zero_move_pulse_delta_us = max(
+            0,
+            min(500, normalized_attention_servo_estimated_zero_move_pulse_delta_us),
+        )
+        normalized_attention_servo_estimated_zero_move_period_s = float(
+            self.attention_servo_estimated_zero_move_period_s
+        )
+        if not math.isfinite(normalized_attention_servo_estimated_zero_move_period_s):
+            raise ValueError("attention_servo_estimated_zero_move_period_s must be finite")
+        normalized_attention_servo_estimated_zero_move_period_s = max(
+            0.05,
+            min(10.0, normalized_attention_servo_estimated_zero_move_period_s),
+        )
+        normalized_attention_servo_estimated_zero_move_duty_cycle = float(
+            self.attention_servo_estimated_zero_move_duty_cycle
+        )
+        if not math.isfinite(normalized_attention_servo_estimated_zero_move_duty_cycle):
+            raise ValueError("attention_servo_estimated_zero_move_duty_cycle must be finite")
+        normalized_attention_servo_estimated_zero_move_duty_cycle = max(
+            0.05,
+            min(1.0, normalized_attention_servo_estimated_zero_move_duty_cycle),
+        )
+        normalized_attention_servo_continuous_return_to_zero_after_s = float(
+            self.attention_servo_continuous_return_to_zero_after_s
+        )
+        if not math.isfinite(normalized_attention_servo_continuous_return_to_zero_after_s):
+            raise ValueError("attention_servo_continuous_return_to_zero_after_s must be finite")
+        normalized_attention_servo_continuous_return_to_zero_after_s = max(
+            0.0,
+            min(3600.0, normalized_attention_servo_continuous_return_to_zero_after_s),
+        )
         normalized_attention_servo_min_confidence = float(self.attention_servo_min_confidence)
         if not math.isfinite(normalized_attention_servo_min_confidence):
             raise ValueError("attention_servo_min_confidence must be finite")
         normalized_attention_servo_min_confidence = max(0.0, min(1.0, normalized_attention_servo_min_confidence))
+        normalized_attention_servo_hold_min_confidence = float(self.attention_servo_hold_min_confidence)
+        if not math.isfinite(normalized_attention_servo_hold_min_confidence):
+            raise ValueError("attention_servo_hold_min_confidence must be finite")
+        normalized_attention_servo_hold_min_confidence = max(
+            0.0,
+            min(normalized_attention_servo_min_confidence, normalized_attention_servo_hold_min_confidence),
+        )
         normalized_attention_servo_deadband = float(self.attention_servo_deadband)
         if not math.isfinite(normalized_attention_servo_deadband):
             raise ValueError("attention_servo_deadband must be finite")
@@ -1336,6 +1441,10 @@ class TwinrConfig:
             str(self.display_ambient_impulse_path or "artifacts/stores/ops/display_ambient_impulse.json").strip()
             or "artifacts/stores/ops/display_ambient_impulse.json"
         )
+        normalized_display_service_connect_path = (
+            str(self.display_service_connect_path or "artifacts/stores/ops/display_service_connect.json").strip()
+            or "artifacts/stores/ops/display_service_connect.json"
+        )
         normalized_display_reserve_bus_plan_path = (
             str(self.display_reserve_bus_plan_path or "artifacts/stores/ops/display_reserve_bus_plan.json").strip()
             or "artifacts/stores/ops/display_reserve_bus_plan.json"
@@ -1387,6 +1496,10 @@ class TwinrConfig:
             None if self.proactive_remote_camera_base_url is None else str(self.proactive_remote_camera_base_url),
             strip_trailing_slash=True,
         )
+        normalized_drone_base_url = _parse_optional_url(
+            None if self.drone_base_url is None else str(self.drone_base_url),
+            strip_trailing_slash=True,
+        )
         normalized_proactive_vision_provider = (
             str(self.proactive_vision_provider or "local_first").strip().lower() or "local_first"
         )
@@ -1413,7 +1526,18 @@ class TwinrConfig:
         object.__setattr__(self, "camera_second_pi_base_url", normalized_camera_second_pi_base_url)
         object.__setattr__(self, "camera_proxy_snapshot_url", normalized_camera_proxy_snapshot_url)
         object.__setattr__(self, "proactive_remote_camera_base_url", normalized_proactive_remote_camera_base_url)
+        object.__setattr__(self, "drone_base_url", normalized_drone_base_url)
         object.__setattr__(self, "proactive_vision_provider", normalized_proactive_vision_provider)
+        object.__setattr__(
+            self,
+            "drone_mission_timeout_s",
+            _parse_float(self.drone_mission_timeout_s, 45.0, minimum=5.0, maximum=120.0),
+        )
+        object.__setattr__(
+            self,
+            "drone_request_timeout_s",
+            _parse_float(self.drone_request_timeout_s, 2.0, minimum=0.1, maximum=15.0),
+        )
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
@@ -1421,6 +1545,7 @@ class TwinrConfig:
         object.__setattr__(self, "display_emoji_cue_ttl_s", normalized_display_emoji_cue_ttl_s)
         object.__setattr__(self, "display_ambient_impulse_path", normalized_display_ambient_impulse_path)
         object.__setattr__(self, "display_ambient_impulse_ttl_s", normalized_display_ambient_impulse_ttl_s)
+        object.__setattr__(self, "display_service_connect_path", normalized_display_service_connect_path)
         object.__setattr__(self, "display_reserve_generation_model", normalized_display_reserve_generation_model)
         object.__setattr__(
             self,
@@ -1436,6 +1561,16 @@ class TwinrConfig:
             self,
             "display_reserve_generation_max_output_tokens",
             normalized_display_reserve_generation_max_output_tokens,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_generation_batch_size",
+            normalized_display_reserve_generation_batch_size,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_generation_variants_per_candidate",
+            normalized_display_reserve_generation_variants_per_candidate,
         )
         object.__setattr__(self, "display_reserve_bus_plan_path", normalized_display_reserve_bus_plan_path)
         object.__setattr__(
@@ -1535,6 +1670,41 @@ class TwinrConfig:
         object.__setattr__(self, "attention_servo_peer_base_url", normalized_attention_servo_peer_base_url)
         object.__setattr__(self, "attention_servo_peer_timeout_s", normalized_attention_servo_peer_timeout_s)
         object.__setattr__(self, "attention_servo_state_path", normalized_attention_servo_state_path)
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_max_uncertainty_degrees",
+            normalized_attention_servo_estimated_zero_max_uncertainty_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_settle_tolerance_degrees",
+            normalized_attention_servo_estimated_zero_settle_tolerance_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_speed_scale",
+            normalized_attention_servo_estimated_zero_speed_scale,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_move_pulse_delta_us",
+            normalized_attention_servo_estimated_zero_move_pulse_delta_us,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_move_period_s",
+            normalized_attention_servo_estimated_zero_move_period_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_estimated_zero_move_duty_cycle",
+            normalized_attention_servo_estimated_zero_move_duty_cycle,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_continuous_return_to_zero_after_s",
+            normalized_attention_servo_continuous_return_to_zero_after_s,
+        )
         object.__setattr__(self, "attention_servo_target_hold_s", normalized_attention_servo_target_hold_s)
         object.__setattr__(
             self,
@@ -1547,6 +1717,11 @@ class TwinrConfig:
             normalized_attention_servo_loss_extrapolation_gain,
         )
         object.__setattr__(self, "attention_servo_min_confidence", normalized_attention_servo_min_confidence)
+        object.__setattr__(
+            self,
+            "attention_servo_hold_min_confidence",
+            normalized_attention_servo_hold_min_confidence,
+        )
         object.__setattr__(self, "attention_servo_deadband", normalized_attention_servo_deadband)
         object.__setattr__(
             self,
@@ -1829,6 +2004,7 @@ class TwinrConfig:
         camera_proxy_snapshot_url = _parse_optional_url(
             get_value("TWINR_CAMERA_PROXY_SNAPSHOT_URL"),
         )
+        camera_device = get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0"
         camera_host_mode = _derive_camera_host_mode(
             raw_value=raw_camera_host_mode,
             camera_second_pi_base_url=camera_second_pi_base_url,
@@ -1842,6 +2018,11 @@ class TwinrConfig:
             get_value("TWINR_PROACTIVE_VISION_PROVIDER"),
             camera_host_mode=camera_host_mode,
             proactive_remote_camera_base_url=effective_second_pi_base_url,
+            camera_device=camera_device,
+        )
+        drone_base_url = _parse_optional_url(
+            get_value("TWINR_DRONE_BASE_URL"),
+            strip_trailing_slash=True,
         )
 
         return cls(
@@ -2450,7 +2631,7 @@ class TwinrConfig:
             ),
             camera_host_mode=camera_host_mode,
             camera_second_pi_base_url=effective_second_pi_base_url,
-            camera_device=get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0",
+            camera_device=camera_device,
             camera_width=int(get_value("TWINR_CAMERA_WIDTH", "640") or "640"),
             camera_height=int(get_value("TWINR_CAMERA_HEIGHT", "480") or "480"),
             camera_framerate=int(get_value("TWINR_CAMERA_FRAMERATE", "30") or "30"),
@@ -2878,6 +3059,11 @@ class TwinrConfig:
                 "07:00",
             )
             or "07:00",
+            drone_enabled=_parse_bool(get_value("TWINR_DRONE_ENABLED"), False),
+            drone_base_url=drone_base_url,
+            drone_require_manual_arm=_parse_bool(get_value("TWINR_DRONE_REQUIRE_MANUAL_ARM"), True),
+            drone_mission_timeout_s=_parse_float(get_value("TWINR_DRONE_MISSION_TIMEOUT_S"), 45.0),
+            drone_request_timeout_s=_parse_float(get_value("TWINR_DRONE_REQUEST_TIMEOUT_S"), 2.0),
             web_host=get_value("TWINR_WEB_HOST", "0.0.0.0") or "0.0.0.0",
             web_port=int(get_value("TWINR_WEB_PORT", "1337") or "1337"),
             runtime_state_path=get_value(
@@ -3177,6 +3363,18 @@ class TwinrConfig:
             reminder_max_entries=int(get_value("TWINR_REMINDER_MAX_ENTRIES", "48") or "48"),
             automation_poll_interval_s=_parse_float(get_value("TWINR_AUTOMATION_POLL_INTERVAL_S"), 5.0),
             automation_max_entries=int(get_value("TWINR_AUTOMATION_MAX_ENTRIES", "96") or "96"),
+            browser_automation_enabled=_parse_bool(
+                get_value("TWINR_BROWSER_AUTOMATION_ENABLED"),
+                False,
+            ),
+            browser_automation_workspace_path=(
+                get_value("TWINR_BROWSER_AUTOMATION_WORKSPACE_PATH", "browser_automation")
+                or "browser_automation"
+            ),
+            browser_automation_entry_module=(
+                get_value("TWINR_BROWSER_AUTOMATION_ENTRY_MODULE", "adapter.py")
+                or "adapter.py"
+            ),
             smart_home_background_worker_enabled=_parse_bool(
                 get_value("TWINR_SMART_HOME_BACKGROUND_WORKER_ENABLED"),
                 True,
@@ -3278,6 +3476,11 @@ class TwinrConfig:
                 18.0,
                 minimum=0.1,
             ),
+            display_service_connect_path=get_value(
+                "TWINR_DISPLAY_SERVICE_CONNECT_PATH",
+                "artifacts/stores/ops/display_service_connect.json",
+            )
+            or "artifacts/stores/ops/display_service_connect.json",
             display_ambient_impulses_enabled=_parse_bool(
                 get_value("TWINR_DISPLAY_AMBIENT_IMPULSES_ENABLED"),
                 True,
@@ -3296,12 +3499,20 @@ class TwinrConfig:
             ),
             display_reserve_generation_timeout_seconds=_parse_float(
                 get_value("TWINR_DISPLAY_RESERVE_GENERATION_TIMEOUT_SECONDS"),
-                12.0,
+                20.0,
                 minimum=1.0,
             ),
             display_reserve_generation_max_output_tokens=max(
                 128,
                 int(get_value("TWINR_DISPLAY_RESERVE_GENERATION_MAX_OUTPUT_TOKENS", "900") or "900"),
+            ),
+            display_reserve_generation_batch_size=max(
+                1,
+                int(get_value("TWINR_DISPLAY_RESERVE_GENERATION_BATCH_SIZE", "2") or "2"),
+            ),
+            display_reserve_generation_variants_per_candidate=max(
+                1,
+                int(get_value("TWINR_DISPLAY_RESERVE_GENERATION_VARIANTS_PER_CANDIDATE", "3") or "3"),
             ),
             display_reserve_bus_plan_path=get_value(
                 "TWINR_DISPLAY_RESERVE_BUS_PLAN_PATH",
@@ -3341,7 +3552,7 @@ class TwinrConfig:
                 get_value("TWINR_DISPLAY_RESERVE_BUS_CANDIDATE_LIMIT", "20") or "20"
             ),
             display_reserve_bus_items_per_day=int(
-                get_value("TWINR_DISPLAY_RESERVE_BUS_ITEMS_PER_DAY", "30") or "30"
+                get_value("TWINR_DISPLAY_RESERVE_BUS_ITEMS_PER_DAY", "20") or "20"
             ),
             display_reserve_bus_topic_gap=int(
                 get_value("TWINR_DISPLAY_RESERVE_BUS_TOPIC_GAP", "2") or "2"
@@ -3420,6 +3631,50 @@ class TwinrConfig:
                 str(project_root / "state" / "attention_servo_state.json"),
             )
             or str(project_root / "state" / "attention_servo_state.json"),
+            attention_servo_estimated_zero_max_uncertainty_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES"),
+                15.0,
+                minimum=0.0,
+                maximum=180.0,
+            ),
+            attention_servo_estimated_zero_settle_tolerance_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES"),
+                1.0,
+                minimum=0.0,
+                maximum=180.0,
+            ),
+            attention_servo_estimated_zero_speed_scale=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SPEED_SCALE"),
+                0.5,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            attention_servo_estimated_zero_move_pulse_delta_us=int(
+                _parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US"),
+                70,
+                minimum=0,
+                maximum=500,
+                )
+            ),
+            attention_servo_estimated_zero_move_period_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S"),
+                0.8,
+                minimum=0.05,
+                maximum=10.0,
+            ),
+            attention_servo_estimated_zero_move_duty_cycle=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE"),
+                0.2,
+                minimum=0.05,
+                maximum=1.0,
+            ),
+            attention_servo_continuous_return_to_zero_after_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S"),
+                0.0,
+                minimum=0.0,
+                maximum=3600.0,
+            ),
             attention_servo_gpio=_parse_optional_int(get_value("TWINR_ATTENTION_SERVO_GPIO")),
             attention_servo_invert_direction=_parse_bool(
                 get_value("TWINR_ATTENTION_SERVO_INVERT_DIRECTION"),
@@ -3442,6 +3697,10 @@ class TwinrConfig:
             ),
             attention_servo_min_confidence=_parse_float(
                 get_value("TWINR_ATTENTION_SERVO_MIN_CONFIDENCE"),
+                0.58,
+            ),
+            attention_servo_hold_min_confidence=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_HOLD_MIN_CONFIDENCE"),
                 0.58,
             ),
             attention_servo_deadband=_parse_float(

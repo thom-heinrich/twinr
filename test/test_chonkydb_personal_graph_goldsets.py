@@ -15,6 +15,10 @@ from twinr.memory.chonkydb import TwinrPersonalGraphStore
 
 
 _FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "chonkydb_personal_graph_goldset.json"
+_TEST_CORINNA_PHONE = "5551234"
+_TEST_CORINNA_NEIGHBOR_PHONE = "5559988"
+_TEST_CORINNA_ALT_PHONE = "5557777"
+_TEST_ANNA_PHONE = "5552345"
 
 
 def _fixture_payload() -> dict[str, object]:
@@ -68,10 +72,10 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
     def test_goldset_lookup_queries_cover_exact_role_family_and_miss_cases(self) -> None:
         cases = (
             ({"name": "Corinna"}, "needs_clarification", None, None, 2),
-            ({"name": "Corinna", "family_name": "Maier"}, "found", "Corinna Maier", ("01761234",), 0),
-            ({"name": "Corinna", "role": "Physiotherapist"}, "found", "Corinna Maier", ("01761234",), 0),
-            ({"name": "Corinna", "role": "Neighbor"}, "found", "Corinna Schmidt", ("0309988",), 0),
-            ({"name": "Anna"}, "found", "Anna Becker", ("08912345",), 0),
+            ({"name": "Corinna", "family_name": "Maier"}, "found", "Corinna Maier", (_TEST_CORINNA_PHONE,), 0),
+            ({"name": "Corinna", "role": "Physiotherapist"}, "found", "Corinna Maier", (_TEST_CORINNA_PHONE,), 0),
+            ({"name": "Corinna", "role": "Neighbor"}, "found", "Corinna Schmidt", (_TEST_CORINNA_NEIGHBOR_PHONE,), 0),
+            ({"name": "Anna"}, "found", "Anna Becker", (_TEST_ANNA_PHONE,), 0),
             ({"name": "Holger"}, "not_found", None, None, 0),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,7 +176,7 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
 
         contacts = {item["name"]: item for item in payload["contacts"]}
         self.assertEqual(contacts["Corinna Maier"]["role"], "Physiotherapist")
-        self.assertEqual(contacts["Corinna Maier"]["phones"], ["01761234"])
+        self.assertEqual(contacts["Corinna Maier"]["phones"], [_TEST_CORINNA_PHONE])
         self.assertEqual(contacts["Corinna Schmidt"]["role"], "Neighbor")
 
     def test_goldset_persistence_roundtrip_keeps_new_contact_details_and_new_memories(self) -> None:
@@ -183,7 +187,7 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
             updated_contact = store.remember_contact(
                 given_name="Corinna",
                 family_name="Maier",
-                phone="01761234",
+                phone=_TEST_CORINNA_PHONE,
                 email="corinna.maier@example.com",
                 role="Physiotherapist",
             )
@@ -217,7 +221,7 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
 
             result = store.remember_contact(
                 given_name="Corinna",
-                phone="040998877",
+                phone=_TEST_CORINNA_ALT_PHONE,
             )
 
         self.assertEqual(result.status, "needs_clarification")
@@ -230,12 +234,12 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
 
             created = store.remember_contact(
                 given_name="Corinna",
-                phone="01761234",
+                phone=_TEST_CORINNA_PHONE,
             )
             updated = store.remember_contact(
                 given_name="Corinna",
                 family_name="Maier",
-                phone="01761234",
+                phone=_TEST_CORINNA_PHONE,
                 role="Physiotherapist",
             )
             lookup = store.lookup_contact(name="Corinna", family_name="Maier")
@@ -245,7 +249,7 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
         self.assertEqual(lookup.status, "found")
         self.assertEqual(lookup.match.label, "Corinna Maier")
         self.assertEqual(lookup.match.role, "Physiotherapist")
-        self.assertEqual(lookup.match.phones, ("01761234",))
+        self.assertEqual(lookup.match.phones, (_TEST_CORINNA_PHONE,))
 
     def test_goldset_context_has_stable_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

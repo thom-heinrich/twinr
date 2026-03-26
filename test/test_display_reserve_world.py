@@ -77,6 +77,24 @@ class DisplayReserveWorldTests(unittest.TestCase):
         self.assertEqual(by_topic["agentic ai"].candidate_family, "world_subscription")
         self.assertFalse(by_topic["agentic ai"].headline.endswith("?"))
         self.assertTrue(by_topic["agentic ai"].body.endswith("?"))
+        self.assertEqual(
+            (by_topic["hamburg local politics"].generation_context or {}).get("card_intent"),
+            {
+                "topic_semantics": "oeffentlicher Anlass zu Hamburg plant neue Schulwege",
+                "statement_intent": "Twinr soll eine konkrete Beobachtung zu Hamburg plant neue Schulwege machen und zeigen, dass dort gerade etwas passiert.",
+                "cta_intent": "Zu einer kurzen Reaktion oder Haltung einladen.",
+                "relationship_stance": "ruhig beobachtend mit leichter eigener Haltung, nicht nachrichtensprecherhaft",
+            },
+        )
+        self.assertEqual(
+            (by_topic["agentic ai"].generation_context or {}).get("card_intent"),
+            {
+                "topic_semantics": "oeffentliches Thema zu agentic ai aus mehreren Quellen",
+                "statement_intent": "Twinr soll eine konkrete Beobachtung dazu machen, dass agentic ai heute ein Thema ist.",
+                "cta_intent": "Zu einer kurzen Einordnung oder Meinung einladen.",
+                "relationship_stance": "ruhig beobachtend, alltagsnah und mit eigener kleiner Haltung",
+            },
+        )
         self.assertGreater(
             by_topic["hamburg local politics"].salience,
             by_topic["schwarzenbek civic life"].salience,
@@ -115,6 +133,15 @@ class DisplayReserveWorldTests(unittest.TestCase):
         self.assertEqual(grouped.action, "brief_update")
         self.assertEqual(grouped.attention_state, "growing")
         self.assertIn("source_count", grouped.generation_context or {})
+        self.assertEqual(
+            (grouped.generation_context or {}).get("card_intent"),
+            {
+                "topic_semantics": "oeffentliches Thema zu AI companions aus mehreren Quellen",
+                "statement_intent": "Twinr soll eine konkrete Beobachtung dazu machen, dass AI companions heute ein Thema ist.",
+                "cta_intent": "Zu einer kurzen Einordnung oder Meinung einladen.",
+                "relationship_stance": "ruhig beobachtend, alltagsnah und mit eigener kleiner Haltung",
+            },
+        )
         self.assertEqual(len(candidates), 1)
 
 

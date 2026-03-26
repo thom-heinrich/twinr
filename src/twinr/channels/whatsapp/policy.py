@@ -59,9 +59,14 @@ class WhatsAppMessagePolicy:
 
     config: WhatsAppChannelConfig
     _sent_cache: _SentMessageCache = field(init=False, repr=False)
+    _inbound_cache: _SentMessageCache = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._sent_cache = _SentMessageCache(
+            ttl_s=self.config.sent_cache_ttl_s,
+            max_entries=self.config.sent_cache_max_entries,
+        )
+        self._inbound_cache = _SentMessageCache(
             ttl_s=self.config.sent_cache_ttl_s,
             max_entries=self.config.sent_cache_max_entries,
         )
@@ -80,6 +85,8 @@ class WhatsAppMessagePolicy:
     ) -> WhatsAppPolicyDecision:
         """Return whether the inbound message should be processed by Twinr."""
 
+        if self._inbound_cache.contains(message.message_id):
+            return WhatsAppPolicyDecision(False, "duplicate_inbound")
         if message.is_group and not self.config.groups_enabled:
             return WhatsAppPolicyDecision(False, "groups_disabled")
         if not self._matches_allowlist(message.sender_id):
@@ -91,7 +98,9 @@ class WhatsAppMessagePolicy:
                 return WhatsAppPolicyDecision(False, "from_self_requires_self_chat_mode")
             if not self._is_self_chat(message.conversation_id, account_jid=account_jid):
                 return WhatsAppPolicyDecision(False, "from_self_not_account_chat")
+            self._inbound_cache.remember(message.message_id)
             return WhatsAppPolicyDecision(True, "self_chat_inbound")
+        self._inbound_cache.remember(message.message_id)
         return WhatsAppPolicyDecision(True, "allowlisted_direct_message")
 
     def _matches_allowlist(self, sender_id: str) -> bool:

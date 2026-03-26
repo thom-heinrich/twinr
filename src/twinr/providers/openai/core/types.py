@@ -198,6 +198,12 @@ class OpenAISearchResult:
     requested_model: str | None = None
     fallback_reason: str | None = None
     attempt_log: tuple["OpenAISearchAttempt", ...] = ()
+    verification_status: str | None = None
+    question_resolved: bool | None = None
+    site_follow_up_recommended: bool = False
+    site_follow_up_reason: str | None = None
+    site_follow_up_url: str | None = None
+    site_follow_up_domain: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize ``sources`` into an immutable tuple of strings."""
@@ -217,6 +223,31 @@ class OpenAISearchResult:
         if any(not isinstance(item, OpenAISearchAttempt) for item in normalized_attempt_log):
             raise TypeError("attempt_log must contain only OpenAISearchAttempt items")
         object.__setattr__(self, "attempt_log", normalized_attempt_log)
+        normalized_verification_status = (
+            str(self.verification_status).strip().lower() if self.verification_status is not None else None
+        )
+        if normalized_verification_status not in {None, "verified", "partial", "unverified"}:
+            raise ValueError("verification_status must be verified, partial, unverified, or None")
+        object.__setattr__(self, "verification_status", normalized_verification_status)
+        normalized_question_resolved = self.question_resolved
+        if normalized_question_resolved is not None and not isinstance(normalized_question_resolved, bool):
+            raise TypeError("question_resolved must be bool or None")
+        object.__setattr__(self, "question_resolved", normalized_question_resolved)
+        object.__setattr__(self, "site_follow_up_recommended", bool(self.site_follow_up_recommended))
+        normalized_follow_up_reason = (
+            str(self.site_follow_up_reason).strip() if self.site_follow_up_reason is not None else None
+        )
+        normalized_follow_up_url = str(self.site_follow_up_url).strip() if self.site_follow_up_url is not None else None
+        normalized_follow_up_domain = (
+            str(self.site_follow_up_domain).strip().lower() if self.site_follow_up_domain is not None else None
+        )
+        if not self.site_follow_up_recommended:
+            normalized_follow_up_reason = None
+            normalized_follow_up_url = None
+            normalized_follow_up_domain = None
+        object.__setattr__(self, "site_follow_up_reason", normalized_follow_up_reason or None)
+        object.__setattr__(self, "site_follow_up_url", normalized_follow_up_url or None)
+        object.__setattr__(self, "site_follow_up_domain", normalized_follow_up_domain or None)
 
 
 @dataclass(frozen=True, slots=True)

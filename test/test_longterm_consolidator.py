@@ -19,6 +19,10 @@ from twinr.memory.longterm.core.models import (
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+
+
 def _source() -> LongTermSourceRefV1:
     return LongTermSourceRefV1(
         source_type="conversation_turn",
@@ -72,12 +76,12 @@ class LongTermMemoryConsolidatorTests(unittest.TestCase):
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
             source=_source(),
             status="candidate",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key=_TEST_CORINNA_PHONE_NEW,
             attributes={"person_ref": "person:corinna_maier"},
         )
         extraction = LongTermTurnExtractionV1(
@@ -89,7 +93,7 @@ class LongTermMemoryConsolidatorTests(unittest.TestCase):
                 LongTermGraphEdgeCandidateV1(
                     source_ref="person:corinna_maier",
                     edge_type="general_has_contact_method",
-                    target_ref="phone:+4940998877",
+                    target_ref=f"phone:{_TEST_CORINNA_PHONE_NEW}",
                     confidence=0.95,
                     attributes={"origin_memory_id": "fact:corinna_phone_new"},
                 ),
@@ -99,12 +103,12 @@ class LongTermMemoryConsolidatorTests(unittest.TestCase):
             LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_old",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +491761234.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                 source=_source(),
                 status="active",
                 confidence=0.95,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+491761234",
+                value_key=_TEST_CORINNA_PHONE_OLD,
                 attributes={"person_ref": "person:corinna_maier"},
             ),
         )

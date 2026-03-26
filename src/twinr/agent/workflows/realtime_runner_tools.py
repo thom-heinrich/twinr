@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class TwinrRealtimeToolDelegatesMixin:
     """Expose the `handle_*` methods expected by realtime tool bindings."""
+
+    tool_executor: Any
 
     def _handle_print_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_print_receipt(arguments)
@@ -14,6 +18,9 @@ class TwinrRealtimeToolDelegatesMixin:
 
     def _handle_schedule_reminder_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_schedule_reminder(arguments)
+
+    def _handle_connect_service_integration_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_connect_service_integration(arguments)
 
     def _handle_list_automations_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_list_automations(arguments)
@@ -66,6 +73,9 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_lookup_contact_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_lookup_contact(arguments)
 
+    def _handle_send_whatsapp_message_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_send_whatsapp_message(arguments)
+
     def _handle_get_memory_conflicts_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_get_memory_conflicts(arguments)
 
@@ -92,6 +102,9 @@ class TwinrRealtimeToolDelegatesMixin:
 
     def _handle_update_simple_setting_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_update_simple_setting(arguments)
+
+    def _handle_manage_voice_quiet_mode_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_manage_voice_quiet_mode(arguments)
 
     def _handle_enroll_voice_profile_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_enroll_voice_profile(arguments)

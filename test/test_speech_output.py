@@ -156,6 +156,34 @@ class InterruptiblePlayer:
         self.stopped = True
 
 
+class CoordinatorPreemptObservationPlayer:
+    def __init__(self) -> None:
+        self.feedback_started = Event()
+        self.feedback_stopped = Event()
+        self.speech_started = Event()
+        self.played: list[bytes] = []
+
+    def play_wav_chunks(self, chunks, *, should_stop=None) -> None:
+        payload = bytearray()
+        first_chunk: bytes | None = None
+        for chunk in chunks:
+            if first_chunk is None:
+                first_chunk = bytes(chunk)
+                if first_chunk.startswith(b"PROCESS"):
+                    self.feedback_started.set()
+                else:
+                    self.speech_started.set()
+            payload.extend(chunk)
+            if should_stop is not None and should_stop():
+                if first_chunk is not None and first_chunk.startswith(b"PROCESS"):
+                    self.feedback_stopped.set()
+                break
+        self.played.append(bytes(payload))
+
+    def stop_playback(self) -> None:
+        return
+
+
 class InterruptibleSpeechOutputTests(unittest.TestCase):
     def test_flush_enqueues_pending_non_atomic_segment(self) -> None:
         tts_provider = SlowTTSProvider()
@@ -379,6 +407,55 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
 
         self.assertTrue(player.played)
         self.assertIn(b"FINAL-1", player.played[0])
+
+    def test_playback_coordinator_waits_for_first_tts_chunk_before_preempting_feedback(self) -> None:
+        tts_provider = GatedFirstChunkTTSProvider()
+        player = CoordinatorPreemptObservationPlayer()
+        coordinator = PlaybackCoordinator(player)
+
+        def _processing_chunks():
+            while True:
+                yield b"PROCESS"
+                sleep(0.01)
+
+        feedback_done = Event()
+
+        def _run_feedback() -> None:
+            coordinator.play_wav_chunks(
+                owner="working_feedback:processing",
+                priority=10,
+                chunks=_processing_chunks(),
+            )
+            feedback_done.set()
+
+        feedback_thread = speech_output_module.Thread(target=_run_feedback, daemon=True)
+        feedback_thread.start()
+        self.assertTrue(player.feedback_started.wait(timeout=1.0))
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            playback_coordinator=coordinator,
+        )
+
+        output.submit_text_delta("Hallo zusammen.")
+        self.assertTrue(tts_provider.started.wait(timeout=1.0))
+        self.assertFalse(player.feedback_stopped.wait(timeout=0.1))
+        self.assertFalse(feedback_done.is_set())
+
+        tts_provider.release.set()
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
+        self.assertTrue(player.feedback_stopped.wait(timeout=1.0))
+        output.close(timeout_s=2.0)
+        output.raise_if_error()
+        coordinator.close(timeout_s=1.0)
+        feedback_thread.join(timeout=1.0)
+
+        self.assertTrue(player.speech_started.is_set())
+        self.assertTrue(feedback_done.is_set())
+        self.assertTrue(any(b"READY-1" in payload for payload in player.played))
 
     def test_abort_returns_quickly_when_first_chunk_stalls(self) -> None:
         tts_provider = GatedFirstChunkTTSProvider()

@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 import sys
 import unittest
 from unittest.mock import patch
@@ -205,8 +206,8 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             monitor = build_default_proactive_monitor(
                 config=config,
                 runtime=runtime,
-                backend=object(),
-                camera=object(),
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
                 camera_lock=None,
                 audio_lock=None,
                 trigger_handler=lambda _decision: False,
@@ -250,8 +251,8 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             monitor = build_default_proactive_monitor(
                 config=config,
                 runtime=runtime,
-                backend=object(),
-                camera=object(),
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
                 camera_lock=None,
                 audio_lock=None,
                 trigger_handler=lambda _decision: False,
@@ -262,6 +263,48 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
         remote_frame_factory.assert_called_once_with(config)
         remote_proxy_factory.assert_not_called()
+        local_factory.assert_not_called()
+        openai_provider.assert_not_called()
+
+    def test_build_default_monitor_uses_aideck_openai_provider_when_configured(self) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_wayland",
+            proactive_vision_provider="aideck_openai",
+            camera_device="aideck://192.168.4.1:5000",
+        )
+        runtime = SimpleNamespace(
+            ops_events=SimpleNamespace(append=lambda **_kwargs: None),
+            fail=lambda _detail: None,
+            status=SimpleNamespace(value="waiting"),
+        )
+        sentinel_provider = object()
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service.AIDeckOpenAIVisionObservationProvider.from_config",
+                return_value=sentinel_provider,
+            ) as aideck_factory,
+            patch(
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+            ) as local_factory,
+            patch(
+                "twinr.proactive.runtime.service.OpenAIVisionObservationProvider",
+            ) as openai_provider,
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: False,
+            )
+
+        self.assertIsNotNone(monitor)
+        assert monitor is not None
+        self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
+        aideck_factory.assert_called_once()
         local_factory.assert_not_called()
         openai_provider.assert_not_called()
 

@@ -12,6 +12,7 @@ tool orchestration while leaving concrete handler modules internal.
 - preserve the package boundary that keeps concrete handlers off the public API
 - carry the canonical schema/instruction surface for reminder, automation, memory, guided user-discovery, and self-coding tools, including learned-skill activation and control
 - expose the route-aware first-word overlay builder used when the local semantic router short-circuits into `web`, `memory`, or `tool` handoffs
+- keep schema/prompt builders importable without eagerly pulling runtime-loop modules back into provider session bootstrap
 
 `tools` does **not** own:
 - concrete tool-side business logic or guard helpers
@@ -45,6 +46,9 @@ tool_schemas = build_realtime_tool_schemas(None)
 executor = RealtimeToolExecutor(owner)
 tool_handlers = bind_realtime_tool_handlers(executor)
 ```
+
+Runtime symbols are loaded lazily from the root package so callers that only
+need prompt/schema builders do not trigger runtime-provider import cycles.
 
 ## See also
 

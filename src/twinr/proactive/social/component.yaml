@@ -12,6 +12,7 @@ owned_concerns:
   - Preserve conservative ReSpeaker busy-state and direction-quality facts for downstream policy consumers
   - Map the local-first IMX500 adapter onto the normalized social vision contract
   - Map the same normalized social vision contract onto peer-LAN IMX500 observations served by a dedicated helper Pi
+  - Route bounded AI-Deck still captures into the continuous OpenAI-backed proactive vision lane when Twinr uses an `aideck://` camera device
   - Stabilize automation-facing camera snapshots, bounded visible-person anchors, coarse motion, and rising-edge coarse/fine gesture events
   - Confirm explicit fine-hand symbols conservatively before the UI or policy layers see them, so random single-frame positives do not become user-facing acknowledgements
   - Load bounded per-symbol fine-hand calibration so ambiguous symbols such as `ok_sign` or `middle_finger` can be stricter than `thumbs_up` or `pointing`
@@ -89,6 +90,11 @@ files:
     exports:
       - FineHandGesturePolicy
       - GestureCalibrationProfile
+  - path: aideck_camera_provider.py
+    role: Bounded continuous AI-Deck still-camera provider that feeds the OpenAI proactive vision classifier from aideck:// captures
+    exports:
+      - AIDeckOpenAIVisionObservationProvider
+      - AIDeckOpenAIVisionProviderConfig
   - path: local_camera_provider.py
     role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including bounded multi-person visibility plus motion and coarse/fine gesture output
     exports:
@@ -216,6 +222,7 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/proactive/__init__.py
 tests:
+  - path: test/test_aideck_camera_provider.py
   - path: test/test_local_ai_camera_provider.py
   - path: test/test_remote_ai_camera_provider.py
   - path: test/test_gesture_calibration.py

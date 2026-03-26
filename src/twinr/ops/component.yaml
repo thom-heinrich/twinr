@@ -101,7 +101,7 @@ files:
   - path: self_coding_pi.py
     role: Pi bootstrap for the pinned self-coding Codex bridge, CLI, auth sync, and remote self-test
   - path: pi_repo_mirror.py
-    role: One-way repo mirror watchdog that keeps /twinr aligned with the authoritative leading repo while preserving Pi-local runtime-only paths
+    role: One-way repo mirror watchdog that keeps /twinr aligned with the authoritative leading repo while preserving Pi-local runtime-only paths and excluding gitignored browser-automation capture artefacts from deploy convergence checks
   - path: pi_runtime_deploy.py
     role: Operator-facing Pi deploy orchestration that mirrors code, syncs the authoritative runtime env, refreshes the editable install, restarts the base services plus any already-enabled repo-backed Pi runtime units, supports first rollout of disabled optional Pi units, and verifies restart health
   - path: health.py
@@ -141,7 +141,7 @@ files:
   - path: pi_runtime_deploy_remote.py
     role: Internal SSH, SCP, sync, and systemd verification helpers used by the Pi deploy orchestrator
   - path: self_test.py
-    role: Bounded hardware self-test execution and artifact capture
+    role: Bounded hardware self-test execution and artifact capture, including AI-Deck WiFi handover, frame capture, and image-sanity probes
     exports:
       - SelfTestResult
       - TwinrSelfTestRunner

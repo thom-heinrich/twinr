@@ -30,6 +30,9 @@ import pino from "pino";
 import QRCodeSvg from "qrcode";
 import QRCodeTerminal from "qrcode-terminal";
 
+import { buildHistoryBatchPayload } from "./history_messages.mjs";
+import { collectIncomingMessagePayloads } from "./incoming_messages.mjs";
+
 const logger = pino({ level: "silent" });
 const authDir = path.resolve(process.env.TWINR_WHATSAPP_AUTH_DIR || "./auth");
 const reconnectBaseMs = parsePositiveInt(process.env.TWINR_WHATSAPP_RECONNECT_BASE_MS, 2000);
@@ -37,6 +40,8 @@ const reconnectMaxMs = Math.max(
   reconnectBaseMs,
   parsePositiveInt(process.env.TWINR_WHATSAPP_RECONNECT_MAX_MS, 30000),
 );
+const historySyncEnabled = parseBool(process.env.TWINR_WHATSAPP_HISTORY_SYNC, false);
+const historyCutoffTimestampMs = parseOptionalInt(process.env.TWINR_WHATSAPP_HISTORY_CUTOFF_MS);
 
 /** @type {ReturnType<typeof makeWASocket> | null} */
 let socket = null;
@@ -44,6 +49,7 @@ let stopRequested = false;
 let reconnectAttempt = 0;
 let reconnectTimer = null;
 let currentAccountJid = null;
+let currentAccountLid = null;
 
 function emit(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -59,6 +65,25 @@ function parsePositiveInt(value, fallback) {
     return fallback;
   }
   return parsed;
+}
+
+function parseOptionalInt(value) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseBool(value, fallback = false) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
 }
 
 function normalizeJid(value) {
@@ -97,6 +122,23 @@ async function buildQrSvg(qr) {
     });
   } catch (error) {
     log(`[twinr-whatsapp] Failed to build QR SVG for portal rendering: ${error}`);
+    return null;
+  }
+}
+
+async function buildQrImageDataUrl(qr) {
+  try {
+    return await QRCodeSvg.toDataURL(qr, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 320,
+      color: {
+        dark: "#000000",
+        light: "#ffffff",
+      },
+    });
+  } catch (error) {
+    log(`[twinr-whatsapp] Failed to build QR PNG for HDMI rendering: ${error}`);
     return null;
   }
 }
@@ -184,12 +226,13 @@ async function startSocket() {
     logger,
     markOnlineOnConnect: false,
     printQRInTerminal: false,
-    shouldSyncHistoryMessage: () => false,
-    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => historySyncEnabled,
+    syncFullHistory: historySyncEnabled,
     version,
   });
   socket = nextSocket;
   currentAccountJid = normalizeJid(nextSocket.user?.id || state.creds?.me?.id) || currentAccountJid;
+  currentAccountLid = normalizeJid(nextSocket.user?.lid || state.creds?.me?.lid) || currentAccountLid;
 
   nextSocket.ev.on("creds.update", saveCreds);
   nextSocket.ev.on("connection.update", async (update) => {
@@ -198,14 +241,17 @@ async function startSocket() {
     }
     const statusCode = update?.lastDisconnect?.error?.output?.statusCode ?? null;
     currentAccountJid = normalizeJid(nextSocket.user?.id || nextSocket.authState?.creds?.me?.id) || currentAccountJid;
+    currentAccountLid = normalizeJid(nextSocket.user?.lid || nextSocket.authState?.creds?.me?.lid) || currentAccountLid;
     if (update?.qr) {
       renderQr(update.qr);
       const qrSvg = await buildQrSvg(update.qr);
+      const qrImageDataUrl = await buildQrImageDataUrl(update.qr);
       emit({
         type: "status",
         connection: update.connection || "qr",
         qr_available: true,
         qr_svg: qrSvg,
+        qr_image_data_url: qrImageDataUrl,
         account_jid: currentAccountJid,
         at: nowIso(),
       });
@@ -253,30 +299,30 @@ async function startSocket() {
   });
 
   nextSocket.ev.on("messages.upsert", (upsert) => {
-    if (socket !== nextSocket || upsert?.type !== "notify") {
+    if (socket !== nextSocket) {
       return;
     }
-    for (const message of upsert.messages || []) {
-      const text = extractText(message).trim();
-      const messageId = String(message?.key?.id || "").trim();
-      const conversationId = normalizeJid(message?.key?.remoteJid);
-      const senderId = normalizeJid(message?.key?.participant || message?.participant || conversationId);
-      if (!text || !messageId || !conversationId || conversationId === "status@broadcast") {
-        continue;
-      }
-      emit({
-        type: "incoming_message",
-        message_id: messageId,
-        conversation_id: conversationId,
-        sender_id: senderId,
-        sender_display_name: message?.pushName || null,
-        text,
-        received_at: nowIso(),
-        is_group: conversationId.endsWith("@g.us"),
-        is_from_self: Boolean(message?.key?.fromMe),
-        account_jid: currentAccountJid,
-      });
+    for (const payload of collectIncomingMessagePayloads(upsert, {
+      extractText,
+      normalizeJid,
+      accountJid: currentAccountJid,
+      accountLid: currentAccountLid,
+      receivedAt: nowIso(),
+    })) {
+      emit(payload);
     }
+  });
+  nextSocket.ev.on("messaging-history.set", (historySet) => {
+    if (socket !== nextSocket || !historySyncEnabled) {
+      return;
+    }
+    emit(buildHistoryBatchPayload(historySet, {
+      extractText,
+      normalizeJid,
+      accountJid: currentAccountJid,
+      accountLid: currentAccountLid,
+      cutoffTimestampMs: historyCutoffTimestampMs,
+    }));
   });
 }
 

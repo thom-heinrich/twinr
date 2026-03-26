@@ -127,6 +127,8 @@ class SupervisorDecision:
     location_hint: str | None = None
     date_context: str | None = None
     context_scope: str | None = None
+    runtime_tool_name: str | None = None
+    runtime_tool_arguments: dict[str, object] | None = None
     response_id: str | None = None
     request_id: str | None = None
     model: str | None = None
@@ -142,6 +144,16 @@ class SupervisorDecision:
             "context_scope",
             normalize_supervisor_decision_context_scope(self.context_scope),
         )
+        object.__setattr__(
+            self,
+            "runtime_tool_name",
+            normalize_supervisor_decision_runtime_tool_name(self.runtime_tool_name),
+        )
+        object.__setattr__(
+            self,
+            "runtime_tool_arguments",
+            normalize_supervisor_decision_runtime_tool_arguments(self.runtime_tool_arguments),
+        )
 
 
 _SUPERVISOR_CONTEXT_SCOPES = frozenset({"tiny_recent", "full_context"})
@@ -156,6 +168,31 @@ def normalize_supervisor_decision_context_scope(value: object) -> str | None:
     if normalized in _SUPERVISOR_CONTEXT_SCOPES:
         return normalized
     return None
+
+
+def normalize_supervisor_decision_runtime_tool_name(value: object) -> str | None:
+    """Return one stripped runtime-local tool name, if present."""
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def normalize_supervisor_decision_runtime_tool_arguments(
+    value: object,
+) -> dict[str, object] | None:
+    """Return JSON-like runtime-local tool arguments when the payload is a dict."""
+
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, object] = {}
+    for key, item in value.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        normalized[key_text] = item
+    return normalized
 
 
 def supervisor_decision_requires_full_context(decision: object | None) -> bool:

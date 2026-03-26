@@ -13,6 +13,10 @@ from twinr.agent.base_agent.conversation.closure import (
 def follow_up_allowed_for_source(loop: Any, *, initial_source: str) -> bool:
     """Report whether the given turn source may reopen a follow-up listen."""
 
+    runtime = getattr(loop, "runtime", None)
+    voice_quiet_active = getattr(runtime, "voice_quiet_active", None)
+    if callable(voice_quiet_active) and voice_quiet_active():
+        return False
     if not loop.config.conversation_follow_up_enabled:
         return False
     if initial_source == "proactive":

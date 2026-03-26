@@ -7,8 +7,9 @@ summary: Root Twinr package boundary, CLI bootstrap, and shared helpers reused a
 owned_concerns:
   - Expose the lazy `twinr` package-root surface for runtime config, status, and on-device memory types.
   - Bootstrap `python -m twinr` and the installed `twinr` script, then dispatch into focused subsystem packages.
+  - Define the versioned package boundary around optional browser automation contracts plus the local unversioned workspace hook.
   - Host small shared utility modules for text normalization, local date parsing, and structured JSON response handling.
-  - Define the package boundary around the agent, channels, memory, providers, hardware, display, web, proactive, orchestrator, ops, automations, and integrations subsystems.
+  - Define the package boundary around the agent, browser_automation, channels, memory, providers, hardware, display, web, proactive, orchestrator, ops, automations, and integrations subsystems.
 out_of_scope:
   - Deep runtime, provider, memory, hardware, or web behavior that belongs in a documented child package under `src/twinr/*`
   - Raspberry Pi bootstrap and OS setup scripts in `hardware/`
@@ -32,6 +33,8 @@ files:
 subpackages:
   - path: agent
     role: Core runtime, tools, workflows, and self-coding packages
+  - path: browser_automation
+    role: Optional browser-automation API contracts and local loader boundary
   - path: channels
     role: External text-channel contracts and transport listeners
   - path: automations
@@ -67,6 +70,7 @@ entrypoints:
   - command: twinr
     role: Installed CLI script
 tests:
+  - path: test/test_browser_automation.py
   - path: test/test_config.py
   - path: test/test_llm_json.py
   - path: test/test_main.py

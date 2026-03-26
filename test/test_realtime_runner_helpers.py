@@ -50,11 +50,18 @@ class _FakeVoiceOrchestrator:
 
 
 class _FollowUpHarness:
-    def __init__(self, *, enabled: bool = True, proactive_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        proactive_enabled: bool = False,
+        voice_quiet_active: bool = False,
+    ) -> None:
         self.config = SimpleNamespace(
             conversation_follow_up_enabled=enabled,
             conversation_follow_up_after_proactive_enabled=proactive_enabled,
         )
+        self.runtime = SimpleNamespace(voice_quiet_active=lambda: voice_quiet_active)
         self.emitted: list[str] = []
 
     def emit(self, line: str) -> None:
@@ -67,6 +74,7 @@ class _VoiceHarness:
         self._voice_orchestrator_runtime_state_lock = RLock()
         self._last_voice_orchestrator_runtime_state: tuple[str, str | None, bool] | None = None
         self._last_voice_orchestrator_intent_context = None
+        self._last_voice_orchestrator_quiet_until_utc: str | None = None
         self._latest_sensor_observation_facts = {
             "camera": {"person_visible": True},
             "person_state": {
@@ -77,7 +85,11 @@ class _VoiceHarness:
                 "interaction_intent_state": {"state": "showing_intent"},
             },
         }
-        self.runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+        self.runtime = SimpleNamespace(
+            status=SimpleNamespace(value="waiting"),
+            voice_quiet_until_utc=lambda: None,
+            voice_quiet_active=lambda: False,
+        )
         self._remote_transcript_commits = RemoteTranscriptCommitCoordinator()
         self.emitted: list[str] = []
         self.traces: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -136,6 +148,16 @@ class RealtimeFollowUpHelpersTests(unittest.TestCase):
             )
         )
 
+    def test_follow_up_allowed_for_source_respects_voice_quiet_gate(self) -> None:
+        quiet_loop = _FollowUpHarness(enabled=True, proactive_enabled=True, voice_quiet_active=True)
+
+        self.assertFalse(
+            realtime_follow_up.follow_up_allowed_for_source(
+                quiet_loop,
+                initial_source="button",
+            )
+        )
+
     def test_emit_closure_decision_writes_expected_lines(self) -> None:
         loop = _FollowUpHarness()
 
@@ -172,6 +194,32 @@ class VoiceOrchestratorRuntimeHelpersTests(unittest.TestCase):
         self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("waiting", "idle", False))
         self.assertEqual(loop.voice_orchestrator.states[-1], ("waiting", "idle", False))
         self.assertTrue(loop.voice_orchestrator.intent_contexts[-1]["person_visible"])
+        self.assertIsNone(loop.voice_orchestrator.intent_contexts[-1]["voice_quiet_until_utc"])
+
+    def test_refresh_voice_orchestrator_sensor_context_replays_when_voice_quiet_changes(self) -> None:
+        loop = _VoiceHarness()
+
+        voice_orchestrator_runtime.notify_voice_orchestrator_state(
+            loop,
+            "waiting",
+            detail="idle",
+            follow_up_allowed=True,
+        )
+        self.assertEqual(len(loop.voice_orchestrator.states), 1)
+
+        loop.runtime = SimpleNamespace(
+            status=SimpleNamespace(value="waiting"),
+            voice_quiet_until_utc=lambda: "2026-03-25T12:15:00Z",
+            voice_quiet_active=lambda: True,
+        )
+        voice_orchestrator_runtime.refresh_voice_orchestrator_sensor_context(loop)
+
+        self.assertEqual(len(loop.voice_orchestrator.states), 2)
+        self.assertEqual(loop.voice_orchestrator.states[-1], ("waiting", "idle", False))
+        self.assertEqual(
+            loop.voice_orchestrator.intent_contexts[-1]["voice_quiet_until_utc"],
+            "2026-03-25T12:15:00Z",
+        )
 
     def test_handle_remote_transcript_committed_reopens_follow_up_turn(self) -> None:
         loop = _VoiceHarness()

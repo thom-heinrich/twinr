@@ -11,6 +11,7 @@ and image dataclasses consumed by higher OpenAI packages.
 - build validated default OpenAI SDK clients from `TwinrConfig`
 - normalize shared Responses API request payloads, including role-aware conversation replay, and tool settings
 - define reusable instruction constants, fallback model lists, and typed response/image objects, including structured search-attempt metadata for runtime journaling
+- define reusable instruction constants, fallback model lists, and typed response/image objects, including structured search verification/follow-up fields for runtime search routing
 
 `core` does **not** own:
 - public adapter surfaces or backend composition in [`../api`](../api/README.md)

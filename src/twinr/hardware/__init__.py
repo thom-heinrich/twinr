@@ -11,9 +11,16 @@ from importlib import import_module
 
 __all__ = [
     "CapturedPhoto",
+    "DroneMissionRequest",
+    "DroneMissionStatus",
+    "DroneServiceConfig",
+    "DroneStateSnapshot",
+    "DroneSafetyStatus",
+    "DronePoseSnapshot",
     "GpioPirMonitor",
     "PirBinding",
     "PirMotionEvent",
+    "RemoteDroneServiceClient",
     "V4L2StillCamera",
     "VoiceAssessment",
     "VoiceProfileMonitor",
@@ -27,9 +34,16 @@ __all__ = [
 
 _EXPORTS = {
     "CapturedPhoto": "twinr.hardware.camera",
+    "DroneMissionRequest": "twinr.hardware.drone_service",
+    "DroneMissionStatus": "twinr.hardware.drone_service",
+    "DronePoseSnapshot": "twinr.hardware.drone_service",
+    "DroneSafetyStatus": "twinr.hardware.drone_service",
+    "DroneServiceConfig": "twinr.hardware.drone_service",
+    "DroneStateSnapshot": "twinr.hardware.drone_service",
     "GpioPirMonitor": "twinr.hardware.pir",
     "PirBinding": "twinr.hardware.pir",
     "PirMotionEvent": "twinr.hardware.pir",
+    "RemoteDroneServiceClient": "twinr.hardware.drone_service",
     "V4L2StillCamera": "twinr.hardware.camera",
     "VoiceAssessment": "twinr.hardware.voice_profile",
     "VoiceProfileMonitor": "twinr.hardware.voice_profile",

@@ -12,7 +12,11 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.hardware.servo_state import AttentionServoRuntimeState, AttentionServoStateStore
+from twinr.hardware.servo_state import (
+    AttentionServoMovementSegment,
+    AttentionServoRuntimeState,
+    AttentionServoStateStore,
+)
 
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "hardware" / "servo" / "attention_servo_state.py"
@@ -27,6 +31,18 @@ class AttentionServoStateScriptTests(unittest.TestCase):
     def test_hold_current_zero_persists_confirmed_manual_hold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "attention_servo_state.json"
+            AttentionServoStateStore(state_path).save(
+                AttentionServoRuntimeState(
+                    heading_degrees=12.0,
+                    heading_uncertainty_degrees=2.0,
+                    movement_journal=(
+                        AttentionServoMovementSegment(pulse_width_us=1390, duration_s=0.9),
+                    ),
+                    hold_until_armed=False,
+                    zero_reference_confirmed=True,
+                    updated_at=5.0,
+                )
+            )
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 exit_code = _MODULE.main(["--state-path", str(state_path), "hold-current-zero"])
@@ -38,6 +54,7 @@ class AttentionServoStateScriptTests(unittest.TestCase):
         if saved_state is None:
             self.fail("expected hold-current-zero to create a persisted state file")
         self.assertEqual(saved_state.heading_degrees, 0.0)
+        self.assertEqual(saved_state.movement_journal, ())
         self.assertTrue(saved_state.hold_until_armed)
         self.assertTrue(saved_state.zero_reference_confirmed)
 
@@ -48,6 +65,7 @@ class AttentionServoStateScriptTests(unittest.TestCase):
             store.save(
                 AttentionServoRuntimeState(
                     heading_degrees=14.5,
+                    heading_uncertainty_degrees=3.25,
                     hold_until_armed=True,
                     zero_reference_confirmed=True,
                     updated_at=10.0,
@@ -64,6 +82,7 @@ class AttentionServoStateScriptTests(unittest.TestCase):
         if saved_state is None:
             self.fail("expected arm to keep a persisted state file")
         self.assertEqual(saved_state.heading_degrees, 14.5)
+        self.assertEqual(saved_state.heading_uncertainty_degrees, 3.25)
         self.assertFalse(saved_state.hold_until_armed)
         self.assertTrue(saved_state.zero_reference_confirmed)
 
@@ -89,4 +108,56 @@ class AttentionServoStateScriptTests(unittest.TestCase):
         self.assertIsNotNone(saved_state)
         if saved_state is None:
             self.fail("expected arm failure to leave the state file intact")
+        self.assertTrue(saved_state.hold_until_armed)
+
+    def test_return_to_estimated_zero_sets_request_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=18.0,
+                    heading_uncertainty_degrees=4.5,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=True,
+                    updated_at=10.0,
+                )
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = _MODULE.main(["--state-path", str(state_path), "return-to-estimated-zero"])
+            saved_state = store.load()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("attention_servo_state=returning_to_estimated_zero", stdout.getvalue())
+        self.assertIsNotNone(saved_state)
+        if saved_state is None:
+            self.fail("expected return-to-estimated-zero to keep a persisted state file")
+        self.assertEqual(saved_state.heading_degrees, 18.0)
+        self.assertEqual(saved_state.heading_uncertainty_degrees, 4.5)
+        self.assertFalse(saved_state.hold_until_armed)
+        self.assertTrue(saved_state.return_to_zero_requested)
+
+    def test_return_to_estimated_zero_fails_without_confirmed_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=6.0,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=False,
+                    updated_at=10.0,
+                )
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                exit_code = _MODULE.main(["--state-path", str(state_path), "return-to-estimated-zero"])
+            saved_state = store.load()
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("estimated zero before a zero reference is confirmed", stderr.getvalue())
+        self.assertIsNotNone(saved_state)
+        if saved_state is None:
+            self.fail("expected return-to-estimated-zero failure to leave the state file intact")
         self.assertTrue(saved_state.hold_until_armed)

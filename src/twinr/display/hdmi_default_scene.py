@@ -6,6 +6,8 @@ so future capability cards, panel morphs, and richer animations can grow
 without bloating the backend adapters.
 """
 
+# pylint: disable=assignment-from-no-return,unsubscriptable-object,not-an-iterable
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -26,12 +28,16 @@ from twinr.display.hdmi_presentation_graph import (
 )
 from twinr.display.presentation_cues import DisplayPresentationCue
 from twinr.display.reserve_bus import DisplayReserveBusState, resolve_display_reserve_bus
+from twinr.display.service_connect_cues import DisplayServiceConnectCue
 
 
 _STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
 _DETAIL_MAX_LINES = 3
 _DEFAULT_HEADER_SIGNAL_ROWS = 2
 _DEFAULT_SCENE_SHOW_TICKER = False
+_PROMPT_MODE_LINE_GAP = 6
+_PROMPT_MODE_SECTION_GAP = 8
+_PROMPT_MODE_WRAP_MAX_LINES = 16
 
 
 class _HdmiSceneTools(Protocol):
@@ -97,6 +103,7 @@ class HdmiStatusPanelModel:
     symbol: str | None = None
     accent: str = "neutral"
     prompt_mode: bool = False
+    image_data_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +112,16 @@ class HdmiNewsTickerModel:
 
     label: str
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HdmiPromptModeLayout:
+    """Describe one fitted prompt-mode text layout inside the reserve card."""
+
+    headline_font: object
+    body_font: object
+    headline_lines: tuple[str, ...]
+    body_lines: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +326,7 @@ class HdmiDefaultSceneRenderer:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -328,6 +346,7 @@ class HdmiDefaultSceneRenderer:
             face_cue=face_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
+            service_connect_cue=service_connect_cue,
             presentation_cue=presentation_cue,
             presentation_now=presentation_now,
             ambient_now=ambient_now,
@@ -359,7 +378,13 @@ class HdmiDefaultSceneRenderer:
             return
         reserve_bus = scene.reserve_bus or DisplayReserveBusState.empty()
         if reserve_bus.owner != "emoji":
-            self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
+            self._draw_status_panel(
+                draw,
+                image=image,
+                box=scene.layout.panel_box,
+                panel=scene.panel,
+                compact=scene.layout.compact_panel,
+            )
         if reserve_bus.owner == "emoji" and reserve_bus.emoji_cue is not None:
             self._draw_emoji_reserve(image, draw, box=scene.layout.panel_box, emoji_cue=reserve_bus.emoji_cue)
         if scene.ticker is not None:
@@ -380,6 +405,7 @@ class HdmiDefaultSceneRenderer:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -391,7 +417,7 @@ class HdmiDefaultSceneRenderer:
             width=width,
             height=height,
             reserve_ticker=ticker is not None,
-            reserve_card_active=ambient_impulse_cue is not None and presentation_cue is None,
+            reserve_card_active=(ambient_impulse_cue is not None or service_connect_cue is not None) and presentation_cue is None,
             header_debug_signal_count=len(debug_signals),
         )
         presentation_graph = self._presentation_graph(
@@ -414,6 +440,7 @@ class HdmiDefaultSceneRenderer:
         reserve_bus = DisplayReserveBusState.empty(reason="presentation_surface_owned")
         if presentation_graph is None:
             reserve_bus = resolve_display_reserve_bus(
+                service_connect_cue=service_connect_cue,
                 emoji_cue=emoji_cue,
                 ambient_impulse_cue=ambient_impulse_cue,
             )
@@ -583,6 +610,16 @@ class HdmiDefaultSceneRenderer:
     ) -> HdmiStatusPanelModel:
         """Build the optional right-hand reserve card from the active ambient cue."""
 
+        service_connect_cue = reserve_bus.service_connect_cue
+        if service_connect_cue is not None:
+            return HdmiStatusPanelModel(
+                eyebrow=self.tools._normalise_text(service_connect_cue.service_label, fallback="").upper(),
+                headline=self.tools._normalise_text(service_connect_cue.summary, fallback=""),
+                helper_text=self.tools._normalise_text(service_connect_cue.detail, fallback=""),
+                cards=(),
+                accent=service_connect_cue.accent,
+                image_data_url=service_connect_cue.qr_image_data_url,
+            )
         ambient_impulse_cue = reserve_bus.ambient_impulse_cue
         if ambient_impulse_cue is None:
             return HdmiStatusPanelModel(
@@ -880,6 +917,7 @@ class HdmiDefaultSceneRenderer:
         self,
         draw: object,
         *,
+        image: object | None = None,
         box: tuple[int, int, int, int],
         panel: HdmiStatusPanelModel,
         compact: bool,
@@ -892,7 +930,7 @@ class HdmiDefaultSceneRenderer:
         if width <= 0 or height <= 0:
             return
         radius = 24 if not compact else 18
-        if not panel.headline and not panel.helper_text and not panel.symbol:
+        if not panel.headline and not panel.helper_text and not panel.symbol and not panel.image_data_url:
             draw.rounded_rectangle(
                 box,
                 radius=radius,
@@ -909,6 +947,16 @@ class HdmiDefaultSceneRenderer:
             width=2,
         )
         accent_fill = self._panel_accent_fill(panel.accent)
+        if panel.image_data_url and image is not None:
+            self._draw_status_panel_with_image(
+                image=image,
+                draw=draw,
+                box=box,
+                panel=panel,
+                compact=compact,
+                accent_fill=accent_fill,
+            )
+            return
         prompt_mode = panel.prompt_mode
         if not prompt_mode:
             draw.rounded_rectangle(
@@ -917,17 +965,6 @@ class HdmiDefaultSceneRenderer:
                 fill=accent_fill,
             )
         eyebrow_font = self.tools._font(13 if compact else 15, bold=True)
-        # Keep the reserve opener large, but leave a little more air on the
-        # 800x480 Pi surface so multi-line prompts stay easier to scan.
-        prompt_text_size = 26 if compact else 31
-        headline_font = self.tools._font(prompt_text_size, bold=True) if prompt_mode else self.tools._font(
-            22 if compact else 28,
-            bold=True,
-        )
-        body_font = self.tools._font(prompt_text_size, bold=False) if prompt_mode else self.tools._font(
-            15 if compact else 18,
-            bold=False,
-        )
         padding_x = 16 if compact else 20
         padding_y = 16 if compact else 18
         text_left = left + padding_x
@@ -944,47 +981,292 @@ class HdmiDefaultSceneRenderer:
             draw.text((eyebrow_x, text_top), panel.eyebrow, fill=(182, 182, 182), font=eyebrow_font)
             text_top += self.tools._text_height(draw, font=eyebrow_font) + (12 if compact else 14)
         if prompt_mode:
-            prompt_total_lines = self._prompt_mode_total_lines(
+            prompt_layout = self._fit_prompt_mode_layout(
                 draw,
+                panel=panel,
+                inner_width=inner_width,
                 available_top=text_top,
                 available_bottom=bottom - padding_y,
-                headline_font=headline_font,
+                compact=compact,
             )
-            if panel.helper_text:
-                prompt_total_lines = max(2, prompt_total_lines)
-            headline_max_lines = max(1, prompt_total_lines - (1 if panel.helper_text else 0))
+            headline_font = prompt_layout.headline_font
+            body_font = prompt_layout.body_font
+            headline_lines = prompt_layout.headline_lines
+            body_lines = prompt_layout.body_lines
         else:
+            headline_font = self.tools._font(22 if compact else 28, bold=True)
+            body_font = self.tools._font(15 if compact else 18, bold=False)
             headline_max_lines = 2
             body_max_lines = 3 if not compact else 2
-        headline_lines = self.tools._wrapped_lines(
-            draw,
-            (panel.headline,),
-            max_width=inner_width,
-            font=headline_font,
-            max_lines=headline_max_lines,
-        )
-        if prompt_mode:
-            body_max_lines = 0 if not panel.helper_text else max(1, prompt_total_lines - len(headline_lines))
-        for line in headline_lines:
+            headline_lines = self.tools._wrapped_lines(
+                draw,
+                (panel.headline,),
+                max_width=inner_width,
+                font=headline_font,
+                max_lines=headline_max_lines,
+            )
+            body_lines = self.tools._wrapped_lines(
+                draw,
+                (panel.helper_text,),
+                max_width=inner_width,
+                font=body_font,
+                max_lines=body_max_lines,
+            )
+        line_gap = _PROMPT_MODE_LINE_GAP if prompt_mode else 2
+        for index, line in enumerate(headline_lines):
             draw.text((text_left, text_top), line, fill=(255, 255, 255), font=headline_font)
-            text_top += self.tools._text_height(draw, font=headline_font) + (6 if prompt_mode else 2)
-        body_lines = self.tools._wrapped_lines(
-            draw,
-            (panel.helper_text,),
-            max_width=inner_width,
-            font=body_font,
-            max_lines=body_max_lines,
-        )
+            text_top += self.tools._text_height(draw, font=headline_font)
+            if index < len(headline_lines) - 1:
+                text_top += line_gap
         if body_lines:
-            text_top += 8 if prompt_mode else 6
-        for line in body_lines:
+            text_top += _PROMPT_MODE_SECTION_GAP if prompt_mode else 6
+        for index, line in enumerate(body_lines):
             draw.text(
                 (text_left, text_top),
                 line,
                 fill=(255, 255, 255) if prompt_mode else (214, 214, 214),
                 font=body_font,
             )
-            text_top += self.tools._text_height(draw, font=body_font) + (6 if prompt_mode else 2)
+            text_top += self.tools._text_height(draw, font=body_font)
+            if index < len(body_lines) - 1:
+                text_top += line_gap
+
+    def _draw_status_panel_with_image(
+        self,
+        image: object,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        panel: HdmiStatusPanelModel,
+        compact: bool,
+        accent_fill: tuple[int, int, int],
+    ) -> None:
+        """Draw one reserve card that includes a pairing QR or other bounded image."""
+
+        left, top, right, bottom = box
+        padding_x = 16 if compact else 20
+        padding_y = 16 if compact else 18
+        text_left = left + padding_x
+        text_top = top + padding_y
+        inner_width = max(56, (right - left) - (padding_x * 2))
+        eyebrow_font = self.tools._font(13 if compact else 15, bold=True)
+        headline_font = self.tools._font(20 if compact else 24, bold=True)
+        body_font = self.tools._font(13 if compact else 15, bold=False)
+
+        draw.rounded_rectangle(
+            (left + 12, top + 12, left + 20, top + 20),
+            radius=4,
+            fill=accent_fill,
+        )
+        if panel.eyebrow:
+            draw.text((text_left, text_top), panel.eyebrow, fill=(182, 182, 182), font=eyebrow_font)
+            text_top += self.tools._text_height(draw, font=eyebrow_font) + (10 if compact else 12)
+
+        headline_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.headline,),
+            max_width=inner_width,
+            font=headline_font,
+            max_lines=2,
+        )
+        body_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.helper_text,),
+            max_width=inner_width,
+            font=body_font,
+            max_lines=2,
+        )
+        if not headline_lines:
+            headline_lines = ()
+        for index, line in enumerate(headline_lines):
+            draw.text((text_left, text_top), line, fill=(255, 255, 255), font=headline_font)
+            text_top += self.tools._text_height(draw, font=headline_font)
+            if index < len(headline_lines) - 1:
+                text_top += 2
+        if body_lines:
+            text_top += 6
+        for index, line in enumerate(body_lines):
+            draw.text((text_left, text_top), line, fill=(214, 214, 214), font=body_font)
+            text_top += self.tools._text_height(draw, font=body_font)
+            if index < len(body_lines) - 1:
+                text_top += 2
+
+        available_top = text_top + 12
+        available_bottom = bottom - padding_y
+        available_height = max(0, available_bottom - available_top)
+        qr_side = min(inner_width, available_height)
+        if qr_side < 72:
+            return
+        qr_left = left + max(0, ((right - left) - qr_side) // 2)
+        qr_top = available_bottom - qr_side
+        qr_box = (qr_left, qr_top, qr_left + qr_side, qr_top + qr_side)
+        draw.rounded_rectangle(qr_box, radius=16 if compact else 18, fill=(255, 255, 255), outline=(84, 84, 84), width=2)
+        if self._paste_inline_image(image, box=qr_box, image_data_url=panel.image_data_url):
+            return
+
+        placeholder_font = self.tools._font(16 if compact else 20, bold=True)
+        placeholder = "QR UNAVAILABLE"
+        placeholder_width = self.tools._text_width(draw, placeholder, font=placeholder_font)
+        placeholder_height = self.tools._text_height(draw, font=placeholder_font)
+        draw.text(
+            (
+                qr_box[0] + max(0, ((qr_box[2] - qr_box[0]) - placeholder_width) // 2),
+                qr_box[1] + max(0, ((qr_box[3] - qr_box[1]) - placeholder_height) // 2),
+            ),
+            placeholder,
+            fill=(42, 42, 42),
+            font=placeholder_font,
+        )
+
+    def _fit_prompt_mode_layout(
+        self,
+        draw: object,
+        *,
+        panel: HdmiStatusPanelModel,
+        inner_width: int,
+        available_top: int,
+        available_bottom: int,
+        compact: bool,
+    ) -> _HdmiPromptModeLayout:
+        """Fit prompt-mode headline and CTA text into the visible card bounds.
+
+        Prompt-mode cards should stay large and calm, but they must also remain
+        fully inside the actual card box. This helper first tries to keep all
+        lines visible at the preferred size and then gradually shrinks the
+        shared prompt-mode type scale until the content fits. If even the
+        minimum size cannot fit everything, it returns a clipped layout on that
+        smallest size so drawn text still stays inside the card.
+        """
+
+        max_size = 26 if compact else 31
+        min_size = 18 if compact else 20
+        available_height = max(0, available_bottom - available_top)
+        for font_size in range(max_size, min_size - 1, -1):
+            layout = self._build_prompt_mode_layout(
+                draw,
+                panel=panel,
+                inner_width=inner_width,
+                font_size=font_size,
+                available_height=available_height,
+                truncate=False,
+            )
+            if layout is not None:
+                return layout
+        fallback_layout = self._build_prompt_mode_layout(
+            draw,
+            panel=panel,
+            inner_width=inner_width,
+            font_size=min_size,
+            available_height=available_height,
+            truncate=True,
+        )
+        if fallback_layout is not None:
+            return fallback_layout
+        headline_font = self.tools._font(min_size, bold=True)
+        body_font = self.tools._font(min_size, bold=False)
+        return _HdmiPromptModeLayout(
+            headline_font=headline_font,
+            body_font=body_font,
+            headline_lines=(),
+            body_lines=(),
+        )
+
+    def _build_prompt_mode_layout(
+        self,
+        draw: object,
+        *,
+        panel: HdmiStatusPanelModel,
+        inner_width: int,
+        font_size: int,
+        available_height: int,
+        truncate: bool,
+    ) -> _HdmiPromptModeLayout | None:
+        """Return one prompt-mode layout for a specific shared font size."""
+
+        headline_font = self.tools._font(font_size, bold=True)
+        body_font = self.tools._font(font_size, bold=False)
+        body_requested = bool(panel.helper_text)
+        if truncate:
+            total_lines = self._prompt_mode_total_lines(
+                draw,
+                available_top=0,
+                available_bottom=available_height,
+                headline_font=headline_font,
+            )
+            if body_requested:
+                total_lines = max(2, total_lines)
+            headline_max_lines = max(1, total_lines - (1 if body_requested else 0))
+            headline_lines = self.tools._wrapped_lines(
+                draw,
+                (panel.headline,),
+                max_width=inner_width,
+                font=headline_font,
+                max_lines=headline_max_lines,
+            )
+            body_max_lines = 0 if not body_requested else max(1, total_lines - len(headline_lines))
+            body_lines = self.tools._wrapped_lines(
+                draw,
+                (panel.helper_text,),
+                max_width=inner_width,
+                font=body_font,
+                max_lines=body_max_lines,
+            )
+            while body_lines and self._prompt_mode_content_height(
+                draw,
+                headline_font=headline_font,
+                headline_line_count=len(headline_lines),
+                body_line_count=len(body_lines),
+            ) > available_height:
+                body_lines = body_lines[:-1]
+            while len(headline_lines) > 1 and self._prompt_mode_content_height(
+                draw,
+                headline_font=headline_font,
+                headline_line_count=len(headline_lines),
+                body_line_count=len(body_lines),
+            ) > available_height:
+                headline_lines = headline_lines[:-1]
+            if self._prompt_mode_content_height(
+                draw,
+                headline_font=headline_font,
+                headline_line_count=len(headline_lines),
+                body_line_count=len(body_lines),
+            ) > available_height:
+                return None
+            return _HdmiPromptModeLayout(
+                headline_font=headline_font,
+                body_font=body_font,
+                headline_lines=headline_lines,
+                body_lines=body_lines,
+            )
+        headline_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.headline,),
+            max_width=inner_width,
+            font=headline_font,
+            max_lines=_PROMPT_MODE_WRAP_MAX_LINES,
+        )
+        body_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.helper_text,),
+            max_width=inner_width,
+            font=body_font,
+            max_lines=_PROMPT_MODE_WRAP_MAX_LINES,
+        )
+        if not headline_lines:
+            return None
+        if self._prompt_mode_content_height(
+            draw,
+            headline_font=headline_font,
+            headline_line_count=len(headline_lines),
+            body_line_count=len(body_lines),
+        ) > available_height:
+            return None
+        return _HdmiPromptModeLayout(
+            headline_font=headline_font,
+            body_font=body_font,
+            headline_lines=headline_lines,
+            body_lines=body_lines,
+        )
 
     def _prompt_mode_total_lines(
         self,
@@ -996,18 +1278,41 @@ class HdmiDefaultSceneRenderer:
     ) -> int:
         """Return prompt-mode line budgets from the actual visible panel height.
 
-        Prompt-mode reserve cards intentionally use one large text scale across
-        the whole message. Fixed two-line budgets waste half the card on the
-        real 800x480 display and make longer prompts appear cut off in the
-        middle. This helper derives a bounded line budget from the actual panel
-        height so the right-hand lane stays readable without shrinking the type.
+        Prompt-mode reserve cards first try to keep a large shared type scale
+        and only shrink when content would overflow the visible card. Once a
+        size has been chosen, this helper derives a bounded line budget from
+        the actual panel height so the right-hand lane stays inside the box.
         """
 
-        line_gap = 6
+        line_gap = _PROMPT_MODE_LINE_GAP
         line_height = max(1, self.tools._text_height(draw, font=headline_font))
         line_step = line_height + line_gap
         available_height = max(0, available_bottom - available_top)
         return max(1, (available_height + line_gap) // line_step)
+
+    def _prompt_mode_content_height(
+        self,
+        draw: object,
+        *,
+        headline_font: object,
+        headline_line_count: int,
+        body_line_count: int,
+    ) -> int:
+        """Measure one prompt-mode copy block against the visible card height."""
+
+        if headline_line_count <= 0 and body_line_count <= 0:
+            return 0
+        line_height = max(1, self.tools._text_height(draw, font=headline_font))
+        total_height = 0
+        if headline_line_count > 0:
+            total_height += line_height * headline_line_count
+            total_height += _PROMPT_MODE_LINE_GAP * max(0, headline_line_count - 1)
+        if body_line_count > 0:
+            if total_height > 0:
+                total_height += _PROMPT_MODE_SECTION_GAP
+            total_height += line_height * body_line_count
+            total_height += _PROMPT_MODE_LINE_GAP * max(0, body_line_count - 1)
+        return total_height
 
     def _panel_accent_fill(self, accent: str) -> tuple[int, int, int]:
         """Return a calm accent color for the ambient reserve card."""
@@ -1201,6 +1506,40 @@ class HdmiDefaultSceneRenderer:
             return False
         try:
             with Image.open(image_path) as opened:
+                prepared = ImageOps.contain(
+                    opened.convert("RGB"),
+                    (max(1, box[2] - box[0] - 12), max(1, box[3] - box[1] - 12)),
+                )
+        except Exception:
+            return False
+        target_left = box[0] + max(0, ((box[2] - box[0]) - prepared.width) // 2)
+        target_top = box[1] + max(0, ((box[3] - box[1]) - prepared.height) // 2)
+        image.paste(prepared, (target_left, target_top))
+        return True
+
+    def _paste_inline_image(
+        self,
+        image: object,
+        *,
+        box: tuple[int, int, int, int],
+        image_data_url: str | None,
+    ) -> bool:
+        """Paste one bounded inline data-URL image into the target box."""
+
+        if not image_data_url:
+            return False
+        try:
+            import base64
+            from io import BytesIO
+            from PIL import Image, ImageOps
+        except ImportError:
+            return False
+        header, separator, payload = str(image_data_url).partition(",")
+        if separator != "," or ";base64" not in header.lower():
+            return False
+        try:
+            decoded = base64.b64decode(payload)
+            with Image.open(BytesIO(decoded)) as opened:
                 prepared = ImageOps.contain(
                     opened.convert("RGB"),
                     (max(1, box[2] - box[0] - 12), max(1, box[3] - box[1] - 12)),

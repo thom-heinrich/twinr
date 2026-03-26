@@ -14,6 +14,29 @@ from twinr.providers.openai.api.adapters import _SUPERVISOR_DECISION_SCHEMA
 from twinr.providers.openai.core.client import _default_client_factory
 
 
+def _search_voice_payload(
+    spoken_answer: str,
+    *,
+    verification_status: str = "verified",
+    question_resolved: bool = True,
+    site_follow_up_recommended: bool = False,
+    site_follow_up_reason: str | None = None,
+    site_follow_up_url: str | None = None,
+    site_follow_up_domain: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "spoken_answer": spoken_answer,
+            "verification_status": verification_status,
+            "question_resolved": question_resolved,
+            "site_follow_up_recommended": site_follow_up_recommended,
+            "site_follow_up_reason": site_follow_up_reason,
+            "site_follow_up_url": site_follow_up_url,
+            "site_follow_up_domain": site_follow_up_domain,
+        }
+    )
+
+
 def _fake_usage(
     *,
     input_tokens: int = 120,
@@ -63,7 +86,7 @@ class FakeResponsesAPI:
         output_text = self.queued_output_texts.pop(0) if self.queued_output_texts else self.output_text
         response_format = ((kwargs.get("text") or {}).get("format") or {})
         if response_format.get("name") == "twinr_live_search_spoken_answer":
-            output_text = json.dumps({"spoken_answer": output_text})
+            output_text = _search_voice_payload(output_text)
         return SimpleNamespace(
             id="resp_123",
             _request_id="req_123",
@@ -168,7 +191,7 @@ class FakeChatCompletionsAPI:
         response_format = kwargs.get("response_format") or {}
         schema_name = (response_format.get("json_schema") or {}).get("name")
         if schema_name == "twinr_live_search_spoken_answer":
-            content = json.dumps({"spoken_answer": content})
+            content = _search_voice_payload(content)
         return SimpleNamespace(
             id="chatcmpl_123",
             _request_id="req_chat_123",
@@ -550,6 +573,9 @@ class OpenAIBackendTests(unittest.TestCase):
         )
 
         self.assertEqual(result.answer, "Morgen in Schwarzenbek 11 Grad, leichter Regen.")
+        self.assertEqual(result.verification_status, "verified")
+        self.assertTrue(result.question_resolved)
+        self.assertFalse(result.site_follow_up_recommended)
         self.assertEqual(
             result.sources,
             (
@@ -683,7 +709,7 @@ class OpenAIBackendTests(unittest.TestCase):
                     )
                 output_text = "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen."
                 if wrap_structured:
-                    output_text = json.dumps({"spoken_answer": output_text})
+                    output_text = _search_voice_payload(output_text)
                 return SimpleNamespace(
                     id="resp_chat",
                     _request_id="req_chat",
@@ -721,6 +747,8 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(result.model, "gpt-5.4-mini")
         self.assertIn("gpt-5.2->gpt-5.4-mini", result.fallback_reason or "")
         self.assertEqual(tuple(attempt.outcome for attempt in result.attempt_log), ("unusable", "unusable", "success"))
+        self.assertEqual(result.verification_status, "verified")
+        self.assertTrue(result.question_resolved)
 
     def test_search_live_info_retries_blank_completed_same_model_before_fallback(self) -> None:
         class BlankCompletedThenAnswerResponses:
@@ -736,8 +764,8 @@ class OpenAIBackendTests(unittest.TestCase):
                         _request_id="req_voice",
                         model="gpt-5.4-mini-2026-03-17",
                         usage=_fake_usage(),
-                        output_text=json.dumps(
-                            {"spoken_answer": "Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut."}
+                        output_text=_search_voice_payload(
+                            "Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut."
                         ),
                         output=[
                             SimpleNamespace(
@@ -822,6 +850,8 @@ class OpenAIBackendTests(unittest.TestCase):
             ("retry", "retry", "retry", "retry", "retry", "success"),
         )
         self.assertTrue(all(attempt.model == "gpt-5.4-mini" for attempt in result.attempt_log))
+        self.assertEqual(result.verification_status, "verified")
+        self.assertTrue(result.question_resolved)
 
     def test_search_live_info_retries_incomplete_max_output_tokens_until_completed(self) -> None:
         class IncompleteThenCompletedResponses:
@@ -837,8 +867,8 @@ class OpenAIBackendTests(unittest.TestCase):
                         _request_id="req_voice",
                         model=kwargs["model"],
                         usage=_fake_usage(),
-                        output_text=json.dumps(
-                            {"spoken_answer": "In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft."}
+                        output_text=_search_voice_payload(
+                            "In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft."
                         ),
                         output=[
                             SimpleNamespace(
@@ -929,11 +959,102 @@ class OpenAIBackendTests(unittest.TestCase):
 
         self.assertEqual(result.answer, "In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft.")
         self.assertEqual(result.sources, ("https://hamburg.example/politik",))
+        self.assertEqual(result.verification_status, "verified")
+        self.assertTrue(result.question_resolved)
         self.assertEqual(
             [call["max_output_tokens"] for call in backend._client.responses.calls[:-1]],
             [1024, 1536, 2048],
         )
         self.assertEqual(backend._client.responses.calls[-1]["max_output_tokens"], 160)
+
+    def test_search_live_info_returns_structured_follow_up_metadata_from_voice_rewrite(self) -> None:
+        class SearchThenStructuredRewriteResponses:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                response_format = ((kwargs.get("text") or {}).get("format") or {})
+                if response_format.get("name") == "twinr_live_search_spoken_answer":
+                    return SimpleNamespace(
+                        id="resp_voice",
+                        _request_id="req_voice",
+                        model=kwargs["model"],
+                        usage=_fake_usage(),
+                        output_text=_search_voice_payload(
+                            "Ich konnte online keinen aktuellen Mittagsplan eindeutig bestätigen.",
+                            verification_status="partial",
+                            question_resolved=False,
+                            site_follow_up_recommended=True,
+                            site_follow_up_reason=(
+                                "Die offizielle Café-Seite könnte den aktuellen Tagesplan nur auf der Website selbst zeigen."
+                            ),
+                            site_follow_up_url="https://cafeluise.example/mittag",
+                            site_follow_up_domain="cafeluise.example",
+                        ),
+                        output=[
+                            SimpleNamespace(
+                                type="message",
+                                status="completed",
+                                content=[
+                                    SimpleNamespace(
+                                        type="output_text",
+                                        text="Ich konnte online keinen aktuellen Mittagsplan eindeutig bestätigen.",
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+                return SimpleNamespace(
+                    id="resp_search",
+                    _request_id="req_search",
+                    model=kwargs["model"],
+                    usage=_fake_usage(),
+                    status="completed",
+                    output_text="Auf der offiziellen Seite ist kein aktuelles Mittagsmenü im Suchergebnis sichtbar.",
+                    output=[
+                        SimpleNamespace(
+                            type="web_search_call",
+                            action=SimpleNamespace(
+                                sources=[SimpleNamespace(url="https://cafeluise.example/mittag")]
+                            ),
+                        ),
+                        SimpleNamespace(
+                            type="message",
+                            status="completed",
+                            content=[
+                                SimpleNamespace(
+                                    type="output_text",
+                                    text="Auf der offiziellen Seite ist kein aktuelles Mittagsmenü im Suchergebnis sichtbar.",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.4-mini"),
+            client=SimpleNamespace(
+                responses=SearchThenStructuredRewriteResponses(),
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+        )
+
+        result = backend.search_live_info_with_metadata("Hat das Café Luise heute online ein Mittagsmenü veröffentlicht?")
+
+        self.assertEqual(result.answer, "Ich konnte online keinen aktuellen Mittagsplan eindeutig bestätigen.")
+        self.assertEqual(result.verification_status, "partial")
+        self.assertFalse(result.question_resolved)
+        self.assertTrue(result.site_follow_up_recommended)
+        self.assertEqual(
+            result.site_follow_up_reason,
+            "Die offizielle Café-Seite könnte den aktuellen Tagesplan nur auf der Website selbst zeigen.",
+        )
+        self.assertEqual(result.site_follow_up_url, "https://cafeluise.example/mittag")
+        self.assertEqual(result.site_follow_up_domain, "cafeluise.example")
 
     def test_search_live_info_raises_budget_error_when_incomplete_retry_ladder_is_exhausted(self) -> None:
         class AlwaysIncompleteResponses:

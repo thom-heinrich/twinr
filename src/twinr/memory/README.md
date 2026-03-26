@@ -32,7 +32,8 @@ subpackages.
 | [__init__.py](./__init__.py) | Public memory exports |
 | [context_store.py](./context_store.py) | Prompt and managed-context stores |
 | [reminders.py](./reminders.py) | Reminder persistence, reservation release, and rendering |
-| [user_discovery.py](./user_discovery.py) | Resumable guided onboarding and lifelong profile-learning state plus progression policy |
+| [user_discovery.py](./user_discovery.py) | Resumable guided onboarding and lifelong profile-learning state plus progression policy, including effective topic completion derived from curated `USER.md` and authoritative long-term profile facts so discovery does not re-ask already known basics or style preferences |
+| [user_discovery_authoritative_profile.py](./user_discovery_authoritative_profile.py) | Narrow adapter that projects authoritative graph and structured long-term profile facts into discovery-topic coverage |
 | [user_discovery_policy.py](./user_discovery_policy.py) | Adaptive discovery topic scoring from reserve-lane engagement |
 | [query_normalization.py](./query_normalization.py) | Retrieval query rewrite cache |
 | [fulltext.py](./fulltext.py) | In-memory FTS selector |

@@ -29,6 +29,7 @@ from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.presentation_cues import DisplayPresentationCue
+from twinr.display.service_connect_cues import DisplayServiceConnectCue
 from twinr.display.layouts import draw_status_card
 
 
@@ -227,6 +228,7 @@ class WaveshareEPD4In2V2:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame.
@@ -242,7 +244,7 @@ class WaveshareEPD4In2V2:
             emoji_cue: Optional HDMI-only emoji reserve cue. Ignored on Waveshare.
             ambient_impulse_cue: Optional HDMI-only reserve card cue. Ignored on Waveshare.
         """
-        del ticker_text, debug_signals, face_cue, emoji_cue, ambient_impulse_cue, presentation_cue
+        del ticker_text, debug_signals, face_cue, emoji_cue, ambient_impulse_cue, service_connect_cue, presentation_cue
         safe_status = self._normalise_text(status, fallback="status").lower() or "status"
         safe_headline = self._normalise_text(headline, fallback=safe_status.title())
         self._set_trace_surface_context(

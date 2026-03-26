@@ -32,6 +32,11 @@ from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+_TEST_CORINNA_GRAPH_PHONE = "5551234"
+
+
 def _config(root: str) -> TwinrConfig:
     return TwinrConfig(
         project_root=root,
@@ -97,25 +102,25 @@ class LongTermRetrieverTests(unittest.TestCase):
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
             details="Use the mobile number ending in 1234.",
             source=_source("turn:1"),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key=_TEST_CORINNA_PHONE_OLD,
             attributes={"person_ref": "person:corinna_maier"},
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
             details="Use the office number ending in 8877.",
             source=_source("turn:2"),
             status="uncertain",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key=_TEST_CORINNA_PHONE_NEW,
             attributes={"person_ref": "person:corinna_maier"},
         )
         conflict = LongTermMemoryConflictV1(
@@ -130,7 +135,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             graph_store.remember_contact(
                 given_name="Corinna",
                 family_name="Maier",
-                phone="01761234",
+                phone=_TEST_CORINNA_GRAPH_PHONE,
                 role="Physiotherapist",
             )
             prompt_context_store.memory_store.remember(
@@ -178,7 +183,7 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIsNotNone(context.conflict_context)
         self.assertIn("Corinna called earlier today", context.episodic_context or "")
         self.assertIn("recent_contact_bundle", context.midterm_context or "")
-        self.assertIn("+491761234", context.durable_context or "")
+        self.assertIn(_TEST_CORINNA_PHONE_OLD, context.durable_context or "")
         self.assertIn("Corinna Maier", context.graph_context or "")
         self.assertIn("contact:person:corinna_maier:phone", context.conflict_context or "")
         self.assertNotIn("This local-only memory should not be used", context.episodic_context or "")
@@ -486,22 +491,22 @@ class LongTermRetrieverTests(unittest.TestCase):
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
             source=_source("turn:1"),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key=_TEST_CORINNA_PHONE_OLD,
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
             source=_source("turn:2"),
             status="uncertain",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key=_TEST_CORINNA_PHONE_NEW,
         )
         conflict = LongTermMemoryConflictV1(
             slot_key="contact:person:corinna_maier:phone",

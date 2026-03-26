@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import math
 import time
 from typing import Any, Protocol
@@ -263,6 +264,7 @@ class EdgeOrchestratorVoiceSession:
         self._pending_transcript_utterance: _PendingTranscriptUtterance | None = None
         self._follow_up_deadline_at: float | None = None
         self._follow_up_opened_at: float | None = None
+        self._voice_quiet_until_utc: str | None = None
         self._intent_context = VoiceRuntimeIntentContext()
         self.backend = backend or _build_transcript_backend(config)
         self._wake_phrase_spotter = wake_phrase_spotter or _build_wake_phrase_spotter(
@@ -302,6 +304,8 @@ class EdgeOrchestratorVoiceSession:
             "state": self._state,
             "backend": self.backend_name,
             "follow_up_allowed": self._follow_up_allowed,
+            "voice_quiet_active": self._voice_quiet_active(),
+            "voice_quiet_until_utc": self._voice_quiet_until_utc,
         }
         payload.update(self._intent_context.trace_details())
         if details:
@@ -478,6 +482,113 @@ class EdgeOrchestratorVoiceSession:
             )
             return None
 
+    def _transcribe_capture(
+        self,
+        *,
+        capture: AmbientAudioCaptureWindow,
+        stage: str,
+        details: dict[str, object] | None = None,
+        prompt: str | None = None,
+    ) -> str | None:
+        """Transcribe one bounded capture without routing it through wake detection."""
+
+        origin_state_value = None if details is None else details.get("origin_state")
+        origin_state = str(origin_state_value).strip() or None
+        resolved_prompt = str(prompt or "").strip() or None
+        try:
+            with self._backend_request_context(
+                stage=stage,
+                capture=capture,
+                origin_state=origin_state,
+            ):
+                return self.backend.transcribe(
+                    _pcm_capture_to_wav_bytes(capture),
+                    filename="voice-window.wav",
+                    content_type="audio/wav",
+                    language=self.config.openai_realtime_language,
+                    prompt=resolved_prompt,
+                ).strip()
+        except Exception as exc:
+            error_message = str(exc).strip()
+            resolved_details: dict[str, object] = {
+                "error_type": type(exc).__name__,
+            }
+            if error_message:
+                resolved_details["error_message"] = error_message[:240]
+            if resolved_prompt is not None:
+                resolved_details["prompt_chars"] = len(resolved_prompt)
+            if details:
+                resolved_details.update(details)
+            self._record_transcript_debug(
+                stage=stage,
+                outcome="backend_error",
+                capture=capture,
+                details=resolved_details,
+            )
+            self._trace_event(
+                "voice_transcription_backend_error",
+                kind="warning",
+                level="WARN",
+                details={
+                    "stage": stage,
+                    **resolved_details,
+                },
+            )
+            return None
+
+    def _match_transcribed_wake(
+        self,
+        *,
+        transcript: str,
+        capture: AmbientAudioCaptureWindow,
+        stage: str,
+        details: dict[str, object] | None = None,
+    ) -> VoiceActivationMatch | None:
+        """Match one already-transcribed utterance against wake phrases.
+
+        Runtime uses ``VoiceActivationPhraseMatcher.match_transcript`` so
+        post-wake commits avoid re-running wake-biased transcription. Fall
+        back to the older capture-based detector only for custom doubles that
+        have not implemented transcript matching yet.
+        """
+
+        match_transcript = getattr(self._wake_phrase_spotter, "match_transcript", None)
+        if callable(match_transcript):
+            try:
+                return match_transcript(transcript)
+            except Exception as exc:
+                error_message = str(exc).strip()
+                resolved_details: dict[str, object] = {
+                    "error_type": type(exc).__name__,
+                }
+                if error_message:
+                    resolved_details["error_message"] = error_message[:240]
+                if details:
+                    resolved_details.update(details)
+                self._record_transcript_debug(
+                    stage=stage,
+                    outcome="matcher_error",
+                    transcript=transcript,
+                    capture=capture,
+                    details=resolved_details,
+                )
+                self._trace_event(
+                    "voice_activation_matcher_error",
+                    kind="warning",
+                    level="WARN",
+                    details={
+                        "stage": stage,
+                        "transcript_chars": len(transcript),
+                        **resolved_details,
+                    },
+                )
+                return None
+        return self._detect_wake_capture(
+            capture=capture,
+            stage=stage,
+            details=details,
+        )
+
     @property
     def backend_name(self) -> str:
         """Return the selected streaming remote-ASR backend label."""
@@ -492,6 +603,7 @@ class EdgeOrchestratorVoiceSession:
         self._pending_transcript_utterance = None
         self._follow_up_deadline_at = None
         self._follow_up_opened_at = None
+        self._voice_quiet_until_utc = None
         self._last_waiting_visible_at = None
 
     def handle_hello(self, request: OrchestratorVoiceHelloRequest) -> list[dict[str, Any]]:
@@ -527,6 +639,9 @@ class EdgeOrchestratorVoiceSession:
         self._state = self._normalize_runtime_state(raw_initial_state)
         self._follow_up_allowed = bool(getattr(request, "follow_up_allowed", False))
         self._runtime_state_attested = bool(getattr(request, "state_attested", False))
+        self._voice_quiet_until_utc = self._normalize_voice_quiet_until_utc(
+            getattr(request, "voice_quiet_until_utc", None)
+        )
         self._intent_context = VoiceRuntimeIntentContext.from_runtime_event(request)
         if self._state == "follow_up_open" and self._follow_up_allowed:
             now = self._monotonic()
@@ -576,6 +691,9 @@ class EdgeOrchestratorVoiceSession:
         self._state = self._normalize_runtime_state(raw_state)
         self._follow_up_allowed = bool(event.follow_up_allowed)
         self._runtime_state_attested = True
+        self._voice_quiet_until_utc = self._normalize_voice_quiet_until_utc(
+            getattr(event, "voice_quiet_until_utc", None)
+        )
         self._intent_context = VoiceRuntimeIntentContext.from_runtime_event(event)
         if self._state == "follow_up_open" and self._follow_up_allowed:
             now = self._monotonic()
@@ -624,6 +742,8 @@ class EdgeOrchestratorVoiceSession:
         if self._normalize_runtime_state(event.state or "waiting") != self._state:
             return False
         if bool(event.follow_up_allowed) != self._follow_up_allowed:
+            return False
+        if self._normalize_voice_quiet_until_utc(getattr(event, "voice_quiet_until_utc", None)) != self._voice_quiet_until_utc:
             return False
         return VoiceRuntimeIntentContext.from_runtime_event(event) == self._intent_context
 
@@ -829,6 +949,45 @@ class EdgeOrchestratorVoiceSession:
         if self._intent_context.person_visible is True:
             self._last_waiting_visible_at = self._monotonic()
 
+    def _normalize_voice_quiet_until_utc(self, value: object | None) -> str | None:
+        """Return a canonical future UTC quiet deadline or ``None``."""
+
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized_text = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+        try:
+            deadline = datetime.fromisoformat(normalized_text)
+        except ValueError:
+            return None
+        if deadline.tzinfo is None:
+            return None
+        deadline = deadline.astimezone(timezone.utc)
+        if deadline <= datetime.now(timezone.utc):
+            return None
+        return deadline.isoformat().replace("+00:00", "Z")
+
+    def _voice_quiet_active(self) -> bool:
+        """Return whether the temporary voice-quiet window is still active."""
+
+        normalized_deadline = self._normalize_voice_quiet_until_utc(self._voice_quiet_until_utc)
+        self._voice_quiet_until_utc = normalized_deadline
+        return normalized_deadline is not None
+
+    def _close_follow_up_open(self, *, reason: str) -> list[dict[str, Any]]:
+        """Close the current remote follow-up window with an explicit reason."""
+
+        self._follow_up_deadline_at = None
+        self._follow_up_opened_at = None
+        self._pending_transcript_utterance = None
+        self._state = "waiting"
+        self._trace_event(
+            "voice_follow_up_closed",
+            kind="mutation",
+            details={"reason": reason},
+        )
+        return [OrchestratorVoiceFollowUpClosedEvent(reason=reason).to_payload()]
+
     def _waiting_visibility_grace_active(self) -> bool:
         """Return whether a recent visible waiting context is still fresh."""
 
@@ -844,6 +1003,8 @@ class EdgeOrchestratorVoiceSession:
 
         if self._state != "waiting":
             return True
+        if self._voice_quiet_active():
+            return False
         if not self._runtime_state_attested:
             return False
         if self._intent_context.waiting_activation_allowed():
@@ -1000,14 +1161,17 @@ class EdgeOrchestratorVoiceSession:
         )
 
     def _drain_timeouts(self) -> list[dict[str, Any]]:
-        if self._state != "follow_up_open" or self._follow_up_deadline_at is None:
+        if self._state != "follow_up_open":
+            return []
+        if self._voice_quiet_active():
+            return self._close_follow_up_open(reason="voice_quiet_active")
+        if not self._follow_up_allowed:
+            return self._close_follow_up_open(reason="follow_up_disabled")
+        if self._follow_up_deadline_at is None:
             return []
         if self._monotonic() < self._follow_up_deadline_at:
             return []
-        self._follow_up_deadline_at = None
-        self._follow_up_opened_at = None
-        self._state = "waiting"
-        return [OrchestratorVoiceFollowUpClosedEvent(reason="timeout").to_payload()]
+        return self._close_follow_up_open(reason="timeout")
 
     def _advance_remote_asr_utterance(
         self,
@@ -1080,14 +1244,30 @@ class EdgeOrchestratorVoiceSession:
                 },
             )
             return None
-        match = self._detect_wake_capture(
-            capture=capture,
-            stage="activation_utterance",
-            details={
-                "origin_state": pending.origin_state,
-                **self._pending_utterance_details(pending),
-            },
-        )
+        match_details = {
+            "origin_state": pending.origin_state,
+            **self._pending_utterance_details(pending),
+        }
+        if pending.origin_state == "waiting":
+            match = self._detect_wake_capture(
+                capture=capture,
+                stage="activation_utterance",
+                details=match_details,
+            )
+        else:
+            transcript = self._transcribe_capture(
+                capture=capture,
+                stage="activation_utterance",
+                details=match_details,
+            )
+            if transcript is None:
+                return None
+            match = self._match_transcribed_wake(
+                transcript=transcript,
+                capture=capture,
+                stage="activation_utterance",
+                details=match_details,
+            )
         if match is None:
             return None
         outcome = "matched" if match.detected else "no_match"

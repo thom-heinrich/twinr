@@ -10,7 +10,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..handlers import automations, household_identity, intelligence, memory, output, portrait_identity, reminders, self_coding, settings, smarthome, user_discovery, voice_profile
+from ..handlers import (
+    automations,
+    browser,
+    household_identity,
+    intelligence,
+    memory,
+    output,
+    portrait_identity,
+    reminders,
+    self_coding,
+    service_connect,
+    settings,
+    smarthome,
+    user_discovery,
+    voice_quiet,
+    voice_profile,
+    whatsapp,
+)
 from .observability import observe_realtime_tool_call
 
 
@@ -51,6 +68,12 @@ class RealtimeToolExecutor:
 
     def handle_search_live_info(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("search_live_info", output.handle_search_live_info, arguments)
+
+    def handle_browser_automation(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self._invoke("browser_automation", browser.handle_browser_automation, arguments)
+
+    def handle_connect_service_integration(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self._invoke("connect_service_integration", service_connect.handle_connect_service_integration, arguments)
 
     def handle_schedule_reminder(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("schedule_reminder", reminders.handle_schedule_reminder, arguments)
@@ -118,6 +141,9 @@ class RealtimeToolExecutor:
     def handle_lookup_contact(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("lookup_contact", memory.handle_lookup_contact, arguments)
 
+    def handle_send_whatsapp_message(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self._invoke("send_whatsapp_message", whatsapp.handle_send_whatsapp_message, arguments)
+
     def handle_get_memory_conflicts(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("get_memory_conflicts", memory.handle_get_memory_conflicts, arguments)
 
@@ -144,6 +170,9 @@ class RealtimeToolExecutor:
 
     def handle_update_simple_setting(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("update_simple_setting", settings.handle_update_simple_setting, arguments)
+
+    def handle_manage_voice_quiet_mode(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self._invoke("manage_voice_quiet_mode", voice_quiet.handle_manage_voice_quiet_mode, arguments)
 
     def handle_enroll_voice_profile(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("enroll_voice_profile", voice_profile.handle_enroll_voice_profile, arguments)

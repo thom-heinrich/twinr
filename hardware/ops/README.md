@@ -10,6 +10,7 @@ contract to the Pi.
 - the authoritative systemd unit that keeps the productive Twinr runtime running on the Pi
 - the dedicated systemd unit that keeps the remote-memory watchdog alive across runtime-supervisor restarts
 - OS-level launch wiring for background checks and runtime processes that must survive shell logout or crashes
+- the development-host bounded drone daemon that exposes Twinr's mission-level inspection contract behind manual-arm and preflight gates
 - the development-host orchestrator server unit that keeps the host-side `remote_asr` websocket endpoint and embedded `/v1/transcribe` surface alive
 - the development-host LAN bridge that exposes a stable `:8797` websocket port to the Pi while forwarding byte-for-byte into that host-side orchestrator endpoint
 - the Pi-side bootstrap entrypoint for self-coding Codex prerequisites
@@ -30,6 +31,8 @@ contract to the Pi.
 | [twinr-remote-memory-watchdog.service](./twinr-remote-memory-watchdog.service) | Dedicated unit: keep the fail-closed remote-memory watchdog warm and continuously refreshing its artifact |
 | [twinr-runtime-supervisor.service](./twinr-runtime-supervisor.service) | Productive unit: authoritatively supervise the streaming loop while consuming the external remote-memory-watchdog artifact |
 | [twinr-web.service](./twinr-web.service) | Productive unit: keep the Twinr web control portal running with managed sign-in |
+| [drone_daemon.py](./drone_daemon.py) | Development-host bounded drone mission daemon: preflight, manual-arm gate, stationary-observe evidence capture, and future primitive boundary |
+| [twinr-drone-daemon.service](./twinr-drone-daemon.service) | Development-host unit: keep the bounded drone daemon alive on a stable local HTTP endpoint for Twinr mission planning |
 | [twinr-orchestrator-server.service](./twinr-orchestrator-server.service) | Development-host unit: keep the host-side orchestrator websocket endpoint plus embedded `/v1/transcribe` remote-ASR surface alive on `127.0.0.1:8798` |
 | [twinr-voice-gateway-bridge.service](./twinr-voice-gateway-bridge.service) | Development-host unit: expose `0.0.0.0:8797` to the Pi and forward it byte-for-byte into the host-side `127.0.0.1:8798` orchestrator endpoint |
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
@@ -71,6 +74,14 @@ bounded IMX500 observation payloads and debug facts from the helper Pi, but it
 must not grow main-runtime orchestration, HDMI policy, or gesture/UI decisions
 into the helper service.
 
+The drone daemon is intentionally mission-bounded as well. Twinr may only queue
+high-level inspect missions, read state, cancel work, or request local manual
+arm approval. Direct roll/pitch/yaw/thrust commands do not belong in this
+surface. The current `stationary_observe_only` mode is the accepted first
+runtime slice: it proves the API, preflight gates, and artifact path while
+keeping motion disabled until the future primitive executor and external
+pose-provider stack are ready.
+
 Retired standalone break-glass units are no longer tracked here. The dedicated
 remote-memory watchdog service is not break-glass; it is the productive owner
 for the watchdog so warm remote state survives runtime-supervisor restarts. If
@@ -111,6 +122,33 @@ sudo systemctl enable --now twinr-voice-gateway-bridge.service
 sudo systemctl status twinr-orchestrator-server.service
 sudo systemctl status twinr-voice-gateway-bridge.service
 ```
+
+Install the development-host bounded drone daemon only on the machine that owns
+the Crazyradio/Bitcraze workspace and future pose-provider sidecars:
+
+```bash
+sudo cp hardware/ops/twinr-drone-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now twinr-drone-daemon.service
+sudo systemctl status twinr-drone-daemon.service
+curl --fail http://127.0.0.1:8791/healthz
+python3 -m twinr --env-file .env --drone-status
+```
+
+For bench-safe bring-up before a real pose-provider is available, run the daemon
+in the foreground with the healthy stub pose source:
+
+```bash
+python3 hardware/ops/drone_daemon.py --repo-root /home/thh/twinr --env-file /home/thh/twinr/.env --pose-provider stub_ok --bind 127.0.0.1 --port 8791
+python3 -m twinr --env-file .env --drone-inspect "self test"
+python3 -m twinr --env-file .env --drone-manual-arm DRN-...
+```
+
+The bounded operator proof is:
+- `POST /missions` returns `pending_manual_arm`
+- `POST /ops/missions/<id>/arm` is local-host only by default
+- mission execution captures stationary evidence instead of moving the aircraft
+- `GET /state` keeps `manual_arm_required=true` and exposes preflight reasons when radio or pose is unhealthy
 
 Install the peer camera snapshot proxy only on the dedicated camera proxy Pi:
 
@@ -192,6 +230,7 @@ By default the deploy command:
 - mirrors `/home/thh/twinr` into `/twinr`
 - treats the local `.env` as authoritative and overwrites `/twinr/.env` with a backup
 - refreshes `/twinr/.venv` via `pip install --no-deps -e /twinr`
+- installs mirrored browser-automation runtime requirements from `browser_automation/runtime_requirements.txt` and Playwright browsers listed in `browser_automation/playwright_browsers.txt` when those manifests exist locally
 - installs the mirrored productive systemd unit files into `/etc/systemd/system/`
 - restarts `twinr-remote-memory-watchdog.service`, `twinr-runtime-supervisor.service`, and `twinr-web.service`
 - also picks up any additional repo-backed Pi runtime unit that is already enabled on the Pi, such as `twinr-whatsapp-channel.service`

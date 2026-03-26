@@ -223,6 +223,7 @@ class TwinrRealtimeHardwareLoop(
         self._voice_orchestrator_runtime_state_lock = RLock()
         self._last_voice_orchestrator_runtime_state: tuple[str, str | None, bool] | None = None
         self._last_voice_orchestrator_intent_context: VoiceRuntimeIntentContext | None = None
+        self._last_voice_orchestrator_quiet_until_utc: str | None = None
         self._last_print_request_at: float | None = None
         self._next_reminder_check_at: float = 0.0
         self._next_automation_check_at: float = 0.0
@@ -571,10 +572,29 @@ class TwinrRealtimeHardwareLoop(
         except Exception as exc:
             self._handle_error(exc)
 
+    def _voice_quiet_active(self) -> bool:
+        """Return whether transcript-first wake should currently stay quiet."""
+
+        voice_quiet_active = getattr(self.runtime, "voice_quiet_active", None)
+        if not callable(voice_quiet_active):
+            return False
+        return bool(voice_quiet_active())
+
     def handle_voice_activation(self, match: VoiceActivationMatch) -> bool:
         try:  # AUDIT-FIX(#4): Prevent background activation handlers from dying on transient runtime or provider failures.
             if not self._required_remote_dependency_current_ready():
                 self._request_required_remote_dependency_refresh()
+                return False
+            if self._voice_quiet_active():
+                self.emit("voice_activation_skipped=voice_quiet")
+                if getattr(self.runtime.status, "value", None) == "waiting":
+                    self._notify_voice_orchestrator_state("waiting", detail="voice_quiet_active")
+                self._record_event(
+                    "voice_activation_skipped",
+                    "Remote voice activation was ignored because Twinr was explicitly staying quiet.",
+                    skip_reason="voice_quiet",
+                    matched_phrase=match.matched_phrase,
+                )
                 return False
             if not self._background_work_allowed():
                 skip_reason = "busy" if self.runtime.status.value != "waiting" else "conversation_active"
@@ -1998,6 +2018,10 @@ class TwinrRealtimeHardwareLoop(
                 )
                 self.emit("playback_join_timeout=true")
         realtime_ms = int((time.monotonic() - realtime_started) * 1000)
+        self.emit("realtime_turn_provider_complete=true")
+        self.emit(f"realtime_turn_answer_started={str(answer_started).lower()}")
+        self.emit(f"realtime_turn_provider_audio_received={str(first_audio_at[0] is not None).lower()}")
+        self.emit(f"realtime_turn_provider_playback_started={str(playback_started).lower()}")
         try:
             if turn_error is not None:
                 raise turn_error
@@ -2011,11 +2035,13 @@ class TwinrRealtimeHardwareLoop(
                 if not answer_started:
                     begin_answering()
                 self.emit("realtime_audio_fallback=true")
+                self.emit("realtime_turn_tts_fallback_start=true")
                 fallback_tts_ms, fallback_first_audio_ms = self._play_streaming_tts_with_feedback(
                     response_text,
                     turn_started=turn_started,
                     should_stop=interrupt_event.is_set,
                 )
+                self.emit("realtime_turn_tts_fallback_done=true")
                 self.emit(f"timing_tts_fallback_ms={fallback_tts_ms}")
                 if fallback_first_audio_ms is not None:
                     first_audio_ms_override = fallback_first_audio_ms
@@ -2028,6 +2054,10 @@ class TwinrRealtimeHardwareLoop(
         self.emit(f"transcript={final_transcript}")
         if not answer_started:
             begin_answering()
+        force_close = True
+        follow_up_mode = "disabled"
+        rearm_remote_follow_up = False
+        self.emit("realtime_turn_finalize_start=true")
         try:
             answer = self.runtime.finalize_agent_turn(response_text)
             self.emit(f"response={answer}")
@@ -2045,15 +2075,27 @@ class TwinrRealtimeHardwareLoop(
                 request_source=listen_source,
                 proactive_trigger=proactive_trigger,
             )
+            force_close = turn.end_conversation or self._follow_up_vetoed_by_closure(
+                user_transcript=final_transcript,
+                assistant_response=answer,
+                request_source=initial_source,
+                proactive_trigger=proactive_trigger,
+            )
+            follow_up_mode = self._voice_orchestrator_follow_up_mode(initial_source=initial_source)
+            rearm_remote_follow_up = (
+                not force_close and follow_up_mode == "remote" and not interrupt_event.is_set()
+            )
         finally:
-            self.runtime.finish_speaking()  # AUDIT-FIX(#6): Always leave the runtime in a non-speaking state even if post-processing or usage accounting fails.
+            if rearm_remote_follow_up:
+                self.emit("realtime_turn_finish_path=rearm_follow_up")
+                self.runtime.rearm_follow_up(request_source="follow_up")
+            else:
+                # AUDIT-FIX(#6): Always leave the runtime in a non-speaking state
+                # even if post-processing or usage accounting fails.
+                self.emit("realtime_turn_finish_path=finish_speaking")
+                self.runtime.finish_speaking()
             self._emit_status(force=True)
-        force_close = turn.end_conversation or self._follow_up_vetoed_by_closure(
-            user_transcript=final_transcript,
-            assistant_response=answer,
-            request_source=initial_source,
-            proactive_trigger=proactive_trigger,
-        )
+        self.emit("realtime_turn_finalize_done=true")
         if turn.end_conversation:
             self.emit("conversation_ended=true")
         elif force_close:
@@ -2081,7 +2123,6 @@ class TwinrRealtimeHardwareLoop(
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
         if interrupt_event.is_set() and not force_close:
             return self._run_interrupt_follow_up_turn()
-        follow_up_mode = self._voice_orchestrator_follow_up_mode(initial_source=initial_source)
         if not force_close and follow_up_mode == "remote":
             self._notify_voice_orchestrator_state(
                 "follow_up_open",

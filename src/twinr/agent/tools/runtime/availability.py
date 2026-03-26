@@ -10,7 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from twinr.browser_automation import probe_browser_automation
 from twinr.integrations import SmartHomeIntegrationAdapter, build_smart_home_hub_adapter
+from twinr.channels.whatsapp.config import WhatsAppChannelConfig
 
 from .registry import bind_realtime_tool_handlers, realtime_tool_names
 
@@ -29,6 +31,8 @@ _SMART_HOME_TOOL_NAMES: frozenset[str] = frozenset(
         "read_smart_home_sensor_stream",
     }
 )
+_BROWSER_AUTOMATION_TOOL_NAMES: frozenset[str] = frozenset({"browser_automation"})
+_WHATSAPP_TOOL_NAMES: frozenset[str] = frozenset({"send_whatsapp_message"})
 
 
 def available_realtime_tool_names(
@@ -46,11 +50,14 @@ def available_realtime_tool_names(
     requested_tool_names = _normalize_requested_tool_names(tool_names)
     if not requested_tool_names:
         return ()
-    if not any(name in _SMART_HOME_TOOL_NAMES for name in requested_tool_names):
-        return requested_tool_names
-    if _smart_home_tools_ready(config):
-        return requested_tool_names
-    return tuple(name for name in requested_tool_names if name not in _SMART_HOME_TOOL_NAMES)
+    available_names = requested_tool_names
+    if any(name in _SMART_HOME_TOOL_NAMES for name in available_names) and not _smart_home_tools_ready(config):
+        available_names = tuple(name for name in available_names if name not in _SMART_HOME_TOOL_NAMES)
+    if any(name in _BROWSER_AUTOMATION_TOOL_NAMES for name in available_names) and not _browser_automation_tools_ready(config):
+        available_names = tuple(name for name in available_names if name not in _BROWSER_AUTOMATION_TOOL_NAMES)
+    if any(name in _WHATSAPP_TOOL_NAMES for name in available_names) and not _whatsapp_tools_ready(config):
+        available_names = tuple(name for name in available_names if name not in _WHATSAPP_TOOL_NAMES)
+    return available_names
 
 
 def bind_available_realtime_tool_handlers(
@@ -89,6 +96,22 @@ def _smart_home_tools_ready(config: TwinrConfig) -> bool:
     except Exception:
         return False
     return isinstance(adapter, SmartHomeIntegrationAdapter)
+
+
+def _browser_automation_tools_ready(config: TwinrConfig) -> bool:
+    project_root = Path(str(getattr(config, "project_root", ".") or ".")).resolve()
+    try:
+        return probe_browser_automation(config=config, project_root=project_root).available
+    except Exception:
+        return False
+
+
+def _whatsapp_tools_ready(config: TwinrConfig) -> bool:
+    try:
+        whatsapp_config = WhatsAppChannelConfig.from_twinr_config(config)
+    except Exception:
+        return False
+    return (whatsapp_config.auth_dir / "creds.json").is_file()
 
 
 __all__ = [

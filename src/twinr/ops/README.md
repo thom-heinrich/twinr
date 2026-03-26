@@ -16,14 +16,15 @@ tools.
 - validate the Pi-side OpenAI env contract for acceptance scripts so `/twinr/.env` can be trusted directly for provider probes without one-off shell injection
 - run a dedicated rolling ChonkyDB remote-memory watchdog
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
-- run strict bootstrap/recovery remote probes once, then reuse a cheaper steady-state keepalive that proves current remote readability without reseeding every snapshot on every tick
+- run strict bootstrap/recovery remote probes once, then reuse a no-bootstrap steady-state keepalive that still proves archive-safe remote readability without reseeding every snapshot on every tick
 - keep fresh watchdog heartbeats authoritative during bounded steady-state idle gaps so the supervisor does not false-fail a healthy remote watchdog between deep probes
 - persist only compact recent-sample summaries in watchdog artifacts so Pi heartbeats stay cheap instead of fsyncing multi-megabyte historical probe payloads every tick
-- keep the heavy `archive` snapshot out of the steady-state watchdog hot path while retaining archive-inclusive bootstrap and recovery proofs
-- persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
+- keep watchdog attestation tiers explicit so current-only probes stay degraded and only archive-safe probes become green/ready
+- persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, including exact endpoint and request-payload type, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - allow the productive runtime supervisor to consume that external watchdog as the long-lived owner, so restarting the supervisor does not cold-reset the watchdog's warm remote state
 - let the productive runtime supervisor self-heal a dead externally managed watchdog owner by re-spawning the detached companion when the watchdog PID/artifact proves the owner is gone
+- reseed the persisted watchdog bootstrap snapshot when the detached companion adopts or spawns a new external owner PID, so handoff windows do not keep advertising a dead previous process
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
 - supervise the productive Pi streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
 - adopt an already-running streaming-loop owner after supervisor restarts instead of thrashing new children into singleton-lock failures
@@ -36,7 +37,7 @@ tools.
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
 - mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
-- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, replace the old manual mirror-as-deploy workflow, restart the productive Pi service set, and verify post-restart health
+- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, restart the productive Pi service set, and verify post-restart health
 - bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
 - expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
 
@@ -60,7 +61,7 @@ tools.
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
-| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start the external watchdog process for live Pi loops when needed |
+| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog process for live Pi loops and reseed bootstrap attestation when the owner PID changes |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment |
 | [runtime_scope.py](./runtime_scope.py) | Build scoped runtime configs so auxiliary loops do not overwrite the primary display/runtime snapshot |
 | [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, and leave display degradation to ops health instead of recycling the speech path |
@@ -71,7 +72,7 @@ tools.
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
 | [devices.py](./devices.py) | Device overview probes |
-| [self_test.py](./self_test.py) | Bounded hardware self-tests |
+| [self_test.py](./self_test.py) | Bounded hardware self-tests, including AI-Deck WiFi handover, frame capture, and image-sanity checks |
 | [support.py](./support.py) | Support bundle export |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
@@ -150,21 +151,27 @@ block later sync cycles.
 Nested `node_modules/` trees are intentionally excluded from the mirror for the
 same reason: SDK and channel dependency installs are local build artefacts, not
 authoritative source content for `/twinr`.
+Captured `browser_automation/artifacts/` output is intentionally excluded from
+the mirror as well, so gitignored screenshots/HTML traces on either host do not
+block official Pi deploy convergence while the small mirrored browser-runtime
+manifests remain available for install.
 When a deleted remote tree survives only because it still contains ignored
 Python caches, the mirror prunes those cache-only stale directories and reruns
 the sync once so the acceptance checkout can still converge cleanly.
 The deploy helper builds on that mirror contract and adds the explicit pieces
 the mirror intentionally does not own: authoritative `.env` sync, a no-deps
-editable refresh by default, productive unit installation/restart, and bounded
-post-restart verification. By default it always manages the base runtime units
-and also picks up any repo-backed Pi unit that is already enabled on the
-acceptance host, which keeps optional services such as WhatsApp inside the same
-restart proof once they are live there. Opt into a dependency-refreshing
-install only when you deliberately want the Pi to re-resolve runtime packages.
-For first rollout of an optional Pi unit that is present in the repo but not
-enabled on the host yet, add `--rollout-service <unit>` so the deploy includes,
-enables, restarts, and verifies that unit without replacing the default base
-service set.
+editable refresh by default, optional mirrored browser-automation runtime
+installs via `browser_automation/runtime_requirements.txt` plus
+`browser_automation/playwright_browsers.txt`, productive unit
+installation/restart, and bounded post-restart verification. By default it
+always manages the base runtime units and also picks up any repo-backed Pi unit
+that is already enabled on the acceptance host, which keeps optional services
+such as WhatsApp inside the same restart proof once they are live there. Opt
+into a dependency-refreshing install only when you deliberately want the Pi to
+re-resolve runtime packages. For first rollout of an optional Pi unit that is
+present in the repo but not enabled on the host yet, add
+`--rollout-service <unit>` so the deploy includes, enables, restarts, and
+verifies that unit without replacing the default base service set.
 
 ## See also
 

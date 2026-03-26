@@ -343,7 +343,11 @@ class OpenAIRealtimeSession:
         """Push the current Twinr session configuration to the provider."""
         session: dict[str, Any] = {
             "type": "realtime",
-            "output_modalities": ["audio", "text"],  # AUDIT-FIX(#8): request text explicitly because this class requires response_text on every successful turn.
+            # Realtime now accepts exactly one output-modality family per
+            # session update. Twinr still gets assistant text through the
+            # output-audio transcript stream, so spoken turns can stay
+            # audio-first without requesting a second text modality.
+            "output_modalities": ["audio"],
             "instructions": self._session_instructions(),
             "audio": {
                 "input": {

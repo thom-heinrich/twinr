@@ -900,6 +900,7 @@ class TwinrRealtimeSupportMixin:
             stop_answering_feedback()
             if first_chunk is None:
                 raise RuntimeError("TTS stream ended without audio")
+            self._try_emit("realtime_tts_first_chunk_received=true")
 
             def playback_chunks():
                 if first_audio_at[0] is None:
@@ -918,12 +919,14 @@ class TwinrRealtimeSupportMixin:
                         raise item
                     yield item
 
+            self._try_emit("realtime_tts_playback_started=true")
             self._get_playback_coordinator().play_wav_chunks(
                 owner="realtime_tts",
                 priority=PlaybackPriority.SPEECH,
                 chunks=playback_chunks(),
                 should_stop=should_stop,
             )
+            self._try_emit("realtime_tts_playback_completed=true")
         finally:
             producer_stop.set()  # AUDIT-FIX(#6): Let the worker thread exit if the consumer aborts early.
             stop_answering_feedback()

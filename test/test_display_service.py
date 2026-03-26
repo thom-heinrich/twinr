@@ -8,7 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import (
     DisplayAmbientImpulseCue,
     DisplayAmbientImpulseCueStore,
@@ -24,6 +24,7 @@ from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.heartbeat import DisplayHeartbeatStore
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
 from twinr.display.service import TwinrStatusDisplayLoop
+from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 
@@ -42,6 +43,7 @@ class FakeDisplay:
                 DisplayFaceCue | None,
                 DisplayEmojiCue | None,
                 DisplayAmbientImpulseCue | None,
+                DisplayServiceConnectCue | None,
                 DisplayPresentationCue | None,
                 tuple[DisplayDebugSignal, ...],
             ]
@@ -60,6 +62,7 @@ class FakeDisplay:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> None:
@@ -75,6 +78,7 @@ class FakeDisplay:
                 face_cue,
                 emoji_cue,
                 ambient_impulse_cue,
+                service_connect_cue,
                 presentation_cue,
                 debug_signals,
             )
@@ -120,6 +124,7 @@ class ReopenableDisplay:
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
+        service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> None:
@@ -134,6 +139,7 @@ class ReopenableDisplay:
             face_cue,
             emoji_cue,
             ambient_impulse_cue,
+            service_connect_cue,
             presentation_cue,
             debug_signals,
         )
@@ -242,7 +248,7 @@ class DisplayServiceTests(unittest.TestCase):
             self.assertEqual(
                 [
                     (status, headline, details)
-                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _emoji, _ambient, _presentation, _signals in display.calls
+                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _emoji, _ambient, _service_connect, _presentation, _signals in display.calls
                 ],
                 [
                     ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
@@ -388,6 +394,7 @@ class DisplayServiceTests(unittest.TestCase):
             face_cue=None,
             emoji_cue=None,
             ambient_impulse_cue=None,
+            service_connect_cue=None,
             presentation_cue=None,
             debug_signals=(),
         )
@@ -576,6 +583,7 @@ class DisplayServiceTests(unittest.TestCase):
             face_cue=None,
             emoji_cue=None,
             ambient_impulse_cue=None,
+            service_connect_cue=None,
             presentation_cue=None,
         )
         second_signature = loop._render_signature(
@@ -603,6 +611,7 @@ class DisplayServiceTests(unittest.TestCase):
                 headline="AI companions",
                 body="Da tut sich etwas.",
             ),
+            service_connect_cue=None,
             presentation_cue=None,
         )
 
@@ -947,6 +956,61 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertEqual(cue.action, "invite_follow_up")
         self.assertEqual(cue.attention_state, "shared_thread")
 
+    def test_display_loop_forwards_active_service_connect_cue_to_default_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            service_connect_store = DisplayServiceConnectCueStore.from_config(config)
+            service_connect_store.save(
+                DisplayServiceConnectCue(
+                    service_id="whatsapp",
+                    service_label="WhatsApp",
+                    phase="qr",
+                    summary="Scan the QR",
+                    detail="Open Linked Devices in WhatsApp.",
+                    qr_image_data_url="data:image/png;base64,AAAA",
+                    accent="warm",
+                ),
+                hold_seconds=15.0,
+            )
+            display = FakeDisplay()
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                service_connect_cue_store=service_connect_store,
+            )
+
+            loop.run(max_cycles=1)
+
+        self.assertEqual(len(display.calls), 1)
+        cue = display.calls[0][10]
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.service_id, "whatsapp")
+        self.assertEqual(cue.phase, "qr")
+        self.assertEqual(cue.qr_image_data_url, "data:image/png;base64,AAAA")
+        self.assertEqual(cue.accent, "warm")
+
     def test_display_loop_forwards_news_ticker_text_to_default_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "state" / "runtime-state.json"
@@ -1028,7 +1092,7 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
         self.assertEqual(len(display.calls), 1)
-        cue = display.calls[0][10]
+        cue = display.calls[0][11]
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.kind, "rich_card")
@@ -1093,7 +1157,7 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
         self.assertEqual(len(display.calls), 1)
-        signals = display.calls[0][11]
+        signals = display.calls[0][12]
         self.assertEqual(
             tuple(signal.label for signal in signals),
             ("MOTION_STILL", "PERSON_1"),

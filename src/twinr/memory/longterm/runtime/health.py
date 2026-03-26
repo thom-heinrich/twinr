@@ -63,6 +63,10 @@ class LongTermRemoteWarmResult:
     failed_store: str | None = None
     failed_snapshot_kind: str | None = None
     checks: tuple[LongTermRemoteWarmCheck, ...] = ()
+    probe_mode: str = "archive_inclusive"
+    archive_checked: bool = True
+    archive_safe: bool = True
+    health_tier: str = "ready"
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe summary for ops artifacts."""
@@ -74,6 +78,10 @@ class LongTermRemoteWarmResult:
             "failed_snapshot_kind": self.failed_snapshot_kind,
             "checked_snapshots": list(self.checked_snapshots),
             "checks": [check.to_dict() for check in self.checks],
+            "probe_mode": self.probe_mode,
+            "archive_checked": self.archive_checked,
+            "archive_safe": self.archive_safe,
+            "health_tier": self.health_tier,
         }
 
 
@@ -95,9 +103,9 @@ class LongTermRemoteHealthProbe:
 
         Args:
             include_archive: When false, skip the archival object snapshot
-                during steady-state watchdog probes so the hot keepalive path
-                proves live current-state readability without revalidating the
-                heavier archive lane every cycle.
+                during explicitly lighter current-state probes. External
+                required-remote watchdogs must still treat archive-inclusive
+                attestation as the only green/ready proof.
         """
 
         checked: list[str] = []
@@ -110,6 +118,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -119,6 +128,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -128,6 +138,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -139,6 +150,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind="objects",
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -148,6 +160,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind="conflicts",
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -158,6 +171,7 @@ class LongTermRemoteHealthProbe:
                     snapshot_kind="archive",
                     checked=checked,
                     checks=checks,
+                    include_archive=include_archive,
                 )
                 if not result.ready:
                     return result
@@ -169,6 +183,7 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind="graph",
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
@@ -180,21 +195,24 @@ class LongTermRemoteHealthProbe:
                 snapshot_kind="midterm",
                 checked=checked,
                 checks=checks,
+                include_archive=include_archive,
             )
             if not result.ready:
                 return result
         except LongTermRemoteUnavailableError as exc:
-            return LongTermRemoteWarmResult(
+            return self._build_result(
                 checked_snapshots=tuple(checked),
                 ready=False,
                 detail=str(exc),
                 checks=tuple(checks),
+                include_archive=include_archive,
             )
 
-        return LongTermRemoteWarmResult(
+        return self._build_result(
             checked_snapshots=tuple(checked),
             ready=True,
             checks=tuple(checks),
+            include_archive=include_archive,
         )
 
     def ensure_operational(self, *, include_archive: bool = True) -> LongTermRemoteWarmResult:
@@ -223,17 +241,19 @@ class LongTermRemoteHealthProbe:
         snapshot_kind: str | None,
         checked: list[str],
         checks: list[LongTermRemoteWarmCheck],
+        include_archive: bool,
     ) -> LongTermRemoteWarmResult:
         """Probe one named snapshot and preserve pointer/origin evidence."""
 
         normalized_kind = str(snapshot_kind or "").strip()
         if not normalized_kind:
-            return LongTermRemoteWarmResult(
+            return self._build_result(
                 checked_snapshots=tuple(checked),
                 ready=False,
                 detail="Required remote long-term snapshot kind is missing.",
                 failed_store=store,
                 checks=tuple(checks),
+                include_archive=include_archive,
             )
         probe_loader = getattr(remote_state, "probe_snapshot_load", None)
         if callable(probe_loader):
@@ -257,19 +277,21 @@ class LongTermRemoteHealthProbe:
         check = self._warm_check_from_probe(store=store, probe=probe)
         checks.append(check)
         if not isinstance(probe.payload, dict):
-            return LongTermRemoteWarmResult(
+            return self._build_result(
                 checked_snapshots=tuple(checked),
                 ready=False,
                 detail=probe.detail or f"Required remote long-term snapshot {normalized_kind!r} is unavailable.",
                 failed_store=store,
                 failed_snapshot_kind=normalized_kind,
                 checks=tuple(checks),
+                include_archive=include_archive,
             )
         checked.append(normalized_kind)
-        return LongTermRemoteWarmResult(
+        return self._build_result(
             checked_snapshots=tuple(checked),
             ready=True,
             checks=tuple(checks),
+            include_archive=include_archive,
         )
 
     @staticmethod
@@ -289,6 +311,39 @@ class LongTermRemoteHealthProbe:
             pointer_document_id=probe.pointer_document_id,
             attempts=probe.attempts,
             payload=probe.payload,
+        )
+
+    @staticmethod
+    def _build_result(
+        *,
+        checked_snapshots: tuple[str, ...],
+        ready: bool,
+        checks: tuple[LongTermRemoteWarmCheck, ...],
+        include_archive: bool,
+        detail: str | None = None,
+        failed_store: str | None = None,
+        failed_snapshot_kind: str | None = None,
+    ) -> LongTermRemoteWarmResult:
+        """Build one normalized warm-result payload with explicit attestation tier."""
+
+        probe_mode = "archive_inclusive" if include_archive else "current_only"
+        if not ready:
+            health_tier = "hard_down"
+        elif include_archive:
+            health_tier = "ready"
+        else:
+            health_tier = "degraded"
+        return LongTermRemoteWarmResult(
+            checked_snapshots=checked_snapshots,
+            ready=ready,
+            detail=detail,
+            failed_store=failed_store,
+            failed_snapshot_kind=failed_snapshot_kind,
+            checks=checks,
+            probe_mode=probe_mode,
+            archive_checked=include_archive,
+            archive_safe=bool(ready and include_archive),
+            health_tier=health_tier,
         )
 
     def _require_remote_state(self, remote_state: LongTermRemoteStateStore | None) -> LongTermRemoteStateStore:

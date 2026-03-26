@@ -7,6 +7,7 @@ hosts do not silently change retention behavior.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -75,9 +76,17 @@ def _coerce_int(value: object, *, default: int, minimum: int, field_name: str) -
             default,
         )
         return default
-    try:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
         parsed = int(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            logger.warning("Invalid %s=%r; falling back to %r", field_name, value, default)
+            return default
+    else:
         logger.warning("Invalid %s=%r; falling back to %r", field_name, value, default)
         return default
     if parsed < minimum:
@@ -104,6 +113,18 @@ def _coerce_timezone_name(value: object, *, default: str) -> str:
         logger.warning("Unknown timezone_name=%r; falling back to %r", candidate, default)
         return default
     return candidate
+
+
+def _retention_policy_override(attributes: object) -> str | None:
+    """Return one normalized retention override from memory attributes."""
+
+    if not isinstance(attributes, Mapping):
+        return None
+    raw_value = attributes.get("retention_policy")
+    if not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.strip().lower()
+    return normalized or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +321,8 @@ class LongTermRetentionPolicy:
 
     def _classify(self, *, item: LongTermMemoryObjectV1, now: datetime) -> str:
         zone = self._policy_zone()
+        if _retention_policy_override(item.attributes) == "preserve":
+            return "keep"
         if item.kind == "episode":
             age = self._age(item.updated_at, now=now, zone=zone)
             if age > timedelta(days=self.ephemeral_episode_days):

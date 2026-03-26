@@ -8,14 +8,20 @@ owned_concerns:
   - Adapt workflow owners into the handler method surface used for realtime tool execution
   - Validate the canonical realtime tool-name to handler binding map before live turns start
   - Filter the exposed realtime tool surface against local integration readiness before tool schemas reach live providers
+  - Filter the optional browser-automation tool out of the live surface unless the local browser workspace is explicitly enabled and probeable
+  - Route the bounded external service-connect tool through the same thin executor and binding path as the other realtime tools
+  - Route the bounded WhatsApp-send tool through the same thin executor and binding path as the other realtime tools, and hide it until the local WhatsApp session is actually paired
   - Route smart-home entity discovery, state-read, control, and stream tools through the same thin executor path as the rest of the realtime tool surface
+  - Route the optional browser-automation tool through the same thin executor path as the other realtime tools
   - Route the shared household-identity tool through the same executor and binding path as legacy portrait and voice tools
   - Route the RSS/world-intelligence configuration tool through the same thin executor and binding path as the other persistent tool handlers
+  - Route the temporary voice-quiet tool through the same thin executor and binding path as the rest of the live-turn tool surface
   - Persist one normalized success/failure observability event per realtime tool call so operator artifacts can show tool name, status, latency, and fallback/model metadata
   - Surface shared sensitive-confirmation guards as structured `confirmation_required` tool results instead of letting them degrade into generic live-turn tool failures
   - Define the synthetic specialist-handoff tool schema and normalize/merge handoff payloads outside the main dual-lane orchestrator
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
+  - Let search handoffs enter the specialist loop when browser automation is available so prompt/tool guidance can choose between generic search and page interaction
   - Keep speech-lane callback semantics and redacted branch forensics isolated from the main dual-lane orchestration file
   - Generate LLM-only recovery replies when streaming lanes fail after the user has already started a turn
   - Define the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
@@ -105,6 +111,7 @@ primary_callers:
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
 tests:
+  - path: test/test_browser_dual_lane_loop.py
   - path: test/test_dual_lane_loop.py
   - path: test/test_openai_realtime.py
   - path: test/test_realtime_runner.py

@@ -23,6 +23,7 @@ from twinr.agent.base_agent.contracts import (
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+from twinr.agent.workflows.streaming_semantic_router import _synthesize_supervisor_decision
 from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan, _SpeechLifecycle
 from twinr.agent.workflows.streaming_turn_orchestrator import FinalLaneTimeoutError
 from twinr.agent.base_agent import TwinrConfig
@@ -43,6 +44,10 @@ from twinr.providers.openai import (
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 from twinr.agent.base_agent import TwinrRuntime
 from twinr.agent.base_agent import TwinrEvent, TwinrStatus
+
+_TEST_CONTACT_PHONE = "555-0100"
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
 
 
 class FakeToolAgentProvider:
@@ -736,6 +741,7 @@ class CapturingDualLaneLoop(DualLaneToolLoop):
     def __init__(self) -> None:
         self.run_calls: list[dict[str, object]] = []
         self.run_handoff_calls: list[dict[str, object]] = []
+        self.run_runtime_local_tool_only_calls: list[dict[str, object]] = []
         self.recovery_calls: list[dict[str, object]] = []
         self.recovery_text = "Ich fasse das gerade passend fuer dich zusammen."
         self.supervisor_instructions = ""
@@ -799,6 +805,19 @@ class CapturingDualLaneLoop(DualLaneToolLoop):
             rounds=2,
             tool_calls=(),
             used_web_search=True,
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+
+    def run_runtime_local_tool_only(self, prompt: str, **kwargs):
+        self.run_runtime_local_tool_only_calls.append({"prompt": prompt, **kwargs})
+        return SimpleNamespace(
+            text="Okay. Ich bin jetzt für 2 Minuten ruhig.",
+            response_id="resp_runtime_local_tool",
+            request_id="req_runtime_local_tool",
+            rounds=1,
+            tool_calls=(),
+            used_web_search=False,
             model="gpt-4o-mini",
             token_usage=None,
         )
@@ -2783,6 +2802,242 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(len(closure.calls), 1)
         self.assertEqual(closure.calls[0]["user_transcript"], "Bis später.")
 
+    def test_direct_remote_follow_up_rearms_runtime_and_notifies_gateway(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.voice_orchestrator = FakeVoiceOrchestrator()
+            loop._latest_sensor_observation_facts = {
+                "camera": {"person_visible": True},
+                "person_state": {
+                    "interaction_ready": True,
+                    "targeted_inference_blocked": False,
+                    "recommended_channel": "speech",
+                    "attention_state": {"state": "attending_to_device"},
+                    "interaction_intent_state": {"state": "showing_intent"},
+                },
+            }
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie geht es dir?",
+                listen_source="voice_activation",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(runtime.status.value, "listening")
+        self.assertIn(
+            (TwinrStatus.ANSWERING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+            runtime.state_machine.history,
+        )
+        assert loop.voice_orchestrator is not None
+        self.assertEqual(
+            loop.voice_orchestrator.states,
+            [
+                ("thinking", "voice_activation", False),
+                ("follow_up_open", "voice_activation", True),
+            ],
+        )
+
+    def test_voice_activation_quiet_turn_finishes_speaking_instead_of_rearming_follow_up(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            lines: list[str] = []
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+            loop.voice_orchestrator = FakeVoiceOrchestrator()
+            loop._latest_sensor_observation_facts = {
+                "camera": {"person_visible": True},
+                "person_state": {
+                    "interaction_ready": True,
+                    "targeted_inference_blocked": False,
+                    "recommended_channel": "speech",
+                    "attention_state": {"state": "attending_to_device"},
+                    "interaction_intent_state": {"state": "showing_intent"},
+                },
+            }
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Gern. Ich bin jetzt 20 Minuten ruhig.",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            original_finalize = runtime.finalize_agent_turn
+
+            def finalize_and_enable_quiet(response_text: str) -> str:
+                answer = original_finalize(response_text)
+                runtime.set_voice_quiet_minutes(minutes=20, reason="tv news")
+                return answer
+
+            runtime.finalize_agent_turn = finalize_and_enable_quiet  # type: ignore[method-assign]
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Sei bitte 20 Minuten ruhig.",
+                listen_source="voice_activation",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertTrue(runtime.voice_quiet_active())
+        self.assertEqual(runtime.status.value, "waiting")
+        self.assertNotIn(
+            (TwinrStatus.ANSWERING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+            runtime.state_machine.history,
+        )
+        self.assertIn("streaming_follow_up_rearm_snapshot=true", lines)
+        self.assertIn("streaming_follow_up_rearm_allowed_now=false", lines)
+        self.assertIn("streaming_turn_finish_path=finish_speaking", lines)
+        assert loop.voice_orchestrator is not None
+        self.assertEqual(
+            loop.voice_orchestrator.states,
+            [
+                ("thinking", "voice_activation", False),
+                ("waiting", "voice_activation", False),
+            ],
+        )
+
+    def test_remote_follow_up_commit_reopens_streaming_turn_while_runtime_stays_listening(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.voice_orchestrator = FakeVoiceOrchestrator()
+            loop._latest_sensor_observation_facts = {
+                "camera": {"person_visible": True},
+                "person_state": {
+                    "interaction_ready": True,
+                    "targeted_inference_blocked": False,
+                    "recommended_channel": "speech",
+                    "attention_state": {"state": "attending_to_device"},
+                    "interaction_intent_state": {"state": "showing_intent"},
+                },
+            }
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            self.assertTrue(
+                loop._run_single_text_turn(
+                    transcript="Wie geht es dir?",
+                    listen_source="voice_activation",
+                    proactive_trigger=None,
+                )
+            )
+            self.assertEqual(runtime.status.value, "listening")
+            captured_kwargs: dict[str, object] = {}
+
+            def fake_run_conversation_session(**kwargs):
+                captured_kwargs.update(kwargs)
+                return True
+
+            loop._run_conversation_session = fake_run_conversation_session  # type: ignore[method-assign]
+
+            handled = loop.handle_remote_transcript_committed(
+                "Ich meinte, ich wollte mein WhatsApp bei dir als App einrichten.",
+                "follow_up",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(captured_kwargs["initial_source"], "follow_up")
+        self.assertEqual(
+            captured_kwargs["seed_transcript"],
+            "Ich meinte, ich wollte mein WhatsApp bei dir als App einrichten.",
+        )
+        self.assertFalse(captured_kwargs["play_initial_beep"])
+
     def test_direct_follow_up_rearms_to_listening_without_waiting_gap(self) -> None:
         class SequencedRecorder:
             def __init__(self) -> None:
@@ -3926,6 +4181,63 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(dual_lane.run_handoff_calls[0]["specialist_conversation"], tool_context)
         self.assertFalse(dual_lane.run_handoff_calls[0]["emit_filler"])
 
+    def test_tiny_recent_tool_handoff_avoids_heavy_tool_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            tiny_recent_context = (("system", "compact tool context"), ("user", "Bitte sei ruhig."),)
+            runtime.search_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("search context must not be requested for local tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("heavy tool context must not be requested"))  # type: ignore[method-assign]
+            runtime.tool_provider_tiny_recent_conversation_context = lambda: tiny_recent_context  # type: ignore[method-assign]
+            decision = SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich kuemmere mich darum.",
+                spoken_reply=None,
+                kind="general",
+                goal="Inspect local runtime state and handle the request.",
+                allow_web_search=False,
+                context_scope="tiny_recent",
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: None  # type: ignore[method-assign]
+            dual_lane.supervisor_decision_provider = object()  # type: ignore[attr-defined]
+            dual_lane.resolve_supervisor_decision = lambda *args, **kwargs: decision  # type: ignore[method-assign]
+
+            result = loop._run_dual_lane_final_response(
+                "Bist du ruhig?",
+                turn_instructions=None,
+            )
+
+        self.assertEqual(result.text, "Heute wird es sonnig.")
+        self.assertEqual(len(dual_lane.run_handoff_calls), 1)
+        self.assertEqual(dual_lane.run_handoff_calls[0]["conversation"], tiny_recent_context)
+        self.assertEqual(dual_lane.run_handoff_calls[0]["specialist_conversation"], tiny_recent_context)
+
     def test_full_context_direct_final_lane_uses_tool_context(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -4327,9 +4639,10 @@ class StreamingRunnerTests(unittest.TestCase):
                 button_monitor=SimpleNamespace(),
                 proactive_monitor=SimpleNamespace(),
             )
-            tool_context = (("system", "tool memory"),)
+            tool_context = (("system", "compact tool context"),)
             runtime.search_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("search context must not be requested for generic tool handoff"))  # type: ignore[method-assign]
-            runtime.tool_provider_conversation_context = lambda: tool_context  # type: ignore[method-assign]
+            runtime.tool_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("heavy tool context must not be requested for tiny_recent local tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_tiny_recent_conversation_context = lambda: tool_context  # type: ignore[method-assign]
             loop._resolve_local_semantic_route = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
                 route_decision=SimpleNamespace(label="tool"),
                 supervisor_decision=SimpleNamespace(
@@ -4339,7 +4652,7 @@ class StreamingRunnerTests(unittest.TestCase):
                     kind="general",
                     goal="Use the appropriate Twinr tools or device actions to handle the request.",
                     allow_web_search=False,
-                    context_scope=None,
+                    context_scope="tiny_recent",
                     response_id="route_resp",
                     request_id="route_req",
                     model="local-router",
@@ -4358,6 +4671,77 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(len(dual_lane.run_handoff_calls), 1)
         self.assertEqual(dual_lane.run_handoff_calls[0]["conversation"], tool_context)
         self.assertEqual(dual_lane.run_handoff_calls[0]["specialist_conversation"], tool_context)
+
+    def test_runtime_local_tool_handoff_skips_specialist_loop(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.search_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("search context must not be requested for runtime-local direct tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("heavy tool context must not be requested for runtime-local direct tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_tiny_recent_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("tiny_recent tool context must not be requested once the supervisor already resolved the direct runtime-local tool"))  # type: ignore[method-assign]
+            loop._resolve_local_semantic_route = lambda transcript: None  # type: ignore[method-assign]
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="handoff",
+                spoken_ack="Ich schalte mich kurz stumm.",
+                spoken_reply=None,
+                kind="automation",
+                goal="Set temporary quiet mode.",
+                allow_web_search=False,
+                context_scope="tiny_recent",
+                runtime_tool_name="manage_voice_quiet_mode",
+                runtime_tool_arguments={"action": "set", "duration_minutes": 2},
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+
+            result = loop._run_dual_lane_final_response(
+                "Sei bitte 2 Minuten ruhig.",
+                turn_instructions=None,
+            )
+
+        self.assertEqual(result.text, "Okay. Ich bin jetzt für 2 Minuten ruhig.")
+        self.assertEqual(len(dual_lane.run_runtime_local_tool_only_calls), 1)
+        self.assertEqual(len(dual_lane.run_handoff_calls), 0)
+        self.assertEqual(len(dual_lane.run_calls), 0)
+
+    def test_local_semantic_router_tool_route_synthesizes_tiny_recent_handoff(self) -> None:
+        decision = _synthesize_supervisor_decision(
+            SimpleNamespace(
+                label="tool",
+                confidence=0.93,
+                margin=0.41,
+                model_id="router-v1",
+            ),
+            FirstWordReply(mode="filler", spoken_text="Ich kuemmere mich darum."),
+        )
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.kind, "general")
+        self.assertEqual(decision.context_scope, "tiny_recent")
 
     def test_local_semantic_router_bridge_reply_uses_route_aware_first_word_overlay(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -4871,7 +5255,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 long_term_memory_query_rewrite_enabled=False,
             )
             runtime = TwinrRuntime(config=config)
-            runtime.remember_contact(given_name="Anna", family_name="Schulz", phone="040 1234567")
+            runtime.remember_contact(given_name="Anna", family_name="Schulz", phone=_TEST_CONTACT_PHONE)
             runtime.long_term_memory.object_store.apply_consolidation(
                 LongTermConsolidationResultV1(
                     turn_id="turn:2",
@@ -4881,7 +5265,7 @@ class StreamingRunnerTests(unittest.TestCase):
                         LongTermMemoryObjectV1(
                             memory_id="fact:corinna_phone_old",
                             kind="contact_method_fact",
-                            summary="Corinna Maier can be reached at +491761234.",
+                            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                             source=LongTermSourceRefV1(
                                 source_type="conversation_turn",
                                 event_ids=("turn:1",),
@@ -4891,14 +5275,14 @@ class StreamingRunnerTests(unittest.TestCase):
                             status="active",
                             confidence=0.95,
                             slot_key="contact:person:corinna_maier:phone",
-                            value_key="+491761234",
+                            value_key=_TEST_CORINNA_PHONE_OLD,
                         ),
                     ),
                     deferred_objects=(
                         LongTermMemoryObjectV1(
                             memory_id="fact:corinna_phone_new",
                             kind="contact_method_fact",
-                            summary="Corinna Maier can be reached at +4940998877.",
+                            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                             source=LongTermSourceRefV1(
                                 source_type="conversation_turn",
                                 event_ids=("turn:2",),
@@ -4908,7 +5292,7 @@ class StreamingRunnerTests(unittest.TestCase):
                             status="uncertain",
                             confidence=0.92,
                             slot_key="contact:person:corinna_maier:phone",
-                            value_key="+4940998877",
+                            value_key=_TEST_CORINNA_PHONE_NEW,
                         ),
                     ),
                     conflicts=(
@@ -4938,15 +5322,15 @@ class StreamingRunnerTests(unittest.TestCase):
         provider_conflict_system = "\n".join(content for role, content in provider_conflict_context if role == "system")
         tool_conflict_system = "\n".join(content for role, content in tool_conflict_context if role == "system")
         supervisor_conflict_system = "\n".join(content for role, content in supervisor_conflict_context if role == "system")
-        self.assertIn("040 1234567", provider_contact_system)
+        self.assertIn(_TEST_CONTACT_PHONE, provider_contact_system)
         self.assertIn("Structured unresolved long-term memory conflicts", provider_conflict_system)
-        self.assertIn("+4940998877", provider_conflict_system)
-        self.assertNotIn("040 1234567", tool_contact_system)
+        self.assertIn(_TEST_CORINNA_PHONE_NEW, provider_conflict_system)
+        self.assertNotIn(_TEST_CONTACT_PHONE, tool_contact_system)
         self.assertNotIn("Structured unresolved long-term memory conflicts", tool_conflict_system)
-        self.assertNotIn("+4940998877", tool_conflict_system)
-        self.assertNotIn("040 1234567", supervisor_contact_system)
+        self.assertNotIn(_TEST_CORINNA_PHONE_NEW, tool_conflict_system)
+        self.assertNotIn(_TEST_CONTACT_PHONE, supervisor_contact_system)
         self.assertNotIn("Structured unresolved long-term memory conflicts", supervisor_conflict_system)
-        self.assertNotIn("+4940998877", supervisor_conflict_system)
+        self.assertNotIn(_TEST_CORINNA_PHONE_NEW, supervisor_conflict_system)
 
     def test_supervisor_context_uses_recent_raw_tail_only(self) -> None:
         with TemporaryDirectory() as temp_dir:

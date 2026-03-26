@@ -46,6 +46,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   otherwise free right-hand reserve area with one real Unicode symbol such as
   `👍` or `👋` without pushing emoji-only semantics into the generic runtime
   snapshot schema
+- allow optional external HDMI service-connect cues so voice-triggered pairing
+  flows can temporarily own that same right-hand reserve area with short
+  status copy and a scannable QR payload without coupling onboarding state into
+  the generic runtime snapshot schema
 - allow optional external HDMI ambient-impulse cues so personality-driven
   capabilities can claim that same reserve area with one bounded, readable,
   question-first reserve card that stays positive, glanceable, and clearly
@@ -57,8 +61,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   or pushback on a shown card can reshape the remaining day plan faster than
   the slower long-term learning loop alone
 - arbitrate that right-hand HDMI reserve area through one explicit reserve-bus
-  helper so emoji acknowledgements, calm ambient cards, and future reserve-only
-  cue families do not compete through inline renderer conditionals
+  helper so service-connect QR/status cards, emoji acknowledgements, calm
+  ambient cards, and future reserve-only cue families do not compete through
+  inline renderer conditionals
 - let the right-hand reserve mirror clear user camera gestures with the same
   symbol when the proactive runtime publishes a bounded acknowledgement, while
   keeping hostile-gesture reactions separate from face emotion
@@ -218,6 +223,10 @@ keeping face emotions in the face channel and not in emoji-only surrogates.
 Calm companion impulses may use a bounded reserve card there too, but that
 card must stay short, positive, and subordinate to stronger
 reserve-surface owners such as gesture acknowledgements or fullscreen
+presentations. Service-connect flows are stronger still: while Twinr is
+opening or waiting on a bounded external pairing flow such as WhatsApp, that
+right-hand area may temporarily turn into a readable service card with the
+current pairing summary and, when available, the scannable QR image itself.
 presentations. On the 800x480 Pi surface that means readable main text first,
 minimal chrome, and a prompt-mode reserve card that reads like one large
 conversation opener instead of a small label plus helper text.
@@ -231,7 +240,8 @@ full reserve message so the box keeps more breathing room, and wording that
 sounds like a natural conversation opener rather than a tiny topic label with
 helper chrome. The large headline should stand on its own as the explanatory
 statement, while the smaller second line should act as the CTA. Prompt-mode
-cards should also consume the
+cards should also fit their shared prompt-mode type scale dynamically to the
+actual visible card box before clipping, and consume the
 actual visible card height instead of stopping after a fixed two-line budget,
 so longer right-lane prompts do not appear cut off halfway down the box.
 

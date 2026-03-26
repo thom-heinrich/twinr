@@ -64,6 +64,7 @@ class ContinuousRotationServoPlanner:
         self._desired_heading_degrees = 0.0
         self._last_observed_at: float | None = None
         self._last_commanded_pulse_width_us = config.center_pulse_width_us
+        self._last_command_speed_scale = 1.0
 
     @property
     def estimated_heading_degrees(self) -> float:
@@ -110,7 +111,13 @@ class ContinuousRotationServoPlanner:
             min(self.config.max_pulse_width_us, bounded_pulse),
         )
 
-    def note_commanded_pulse_width(self, pulse_width_us: int, *, observed_at: float | None) -> None:
+    def note_commanded_pulse_width(
+        self,
+        pulse_width_us: int,
+        *,
+        observed_at: float | None,
+        speed_scale: float = 1.0,
+    ) -> None:
         """Advance the estimate to `observed_at` and remember the actual applied command."""
 
         self._advance(observed_at=observed_at)
@@ -118,12 +125,17 @@ class ContinuousRotationServoPlanner:
             self.config.min_pulse_width_us,
             min(self.config.max_pulse_width_us, int(pulse_width_us)),
         )
+        checked_speed_scale = float(speed_scale)
+        if not math.isfinite(checked_speed_scale):
+            checked_speed_scale = 1.0
+        self._last_command_speed_scale = max(0.0, checked_speed_scale)
 
     def note_stopped(self, *, observed_at: float | None) -> None:
         """Advance once more and freeze subsequent motion around the neutral pulse."""
 
         self._advance(observed_at=observed_at)
         self._last_commanded_pulse_width_us = self.config.center_pulse_width_us
+        self._last_command_speed_scale = 1.0
 
     def reset(self, *, heading_degrees: float = 0.0, observed_at: float | None = None) -> None:
         """Reset the virtual heading and neutralize the remembered command."""
@@ -135,6 +147,7 @@ class ContinuousRotationServoPlanner:
         )
         self._desired_heading_degrees = self._estimated_heading_degrees
         self._last_commanded_pulse_width_us = self.config.center_pulse_width_us
+        self._last_command_speed_scale = 1.0
         self._last_observed_at = None if observed_at is None else float(observed_at)
 
     def _advance(self, *, observed_at: float | None) -> None:
@@ -149,7 +162,10 @@ class ContinuousRotationServoPlanner:
         if not math.isfinite(dt_s) or dt_s <= 0.0:
             self._last_observed_at = checked_at
             return
-        speed_degrees_per_s = self._speed_degrees_per_s_for_pulse(self._last_commanded_pulse_width_us)
+        speed_degrees_per_s = (
+            self._speed_degrees_per_s_for_pulse(self._last_commanded_pulse_width_us)
+            * self._last_command_speed_scale
+        )
         if speed_degrees_per_s != 0.0:
             self._estimated_heading_degrees = _clamp(
                 self._estimated_heading_degrees + (speed_degrees_per_s * dt_s),

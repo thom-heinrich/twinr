@@ -3,7 +3,7 @@ name: hardware
 path: src/twinr/hardware
 kind: python-package
 visibility: internal
-summary: Provide bounded audio, GPIO, servo, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
+summary: Provide bounded audio, GPIO, servo, camera, printer, voice-profile, remote drone-mission client, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and activation flows
   - Lift under-driven PCM16 activation-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
@@ -12,7 +12,8 @@ owned_concerns:
   - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Drive one bounded body-orientation servo from an already-derived normalized attention target, including calibrated center/invert controls, soft end-stop margins, calm idle release near neutral, and a dedicated open-loop continuous-rotation mode with bounded virtual-heading estimation for 360-degree servos
-  - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes or a bounded peer-Pi HTTP snapshot proxy when the main host has no local still camera
+  - Capture still photos via ffmpeg-backed V4L2 integration, a bounded Bitcraze AI-Deck WiFi stream adapter with temporary AP handover and WiFi restore on single-radio hosts, a bounded Pi libcamera fallback for busy unicam-image nodes, or a bounded peer-Pi HTTP snapshot proxy when the main host has no local still camera
+  - Reach one bounded external drone daemon over HTTP so Twinr can queue inspect missions, read state, cancel work, and preserve a strict mission-only boundary above the future primitive executor
   - Persist local portrait identities with multiple reference images per user
   - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
   - Persist and assess multi-user local household voice identities on device
@@ -95,6 +96,20 @@ files:
       - AICameraPoseSupportDiagnostic
       - capture_pose_probe
       - capture_pose_probe_sequence
+  - path: aideck_camera.py
+    role: Bounded Bitcraze AI-Deck still-frame adapter that can temporarily join the deck AP, normalize one CPX-over-TCP frame into standard PNG or JPEG photo payloads, and restore the previous WiFi link
+  - path: aideck_wifi.py
+    role: Focused `nmcli` handover helper that temporarily joins the AI-Deck AP and restores the previous WiFi connection after one bounded capture
+  - path: drone_service.py
+    role: Strict mission-level client for the external bounded drone daemon, including inspect requests and normalized state, pose, and safety snapshots
+    exports:
+      - DroneMissionRequest
+      - DroneMissionStatus
+      - DronePoseSnapshot
+      - DroneSafetyStatus
+      - DroneServiceConfig
+      - DroneStateSnapshot
+      - RemoteDroneServiceClient
   - path: hand_landmarks.py
     role: Bounded MediaPipe hand-landmark ROI worker for the Pi-side camera path
     exports:
@@ -139,7 +154,7 @@ files:
   - path: servo_maestro.py
     role: Focused Pololu Mini Maestro command-port adapter for bounded USB serial servo output, stale-path recovery, ttyACM fallback discovery, and command-port auto-baud initialization
   - path: camera.py
-    role: still camera adapter with bounded ffmpeg/V4L2 capture, Pi rpicam fallback, optional peer-Pi HTTP snapshot fetches, and bounded persistence
+    role: still camera adapter with bounded ffmpeg/V4L2 capture, optional AI-Deck stream selection plus AP handover, Pi rpicam fallback, optional peer-Pi HTTP snapshot fetches, and bounded persistence
     exports:
       - CameraError
       - CameraConfigurationError

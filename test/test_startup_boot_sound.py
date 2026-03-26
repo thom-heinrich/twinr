@@ -59,7 +59,7 @@ class StartupBootSoundTests(unittest.TestCase):
         self.assertEqual(spec.clip_start_s, 4.0)
         self.assertEqual(spec.clip_duration_s, 7.0)
         self.assertEqual(spec.fade_out_duration_s, 3.0)
-        self.assertEqual(spec.output_gain, 0.2)
+        self.assertEqual(spec.output_gain, 0.1)
 
     def test_play_startup_boot_sound_queues_feedback_priority_clip(self) -> None:
         coordinator = _FakePlaybackCoordinator()

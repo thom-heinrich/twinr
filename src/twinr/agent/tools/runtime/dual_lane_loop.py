@@ -52,12 +52,16 @@ from .loop_support import (
     strip_text as _strip_text,
 )
 from .recovery_reply import LLMRecoveryResponder
+from .runtime_local_handoff import (
+    decision_runtime_local_tool_call as _decision_runtime_local_tool_call,
+    runtime_local_tool_reply_text as _runtime_local_tool_reply_text,
+)
 from .speech_lane import (
     SpeechLaneDelta,
     safe_emit_speech_delta as _safe_emit_speech_delta,
     safe_emit_text_delta as _safe_emit_text_delta,
 )
-from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
+from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop, ToolHandler
 
 
 logger = logging.getLogger(__name__)  # AUDIT-FIX(#1): Preserve root-cause visibility while returning senior-safe fallbacks.
@@ -85,11 +89,11 @@ class DualLaneToolLoop:
         *,
         supervisor_provider: ToolCallingAgentProvider,
         specialist_provider: ToolCallingAgentProvider,
-        tool_handlers: dict[str, Callable[[dict[str, Any]], Any]],
+        tool_handlers: dict[str, ToolHandler],
         tool_schemas: Sequence[dict[str, Any]],
         supervisor_decision_provider: SupervisorDecisionProvider | None = None,
         first_word_provider: FirstWordProvider | None = None,
-        supervisor_tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
+        supervisor_tool_handlers: dict[str, ToolHandler] | None = None,
         supervisor_tool_schemas: Sequence[dict[str, Any]] | None = None,
         supervisor_instructions: str,
         specialist_instructions: str,
@@ -381,12 +385,26 @@ class DualLaneToolLoop:
         """Resolve the specialist result through either direct search or the worker loop."""
         _raise_if_should_stop(should_stop, context="specialist_resolution_start")
         specialist_prompt = _strip_text(normalized_arguments.get("prompt")) or prompt
-        if normalized_arguments["kind"] == "search":
+        if normalized_arguments["kind"] == "search" and "browser_automation" not in self.tool_handlers:
             return self._run_direct_search_handoff(
                 prompt,
                 normalized_arguments,
                 should_stop=should_stop,
             )
+        specialist_allow_web_search = _handoff_allow_web_search(
+            normalized_arguments,
+            allow_web_search,
+        )
+        if (
+            normalized_arguments["kind"] == "search"
+            and "browser_automation" in self.tool_handlers
+            and "search_live_info" in self.tool_handlers
+        ):
+            # Keep generic web research and browser work on explicit Twinr tools
+            # once the optional browser lane is available. Otherwise the provider's
+            # own web-search mode can bypass the intended search-vs-browser
+            # boundary and skip the permission step entirely.
+            specialist_allow_web_search = False
         return ToolCallingStreamingLoop(
             provider=self.specialist_provider,
             tool_handlers=self.tool_handlers,
@@ -400,10 +418,7 @@ class DualLaneToolLoop:
                 instructions,
                 _specialist_handoff_context(normalized_arguments),
             ),
-            allow_web_search=_handoff_allow_web_search(
-                normalized_arguments,
-                allow_web_search,
-            ),
+            allow_web_search=specialist_allow_web_search,
             on_text_delta=None,
             should_stop=should_stop,
         )
@@ -587,6 +602,128 @@ class DualLaneToolLoop:
             used_web_search=bool(specialist_result.used_web_search),
         )
 
+    def run_runtime_local_tool_only(
+        self,
+        prompt: str,
+        *,
+        decision: Any,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None = None,
+        emit_filler: bool = True,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> StreamingToolLoopResult:
+        """Execute one supervisor-resolved runtime-local tool without a specialist hop."""
+
+        resolved_tool_call = _decision_runtime_local_tool_call(decision)
+        if resolved_tool_call is None:
+            raise ValueError("runtime-local tool handoff requires runtime_tool_name and runtime_tool_arguments")
+        tool_name, tool_arguments = resolved_tool_call
+        handler = self.tool_handlers.get(tool_name)
+        if handler is None:
+            raise ValueError(f"runtime-local tool handoff requested unavailable tool: {tool_name}")
+        _raise_if_should_stop(should_stop, context="runtime_local_tool_start")
+        self._trace_event(
+            "dual_lane_runtime_local_tool_started",
+            kind="branch",
+            details={
+                "prompt": _text_summary(prompt),
+                "decision": _decision_summary(decision),
+                "tool_name": tool_name,
+                "argument_keys": sorted(tool_arguments.keys()),
+                "emit_filler": bool(emit_filler),
+            },
+        )
+
+        def _emit_user_text(
+            text: str,
+            *,
+            lane: str = "direct",
+            replace_current: bool = False,
+            atomic: bool = False,
+        ) -> None:
+            _safe_emit_speech_delta(
+                on_lane_text_delta,
+                on_text_delta,
+                SpeechLaneDelta(
+                    text=text,
+                    lane=lane,
+                    replace_current=replace_current,
+                    atomic=atomic,
+                ),
+            )
+
+        spoken_ack = _strip_text(getattr(decision, "spoken_ack", None))
+        if emit_filler and spoken_ack:
+            _emit_user_text(spoken_ack, lane="filler")
+
+        try:
+            tool_output = handler(tool_arguments)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            logger.exception("Runtime-local tool handoff failed.")
+            self._trace_event(
+                "dual_lane_runtime_local_tool_failed",
+                kind="exception",
+                level="ERROR",
+                details={
+                    "error_type": type(exc).__name__,
+                    "decision": _decision_summary(decision),
+                    "tool_name": tool_name,
+                    "argument_keys": sorted(tool_arguments.keys()),
+                },
+            )
+            raise
+        _raise_if_should_stop(should_stop, context="runtime_local_tool_after_handler")
+
+        final_text = _runtime_local_tool_reply_text(tool_output) or spoken_ack
+        if final_text and (on_text_delta is not None or on_lane_text_delta is not None):
+            _emit_user_text(
+                final_text,
+                lane="final",
+                replace_current=emit_filler and bool(spoken_ack),
+                atomic=True,
+            )
+        self._trace_event(
+            "dual_lane_runtime_local_tool_completed",
+            kind="observation",
+            details={
+                "decision": _decision_summary(decision),
+                "tool_name": tool_name,
+                "final_text": _text_summary(final_text),
+                "output_present": tool_output is not None,
+            },
+        )
+        call_id = _first_non_none(
+            getattr(decision, "response_id", None),
+            _make_call_id(tool_name),
+        )
+        return _make_loop_result(
+            text=final_text,
+            rounds=1,
+            tool_calls=(
+                AgentToolCall(
+                    name=tool_name,
+                    call_id=call_id,
+                    arguments=tool_arguments,
+                    raw_arguments=_safe_json_dumps(tool_arguments),
+                ),
+            ),
+            tool_results=(
+                AgentToolResult(
+                    call_id=call_id,
+                    name=tool_name,
+                    output=tool_output,
+                    serialized_output=_safe_json_dumps(tool_output),
+                ),
+            ),
+            response_id=getattr(decision, "response_id", None),
+            request_id=getattr(decision, "request_id", None),
+            model=getattr(decision, "model", None),
+            token_usage=getattr(decision, "token_usage", None),
+            used_web_search=False,
+        )
+
     def run(
         self,
         prompt: str,
@@ -633,10 +770,10 @@ class DualLaneToolLoop:
                 ),
             )  # AUDIT-FIX(#1): Guard TTS/UI callback failures so they cannot abort the turn.
 
-        def handoff_specialist_worker(arguments: dict[str, Any]) -> dict[str, Any]:
+        def handoff_specialist_worker(arguments: dict[str, Any] | AgentToolCall) -> dict[str, Any]:
             _raise_if_should_stop(should_stop, context="handoff_worker_start")
             normalized_arguments = _normalize_handoff_arguments(
-                arguments,
+                arguments.arguments if isinstance(arguments, AgentToolCall) else arguments,
                 fallback_prompt=prompt,
             )  # AUDIT-FIX(#12): Validate and normalize supervisor-provided handoff payloads consistently.
             spoken_ack = normalized_arguments["spoken_ack"]

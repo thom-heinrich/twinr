@@ -41,8 +41,8 @@ _DISPLAY_ACK_FALLBACK_POLICIES = {
     # social-path defaults. Keep the HDMI ack lane tuned to real device traces
     # so clear user gestures publish, while still blocking the weakest false
     # positives seen in candidate-frame QA.
-    SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.56, 1, 0.35),
-    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.44, 1, 0.35),
+    SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.56, 2, 0.35),
+    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.44, 2, 0.35),
     SocialFineHandGesture.PEACE_SIGN: FineHandGesturePolicy(0.60, 1, 0.40),
 }
 
@@ -156,7 +156,7 @@ class GestureAckLane:
         )
         effective_policy = FineHandGesturePolicy(
             min_confidence=min(policy.min_confidence, fallback_policy.min_confidence),
-            confirm_samples=policy.confirm_samples,
+            confirm_samples=max(policy.confirm_samples, fallback_policy.confirm_samples),
             hold_s=policy.hold_s,
         )
         if confidence < effective_policy.min_confidence:

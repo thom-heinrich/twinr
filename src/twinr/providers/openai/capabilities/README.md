@@ -24,7 +24,9 @@ models can finish cleanly instead of degrading into generic blank-answer
 errors. Successful search results now also retain the requested model,
 structured per-attempt metadata, and any concrete fallback reason so runtime
 callers can persist what actually happened when a search left its primary
-model.
+model. The search voice-rewrite step also returns structured verification and
+follow-up metadata so Twinr can distinguish verified answers from partial or
+unverified results and decide whether to ask for a deeper website check.
 
 `capabilities` does **not** own:
 - low-level client construction, shared request builders, or base types in [`../core`](../core/README.md)

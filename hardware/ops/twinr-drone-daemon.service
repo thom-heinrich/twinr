@@ -1,0 +1,14 @@
+[Unit]
+Description=Twinr bounded drone mission daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/thh/twinr
+ExecStart=/usr/bin/python3 /home/thh/twinr/hardware/ops/drone_daemon.py --repo-root /home/thh/twinr --env-file /home/thh/twinr/.env
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

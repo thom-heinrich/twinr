@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hydration Dashboard</title>
+  </head>
+  <body>
+    <main id="app">
+      <h1>Hydration Dashboard</h1>
+      <p id="status">Loading live dashboard data...</p>
+    </main>
+    <script>
+      window.setTimeout(() => {
+        const app = document.getElementById("app");
+        app.innerHTML = `
+          <h1>Hydrated Status Card</h1>
+          <p>Priority contact: Ingrid Holm</p>
+          <p>Queue state: Ready for handoff</p>
+        `;
+        document.title = "Hydrated Status Card";
+      }, 80);
+    </script>
+  </body>
+</html>

@@ -191,6 +191,7 @@ class StreamingTurnCoordinatorHooks:
     record_usage: Callable[..., None]
     evaluate_follow_up_closure: Callable[..., ConversationClosureEvaluation]
     apply_follow_up_closure_evaluation: Callable[..., bool]
+    follow_up_rearm_allowed_now: Callable[[str], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,11 +1024,32 @@ class StreamingTurnCoordinator:
             request_source=self.request.listen_source,
             proactive_trigger=self.request.proactive_trigger,
         )
+        remote_follow_up_rearm_allowed_now = False
+        if self.request.allow_follow_up_rearm:
+            try:
+                remote_follow_up_rearm_allowed_now = bool(
+                    self.hooks.follow_up_rearm_allowed_now(self.request.listen_source)
+                )
+            except Exception as exc:
+                self.hooks.emit(f"streaming_follow_up_rearm_check_failed={type(exc).__name__}")
+        rearm_follow_up = (
+            not force_close
+            and self.request.allow_follow_up_rearm
+            and remote_follow_up_rearm_allowed_now
+        )
+        self.hooks.emit(
+            f"streaming_follow_up_rearm_snapshot={str(self.request.allow_follow_up_rearm).lower()}"
+        )
+        self.hooks.emit(
+            f"streaming_follow_up_rearm_allowed_now={str(remote_follow_up_rearm_allowed_now).lower()}"
+        )
         self.speech_lifecycle.stop_snapshot_heartbeat()
         self._raise_if_interrupted(phase_reason="before_runtime_finish")
-        if not force_close and self.request.allow_follow_up_rearm:
+        if rearm_follow_up:
+            self.hooks.emit("streaming_turn_finish_path=rearm_follow_up")
             self.runtime.rearm_follow_up(request_source="follow_up")
         else:
+            self.hooks.emit("streaming_turn_finish_path=finish_speaking")
             self.runtime.finish_speaking()
         self.hooks.emit_status()
         if end_conversation:

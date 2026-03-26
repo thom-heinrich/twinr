@@ -2,6 +2,7 @@ from datetime import timedelta
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 # pylint: disable=no-name-in-module
@@ -39,6 +40,21 @@ class TwinrRuntimeTests(unittest.TestCase):
         runtime.finish_speaking()
         self.assertEqual(runtime.status, TwinrStatus.WAITING)
         self.assertEqual(runtime.memory.last_assistant_message(), "Hello back")
+
+    def test_complete_agent_turn_passes_explicit_source_and_modality_to_long_term_memory(self) -> None:
+        runtime = TwinrRuntime(config=TwinrConfig())
+        calls: list[dict[str, str]] = []
+        runtime.long_term_memory = SimpleNamespace(
+            enqueue_conversation_turn=lambda **kwargs: calls.append(kwargs)
+        )
+
+        runtime.begin_listening(request_source="whatsapp")
+        runtime.submit_transcript("Hallo Twinr")
+        runtime.complete_agent_turn("Hallo zurueck", source="whatsapp", modality="text")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["source"], "whatsapp")
+        self.assertEqual(calls[0]["modality"], "text")
 
     def test_follow_up_rearm_transitions_directly_back_to_listening(self) -> None:
         runtime = TwinrRuntime(config=TwinrConfig())

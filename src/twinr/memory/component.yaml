@@ -105,6 +105,11 @@ files:
       - UserDiscoveryStoredFact
       - UserDiscoveryTopicDefinition
       - UserDiscoveryTopicState
+  - path: user_discovery_authoritative_profile.py
+    role: Authoritative graph/structured-profile adapter for discovery topic completion
+    exports:
+      - UserDiscoveryAuthoritativeCoverage
+      - UserDiscoveryAuthoritativeProfileReader
   - path: user_discovery_policy.py
     role: Topic scoring and phrasing policy derived from reserve-lane engagement signals
     exports:

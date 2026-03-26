@@ -1,4 +1,10 @@
-"""Remote execution and verification helpers for Pi runtime deploys."""
+"""Remote execution and verification helpers for Pi runtime deploys.
+
+This module owns the SSH/SCP-side primitives used by the operator-facing Pi
+deploy flow. Besides core repo/env/systemd steps, it also installs optional
+runtime support files that live inside mirrored local workspaces such as the
+ignored ``browser_automation/`` tree.
+"""
 
 from __future__ import annotations
 
@@ -196,6 +202,70 @@ def install_editable_package(
             )
         )
     )
+    return summarize_output(completed)
+
+
+def install_browser_automation_runtime_support(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    install_python_requirements: bool,
+    install_playwright_browsers: bool,
+) -> str:
+    """Install mirrored browser-automation runtime requirements on the Pi.
+
+    Args:
+        remote: Remote executor targeting the Pi acceptance host.
+        remote_root: Mirrored Twinr checkout root on the Pi.
+        install_python_requirements: Whether to install Python packages from
+            ``browser_automation/runtime_requirements.txt``.
+        install_playwright_browsers: Whether to install Playwright browser
+            binaries listed in ``browser_automation/playwright_browsers.txt``.
+
+    Returns:
+        One compact summary of the remote install output.
+    """
+
+    remote_python = f"{remote_root}/.venv/bin/python"
+    requirements_path = f"{remote_root}/browser_automation/runtime_requirements.txt"
+    browsers_path = f"{remote_root}/browser_automation/playwright_browsers.txt"
+    lines = [
+        f"remote_root={shlex.quote(remote_root)}",
+        f"remote_python={shlex.quote(remote_python)}",
+        f"requirements_path={shlex.quote(requirements_path)}",
+        f"browsers_path={shlex.quote(browsers_path)}",
+        "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
+    ]
+    if install_python_requirements:
+        lines.extend(
+            (
+                'test -s "$requirements_path"',
+                'echo "[browser_automation] installing python requirements"',
+                '"$remote_python" -m pip install -r "$requirements_path"',
+            )
+        )
+    if install_playwright_browsers:
+        lines.extend(
+            (
+                'test -s "$browsers_path"',
+                "browser_names=()",
+                'while IFS= read -r raw_line; do',
+                '  line="${raw_line%%#*}"',
+                '  set -- $line',
+                '  if [ "$#" -eq 0 ]; then',
+                "    continue",
+                "  fi",
+                '  browser_names+=("$1")',
+                'done < "$browsers_path"',
+                'if [ "${#browser_names[@]}" -eq 0 ]; then',
+                '  echo "playwright browser manifest did not contain any browser names" >&2',
+                "  exit 1",
+                "fi",
+                'echo "[browser_automation] installing Playwright browsers: ${browser_names[*]}"',
+                '"$remote_python" -m playwright install "${browser_names[@]}"',
+            )
+        )
+    completed = remote.run_ssh("\n".join(lines))
     return summarize_output(completed)
 
 
@@ -414,6 +484,7 @@ __all__ = [
     "PiRemoteExecutor",
     "PiSyncedFileResult",
     "PiSystemdServiceState",
+    "install_browser_automation_runtime_support",
     "install_editable_package",
     "install_service_units",
     "load_journal_excerpt",

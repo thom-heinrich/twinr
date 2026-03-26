@@ -8,11 +8,12 @@ It keeps live-search behavior isolated from the generic response helpers.
 from __future__ import annotations
 ##REFACTOR: 2026-03-16##
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 import json
 import re
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent.config import DEFAULT_OPENAI_MAIN_MODEL
@@ -81,6 +82,7 @@ _SEARCH_OUTPUT_TOKEN_RETRY_LADDER = (512, 768, 1024, 1536, 2048, 3072)
 _FALLBACK_SEARCH_MODEL = DEFAULT_OPENAI_MAIN_MODEL
 _SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS = 160
 _MAX_SEARCH_ATTEMPT_DETAIL_CHARS = 240
+_SEARCH_VERIFICATION_STATUSES = frozenset({"verified", "partial", "unverified"})
 _SEARCH_SPOKEN_ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -93,11 +95,68 @@ _SEARCH_SPOKEN_ANSWER_SCHEMA: dict[str, Any] = {
                 "Use plain sentences only. Do not include markdown, URLs, citations, "
                 "source names, brackets, bullets, headings, or meta commentary."
             ),
-        }
+        },
+        "verification_status": {
+            "type": "string",
+            "enum": sorted(_SEARCH_VERIFICATION_STATUSES),
+            "description": (
+                "Use verified only when the exact requested detail is currently confirmed. "
+                "Use partial when the search found useful context but not the exact requested detail. "
+                "Use unverified when current search results did not verify the requested detail."
+            ),
+        },
+        "question_resolved": {
+            "type": "boolean",
+            "description": (
+                "True only when this search result is sufficient as the final answer to the user's request."
+            ),
+        },
+        "site_follow_up_recommended": {
+            "type": "boolean",
+            "description": (
+                "True when checking a specific website could materially clarify the still-unverified detail."
+            ),
+        },
+        "site_follow_up_reason": {
+            "type": ["string", "null"],
+            "maxLength": 200,
+            "description": "Short reason why a website check may help when the result is unresolved.",
+        },
+        "site_follow_up_url": {
+            "type": ["string", "null"],
+            "maxLength": 1000,
+            "description": "Best concrete website URL to inspect next when follow-up is recommended.",
+        },
+        "site_follow_up_domain": {
+            "type": ["string", "null"],
+            "maxLength": 253,
+            "description": "Host name for the recommended follow-up website when available.",
+        },
     },
-    "required": ["spoken_answer"],
+    "required": [
+        "spoken_answer",
+        "verification_status",
+        "question_resolved",
+        "site_follow_up_recommended",
+        "site_follow_up_reason",
+        "site_follow_up_url",
+        "site_follow_up_domain",
+    ],
     "additionalProperties": False,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredSearchVoiceResult:
+    """Capture the structured spoken search result returned by the rewrite step."""
+
+    spoken_answer: str
+    verification_status: str
+    question_resolved: bool
+    site_follow_up_recommended: bool
+    site_follow_up_reason: str | None = None
+    site_follow_up_url: str | None = None
+    site_follow_up_domain: str | None = None
 
 
 def _collapse_whitespace(value: str | None) -> str:
@@ -250,8 +309,28 @@ def _search_responses_text_format() -> dict[str, Any]:
     }
 
 
-def _extract_structured_search_answer(text: str) -> str:
-    """Parse and normalize the structured spoken-answer payload returned by search."""
+def _normalize_search_verification_status(value: object) -> str:
+    """Normalize and validate the structured search verification status."""
+
+    normalized = _collapse_whitespace(None if value is None else str(value)).lower()
+    if normalized not in _SEARCH_VERIFICATION_STATUSES:
+        raise ValueError("search structured output is missing a valid verification_status")
+    return normalized
+
+
+def _extract_domain_hint(url: str | None) -> str | None:
+    """Return a normalized host name for one candidate follow-up URL."""
+
+    normalized_url = _collapse_whitespace(url)
+    if not normalized_url:
+        return None
+    parsed = urlparse(normalized_url)
+    hostname = _collapse_whitespace(parsed.hostname)
+    return hostname.lower() or None
+
+
+def _extract_structured_search_answer(text: str) -> _StructuredSearchVoiceResult:
+    """Parse and normalize the structured spoken search payload returned by search."""
 
     raw_text = str(text or "").strip()
     if not raw_text:
@@ -262,7 +341,31 @@ def _extract_structured_search_answer(text: str) -> str:
     spoken_answer = _collapse_whitespace(payload.get("spoken_answer"))
     if not spoken_answer:
         raise ValueError("search structured output is missing spoken_answer")
-    return spoken_answer
+    question_resolved = payload.get("question_resolved")
+    if not isinstance(question_resolved, bool):
+        raise ValueError("search structured output is missing question_resolved")
+    site_follow_up_recommended = payload.get("site_follow_up_recommended")
+    if not isinstance(site_follow_up_recommended, bool):
+        raise ValueError("search structured output is missing site_follow_up_recommended")
+    site_follow_up_reason = _collapse_whitespace(payload.get("site_follow_up_reason")) or None
+    site_follow_up_url = _collapse_whitespace(payload.get("site_follow_up_url")) or None
+    site_follow_up_domain = _collapse_whitespace(payload.get("site_follow_up_domain")) or None
+    normalized_follow_up_domain = _extract_domain_hint(site_follow_up_url) or (
+        site_follow_up_domain.lower() if site_follow_up_domain else None
+    )
+    if not site_follow_up_recommended:
+        site_follow_up_reason = None
+        site_follow_up_url = None
+        normalized_follow_up_domain = None
+    return _StructuredSearchVoiceResult(
+        spoken_answer=spoken_answer,
+        verification_status=_normalize_search_verification_status(payload.get("verification_status")),
+        question_resolved=question_resolved,
+        site_follow_up_recommended=site_follow_up_recommended,
+        site_follow_up_reason=site_follow_up_reason,
+        site_follow_up_url=site_follow_up_url,
+        site_follow_up_domain=normalized_follow_up_domain,
+    )
 
 
 def _parse_context_reference_date(date_context: str | None) -> date | None:
@@ -449,7 +552,7 @@ class OpenAISearchMixin:
                         )
                 continue
 
-            candidate, model_error, model_attempts = self._search_with_responses_model(
+            response_candidate, model_error, model_attempts = self._search_with_responses_model(
                 model,
                 prompt,
                 conversation=search_conversation,
@@ -458,11 +561,11 @@ class OpenAISearchMixin:
                 output_token_candidates=output_token_candidates,
             )
             attempt_log.extend(model_attempts)
-            if candidate is not None:
+            if response_candidate is not None:
                 return self._rewrite_search_result_for_voice(
                     question=normalized_question,
                     candidate=self._finalize_search_result(
-                        candidate,
+                        response_candidate,
                         requested_model=requested_model,
                         attempt_log=attempt_log,
                     ),
@@ -704,30 +807,41 @@ class OpenAISearchMixin:
         question: str,
         candidate: OpenAISearchResult,
     ) -> OpenAISearchResult:
-        """Rewrite a verified search answer into clean spoken output.
+        """Rewrite a search result into clean spoken output plus verification metadata.
 
         Web-search models tend to keep inline citations or web-style phrasing
         even under strict instructions. Twinr therefore runs one bounded
-        non-search voice rewrite that preserves only the verified facts already
-        present in the search answer.
+        non-search voice rewrite that preserves only the search-result facts
+        already present in the answer.
         """
 
         preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None)) or DEFAULT_OPENAI_MAIN_MODEL
+        rendered_sources = ", ".join(candidate.sources) if candidate.sources else "none"
         prompt = (
             f"Original user question: {question}\n"
-            f"Verified live-search answer: {candidate.answer}\n"
-            "Rewrite the verified answer as what Twinr should say aloud now."
+            f"Live-search result: {candidate.answer}\n"
+            f"Source URLs: {rendered_sources}\n"
+            "Rewrite the search result as what Twinr should say aloud now."
         )
         instructions = (
             "You are Twinr preparing a spoken answer for a voice assistant. "
             "Everything you write will be read aloud exactly as written. "
-            "Use only facts already present in the verified live-search answer. "
-            "Do not add facts, do not ask a follow-up question unless the verified answer itself lacks a key fact, "
+            "Use only facts already present in the live-search result. "
+            "Do not add facts, do not ask a follow-up question unless the live-search result itself lacks a key fact, "
             "and do not mention sources, URLs, markdown, citations, brackets, or reference phrases. "
             "Keep the reply short, natural, warm, spoken, senior-friendly, and usually to one or two short sentences. "
             "Avoid stiff, bureaucratic, or institutional wording. "
-            "Prefer plain spoken wording over formal written-report phrasing or generic advisories unless the verified answer itself requires that wording. "
-            "Return only the spoken answer text."
+            "Prefer plain spoken wording over formal written-report phrasing or generic advisories unless the live-search result itself requires that wording. "
+            "Return a JSON object with the spoken answer plus verification metadata. "
+            "Mark verification_status as verified only when the exact requested detail is confirmed. "
+            "A missing clear current hint, older menu, general page, or absent search-result evidence is not a verified negative answer. "
+            "Mark those cases as partial or unverified instead of verified. "
+            "Mark it as partial when the search found useful context but not the exact requested detail. "
+            "Mark it as unverified when the current search did not verify the requested detail at all. "
+            "Set question_resolved true only when Twinr can safely treat the result as a final resolution without a deeper website check. "
+            "Set site_follow_up_recommended true when checking a specific website could materially clarify the unresolved detail, especially for a place, business, or organization where an official site exists but the current detail was not clearly verified from search results alone. "
+            "When site_follow_up_recommended is true and one source clearly looks like the primary or official site, include that URL and host; otherwise keep them null. "
+            "Keep site_follow_up_reason short and concrete."
         )
         last_error: Exception | None = None
         rewrite_models: list[str] = []
@@ -749,10 +863,10 @@ class OpenAISearchMixin:
                 )
                 request["text"] = {"format": _search_responses_text_format()}
                 response = self._client.responses.create(**request)
-                spoken_answer = _extract_structured_search_answer(self._extract_output_text(response))
-                if spoken_answer:
+                structured_result = _extract_structured_search_answer(self._extract_output_text(response))
+                if structured_result.spoken_answer:
                     return OpenAISearchResult(
-                        answer=spoken_answer,
+                        answer=structured_result.spoken_answer,
                         sources=candidate.sources,
                         response_id=candidate.response_id,
                         request_id=candidate.request_id,
@@ -762,6 +876,12 @@ class OpenAISearchMixin:
                         requested_model=candidate.requested_model,
                         fallback_reason=candidate.fallback_reason,
                         attempt_log=candidate.attempt_log,
+                        verification_status=structured_result.verification_status,
+                        question_resolved=structured_result.question_resolved,
+                        site_follow_up_recommended=structured_result.site_follow_up_recommended,
+                        site_follow_up_reason=structured_result.site_follow_up_reason,
+                        site_follow_up_url=structured_result.site_follow_up_url,
+                        site_follow_up_domain=structured_result.site_follow_up_domain,
                     )
             except Exception as exc:  # pragma: no cover - defensive runtime fallback
                 last_error = exc

@@ -41,6 +41,11 @@ from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.text_utils import retrieval_terms
 
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+_TEST_MARTA_PHONE_OLD = "+15555551122"
+_TEST_MARTA_PHONE_NEW = "+15555553456"
+
 
 class _FakeRemoteState:
     def __init__(self) -> None:
@@ -1086,22 +1091,22 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             old_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_old",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +491761234.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                 source=_source(),
                 status="active",
                 confidence=0.95,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+491761234",
+                value_key=_TEST_CORINNA_PHONE_OLD,
             )
             new_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_new",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +4940998877.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                 source=_source(),
                 status="uncertain",
                 confidence=0.92,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+4940998877",
+                value_key=_TEST_CORINNA_PHONE_NEW,
             )
             conflict = LongTermMemoryConflictV1(
                 slot_key="contact:person:corinna_maier:phone",
@@ -1205,22 +1210,22 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             old_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_old",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +491761234.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                 source=_source(),
                 status="active",
                 confidence=0.95,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+491761234",
+                value_key=_TEST_CORINNA_PHONE_OLD,
             )
             new_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_new",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +4940998877.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                 source=_source(),
                 status="uncertain",
                 confidence=0.92,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+4940998877",
+                value_key=_TEST_CORINNA_PHONE_NEW,
             )
             conflict = LongTermMemoryConflictV1(
                 slot_key="contact:person:corinna_maier:phone",
@@ -1232,22 +1237,22 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             old_marta_phone = LongTermMemoryObjectV1(
                 memory_id="fact:marta_phone_old",
                 kind="contact_method_fact",
-                summary="Marta Schulz can be reached at +49170111222.",
+                summary=f"Marta Schulz can be reached at {_TEST_MARTA_PHONE_OLD}.",
                 source=_source(),
                 status="active",
                 confidence=0.95,
                 slot_key="contact:person:marta_schulz:phone",
-                value_key="+49170111222",
+                value_key=_TEST_MARTA_PHONE_OLD,
             )
             new_marta_phone = LongTermMemoryObjectV1(
                 memory_id="fact:marta_phone_new",
                 kind="contact_method_fact",
-                summary="Marta Schulz can be reached at +4930123456.",
+                summary=f"Marta Schulz can be reached at {_TEST_MARTA_PHONE_NEW}.",
                 source=_source(),
                 status="uncertain",
                 confidence=0.9,
                 slot_key="contact:person:marta_schulz:phone",
-                value_key="+4930123456",
+                value_key=_TEST_MARTA_PHONE_NEW,
             )
             second_conflict = LongTermMemoryConflictV1(
                 slot_key="contact:person:marta_schulz:phone",
@@ -1316,11 +1321,12 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(conflicts, ())
         self.assertEqual(remote_state.client.topk_records_calls, 0)
 
-    def test_select_relevant_objects_records_remote_read_histograms_for_search_and_batch(self) -> None:
+    def test_remote_catalog_records_endpoint_and_payload_kind_histograms_for_topk_search_and_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
             remote_state = _FakeRemoteState()
             remote_state.required = True
+            remote_state.client.supports_topk_records = True
             remote_state.config.project_root = str(project_root)
             store = LongTermStructuredStore(
                 base_path=project_root / "state" / "chonkydb",
@@ -1345,25 +1351,41 @@ class LongTermStructuredStoreTests(unittest.TestCase):
                 conflicts=(),
                 archived_objects=(),
             )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
 
-            relevant = store.select_relevant_objects(
-                query_text="Früher stand die rote Thermoskanne",
+            relevant = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text="Thermoskanne",
                 limit=3,
+            )
+            hydrated = remote_catalog.load_item_payloads(
+                snapshot_kind="objects",
+                item_ids=("fact:0", "fact:1"),
             )
             histogram_path = project_root / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
             payload = json.loads(histogram_path.read_text(encoding="utf-8"))
 
         self.assertEqual(len(relevant), 3)
+        self.assertEqual(len(hydrated), 2)
         operations = dict(payload.get("operations") or {})
-        self.assertIn("objects:retrieve_search", operations)
-        self.assertIn("objects:retrieve_batch", operations)
-        search_entry = dict(operations["objects:retrieve_search"])
-        batch_entry = dict(operations["objects:retrieve_batch"])
+        self.assertIn("objects:topk_search", operations)
+        self.assertIn("objects:topk_batch", operations)
+        search_entry = dict(operations["objects:topk_search"])
+        batch_entry = dict(operations["objects:topk_batch"])
         self.assertEqual(search_entry["last_outcome"], "ok")
         self.assertEqual(search_entry["last_classification"], "ok")
+        self.assertEqual(search_entry["last_request_endpoint"], "POST /v1/external/retrieve/topk_records")
+        self.assertEqual(search_entry["last_request_payload_kind"], "topk_scope_query")
+        self.assertGreaterEqual(int(dict(search_entry["request_endpoint_counts"])["POST /v1/external/retrieve/topk_records"]), 1)
+        self.assertGreaterEqual(int(dict(search_entry["request_payload_kind_counts"])["topk_scope_query"]), 1)
         self.assertGreaterEqual(int(search_entry["total_count"]), 1)
         self.assertEqual(batch_entry["last_outcome"], "ok")
         self.assertEqual(batch_entry["last_classification"], "ok")
+        self.assertEqual(batch_entry["last_request_endpoint"], "POST /v1/external/retrieve/topk_records")
+        self.assertEqual(batch_entry["last_request_payload_kind"], "topk_allowed_doc_batch")
+        self.assertGreaterEqual(int(dict(batch_entry["request_endpoint_counts"])["POST /v1/external/retrieve/topk_records"]), 1)
+        self.assertGreaterEqual(int(dict(batch_entry["request_payload_kind_counts"])["topk_allowed_doc_batch"]), 1)
         self.assertGreaterEqual(int(batch_entry["total_count"]), 1)
 
     def test_select_relevant_objects_degrades_remote_search_timeout_to_local_catalog_selection(self) -> None:
@@ -1471,22 +1493,22 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             old_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_old",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +491761234.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                 source=_source(),
                 status="active",
                 confidence=0.95,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+491761234",
+                value_key=_TEST_CORINNA_PHONE_OLD,
             )
             new_phone = LongTermMemoryObjectV1(
                 memory_id="fact:corinna_phone_new",
                 kind="contact_method_fact",
-                summary="Corinna Maier can be reached at +4940998877.",
+                summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                 source=_source(),
                 status="uncertain",
                 confidence=0.92,
                 slot_key="contact:person:corinna_maier:phone",
-                value_key="+4940998877",
+                value_key=_TEST_CORINNA_PHONE_NEW,
             )
             conflict = LongTermMemoryConflictV1(
                 slot_key="contact:person:corinna_maier:phone",
@@ -4248,24 +4270,24 @@ class LongTermStructuredStoreTests(unittest.TestCase):
                     LongTermMemoryObjectV1(
                         memory_id="fact:corinna_phone_old",
                         kind="contact_method_fact",
-                        summary="Corinna Maier can be reached at +491761234.",
+                        summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
                         source=_source(),
                         status="active",
                         confidence=0.95,
                         slot_key="contact:person:corinna_maier:phone",
-                        value_key="+491761234",
+                        value_key=_TEST_CORINNA_PHONE_OLD,
                     ),
                 ),
                 deferred_objects=(
                     LongTermMemoryObjectV1(
                         memory_id="fact:corinna_phone_new",
                         kind="contact_method_fact",
-                        summary="Corinna Maier can be reached at +4940998877.",
+                        summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
                         source=_source(),
                         status="uncertain",
                         confidence=0.92,
                         slot_key="contact:person:corinna_maier:phone",
-                        value_key="+4940998877",
+                        value_key=_TEST_CORINNA_PHONE_NEW,
                     ),
                 ),
                 conflicts=(

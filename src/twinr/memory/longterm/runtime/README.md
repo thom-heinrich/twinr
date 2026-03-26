@@ -16,6 +16,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
 - Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
 - Persist conversation turns and multimodal evidence through bounded workers
+- Preserve turn provenance such as external channel source and input modality so text channels like WhatsApp reach durable memory and personality learning as first-class turns instead of generic voice-only records
 - Coalesce high-frequency sensor observations onto a latest-only idle-loop handoff before they hit multimodal long-term persistence, so proactive sensor churn cannot build an unbounded remote write backlog
 - Route consolidated conversation turns and post-turn tool history into the structured personality-learning service without mixing that policy into the core memory algorithms
 - Keep foreground turn finalization bounded by queueing tool-history learning without taking the shared long-term store lock first, then letting the later conversation-persistence/flush path commit those signals under the existing long-term store lock
@@ -29,8 +30,9 @@ bounded background writers into the APIs used by agent runtime loops.
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Propagate successful external watchdog attestations back into every owned remote-state adapter so stale local cooldown state cannot contradict the Pi's required-remote gate
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
-- Split remote readiness into a strict bootstrap pass and a cheaper steady-state watchdog pass so live keepalives can prove current remote readability without reseeding every snapshot on every tick
-- Skip the heavier `archive` snapshot during steady-state watchdog probes while keeping startup and recovery fully archive-inclusive and fail closed
+- Split remote readiness into a strict bootstrap pass and a no-bootstrap steady-state watchdog pass so live keepalives can reuse warm remote state without reseeding every snapshot on every tick
+- Expose explicit attestation tiers so lighter current-only probes are visible as degraded/current-only instead of looking archive-safe
+- Keep the external required-remote watchdog archive-inclusive even in steady state so a green watchdog sample remains archive-safe and valid for startup/recovery gating
 - Fail closed when any required remote snapshot or shard is unreadable
 - Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
 - Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
@@ -69,6 +71,8 @@ fast_context = service.build_fast_provider_context(query_text)  # compact quick-
 service.enqueue_conversation_turn(
     transcript=user_text,
     response=assistant_text,
+    source="whatsapp",
+    modality="text",
 )
 service.enqueue_personality_tool_history(
     tool_calls=tool_calls,

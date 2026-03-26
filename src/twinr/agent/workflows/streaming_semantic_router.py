@@ -219,7 +219,13 @@ def _synthesize_supervisor_decision(
         kind=_handoff_kind_for_label(route_label),
         goal=_handoff_goal_for_label(route_label),
         allow_web_search=(route_label == "web"),
-        context_scope=("full_context" if route_label == "memory" else None),
+        context_scope=(
+            "full_context"
+            if route_label == "memory"
+            else "tiny_recent"
+            if route_label == "tool"
+            else None
+        ),
         response_id=f"local_semantic_router:{route_label}",
         request_id=f"local_semantic_router:{route_label}:{_route_id_suffix(route_decision)}",
         model=route_decision.model_id,

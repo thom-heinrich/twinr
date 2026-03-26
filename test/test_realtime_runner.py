@@ -53,6 +53,7 @@ from twinr.agent.base_agent.conversation.closure import ConversationClosureDecis
 from twinr.agent.personality.intelligence import WorldFeedItem
 from twinr.agent.personality.steering import ConversationTurnSteeringCue
 from twinr.agent.tools.handlers.output import handle_search_live_info
+from twinr.agent.tools.runtime.browser_follow_up import peek_pending_browser_follow_up_hint
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileTarget,
@@ -74,6 +75,10 @@ from twinr.hardware.audio import (
     normalize_wav_playback_level,
 )
 from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
+
+
+_TEST_CORINNA_GRAPH_PHONE = "5551234"
+_TEST_CORINNA_NEIGHBOR_PHONE = "5559988"
 
 
 def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
@@ -234,6 +239,9 @@ class FakePrintBackend:
             used_web_search=True,
             model="gpt-5.2-chat-latest",
             token_usage=None,
+            verification_status="verified",
+            question_resolved=True,
+            site_follow_up_recommended=False,
         )
 
     def respond_to_images_with_metadata(
@@ -737,21 +745,25 @@ class FakeVoiceOrchestrator:
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
+        presence_active: bool | None = None,
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        voice_quiet_until_utc: str | None = None,
     ) -> None:
         self.states.append((state, detail, follow_up_allowed))
-        self.intent_contexts.append(
-            {
-                "attention_state": attention_state,
-                "interaction_intent_state": interaction_intent_state,
-                "person_visible": person_visible,
-                "interaction_ready": interaction_ready,
-                "targeted_inference_blocked": targeted_inference_blocked,
-                "recommended_channel": recommended_channel,
-            }
-        )
+        payload = {
+            "attention_state": attention_state,
+            "interaction_intent_state": interaction_intent_state,
+            "person_visible": person_visible,
+            "presence_active": presence_active,
+            "interaction_ready": interaction_ready,
+            "targeted_inference_blocked": targeted_inference_blocked,
+            "recommended_channel": recommended_channel,
+        }
+        if voice_quiet_until_utc is not None:
+            payload["voice_quiet_until_utc"] = voice_quiet_until_utc
+        self.intent_contexts.append(payload)
 
     def pause_capture(self, *, reason: str) -> None:
         self.paused.append(reason)
@@ -1629,6 +1641,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(backend.synthesize_calls, ["Guten Tag"])
         self.assertEqual(player.played, [b"PCM"])
         self.assertIn("realtime_audio_fallback=true", lines)
+        self.assertIn("realtime_turn_provider_complete=true", lines)
+        self.assertIn("realtime_turn_provider_audio_received=false", lines)
+        self.assertIn("realtime_turn_tts_fallback_start=true", lines)
+        self.assertIn("realtime_tts_playback_started=true", lines)
+        self.assertIn("realtime_tts_playback_completed=true", lines)
+        self.assertIn("realtime_turn_tts_fallback_done=true", lines)
         self.assertTrue(any(line.startswith("timing_tts_fallback_ms=") for line in lines))
 
     def test_yellow_button_accepts_split_support_providers(self) -> None:
@@ -1666,6 +1684,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.pause_values, [])
         self.assertGreaterEqual(len(player.tones), 1)
         self.assertIn("voice_activation_mode=direct_text", lines)
+        self.assertIn("realtime_turn_provider_complete=true", lines)
+        self.assertIn("realtime_turn_provider_audio_received=true", lines)
+        self.assertIn("realtime_turn_finalize_start=true", lines)
+        self.assertIn("realtime_turn_finish_path=finish_speaking", lines)
+        self.assertIn("realtime_turn_finalize_done=true", lines)
+        self.assertNotIn("realtime_turn_tts_fallback_start=true", lines)
         self.assertEqual(loop.runtime.last_transcript, "")
         self.assertIn("transcript=Hallo Twinr", lines)
 
@@ -1694,6 +1718,37 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"WAVPCM", b"PCM"])
         self.assertIn("voice_activation_mode=listen", lines)
         self.assertIn("voice_activation_ack=Ja?", lines)
+
+    def test_voice_activation_is_ignored_while_runtime_quiet_mode_is_active(self) -> None:
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+        quiet_state = loop.runtime.set_voice_quiet_minutes(minutes=20, reason="tv news")
+        loop._refresh_voice_orchestrator_sensor_context()
+
+        handled = loop.handle_voice_activation(
+            VoiceActivationMatch(
+                detected=True,
+                transcript="Hey Twinr bist du ruhig",
+                matched_phrase="hey twinr",
+                remaining_text="bist du ruhig",
+                normalized_transcript="hey twinr bist du ruhig",
+            )
+        )
+
+        self.assertFalse(handled)
+        self.assertTrue(loop.runtime.voice_quiet_active())
+        self.assertEqual(realtime_session.text_calls, [])
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(recorder.pause_values, [])
+        self.assertEqual(player.tones, [])
+        self.assertIn("voice_activation_skipped=voice_quiet", lines)
+        self.assertEqual(fake_voice.states[-1], ("waiting", "voice_quiet_active", False))
+        self.assertEqual(
+            fake_voice.intent_contexts[-1]["voice_quiet_until_utc"],
+            quiet_state.until_utc,
+        )
 
     def test_voice_orchestrator_activation_without_remaining_text_uses_same_stream_remote_commit(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
@@ -1761,6 +1816,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 "attention_state": "attending_to_device",
                 "interaction_intent_state": "showing_intent",
                 "person_visible": True,
+                "presence_active": None,
                 "interaction_ready": True,
                 "targeted_inference_blocked": False,
                 "recommended_channel": "speech",
@@ -2043,6 +2099,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     "attention_state": "attending_to_device",
                     "interaction_intent_state": "showing_intent",
                     "person_visible": True,
+                    "presence_active": None,
                     "interaction_ready": True,
                     "targeted_inference_blocked": False,
                     "recommended_channel": "speech",
@@ -2083,6 +2140,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     "attention_state": "attending_to_device",
                     "interaction_intent_state": "showing_intent",
                     "person_visible": True,
+                    "presence_active": None,
                     "interaction_ready": True,
                     "targeted_inference_blocked": False,
                     "recommended_channel": "speech",
@@ -2179,6 +2237,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
 
         self.assertTrue(handled)
+        self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
         self.assertIn(("thinking", "voice_activation", False), fake_voice.states)
         self.assertIn(("speaking", "voice_activation", True), fake_voice.states)
         self.assertIn(("follow_up_open", "voice_activation", True), fake_voice.states)
@@ -4224,7 +4283,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 {
                     "given_name": "Corinna",
                     "family_name": "Maier",
-                    "phone": "01761234",
+                    "phone": _TEST_CORINNA_GRAPH_PHONE,
                     "role": "Physiotherapeutin",
                     "confirmed": True,
                 }
@@ -4233,7 +4292,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 {
                     "given_name": "Corinna",
                     "family_name": "Schmidt",
-                    "phone": "0309988",
+                    "phone": _TEST_CORINNA_NEIGHBOR_PHONE,
                     "role": "Nachbarin",
                     "confirmed": True,
                 }
@@ -4258,33 +4317,186 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(lookup["options"]), 2)
         self.assertEqual(resolved["status"], "found")
         self.assertEqual(resolved["label"], "Corinna Maier")
-        self.assertEqual(resolved["phones"], ["01761234"])
+        self.assertEqual(resolved["phones"], [_TEST_CORINNA_GRAPH_PHONE])
         self.assertIn("graph_contact_tool_call=true", lines)
         self.assertIn("graph_contact_lookup=true", lines)
+
+    def test_send_whatsapp_message_tool_requires_confirmation_then_sends(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.lookup_contact = mock.Mock(
+                return_value=SimpleNamespace(
+                    status="found",
+                    match=SimpleNamespace(
+                        label="Anna Schulz",
+                        role="Tochter",
+                        phones=("+15555552233",),
+                        emails=(),
+                    ),
+                )
+            )
+
+            first = loop._handle_send_whatsapp_message_tool_call(
+                {
+                    "name": "Anna",
+                    "message": "Ich komme spaeter.",
+                }
+            )
+            with mock.patch(
+                "twinr.agent.tools.handlers.whatsapp.dispatch_whatsapp_outbound_message",
+                return_value=SimpleNamespace(
+                    status="sent",
+                    ok=True,
+                    message_id="wa-msg-1",
+                    error_code=None,
+                    error=None,
+                ),
+            ) as dispatch_mock:
+                second = loop._handle_send_whatsapp_message_tool_call(
+                    {
+                        "name": "Anna",
+                        "message": "Ich komme spaeter.",
+                        "confirmed": True,
+                    }
+                )
+
+        self.assertEqual(first["status"], "confirmation_required")
+        self.assertTrue(first["requires_confirmation"])
+        self.assertIn("Anna Schulz", first["question"])
+        self.assertEqual(second["status"], "sent")
+        self.assertEqual(second["message_id"], "wa-msg-1")
+        self.assertEqual(second["phone_last4"], "...2233")
+        dispatch_mock.assert_called_once_with(
+            loop.config,
+            chat_jid="15555552233@s.whatsapp.net",
+            text="Ich komme spaeter.",
+            recipient_label="Anna Schulz",
+        )
+        self.assertIn("whatsapp_send_tool_call=true", lines)
+        self.assertIn("whatsapp_send_status=sent", lines)
+
+    def test_send_whatsapp_message_tool_surfaces_contact_clarification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.lookup_contact = mock.Mock(
+                return_value=SimpleNamespace(
+                    status="needs_clarification",
+                    question="Welche Corinna meinst du?",
+                    options=(
+                        SimpleNamespace(
+                            label="Corinna Maier",
+                            role="Physiotherapeutin",
+                            phones=("+15555554567",),
+                            emails=(),
+                        ),
+                        SimpleNamespace(
+                            label="Corinna Schmidt",
+                            role="Nachbarin",
+                            phones=("+15555553456",),
+                            emails=(),
+                        ),
+                    ),
+                )
+            )
+
+            result = loop._handle_send_whatsapp_message_tool_call(
+                {
+                    "name": "Corinna",
+                    "message": "Kannst du mich spaeter anrufen?",
+                }
+            )
+
+        self.assertEqual(result["status"], "needs_clarification")
+        self.assertEqual(result["question"], "Welche Corinna meinst du?")
+        self.assertEqual(len(result["options"]), 2)
+        self.assertEqual(result["options"][0]["phone_last4_options"], ["...4567"])
+
+    def test_send_whatsapp_message_tool_requires_phone_suffix_when_contact_has_multiple_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.lookup_contact = mock.Mock(
+                return_value=SimpleNamespace(
+                    status="found",
+                    match=SimpleNamespace(
+                        label="Anna Schulz",
+                        role="Tochter",
+                        phones=("+15555552233", "+15555554444"),
+                        emails=(),
+                    ),
+                )
+            )
+
+            first = loop._handle_send_whatsapp_message_tool_call(
+                {
+                    "name": "Anna",
+                    "message": "Bitte melde dich kurz.",
+                    "confirmed": True,
+                }
+            )
+            with mock.patch(
+                "twinr.agent.tools.handlers.whatsapp.dispatch_whatsapp_outbound_message",
+                return_value=SimpleNamespace(
+                    status="sent",
+                    ok=True,
+                    message_id="wa-msg-2",
+                    error_code=None,
+                    error=None,
+                ),
+            ) as dispatch_mock:
+                second = loop._handle_send_whatsapp_message_tool_call(
+                    {
+                        "name": "Anna",
+                        "message": "Bitte melde dich kurz.",
+                        "confirmed": True,
+                        "phone_last4": "4444",
+                    }
+                )
+
+        self.assertEqual(first["status"], "needs_phone_clarification")
+        self.assertEqual(first["options"], ["...2233", "...4444"])
+        self.assertEqual(second["status"], "sent")
+        dispatch_mock.assert_called_once_with(
+            loop.config,
+            chat_jid="15555554444@s.whatsapp.net",
+            text="Bitte melde dich kurz.",
+            recipient_label="Anna Schulz",
+        )
 
     def test_memory_conflict_tool_calls_list_and_resolve_open_conflicts(self) -> None:
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary="Corinna Maier can be reached at +15555551234.",
             details="Use the mobile number ending in 1234.",
             source=_longterm_source("turn:1"),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key="+15555551234",
             attributes={"person_ref": "person:corinna_maier"},
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary="Corinna Maier can be reached at +15555558877.",
             details="Use the office number ending in 8877.",
             source=_longterm_source("turn:2"),
             status="uncertain",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key="+15555558877",
             attributes={"person_ref": "person:corinna_maier"},
         )
         conflict = LongTermMemoryConflictV1(
@@ -4349,22 +4561,22 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary="Corinna Maier can be reached at +15555551234.",
             source=_longterm_source("turn:1"),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key="+15555551234",
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary="Corinna Maier can be reached at +15555558877.",
             source=_longterm_source("turn:2"),
             status="uncertain",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key="+15555558877",
         )
         conflict = LongTermMemoryConflictV1(
             slot_key="contact:person:corinna_maier:phone",
@@ -4708,6 +4920,34 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("OPENAI_TTS_SPEED=0.90", env_text)
         self.assertIn("OPENAI_REALTIME_SPEED=0.90", env_text)
 
+    def test_manage_voice_quiet_mode_tool_call_sets_and_clears_runtime_window(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+
+        active = loop._handle_manage_voice_quiet_mode_tool_call(
+            {
+                "action": "set",
+                "duration_minutes": 20,
+                "reason": "tv news",
+            }
+        )
+        status = loop._handle_manage_voice_quiet_mode_tool_call({"action": "status"})
+        cleared = loop._handle_manage_voice_quiet_mode_tool_call({"action": "clear"})
+
+        self.assertEqual(active["status"], "active")
+        self.assertTrue(active["active"])
+        self.assertEqual(active["reason"], "tv news")
+        self.assertGreater(active["remaining_minutes"], 0)
+        self.assertEqual(status["status"], "active")
+        self.assertEqual(cleared["status"], "cleared")
+        self.assertFalse(cleared["active"])
+        self.assertFalse(loop.runtime.voice_quiet_active())
+        self.assertTrue(any("voice_quiet_until_utc" in context for context in fake_voice.intent_contexts))
+        self.assertTrue(any(line == "voice_quiet_tool_call=set" for line in lines))
+        self.assertTrue(any(line == "voice_quiet_tool_call=clear" for line in lines))
+
     def test_voice_profile_tools_can_enroll_status_and_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -4971,6 +5211,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             model="gpt-4o-mini",
             requested_model="gpt-5.4-mini",
             fallback_reason="gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
+            verification_status="partial",
+            question_resolved=False,
+            site_follow_up_recommended=True,
+            site_follow_up_reason="The official site may still clarify the exact departure.",
+            site_follow_up_url="https://example.com/fahrplan",
+            site_follow_up_domain="example.com",
             attempt_log=(
                 OpenAISearchAttempt(
                     model="gpt-5.4-mini",
@@ -5003,6 +5249,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             result["fallback_reason"],
             "gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
         )
+        self.assertEqual(result["verification_status"], "partial")
+        self.assertFalse(result["question_resolved"])
+        self.assertTrue(result["site_follow_up_recommended"])
+        self.assertEqual(result["site_follow_up_reason"], "The official site may still clarify the exact departure.")
+        self.assertEqual(result["site_follow_up_url"], "https://example.com/fahrplan")
+        self.assertEqual(result["site_follow_up_domain"], "example.com")
         self.assertEqual(result["search_budget_trace"], "1024->1536")
         self.assertTrue(result["search_budget_escalated"])
         self.assertEqual(result["search_initial_output_budget"], 1024)
@@ -5027,6 +5279,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             latest["fallback_reason"],
             "gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
         )
+        self.assertEqual(latest["verification_status"], "partial")
+        self.assertFalse(latest["question_resolved"])
+        self.assertTrue(latest["site_follow_up_recommended"])
+        self.assertEqual(latest["site_follow_up_reason"], "The official site may still clarify the exact departure.")
+        self.assertEqual(latest["site_follow_up_url"], "https://example.com/fahrplan")
+        self.assertEqual(latest["site_follow_up_domain"], "example.com")
         self.assertEqual(latest["search_budget_trace"], "1024->1536")
         self.assertTrue(latest["search_budget_escalated"])
         self.assertEqual(latest["search_initial_output_budget"], 1024)
@@ -5060,6 +5318,49 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         time.sleep(0.05)
+
+    def test_search_tool_call_records_pending_browser_follow_up_hint(self) -> None:
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop()
+        print_backend.search_live_info_with_metadata = lambda *args, **kwargs: SimpleNamespace(
+            answer="Auf der offiziellen Website sollte man das direkt prüfen.",
+            sources=("https://www.cafe-luise-baeckerei.de/",),
+            response_id="resp_search_hint_1",
+            request_id="req_search_hint_1",
+            used_web_search=True,
+            model="gpt-5.4-mini",
+            requested_model="gpt-5.4-mini",
+            fallback_reason=None,
+            verification_status="partial",
+            question_resolved=False,
+            site_follow_up_recommended=True,
+            site_follow_up_reason="Die offizielle Website sollte geprüft werden.",
+            site_follow_up_url="https://www.cafe-luise-baeckerei.de/",
+            site_follow_up_domain="cafe-luise-baeckerei.de",
+            attempt_log=(),
+            token_usage=None,
+        )
+
+        result = handle_search_live_info(
+            loop,
+            {
+                "question": "Hat Café Luise heute ein Mittagsmenü veröffentlicht?",
+                "location_hint": "Hamburg",
+            },
+        )
+
+        hint = peek_pending_browser_follow_up_hint(loop.runtime)
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertEqual(result["site_follow_up_url"], "https://www.cafe-luise-baeckerei.de/")
+        self.assertEqual(hint.follow_up_url, "https://www.cafe-luise-baeckerei.de/")
+        self.assertEqual(hint.follow_up_domain, "cafe-luise-baeckerei.de")
+        self.assertEqual(hint.verification_status, "partial")
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=20))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
 
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(

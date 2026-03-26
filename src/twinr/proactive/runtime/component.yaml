@@ -34,6 +34,9 @@ owned_concerns:
   - Mirror clear stabilized user camera gestures into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
   - Publish sparse personality-driven HDMI reserve impulses only when quiet-hours, cadence, presence, and reserve-surface ownership all allow it
   - Blend right-lane ambient companion candidates from personality, durable memory hooks, slower reflection summaries, and long-horizon shown-card outcome learning through one modular orchestration path
+  - Backfill additional reserve-lane semantic topics from latent personality snapshot continuity, relationship, place, and concrete world-signal state when stronger explicit loaders stay sparse
+  - Expand grounded semantic reserve topics into multiple deterministic card surfaces while preserving one shared semantic topic key for answer-based retirement, feedback, and learning
+  - Keep reserve-card writer/judge gold examples plus the shared quality rubric in one focused copy-contract module so prompt assets stay small, versioned, and family-generic
   - Blend reserve-lane candidates from personality state plus durable memory follow-up and clarification hooks so ambient prompts can also strengthen Twinr's long-term memory
   - Publish guided user-discovery start, resume, and short profile-review invitations into the same reserve lane so lifelong profile learning stays visible without a second profile UI
   - Derive direct reserve-lane world candidates from active RSS subscriptions and condensed awareness threads so seeded world breadth still reaches the right-hand lane when other sources are temporarily sparse
@@ -194,10 +197,35 @@ files:
   - path: display_reserve_candidates.py
     role: Compatibility wrapper that keeps the historic reserve-candidate loader stable while delegating real sourcing to the modular ambient companion flow
   - path: display_reserve_flow.py
-    role: Shared ambient companion orchestration that blends personality, memory, reflection, and long-horizon reserve-lane learning into one bounded candidate pool
+    role: Shared ambient companion orchestration that blends personality, memory, reflection, latent snapshot-topic backfill, and long-horizon reserve-lane learning into one bounded semantic-topic pool, with a raw selected-card seam for eval harnesses before copy rewrite and deterministic card-surface expansion
     exports:
       - DisplayReserveCompanionFlow
       - DisplayReserveCompanionFlowContext
+  - path: display_reserve_diversity.py
+    role: Shared reserve-lane diversity policy that normalizes raw implementation-shaped sources into broader conversational seed families and axes, then selects a broader raw candidate subset for plan building and copy rewrite
+    exports:
+      - DEFAULT_DISPLAY_RESERVE_DIVERSITY_POLICY
+      - DisplayReserveDiversityPolicy
+      - DisplayReserveSeedProfile
+      - display_reserve_seed_profile
+      - reserve_seed_axis
+      - reserve_seed_family
+      - select_diverse_candidates
+  - path: display_reserve_expansion.py
+    role: Deterministic semantic-topic bundling and multi-angle right-lane card expansion that keeps concrete card ids separate from grouped semantic topic keys used by feedback, retirement, and learning
+    exports:
+      - DisplayReserveTopicBundle
+      - bundle_display_reserve_candidates
+      - expand_display_reserve_candidates
+  - path: display_reserve_copy_contract.py
+    role: Shared reserve-card copy assets that normalize candidate families and expose family-scoped gold examples plus the shared quality rubric for writer/judge prompts
+    exports:
+      - ReserveCopyExample
+      - ReserveCopyRubricCriterion
+      - reserve_copy_examples_for_family
+      - reserve_copy_examples_payload
+      - reserve_copy_rubric_payload
+      - resolve_reserve_copy_family
   - path: display_reserve_learning.py
     role: Long-horizon reserve-lane learning profile derived from durable shown-card outcomes so future plans can reward welcome openers and cool repetitive ones generically
     exports:
@@ -205,32 +233,41 @@ files:
       - DisplayReserveLearningProfileBuilder
       - DisplayReserveLearningSignal
   - path: display_reserve_memory.py
-    role: Focused conversion of durable clarification conflicts and gentle follow-ups into reserve-lane candidate families
+    role: Focused conversion of durable clarification conflicts and gentle follow-ups into reserve-lane candidate families, including semantic card_intent payloads for calm clarification and follow-up wording
     exports:
       - DisplayReserveMemoryCandidateSet
       - build_memory_conflict_candidate
       - build_memory_follow_up_candidate
       - load_display_reserve_memory_candidates
+  - path: display_reserve_snapshot_topics.py
+    role: Latent snapshot-topic reserve loader that backfills additional continuity, relationship, place, and concrete world-signal seeds from the persisted personality snapshot when stronger explicit loaders stay sparse
+    exports:
+      - load_display_reserve_snapshot_candidates
   - path: display_reserve_user_discovery.py
-    role: Guided user-discovery reserve-candidate loader for start, resume, and short profile-review invites
+    role: Guided user-discovery reserve-candidate loader for start, resume, and short profile-review invites, including semantic card_intent payloads for reserve-card generation
     exports:
       - load_display_reserve_user_discovery_candidates
   - path: display_reserve_reflection.py
-    role: Reflection-derived reserve-candidate loader for summaries and midterm packets that should inform the ambient lane without reflection-specific coupling elsewhere
+    role: Reflection-derived reserve-candidate loader for summaries and midterm packets that should inform the ambient lane without reflection-specific coupling elsewhere, including semantic card_intent payloads for calm callback/follow-up wording
     exports:
       - DisplayReserveReflectionConfig
       - load_display_reserve_reflection_candidates
   - path: display_reserve_world.py
-    role: Direct world-intelligence reserve-candidate loader that turns active RSS subscriptions and condensed awareness threads into calm topic-breadth candidates for the right-hand lane
+    role: Direct world-intelligence reserve-candidate loader that turns active RSS subscriptions and condensed awareness threads into calm topic-breadth candidates for the right-hand lane, including semantic card_intent payloads for public-topic observation cards
     exports:
       - load_display_reserve_world_candidates
   - path: display_reserve_prompting.py
-    role: Compact prompt-payload and anchor-shaping layer for reserve-card rewriting so the LLM sees explicit topical anchors and short context summaries instead of raw nested candidate payloads
+    role: Compact prompt-payload and anchor-shaping layer for reserve-card rewriting so the LLM sees explicit topical anchors, semantic card_intent hints, expansion angles, normalized copy families, shared quality rubric, and family-scoped gold examples instead of raw nested candidate payloads
     exports:
       - build_candidate_prompt_payload
       - build_generation_prompt
+      - build_selection_prompt
   - path: display_reserve_generation.py
-    role: Rewrite reserve-card wording through small bounded structured LLM batches without changing topic ranking or live publish cadence, using compact prompt payloads so slow calls and weak raw anchors do not dominate the right-lane UX
+    role: Rewrite reserve-card wording through small bounded structured writer/judge batches without changing semantic-topic grouping or live publish cadence, using compact prompt payloads plus configurable batch, variant, and local deadline limits so slow calls and weak raw anchors do not dominate the right-lane UX, and expose bounded trace metadata for eval harnesses
+    exports:
+      - DisplayReserveCopyGenerator
+      - DisplayReserveGenerationError
+      - DisplayReserveGenerationTrace
   - path: display_reserve_companion_planner.py
     role: Explicit overnight reserve-lane planner that runs nightly reflection/world refresh, summarizes recent shown-card outcomes, and stores the prepared next-day plan for morning adoption
     exports:
@@ -249,7 +286,7 @@ files:
       - parse_timestamp
       - utc_now
   - path: display_reserve_runtime.py
-    role: Shared right-lane reserve publisher that all text-card producers reuse so cue persistence and exposure history stay on one common runtime path
+    role: Shared right-lane reserve publisher that all text-card producers reuse so cue persistence and exposure history stay on one common runtime path with concrete card ids plus grouped semantic topic keys
     exports:
       - DisplayReserveRuntimePublishResult
       - DisplayReserveRuntimePublisher
@@ -265,7 +302,7 @@ files:
       - DisplaySocialReservePublishResult
       - DisplaySocialReservePublisher
   - path: display_reserve_day_plan.py
-    role: Build and persist one calm current-day reserve rotation from personality-driven candidate state, including short-lived feedback-driven replanning, generic source-family spacing, and answer-based same-day retirement instead of one-shot card exhaustion
+    role: Build and persist one calm current-day reserve rotation from expanded reserve card surfaces, including semantic-topic spacing, short-lived feedback-driven replanning, generic source-family spacing, and answer-based same-day retirement instead of one-shot card exhaustion
     exports:
       - DisplayReserveDayPlan
       - DisplayReserveDayPlanStore
@@ -401,6 +438,8 @@ tests:
   - path: test/test_display_reserve_reflection.py
   - path: test/test_display_reserve_world.py
   - path: test/test_display_reserve_flow.py
+  - path: test/test_display_reserve_snapshot_topics.py
+  - path: test/test_display_reserve_expansion.py
   - path: test/test_display_reserve_runtime.py
   - path: test/test_display_reserve_day_plan.py
   - path: test/test_display_reserve_companion_planner.py

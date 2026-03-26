@@ -9,13 +9,19 @@ integration layer. It blends:
 - slower reflection-derived summaries and midterm packets
 - long-horizon reserve-lane learning from prior visible card outcomes
 
-The result is still just a bounded candidate pool. Scheduling, publishing, and
-LLM copy rewriting remain in their dedicated modules.
+The result is a bounded card-surface pool rather than only raw topic seeds.
+Scheduling, publishing, and LLM copy rewriting remain in their dedicated
+modules, and the flow now exposes the selected-card seam as well so eval
+harnesses can exercise the same upstream selection path before copy rewrite.
+Broad seed-family diversity is normalized through the dedicated diversity
+module before semantic-topic expansion turns strong grounded topics into
+multiple card surfaces, and a dedicated latent-snapshot backfill path widens
+semantic topic breadth when the stronger explicit loaders stay sparse.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 
@@ -25,9 +31,11 @@ from twinr.agent.personality.display_impulses import (
     build_ambient_display_impulse_candidates,
 )
 from twinr.agent.personality.intelligence.store import RemoteStateWorldIntelligenceStore
+from twinr.agent.personality.models import PersonalitySnapshot
 from twinr.agent.personality.service import PersonalityContextService
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
+from .display_reserve_expansion import expand_display_reserve_candidates
 from .display_reserve_generation import DisplayReserveCopyGenerator
 from .display_reserve_learning import (
     DisplayReserveLearningProfile,
@@ -35,6 +43,7 @@ from .display_reserve_learning import (
 )
 from .display_reserve_memory import load_display_reserve_memory_candidates
 from .display_reserve_reflection import load_display_reserve_reflection_candidates
+from .display_reserve_snapshot_topics import load_display_reserve_snapshot_candidates
 from .display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
 from .display_reserve_world import load_display_reserve_world_candidates
 
@@ -66,7 +75,7 @@ def _candidate_sort_key(candidate: AmbientDisplayImpulseCandidate) -> tuple[floa
 class DisplayReserveCompanionFlowContext:
     """Collect the slower companion-flow inputs for one candidate pass."""
 
-    snapshot: object | None
+    snapshot: PersonalitySnapshot | None
     learning_profile: DisplayReserveLearningProfile
 
 
@@ -86,7 +95,28 @@ class DisplayReserveCompanionFlow:
         local_now: datetime,
         max_items: int,
     ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
-        """Return one bounded companion-flow candidate set for the reserve lane."""
+        """Return rewritten reserve candidates for the visible right-lane plan."""
+
+        snapshot, selected = self.load_raw_candidates(
+            config,
+            local_now=local_now,
+            max_items=max_items,
+        )
+        return self.copy_generator.rewrite_candidates(
+            config=config,
+            snapshot=snapshot,
+            candidates=selected,
+            local_now=local_now,
+        )
+
+    def load_raw_candidates(
+        self,
+        config: TwinrConfig,
+        *,
+        local_now: datetime,
+        max_items: int,
+    ) -> tuple[PersonalitySnapshot | None, tuple[AmbientDisplayImpulseCandidate, ...]]:
+        """Return snapshot plus selected reserve candidates before copy rewrite."""
 
         limited_max = max(1, int(max_items))
         snapshot = self.personality_service.load_snapshot(config=config)
@@ -136,20 +166,27 @@ class DisplayReserveCompanionFlow:
                 max_items=max(limited_max, 4),
             )
         )
+        candidates.extend(
+            load_display_reserve_snapshot_candidates(
+                snapshot,
+                engagement_signals=engagement_signals,
+                exclude_topic_keys=tuple(
+                    candidate.semantic_key() or candidate.topic_key
+                    for candidate in candidates
+                ),
+                max_items=max(limited_max, 12),
+            )
+        )
 
         adapted = tuple(
             self._apply_learning_profile(candidate, profile=learning_profile)
             for candidate in candidates
         )
-        deduped = self._dedupe(adapted)
-        ranked = sorted(deduped.values(), key=_candidate_sort_key, reverse=True)
-        selected = tuple(ranked[:limited_max])
-        return self.copy_generator.rewrite_candidates(
-            config=config,
-            snapshot=snapshot,
-            candidates=selected,
-            local_now=local_now,
+        expanded = expand_display_reserve_candidates(
+            adapted,
+            target_cards=limited_max,
         )
+        return snapshot, expanded
 
     def _apply_learning_profile(
         self,

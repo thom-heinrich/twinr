@@ -143,7 +143,11 @@ class TwinrTextChannelTurnService:
                                 allow_web_search=self.allow_web_search,
                             )
                         with workflow_span(name="text_channel_complete_agent_turn", kind="mutation"):
-                            answer = self.runtime.complete_agent_turn(response.text)
+                            answer = self.runtime.complete_agent_turn(
+                                response.text,
+                                source=message.channel,
+                                modality="text",
+                            )
                         with workflow_span(name="text_channel_finish_speaking", kind="mutation"):
                             self.runtime.finish_speaking()
                         metadata: dict[str, str] = {}

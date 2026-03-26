@@ -12,6 +12,7 @@ owned_concerns:
   - Resolve per-bridge Hue application keys and aggregate multiple configured bridges when smart-home routing needs them
   - Expose generic smart-home contracts and provider packages under src/twinr/integrations/smarthome
   - Persist integration configuration and expose integration automation family blocks to the web layer
+  - Normalize bounded social-history learning consent and import-state records shared by the portal and runtime queue workers
 out_of_scope:
   - Provider-specific email transport, normalization, and adapter behavior in src/twinr/integrations/email
   - Provider-specific calendar event parsing and agenda behavior in src/twinr/integrations/calendar
@@ -84,6 +85,15 @@ files:
       - ManagedIntegrationConfig
       - TwinrIntegrationStore
       - integration_store_path
+  - path: social_history.py
+    role: Canonical social-history learning consent and import-state normalization shared by the portal and runtime
+    exports:
+      - SOCIAL_HISTORY_ALLOWED_SOURCES
+      - SOCIAL_HISTORY_LEARNING_INTEGRATION_ID
+      - SOCIAL_HISTORY_LOOKBACK_OPTIONS
+      - SOCIAL_HISTORY_SOURCE_WHATSAPP
+      - SocialHistoryLearningConfig
+      - social_history_record_with_import_state
   - path: web_automation_families.py
     role: Dashboard automation-family provider blocks for managed integrations
     exports:
@@ -161,7 +171,12 @@ public_api:
     - SmartHomeEventKind
     - SmartHomeIntegrationAdapter
     - SmartHomeSensorStream
+    - SOCIAL_HISTORY_ALLOWED_SOURCES
+    - SOCIAL_HISTORY_LEARNING_INTEGRATION_ID
+    - SOCIAL_HISTORY_LOOKBACK_OPTIONS
+    - SOCIAL_HISTORY_SOURCE_WHATSAPP
     - RoutedSmartHomeProvider
+    - SocialHistoryLearningConfig
     - TwinrIntegrationStore
     - HueBridgeClient
     - HueBridgeConfig
@@ -180,6 +195,7 @@ public_api:
     - manifest_for_id
     - manifests_for_domain
     - parse_routed_entity_id
+    - social_history_record_with_import_state
     - stricter_confirmation
     - validate_calendar_source
 primary_callers:

@@ -18,7 +18,7 @@ next day plan without hardcoding any topic names or parsing raw transcripts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -55,6 +55,8 @@ def _compact_text(value: object | None, *, max_len: int) -> str:
 def _coerce_days(value: object, *, default: float, minimum: float, maximum: float) -> float:
     """Coerce one config-like day value into a bounded finite float."""
 
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -72,6 +74,38 @@ def _history_family(exposure: DisplayAmbientImpulseExposure) -> str:
     if family:
         return family
     return _compact_text(exposure.source, max_len=40).casefold() or "general"
+
+
+def _history_topic(exposure: DisplayAmbientImpulseExposure) -> str:
+    """Return the grouped semantic topic key recorded for one exposure."""
+
+    return _compact_text(exposure.semantic_topic_key, max_len=96).casefold() or _compact_text(
+        exposure.topic_key,
+        max_len=96,
+    ).casefold()
+
+
+def _coerce_float_bucket(value: object, *, default: float = 0.0) -> float:
+    """Return one finite float from a mutable accumulator bucket."""
+
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _coerce_int_bucket(value: object, *, default: int = 0) -> int:
+    """Return one bounded int from a mutable accumulator bucket."""
+
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _outcome_weight(exposure: DisplayAmbientImpulseExposure) -> float:
@@ -170,7 +204,7 @@ class DisplayReserveLearningProfile:
     def candidate_adjustment(self, candidate: AmbientDisplayImpulseCandidate) -> float:
         """Return one bounded salience adjustment for a reserve candidate."""
 
-        topic = self.topic_signal(candidate.topic_key)
+        topic = self.topic_signal(candidate.semantic_key())
         family = self.family_signal(
             _compact_text(getattr(candidate, "candidate_family", None), max_len=40)
             or candidate.source
@@ -189,7 +223,7 @@ class DisplayReserveLearningProfile:
     def context_for_candidate(self, candidate: AmbientDisplayImpulseCandidate) -> dict[str, object]:
         """Return one JSON-safe learning context block for LLM copy generation."""
 
-        topic = self.topic_signal(candidate.topic_key)
+        topic = self.topic_signal(candidate.semantic_key())
         family_name = (
             _compact_text(getattr(candidate, "candidate_family", None), max_len=40)
             or candidate.source
@@ -259,7 +293,7 @@ class DisplayReserveLearningProfileBuilder:
             immediate_pickup = exposure.response_mode == "voice_immediate_pickup"
             self._accumulate(
                 topics,
-                key=exposure.topic_key,
+                key=_history_topic(exposure),
                 weight=weight,
                 outcome=outcome,
                 shown_at=shown_at,
@@ -338,20 +372,24 @@ class DisplayReserveLearningProfileBuilder:
                 "last_negative_at": None,
             },
         )
-        state["exposure_weight"] = float(state["exposure_weight"]) + weight
-        state["outcome_score"] = float(state["outcome_score"]) + outcome * weight
+        state["exposure_weight"] = _coerce_float_bucket(state.get("exposure_weight")) + weight
+        state["outcome_score"] = _coerce_float_bucket(state.get("outcome_score")) + outcome * weight
         if immediate_pickup:
-            state["immediate_pickup_weight"] = float(state["immediate_pickup_weight"]) + weight
+            state["immediate_pickup_weight"] = _coerce_float_bucket(
+                state.get("immediate_pickup_weight")
+            ) + weight
         if is_positive:
-            state["positive_weight"] = float(state["positive_weight"]) + weight
+            state["positive_weight"] = _coerce_float_bucket(state.get("positive_weight")) + weight
             state["last_positive_at"] = shown_at
         if is_negative:
-            state["negative_weight"] = float(state["negative_weight"]) + weight
+            state["negative_weight"] = _coerce_float_bucket(state.get("negative_weight")) + weight
             state["last_negative_at"] = shown_at
         if shown_at >= recent_cutoff:
-            state["recent_exposure_count"] = int(state["recent_exposure_count"]) + 1
+            state["recent_exposure_count"] = _coerce_int_bucket(state.get("recent_exposure_count")) + 1
             if is_positive:
-                state["recent_positive_count"] = int(state["recent_positive_count"]) + 1
+                state["recent_positive_count"] = _coerce_int_bucket(
+                    state.get("recent_positive_count")
+                ) + 1
         last_shown_at = state.get("last_shown_at")
         if not isinstance(last_shown_at, datetime) or shown_at >= last_shown_at:
             state["last_shown_at"] = shown_at
@@ -366,13 +404,13 @@ class DisplayReserveLearningProfileBuilder:
         for key, payload in raw.items():
             frozen[key] = DisplayReserveLearningSignal(
                 key=key,
-                exposure_weight=float(payload.get("exposure_weight", 0.0) or 0.0),
-                outcome_score=float(payload.get("outcome_score", 0.0) or 0.0),
-                immediate_pickup_weight=float(payload.get("immediate_pickup_weight", 0.0) or 0.0),
-                positive_weight=float(payload.get("positive_weight", 0.0) or 0.0),
-                negative_weight=float(payload.get("negative_weight", 0.0) or 0.0),
-                recent_exposure_count=int(payload.get("recent_exposure_count", 0) or 0),
-                recent_positive_count=int(payload.get("recent_positive_count", 0) or 0),
+                exposure_weight=_coerce_float_bucket(payload.get("exposure_weight")),
+                outcome_score=_coerce_float_bucket(payload.get("outcome_score")),
+                immediate_pickup_weight=_coerce_float_bucket(payload.get("immediate_pickup_weight")),
+                positive_weight=_coerce_float_bucket(payload.get("positive_weight")),
+                negative_weight=_coerce_float_bucket(payload.get("negative_weight")),
+                recent_exposure_count=_coerce_int_bucket(payload.get("recent_exposure_count")),
+                recent_positive_count=_coerce_int_bucket(payload.get("recent_positive_count")),
                 last_shown_at=self._iso(payload.get("last_shown_at")),
                 last_positive_at=self._iso(payload.get("last_positive_at")),
                 last_negative_at=self._iso(payload.get("last_negative_at")),

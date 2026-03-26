@@ -56,25 +56,25 @@
     {
       "id": "phone:corinna_maier_mobile",
       "type": "phone",
-      "label": "01761234",
+      "label": "5551234",
       "attributes": {
-        "canonical": "01761234"
+        "canonical": "5551234"
       }
     },
     {
       "id": "phone:corinna_schmidt_mobile",
       "type": "phone",
-      "label": "0309988",
+      "label": "5559988",
       "attributes": {
-        "canonical": "0309988"
+        "canonical": "5559988"
       }
     },
     {
       "id": "phone:anna_becker_mobile",
       "type": "phone",
-      "label": "08912345",
+      "label": "5552345",
       "attributes": {
-        "canonical": "08912345"
+        "canonical": "5552345"
       }
     },
     {

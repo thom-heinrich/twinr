@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.tools.handlers.household_identity import handle_manage_household_identity
 from twinr.agent.tools.handlers.output import handle_inspect_camera
 from twinr.agent.tools.handlers.portrait_identity import handle_enroll_portrait_identity
@@ -17,6 +17,7 @@ from twinr.ops.paths import resolve_ops_paths
 from twinr.web.conversation_lab import (
     _CONVERSATION_LAB_TOOL_NAMES,
     _ConversationLabToolOwner,
+    _build_tool_loop,
     _conversation_lab_runtime_config,
     _search_snapshot,
     run_conversation_lab_turn,
@@ -129,6 +130,7 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
         )
 
     def test_conversation_lab_exposes_portrait_and_camera_tools(self) -> None:
+        self.assertIn("browser_automation", _CONVERSATION_LAB_TOOL_NAMES)
         self.assertIn("list_smart_home_entities", _CONVERSATION_LAB_TOOL_NAMES)
         self.assertIn("read_smart_home_state", _CONVERSATION_LAB_TOOL_NAMES)
         self.assertIn("control_smart_home_entities", _CONVERSATION_LAB_TOOL_NAMES)
@@ -138,6 +140,7 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
         self.assertIn("reset_portrait_identity", _CONVERSATION_LAB_TOOL_NAMES)
         self.assertIn("manage_household_identity", _CONVERSATION_LAB_TOOL_NAMES)
         self.assertIn("inspect_camera", _CONVERSATION_LAB_TOOL_NAMES)
+        self.assertIn("manage_voice_quiet_mode", _CONVERSATION_LAB_TOOL_NAMES)
 
     def test_owner_supports_portrait_identity_handler(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,6 +235,62 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
 
         self.assertFalse(runtime_config.adaptive_timing_enabled)
         self.assertFalse(runtime_config.long_term_memory_background_store_turns)
+
+    def test_build_tool_loop_filters_conversation_lab_tools_by_runtime_availability(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            llm_provider="anthropic",
+        )
+        owner = SimpleNamespace(
+            print_backend=None,
+            _configurable_providers=(),
+            collector=SimpleNamespace(trace_event=lambda *args, **kwargs: None, trace_decision=lambda *args, **kwargs: None),
+        )
+        provider_bundle = SimpleNamespace(
+            print_backend=None,
+            tool_agent=object(),
+            support_backend=object(),
+        )
+        captured: dict[str, object] = {}
+
+        def _fake_loop(*, provider, tool_handlers, tool_schemas, stream_final_only):
+            captured["provider"] = provider
+            captured["tool_handlers"] = dict(tool_handlers)
+            captured["tool_schemas"] = list(tool_schemas)
+            captured["stream_final_only"] = stream_final_only
+            return "loop-sentinel"
+
+        with (
+            patch("twinr.web.conversation_lab.build_streaming_provider_bundle", return_value=provider_bundle),
+            patch("twinr.web.conversation_lab.RealtimeToolExecutor", return_value=object()),
+            patch(
+                "twinr.web.conversation_lab.available_realtime_tool_names",
+                return_value=("search_live_info", "browser_automation"),
+            ),
+            patch(
+                "twinr.web.conversation_lab.bind_realtime_tool_handlers",
+                return_value={
+                    "search_live_info": object(),
+                    "browser_automation": object(),
+                    "schedule_reminder": object(),
+                },
+            ),
+            patch(
+                "twinr.web.conversation_lab.build_agent_tool_schemas",
+                side_effect=lambda tool_names: [{"type": "function", "name": name} for name in tool_names],
+            ),
+            patch("twinr.web.conversation_lab.ToolCallingStreamingLoop", side_effect=_fake_loop),
+        ):
+            loop, _resources = _build_tool_loop(config=config, owner=owner)
+
+        self.assertEqual(loop, "loop-sentinel")
+        self.assertEqual(tuple(captured["tool_handlers"].keys()), ("search_live_info", "browser_automation"))
+        self.assertEqual(
+            [schema["name"] for schema in captured["tool_schemas"]],
+            ["search_live_info", "browser_automation"],
+        )
 
     def test_run_conversation_lab_turn_skips_flush_and_personality_history_without_background_writers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

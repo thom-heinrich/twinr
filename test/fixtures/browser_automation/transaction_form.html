@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Transaction Sandbox</title>
+  </head>
+  <body>
+    <main>
+      <h1>Transaction Sandbox</h1>
+      <p>Fill the sandbox order details and submit the review form.</p>
+      <form action="/transaction_result.html" method="get">
+        <label for="customer-name">Customer name</label>
+        <input id="customer-name" name="customer" />
+
+        <label for="delivery-speed">Delivery speed</label>
+        <select id="delivery-speed" name="delivery">
+          <option value="Standard">Standard</option>
+          <option value="Express">Express</option>
+        </select>
+
+        <label>
+          <input type="checkbox" name="gift_wrap" value="yes" />
+          Add gift wrap
+        </label>
+
+        <button type="submit">Review sandbox order</button>
+      </form>
+    </main>
+  </body>
+</html>

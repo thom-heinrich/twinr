@@ -106,8 +106,10 @@ class DisplayAmbientImpulsePublisher:
 
         return self.runtime_publisher.history_store
 
-    @candidate_loader.setter
-    def candidate_loader(self, value: Callable[..., tuple[AmbientDisplayImpulseCandidate, ...]]) -> None:
+    def set_candidate_loader(
+        self,
+        value: Callable[..., tuple[AmbientDisplayImpulseCandidate, ...]],
+    ) -> None:
         """Replace the planner candidate loader for tests or alternate wiring."""
 
         try:
@@ -187,7 +189,7 @@ class DisplayAmbientImpulsePublisher:
             )
             if fallback_item is None:
                 return DisplayAmbientImpulsePublishResult(action="inactive", reason="no_planned_item")
-            restored = self.runtime_publisher.show_visible_only(
+            visible_only_result = self.runtime_publisher.show_visible_only(
                 DisplayReserveRuntimeRequest(
                     topic_key=fallback_item.topic_key,
                     title=fallback_item.title,
@@ -206,6 +208,7 @@ class DisplayAmbientImpulsePublisher:
                         fallback_item=fallback_item,
                     ),
                     reason=f"{fallback_item.reason}; idle_fill",
+                    semantic_topic_key=fallback_item.semantic_key(),
                     candidate_family=fallback_item.candidate_family,
                     match_anchors=(fallback_item.title, fallback_item.headline, fallback_item.body),
                     metadata={
@@ -221,7 +224,7 @@ class DisplayAmbientImpulsePublisher:
                 action="restored_fill",
                 reason="plan_exhausted_idle_fill",
                 topic_key=fallback_item.topic_key,
-                cue=restored.cue,
+                cue=visible_only_result.cue,
             )
 
         published = self.runtime_publisher.publish(
@@ -239,6 +242,7 @@ class DisplayAmbientImpulsePublisher:
                 accent=item.accent,
                 hold_seconds=item.hold_seconds,
                 reason=item.reason,
+                semantic_topic_key=item.semantic_key(),
                 candidate_family=item.candidate_family,
                 match_anchors=(item.title, item.headline, item.body),
                 metadata={
@@ -271,14 +275,16 @@ class DisplayAmbientImpulsePublisher:
 
         Temporary right-lane overrides such as social prompts may expire while
         normal ambient publishing is intentionally blocked. In that state Twinr
-        should keep the lane populated with the current same-day card instead
-        of leaving the surface blank.
+        should only restore a card that was already truly shown earlier the
+        same day instead of surfacing the next unpublished plan item and
+        pinning the rotation on that first topic.
         """
 
-        fill_item = self.planner.peek_next_item(
+        plan = self.planner.ensure_plan(
             config=config,
             local_now=local_now,
         )
+        fill_item = plan.last_shown_item()
         if fill_item is None:
             fill_item = self.planner.peek_idle_fill_item(
                 config=config,
@@ -305,6 +311,7 @@ class DisplayAmbientImpulsePublisher:
                     fallback_item=fill_item,
                 ),
                 reason=f"{fill_item.reason}; {reason}",
+                semantic_topic_key=fill_item.semantic_key(),
                 candidate_family=fill_item.candidate_family,
                 match_anchors=(fill_item.title, fill_item.headline, fill_item.body),
                 metadata={

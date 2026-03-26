@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import (
     DisplayAmbientImpulseController,
     DisplayAmbientImpulseCue,
@@ -100,7 +100,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                 display_reserve_bus_items_per_day=4,
             )
             publisher = DisplayAmbientImpulsePublisher.from_config(config)
-            publisher.candidate_loader = lambda _config, *, local_now, max_items: (
+            publisher.set_candidate_loader(lambda _config, *, local_now, max_items: (
                 AmbientDisplayImpulseCandidate(
                     topic_key="ai companions",
                     title="AI companions",
@@ -115,7 +115,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                     accent="warm",
                     reason=f"test@{local_now.date().isoformat()}",
                 ),
-            )[:max_items]
+            )[:max_items])
             now = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
 
             result = publisher.publish_if_due(
@@ -179,7 +179,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                 display_reserve_bus_items_per_day=4,
             )
             publisher = DisplayAmbientImpulsePublisher.from_config(config)
-            publisher.candidate_loader = lambda _config, *, local_now, max_items: (
+            publisher.set_candidate_loader(lambda _config, *, local_now, max_items: (
                 AmbientDisplayImpulseCandidate(
                     topic_key="world politics",
                     title="World politics",
@@ -194,7 +194,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                     accent="warm",
                     reason=f"test@{local_now.date().isoformat()}",
                 ),
-            )[:max_items]
+            )[:max_items])
             now = datetime(2026, 3, 22, 16, 0, tzinfo=timezone.utc)
 
             publisher.publish_if_due(
@@ -212,6 +212,8 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
         self.assertTrue(
             any("weltpolitik" in anchor.casefold() for anchor in history[0].anchors())
         )
+        self.assertIsNotNone(history[0].metadata)
+        assert history[0].metadata is not None
         self.assertEqual(history[0].metadata["reason"], "plan[0] test@2026-03-22")
 
     def test_publisher_republishes_unanswered_same_day_item_after_cycle_wrap(self) -> None:
@@ -224,7 +226,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                 proactive_quiet_hours_end_local="07:00",
             )
             publisher = DisplayAmbientImpulsePublisher.from_config(config)
-            publisher.candidate_loader = lambda _config, *, local_now, max_items: (
+            publisher.set_candidate_loader(lambda _config, *, local_now, max_items: (
                 AmbientDisplayImpulseCandidate(
                     topic_key="ai companions",
                     title="AI companions",
@@ -239,7 +241,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                     accent="warm",
                     reason=f"test@{local_now.date().isoformat()}",
                 ),
-            )[:max_items]
+            )[:max_items])
             now = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
 
             first = publisher.publish_if_due(
@@ -270,6 +272,55 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
         self.assertEqual(len(history), 2)
         self.assertEqual(plan.cursor, 2)
 
+    def test_publisher_does_not_restore_unshown_plan_item_when_presence_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                display_driver="hdmi_wayland",
+                display_reserve_bus_items_per_day=1,
+            )
+            publisher = DisplayAmbientImpulsePublisher.from_config(config)
+            publisher.set_candidate_loader(lambda _config, *, local_now, max_items: (
+                AmbientDisplayImpulseCandidate(
+                    topic_key="skyla-und-uschi",
+                    title="Skyla und Uschi",
+                    source="reflection_midterm",
+                    action="ask_one",
+                    attention_state="shared_thread",
+                    salience=0.92,
+                    eyebrow="",
+                    headline="Ich denke noch an Skyla und Uschi.",
+                    body="Wie geht es den beiden gerade?",
+                    symbol="question",
+                    accent="warm",
+                    reason=f"test@{local_now.date().isoformat()}",
+                ),
+            )[:max_items])
+            now = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
+
+            result = publisher.publish_if_due(
+                config=config,
+                monotonic_now=100.0,
+                runtime_status="waiting",
+                presence_active=False,
+                local_now=now,
+            )
+            cue = publisher.active_store.load_active(now=now + timedelta(seconds=1))
+            history = publisher.history_store.load()
+            plan = publisher.planner.store.load()
+
+        self.assertEqual(result.action, "blocked")
+        self.assertEqual(result.reason, "no_active_presence")
+        self.assertIsNone(cue)
+        self.assertEqual(len(history), 0)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.cursor, 0)
+        current_item = plan.current_item()
+        self.assertIsNotNone(current_item)
+        assert current_item is not None
+        self.assertEqual(current_item.topic_key, "skyla-und-uschi")
+
     def test_publisher_restores_passive_fill_after_social_override_expires_in_quiet_hours(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -280,7 +331,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                 proactive_quiet_hours_end_local="07:00",
             )
             publisher = DisplayAmbientImpulsePublisher.from_config(config)
-            publisher.candidate_loader = lambda _config, *, local_now, max_items: (
+            publisher.set_candidate_loader(lambda _config, *, local_now, max_items: (
                 AmbientDisplayImpulseCandidate(
                     topic_key="ai companions",
                     title="AI companions",
@@ -295,7 +346,7 @@ class DisplayAmbientImpulsePublisherTests(unittest.TestCase):
                     accent="warm",
                     reason=f"test@{local_now.date().isoformat()}",
                 ),
-            )[:max_items]
+            )[:max_items])
             daytime = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
             quiet_override_at = datetime(2026, 3, 22, 21, 1, tzinfo=timezone.utc)
 

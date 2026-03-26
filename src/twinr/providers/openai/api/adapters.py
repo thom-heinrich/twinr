@@ -761,7 +761,10 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
         "action": {
             "type": "string",
             "enum": ["direct", "handoff", "end_conversation"],
-            "description": "direct for a short immediate answer, handoff for specialist work, end_conversation to stop for now.",
+            "description": (
+                "direct for a short immediate answer, handoff for specialist work, end_conversation to stop for now. "
+                "Runtime-local state mutations or checks such as bounded voice-quiet set/status/clear must use handoff, not direct."
+            ),
         },
         "spoken_ack": {
             "type": ["string", "null"],
@@ -809,8 +812,22 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "enum": ["tiny_recent", "full_context", None],
             "description": (
-                "tiny_recent only when the fast lane can answer safely from the tiny recent context alone. "
+                "tiny_recent when the downstream runtime-local specialist can finish safely from the tiny recent context plus live runtime state alone, including bounded voice-quiet or current listening-state work. "
                 "full_context when the answer depends on broader memory or richer provider context."
+            ),
+        },
+        "runtime_tool_name": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional exact Twinr runtime tool name for a one-shot tiny_recent handoff that can be executed directly without a second specialist model hop, "
+                "for example manage_voice_quiet_mode for bounded quiet/status/resume control."
+            ),
+        },
+        "runtime_tool_arguments_json": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional compact JSON object string with the concrete arguments for runtime_tool_name. "
+                "Use null unless the handoff can be satisfied by one direct runtime-local tool call."
             ),
         },
     },
@@ -825,6 +842,8 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
         "location_hint",
         "date_context",
         "context_scope",
+        "runtime_tool_name",
+        "runtime_tool_arguments_json",
     ],
     "additionalProperties": False,
 }
@@ -1009,6 +1028,8 @@ class OpenAISupervisorDecisionProvider:
             location_hint=_optional_text(payload.get("location_hint")),
             date_context=_optional_text(payload.get("date_context")),
             context_scope=_optional_text(payload.get("context_scope")),
+            runtime_tool_name=_optional_text(payload.get("runtime_tool_name")),
+            runtime_tool_arguments=_optional_json_object(payload.get("runtime_tool_arguments_json")),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=extract_model_name(response, model),
@@ -1199,6 +1220,23 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_json_object(value: Any) -> dict[str, object] | None:
+    """Parse one optional compact JSON object string into a dict."""
+
+    if isinstance(value, dict):
+        return dict(value)
+    payload = _optional_text(value)
+    if payload is None:
+        return None
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {str(key): item for key, item in parsed.items() if str(key).strip()}
 
 
 def _coerce_topic_titles(value: Any) -> tuple[str, ...]:

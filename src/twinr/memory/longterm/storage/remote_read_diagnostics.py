@@ -38,6 +38,8 @@ class LongTermRemoteReadContext:
 
     snapshot_kind: str
     operation: str
+    request_method: str | None = None
+    request_payload_kind: str | None = None
     item_id: str | None = None
     document_id_hint: str | None = None
     uri_hint: str | None = None
@@ -418,6 +420,8 @@ def _build_remote_request_diagnostic_data(
         "request_kind": normalized_request_kind,
         "snapshot_kind": _normalize_text(getattr(context, "snapshot_kind", None)),
         "operation": _normalize_text(getattr(context, "operation", None)),
+        "request_method": _normalize_text(getattr(context, "request_method", None)),
+        "request_payload_kind": _normalize_text(getattr(context, "request_payload_kind", None)),
         "outcome": normalized_outcome,
         "classification": classification,
         "latency_ms": round(elapsed_ms, 3),
@@ -464,6 +468,10 @@ def _build_remote_request_diagnostic_data(
         "root_cause_message": _compact_text(str(root_cause), limit=_MAX_ERROR_TEXT_CHARS),
         "exception_chain": [type(item).__name__ for item in _exception_chain(exc)],
     }
+    request_method = _normalize_text(getattr(context, "request_method", None))
+    request_path = _normalize_text(getattr(context, "request_path", None))
+    if request_method and request_path:
+        data["request_endpoint"] = f"{request_method} {request_path}"
     if isinstance(root_cause, OSError):
         data["root_cause_errno"] = _normalize_int(getattr(root_cause, "errno", None))
     status_code = _status_code_from_exception(exc)

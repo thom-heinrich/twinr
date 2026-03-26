@@ -42,6 +42,7 @@ from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.providers.openai import OpenAIBackend
 
 from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurface, ProactiveCameraSurfaceUpdate
+from ..social.aideck_camera_provider import AIDeckOpenAIVisionObservationProvider
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from ..social.local_camera_provider import LocalAICameraObservationProvider
 from ..social.remote_camera_provider import (
@@ -118,7 +119,7 @@ from . import service_attention_helpers
 from . import service_gesture_helpers
 
 if TYPE_CHECKING:
-    from twinr.agent.base_agent.runtime import TwinrRuntime
+    from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 
 _VISION_REVIEW_FAIL_OPEN_TRIGGERS = frozenset(
     {"possible_fall", "floor_stillness", "distress_possible"}
@@ -3822,6 +3823,13 @@ def build_default_proactive_monitor(
             provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
             if provider_name == "openai":
                 vision_observer = OpenAIVisionObservationProvider(
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=camera_lock,
+                )
+            elif provider_name == "aideck_openai":
+                vision_observer = AIDeckOpenAIVisionObservationProvider.from_config(
+                    config,
                     backend=backend,
                     camera=camera,
                     camera_lock=camera_lock,

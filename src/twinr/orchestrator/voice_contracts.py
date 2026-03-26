@@ -107,6 +107,7 @@ class OrchestratorVoiceHelloRequest:
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
+    voice_quiet_until_utc: str | None = None
     state_attested: bool = True
 
     def to_payload(self) -> dict[str, Any]:
@@ -138,6 +139,8 @@ class OrchestratorVoiceHelloRequest:
             payload["targeted_inference_blocked"] = self.targeted_inference_blocked
         if self.recommended_channel is not None:
             payload["recommended_channel"] = self.recommended_channel
+        if self.voice_quiet_until_utc is not None:
+            payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
 
     @classmethod
@@ -177,6 +180,7 @@ class OrchestratorVoiceHelloRequest:
                 else None
             ),
             recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
+            voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
             state_attested=_coerce_bool(payload_dict.get("state_attested"), default=False),
         )
 
@@ -228,6 +232,7 @@ class OrchestratorVoiceRuntimeStateEvent:
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
+    voice_quiet_until_utc: str | None = None
 
     def to_payload(self, *, include_type: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -252,6 +257,8 @@ class OrchestratorVoiceRuntimeStateEvent:
             payload["targeted_inference_blocked"] = self.targeted_inference_blocked
         if self.recommended_channel is not None:
             payload["recommended_channel"] = self.recommended_channel
+        if self.voice_quiet_until_utc is not None:
+            payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
 
     @classmethod
@@ -286,6 +293,7 @@ class OrchestratorVoiceRuntimeStateEvent:
                 else None
             ),
             recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
+            voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
         )
 
 

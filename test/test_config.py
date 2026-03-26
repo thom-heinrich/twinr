@@ -7,6 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 
+_TEST_WHATSAPP_ALLOW_FROM_DISPLAY = "+1 555 555 4567"
+
 
 class TwinrConfigTests(unittest.TestCase):
     def test_parse_float_accepts_optional_bounds(self) -> None:
@@ -87,6 +89,27 @@ class TwinrConfigTests(unittest.TestCase):
         )
         self.assertFalse(config.local_semantic_router_trace)
 
+    def test_from_env_reads_browser_automation_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                        "TWINR_BROWSER_AUTOMATION_WORKSPACE_PATH=browser_automation",
+                        "TWINR_BROWSER_AUTOMATION_ENTRY_MODULE=adapter.py",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.browser_automation_enabled)
+        self.assertEqual(config.browser_automation_workspace_path, "browser_automation")
+        self.assertEqual(config.browser_automation_entry_module, "adapter.py")
+
     def test_from_env_second_pi_mode_derives_remote_frame_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -144,6 +167,20 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
         self.assertEqual(config.proactive_vision_provider, "remote_frame")
         self.assertEqual(config.camera_proxy_snapshot_url, "http://10.42.0.2:8767/snapshot.png")
+
+    def test_from_env_aideck_camera_defaults_to_aideck_openai_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.camera_host_mode, "onboard")
+        self.assertEqual(config.camera_device, "aideck://192.168.4.1:5000")
+        self.assertEqual(config.proactive_vision_provider, "aideck_openai")
 
     def test_display_gpio_conflicts_reports_button_overlap(self) -> None:
         config = TwinrConfig(
@@ -204,7 +241,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_specialist_model, "gpt-5.4-mini")
         self.assertEqual(config.conversation_closure_model, "gpt-5.4-mini")
         self.assertEqual(config.display_reserve_generation_model, "gpt-5.4-mini")
-        self.assertEqual(config.display_reserve_generation_timeout_seconds, 12.0)
+        self.assertEqual(config.display_reserve_generation_timeout_seconds, 20.0)
+        self.assertEqual(config.display_reserve_generation_batch_size, 2)
+        self.assertEqual(config.display_reserve_generation_variants_per_candidate, 3)
 
     def test_from_env_reads_proactive_audio_input_device_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -311,6 +350,13 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_ENABLED=true",
                         "TWINR_ATTENTION_SERVO_FORENSIC_TRACE_ENABLED=true",
                         "TWINR_ATTENTION_SERVO_DRIVER=lgpio_pwm",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES=12.5",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES=0.9",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SPEED_SCALE=0.4",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US=74",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S=1.1",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE=0.18",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S=60.0",
                         "TWINR_ATTENTION_SERVO_GPIO=18",
                         "TWINR_ATTENTION_SERVO_INVERT_DIRECTION=true",
                         "TWINR_ATTENTION_SERVO_TARGET_HOLD_S=1.6",
@@ -360,6 +406,13 @@ class TwinrConfigTests(unittest.TestCase):
             config.attention_servo_state_path,
             str(Path(temp_dir) / "state" / "attention_servo_state.json"),
         )
+        self.assertEqual(config.attention_servo_estimated_zero_max_uncertainty_degrees, 12.5)
+        self.assertEqual(config.attention_servo_estimated_zero_settle_tolerance_degrees, 0.9)
+        self.assertEqual(config.attention_servo_estimated_zero_speed_scale, 0.4)
+        self.assertEqual(config.attention_servo_estimated_zero_move_pulse_delta_us, 74)
+        self.assertEqual(config.attention_servo_estimated_zero_move_period_s, 1.1)
+        self.assertEqual(config.attention_servo_estimated_zero_move_duty_cycle, 0.18)
+        self.assertEqual(config.attention_servo_continuous_return_to_zero_after_s, 60.0)
         self.assertEqual(config.attention_servo_gpio, 18)
         self.assertTrue(config.attention_servo_invert_direction)
         self.assertEqual(config.attention_servo_target_hold_s, 1.6)
@@ -461,6 +514,13 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S=2.25",
                         "TWINR_ATTENTION_SERVO_MAESTRO_CHANNEL=1",
                         "TWINR_ATTENTION_SERVO_STATE_PATH=/tmp/custom-attention-servo-state.json",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES=9.0",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES=0.8",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SPEED_SCALE=0.45",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US=71",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S=0.9",
+                        "TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE=0.22",
+                        "TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S=45.0",
                     ]
                 )
                 + "\n",
@@ -475,6 +535,13 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_peer_timeout_s, 2.25)
         self.assertEqual(config.attention_servo_maestro_channel, 1)
         self.assertEqual(config.attention_servo_state_path, "/tmp/custom-attention-servo-state.json")
+        self.assertEqual(config.attention_servo_estimated_zero_max_uncertainty_degrees, 9.0)
+        self.assertEqual(config.attention_servo_estimated_zero_settle_tolerance_degrees, 0.8)
+        self.assertEqual(config.attention_servo_estimated_zero_speed_scale, 0.45)
+        self.assertEqual(config.attention_servo_estimated_zero_move_pulse_delta_us, 71)
+        self.assertEqual(config.attention_servo_estimated_zero_move_period_s, 0.9)
+        self.assertEqual(config.attention_servo_estimated_zero_move_duty_cycle, 0.22)
+        self.assertEqual(config.attention_servo_continuous_return_to_zero_after_s, 45.0)
 
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -509,6 +576,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_DISPLAY_RESERVE_GENERATION_REASONING_EFFORT=minimal",
                         "TWINR_DISPLAY_RESERVE_GENERATION_TIMEOUT_SECONDS=6.5",
                         "TWINR_DISPLAY_RESERVE_GENERATION_MAX_OUTPUT_TOKENS=640",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_BATCH_SIZE=1",
+                        "TWINR_DISPLAY_RESERVE_GENERATION_VARIANTS_PER_CANDIDATE=4",
                         "TWINR_DISPLAY_RESERVE_BUS_PLAN_PATH=state/custom/reserve_plan.json",
                         "TWINR_DISPLAY_RESERVE_BUS_PREPARED_PLAN_PATH=state/custom/reserve_plan_prepared.json",
                         "TWINR_DISPLAY_RESERVE_BUS_MAINTENANCE_STATE_PATH=state/custom/reserve_maintenance.json",
@@ -542,6 +611,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_reserve_generation_reasoning_effort, "minimal")
         self.assertEqual(config.display_reserve_generation_timeout_seconds, 6.5)
         self.assertEqual(config.display_reserve_generation_max_output_tokens, 640)
+        self.assertEqual(config.display_reserve_generation_batch_size, 1)
+        self.assertEqual(config.display_reserve_generation_variants_per_candidate, 4)
         self.assertEqual(config.display_reserve_bus_plan_path, "state/custom/reserve_plan.json")
         self.assertEqual(config.display_reserve_bus_prepared_plan_path, "state/custom/reserve_plan_prepared.json")
         self.assertEqual(config.display_reserve_bus_maintenance_state_path, "state/custom/reserve_maintenance.json")
@@ -559,6 +630,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_reserve_bus_min_hold_s, 900.0)
         self.assertEqual(config.display_reserve_bus_base_hold_s, 1800.0)
         self.assertEqual(config.display_reserve_bus_max_hold_s, 3000.0)
+
+    def test_from_env_defaults_display_reserve_bus_items_per_day_to_twenty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_reserve_bus_items_per_day, 20)
 
     def test_from_env_reads_display_presentation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -632,7 +712,7 @@ class TwinrConfigTests(unittest.TestCase):
             env_path.write_text(
                 "\n".join(
                     [
-                        "TWINR_WHATSAPP_ALLOW_FROM=+49 171 1234567",
+                        f"TWINR_WHATSAPP_ALLOW_FROM={_TEST_WHATSAPP_ALLOW_FROM_DISPLAY}",
                         "TWINR_WHATSAPP_NODE_BINARY=/usr/bin/node",
                         f"TWINR_WHATSAPP_AUTH_DIR={root / 'state' / 'channels' / 'whatsapp' / 'auth'}",
                         f"TWINR_WHATSAPP_WORKER_ROOT={root / 'src' / 'twinr' / 'channels' / 'whatsapp' / 'worker'}",
@@ -651,7 +731,7 @@ class TwinrConfigTests(unittest.TestCase):
 
             config = TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.whatsapp_allow_from, "+49 171 1234567")
+        self.assertEqual(config.whatsapp_allow_from, _TEST_WHATSAPP_ALLOW_FROM_DISPLAY)
         self.assertEqual(config.whatsapp_node_binary, "/usr/bin/node")
         self.assertTrue(config.whatsapp_groups_enabled)
         self.assertTrue(config.whatsapp_self_chat_mode)

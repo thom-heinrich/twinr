@@ -47,6 +47,8 @@ class TwinrRuntimeSnapshotMixin:
                 user_voice_user_id=self.user_voice_user_id,
                 user_voice_user_display_name=self.user_voice_user_display_name,
                 user_voice_match_source=self.user_voice_match_source,
+                voice_quiet_until_utc=getattr(self, "voice_quiet_until_utc", lambda: None)(),
+                voice_quiet_reason=getattr(self, "_voice_quiet_reason", None),
             )
             workflow_event(
                 kind="metric",
@@ -111,6 +113,12 @@ class TwinrRuntimeSnapshotMixin:
                 self._snapshot_get(snapshot, "user_voice_user_display_name")
             )
             self.user_voice_match_source = self._coerce_optional_text(self._snapshot_get(snapshot, "user_voice_match_source"))
+            restore_voice_quiet = getattr(self, "restore_voice_quiet", None)
+            if callable(restore_voice_quiet):
+                restore_voice_quiet(  # pylint: disable=not-callable
+                    until_utc=self._snapshot_get(snapshot, "voice_quiet_until_utc"),
+                    reason=self._snapshot_get(snapshot, "voice_quiet_reason"),
+                )
 
             legacy_turns = self._restore_legacy_turns(self._snapshot_get(snapshot, "memory_turns", ()))
             raw_tail = self._restore_raw_tail(self._snapshot_get(snapshot, "memory_raw_tail", ()))
@@ -151,6 +159,9 @@ class TwinrRuntimeSnapshotMixin:
         self.user_voice_user_id = None
         self.user_voice_user_display_name = None
         self.user_voice_match_source = None
+        reset_voice_quiet = getattr(self, "reset_voice_quiet", None)
+        if callable(reset_voice_quiet):
+            reset_voice_quiet()  # pylint: disable=not-callable
         self._reset_memory_context()
 
     def _reset_memory_context(self) -> None:

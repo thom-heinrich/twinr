@@ -59,6 +59,11 @@ def decision_summary(decision: Any | None) -> dict[str, Any]:
         "action": normalize_decision_action(getattr(decision, "action", None)),
         "kind": normalize_handoff_kind(getattr(decision, "kind", None)),
         "context_scope": strip_text(getattr(decision, "context_scope", None)) or None,
+        "runtime_tool_name": strip_text(getattr(decision, "runtime_tool_name", None)) or None,
+        "runtime_tool_arguments_present": isinstance(
+            getattr(decision, "runtime_tool_arguments", None),
+            dict,
+        ),
         "allow_web_search": getattr(decision, "allow_web_search", None),
         "spoken_ack": text_summary(getattr(decision, "spoken_ack", None)),
         "spoken_reply": text_summary(getattr(decision, "spoken_reply", None)),

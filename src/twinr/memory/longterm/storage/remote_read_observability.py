@@ -36,6 +36,9 @@ _HISTOGRAM_BUCKETS_MS: tuple[tuple[float, str], ...] = (
 )
 _SUPPORTED_OPERATIONS = frozenset(
     {
+        "snapshot_load",
+        "fetch_item_document",
+        "fetch_catalog_segment",
         "retrieve_search",
         "retrieve_batch",
         "topk_search",
@@ -70,6 +73,9 @@ def record_remote_read_observation(
     data = {
         "snapshot_kind": _normalize_text(getattr(context, "snapshot_kind", None)),
         "operation": operation,
+        "request_method": _normalize_text(getattr(context, "request_method", None)),
+        "request_path": _normalize_text(getattr(context, "request_path", None)),
+        "request_payload_kind": _normalize_text(getattr(context, "request_payload_kind", None)),
         "outcome": normalized_outcome,
         "classification": normalized_classification,
         "latency_ms": round(bounded_latency_ms, 3),
@@ -196,6 +202,12 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
     operation = str(data.get("operation") or "unknown")
     snapshot_kind = str(data.get("snapshot_kind") or "unknown")
     key = f"{snapshot_kind}:{operation}"
+    request_method = _normalize_text(data.get("request_method"))
+    request_path = _normalize_text(data.get("request_path"))
+    request_payload_kind = _normalize_text(data.get("request_payload_kind"))
+    request_endpoint = None
+    if request_method and request_path:
+        request_endpoint = f"{request_method} {request_path}"
     entry = operations.get(key)
     if not isinstance(entry, dict):
         entry = {
@@ -205,6 +217,8 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
             "outcome_counts": {},
             "classification_counts": {},
             "latency_buckets_ms": {},
+            "request_endpoint_counts": {},
+            "request_payload_kind_counts": {},
             "last_latency_ms": 0.0,
             "last_updated_at": _utc_now_iso(),
         }
@@ -213,18 +227,30 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
     outcome_counts = dict(entry.get("outcome_counts") or {})
     classification_counts = dict(entry.get("classification_counts") or {})
     latency_buckets = dict(entry.get("latency_buckets_ms") or {})
+    request_endpoint_counts = dict(entry.get("request_endpoint_counts") or {})
+    request_payload_kind_counts = dict(entry.get("request_payload_kind_counts") or {})
     outcome = str(data.get("outcome") or "ok")
     classification = str(data.get("classification") or "ok")
     latency_bucket = str(data.get("latency_bucket") or _latency_bucket(float(data.get("latency_ms") or 0.0)))
     outcome_counts[outcome] = int(outcome_counts.get(outcome, 0)) + 1
     classification_counts[classification] = int(classification_counts.get(classification, 0)) + 1
     latency_buckets[latency_bucket] = int(latency_buckets.get(latency_bucket, 0)) + 1
+    if request_endpoint is not None:
+        request_endpoint_counts[request_endpoint] = int(request_endpoint_counts.get(request_endpoint, 0)) + 1
+    if request_payload_kind is not None:
+        request_payload_kind_counts[request_payload_kind] = int(request_payload_kind_counts.get(request_payload_kind, 0)) + 1
     entry["outcome_counts"] = outcome_counts
     entry["classification_counts"] = classification_counts
     entry["latency_buckets_ms"] = latency_buckets
+    entry["request_endpoint_counts"] = request_endpoint_counts
+    entry["request_payload_kind_counts"] = request_payload_kind_counts
     entry["last_latency_ms"] = float(data.get("latency_ms") or 0.0)
     entry["last_outcome"] = outcome
     entry["last_classification"] = classification
+    entry["last_request_method"] = request_method
+    entry["last_request_path"] = request_path
+    entry["last_request_endpoint"] = request_endpoint
+    entry["last_request_payload_kind"] = request_payload_kind
     entry["last_updated_at"] = _utc_now_iso()
     payload["updated_at"] = entry["last_updated_at"]
 

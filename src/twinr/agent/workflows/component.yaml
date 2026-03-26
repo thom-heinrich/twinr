@@ -9,6 +9,7 @@ owned_concerns:
   - Coordinate live conversation sessions, print delivery, and bounded speech output
   - Bridge bounded edge audio and runtime-state updates into the server-backed voice orchestrator without moving runtime-state ownership off the Pi loop
   - Coordinate bounded same-stream transcript commits from the server-backed voice orchestrator so live wake/listen turns stay remote and the Pi remains an I/O edge
+  - Replay the runtime-owned temporary voice-quiet window into the live voice orchestrator and suppress automatic follow-up reopening while that bounded quiet window is active
   - Keep remote live barge-in on that same server stream instead of reopening a second local interrupt-STT watcher on the Pi
   - Keep live capture paths from failing immediately on proven transient XVF3800 re-enumeration by reusing the bounded hardware-level recovery helper
   - Cache and replay one normalized activation-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
@@ -218,7 +219,7 @@ files:
   - path: required_remote_watch.py
     role: Background required-remote readiness watch for fail-closed runtimes
   - path: required_remote_snapshot.py
-    role: External remote-watchdog snapshot evaluation for live loop gating
+    role: External remote-watchdog snapshot evaluation for live loop gating, including bounded recovery of a dead detached watchdog owner
   - path: speech_output.py
     role: Interruptible streamed TTS playback queue with first-audio gating and fast aborts
     exports:
@@ -235,11 +236,18 @@ files:
       - PrintLaneRequest
       - TwinrPrintLane
   - path: working_feedback.py
-    role: Bounded processing, answering, and printing tone/media loops with long-think attenuation
+    role: Bounded processing, answering, and printing tone/media loops with the significantly slowed quieter dragon processing clip as the default think cue and long-think attenuation
     exports:
       - WorkingFeedbackKind
       - WorkingFeedbackProfile
       - start_working_feedback_loop
+  - path: working_feedback_tone.py
+    role: Optional synthesized processing-tone helper kept for non-default cue experiments and direct tests
+    exports:
+      - PROCESSING_SWELL_TONE_SPEC
+      - SwellingFeedbackToneSpec
+      - build_swelling_feedback_tone_pcm16
+      - build_swelling_feedback_tone_wav_bytes
 primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/agent/tools/handlers/output.py
@@ -255,6 +263,7 @@ tests:
   - path: test/test_dual_lane_loop.py
   - path: test/test_speech_output.py
   - path: test/test_working_feedback.py
+  - path: test/test_working_feedback_tone.py
   - path: test/test_workflow_forensics.py
   - path: test/test_openai_realtime.py
   - path: test/test_longterm_multimodal.py

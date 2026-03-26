@@ -15,6 +15,11 @@ from twinr.ops.self_coding_pi import (
 )
 
 
+_TEST_PI_HOST = "192.0.2.10"
+_TEST_PI_SSH_USER = "pi-test-user"
+_TEST_PI_SSH_PASSWORD = "placeholder-password"
+
+
 def _completed(
     args: list[str],
     *,
@@ -32,9 +37,9 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
             env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",
@@ -45,7 +50,11 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
 
         self.assertEqual(
             settings,
-            PiConnectionSettings(host="192.168.1.95", user="thh", password="chaos"),
+            PiConnectionSettings(
+                host=_TEST_PI_HOST,
+                user=_TEST_PI_SSH_USER,
+                password=_TEST_PI_SSH_PASSWORD,
+            ),
         )
 
     def test_bootstrap_runs_remote_install_sync_and_self_test_steps(self) -> None:
@@ -66,9 +75,9 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
             pi_env_path.write_text(
                 '\n'.join(
                     (
-                        'PI_HOST="192.168.1.95"',
-                        'PI_SSH_USER="thh"',
-                        'PI_SSH_PW="chaos"',
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
                     )
                 )
                 + "\n",
@@ -98,7 +107,7 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
         self.assertIn("sshpass -e rsync", joined)
         self.assertIn("npm install -g @openai/codex@0.114.0", joined)
         self.assertIn("--self-coding-codex-self-test", joined)
-        self.assertTrue(any(env and env.get("SSHPASS") == "chaos" for env in env_overrides))
+        self.assertTrue(any(env and env.get("SSHPASS") == _TEST_PI_SSH_PASSWORD for env in env_overrides))
 
 
 if __name__ == "__main__":

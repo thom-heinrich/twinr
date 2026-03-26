@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Docs Home</title>
+  </head>
+  <body>
+    <main id="app">
+      <h1>Fixture Docs Home</h1>
+      <p>Use the docs navigation to open the Dark mode page.</p>
+      <a id="dark-mode-link" href="/same_tab_spa_dark_mode.html">Dark mode</a>
+    </main>
+    <script>
+      const app = document.getElementById("app");
+      const link = document.getElementById("dark-mode-link");
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        window.history.pushState({}, "", "/same_tab_spa_dark_mode.html");
+        document.title = "Dark mode - Fixture Docs";
+        app.innerHTML = `
+          <h1>Dark mode</h1>
+          <p>Manual dark mode uses the <code>dark:</code> utility variant.</p>
+          <p>Example: <code>dark:bg-slate-900</code>.</p>
+        `;
+      });
+    </script>
+  </body>
+</html>

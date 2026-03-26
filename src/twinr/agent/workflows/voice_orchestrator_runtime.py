@@ -12,6 +12,25 @@ from twinr.agent.workflows.remote_transcript_commit import (
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 
 
+def _voice_quiet_until_utc(loop: Any) -> str | None:
+    """Return the current temporary voice-quiet deadline, if active."""
+
+    runtime = getattr(loop, "runtime", None)
+    getter = getattr(runtime, "voice_quiet_until_utc", None)
+    if not callable(getter):
+        return None
+    value = getter()
+    return str(value or "").strip() or None
+
+
+def _effective_follow_up_allowed(loop: Any, *, follow_up_allowed: bool) -> bool:
+    """Disable automatic follow-up while temporary quiet mode is active."""
+
+    if not follow_up_allowed:
+        return False
+    return _voice_quiet_until_utc(loop) is None
+
+
 def voice_orchestrator_handles_follow_up(loop: Any, *, initial_source: str) -> bool:
     """Report whether the current voice path reopens follow-up remotely."""
 
@@ -44,14 +63,17 @@ def notify_voice_orchestrator_state(
     intent_context = VoiceRuntimeIntentContext.from_sensor_facts(
         getattr(loop, "_latest_sensor_observation_facts", None)
     )
+    quiet_until_utc = _voice_quiet_until_utc(loop)
     try:
         with loop._voice_orchestrator_runtime_state_lock:
             loop._last_voice_orchestrator_runtime_state = (state, detail, follow_up_allowed)
             loop._last_voice_orchestrator_intent_context = intent_context
+            loop._last_voice_orchestrator_quiet_until_utc = quiet_until_utc
             loop.voice_orchestrator.notify_runtime_state(
                 state=state,
                 detail=detail,
-                follow_up_allowed=follow_up_allowed,
+                follow_up_allowed=_effective_follow_up_allowed(loop, follow_up_allowed=follow_up_allowed),
+                voice_quiet_until_utc=quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
     except Exception as exc:
@@ -74,6 +96,7 @@ def prime_voice_orchestrator_waiting_state(loop: Any) -> None:
     with loop._voice_orchestrator_runtime_state_lock:
         loop._last_voice_orchestrator_runtime_state = ("waiting", None, False)
         loop._last_voice_orchestrator_intent_context = intent_context
+        loop._last_voice_orchestrator_quiet_until_utc = _voice_quiet_until_utc(loop)
         if intent_context is None:
             loop._trace_event(
                 "voice_orchestrator_waiting_state_seed_deferred",
@@ -87,6 +110,7 @@ def prime_voice_orchestrator_waiting_state(loop: Any) -> None:
                 state="waiting",
                 detail=None,
                 follow_up_allowed=False,
+                voice_quiet_until_utc=loop._last_voice_orchestrator_quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
         else:
@@ -94,6 +118,7 @@ def prime_voice_orchestrator_waiting_state(loop: Any) -> None:
                 state="waiting",
                 detail=None,
                 follow_up_allowed=False,
+                voice_quiet_until_utc=loop._last_voice_orchestrator_quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
 
@@ -106,19 +131,25 @@ def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
     intent_context = VoiceRuntimeIntentContext.from_sensor_facts(
         getattr(loop, "_latest_sensor_observation_facts", None)
     )
+    quiet_until_utc = _voice_quiet_until_utc(loop)
     try:
         with loop._voice_orchestrator_runtime_state_lock:
             last_state = loop._last_voice_orchestrator_runtime_state
             if last_state is None:
                 return
-            if intent_context == loop._last_voice_orchestrator_intent_context:
+            if (
+                intent_context == loop._last_voice_orchestrator_intent_context
+                and quiet_until_utc == getattr(loop, "_last_voice_orchestrator_quiet_until_utc", None)
+            ):
                 return
             state, detail, follow_up_allowed = last_state
             loop._last_voice_orchestrator_intent_context = intent_context
+            loop._last_voice_orchestrator_quiet_until_utc = quiet_until_utc
             loop.voice_orchestrator.notify_runtime_state(
                 state=state,
                 detail=detail,
-                follow_up_allowed=follow_up_allowed,
+                follow_up_allowed=_effective_follow_up_allowed(loop, follow_up_allowed=follow_up_allowed),
+                voice_quiet_until_utc=quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
     except Exception as exc:
@@ -143,11 +174,23 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
         if committed_source != "follow_up":
             loop.emit(f"voice_orchestrator_transcript_ignored={committed_source}")
             return False
+        if not loop._follow_up_allowed_for_source(initial_source="follow_up"):
+            loop.emit("voice_orchestrator_follow_up_skipped=disabled")
+            return False
+        cached_state = getattr(loop, "_last_voice_orchestrator_runtime_state", None)
+        follow_up_open = (
+            not isinstance(cached_state, tuple)
+            or len(cached_state) < 3
+            or (
+                cached_state[0] == "follow_up_open"
+                and bool(cached_state[2])
+            )
+        )
+        if not follow_up_open:
+            loop.emit("voice_orchestrator_follow_up_skipped=closed")
+            return False
         if not loop._required_remote_dependency_current_ready():
             loop._request_required_remote_dependency_refresh()
-            return False
-        if not loop._background_work_allowed():
-            loop.emit("voice_orchestrator_follow_up_skipped=busy")
             return False
         loop.emit("voice_orchestrator_follow_up=true")
         loop._trace_event(

@@ -61,12 +61,20 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
         self.assertIn(first.action, {"ask_one", "invite_follow_up"})
         self.assertEqual(first.accent, "warm")
         self.assertEqual(first.eyebrow, "")
-        self.assertTrue(first.headline.endswith("?"))
         self.assertIn("AI companions", first.headline)
         self.assertTrue(first.body)
         self.assertIsNotNone(first.generation_context)
         assert first.generation_context is not None
         self.assertEqual(first.generation_context.get("candidate_family"), "mindshare")
+        self.assertEqual(
+            first.generation_context.get("card_intent"),
+            {
+                "topic_semantics": "gemeinsamer Faden zu AI companions",
+                "statement_intent": "Twinr soll eine konkrete Beobachtung oder einen ruhigen Rueckbezug zu AI companions machen.",
+                "cta_intent": "Zu einer kurzen Meinung, Ergaenzung oder einem Weiterreden einladen.",
+                "relationship_stance": "warm und aufmerksam statt behauptend",
+            },
+        )
 
     def test_continuity_topic_prefers_memory_clarifying_copy(self) -> None:
         snapshot = PersonalitySnapshot(
@@ -105,7 +113,6 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
 
         self.assertTrue(candidates)
         first = candidates[0]
-        self.assertTrue(first.headline.endswith("?"))
         self.assertIn("Arzttermin", first.headline)
         self.assertTrue(first.body)
 
@@ -177,6 +184,15 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
         self.assertTrue(candidates)
         context = candidates[0].generation_context or {}
         self.assertEqual(context.get("hook_hint"), "Der Nutzer kommt darauf immer wieder zurueck.")
+        self.assertEqual(
+            context.get("card_intent"),
+            {
+                "topic_semantics": "gemeinsamer Faden zu AI companions",
+                "statement_intent": "Twinr soll eine konkrete Beobachtung oder einen ruhigen Rueckbezug zu AI companions machen.",
+                "cta_intent": "Zu einer kurzen Meinung, Ergaenzung oder einem Weiterreden einladen.",
+                "relationship_stance": "warm und aufmerksam statt behauptend",
+            },
+        )
 
     def test_live_search_mindshare_does_not_surface_as_display_impulse(self) -> None:
         snapshot = PersonalitySnapshot(

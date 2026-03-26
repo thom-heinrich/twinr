@@ -9,8 +9,8 @@ owned_concerns:
   - Build declared form-field definitions for env-backed and managed-store settings and collect fail-closed updates
   - Parse URL-encoded request bodies and atomically read or write `.env` and text-backed settings files
   - Persist the managed web-auth state and verify signed portal sessions without leaking raw passwords
-  - Persist generic per-channel onboarding snapshots, including temporary portal QR payloads, and coordinate one bounded pairing job per channel inside the web process
-  - Validate WhatsApp wizard inputs, collect bounded runtime probes, and coordinate the bounded WhatsApp pairing flow
+  - Keep compatibility re-export shims for the shared channel-onboarding and WhatsApp pairing helpers that now live under `src/twinr/channels`
+  - Validate WhatsApp wizard inputs while reusing the shared runtime-neutral pairing probes and coordination helpers instead of owning a second onboarding implementation
   - Expose the curated support import surface consumed across the web package
 out_of_scope:
   - FastAPI route handling, redirects, and page composition in `src/twinr/web/app.py`
@@ -73,13 +73,13 @@ files:
       - web_auth_session_cookie_name
       - web_auth_session_max_age_seconds
   - path: channel_onboarding.py
-    role: Generic channel-onboarding snapshot persistence, including QR payload storage, and bounded in-process pairing registry
+    role: Compatibility wrapper that re-exports the runtime-neutral channel-onboarding helpers from `twinr.channels.onboarding`
     exports:
       - ChannelPairingSnapshot
       - FileBackedChannelOnboardingStore
       - InProcessChannelPairingRegistry
   - path: whatsapp.py
-    role: WhatsApp wizard validation, QR snapshot shaping, bounded runtime probes, and bounded pairing coordination
+    role: Compatibility wrapper that re-exports the shared WhatsApp pairing helpers from `twinr.channels.whatsapp.pairing`
     exports:
       - WhatsAppPairingCoordinator
       - WhatsAppRuntimeProbe

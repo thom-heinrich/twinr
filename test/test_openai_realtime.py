@@ -136,7 +136,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertTrue(manager.entered)
         self.assertTrue(manager.exited)
         self.assertEqual(connection.session.calls[0]["type"], "realtime")
-        self.assertEqual(connection.session.calls[0]["output_modalities"], ["audio", "text"])
+        self.assertEqual(connection.session.calls[0]["output_modalities"], ["audio"])
         self.assertEqual(connection.session.calls[0]["audio"]["output"]["voice"], "sage")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["type"], "audio/pcm")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["rate"], 24000)
@@ -164,6 +164,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("update_simple_setting tool", instructions)
         self.assertIn("remember_contact tool", instructions)
         self.assertIn("lookup_contact tool", instructions)
+        self.assertIn("send_whatsapp_message tool", instructions)
         self.assertIn("get_memory_conflicts tool", instructions)
         self.assertIn("resolve_memory_conflict tool", instructions)
         self.assertIn("remember_preference tool", instructions)
@@ -172,6 +173,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("Use spoken_voice when the user explicitly asks you to change how your voice sounds", instructions)
         self.assertIn("Resolve descriptive voice requests to the best supported Twinr voice", instructions)
         self.assertIn("Use speech_speed when the user explicitly asks you to speak slower or faster", instructions)
+        self.assertIn("manage_voice_quiet_mode", instructions)
+        self.assertIn("temporary stay quiet", instructions)
+        self.assertIn("ask one short follow-up question for the quiet duration", instructions)
+        self.assertIn("Do not answer a quiet-mode status question from conversational memory", instructions)
         self.assertIn("create_time_automation", instructions)
         self.assertIn("Local date/time context for resolving reminders, timers, and scheduled automations:", instructions)
         self.assertIn("memory_capacity level", instructions)
@@ -297,6 +302,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             tool_handlers={
                 "print_receipt": lambda _arguments: {"status": "printed"},
                 "search_live_info": lambda _arguments: {"status": "ok", "answer": "Antwort"},
+                "browser_automation": lambda _arguments: {"status": "completed"},
+                "connect_service_integration": lambda _arguments: {"status": "started"},
                 "schedule_reminder": lambda _arguments: {"status": "scheduled"},
                 "list_automations": lambda _arguments: {"status": "ok", "automations": []},
                 "create_time_automation": lambda _arguments: {"status": "created"},
@@ -311,6 +318,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_memory": lambda _arguments: {"status": "saved"},
                 "remember_contact": lambda _arguments: {"status": "created"},
                 "lookup_contact": lambda _arguments: {"status": "found"},
+                "send_whatsapp_message": lambda _arguments: {"status": "sent"},
                 "get_memory_conflicts": lambda _arguments: {"status": "ok", "conflicts": []},
                 "resolve_memory_conflict": lambda _arguments: {"status": "resolved"},
                 "remember_preference": lambda _arguments: {"status": "updated"},
@@ -320,6 +328,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "manage_user_discovery": lambda _arguments: {"status": "ok"},
                 "configure_world_intelligence": lambda _arguments: {"status": "ok"},
                 "update_simple_setting": lambda _arguments: {"status": "updated"},
+                "manage_voice_quiet_mode": lambda _arguments: {"status": "active"},
                 "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
                 "get_voice_profile_status": lambda _arguments: {"status": "ok"},
                 "reset_voice_profile": lambda _arguments: {"status": "reset"},
@@ -341,6 +350,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             [
                 "print_receipt",
                 "search_live_info",
+                "browser_automation",
+                "connect_service_integration",
                 "schedule_reminder",
                 "list_automations",
                 "create_time_automation",
@@ -355,6 +366,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_memory",
                 "remember_contact",
                 "lookup_contact",
+                "send_whatsapp_message",
                 "get_memory_conflicts",
                 "resolve_memory_conflict",
                 "remember_preference",
@@ -364,6 +376,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "manage_user_discovery",
                 "configure_world_intelligence",
                 "update_simple_setting",
+                "manage_voice_quiet_mode",
                 "enroll_voice_profile",
                 "get_voice_profile_status",
                 "reset_voice_profile",
@@ -387,6 +400,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             "Do not use it for the user's own smart-home inventory",
             tools_by_name["search_live_info"]["description"],
         )
+        self.assertIn("goal", tools_by_name["browser_automation"]["parameters"]["properties"])
+        self.assertIn("service", tools_by_name["connect_service_integration"]["parameters"]["properties"])
+        self.assertIn("right info panel", tools_by_name["connect_service_integration"]["description"])
         self.assertIn("due_at", tools_by_name["schedule_reminder"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["schedule_reminder"]["parameters"]["properties"])
         self.assertIn("include_disabled", tools_by_name["list_automations"]["parameters"]["properties"])
@@ -432,6 +448,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("role", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("name", tools_by_name["lookup_contact"]["parameters"]["properties"])
+        self.assertIn("message", tools_by_name["send_whatsapp_message"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["send_whatsapp_message"]["parameters"]["properties"])
+        self.assertIn("phone_last4", tools_by_name["send_whatsapp_message"]["parameters"]["properties"])
         self.assertIn("query_text", tools_by_name["get_memory_conflicts"]["parameters"]["properties"])
         self.assertIn("slot_key", tools_by_name["resolve_memory_conflict"]["parameters"]["properties"])
         self.assertIn("selected_memory_id", tools_by_name["resolve_memory_conflict"]["parameters"]["properties"])
@@ -463,6 +482,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             tools_by_name["update_simple_setting"]["parameters"]["properties"]["value"]["description"],
         )
         self.assertIn("confirmed", tools_by_name["update_simple_setting"]["parameters"]["properties"])
+        self.assertIn("action", tools_by_name["manage_voice_quiet_mode"]["parameters"]["properties"])
+        self.assertIn("duration_minutes", tools_by_name["manage_voice_quiet_mode"]["parameters"]["properties"])
+        self.assertIn("reason", tools_by_name["manage_voice_quiet_mode"]["parameters"]["properties"])
+        self.assertEqual(
+            tools_by_name["manage_voice_quiet_mode"]["parameters"]["properties"]["duration_minutes"]["maximum"],
+            720,
+        )
         self.assertIn("confirmed", tools_by_name["create_time_automation"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_time_automation"]["parameters"]["properties"])
@@ -489,6 +515,12 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("two to four targeted smart-home queries", connection.session.calls[0]["instructions"])
         self.assertIn("manage_user_discovery", connection.session.calls[0]["instructions"])
         self.assertIn("configure_world_intelligence tool", connection.session.calls[0]["instructions"])
+        self.assertIn("connect_service_integration tool", connection.session.calls[0]["instructions"])
+        self.assertIn("right info panel shows the QR", connection.session.calls[0]["instructions"])
+        self.assertIn("send_whatsapp_message tool", connection.session.calls[0]["instructions"])
+        self.assertIn("manage_voice_quiet_mode", connection.session.calls[0]["instructions"])
+        self.assertIn("ask one short follow-up question for the quiet duration", connection.session.calls[0]["instructions"])
+        self.assertIn("Do not answer a quiet-mode status question from conversational memory", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:
         session, connection, _manager = self.make_session()
@@ -501,6 +533,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "update_time_automation": lambda _arguments: {"status": "updated"},
                 "update_sensor_automation": lambda _arguments: {"status": "updated"},
                 "update_simple_setting": lambda _arguments: {"status": "updated"},
+                "manage_voice_quiet_mode": lambda _arguments: {"status": "active"},
             },
         )
 
@@ -514,6 +547,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             "update_time_automation",
             "update_sensor_automation",
             "update_simple_setting",
+            "manage_voice_quiet_mode",
         ):
             parameters = tools_by_name[tool_name]["parameters"]
             for forbidden_key in ("anyOf", "allOf", "oneOf", "not", "enum"):
@@ -521,6 +555,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(
             tools_by_name["update_simple_setting"]["parameters"]["properties"]["value"]["anyOf"],
             [{"type": "number"}, {"type": "string", "minLength": 1}],
+        )
+        self.assertIn(
+            "Use action status when the user asks whether Twinr is currently quiet or still listening.",
+            tools_by_name["manage_voice_quiet_mode"]["description"],
         )
 
     def test_session_instructions_require_literal_tool_text_for_exact_print_requests(self) -> None:

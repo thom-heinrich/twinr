@@ -175,6 +175,44 @@ def _follow_up_body(candidate: LongTermProactiveCandidateV1) -> str:
     )
 
 
+def _conflict_card_intent(item: LongTermConflictQueueItemV1) -> dict[str, str]:
+    """Return structured semantic card intent for one memory-conflict card."""
+
+    anchor = _truncate_text(item.question, max_len=96) or _truncate_text(item.slot_key, max_len=72) or "dem Punkt"
+    if len(item.options) >= 2:
+        return {
+            "topic_semantics": f"alltaegliche Klaerung zu {anchor}",
+            "statement_intent": f"Twinr soll ruhig sagen, dass zu {anchor} gerade zwei moegliche Versionen offen sind.",
+            "cta_intent": "Den Nutzer bitten, kurz zu sagen, was stimmt oder was gemeint ist.",
+            "relationship_stance": "ruhige Klaerung statt Datenpflege- oder Systemton",
+        }
+    return {
+        "topic_semantics": f"offener Erinnerungspunkt zu {anchor}",
+        "statement_intent": f"Twinr soll ruhig sagen, dass zu {anchor} noch etwas offen ist.",
+        "cta_intent": "Den Nutzer zu einer kurzen Ergaenzung oder Klaerung einladen.",
+        "relationship_stance": "persoenliches Nachfassen statt Speicherlogik",
+    }
+
+
+def _follow_up_card_intent(candidate: LongTermProactiveCandidateV1) -> dict[str, str]:
+    """Return structured semantic card intent for one memory follow-up."""
+
+    anchor = _truncate_text(_clean_follow_up_summary(candidate.summary), max_len=96) or "dem Thema"
+    if candidate.confidence >= 0.78:
+        return {
+            "topic_semantics": f"persoenlicher Nachfasser zu {anchor}",
+            "statement_intent": f"Twinr soll ruhig an {anchor} anknuepfen und zeigen, dass dazu noch etwas offen ist.",
+            "cta_intent": "Zu einem kurzen Update oder Weiterreden einladen.",
+            "relationship_stance": "ruhiges persoenliches Nachfassen statt Erinnerungs- oder Speicherton",
+        }
+    return {
+        "topic_semantics": f"kleiner Nachtrag zu {anchor}",
+        "statement_intent": f"Twinr soll einen kleinen Nachtrag oder Rueckbezug zu {anchor} anstossen.",
+        "cta_intent": "Zu einer kurzen Ergaenzung oder Einordnung einladen.",
+        "relationship_stance": "leicht und alltagsnah statt meta",
+    }
+
+
 def _conflict_generation_context(item: LongTermConflictQueueItemV1) -> dict[str, object]:
     """Return generic structured context for LLM-written conflict copy."""
 
@@ -194,6 +232,7 @@ def _conflict_generation_context(item: LongTermConflictQueueItemV1) -> dict[str,
         "memory_goal": "clarify_conflict",
         "display_anchor": _truncate_text(item.question, max_len=120),
         "hook_hint": _truncate_text(item.reason, max_len=140),
+        "card_intent": _conflict_card_intent(item),
         "question": _truncate_text(item.question, max_len=140),
         "reason": _truncate_text(item.reason, max_len=180),
         "options": options,
@@ -208,6 +247,7 @@ def _follow_up_generation_context(candidate: LongTermProactiveCandidateV1) -> di
         "memory_goal": "gentle_follow_up",
         "display_anchor": _truncate_text(_clean_follow_up_summary(candidate.summary), max_len=120),
         "hook_hint": _truncate_text(candidate.rationale, max_len=140),
+        "card_intent": _follow_up_card_intent(candidate),
         "summary": _truncate_text(_clean_follow_up_summary(candidate.summary), max_len=140),
         "rationale": _truncate_text(candidate.rationale, max_len=180),
         "confidence": round(float(candidate.confidence), 3),

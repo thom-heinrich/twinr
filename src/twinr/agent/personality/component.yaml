@@ -45,7 +45,7 @@ files:
   - path: display_impulse_copy.py
     role: Reserve-card copy builder that keeps the large headline explanatory, the smaller second line as CTA, and the topic context generic and policy-driven.
   - path: display_impulses.py
-    role: Generic ambient display-impulse candidate generation from mindshare and positive-engagement state.
+    role: Generic ambient display-impulse candidate generation from mindshare and positive-engagement state, including semantic card_intent payloads for reserve-card rewriting.
   - path: ambient_feedback.py
     role: Generic reserve-card feedback extraction that correlates shown-card exposure history with later structured turn evidence.
   - path: positive_engagement.py

@@ -32,8 +32,15 @@ from twinr.agent.self_coding.retest import run_self_coding_skill_retest
 from twinr.agent.self_coding.runtime import SelfCodingSkillRuntimeStore
 from twinr.agent.self_coding.operator_status import build_self_coding_operator_status
 from twinr.agent.self_coding.watchdog import cleanup_stale_compile_status, cleanup_stale_execution_run
+from twinr.channels.whatsapp.history_import import WhatsAppHistoryImportQueue
 from twinr.hardware.voice_profile import VoiceProfileMonitor
-from twinr.integrations import build_managed_integrations, integration_automation_family_providers
+from twinr.integrations import (
+    SOCIAL_HISTORY_LEARNING_INTEGRATION_ID,
+    SocialHistoryLearningConfig,
+    build_managed_integrations,
+    integration_automation_family_providers,
+    social_history_record_with_import_state,
+)
 from twinr.memory.reminders import format_due_label
 from twinr.memory.longterm.retrieval.operator_search import run_long_term_operator_search
 from twinr.ops import (
@@ -83,6 +90,7 @@ from twinr.web.presenters import (
     _adaptive_timing_view,
     _build_calendar_integration_record,
     _build_email_integration_record,
+    _build_social_history_learning_record,
     _build_smart_home_integration_record,
     _calendar_integration_sections,
     build_ops_debug_page_context,
@@ -100,6 +108,8 @@ from twinr.web.presenters import (
     _recent_named_files,
     _reminder_rows,
     _resolve_named_file,
+    _social_history_learning_panel,
+    _social_history_learning_sections,
     _smart_home_integration_sections,
     _settings_sections,
     _whatsapp_integration_context,
@@ -1573,6 +1583,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         email_record = await _call_sync(store.get, "email_mailbox")
         calendar_record = await _call_sync(store.get, "calendar_agenda")
         smart_home_record = await _call_sync(store.get, "smart_home_hub")
+        social_history_record = await _call_sync(store.get, SOCIAL_HISTORY_LEARNING_INTEGRATION_ID)
         runtime = await _call_sync(build_managed_integrations, ctx.project_root, env_path=ctx.env_path)
         pairing_snapshot = await _call_sync(whatsapp_pairing.load_snapshot)
         return ctx.render(
@@ -1596,6 +1607,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 env_path=ctx.env_path,
                 pairing_snapshot=pairing_snapshot,
             ),
+            social_history_panel=_social_history_learning_panel(social_history_record),
+            social_history_sections=_social_history_learning_sections(social_history_record),
             email_sections=_email_integration_sections(email_record, env_values),
             calendar_sections=_calendar_integration_sections(calendar_record),
             smart_home_sections=_smart_home_integration_sections(smart_home_record, env_values),
@@ -1620,12 +1633,35 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 record, env_updates = await _call_sync(_build_calendar_integration_record, form)
             elif integration_id == "smart_home_hub":
                 record, env_updates = await _call_sync(_build_smart_home_integration_record, form, env_values)
+            elif integration_id == SOCIAL_HISTORY_LEARNING_INTEGRATION_ID:
+                current_record = await _call_sync(store.get, SOCIAL_HISTORY_LEARNING_INTEGRATION_ID)
+                record = await _call_sync(_build_social_history_learning_record, form, current_record)
+                env_updates = {}
             else:
                 raise ValueError("Please choose a valid integration form.")
 
             # AUDIT-FIX(#7): Keep integration store writes and matching .env updates serialized.
             async with state_write_lock:
                 await _call_sync(store.save, record)
+                if integration_id == SOCIAL_HISTORY_LEARNING_INTEGRATION_ID:
+                    action = str(form.get("_integration_action", "save_social_history") or "save_social_history").strip()
+                    social_history = SocialHistoryLearningConfig.from_record(record)
+                    if social_history.enabled and action == "save_and_import_social_history":
+                        runtime_probe = await _call_sync(probe_whatsapp_runtime, _config, env_path=ctx.env_path)
+                        if not runtime_probe.paired:
+                            raise ValueError("WhatsApp must be paired before Twinr can import history.")
+                        import_request = await _call_sync(
+                            WhatsAppHistoryImportQueue.from_twinr_config(_config).submit_request,
+                            source=social_history.source,
+                            lookback_key=social_history.lookback_key,
+                        )
+                        queued_record = social_history_record_with_import_state(
+                            await _call_sync(store.get, SOCIAL_HISTORY_LEARNING_INTEGRATION_ID),
+                            status="queued",
+                            request_id=import_request.request_id,
+                            detail="Twinr queued one bounded WhatsApp history import.",
+                        )
+                        await _call_sync(store.save, queued_record)
                 if env_updates:
                     await _call_sync(write_env_updates, ctx.env_path, env_updates)
         except Exception as exc:

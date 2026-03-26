@@ -10,6 +10,7 @@ owned_concerns:
   - Validate and canonicalize managed email and calendar form submissions before route handlers persist them
   - Validate and canonicalize managed smart-home Hue form submissions, including multi-bridge host lists and per-bridge application keys, before route handlers persist them
   - Build the compact WhatsApp setup summary for `/integrations` while keeping QR pairing in the dedicated wizard
+  - Build and validate the `/integrations` social-history learning consent panel, including bounded source/window choices and operator-facing import status
   - Build the WhatsApp self-chat wizard page context, including bounded pairing-state rows, persisted onboarding snapshots, and live portal QR rendering, without moving route orchestration or subprocess calls into templates
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
   - Build self-coding operator telemetry rows from persisted self-coding state without moving policy into web routes
@@ -29,6 +30,7 @@ files:
       - _build_calendar_integration_record
       - _build_email_integration_record
       - _build_smart_home_integration_record
+      - _build_social_history_learning_record
       - _calendar_integration_sections
       - _capture_voice_profile_sample
       - _connect_sections
@@ -46,6 +48,8 @@ files:
       - _reminder_rows
       - _resolve_named_file
       - _settings_sections
+      - _social_history_learning_panel
+      - _social_history_learning_sections
       - _whatsapp_integration_context
       - build_self_coding_ops_page_context
       - build_whatsapp_wizard_page_context
@@ -80,6 +84,12 @@ files:
       - _integration_overview_rows
       - _smart_home_integration_sections
       - _whatsapp_integration_context
+  - path: social_history.py
+    role: Social-history learning presenter sections, status panel, and form validation for `/integrations`
+    exports:
+      - _build_social_history_learning_record
+      - _social_history_learning_panel
+      - _social_history_learning_sections
   - path: memory.py
     role: Memory, reminders, and print-related settings sections
     exports:
@@ -122,6 +132,7 @@ public_api:
     - _build_calendar_integration_record
     - _build_email_integration_record
     - _build_smart_home_integration_record
+    - _build_social_history_learning_record
     - _calendar_integration_sections
     - _capture_voice_profile_sample
     - _connect_sections
@@ -141,6 +152,8 @@ public_api:
     - _reminder_rows
     - _resolve_named_file
     - _settings_sections
+    - _social_history_learning_panel
+    - _social_history_learning_sections
     - _whatsapp_integration_context
     - build_self_coding_ops_page_context
     - build_whatsapp_wizard_page_context

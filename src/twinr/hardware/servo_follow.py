@@ -28,7 +28,17 @@ from twinr.hardware.servo_continuous import (
 )
 from twinr.hardware.servo_maestro import PololuMaestroServoPulseWriter
 from twinr.hardware.servo_peer import PeerPololuMaestroServoPulseWriter
-from twinr.hardware.servo_state import AttentionServoRuntimeState, AttentionServoStateStore
+from twinr.hardware.servo_segment_player import (
+    BoundedServoPulseSegmentPlayer,
+    ServoPulseSegmentCompletion,
+    ServoPulseSegmentPlayback,
+    ServoPulseSegmentPlayer,
+)
+from twinr.hardware.servo_state import (
+    AttentionServoMovementSegment,
+    AttentionServoRuntimeState,
+    AttentionServoStateStore,
+)
 
 
 _DEFAULT_SERVO_FREQUENCY_HZ = 50
@@ -68,16 +78,25 @@ _DEFAULT_EXIT_VISIBLE_BOX_EDGE_THRESHOLD = 0.92
 _DEFAULT_EXIT_COOLDOWN_S = 30.0
 _DEFAULT_CONTROL_MODE = "position"
 _DEFAULT_STATE_PATH = "state/attention_servo_state.json"
+_DEFAULT_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES = 15.0
+_DEFAULT_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES = 1.0
+_DEFAULT_ESTIMATED_ZERO_SPEED_SCALE = 0.5
 _DEFAULT_CONTINUOUS_MAX_SPEED_DEGREES_PER_S = 120.0
 _DEFAULT_CONTINUOUS_SLOW_ZONE_DEGREES = 45.0
 _DEFAULT_CONTINUOUS_STOP_TOLERANCE_DEGREES = 4.0
 _DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US = 70
 _DEFAULT_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US = 160
+_DEFAULT_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US = _DEFAULT_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US
+_DEFAULT_ESTIMATED_ZERO_MOVE_PERIOD_S = 0.8
+_DEFAULT_ESTIMATED_ZERO_MOVE_DUTY_CYCLE = 0.2
+_DEFAULT_CONTINUOUS_RETURN_TO_ZERO_AFTER_S = 0.0
 _MIN_RELEASE_TOLERANCE_US = 12
 _MAX_RELEASE_TOLERANCE_US = 48
 _SERVO_PRECHECK_TIMEOUT_S = 2.0
 _RECOVERABLE_SERVO_FAULT_RETRY_S = 1.0
 _CONFLICTING_GPIO_OVERLAY_NAMES = frozenset({"pwm-pio"})
+_MOVEMENT_JOURNAL_MAX_SEGMENTS = 256
+_MOVEMENT_JOURNAL_MIN_DURATION_S = 0.005
 
 
 def _clamp_ratio(value: float) -> float:
@@ -805,6 +824,13 @@ class AttentionServoConfig:
     peer_base_url: str | None = None
     peer_timeout_s: float = 1.5
     state_path: str = _DEFAULT_STATE_PATH
+    estimated_zero_max_uncertainty_degrees: float = _DEFAULT_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES
+    estimated_zero_settle_tolerance_degrees: float = _DEFAULT_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES
+    estimated_zero_speed_scale: float = _DEFAULT_ESTIMATED_ZERO_SPEED_SCALE
+    estimated_zero_move_pulse_delta_us: int = _DEFAULT_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US
+    estimated_zero_move_period_s: float = _DEFAULT_ESTIMATED_ZERO_MOVE_PERIOD_S
+    estimated_zero_move_duty_cycle: float = _DEFAULT_ESTIMATED_ZERO_MOVE_DUTY_CYCLE
+    continuous_return_to_zero_after_s: float = _DEFAULT_CONTINUOUS_RETURN_TO_ZERO_AFTER_S
     gpio_chip: str = "gpiochip0"
     gpio: int | None = None
     invert_direction: bool = False
@@ -812,6 +838,7 @@ class AttentionServoConfig:
     loss_extrapolation_s: float = _DEFAULT_LOSS_EXTRAPOLATION_S
     loss_extrapolation_gain: float = _DEFAULT_LOSS_EXTRAPOLATION_GAIN
     min_confidence: float = _DEFAULT_MIN_CONFIDENCE
+    hold_min_confidence: float = _DEFAULT_MIN_CONFIDENCE
     deadband: float = _DEFAULT_DEADBAND
     min_pulse_width_us: int = _DEFAULT_MIN_PULSE_WIDTH_US
     center_pulse_width_us: int = _DEFAULT_CENTER_PULSE_WIDTH_US
@@ -948,6 +975,76 @@ class AttentionServoConfig:
                 maximum=30.0,
             ),
             state_path=str(resolved_state_path),
+            estimated_zero_max_uncertainty_degrees=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_max_uncertainty_degrees",
+                    _DEFAULT_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES,
+                minimum=0.0,
+                maximum=180.0,
+            ),
+            estimated_zero_settle_tolerance_degrees=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_settle_tolerance_degrees",
+                    _DEFAULT_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES,
+                minimum=0.0,
+                maximum=max(1.0, mechanical_range_degrees * 0.5),
+            ),
+            estimated_zero_speed_scale=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_speed_scale",
+                    _DEFAULT_ESTIMATED_ZERO_SPEED_SCALE,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_SPEED_SCALE,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            estimated_zero_move_pulse_delta_us=_bounded_int(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_move_pulse_delta_us",
+                    _DEFAULT_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US,
+                minimum=0,
+                maximum=max(1, min(center_pulse - min_pulse, max_pulse - center_pulse)),
+            ),
+            estimated_zero_move_period_s=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_move_period_s",
+                    _DEFAULT_ESTIMATED_ZERO_MOVE_PERIOD_S,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_MOVE_PERIOD_S,
+                minimum=0.05,
+                maximum=10.0,
+            ),
+            estimated_zero_move_duty_cycle=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_estimated_zero_move_duty_cycle",
+                    _DEFAULT_ESTIMATED_ZERO_MOVE_DUTY_CYCLE,
+                ),
+                default=_DEFAULT_ESTIMATED_ZERO_MOVE_DUTY_CYCLE,
+                minimum=0.05,
+                maximum=1.0,
+            ),
+            continuous_return_to_zero_after_s=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_continuous_return_to_zero_after_s",
+                    _DEFAULT_CONTINUOUS_RETURN_TO_ZERO_AFTER_S,
+                ),
+                default=_DEFAULT_CONTINUOUS_RETURN_TO_ZERO_AFTER_S,
+                minimum=0.0,
+                maximum=3600.0,
+            ),
             gpio_chip=str(getattr(config, "gpio_chip", "gpiochip0") or "gpiochip0"),
             gpio=configured_gpio,
             invert_direction=bool(getattr(config, "attention_servo_invert_direction", False)),
@@ -969,6 +1066,17 @@ class AttentionServoConfig:
                 default=_DEFAULT_MIN_CONFIDENCE,
                 minimum=0.0,
                 maximum=1.0,
+            ),
+            hold_min_confidence=_bounded_float(
+                getattr(config, "attention_servo_hold_min_confidence", _DEFAULT_MIN_CONFIDENCE),
+                default=_DEFAULT_MIN_CONFIDENCE,
+                minimum=0.0,
+                maximum=_bounded_float(
+                    getattr(config, "attention_servo_min_confidence", _DEFAULT_MIN_CONFIDENCE),
+                    default=_DEFAULT_MIN_CONFIDENCE,
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
             ),
             deadband=_bounded_float(
                 getattr(config, "attention_servo_deadband", _DEFAULT_DEADBAND),
@@ -1252,6 +1360,7 @@ class AttentionServoController:
         *,
         config: AttentionServoConfig,
         pulse_writer: ServoPulseWriter | None = None,
+        replay_segment_player: ServoPulseSegmentPlayer | None = None,
     ) -> None:
         self.config = config
         self._pulse_writer = pulse_writer or _default_pulse_writer_for_config(config)
@@ -1263,7 +1372,14 @@ class AttentionServoController:
             if startup_state is None or not startup_state.zero_reference_confirmed
             else startup_state.heading_degrees
         )
+        self._heading_uncertainty_degrees = (
+            0.0 if startup_state is None else startup_state.heading_uncertainty_degrees
+        )
+        self._movement_journal: list[AttentionServoMovementSegment] = list(
+            () if startup_state is None else startup_state.movement_journal
+        )
         self._startup_hold_until_armed = bool(startup_state and startup_state.hold_until_armed)
+        self._return_to_zero_requested = bool(startup_state and startup_state.return_to_zero_requested)
         self._zero_reference_confirmed = bool(startup_state and startup_state.zero_reference_confirmed)
         self._last_saved_runtime_state = startup_state
         self._last_runtime_state_mtime_ns = (
@@ -1271,6 +1387,15 @@ class AttentionServoController:
         )
         self._last_target_center_x: float | None = None
         self._last_target_at: float | None = None
+        self._last_visible_target_at: float | None = None
+        self._movement_journal_active_pulse_width_us: int | None = None
+        self._movement_journal_active_started_at: float | None = None
+        self._movement_journal_replay_player = (
+            replay_segment_player or self._build_movement_journal_replay_player()
+        )
+        self._zero_return_direction_sign: int | None = None
+        self._zero_return_phase_anchor_at: float | None = None
+        self._zero_return_move_phase_active: bool | None = None
         self._last_target_velocity_x_per_s = 0.0
         self._last_commanded_pulse_width_us: int | None = None
         self._last_physical_pulse_width_us: int | None = None
@@ -1338,20 +1463,71 @@ class AttentionServoController:
             return None
         return AttentionServoStateStore(self.config.state_path)
 
+    def _build_movement_journal_replay_player(self) -> BoundedServoPulseSegmentPlayer | None:
+        if not self.config.uses_continuous_rotation or self.config.gpio is None:
+            return None
+        return BoundedServoPulseSegmentPlayer(
+            pulse_writer=self._pulse_writer,
+            gpio_chip=self.config.gpio_chip,
+            gpio=self.config.gpio,
+        )
+
     def _load_runtime_state(self) -> AttentionServoRuntimeState | None:
         if self._state_store is None:
             return None
         return self._state_store.load()
 
-    def _current_runtime_state(self, *, observed_at: float | None) -> AttentionServoRuntimeState | None:
+    def _runtime_state_snapshot(
+        self,
+        *,
+        observed_at: float | None,
+        heading_degrees: float | None = None,
+        heading_uncertainty_degrees: float | None = None,
+        movement_journal: tuple[AttentionServoMovementSegment, ...] | None = None,
+        hold_until_armed: bool | None = None,
+        return_to_zero_requested: bool | None = None,
+        zero_reference_confirmed: bool | None = None,
+    ) -> AttentionServoRuntimeState | None:
         if self._continuous_planner is None:
             return None
+        resolved_heading_degrees = (
+            self._continuous_planner.estimated_heading_degrees
+            if heading_degrees is None
+            else float(heading_degrees)
+        )
+        resolved_heading_uncertainty_degrees = (
+            self._heading_uncertainty_degrees
+            if heading_uncertainty_degrees is None
+            else float(heading_uncertainty_degrees)
+        )
         return AttentionServoRuntimeState(
-            heading_degrees=round(self._continuous_planner.estimated_heading_degrees, 3),
-            hold_until_armed=self._startup_hold_until_armed,
-            zero_reference_confirmed=self._zero_reference_confirmed,
+            heading_degrees=round(resolved_heading_degrees, 3),
+            heading_uncertainty_degrees=round(resolved_heading_uncertainty_degrees, 3),
+            movement_journal=(
+                self._movement_journal_snapshot(observed_at=observed_at)
+                if movement_journal is None
+                else movement_journal
+            ),
+            hold_until_armed=(
+                self._startup_hold_until_armed
+                if hold_until_armed is None
+                else bool(hold_until_armed)
+            ),
+            return_to_zero_requested=(
+                self._return_to_zero_requested
+                if return_to_zero_requested is None
+                else bool(return_to_zero_requested)
+            ),
+            zero_reference_confirmed=(
+                self._zero_reference_confirmed
+                if zero_reference_confirmed is None
+                else bool(zero_reference_confirmed)
+            ),
             updated_at=observed_at,
         )
+
+    def _current_runtime_state(self, *, observed_at: float | None) -> AttentionServoRuntimeState | None:
+        return self._runtime_state_snapshot(observed_at=observed_at)
 
     def _persist_runtime_state(self, *, observed_at: float | None, force: bool = False) -> None:
         current_state = self._current_runtime_state(observed_at=observed_at)
@@ -1361,7 +1537,10 @@ class AttentionServoController:
         state_changed = (
             previous_state is None
             or previous_state.heading_degrees != current_state.heading_degrees
+            or previous_state.heading_uncertainty_degrees != current_state.heading_uncertainty_degrees
+            or previous_state.movement_journal != current_state.movement_journal
             or previous_state.hold_until_armed != current_state.hold_until_armed
+            or previous_state.return_to_zero_requested != current_state.return_to_zero_requested
             or previous_state.zero_reference_confirmed != current_state.zero_reference_confirmed
         )
         if not force and not state_changed:
@@ -1370,9 +1549,98 @@ class AttentionServoController:
         self._last_saved_runtime_state = current_state
         self._last_runtime_state_mtime_ns = self._state_store.mtime_ns()
 
+    def _movement_journal_snapshot(
+        self,
+        *,
+        observed_at: float | None,
+    ) -> tuple[AttentionServoMovementSegment, ...]:
+        snapshot = list(self._movement_journal)
+        active_segment = self._active_movement_journal_segment(observed_at=observed_at)
+        if active_segment is not None:
+            snapshot.append(active_segment)
+        return tuple(snapshot)
+
+    def _active_movement_journal_segment(
+        self,
+        *,
+        observed_at: float | None,
+    ) -> AttentionServoMovementSegment | None:
+        if (
+            self._movement_journal_active_pulse_width_us is None
+            or self._movement_journal_active_started_at is None
+            or observed_at is None
+        ):
+            return None
+        duration_s = max(0.0, float(observed_at) - self._movement_journal_active_started_at)
+        if duration_s < _MOVEMENT_JOURNAL_MIN_DURATION_S:
+            return None
+        return AttentionServoMovementSegment(
+            pulse_width_us=self._movement_journal_active_pulse_width_us,
+            duration_s=duration_s,
+        )
+
+    def _append_movement_journal_segment(self, segment: AttentionServoMovementSegment) -> None:
+        if (
+            segment.duration_s < _MOVEMENT_JOURNAL_MIN_DURATION_S
+            or segment.pulse_width_us == self.config.center_pulse_width_us
+        ):
+            return
+        if self._movement_journal and self._movement_journal[-1].pulse_width_us == segment.pulse_width_us:
+            merged_duration_s = self._movement_journal[-1].duration_s + segment.duration_s
+            self._movement_journal[-1] = AttentionServoMovementSegment(
+                pulse_width_us=segment.pulse_width_us,
+                duration_s=merged_duration_s,
+            )
+        else:
+            self._movement_journal.append(segment)
+        if len(self._movement_journal) > _MOVEMENT_JOURNAL_MAX_SEGMENTS:
+            self._movement_journal = self._movement_journal[-_MOVEMENT_JOURNAL_MAX_SEGMENTS :]
+
+    def _close_active_movement_journal_segment(
+        self,
+        *,
+        observed_at: float | None,
+        record: bool,
+    ) -> None:
+        active_segment = self._active_movement_journal_segment(observed_at=observed_at)
+        self._movement_journal_active_pulse_width_us = None
+        self._movement_journal_active_started_at = None
+        if record and active_segment is not None:
+            self._append_movement_journal_segment(active_segment)
+
+    def _start_active_movement_journal_segment(
+        self,
+        *,
+        pulse_width_us: int,
+        observed_at: float | None,
+    ) -> None:
+        if observed_at is None or pulse_width_us == self.config.center_pulse_width_us:
+            self._movement_journal_active_pulse_width_us = None
+            self._movement_journal_active_started_at = None
+            return
+        self._movement_journal_active_pulse_width_us = int(pulse_width_us)
+        self._movement_journal_active_started_at = float(observed_at)
+
+    def _clear_movement_journal(self) -> None:
+        self._movement_journal.clear()
+        self._movement_journal_active_pulse_width_us = None
+        self._movement_journal_active_started_at = None
+        if self._movement_journal_replay_player is not None:
+            self._movement_journal_replay_player.cancel()
+
+    def _inverse_movement_journal_pulse_width_us(self, pulse_width_us: int) -> int:
+        center_pulse_width_us = self.config.center_pulse_width_us
+        inverse_pulse_width_us = center_pulse_width_us - (int(pulse_width_us) - center_pulse_width_us)
+        return max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, inverse_pulse_width_us),
+        )
+
     def _clear_tracking_state_for_external_override(self) -> None:
         """Drop transient follow latches before a live operator state override."""
 
+        if self._movement_journal_replay_player is not None:
+            self._movement_journal_replay_player.cancel()
         self._last_target_center_x = None
         self._last_target_at = None
         self._last_target_velocity_x_per_s = 0.0
@@ -1381,35 +1649,65 @@ class AttentionServoController:
         self._settled_since = None
         self._visible_target_pulse_width_us = None
         self._exit_cooldown_until_at = None
+        self._reset_zero_return_cycle_state()
         self._clear_exit_pursuit(clear_recent_visible_targets=True)
 
-    def _apply_loaded_runtime_state(
+    def _reset_zero_return_cycle_state(self) -> None:
+        """Forget the current continuous-servo zero-return direction and phase."""
+
+        self._zero_return_direction_sign = None
+        self._zero_return_phase_anchor_at = None
+        self._zero_return_move_phase_active = None
+
+    def _adopt_runtime_state(
         self,
         state: AttentionServoRuntimeState,
         *,
         observed_at: float | None,
     ) -> None:
-        """Adopt one externally updated state snapshot into the live controller."""
+        """Adopt one runtime-state snapshot into the live controller."""
 
         previous_hold = self._startup_hold_until_armed
+        previous_return_to_zero_requested = self._return_to_zero_requested
         previous_zero_reference = self._zero_reference_confirmed
         previous_heading_degrees = self._continuous_startup_heading_degrees
+        previous_movement_journal = tuple(self._movement_journal)
         refreshed_heading_degrees = (
             0.0 if not state.zero_reference_confirmed else state.heading_degrees
         )
+        refreshed_movement_journal = (
+            tuple(state.movement_journal)
+            if state.zero_reference_confirmed
+            else ()
+        )
+        self._heading_uncertainty_degrees = state.heading_uncertainty_degrees
         self._startup_hold_until_armed = bool(state.hold_until_armed)
+        self._return_to_zero_requested = bool(state.return_to_zero_requested)
         self._zero_reference_confirmed = bool(state.zero_reference_confirmed)
         self._continuous_startup_heading_degrees = refreshed_heading_degrees
-        self._last_saved_runtime_state = state
+        self._movement_journal = list(refreshed_movement_journal)
+        self._movement_journal_active_pulse_width_us = None
+        self._movement_journal_active_started_at = None
         entering_manual_hold = not previous_hold and self._startup_hold_until_armed
+        leaving_manual_hold = previous_hold and not self._startup_hold_until_armed
+        return_request_changed = previous_return_to_zero_requested != self._return_to_zero_requested
         heading_changed = not math.isclose(
             previous_heading_degrees,
             refreshed_heading_degrees,
             abs_tol=0.001,
         )
+        movement_journal_changed = previous_movement_journal != refreshed_movement_journal
         zero_reference_changed = previous_zero_reference != self._zero_reference_confirmed
-        if entering_manual_hold or heading_changed or zero_reference_changed:
+        if (
+            entering_manual_hold
+            or return_request_changed
+            or heading_changed
+            or movement_journal_changed
+            or zero_reference_changed
+        ):
             self._clear_tracking_state_for_external_override()
+        if leaving_manual_hold and observed_at is not None:
+            self._last_visible_target_at = float(observed_at)
         if self._continuous_planner is None:
             return
         if not heading_changed and not zero_reference_changed:
@@ -1426,6 +1724,17 @@ class AttentionServoController:
         )
         self._reset_motion_state(self.config.center_pulse_width_us)
 
+    def _apply_loaded_runtime_state(
+        self,
+        state: AttentionServoRuntimeState,
+        *,
+        observed_at: float | None,
+    ) -> None:
+        """Adopt one externally updated state snapshot into the live controller."""
+
+        self._adopt_runtime_state(state, observed_at=observed_at)
+        self._last_saved_runtime_state = state
+
     def _refresh_runtime_state_from_store(self, *, observed_at: float | None) -> None:
         """Reload the persisted runtime state when an operator changes it live."""
 
@@ -1437,31 +1746,233 @@ class AttentionServoController:
             return
         self._apply_loaded_runtime_state(refreshed_state, observed_at=observed_at)
 
-    def _command_manual_hold_center(self, *, observed_at: float | None) -> int:
-        """Drive the neutral stop pulse continuously while startup hold is active."""
+    def _apply_manual_hold(self, *, observed_at: float | None) -> None:
+        """Keep a continuous servo electrically released while startup hold is active.
 
-        target_pulse_width_us = self.config.center_pulse_width_us
+        A 360-degree servo has no absolute position hold. Driving the configured
+        center pulse during startup hold therefore still commands real motion
+        when the individual servo's neutral trim is even slightly off. Safe
+        startup hold for this path must mean "release output" instead of
+        "continuously drive center".
+        """
+
+        current_pulse_width_us = None
+        if self._movement_journal_replay_player is not None:
+            self._movement_journal_replay_player.cancel()
+        current_pulse_reader = getattr(self._pulse_writer, "current_pulse_width_us", None)
+        if callable(current_pulse_reader) and self.config.gpio is not None:
+            try:
+                current_pulse_width_us = current_pulse_reader(
+                    gpio_chip=self.config.gpio_chip,
+                    gpio=self.config.gpio,
+                )
+            except Exception:
+                current_pulse_width_us = None
         try:
-            if self._last_commanded_pulse_width_us != target_pulse_width_us:
-                self._pulse_writer.write(
+            if self._last_commanded_pulse_width_us is not None or current_pulse_width_us is not None:
+                self._pulse_writer.disable(
                     gpio_chip=self.config.gpio_chip,
                     gpio=self.config.gpio if self.config.gpio is not None else 0,
-                    pulse_width_us=target_pulse_width_us,
                 )
+            self._close_active_movement_journal_segment(
+                observed_at=observed_at,
+                record=not self._return_to_zero_requested,
+            )
             if self._continuous_planner is not None:
-                self._continuous_planner.note_commanded_pulse_width(
-                    target_pulse_width_us,
-                    observed_at=observed_at,
-                )
+                self._continuous_planner.note_stopped(observed_at=observed_at)
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
-        self._last_commanded_pulse_width_us = target_pulse_width_us
-        self._last_physical_pulse_width_us = target_pulse_width_us
-        self._released_pulse_width_us = None
-        self._reset_motion_state(target_pulse_width_us)
+        self._last_commanded_pulse_width_us = None
+        self._last_physical_pulse_width_us = self.config.center_pulse_width_us
+        self._released_pulse_width_us = self.config.center_pulse_width_us
+        self._reset_zero_return_cycle_state()
+        self._reset_motion_state(self.config.center_pulse_width_us)
         self._persist_runtime_state(observed_at=observed_at, force=True)
-        return target_pulse_width_us
+
+    def _reject_estimated_zero_return(
+        self,
+        *,
+        observed_at: float | None,
+        checked_confidence: float,
+        target_center_x: float | None,
+        reason: str,
+    ) -> AttentionServoDecision:
+        self._reset_zero_return_cycle_state()
+        rejection_state = self._runtime_state_snapshot(
+            observed_at=observed_at,
+            hold_until_armed=True,
+            return_to_zero_requested=False,
+        )
+        if rejection_state is not None:
+            self._adopt_runtime_state(rejection_state, observed_at=observed_at)
+        self._apply_manual_hold(observed_at=observed_at)
+        return AttentionServoDecision(
+            observed_at=observed_at,
+            active=False,
+            reason=reason,
+            confidence=checked_confidence,
+            target_center_x=target_center_x,
+            applied_center_x=0.5,
+            target_pulse_width_us=self.config.center_pulse_width_us,
+            commanded_pulse_width_us=None,
+        )
+
+    def _update_return_to_estimated_zero(
+        self,
+        *,
+        observed_at: float | None,
+        checked_confidence: float,
+        target_center_x: float | None,
+    ) -> AttentionServoDecision:
+        """Drive a bounded open-loop return toward the persisted virtual zero."""
+
+        if self._continuous_planner is None:
+            return self._reject_estimated_zero_return(
+                observed_at=observed_at,
+                checked_confidence=checked_confidence,
+                target_center_x=target_center_x,
+                reason="estimated_zero_rejected_unavailable",
+            )
+        if not self._zero_reference_confirmed:
+            return self._reject_estimated_zero_return(
+                observed_at=observed_at,
+                checked_confidence=checked_confidence,
+                target_center_x=target_center_x,
+                reason="estimated_zero_rejected_unconfirmed",
+            )
+        if (
+            self._heading_uncertainty_degrees
+            > self.config.estimated_zero_max_uncertainty_degrees
+        ):
+            return self._reject_estimated_zero_return(
+                observed_at=observed_at,
+                checked_confidence=checked_confidence,
+                target_center_x=target_center_x,
+                reason="estimated_zero_rejected_uncertainty",
+            )
+        if self._movement_journal or self._movement_journal_active_pulse_width_us is not None:
+            return self._update_return_to_estimated_zero_from_movement_journal(
+                observed_at=observed_at,
+                checked_confidence=checked_confidence,
+                target_center_x=target_center_x,
+            )
+        target_pulse_width_us, settled_at_zero = self._prepare_monotonic_zero_return_target(
+            observed_at=observed_at,
+        )
+        if settled_at_zero:
+            completed_state = self._runtime_state_snapshot(
+                observed_at=observed_at,
+                heading_degrees=0.0,
+                hold_until_armed=True,
+                return_to_zero_requested=False,
+            )
+            if completed_state is not None:
+                self._adopt_runtime_state(completed_state, observed_at=observed_at)
+            self._apply_manual_hold(observed_at=observed_at)
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=False,
+                reason="estimated_zero_hold",
+                confidence=checked_confidence,
+                target_center_x=target_center_x,
+                applied_center_x=0.5,
+                target_pulse_width_us=self.config.center_pulse_width_us,
+                commanded_pulse_width_us=None,
+            )
+        if target_pulse_width_us is None:
+            raise RuntimeError("estimated-zero target was unexpectedly unavailable")
+        target_pulse_width_us = self._slow_estimated_zero_target_pulse_width(
+            target_pulse_width_us=target_pulse_width_us,
+            observed_at=observed_at,
+        )
+        commanded_pulse_width_us = self._write_continuous_zero_return_target_pulse_width(
+            observed_at=observed_at,
+            target_pulse_width_us=target_pulse_width_us,
+        )
+        return AttentionServoDecision(
+            observed_at=observed_at,
+            active=commanded_pulse_width_us is not None
+            and commanded_pulse_width_us != self.config.center_pulse_width_us,
+            reason="returning_to_estimated_zero",
+            confidence=checked_confidence,
+            target_center_x=target_center_x,
+            applied_center_x=0.5,
+            target_pulse_width_us=target_pulse_width_us,
+            commanded_pulse_width_us=commanded_pulse_width_us,
+        )
+
+    def _update_return_to_estimated_zero_from_movement_journal(
+        self,
+        *,
+        observed_at: float | None,
+        checked_confidence: float,
+        target_center_x: float | None,
+    ) -> AttentionServoDecision:
+        """Replay the logged outbound motion in reverse with exact segment deadlines."""
+
+        self._close_active_movement_journal_segment(
+            observed_at=observed_at,
+            record=True,
+        )
+        replay_completion = self._consume_movement_journal_replay_completion(
+            observed_at=observed_at,
+        )
+        if replay_completion is not None and self._movement_journal:
+            self._movement_journal.pop()
+            self._persist_runtime_state(observed_at=observed_at, force=True)
+        active_replay_segment = self._active_movement_journal_replay_segment()
+        if active_replay_segment is not None:
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=active_replay_segment.pulse_width_us != self.config.center_pulse_width_us,
+                reason="returning_to_estimated_zero",
+                confidence=checked_confidence,
+                target_center_x=target_center_x,
+                applied_center_x=0.5,
+                target_pulse_width_us=active_replay_segment.pulse_width_us,
+                commanded_pulse_width_us=active_replay_segment.pulse_width_us,
+            )
+        if self._movement_journal:
+            current_segment = self._movement_journal[-1]
+            target_pulse_width_us = self._inverse_movement_journal_pulse_width_us(
+                current_segment.pulse_width_us
+            )
+            started_segment = self._start_movement_journal_replay_segment(
+                observed_at=observed_at,
+                target_pulse_width_us=target_pulse_width_us,
+                duration_s=max(_MOVEMENT_JOURNAL_MIN_DURATION_S, current_segment.duration_s),
+            )
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=started_segment.pulse_width_us != self.config.center_pulse_width_us,
+                reason="returning_to_estimated_zero",
+                confidence=checked_confidence,
+                target_center_x=target_center_x,
+                applied_center_x=0.5,
+                target_pulse_width_us=started_segment.pulse_width_us,
+                commanded_pulse_width_us=started_segment.pulse_width_us,
+            )
+        completed_state = self._runtime_state_snapshot(
+            observed_at=observed_at,
+            heading_degrees=0.0,
+            movement_journal=(),
+            hold_until_armed=True,
+            return_to_zero_requested=False,
+        )
+        if completed_state is not None:
+            self._adopt_runtime_state(completed_state, observed_at=observed_at)
+        self._apply_manual_hold(observed_at=observed_at)
+        return AttentionServoDecision(
+            observed_at=observed_at,
+            active=False,
+            reason="estimated_zero_hold",
+            confidence=checked_confidence,
+            target_center_x=target_center_x,
+            applied_center_x=0.5,
+            target_pulse_width_us=self.config.center_pulse_width_us,
+            commanded_pulse_width_us=None,
+        )
 
     def update(
         self,
@@ -1522,7 +2033,7 @@ class AttentionServoController:
             )
         self._refresh_runtime_state_from_store(observed_at=checked_at)
         if self._startup_hold_until_armed and self._continuous_planner is not None:
-            commanded_pulse_width_us = self._command_manual_hold_center(observed_at=checked_at)
+            self._apply_manual_hold(observed_at=checked_at)
             self._last_update_at = checked_at
             return AttentionServoDecision(
                 observed_at=observed_at,
@@ -1532,8 +2043,16 @@ class AttentionServoController:
                 target_center_x=target_center_x,
                 applied_center_x=0.5,
                 target_pulse_width_us=self.config.center_pulse_width_us,
-                commanded_pulse_width_us=commanded_pulse_width_us,
+                commanded_pulse_width_us=None,
             )
+        if self._return_to_zero_requested and self._continuous_planner is not None:
+            decision = self._update_return_to_estimated_zero(
+                observed_at=checked_at,
+                checked_confidence=checked_confidence,
+                target_center_x=target_center_x,
+            )
+            self._last_update_at = checked_at
+            return decision
         if self.config.follow_exit_only:
             return self._update_follow_exit_only(
                 observed_at=checked_at,
@@ -1555,22 +2074,50 @@ class AttentionServoController:
             active=effective_active,
             target_center_x=target_center_x,
             confidence=checked_confidence,
+            visible_target_present=checked_visible_target_present,
         )
         if reason == "awaiting_exit_confirmation":
+            self._reset_zero_return_cycle_state()
             return self._await_exit_confirmation(
                 observed_at=checked_at,
                 confidence=checked_confidence,
                 target_center_x=target_center_x,
                 applied_center_x=applied_center_x,
             )
+        if not self._return_to_zero_requested and reason != "recentering":
+            self._reset_zero_return_cycle_state()
+        absence_hold_decision = self._maybe_hold_continuous_absence_before_return_to_zero(
+            observed_at=checked_at,
+            confidence=checked_confidence,
+            target_center_x=target_center_x,
+            visible_target_present=checked_visible_target_present,
+            active=effective_active,
+            reason=reason,
+        )
+        if absence_hold_decision is not None:
+            return absence_hold_decision
+        if (
+            self._continuous_planner is not None
+            and not effective_active
+            and reason == "recentering"
+        ):
+            rest_decision = self._drive_rest_position(
+                observed_at=checked_at,
+                confidence=checked_confidence,
+                target_center_x=target_center_x,
+            )
+            self._last_update_at = checked_at
+            return rest_decision
         applied_center_x = self._clamped_follow_center_x(applied_center_x)
         applied_center_x = self._smoothed_target_center_x(
             observed_at=checked_at,
             target_center_x=applied_center_x,
+            active_tracking=effective_active,
         )
         target_pulse_width_us = self._target_pulse_width_for_center_x(
             center_x=applied_center_x,
             observed_at=checked_at,
+            active_tracking=effective_active,
         )
         target_pulse_width_us = self._stabilize_visible_target_pulse_width(
             target_pulse_width_us=target_pulse_width_us,
@@ -2109,6 +2656,44 @@ class AttentionServoController:
         confidence: float,
         target_center_x: float | None,
     ) -> AttentionServoDecision:
+        if self._continuous_planner is not None:
+            target_pulse_width_us, settled_at_zero = self._prepare_monotonic_zero_return_target(
+                observed_at=observed_at,
+            )
+            if settled_at_zero:
+                self._release_active_output(observed_at=observed_at)
+                self._last_update_at = observed_at
+                return AttentionServoDecision(
+                    observed_at=observed_at,
+                    active=False,
+                    reason="idle_released",
+                    confidence=confidence,
+                    target_center_x=target_center_x,
+                    applied_center_x=0.5,
+                    target_pulse_width_us=target_pulse_width_us,
+                    commanded_pulse_width_us=None,
+                )
+            if target_pulse_width_us is None:
+                raise RuntimeError("continuous zero-return target was unexpectedly unavailable")
+            target_pulse_width_us = self._slow_estimated_zero_target_pulse_width(
+                target_pulse_width_us=target_pulse_width_us,
+                observed_at=observed_at,
+            )
+            commanded_pulse_width_us = self._write_continuous_zero_return_target_pulse_width(
+                observed_at=observed_at,
+                target_pulse_width_us=target_pulse_width_us,
+            )
+            return AttentionServoDecision(
+                observed_at=observed_at,
+                active=commanded_pulse_width_us is not None
+                and commanded_pulse_width_us != self.config.center_pulse_width_us,
+                reason="recentering",
+                confidence=confidence,
+                target_center_x=target_center_x,
+                applied_center_x=0.5,
+                target_pulse_width_us=target_pulse_width_us,
+                commanded_pulse_width_us=commanded_pulse_width_us,
+            )
         target_pulse_width_us = self.config.center_pulse_width_us
         if self._maybe_release_idle(
             observed_at=observed_at,
@@ -2142,6 +2727,56 @@ class AttentionServoController:
             commanded_pulse_width_us=commanded_pulse_width_us,
         )
 
+    def _maybe_hold_continuous_absence_before_return_to_zero(
+        self,
+        *,
+        observed_at: float | None,
+        confidence: float,
+        target_center_x: float | None,
+        visible_target_present: bool,
+        active: bool,
+        reason: str,
+    ) -> AttentionServoDecision | None:
+        """Release the continuous servo before a delayed return-to-zero phase.
+
+        Continuous servos cannot hold a position electrically. When the person
+        leaves frame, Twinr should stop driving, keep the last estimated
+        heading, and only start the slow return to virtual zero after the
+        configured no-user delay has elapsed.
+        """
+
+        if (
+            self._continuous_planner is None
+            or visible_target_present
+            or active
+            or reason != "recentering"
+        ):
+            return None
+        absence_hold_s = max(0.0, self.config.continuous_return_to_zero_after_s)
+        if absence_hold_s <= 0.0 or observed_at is None:
+            return None
+        last_visible_target_at = self._last_visible_target_at
+        if last_visible_target_at is None:
+            return None
+        if observed_at < last_visible_target_at:
+            self._last_visible_target_at = observed_at
+            return None
+        if (observed_at - last_visible_target_at) >= absence_hold_s:
+            return None
+        self._reset_zero_return_cycle_state()
+        self._release_active_output(observed_at=observed_at)
+        self._last_update_at = observed_at
+        return AttentionServoDecision(
+            observed_at=observed_at,
+            active=False,
+            reason="absence_hold_released",
+            confidence=confidence,
+            target_center_x=target_center_x,
+            applied_center_x=0.5,
+            target_pulse_width_us=self.config.center_pulse_width_us,
+            commanded_pulse_width_us=None,
+        )
+
     def _write_target_pulse_width(
         self,
         *,
@@ -2166,6 +2801,10 @@ class AttentionServoController:
                 self._last_commanded_pulse_width_us is None
                 or commanded_pulse_width_us != self._last_commanded_pulse_width_us
             ):
+                self._close_active_movement_journal_segment(
+                    observed_at=observed_at,
+                    record=not self._return_to_zero_requested,
+                )
                 self._pulse_writer.write(
                     gpio_chip=self.config.gpio_chip,
                     gpio=self.config.gpio,
@@ -2189,6 +2828,82 @@ class AttentionServoController:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
         return commanded_pulse_width_us
+
+    def _write_immediate_target_pulse_width(
+        self,
+        *,
+        observed_at: float | None,
+        target_pulse_width_us: int,
+        planner_speed_scale: float = 1.0,
+    ) -> int:
+        """Write one already-bounded continuous-servo target without extra smoothing.
+
+        The continuous zero-return path is already slowed by explicit move
+        windows around neutral. A second motion-profile ramp can shrink the
+        effective command below the servo's real movement threshold and trap
+        the controller in endless no-progress nudges.
+        """
+
+        commanded_pulse_width_us = max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, int(target_pulse_width_us)),
+        )
+        try:
+            if self.config.gpio is None:
+                raise RuntimeError("Attention servo output is enabled without a configured output channel")
+            if (
+                self._last_commanded_pulse_width_us is None
+                or commanded_pulse_width_us != self._last_commanded_pulse_width_us
+            ):
+                self._pulse_writer.write(
+                    gpio_chip=self.config.gpio_chip,
+                    gpio=self.config.gpio,
+                    pulse_width_us=commanded_pulse_width_us,
+                )
+                if self._continuous_planner is not None:
+                    self._continuous_planner.note_commanded_pulse_width(
+                        commanded_pulse_width_us,
+                        observed_at=observed_at,
+                        speed_scale=planner_speed_scale,
+                    )
+                self._last_commanded_pulse_width_us = commanded_pulse_width_us
+                self._last_physical_pulse_width_us = commanded_pulse_width_us
+                if not self._return_to_zero_requested:
+                    self._start_active_movement_journal_segment(
+                        pulse_width_us=commanded_pulse_width_us,
+                        observed_at=observed_at,
+                    )
+                self._persist_runtime_state(observed_at=observed_at)
+            self._last_update_at = observed_at
+        except Exception as exc:
+            self._fault_reason = f"{exc.__class__.__name__}: {exc}"
+            raise
+        return commanded_pulse_width_us
+
+    def _write_continuous_zero_return_target_pulse_width(
+        self,
+        *,
+        observed_at: float | None,
+        target_pulse_width_us: int,
+    ) -> int | None:
+        """Emit one slow zero-return command, releasing output during pause windows.
+
+        Continuous-servo zero-return already uses explicit short move windows.
+        Driving the configured stop pulse during the off-window can still cause
+        reverse creep on a real servo whose neutral trim is imperfect. Treat
+        that off-window as an electrical release instead of a center-pulse
+        command so the shaft pauses without counter-steering.
+        """
+
+        if int(target_pulse_width_us) == self.config.center_pulse_width_us:
+            self._release_active_output(observed_at=observed_at)
+            self._last_update_at = observed_at
+            return None
+        return self._write_immediate_target_pulse_width(
+            observed_at=observed_at,
+            target_pulse_width_us=target_pulse_width_us,
+            planner_speed_scale=self.config.estimated_zero_speed_scale,
+        )
 
     def _begin_exit_pursuit(self, *, observed_at: float | None) -> float | None:
         anchor_center_x = self._recent_exit_anchor_center_x(observed_at=observed_at)
@@ -2250,6 +2965,8 @@ class AttentionServoController:
 
         gpio = self.config.gpio
         try:
+            if self._movement_journal_replay_player is not None:
+                self._movement_journal_replay_player.close()
             if self.config.enabled and gpio is not None and self._last_commanded_pulse_width_us is not None:
                 self._pulse_writer.disable(
                     gpio_chip=self.config.gpio_chip,
@@ -2257,6 +2974,7 @@ class AttentionServoController:
                 )
         finally:
             self._last_commanded_pulse_width_us = None
+            self._reset_zero_return_cycle_state()
             self._reset_motion_state()
             if self._continuous_planner is not None:
                 self._continuous_planner.reset()
@@ -2339,12 +3057,23 @@ class AttentionServoController:
             "visible_target_pulse_width_us": self._visible_target_pulse_width_us,
             "startup_rest_alignment_pending": self._startup_rest_alignment_pending,
             "startup_hold_until_armed": self._startup_hold_until_armed,
+            "return_to_zero_requested": self._return_to_zero_requested,
             "zero_reference_confirmed": self._zero_reference_confirmed,
+            "movement_journal_segments": len(self._movement_journal_snapshot(observed_at=checked_at)),
+            "movement_journal_total_duration_s": round(
+                sum(segment.duration_s for segment in self._movement_journal_snapshot(observed_at=checked_at)),
+                3,
+            ),
+            "movement_journal_replay_active": self._active_movement_journal_replay_segment() is not None,
+            "movement_journal_replay_due_in_s": self._movement_journal_replay_due_in_seconds(
+                observed_at=checked_at,
+            ),
             "continuous_estimated_heading_degrees": (
                 None
                 if self._continuous_planner is None
                 else round(self._continuous_planner.estimated_heading_degrees, 3)
             ),
+            "continuous_heading_uncertainty_degrees": round(self._heading_uncertainty_degrees, 3),
             "continuous_desired_heading_degrees": (
                 None
                 if self._continuous_planner is None
@@ -2366,10 +3095,85 @@ class AttentionServoController:
                 "exit_reacquire_center_tolerance": round(self.config.exit_reacquire_center_tolerance, 4),
                 "exit_cooldown_s": round(self.config.exit_cooldown_s, 3),
                 "exit_follow_offset_limit": round(self.config.exit_follow_offset_limit, 4),
+                "min_confidence": round(self.config.min_confidence, 4),
+                "hold_min_confidence": round(self.config.hold_min_confidence, 4),
                 "deadband": round(self.config.deadband, 4),
                 "state_path": self.config.state_path,
+                "estimated_zero_max_uncertainty_degrees": round(
+                    self.config.estimated_zero_max_uncertainty_degrees,
+                    3,
+                ),
+                "estimated_zero_settle_tolerance_degrees": round(
+                    self.config.estimated_zero_settle_tolerance_degrees,
+                    3,
+                ),
+                "estimated_zero_speed_scale": round(self.config.estimated_zero_speed_scale, 3),
+                "estimated_zero_move_pulse_delta_us": self.config.estimated_zero_move_pulse_delta_us,
+                "estimated_zero_move_period_s": round(self.config.estimated_zero_move_period_s, 3),
+                "estimated_zero_move_duty_cycle": round(self.config.estimated_zero_move_duty_cycle, 3),
             },
         }
+
+    def _active_movement_journal_replay_segment(self) -> ServoPulseSegmentPlayback | None:
+        if self._movement_journal_replay_player is None:
+            return None
+        return self._movement_journal_replay_player.active_segment()
+
+    def _movement_journal_replay_due_in_seconds(
+        self,
+        *,
+        observed_at: float | None,
+    ) -> float | None:
+        active_segment = self._active_movement_journal_replay_segment()
+        if active_segment is None or observed_at is None:
+            return None
+        return round(max(0.0, active_segment.due_at - float(observed_at)), 3)
+
+    def _consume_movement_journal_replay_completion(
+        self,
+        *,
+        observed_at: float | None,
+    ) -> ServoPulseSegmentCompletion | None:
+        if self._movement_journal_replay_player is None:
+            return None
+        completion = self._movement_journal_replay_player.consume_completion()
+        if completion is None:
+            return None
+        if completion.error:
+            self._fault_reason = completion.error
+            raise RuntimeError(completion.error)
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_stopped(observed_at=observed_at)
+        self._released_pulse_width_us = completion.playback.pulse_width_us
+        self._last_physical_pulse_width_us = completion.playback.pulse_width_us
+        self._last_commanded_pulse_width_us = None
+        self._reset_motion_state(self._released_pulse_width_us)
+        self._last_update_at = observed_at
+        return completion
+
+    def _start_movement_journal_replay_segment(
+        self,
+        *,
+        observed_at: float | None,
+        target_pulse_width_us: int,
+        duration_s: float,
+    ) -> ServoPulseSegmentPlayback:
+        if self._movement_journal_replay_player is None:
+            raise RuntimeError("movement-journal replay player is unavailable")
+        started_segment = self._movement_journal_replay_player.start_segment(
+            pulse_width_us=target_pulse_width_us,
+            duration_s=duration_s,
+        )
+        if self._continuous_planner is not None:
+            self._continuous_planner.note_commanded_pulse_width(
+                started_segment.pulse_width_us,
+                observed_at=observed_at,
+            )
+        self._last_commanded_pulse_width_us = started_segment.pulse_width_us
+        self._last_physical_pulse_width_us = started_segment.pulse_width_us
+        self._released_pulse_width_us = None
+        self._last_update_at = observed_at
+        return started_segment
 
     def _prime_last_physical_pulse_width_from_writer(self) -> None:
         """Seed the motion planner from the kernel's remembered pulse width on controller startup.
@@ -2415,11 +3219,23 @@ class AttentionServoController:
         active: bool,
         target_center_x: float | None,
         confidence: float,
+        visible_target_present: bool,
     ) -> bool:
+        confidence_floor = self.config.min_confidence
+        if (
+            visible_target_present
+            and active
+            and target_center_x is not None
+            and self._last_target_center_x is not None
+            and self._last_target_at is not None
+        ):
+            # Acquisition can stay strict while an already-visible track gets a
+            # lower release threshold to avoid confidence-edge thrashing.
+            confidence_floor = min(confidence_floor, self.config.hold_min_confidence)
         return (
             active
             and target_center_x is not None
-            and confidence >= self.config.min_confidence
+            and confidence >= confidence_floor
         )
 
     def _visible_target_present(
@@ -2431,8 +3247,14 @@ class AttentionServoController:
         return active and target_center_x is not None
 
     def _release_active_output(self, *, observed_at: float | None = None) -> None:
+        if self._movement_journal_replay_player is not None:
+            self._movement_journal_replay_player.cancel()
         if self._last_commanded_pulse_width_us is None:
             if self._continuous_planner is not None:
+                self._close_active_movement_journal_segment(
+                    observed_at=observed_at,
+                    record=not self._return_to_zero_requested,
+                )
                 self._continuous_planner.note_stopped(observed_at=observed_at)
                 self._persist_runtime_state(observed_at=observed_at, force=True)
             return
@@ -2444,6 +3266,10 @@ class AttentionServoController:
         except Exception as exc:
             self._fault_reason = f"{exc.__class__.__name__}: {exc}"
             raise
+        self._close_active_movement_journal_segment(
+            observed_at=observed_at,
+            record=not self._return_to_zero_requested,
+        )
         if self._continuous_planner is not None:
             self._continuous_planner.note_stopped(observed_at=observed_at)
         self._released_pulse_width_us = self._last_commanded_pulse_width_us
@@ -2476,6 +3302,8 @@ class AttentionServoController:
             return True
         if not self._driver_supports_fault_recovery():
             return False
+        if self._movement_journal_replay_player is not None:
+            self._movement_journal_replay_player.cancel()
         retry_anchor_at = time.monotonic() if observed_at is None else observed_at
         if self._fault_retry_after_at is not None and retry_anchor_at < self._fault_retry_after_at:
             return False
@@ -2497,6 +3325,11 @@ class AttentionServoController:
             self._last_target_velocity_x_per_s = 0.0
             self._smoothed_center_x = None
             if self._continuous_planner is not None:
+                self._heading_uncertainty_degrees = max(
+                    self._heading_uncertainty_degrees,
+                    self.config.estimated_zero_max_uncertainty_degrees + self.config.continuous_stop_tolerance_degrees,
+                )
+                self._return_to_zero_requested = False
                 self._continuous_planner.reset(
                     heading_degrees=self._continuous_planner.estimated_heading_degrees,
                     observed_at=observed_at,
@@ -2610,6 +3443,7 @@ class AttentionServoController:
         if observed_at is None:
             return
         checked_at = float(observed_at)
+        self._last_visible_target_at = checked_at
         history_window_s = max(
             self.config.target_hold_s,
             self.config.loss_extrapolation_s,
@@ -2863,17 +3697,21 @@ class AttentionServoController:
         active: bool,
         target_center_x: float | None,
         confidence: float,
+        visible_target_present: bool,
     ) -> tuple[float, bool, str]:
         checked_at = None if observed_at is None else float(observed_at)
         target_available = self._target_available(
             active=active,
             target_center_x=target_center_x,
             confidence=confidence,
+            visible_target_present=visible_target_present,
         )
         if target_available:
             if target_center_x is None:
                 raise RuntimeError("Target availability requires a concrete normalized target center")
             normalized_center_x = _clamp_ratio(float(target_center_x))
+            self._last_visible_target_at = checked_at
+            self._reset_zero_return_cycle_state()
             self._update_target_velocity(
                 observed_at=checked_at,
                 target_center_x=normalized_center_x,
@@ -3007,13 +3845,132 @@ class AttentionServoController:
             normalized_offset = 0.0
         return normalized_offset * self._maximum_target_heading_degrees()
 
-    def _target_pulse_width_for_center_x(self, *, center_x: float, observed_at: float | None) -> int:
+    def _target_pulse_width_for_center_x(
+        self,
+        *,
+        center_x: float,
+        observed_at: float | None,
+        active_tracking: bool = False,
+    ) -> int:
         if self._continuous_planner is None:
             return self._pulse_width_for_center_x(center_x)
+        if active_tracking:
+            # Visible-target following already closes the loop through vision.
+            # Reusing the virtual-heading planner here makes sparse Pi refresh
+            # cadence overshoot the estimated heading and flip left/right on
+            # the next frame even while the target stays on the same side.
+            return self._continuous_tracking_pulse_width_for_center_x(center_x)
         return self._continuous_planner.target_pulse_width_for_heading(
             self._desired_heading_degrees_for_center_x(center_x),
             observed_at=observed_at,
         )
+
+    def _prepare_monotonic_zero_return_target(
+        self,
+        *,
+        observed_at: float | None,
+    ) -> tuple[int | None, bool]:
+        """Return one zero-return target that will not intentionally reverse direction.
+
+        Continuous-servo homing is open-loop. Once the virtual heading estimate
+        crosses zero, issuing the opposite pulse creates visible left/right
+        chatter. Treat that first sign flip as "close enough", snap the virtual
+        heading back to zero, and stop instead of counter-steering.
+        """
+
+        if self._continuous_planner is None:
+            return None, False
+        center_pulse_width_us = self.config.center_pulse_width_us
+        target_pulse_width_us = self._target_pulse_width_for_center_x(
+            center_x=0.5,
+            observed_at=observed_at,
+        )
+        estimated_heading_degrees = self._continuous_planner.estimated_heading_degrees
+        stop_tolerance_degrees = self.config.estimated_zero_settle_tolerance_degrees
+        if (
+            abs(estimated_heading_degrees) <= stop_tolerance_degrees
+            and target_pulse_width_us == center_pulse_width_us
+        ):
+            self._reset_zero_return_cycle_state()
+            self._continuous_planner.reset(heading_degrees=0.0, observed_at=observed_at)
+            return None, True
+        return_direction_sign = 0
+        if estimated_heading_degrees < (-stop_tolerance_degrees):
+            return_direction_sign = 1
+        elif estimated_heading_degrees > stop_tolerance_degrees:
+            return_direction_sign = -1
+        if return_direction_sign == 0:
+            self._reset_zero_return_cycle_state()
+            self._continuous_planner.reset(heading_degrees=0.0, observed_at=observed_at)
+            return None, True
+        if self._zero_return_direction_sign is None:
+            self._zero_return_direction_sign = return_direction_sign
+        elif return_direction_sign != self._zero_return_direction_sign:
+            self._reset_zero_return_cycle_state()
+            self._continuous_planner.reset(heading_degrees=0.0, observed_at=observed_at)
+            return None, True
+        pulse_delta_us = abs(target_pulse_width_us - center_pulse_width_us)
+        if pulse_delta_us <= 0:
+            pulse_delta_us = self.config.continuous_min_speed_pulse_delta_us
+        monotonic_target_pulse_width_us = center_pulse_width_us + (return_direction_sign * pulse_delta_us)
+        monotonic_target_pulse_width_us = max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, monotonic_target_pulse_width_us),
+        )
+        return monotonic_target_pulse_width_us, False
+
+    def _slow_estimated_zero_target_pulse_width(
+        self,
+        *,
+        target_pulse_width_us: int,
+        observed_at: float | None,
+    ) -> int:
+        """Return one extra-slow open-loop target for estimated-zero returns."""
+
+        checked_target_us = max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, int(target_pulse_width_us)),
+        )
+        center_pulse_width_us = self.config.center_pulse_width_us
+        pulse_delta_us = checked_target_us - center_pulse_width_us
+        if pulse_delta_us == 0:
+            return center_pulse_width_us
+        max_move_delta_us = max(0, int(self.config.estimated_zero_move_pulse_delta_us))
+        if max_move_delta_us == 0:
+            return center_pulse_width_us
+        if self.config.estimated_zero_move_duty_cycle >= 1.0:
+            self._zero_return_phase_anchor_at = observed_at
+            self._zero_return_move_phase_active = True
+        elif observed_at is not None:
+            checked_at = max(0.0, float(observed_at))
+            active_window_s = (
+                self.config.estimated_zero_move_period_s * self.config.estimated_zero_move_duty_cycle
+            )
+            release_window_s = max(0.0, self.config.estimated_zero_move_period_s - active_window_s)
+            phase_anchor_at = self._zero_return_phase_anchor_at
+            move_phase_active = self._zero_return_move_phase_active
+            if phase_anchor_at is None or move_phase_active is None or checked_at < phase_anchor_at:
+                phase_anchor_at = checked_at
+                move_phase_active = True
+                self._zero_return_phase_anchor_at = checked_at
+                self._zero_return_move_phase_active = True
+            elapsed_phase_s = max(0.0, checked_at - phase_anchor_at)
+            if move_phase_active:
+                if elapsed_phase_s >= active_window_s:
+                    self._zero_return_phase_anchor_at = checked_at
+                    self._zero_return_move_phase_active = False
+                    return center_pulse_width_us
+            elif elapsed_phase_s >= release_window_s:
+                self._zero_return_phase_anchor_at = checked_at
+                self._zero_return_move_phase_active = True
+            else:
+                return center_pulse_width_us
+        bounded_delta_us = min(abs(pulse_delta_us), max_move_delta_us)
+        if bounded_delta_us <= 0:
+            return center_pulse_width_us
+        if pulse_delta_us > 0:
+            return min(self.config.safe_max_pulse_width_us, center_pulse_width_us + bounded_delta_us)
+        return max(self.config.safe_min_pulse_width_us, center_pulse_width_us - bounded_delta_us)
 
     def _pulse_width_for_center_x(self, center_x: float) -> int:
         normalized_center_x = self._clamped_follow_center_x(center_x)
@@ -3028,6 +3985,36 @@ class AttentionServoController:
             span = self.config.center_pulse_width_us - self.config.safe_min_pulse_width_us
         pulse_width = int(round(self.config.center_pulse_width_us + (normalized_offset * span)))
         return max(self.config.safe_min_pulse_width_us, min(self.config.safe_max_pulse_width_us, pulse_width))
+
+    def _continuous_tracking_pulse_width_for_center_x(self, center_x: float) -> int:
+        """Map live image error to one bounded continuous-servo speed command."""
+
+        normalized_center_x = self._clamped_follow_center_x(center_x)
+        normalized_offset = (normalized_center_x - 0.5) * 2.0
+        if self.config.invert_direction:
+            normalized_offset *= -1.0
+        absolute_offset = abs(normalized_offset)
+        if absolute_offset <= self.config.deadband:
+            return self.config.center_pulse_width_us
+        offset_ratio = (absolute_offset - self.config.deadband) / max(1e-6, 1.0 - self.config.deadband)
+        bounded_offset_ratio = max(0.0, min(1.0, offset_ratio))
+        pulse_delta_us = self.config.continuous_min_speed_pulse_delta_us
+        if self.config.continuous_max_speed_pulse_delta_us > self.config.continuous_min_speed_pulse_delta_us:
+            pulse_delta_us += int(
+                round(
+                    (
+                        self.config.continuous_max_speed_pulse_delta_us
+                        - self.config.continuous_min_speed_pulse_delta_us
+                    )
+                    * bounded_offset_ratio
+                )
+            )
+        direction_sign = 1 if normalized_offset > 0.0 else -1
+        pulse_width_us = self.config.center_pulse_width_us + (direction_sign * pulse_delta_us)
+        return max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, pulse_width_us),
+        )
 
     def _effective_dt_s(self, *, observed_at: float | None) -> float:
         previous = self._last_update_at
@@ -3060,10 +4047,22 @@ class AttentionServoController:
         *,
         observed_at: float | None,
         target_center_x: float,
+        active_tracking: bool = False,
     ) -> float:
         normalized_target = _clamp_ratio(target_center_x)
         previous = 0.5 if self._smoothed_center_x is None else self._smoothed_center_x
-        if self.config.target_smoothing_s <= 0.0:
+        if (
+            active_tracking
+            and self._continuous_planner is not None
+            and ((previous - 0.5) * (normalized_target - 0.5)) < 0.0
+        ):
+            # Active visible follow should be able to cross image center
+            # promptly. Reusing the old-side smoothed center here creates a
+            # practical center barrier where the servo keeps drifting on the
+            # stale side long after the live target has crossed over.
+            smoothed = normalized_target
+            self._visible_target_pulse_width_us = None
+        elif self.config.target_smoothing_s <= 0.0:
             smoothed = normalized_target
         else:
             dt = self._effective_dt_s(observed_at=observed_at)
@@ -3300,6 +4299,12 @@ class AttentionServoController:
     ) -> AttentionServoDecision | None:
         released_pulse_width_us = self._released_pulse_width_us
         if released_pulse_width_us is None:
+            return None
+        if self._continuous_planner is not None and active:
+            # A visible continuous-servo follow target must not stay parked on
+            # the last released pulse; that creates bursty move/release jitter.
+            self._released_pulse_width_us = None
+            self._settled_since = None
             return None
         if target_pulse_width_us == self.config.center_pulse_width_us:
             if released_pulse_width_us != self.config.center_pulse_width_us:

@@ -527,6 +527,50 @@ class TwinrRuntimeContextMixin:
 
         return self._provider_context_messages(tool_context=True)
 
+    def tool_provider_tiny_recent_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        """Return bounded tool context without synchronous remote retrieval.
+
+        Runtime-local tool turns such as immediate device/session-state checks
+        must stay off the heavy remote long-term-memory path while the user is
+        already waiting inside the active streaming final lane. This compact
+        context keeps the tool instructions grounded in live runtime guidance,
+        the visible display topic, one local summary turn, and the tiny recent
+        raw-tail window only.
+        """
+
+        with self._runtime_context_lock():
+            messages: list[tuple[str, str]] = []
+            try:
+                contract = memory_and_response_contract(self.config.openai_realtime_language)
+            except Exception as exc:
+                self._safe_append_ops_event(
+                    event="tool_tiny_recent_context_contract_failed",
+                    message="Twinr could not build the compact tool language contract and continued with reduced context.",
+                    data={"error_type": type(exc).__name__},
+                )
+            else:
+                messages.append(("system", contract))
+
+            guidance = self._voice_guidance_message()
+            if guidance:
+                messages.append(("system", guidance))
+
+            discovery_guidance = self._discovery_guidance_message(tool_context=True)
+            if discovery_guidance:
+                messages.append(("system", discovery_guidance))
+
+            self_coding_guidance = self._self_coding_guidance_message(tool_context=True)
+            if self_coding_guidance:
+                messages.append(("system", self_coding_guidance))
+
+            display_grounding = build_active_display_grounding_message(self.config)
+            if display_grounding:
+                messages.append(("system", display_grounding))
+
+            messages.extend(self._local_summary_context_unlocked(limit=1))
+            messages.extend(self._raw_tail_context_unlocked(limit=3))
+            return tuple(messages)
+
     def supervisor_direct_provider_conversation_context(
         self,
         query_text: str | None = None,

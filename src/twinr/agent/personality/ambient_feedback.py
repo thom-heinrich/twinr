@@ -230,15 +230,15 @@ class AmbientImpulseFeedbackExtractor:
         """Flatten structured batch content into generic match targets."""
 
         targets: list[_BatchTarget] = []
-        for signal in batch.interaction_signals:
+        for interaction_signal in batch.interaction_signals:
             targets.append(
                 _BatchTarget(
-                    signal_kind=signal.signal_kind,
-                    target=signal.target,
-                    summary=signal.summary,
-                    confidence=float(signal.confidence),
-                    evidence_count=int(signal.evidence_count),
-                    source_event_ids=tuple(signal.source_event_ids),
+                    signal_kind=interaction_signal.signal_kind,
+                    target=interaction_signal.target,
+                    summary=interaction_signal.summary,
+                    confidence=float(interaction_signal.confidence),
+                    evidence_count=int(interaction_signal.evidence_count),
+                    source_event_ids=tuple(interaction_signal.source_event_ids),
                 )
             )
         for thread in batch.continuity_threads:
@@ -252,26 +252,26 @@ class AmbientImpulseFeedbackExtractor:
                     source_event_ids=(),
                 )
             )
-        for signal in batch.place_signals:
+        for place_signal in batch.place_signals:
             targets.append(
                 _BatchTarget(
                     signal_kind="place",
-                    target=signal.place_name,
-                    summary=signal.summary,
-                    confidence=float(signal.confidence),
-                    evidence_count=int(signal.evidence_count),
-                    source_event_ids=tuple(signal.source_event_ids),
+                    target=place_signal.place_name,
+                    summary=place_signal.summary,
+                    confidence=float(place_signal.confidence),
+                    evidence_count=int(place_signal.evidence_count),
+                    source_event_ids=tuple(place_signal.source_event_ids),
                 )
             )
-        for signal in batch.world_signals:
+        for world_signal in batch.world_signals:
             targets.append(
                 _BatchTarget(
                     signal_kind="world",
-                    target=signal.topic,
-                    summary=signal.summary,
-                    confidence=float(signal.salience),
-                    evidence_count=int(signal.evidence_count),
-                    source_event_ids=tuple(signal.source_event_ids),
+                    target=world_signal.topic,
+                    summary=world_signal.summary,
+                    confidence=float(world_signal.salience),
+                    evidence_count=int(world_signal.evidence_count),
+                    source_event_ids=tuple(world_signal.source_event_ids),
                 )
             )
         return tuple(targets)
@@ -283,7 +283,7 @@ class AmbientImpulseFeedbackExtractor:
     ) -> _BatchTarget | None:
         """Return the first structured target that matches the shown card anchors."""
 
-        exposure_tokens = []
+        exposure_tokens: list[str] = []
         for anchor in exposure.anchors():
             exposure_tokens.extend(_match_tokens(anchor))
         unique_exposure_tokens = tuple(dict.fromkeys(exposure_tokens))
@@ -304,7 +304,7 @@ class AmbientImpulseFeedbackExtractor:
 
         exposure_count = max(
             1,
-            self.history_store.topic_exposure_count(topic_key=exposure.topic_key, now=occurred_at),
+            self.history_store.topic_exposure_count(topic_key=exposure.semantic_key(), now=occurred_at),
         )
         response_mode, response_latency_seconds = self._response_profile(
             exposure=exposure,
@@ -315,7 +315,7 @@ class AmbientImpulseFeedbackExtractor:
         active_bonus = 0.08 if occurred_at <= exposure.expires_at_datetime() else 0.0
         signal_confidence = min(0.98, max(0.58, matched_target.confidence + 0.08 + active_bonus + immediate_bonus))
         evidence_count = max(2, matched_target.evidence_count, exposure_count + (1 if immediate_bonus > 0.0 else 0))
-        signal_target = matched_target.target or exposure.title or exposure.topic_key
+        signal_target = matched_target.target or exposure.title or exposure.semantic_key()
         turn_slug = slugify_identifier(turn_id, fallback="turn")
         target_slug = slugify_identifier(signal_target, fallback="topic")
         return InteractionSignal(
@@ -356,7 +356,7 @@ class AmbientImpulseFeedbackExtractor:
 
         exposure_count = max(
             1,
-            self.history_store.topic_exposure_count(topic_key=exposure.topic_key, now=occurred_at),
+            self.history_store.topic_exposure_count(topic_key=exposure.semantic_key(), now=occurred_at),
         )
         response_mode, response_latency_seconds = self._response_profile(
             exposure=exposure,
@@ -364,7 +364,7 @@ class AmbientImpulseFeedbackExtractor:
             status="avoided" if matched_target.signal_kind == INTERACTION_SIGNAL_TOPIC_AVERSION else "cooled",
         )
         immediate_penalty = 0.08 if response_mode == "voice_immediate_pushback" else 0.0
-        signal_target = matched_target.target or exposure.title or exposure.topic_key
+        signal_target = matched_target.target or exposure.title or exposure.semantic_key()
         signal_kind = (
             INTERACTION_SIGNAL_TOPIC_AVERSION
             if matched_target.signal_kind == INTERACTION_SIGNAL_TOPIC_AVERSION
@@ -418,9 +418,9 @@ class AmbientImpulseFeedbackExtractor:
 
         exposure_count = max(
             2,
-            self.history_store.topic_exposure_count(topic_key=exposure.topic_key, now=occurred_at),
+            self.history_store.topic_exposure_count(topic_key=exposure.semantic_key(), now=occurred_at),
         )
-        signal_target = exposure.title or exposure.topic_key
+        signal_target = exposure.title or exposure.semantic_key()
         turn_slug = slugify_identifier(turn_id, fallback="turn")
         target_slug = slugify_identifier(signal_target, fallback="topic")
         return InteractionSignal(
@@ -467,7 +467,7 @@ class AmbientImpulseFeedbackExtractor:
         if not strong_other_topic_present:
             return False
         exposure_count = self.history_store.topic_exposure_count(
-            topic_key=exposure.topic_key,
+            topic_key=exposure.semantic_key(),
             now=occurred_at,
         )
         if exposure_count < 2:
@@ -567,7 +567,7 @@ class AmbientImpulseFeedbackExtractor:
             "ignored": 0.38,
         }[reaction]
         self.reserve_bus_feedback_store.record_reaction(
-            topic_key=exposure.topic_key,
+            topic_key=exposure.semantic_key(),
             reaction=reaction,
             intensity=intensity,
             reason=summary,

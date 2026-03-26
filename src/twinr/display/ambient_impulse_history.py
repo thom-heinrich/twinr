@@ -17,12 +17,13 @@ The contract stays bounded:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -105,10 +106,10 @@ def _normalize_mapping(value: Mapping[str, object] | None) -> dict[str, object] 
     return normalized or None
 
 
-def _normalize_text_tuple(values: Sequence[object] | None, *, max_items: int, max_len: int) -> tuple[str, ...]:
+def _normalize_text_tuple(values: Iterable[object] | None, *, max_items: int, max_len: int) -> tuple[str, ...]:
     """Normalize one bounded ordered text tuple while removing duplicates."""
 
-    if not values:
+    if values is None:
         return ()
     ordered: list[str] = []
     seen: set[str] = set()
@@ -124,6 +125,20 @@ def _normalize_text_tuple(values: Sequence[object] | None, *, max_items: int, ma
         if len(ordered) >= max_items:
             break
     return tuple(ordered)
+
+
+def _normalize_optional_float(value: object | None) -> float | None:
+    """Return one optional finite float for persisted payloads."""
+
+    if value is None:
+        return None
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _normalize_response_status(value: object | None) -> str:
@@ -170,6 +185,7 @@ class DisplayAmbientImpulseExposure:
     attention_state: str
     shown_at: str
     expires_at: str
+    semantic_topic_key: str = ""
     match_anchors: tuple[str, ...] = ()
     response_status: str = "pending"
     response_sentiment: str = "unknown"
@@ -187,6 +203,8 @@ class DisplayAmbientImpulseExposure:
         object.__setattr__(self, "exposure_id", _compact_text(self.exposure_id, max_len=64))
         object.__setattr__(self, "source", _compact_text(self.source, max_len=48) or "ambient_impulse")
         object.__setattr__(self, "topic_key", _compact_text(self.topic_key, max_len=96).casefold())
+        semantic_topic_key = _compact_text(self.semantic_topic_key, max_len=96).casefold()
+        object.__setattr__(self, "semantic_topic_key", semantic_topic_key or self.topic_key)
         object.__setattr__(self, "title", _compact_text(self.title, max_len=96))
         object.__setattr__(self, "headline", _compact_text(self.headline, max_len=160))
         object.__setattr__(self, "body", _compact_text(self.body, max_len=160))
@@ -226,10 +244,13 @@ class DisplayAmbientImpulseExposure:
     def from_dict(cls, payload: Mapping[str, object]) -> "DisplayAmbientImpulseExposure":
         """Build one exposure record from persisted JSON-style data."""
 
+        raw_match_anchors = payload.get("match_anchors")
+        raw_metadata = payload.get("metadata")
         return cls(
             exposure_id=_compact_text(payload.get("exposure_id"), max_len=64),
             source=_compact_text(payload.get("source"), max_len=48) or "ambient_impulse",
             topic_key=_compact_text(payload.get("topic_key"), max_len=96),
+            semantic_topic_key=_compact_text(payload.get("semantic_topic_key"), max_len=96),
             title=_compact_text(payload.get("title"), max_len=96),
             headline=_compact_text(payload.get("headline"), max_len=160),
             body=_compact_text(payload.get("body"), max_len=160),
@@ -237,16 +258,23 @@ class DisplayAmbientImpulseExposure:
             attention_state=_compact_text(payload.get("attention_state"), max_len=32),
             shown_at=_compact_text(payload.get("shown_at"), max_len=64),
             expires_at=_compact_text(payload.get("expires_at"), max_len=64),
-            match_anchors=tuple(payload.get("match_anchors", ()) or ()),
+            match_anchors=_normalize_text_tuple(
+                raw_match_anchors
+                if isinstance(raw_match_anchors, Sequence)
+                and not isinstance(raw_match_anchors, (str, bytes, bytearray))
+                else None,
+                max_items=8,
+                max_len=160,
+            ),
             response_status=_compact_text(payload.get("response_status"), max_len=32),
             response_sentiment=_compact_text(payload.get("response_sentiment"), max_len=32),
             response_at=_compact_text(payload.get("response_at"), max_len=64) or None,
             response_mode=_compact_text(payload.get("response_mode"), max_len=48),
-            response_latency_seconds=payload.get("response_latency_seconds"),
+            response_latency_seconds=_normalize_optional_float(payload.get("response_latency_seconds")),
             response_turn_id=_compact_text(payload.get("response_turn_id"), max_len=96) or None,
             response_target=_compact_text(payload.get("response_target"), max_len=96) or None,
             response_summary=_compact_text(payload.get("response_summary"), max_len=220),
-            metadata=payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else None,
+            metadata=raw_metadata if isinstance(raw_metadata, Mapping) else None,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -259,6 +287,11 @@ class DisplayAmbientImpulseExposure:
 
         return _normalize_timestamp(self.shown_at) or _utc_now()
 
+    def semantic_key(self) -> str:
+        """Return the grouped semantic topic key for this exposure."""
+
+        return _compact_text(self.semantic_topic_key, max_len=96).casefold() or self.topic_key
+
     def expires_at_datetime(self) -> datetime:
         """Return the expiry timestamp as an aware UTC datetime."""
 
@@ -268,7 +301,7 @@ class DisplayAmbientImpulseExposure:
         """Return the ordered matching anchors for feedback correlation."""
 
         return _normalize_text_tuple(
-            (self.topic_key, self.title, self.headline, self.body, *self.match_anchors),
+            (self.semantic_topic_key, self.topic_key, self.title, self.headline, self.body, *self.match_anchors),
             max_items=10,
             max_len=160,
         )
@@ -291,6 +324,7 @@ class DisplayAmbientImpulseExposure:
             exposure_id=self.exposure_id,
             source=self.source,
             topic_key=self.topic_key,
+            semantic_topic_key=self.semantic_topic_key,
             title=self.title,
             headline=self.headline,
             body=self.body,
@@ -378,6 +412,7 @@ class DisplayAmbientImpulseHistoryStore:
         *,
         source: str,
         topic_key: str,
+        semantic_topic_key: str | None = None,
         title: str,
         headline: str,
         body: str,
@@ -398,6 +433,7 @@ class DisplayAmbientImpulseHistoryStore:
             ),
             source=source,
             topic_key=topic_key,
+            semantic_topic_key=semantic_topic_key or topic_key,
             title=title,
             headline=headline,
             body=body,
@@ -450,7 +486,7 @@ class DisplayAmbientImpulseHistoryStore:
         return sum(
             1
             for exposure in self.load()
-            if exposure.topic_key == normalized_topic and exposure.shown_at_datetime() >= minimum_shown_at
+            if exposure.semantic_topic_key == normalized_topic and exposure.shown_at_datetime() >= minimum_shown_at
         )
 
     def resolve_feedback(

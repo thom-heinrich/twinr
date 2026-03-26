@@ -3039,6 +3039,53 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(data["error_type"], "ChonkyDBError")
         self.assertEqual(data["root_cause_type"], "gaierror")
 
+    def test_remote_snapshot_timeout_records_endpoint_payload_type_and_histogram(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=1,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            read_opener = FakeOpener()
+            read_opener.queue_exception(TimeoutError("Read operation timed out"))
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+            state._remember_snapshot_document_id(snapshot_kind="archive", document_id="archive-doc-1")
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                state.load_snapshot(snapshot_kind="archive")
+
+            events = TwinrOpsEventStore.from_project_root(temp_dir).tail(limit=5)
+            histogram_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
+            payload = json.loads(histogram_path.read_text(encoding="utf-8"))
+
+        failed_event = next(event for event in events if event["event"] == "longterm_remote_read_failed")
+        data = dict(failed_event["data"])
+        self.assertEqual(data["snapshot_kind"], "archive")
+        self.assertEqual(data["operation"], "snapshot_load")
+        self.assertEqual(data["classification"], "timeout")
+        self.assertEqual(data["request_method"], "GET")
+        self.assertEqual(data["request_path"], "/v1/external/documents/full")
+        self.assertEqual(data["request_endpoint"], "GET /v1/external/documents/full")
+        self.assertEqual(data["request_payload_kind"], "document_id_cached_head")
+        self.assertEqual(data["timeout_reason"], "read_operation_timed_out")
+        operations = dict(payload.get("operations") or {})
+        entry = dict(operations["archive:snapshot_load"])
+        self.assertEqual(entry["last_request_endpoint"], "GET /v1/external/documents/full")
+        self.assertEqual(entry["last_request_payload_kind"], "document_id_cached_head")
+        self.assertEqual(entry["last_classification"], "timeout")
+        self.assertEqual(dict(entry["request_endpoint_counts"])["GET /v1/external/documents/full"], 1)
+        self.assertEqual(dict(entry["request_payload_kind_counts"])["document_id_cached_head"], 1)
+
     def test_remote_snapshot_loads_from_documents_full_chunk_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)

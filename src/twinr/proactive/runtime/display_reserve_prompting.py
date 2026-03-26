@@ -2,10 +2,14 @@
 
 The reserve-copy generator should not pass full raw candidate context into one
 large prompt. This module turns rich structured reserve candidates into a much
-smaller prompt contract with two explicit user-facing semantics:
+smaller prompt contract with six explicit user-facing semantics:
 
 - ``topic_anchor``: what the card is about in a clear glanceable way
 - ``hook_hint``: the concrete angle, follow-up, or tension to write from
+- ``card_intent``: structured meaning for headline statement, CTA, topic, and stance
+- ``pickup_signal``: condensed evidence from real earlier reserve-card outcomes
+- ``copy_family``: normalized family for copy examples and judging
+- ``quality_rubric`` / ``family_examples``: small positive writer/judge assets
 
 Everything else is compressed into one short ``context_summary`` string so the
 LLM has enough context to sound like Twinr without dragging around large nested
@@ -20,6 +24,12 @@ import json
 
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.agent.personality.models import PersonalitySnapshot
+
+from .display_reserve_copy_contract import (
+    reserve_copy_examples_payload,
+    reserve_copy_rubric_payload,
+    resolve_reserve_copy_family,
+)
 
 _DEFAULT_CONTEXT_SUMMARY_MAX_CHARS = 220
 _DEFAULT_LIST_ITEMS = 3
@@ -66,6 +76,31 @@ def _value_text(value: object | None, *, max_len: int) -> str:
     return _truncate_text(value, max_len=max_len)
 
 
+def _bounded_float(
+    value: object | None,
+    *,
+    minimum: float,
+    maximum: float,
+    default: float = 0.0,
+) -> float:
+    """Clamp one prompt-facing numeric signal into a finite bounded range."""
+
+    if value is None:
+        return default
+    try:
+        if isinstance(value, (int, float, str, bytes, bytearray)):
+            number = float(value)
+        else:
+            return default
+    except (TypeError, ValueError):
+        return default
+    if number < minimum:
+        return minimum
+    if number > maximum:
+        return maximum
+    return number
+
+
 def _first_text(mapping: Mapping[str, object], keys: Sequence[str], *, max_len: int) -> str:
     """Return the first non-empty bounded mapping value for the given keys."""
 
@@ -90,6 +125,7 @@ def _topic_anchor(candidate: AmbientDisplayImpulseCandidate, context: Mapping[st
             "source_title",
             "source_label",
             "question",
+            "topic_semantics",
         ),
         max_len=84,
     )
@@ -105,11 +141,34 @@ def _hook_hint(candidate: AmbientDisplayImpulseCandidate, context: Mapping[str, 
             "hook_hint",
             "question",
             "topic_summary",
+            "statement_intent",
             "rationale",
             "reason",
         ),
         max_len=120,
     )
+
+
+def _card_intent(context: Mapping[str, object]) -> dict[str, str] | None:
+    """Return one structured semantic card-intent block when present."""
+
+    raw = _coerce_mapping(context.get("card_intent"))
+    if not raw:
+        return None
+    keys = (
+        "topic_semantics",
+        "statement_intent",
+        "cta_intent",
+        "relationship_stance",
+        "source_semantics",
+    )
+    card_intent: dict[str, str] = {}
+    for key in keys:
+        max_len = 160 if key.endswith("_intent") else 96
+        text = _truncate_text(raw.get(key), max_len=max_len)
+        if text:
+            card_intent[key] = text
+    return card_intent or None
 
 
 def _context_summary(
@@ -158,14 +217,65 @@ def _context_summary(
     return _truncate_text(" | ".join(parts), max_len=_DEFAULT_CONTEXT_SUMMARY_MAX_CHARS)
 
 
+def _pickup_signal(context: Mapping[str, object]) -> dict[str, object] | None:
+    """Return one compact real-outcome hint block for copy generation.
+
+    ``ambient_learning`` is derived from actual reserve-card exposures and
+    whether those cards were picked up, ignored, or cooled later. The prompt
+    should only see a very small normalized slice of that evidence.
+    """
+
+    learning = _coerce_mapping(context.get("ambient_learning"))
+    if not learning:
+        return None
+    topic_state = _truncate_text(learning.get("topic_state"), max_len=24).casefold() or "unknown"
+    family_state = _truncate_text(learning.get("family_state"), max_len=24).casefold() or "unknown"
+    topic_score = round(
+        _bounded_float(learning.get("topic_score"), minimum=-1.0, maximum=1.0),
+        3,
+    )
+    repetition_pressure = round(
+        _bounded_float(learning.get("topic_repetition_pressure"), minimum=0.0, maximum=1.0),
+        3,
+    )
+    family_score = round(
+        _bounded_float(learning.get("family_score"), minimum=-1.0, maximum=1.0),
+        3,
+    )
+    action_score = round(
+        _bounded_float(learning.get("action_score"), minimum=-1.0, maximum=1.0),
+        3,
+    )
+    if (
+        topic_state == "unknown"
+        and family_state == "unknown"
+        and topic_score == 0.0
+        and repetition_pressure == 0.0
+        and family_score == 0.0
+        and action_score == 0.0
+    ):
+        return None
+    return {
+        "topic_state": topic_state,
+        "topic_score": topic_score,
+        "topic_repetition_pressure": repetition_pressure,
+        "family_state": family_state,
+        "family_score": family_score,
+        "action_score": action_score,
+    }
+
+
 def build_candidate_prompt_payload(candidate: AmbientDisplayImpulseCandidate) -> dict[str, object]:
     """Serialize one reserve candidate into a compact LLM prompt payload."""
 
     context = _coerce_mapping(candidate.generation_context)
     topic_anchor = _topic_anchor(candidate, context)
     hook_hint = _hook_hint(candidate, context)
-    return {
+    payload: dict[str, object] = {
         "topic_key": candidate.topic_key,
+        "semantic_topic_key": candidate.semantic_key(),
+        "expansion_angle": _truncate_text(candidate.expansion_angle, max_len=32),
+        "copy_family": resolve_reserve_copy_family(candidate),
         "candidate_family": _truncate_text(candidate.candidate_family, max_len=32) or "general",
         "source": _truncate_text(candidate.source, max_len=32),
         "action": _truncate_text(candidate.action, max_len=24),
@@ -179,6 +289,20 @@ def build_candidate_prompt_payload(candidate: AmbientDisplayImpulseCandidate) ->
             hook_hint=hook_hint,
         ),
     }
+    support_sources = [
+        _truncate_text(value, max_len=32)
+        for value in candidate.support_sources
+        if _truncate_text(value, max_len=32)
+    ]
+    if support_sources:
+        payload["support_sources"] = support_sources
+    card_intent = _card_intent(context)
+    if card_intent is not None:
+        payload["card_intent"] = card_intent
+    pickup_signal = _pickup_signal(context)
+    if pickup_signal is not None:
+        payload["pickup_signal"] = pickup_signal
+    return payload
 
 
 def _verbosity_label(value: float) -> str:
@@ -306,21 +430,82 @@ def build_generation_prompt(
     snapshot: PersonalitySnapshot | None,
     candidates: Sequence[AmbientDisplayImpulseCandidate],
     local_now: datetime | None,
+    variants_per_candidate: int,
 ) -> str:
-    """Build the compact user prompt for one reserve-copy generation batch."""
+    """Build the compact user prompt for the first reserve-copy variant pass."""
 
     payload = {
         "local_day": (local_now or datetime.now().astimezone()).date().isoformat(),
+        "variants_per_candidate": max(1, int(variants_per_candidate)),
         "personality": _snapshot_prompt_profile(snapshot),
+        "quality_rubric": reserve_copy_rubric_payload(),
+        "family_examples": reserve_copy_examples_payload(candidates),
         "candidates": [build_candidate_prompt_payload(candidate) for candidate in candidates],
     }
     return (
-        "Schreibe fuer jeden Kandidaten eine kurze, persoenlich klingende HDMI-Reserve-Karte.\n"
+        "Erzeuge fuer jeden Kandidaten mehrere moegliche HDMI-Reserve-Karten.\n"
         "Rueckgabeformat: JSON mit einem Feld 'items'.\n"
+        "Jedes item braucht 'topic_key' und ein Feld 'variants'.\n"
+        "Jede Variante braucht genau 'headline' und 'body'.\n"
         "Nutze exakt die topic_key-Werte aus den Kandidaten.\n"
+        f"Erzeuge pro Kandidat genau {max(1, int(variants_per_candidate))} Varianten.\n"
+        "Die Varianten sollen unterschiedliche, aber plausible Aufhaenger haben und nicht nur dieselbe Formulierung leicht umstellen.\n"
         "Der Text soll positive Interaktion oeffnen und Twinrs Persoenlichkeit zeigen.\n"
+        "family_examples enthaelt kleine Gold-Beispiele fuer gute Karten in der jeweiligen copy_family. "
+        "Nutze sie als Stil- und Strukturreferenz, nicht als Satzschablone.\n"
+        "quality_rubric zeigt, woran gute Karten gemessen werden. "
+        "Sie gilt schon im Writer-Pass als stiller Selbstcheck.\n"
         "Nutze besonders personality.voice_de fuer die deutsche Stimme, topic_anchor fuer die klare Themenbenennung, "
-        "hook_hint fuer den eigentlichen Aufhaenger und context_summary fuer den konkreten Anlass.\n\n"
+        "hook_hint fuer den eigentlichen Aufhaenger, context_summary fuer den konkreten Anlass, "
+        "card_intent als semantische Kartenspezifikation und pickup_signal fuer echte Reaktionsspuren aus frueheren Reserve-Karten.\n"
+        "Wenn card_intent vorhanden ist, beschreibt statement_intent die Aussage der Headline, cta_intent die Bewegung der Body-Zeile, "
+        "topic_semantics den Themenkern und relationship_stance Twinrs Haltung.\n"
+        "Nutze diese Semantik als Primärquelle und spiegle weder topic_anchor noch card_intent wortwoertlich als Label zurück.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def build_selection_prompt(
+    *,
+    snapshot: PersonalitySnapshot | None,
+    candidates: Sequence[AmbientDisplayImpulseCandidate],
+    variants_by_topic: Mapping[str, Sequence[Mapping[str, str]]],
+    local_now: datetime | None,
+) -> str:
+    """Build the compact user prompt for the second reserve-copy selection pass."""
+
+    candidate_payloads: list[dict[str, object]] = []
+    for candidate in candidates:
+        payload = build_candidate_prompt_payload(candidate)
+        payload["variants"] = [
+            {
+                "headline": _truncate_text(variant.get("headline"), max_len=128),
+                "body": _truncate_text(variant.get("body"), max_len=128),
+            }
+            for variant in variants_by_topic.get(candidate.topic_key.casefold(), ())
+            if _truncate_text(variant.get("headline"), max_len=128)
+            and _truncate_text(variant.get("body"), max_len=128)
+        ]
+        candidate_payloads.append(payload)
+    payload = {
+        "local_day": (local_now or datetime.now().astimezone()).date().isoformat(),
+        "personality": _snapshot_prompt_profile(snapshot),
+        "quality_rubric": reserve_copy_rubric_payload(),
+        "family_examples": reserve_copy_examples_payload(candidates),
+        "candidates": candidate_payloads,
+    }
+    return (
+        "Waehle fuer jeden Kandidaten aus mehreren Vorschlaegen die beste finale HDMI-Reserve-Karte.\n"
+        "Rueckgabeformat: JSON mit einem Feld 'items'.\n"
+        "Jedes item braucht genau 'topic_key', 'headline' und 'body'.\n"
+        "Nutze exakt die topic_key-Werte aus den Kandidaten.\n"
+        "Waehle die Variante, die am klarsten, engagingsten und am ehesten nach Twinr klingt.\n"
+        "Du darfst eine gewaehlte Variante minimal straffen oder grammatisch glaetten, aber nicht den Anlass neu erfinden.\n"
+        "Nutze family_examples als positive Stilreferenz fuer die jeweilige copy_family.\n"
+        "Pruefe jede Variante still an quality_rubric. "
+        "Wenn zwei Varianten gegeneinander antreten, gewinnt die, die in der Rubrik insgesamt besser abschneidet.\n"
+        "Wenn ein Kandidat card_intent enthaelt, muessen statement_intent und cta_intent in der finalen Karte klar wiedererkennbar bleiben.\n"
+        "Bevorzuge Varianten mit konkreter Beobachtung, klarem Themenanker und echter Einladung statt generischer Nettigkeit.\n\n"
         f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
     )
 
@@ -328,4 +513,5 @@ def build_generation_prompt(
 __all__ = [
     "build_candidate_prompt_payload",
     "build_generation_prompt",
+    "build_selection_prompt",
 ]

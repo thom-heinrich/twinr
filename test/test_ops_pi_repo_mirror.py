@@ -15,6 +15,11 @@ from twinr.ops.pi_repo_mirror import PiRepoMirrorWatchdog
 from twinr.ops.self_coding_pi import PiConnectionSettings
 
 
+_TEST_PI_HOST = "192.0.2.10"
+_TEST_PI_SSH_USER = "pi-test-user"
+_TEST_PI_SSH_PASSWORD = "placeholder-password"
+
+
 def _completed(
     args: list[str],
     *,
@@ -54,9 +59,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
             )
@@ -80,12 +85,13 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--exclude=**/*.pyc", commands[0])
         self.assertIn("--exclude=**/*.pyo", commands[0])
         self.assertIn("--exclude=**/node_modules/", commands[0])
+        self.assertIn("--exclude=**/browser_automation/artifacts/", commands[0])
         self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])
         env = envs[0]
         self.assertIsNotNone(env)
         assert env is not None
-        self.assertEqual(env["SSHPASS"], "chaos")
+        self.assertEqual(env["SSHPASS"], _TEST_PI_SSH_PASSWORD)
 
     def test_probe_once_excludes_local_special_files_from_rsync_args(self) -> None:
         commands: list[list[str]] = []
@@ -103,9 +109,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
             )
@@ -140,9 +146,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
             )
@@ -180,9 +186,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
             )
@@ -223,9 +229,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
             )
@@ -270,9 +276,9 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
                 connection_settings=PiConnectionSettings(
-                    host="192.168.1.95",
-                    user="thh",
-                    password="chaos",
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
                 ),
                 subprocess_runner=_runner,
                 sleep_fn=clock.sleep,

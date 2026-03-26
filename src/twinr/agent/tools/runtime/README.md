@@ -11,9 +11,15 @@ streaming APIs.
 - adapt workflow owners into `handle_*` methods for realtime tools
 - validate the canonical tool-name to handler binding registry
 - gate runtime tool exposure against local integration readiness so unavailable tool families are omitted before a live turn starts
+- gate optional browser automation behind the local browser workspace probe so disabled or missing adapters never leak into the live tool surface
+- route the bounded external service-connect tool through the same thin executor surface as the other realtime tools so voice turns can open supported pairing flows
+- route the bounded WhatsApp-send tool through the same thin executor and availability-gated binding path so voice turns can message remembered contacts without bypassing the running channel service
 - route smart-home discovery, state-read, control, and sensor-stream tools through the same thin executor surface as the other realtime tools
+- route the optional browser-automation tool through the same thin executor surface as the rest of the realtime tool contract
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
+- route the temporary voice-quiet tool through the same thin executor surface as the other live-turn tools so users can suppress transcript-first wake for a bounded runtime window
+- allow the streaming fast lane to execute a supervisor-resolved one-shot runtime-local tool directly when the structured decision already carries an exact `runtime_tool_name` plus arguments, so bounded control turns like temporary voice quiet do not pay an avoidable second specialist-model hop
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - record one generic success/failure observability event per realtime tool call so operator readback can see which tool ran, how long it took, and whether model fallback metadata was involved
 - convert shared sensitive-confirmation guards into structured `confirmation_required` tool results so live turns can ask for explicit approval instead of collapsing into generic technical-error speech
@@ -25,6 +31,8 @@ streaming APIs.
 - emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and failure-path selection through focused helper modules
 - enforce the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
 - keep handoff metadata aligned with product reality so the user's own smart-home inventory, room/device state, and recent in-home events stay on local automation/smart-home lanes instead of drifting into web-search handoffs
+- let search handoffs enter the specialist tool loop when the optional browser tool is available, so the model can choose between generic web search and bounded site interaction via prompt/tool guidance
+- disable provider-native web search for those browser-capable search handoffs so the specialist has to stay on explicit Twinr tools (`search_live_info` versus `browser_automation`) instead of bypassing the permission boundary
 - share common stop-guard, loop-result, token-merge, and JSON-envelope helpers across the single-lane and dual-lane runtime paths
 
 The dual-lane handoff loop preserves optional explicit search hints such as a
@@ -51,6 +59,7 @@ lines when the fast lane does not provide one.
 | [registry.py](./registry.py) | Tool binding validation |
 | [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
 | [handoff.py](./handoff.py) | Handoff schema, normalization, and chronological specialist merge helpers |
+| [runtime_local_handoff.py](./runtime_local_handoff.py) | Normalize direct runtime-local handoff tool payloads and user-facing reply extraction |
 | [speech_lane.py](./speech_lane.py) | Speech-lane event model and safe callback emission |
 | [forensics.py](./forensics.py) | Redacted branch-forensics summaries |
 | [loop_support.py](./loop_support.py) | Shared loop stop/result/json/token helpers |

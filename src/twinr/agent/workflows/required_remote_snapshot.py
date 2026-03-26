@@ -9,6 +9,7 @@ required-remote readiness.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,10 +17,23 @@ import errno
 import math
 import os
 import time
+from typing import Protocol
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot, RemoteMemoryWatchdogStore
+
+
+WatchdogRecoveryStarter = Callable[[TwinrConfig, str], int | None]
+
+
+class RemoteWatchdogStoreLike(Protocol):
+    """Describe the minimal persisted-watchdog store contract used here."""
+
+    path: Path
+
+    def load(self) -> RemoteMemoryWatchdogSnapshot | None:
+        """Return the newest watchdog snapshot or ``None`` when missing."""
 
 
 def _parse_utc_timestamp(value: str | None) -> datetime | None:
@@ -55,6 +69,31 @@ def _pid_is_alive(pid: int | None) -> bool:
             return False
         return True
     return True
+
+
+def _probe_attestation_bool(snapshot: RemoteMemoryWatchdogSnapshot, field_name: str) -> bool | None:
+    """Return one boolean attestation field from the watchdog probe payload."""
+
+    probe_payload = getattr(getattr(snapshot, "current", None), "probe", None)
+    if not isinstance(probe_payload, dict):
+        return None
+    warm_payload = probe_payload.get("warm_result")
+    if not isinstance(warm_payload, dict) or field_name not in warm_payload:
+        return None
+    return bool(warm_payload.get(field_name))
+
+
+def _probe_attestation_text(snapshot: RemoteMemoryWatchdogSnapshot, field_name: str) -> str | None:
+    """Return one string attestation field from the watchdog probe payload."""
+
+    probe_payload = getattr(getattr(snapshot, "current", None), "probe", None)
+    if not isinstance(probe_payload, dict):
+        return None
+    warm_payload = probe_payload.get("warm_result")
+    if not isinstance(warm_payload, dict):
+        return None
+    text = str(warm_payload.get(field_name, "") or "").strip()
+    return text or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,7 +312,7 @@ def assess_required_remote_watchdog_snapshot(
     config: TwinrConfig,
     *,
     now_wall: datetime | None = None,
-    store: RemoteMemoryWatchdogStore | None = None,
+    store: RemoteWatchdogStoreLike | None = None,
 ) -> RequiredRemoteWatchdogAssessment:
     """Evaluate whether the external remote watchdog currently proves readiness."""
 
@@ -353,7 +392,6 @@ def assess_required_remote_watchdog_snapshot(
         snapshot=snapshot,
         max_sample_age_s=max_sample_age_s,
     )
-    max_heartbeat_age_s = _max_allowed_heartbeat_age_s(config=config, snapshot=snapshot)
     max_steady_state_heartbeat_age_s = _max_allowed_steady_state_heartbeat_age_s(
         config=config,
         snapshot=snapshot,
@@ -366,11 +404,6 @@ def assess_required_remote_watchdog_snapshot(
         max_sample_age_s=max_sample_age_s,
     )
     inflight_probe_age_s = getattr(snapshot, "probe_age_s", None)
-    heartbeat_fresh = (
-        heartbeat_age_s is not None
-        and math.isfinite(heartbeat_age_s)
-        and heartbeat_age_s <= max_heartbeat_age_s
-    )
     inflight_heartbeat_fresh = (
         bool(getattr(snapshot, "probe_inflight", False))
         and heartbeat_age_s is not None
@@ -445,6 +478,32 @@ def assess_required_remote_watchdog_snapshot(
             probe_age_s=inflight_probe_age_s,
         )
 
+    archive_safe = _probe_attestation_bool(snapshot, "archive_safe")
+    health_tier = _probe_attestation_text(snapshot, "health_tier")
+    if archive_safe is False or (health_tier is not None and health_tier != "ready"):
+        detail = "Remote memory watchdog sample is not archive-safe."
+        if health_tier and health_tier != "ready":
+            detail = f"Remote memory watchdog sample is {health_tier}, not archive-safe."
+        return RequiredRemoteWatchdogAssessment(
+            ready=False,
+            detail=detail,
+            artifact_path=artifact_path,
+            pid_alive=True,
+            sample_age_s=sample_age_s,
+            max_sample_age_s=max_sample_age_s,
+            sample_status=current.status,
+            sample_ready=current.ready,
+            sample_required=current.required,
+            sample_latency_ms=current.latency_ms,
+            watchdog_pid=snapshot.pid,
+            snapshot_updated_at=snapshot.updated_at,
+            snapshot_stale=False,
+            heartbeat_age_s=heartbeat_age_s,
+            heartbeat_updated_at=getattr(snapshot, "heartbeat_at", None),
+            probe_inflight=bool(getattr(snapshot, "probe_inflight", False)),
+            probe_age_s=inflight_probe_age_s,
+        )
+
     return RequiredRemoteWatchdogAssessment(
         ready=True,
         detail="ok",
@@ -487,6 +546,38 @@ def _watchdog_startup_poll_s(config: TwinrConfig) -> float:
     )
 
 
+def _default_watchdog_env_file(config: TwinrConfig) -> str:
+    """Return the canonical dotenv path for detached watchdog recovery."""
+
+    project_root = Path(str(getattr(config, "project_root", "") or "")).expanduser()
+    return str(project_root / ".env")
+
+
+def _default_watchdog_recovery_starter(config: TwinrConfig, env_file: str) -> int | None:
+    """Best-effort spawn helper for a missing or dead external watchdog."""
+
+    from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+    return ensure_remote_memory_watchdog_process(
+        config,
+        env_file=env_file,
+        emit=lambda _line: None,
+    )
+
+
+def _assessment_warrants_watchdog_recovery(assessment: RequiredRemoteWatchdogAssessment) -> bool:
+    """Return whether the current watchdog state is recoverable by respawn."""
+
+    if assessment.ready:
+        return False
+    detail = str(assessment.detail or "").strip().lower()
+    if "snapshot is missing" in detail:
+        return True
+    if "not alive" in detail:
+        return True
+    return False
+
+
 def _assessment_allows_startup_wait(assessment: RequiredRemoteWatchdogAssessment) -> bool:
     """Return whether a non-ready watchdog state still looks like startup."""
 
@@ -506,14 +597,24 @@ def _assessment_allows_startup_wait(assessment: RequiredRemoteWatchdogAssessment
 def ensure_required_remote_watchdog_snapshot_ready(
     config: TwinrConfig,
     *,
-    store: RemoteMemoryWatchdogStore | None = None,
+    store: RemoteWatchdogStoreLike | None = None,
+    env_file: str | Path | None = None,
+    recovery_starter: WatchdogRecoveryStarter | None = None,
 ) -> RequiredRemoteWatchdogAssessment:
     """Raise when the external remote watchdog does not prove readiness."""
 
     watchdog_store = store or RemoteMemoryWatchdogStore.from_config(config)
+    resolved_env_file = str(Path(env_file or _default_watchdog_env_file(config)).expanduser())
+    starter = recovery_starter or _default_watchdog_recovery_starter
     assessment = assess_required_remote_watchdog_snapshot(config, store=watchdog_store)
     if assessment.ready:
         return assessment
+    if _assessment_warrants_watchdog_recovery(assessment):
+        owner_pid = starter(config, resolved_env_file)
+        if owner_pid is not None:
+            assessment = assess_required_remote_watchdog_snapshot(config, store=watchdog_store)
+            if assessment.ready:
+                return assessment
     startup_wait_s = _watchdog_startup_wait_s(config)
     if startup_wait_s > 0.0 and _assessment_allows_startup_wait(assessment):
         deadline = time.monotonic() + startup_wait_s

@@ -14,6 +14,7 @@ dashboard metadata that provider packages plug into.
 - resolve single-bridge and multi-bridge Hue runtime wiring from store and `.env` state
 - expose vendor-neutral smart-home contracts plus provider packages such as Hue
 - persist integration settings and expose integration-family blocks to `src/twinr/web`
+- normalize bounded social-history learning consent/import state in the shared integration store so portal UI and runtime queue workers read the same operator-approved source/window settings
 
 `integrations` does **not** own:
 - provider-specific email logic in [email/](./email)
@@ -32,6 +33,7 @@ dashboard metadata that provider packages plug into.
 | [registry.py](./registry.py) | Adapter registration and dispatch |
 | [runtime.py](./runtime.py) | Managed email/calendar/smart-home wiring |
 | [store.py](./store.py) | File-backed integration config store |
+| [social_history.py](./social_history.py) | Canonical social-history learning consent and import-status model |
 | [web_automation_families.py](./web_automation_families.py) | Dashboard family blocks |
 | [calendar/](./calendar) | Calendar provider package |
 | [email/](./email) | Email provider package |
@@ -55,6 +57,14 @@ from twinr.integrations import build_managed_integrations
 
 runtime = build_managed_integrations(project_root=".")
 readiness = runtime.readiness_for("smart_home_hub")
+```
+
+```python
+from twinr.integrations import SocialHistoryLearningConfig
+
+config = SocialHistoryLearningConfig.from_record(record)
+if config.enabled and config.source == "whatsapp":
+    print(config.lookback_label)
 ```
 
 ## See also

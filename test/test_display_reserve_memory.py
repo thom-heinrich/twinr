@@ -45,6 +45,15 @@ class DisplayReserveMemoryTests(unittest.TestCase):
         self.assertTrue(candidate.body.endswith("?"))
         self.assertNotEqual(candidate.headline, reason)
         self.assertNotEqual(candidate.body, question)
+        self.assertEqual(
+            (candidate.generation_context or {}).get("card_intent"),
+            {
+                "topic_semantics": f"alltaegliche Klaerung zu {question}",
+                "statement_intent": f"Twinr soll ruhig sagen, dass zu {question} gerade zwei moegliche Versionen offen sind.",
+                "cta_intent": "Den Nutzer bitten, kurz zu sagen, was stimmt oder was gemeint ist.",
+                "relationship_stance": "ruhige Klaerung statt Datenpflege- oder Systemton",
+            },
+        )
 
     def test_memory_follow_up_candidate_uses_statement_headline_and_cta_body(self) -> None:
         candidate = build_memory_follow_up_candidate(
@@ -62,6 +71,15 @@ class DisplayReserveMemoryTests(unittest.TestCase):
         assert candidate is not None
         self.assertFalse(candidate.headline.endswith("?"))
         self.assertTrue(candidate.body.endswith("?"))
+        self.assertEqual(
+            (candidate.generation_context or {}).get("card_intent"),
+            {
+                "topic_semantics": "persoenlicher Nachfasser zu The doctor appointment from yesterday is still open.",
+                "statement_intent": "Twinr soll ruhig an The doctor appointment from yesterday is still open. anknuepfen und zeigen, dass dazu noch etwas offen ist.",
+                "cta_intent": "Zu einem kurzen Update oder Weiterreden einladen.",
+                "relationship_stance": "ruhiges persoenliches Nachfassen statt Erinnerungs- oder Speicherton",
+            },
+        )
 
 
 if __name__ == "__main__":

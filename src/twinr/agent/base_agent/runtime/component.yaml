@@ -3,7 +3,7 @@ name: runtime
 path: src/twinr/agent/base_agent/runtime
 kind: python-package
 visibility: internal
-summary: Compose TwinrRuntime from focused mixins for lifecycle, flow, context, discovery, memory, automations, and snapshot durability.
+summary: Compose TwinrRuntime from focused mixins for lifecycle, flow, context, discovery, memory, automations, temporary voice-quiet state, and snapshot durability.
 owned_concerns:
   - Assemble the canonical TwinrRuntime surface from focused runtime mixins
   - Bootstrap and shut down runtime-owned stores and background-capable services
@@ -12,6 +12,7 @@ owned_concerns:
   - Surface the active reserve-lane card as bounded provider context and per-turn supervisor grounding overlays for display-grounded turns
   - Bridge guided user-discovery actions into managed context, graph memory, and durable memory commits without widening workflow loops
   - Mediate on-device memory, durable memory, reminders, automations, and runtime snapshot persistence
+  - Own the bounded temporary voice-quiet window that suppresses transcript-first wake and automatic follow-up for a user-requested period
   - Forward completed tool history into long-term-backed personality learning after turn finalization
   - Expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape calm place/world awareness
 out_of_scope:
@@ -57,6 +58,11 @@ files:
     role: Reminder and automation mutation/query helpers
     exports:
       - TwinrRuntimeAutomationMixin
+  - path: voice_quiet.py
+    role: Runtime-owned temporary voice-quiet window helpers
+    exports:
+      - TwinrRuntimeVoiceQuietMixin
+      - VoiceQuietState
   - path: snapshot.py
     role: Canonical runtime snapshot save and restore
     exports:

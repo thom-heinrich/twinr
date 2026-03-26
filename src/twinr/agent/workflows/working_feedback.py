@@ -7,13 +7,13 @@ import io
 import math
 import time
 import wave
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import replace
 import logging
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
-from typing import Literal
+from typing import Literal, SupportsFloat, SupportsInt, cast
 from weakref import WeakKeyDictionary
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -68,7 +68,7 @@ _DEFAULT_WORKING_FEEDBACK_PROFILES: dict[WorkingFeedbackKind, WorkingFeedbackPro
     "processing": WorkingFeedbackProfile(
         delay_ms=450,
         pause_ms=620,
-        volume=0.12,
+        volume=0.06,
         gap_ms=28,
         patterns=(
             ((659, 52), (880, 38)),
@@ -106,16 +106,17 @@ _DEFAULT_WORKING_FEEDBACK_PROFILES: dict[WorkingFeedbackKind, WorkingFeedbackPro
 _DEFAULT_WORKING_FEEDBACK_MEDIA_SPECS: dict[WorkingFeedbackKind, WorkingFeedbackMediaSpec] = {
     "processing": WorkingFeedbackMediaSpec(
         clip=RenderedAudioClipSpec(
-            relative_path=Path("media") / "waiting.mp3",
-            clip_start_s=3.0,
-            clip_duration_s=3.0,
-            fade_in_duration_s=0.9,
-            fade_out_start_s=2.75,
-            fade_out_duration_s=0.25,
-            output_gain=0.3,
+            relative_path=Path("media") / "dragon-studio-computer-startup-sound-effect-312870.mp3",
+            clip_start_s=0.0,
+            clip_duration_s=0.8,
+            fade_in_duration_s=0.09,
+            fade_out_start_s=1.08,
+            fade_out_duration_s=0.15,
+            output_gain=0.105,
+            playback_speed=0.65,
             normalize_max_gain=1.0,
         ),
-        pause_ms=80,
+        pause_ms=0,
         attenuation_start_s=4.0,
         attenuation_reach_floor_s=30.0,
         minimum_output_gain=0.15,
@@ -164,10 +165,14 @@ def _coerce_non_negative_int(value: object, *, field_name: str) -> int:
     """Coerce a runtime value to a non-negative integer."""
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must not be bool")
+    if isinstance(value, int):
+        coerced = value
+    else:
+        int_like = cast(SupportsInt | str | bytes | bytearray, value)
+        coerced = int(int_like)
     if isinstance(value, float):
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{field_name} must be an integer value")
-    coerced = int(value)
     if coerced < 0:
         raise ValueError(f"{field_name} must be >= 0")
     return coerced
@@ -187,7 +192,8 @@ def _coerce_volume(value: object, *, field_name: str) -> float:
     """Coerce a runtime value to a bounded playback volume."""
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must not be bool")
-    coerced = float(value)
+    float_like = cast(SupportsFloat | str | bytes | bytearray, value)
+    coerced = float(float_like)
     if not math.isfinite(coerced):
         raise ValueError(f"{field_name} must be finite")
     if not 0.0 <= coerced <= 1.0:
@@ -202,8 +208,12 @@ def _normalize_patterns(
     field_name: str,
 ) -> tuple[tuple[tuple[int, int], ...], ...]:
     """Validate and normalize tone-pattern tuples for playback."""
+    if isinstance(patterns, (str, bytes, bytearray)) or not isinstance(patterns, Iterable):
+        raise ValueError(f"{field_name} must be an iterable of tone sequences")
     normalized_patterns: list[tuple[tuple[int, int], ...]] = []
     for pattern_index, sequence in enumerate(patterns):
+        if isinstance(sequence, (str, bytes, bytearray)) or not isinstance(sequence, Iterable):
+            raise ValueError(f"{field_name}[{pattern_index}] must be an iterable of note tuples")
         normalized_sequence: list[tuple[int, int]] = []
         for tone_index, note in enumerate(sequence):
             try:
@@ -551,13 +561,14 @@ def _resolve_media_clip(
     *,
     player,
     kind: WorkingFeedbackKind,
+    sample_rate: int,
     config: TwinrConfig | None,
     emit: Callable[[str], None] | None,
 ) -> _ResolvedWorkingFeedbackMedia | None:
-    if config is None:
-        return None
     media_spec = _resolve_media_spec(kind)
     if media_spec is None:
+        return None
+    if config is None:
         return None
     try:
         wav_bytes = build_rendered_audio_clip_wav_bytes(config, media_spec.clip)
@@ -568,6 +579,10 @@ def _resolve_media_clip(
         )
         return None
     if wav_bytes is None:
+        _safe_emit(
+            emit,
+            f"working_feedback_media_fallback={kind}:missing_asset",
+        )
         return None
     if not _media_uses_long_think_attenuation(media_spec):
         return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=wav_bytes)
@@ -649,6 +664,7 @@ def start_working_feedback_loop(
     resolved_media = _resolve_media_clip(
         player=player,
         kind=kind,
+        sample_rate=normalized_sample_rate,
         config=config,
         emit=emit,
     )
@@ -657,6 +673,12 @@ def start_working_feedback_loop(
     generation, previous_stop_event = _activate_player_loop(player_state, stop_event)
     if previous_stop_event is not None and previous_stop_event is not stop_event:
         previous_stop_event.set()
+
+    def wait_for_pause() -> bool:
+        pause_ms = resolved_media.spec.pause_ms if resolved_media is not None else profile.pause_ms
+        if pause_ms <= 0:
+            return stop_event.is_set()
+        return stop_event.wait(pause_ms / 1000.0)
 
     def worker() -> None:
         try:
@@ -773,8 +795,7 @@ def start_working_feedback_loop(
                     if acquired:
                         player_state.playback_lock.release()
 
-                pause_ms = resolved_media.spec.pause_ms if resolved_media is not None else profile.pause_ms
-                if stop_event.wait(max(0.05, pause_ms / 1000.0)):
+                if wait_for_pause():
                     return
         finally:
             _release_player_loop(player_state, generation, stop_event)

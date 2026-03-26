@@ -57,6 +57,7 @@ DEFAULT_IGNORED_PATTERNS: tuple[str, ...] = (
     "**/*.pyc",
     "**/*.pyo",
     "**/node_modules/",
+    "**/browser_automation/artifacts/",
 )
 
 
@@ -388,10 +389,11 @@ done
             "-e",
             "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
         ]
-        # Python bytecode and nested node dependency trees are local runtime or
-        # build artefacts. Keeping them outside the authoritative mirror avoids
-        # sync failures when productive processes or local SDK installs mutate
-        # those trees independently of the source-managed repo content.
+        # Python bytecode, nested node dependency trees, and browser-automation
+        # captures are local runtime or build artefacts. Keeping them outside
+        # the authoritative mirror avoids sync failures when productive
+        # processes or local SDK installs mutate those trees independently of
+        # the source-managed repo content.
         for pattern in DEFAULT_IGNORED_PATTERNS:
             args.append(f"--exclude={pattern}")
         # Repo mirroring should only carry ordinary files, symlinks, and

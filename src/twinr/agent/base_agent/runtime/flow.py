@@ -85,11 +85,20 @@ class TwinrRuntimeFlowMixin:
         except Exception:
             _LOGGER.exception("Failed to enqueue Twinr multimodal evidence.")  # AUDIT-FIX(#3): Auxiliary memory failures must not break UX.
 
-    def _enqueue_conversation_turn_safe(self, *, transcript: str, response: str) -> None:
+    def _enqueue_conversation_turn_safe(
+        self,
+        *,
+        transcript: str,
+        response: str,
+        source: str = "conversation",
+        modality: str = "voice",
+    ) -> None:
         try:
             self.long_term_memory.enqueue_conversation_turn(
                 transcript=transcript,
                 response=response,
+                source=source,
+                modality=modality,
             )
         except Exception:
             _LOGGER.exception("Failed to enqueue Twinr conversation turn.")  # AUDIT-FIX(#3): Auxiliary memory failures must not break UX.
@@ -124,7 +133,14 @@ class TwinrRuntimeFlowMixin:
                 },
             )
 
-    def _store_agent_turn(self, cleaned_answer: str, *, transition_to_answering: bool) -> str:
+    def _store_agent_turn(
+        self,
+        cleaned_answer: str,
+        *,
+        transition_to_answering: bool,
+        source: str = "conversation",
+        modality: str = "voice",
+    ) -> str:
         lock = self._runtime_flow_lock()
         lock_wait_started = time.monotonic()
         with lock:  # AUDIT-FIX(#7): Keep transition-to-answering and response storage atomic.
@@ -176,6 +192,8 @@ class TwinrRuntimeFlowMixin:
         self._enqueue_conversation_turn_safe(
             transcript=transcript,
             response=cleaned_answer,
+            source=source,
+            modality=modality,
         )
         workflow_event(
             kind="metric",
@@ -355,17 +373,39 @@ class TwinrRuntimeFlowMixin:
             self._persist_snapshot_safe()
         return status
 
-    def finalize_agent_turn(self, answer: str) -> str:
+    def finalize_agent_turn(
+        self,
+        answer: str,
+        *,
+        source: str = "conversation",
+        modality: str = "voice",
+    ) -> str:
         """Store an assistant answer without changing the current status."""
 
         cleaned_answer = self._require_text(answer, field_name="answer")  # AUDIT-FIX(#2): Reject blank assistant answers early.
-        return self._store_agent_turn(cleaned_answer, transition_to_answering=False)
+        return self._store_agent_turn(
+            cleaned_answer,
+            transition_to_answering=False,
+            source=source,
+            modality=modality,
+        )
 
-    def complete_agent_turn(self, answer: str) -> str:
+    def complete_agent_turn(
+        self,
+        answer: str,
+        *,
+        source: str = "conversation",
+        modality: str = "voice",
+    ) -> str:
         """Store an assistant answer and transition into answering."""
 
         cleaned_answer = self._require_text(answer, field_name="answer")
-        return self._store_agent_turn(cleaned_answer, transition_to_answering=True)
+        return self._store_agent_turn(
+            cleaned_answer,
+            transition_to_answering=True,
+            source=source,
+            modality=modality,
+        )
 
     def finish_speaking(self) -> TwinrStatus:
         """Mark the spoken response as finished and return toward idle."""

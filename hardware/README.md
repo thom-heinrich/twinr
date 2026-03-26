@@ -7,7 +7,9 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 `hardware` owns:
 - persist Raspberry Pi hardware settings into Twinr env files and OS config
 - install vendor or system dependencies for display, audio, and printer paths
+- install and stage vendor prerequisites for optional Bitcraze Crazyradio/Crazyflie experimentation under an isolated runtime workspace
 - install or stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
+- install or stage the development-host bounded drone daemon that exposes Twinr's mission-level inspection surface behind preflight and manual-arm gates
 - stage transport-only helper-Pi services when the main Pi needs still or live AI-camera access over the direct peer link
 - stage low-level Pi-side kernel or OS integration code when a peripheral needs a real kernel-facing driver path instead of a userspace helper
 - run bounded manual probes for buttons, PIR motion, display, and printer setup
@@ -24,9 +26,10 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 |---|---|
 | [buttons/](./buttons) | Button setup and GPIO probe |
 | [display/](./display) | Display backend setup and smoke tests |
+| [bitcraze/](./bitcraze) | Crazyradio USB access, pinned firmware staging, and isolated `/twinr/bitcraze` workspace provisioning |
 | [mic/](./mic) | Audio default-device setup, playback loudness normalization/softvol, and XVF3800 USB-access rule |
 | [servo/](./servo) | Pololu Maestro USB access, `USB_DUAL_PORT` setup, and operator hold/arm state control for Twinr's continuous attention-servo runtime |
-| [ops/](./ops) | Pi-side productive systemd units plus Pi bootstrap helpers |
+| [ops/](./ops) | Pi-side productive systemd units, the development-host bounded drone daemon, and Pi/bootstrap deploy helpers |
 | [piaicam/](./piaicam) | Pi AI Camera smoke tests, custom gesture dataset capture, and MediaPipe model staging/training |
 | [pir/](./pir) | PIR setup and motion probe |
 | [printer/](./printer) | Thermal-printer CUPS setup |
@@ -41,6 +44,8 @@ Retired standalone break-glass units now live only under the ignored top-level `
 ```bash
 ./hardware/buttons/setup_buttons.sh --env-file .env --green 23 --yellow 22 --probe
 python3 hardware/display/display_test.py --env-file .env
+sudo ./hardware/bitcraze/setup_bitcraze.sh --workspace /twinr/bitcraze --runtime-user thh
+python3 hardware/bitcraze/probe_crazyradio.py --workspace /twinr/bitcraze
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match reSpeaker --test
 sudo ./hardware/mic/setup_respeaker_access.sh
 sudo ./hardware/servo/setup_pololu_maestro.sh
@@ -59,6 +64,7 @@ sudo install -m 0755 hardware/ops/peer_servo_proxy.py /opt/twinr-peer-servo/repo
 sudo install -m 0644 hardware/ops/twinr-peer-servo-proxy.service /etc/systemd/system/twinr-peer-servo-proxy.service
 python3 hardware/ops/install_whatsapp_node_runtime.py
 python3 hardware/ops/bootstrap_self_coding_pi.py
+python3 hardware/ops/drone_daemon.py --pose-provider stub_ok --bind 127.0.0.1 --port 8791
 python3 hardware/ops/watch_pi_repo_mirror.py --once
 python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
 ```

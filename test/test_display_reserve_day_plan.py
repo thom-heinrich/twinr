@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.display.reserve_bus_feedback import DisplayReserveBusFeedbackStore
 from twinr.proactive.runtime.display_reserve_day_plan import (
@@ -24,6 +24,8 @@ def _candidate(
     salience: float,
     source: str = "world",
     candidate_family: str = "world",
+    generation_context: dict[str, object] | None = None,
+    semantic_topic_key: str = "",
 ) -> AmbientDisplayImpulseCandidate:
     return AmbientDisplayImpulseCandidate(
         topic_key=topic_key,
@@ -39,6 +41,8 @@ def _candidate(
         accent="info",
         reason=f"seed:{topic_key}",
         candidate_family=candidate_family,
+        generation_context=generation_context,
+        semantic_topic_key=semantic_topic_key,
     )
 
 
@@ -270,6 +274,92 @@ class DisplayReserveDayPlanTests(unittest.TestCase):
         self.assertEqual([item.topic_key for item in rebuilt.active_items()], ["ai companions"])
         self.assertEqual(rebuilt.current_item().topic_key, "ai companions")
 
+    def test_planner_uses_semantic_topic_gap_for_sibling_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                display_reserve_bus_items_per_day=6,
+                display_reserve_bus_topic_gap=2,
+            )
+            planner = DisplayReserveDayPlanner.from_config(config)
+            planner.candidate_loader = lambda _config, *, local_now, max_items: (
+                _candidate(
+                    topic_key="world politics::primary::a1",
+                    semantic_topic_key="world politics",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.94,
+                ),
+                _candidate(
+                    topic_key="world politics::public_reaction::b2",
+                    semantic_topic_key="world politics",
+                    action="ask_one",
+                    attention_state="forming",
+                    salience=0.91,
+                ),
+                _candidate(
+                    topic_key="ai companions::primary::c3",
+                    semantic_topic_key="ai companions",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.60,
+                ),
+            )[:max_items]
+            now = datetime(2026, 3, 22, 14, 30, tzinfo=timezone.utc)
+
+            plan = planner.ensure_plan(config=config, local_now=now)
+
+        self.assertEqual(
+            [item.semantic_key() for item in plan.items],
+            ["world politics", "ai companions", "world politics"],
+        )
+
+    def test_feedback_rebuild_retires_all_sibling_cards_for_answered_semantic_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, display_reserve_bus_items_per_day=6)
+            planner = DisplayReserveDayPlanner.from_config(config)
+            planner.candidate_loader = lambda _config, *, local_now, max_items: (
+                _candidate(
+                    topic_key="world politics::primary::a1",
+                    semantic_topic_key="world politics",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.94,
+                ),
+                _candidate(
+                    topic_key="world politics::public_reaction::b2",
+                    semantic_topic_key="world politics",
+                    action="ask_one",
+                    attention_state="forming",
+                    salience=0.90,
+                ),
+                _candidate(
+                    topic_key="ai companions::primary::c3",
+                    semantic_topic_key="ai companions",
+                    action="hint",
+                    attention_state="background",
+                    salience=0.52,
+                ),
+            )[:max_items]
+            feedback_store = DisplayReserveBusFeedbackStore.from_config(config)
+            now = datetime(2026, 3, 22, 13, 30, tzinfo=timezone.utc)
+
+            first = planner.ensure_plan(config=config, local_now=now)
+            planner.mark_published(config=config, local_now=now + timedelta(minutes=1))
+            feedback_store.record_reaction(
+                topic_key="world politics",
+                reaction="immediate_engagement",
+                intensity=1.0,
+                reason="The user answered one reserve card from the world politics bundle.",
+                now=now + timedelta(minutes=2),
+            )
+            rebuilt = planner.ensure_plan(config=config, local_now=now + timedelta(minutes=3))
+
+        self.assertEqual(first.current_item().semantic_key(), "world politics")
+        self.assertEqual(rebuilt.retired_topic_keys, ("world politics",))
+        self.assertEqual([item.semantic_key() for item in rebuilt.active_items()], ["ai companions"])
+        self.assertEqual(rebuilt.current_item().semantic_key(), "ai companions")
+
     def test_planner_spreads_sources_when_multiple_families_exist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir, display_reserve_bus_items_per_day=6)
@@ -337,6 +427,60 @@ class DisplayReserveDayPlanTests(unittest.TestCase):
 
         first_families = [item.candidate_family for item in plan.items[:3]]
         self.assertEqual(first_families, ["world", "memory_follow_up", "place"])
+
+    def test_planner_normalizes_seed_families_for_public_topic_spacing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, display_reserve_bus_items_per_day=6)
+            planner = DisplayReserveDayPlanner.from_config(config)
+            planner.candidate_loader = lambda _config, *, local_now, max_items: (
+                _candidate(
+                    topic_key="world-awareness",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.94,
+                    source="world_awareness",
+                    candidate_family="world_awareness",
+                ),
+                _candidate(
+                    topic_key="world-subscription",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.90,
+                    source="world_subscription",
+                    candidate_family="world_subscription",
+                ),
+                _candidate(
+                    topic_key="doctor-follow-up",
+                    action="ask_one",
+                    attention_state="forming",
+                    salience=0.82,
+                    source="memory_follow_up",
+                    candidate_family="memory_follow_up",
+                    generation_context={"memory_goal": "gentle_follow_up"},
+                ),
+                _candidate(
+                    topic_key="twinr-thread",
+                    action="ask_one",
+                    attention_state="shared_thread",
+                    salience=0.78,
+                    source="reflection_summary",
+                    candidate_family="reflection",
+                    generation_context={"reflection_kind": "thread", "memory_domain": "thread"},
+                ),
+            )[:max_items]
+            now = datetime(2026, 3, 22, 16, 0, tzinfo=timezone.utc)
+
+            plan = planner.ensure_plan(config=config, local_now=now)
+
+        first_topics = [item.topic_key for item in plan.items[:4]]
+        self.assertEqual(
+            set(first_topics),
+            {"world-awareness", "doctor-follow-up", "world-subscription", "twinr-thread"},
+        )
+        self.assertGreater(
+            abs(first_topics.index("world-awareness") - first_topics.index("world-subscription")),
+            1,
+        )
 
     def test_default_hold_seconds_rotate_more_often_but_still_remain_calm(self) -> None:
         config = TwinrConfig(project_root=".")

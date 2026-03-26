@@ -35,6 +35,7 @@ class WhatsAppWorkerStatusEvent:
     reconnect_in_ms: int | None = None
     qr_available: bool = False
     qr_svg: str | None = None
+    qr_image_data_url: str | None = None
     fatal: bool = False
 
 
@@ -48,6 +49,32 @@ class WhatsAppWorkerSendResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WhatsAppWorkerHistoryMessage:
+    """Represent one normalized WhatsApp history message emitted by the worker."""
+
+    message_id: str
+    conversation_id: str
+    sender_id: str
+    text: str
+    timestamp_ms: int
+    is_group: bool = False
+    is_from_self: bool = False
+    chat_label: str | None = None
+    sender_label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WhatsAppWorkerHistoryBatchEvent:
+    """Represent one normalized WhatsApp history-sync batch."""
+
+    messages: tuple[WhatsAppWorkerHistoryMessage, ...]
+    sync_type: str | None = None
+    progress: int | None = None
+    is_latest: bool | None = None
+    peer_data_request_session_id: str | None = None
+
+
 class WhatsAppWorkerExitedError(ChannelTransportError):
     """Raise when the Baileys worker exits while the channel loop is active."""
 
@@ -59,10 +86,20 @@ class WhatsAppWorkerExitedError(ChannelTransportError):
 class WhatsAppWorkerBridge:
     """Own the Baileys worker process and expose typed inbound events."""
 
-    def __init__(self, config: WhatsAppChannelConfig) -> None:
+    def __init__(
+        self,
+        config: WhatsAppChannelConfig,
+        *,
+        history_sync_enabled: bool = False,
+        history_cutoff_timestamp_ms: int | None = None,
+    ) -> None:
         self.config = config
+        self.history_sync_enabled = history_sync_enabled
+        self.history_cutoff_timestamp_ms = history_cutoff_timestamp_ms
         self._process: subprocess.Popen[str] | None = None
-        self._event_queue: queue.Queue[ChannelInboundMessage | WhatsAppWorkerStatusEvent] = queue.Queue()
+        self._event_queue: queue.Queue[
+            ChannelInboundMessage | WhatsAppWorkerStatusEvent | WhatsAppWorkerHistoryBatchEvent
+        ] = queue.Queue()
         self._pending_results: dict[str, queue.Queue[WhatsAppWorkerSendResult]] = {}
         self._lock = threading.RLock()
         self._stdout_thread: threading.Thread | None = None
@@ -95,7 +132,10 @@ class WhatsAppWorkerBridge:
                 "TWINR_WHATSAPP_AUTH_DIR": str(self.config.auth_dir),
                 "TWINR_WHATSAPP_RECONNECT_BASE_MS": str(int(self.config.reconnect_base_delay_s * 1000)),
                 "TWINR_WHATSAPP_RECONNECT_MAX_MS": str(int(self.config.reconnect_max_delay_s * 1000)),
+                "TWINR_WHATSAPP_HISTORY_SYNC": "1" if self.history_sync_enabled else "0",
             }
+            if self.history_cutoff_timestamp_ms is not None:
+                environment["TWINR_WHATSAPP_HISTORY_CUTOFF_MS"] = str(int(self.history_cutoff_timestamp_ms))
             self._process = subprocess.Popen(
                 [self.config.node_binary, str(self.worker_entry)],
                 cwd=str(self.config.worker_root),
@@ -168,7 +208,11 @@ class WhatsAppWorkerBridge:
         finally:
             self._release_pending_results("worker stopped")
 
-    def next_event(self, *, timeout_s: float | None = None) -> ChannelInboundMessage | WhatsAppWorkerStatusEvent | None:
+    def next_event(
+        self,
+        *,
+        timeout_s: float | None = None,
+    ) -> ChannelInboundMessage | WhatsAppWorkerStatusEvent | WhatsAppWorkerHistoryBatchEvent | None:
         """Return the next typed worker event or ``None`` on timeout."""
 
         try:
@@ -281,7 +325,7 @@ class WhatsAppWorkerBridge:
             return
 
         if payload_type in {"status", "fatal", "worker_ready"}:
-            event = WhatsAppWorkerStatusEvent(
+            status_event = WhatsAppWorkerStatusEvent(
                 connection=str(payload.get("connection", payload_type) or payload_type),
                 detail=self._optional_string(payload.get("detail")),
                 account_jid=self._optional_string(payload.get("account_jid")),
@@ -289,9 +333,10 @@ class WhatsAppWorkerBridge:
                 reconnect_in_ms=self._optional_int(payload.get("reconnect_in_ms")),
                 qr_available=bool(payload.get("qr_available", False)),
                 qr_svg=self._optional_string(payload.get("qr_svg")),
+                qr_image_data_url=self._optional_string(payload.get("qr_image_data_url")),
                 fatal=payload_type == "fatal" or bool(payload.get("fatal", False)),
             )
-            self._event_queue.put(event)
+            self._event_queue.put(status_event)
             return
 
         if payload_type == "send_result":
@@ -309,6 +354,47 @@ class WhatsAppWorkerBridge:
                 waiter = self._pending_results.get(request_id)
             if waiter is not None:
                 waiter.put(result)
+            return
+
+        if payload_type == "history_batch":
+            messages_payload = payload.get("messages")
+            if not isinstance(messages_payload, list):
+                LOGGER.warning("Ignoring WhatsApp worker history_batch without messages list: %r", payload)
+                return
+            messages: list[WhatsAppWorkerHistoryMessage] = []
+            for item in messages_payload:
+                if not isinstance(item, dict):
+                    continue
+                timestamp_ms = self._optional_int(item.get("timestamp_ms"))
+                if timestamp_ms is None:
+                    continue
+                message_id = str(item.get("message_id", "") or "").strip()
+                conversation_id = str(item.get("conversation_id", "") or "").strip()
+                sender_id = str(item.get("sender_id", "") or "").strip()
+                text = str(item.get("text", "") or "").strip()
+                if not all((message_id, conversation_id, sender_id, text)):
+                    continue
+                messages.append(
+                    WhatsAppWorkerHistoryMessage(
+                        message_id=message_id,
+                        conversation_id=conversation_id,
+                        sender_id=sender_id,
+                        text=text,
+                        timestamp_ms=timestamp_ms,
+                        is_group=bool(item.get("is_group", False)),
+                        is_from_self=bool(item.get("is_from_self", False)),
+                        chat_label=self._optional_string(item.get("chat_label")),
+                        sender_label=self._optional_string(item.get("sender_label")),
+                    )
+                )
+            history_event = WhatsAppWorkerHistoryBatchEvent(
+                messages=tuple(messages),
+                sync_type=self._optional_string(payload.get("sync_type")),
+                progress=self._optional_int(payload.get("progress")),
+                is_latest=self._optional_bool(payload.get("is_latest")),
+                peer_data_request_session_id=self._optional_string(payload.get("peer_data_request_session_id")),
+            )
+            self._event_queue.put(history_event)
             return
 
         LOGGER.debug("Ignoring unsupported WhatsApp worker payload type %r.", payload_type)
@@ -339,7 +425,28 @@ class WhatsAppWorkerBridge:
     def _optional_int(value: object) -> int | None:
         if value is None:
             return None
-        try:
+        if isinstance(value, bool):
             return int(value)
-        except (TypeError, ValueError):
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _optional_bool(value: object) -> bool | None:
+        if value is None:
             return None
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return None

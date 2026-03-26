@@ -40,6 +40,7 @@ class DisplayReserveRuntimeRequest:
     accent: str
     hold_seconds: float
     reason: str
+    semantic_topic_key: str = ""
     candidate_family: str = "general"
     match_anchors: tuple[str, ...] = ()
     metadata: Mapping[str, object] | None = None
@@ -91,6 +92,7 @@ class DisplayReserveRuntimePublisher:
         effective_now = (now or utc_now()).astimezone(timezone.utc)
         cue = self.controller.show_impulse(
             topic_key=request.topic_key,
+            semantic_topic_key=request.semantic_topic_key,
             eyebrow=request.eyebrow,
             headline=request.headline,
             body=request.body,
@@ -113,6 +115,7 @@ class DisplayReserveRuntimePublisher:
         exposure = self.history_store.append_exposure(
             source=request.history_source,
             topic_key=request.topic_key,
+            semantic_topic_key=request.semantic_topic_key,
             title=request.title,
             headline=cue.headline,
             body=cue.body,
@@ -144,6 +147,7 @@ class DisplayReserveRuntimePublisher:
         effective_now = (now or utc_now()).astimezone(timezone.utc)
         cue = self.controller.show_impulse(
             topic_key=request.topic_key,
+            semantic_topic_key=request.semantic_topic_key,
             eyebrow=request.eyebrow,
             headline=request.headline,
             body=request.body,

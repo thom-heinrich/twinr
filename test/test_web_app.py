@@ -60,6 +60,10 @@ from twinr.ops.remote_memory_watchdog import (
 from twinr.web import create_app
 from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
 
+_TEST_WHATSAPP_ALLOW_FROM = "+15555554567"
+_TEST_WHATSAPP_ALLOW_FROM_DISPLAY = "+1 555 555 4567"
+_TEST_WEB_HOST = "192.0.2.10"
+
 
 class _WarningQuietTestClient(TestClient):
     """Suppress the known Task/Future cancel deprecation noise during requests."""
@@ -287,9 +291,9 @@ class WebAppTests(unittest.TestCase):
     def test_whatsapp_runtime_step_accepts_https_proxy_same_origin_headers(self) -> None:
         client, env_path = self.make_client(
             extra_env={
-                "TWINR_WEB_ALLOWED_HOSTS": "192.168.1.95",
+                "TWINR_WEB_ALLOWED_HOSTS": _TEST_WEB_HOST,
             },
-            base_url="http://192.168.1.95",
+            base_url=f"http://{_TEST_WEB_HOST}",
             client_host="127.0.0.1",
         )
 
@@ -301,11 +305,11 @@ class WebAppTests(unittest.TestCase):
                 "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
             },
             headers={
-                "host": "192.168.1.95",
-                "origin": "https://192.168.1.95",
-                "referer": "https://192.168.1.95/connect/whatsapp?step=runtime",
+                "host": _TEST_WEB_HOST,
+                "origin": f"https://{_TEST_WEB_HOST}",
+                "referer": f"https://{_TEST_WEB_HOST}/connect/whatsapp?step=runtime",
                 "x-forwarded-proto": "https",
-                "x-forwarded-host": "192.168.1.95",
+                "x-forwarded-host": _TEST_WEB_HOST,
             },
             follow_redirects=False,
         )
@@ -778,7 +782,7 @@ class WebAppTests(unittest.TestCase):
             "/connect/whatsapp",
             data={
                 "_action": "save_chat",
-                "TWINR_WHATSAPP_ALLOW_FROM": "+49 171 1234567",
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM_DISPLAY,
             },
             follow_redirects=False,
         )
@@ -786,7 +790,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers["location"], "/connect/whatsapp?saved=1&step=runtime")
         env_text = env_path.read_text(encoding="utf-8")
-        self.assertIn("TWINR_WHATSAPP_ALLOW_FROM=+491711234567", env_text)
+        self.assertIn(f"TWINR_WHATSAPP_ALLOW_FROM={_TEST_WHATSAPP_ALLOW_FROM}", env_text)
         self.assertIn("TWINR_WHATSAPP_SELF_CHAT_MODE=true", env_text)
         self.assertIn("TWINR_WHATSAPP_GROUPS_ENABLED=false", env_text)
 
@@ -812,7 +816,7 @@ class WebAppTests(unittest.TestCase):
     def test_whatsapp_wizard_shows_paired_state_when_creds_exist(self) -> None:
         client, env_path = self.make_client(
             extra_env={
-                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM,
                 "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
                 "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
                 "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
@@ -834,7 +838,7 @@ class WebAppTests(unittest.TestCase):
     def test_whatsapp_wizard_post_starts_pairing_window_from_ui(self) -> None:
         client, env_path = self.make_client(
             extra_env={
-                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM,
                 "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
                 "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
             }
@@ -856,7 +860,7 @@ class WebAppTests(unittest.TestCase):
     def test_whatsapp_wizard_shows_live_qr_status_and_auto_refresh(self) -> None:
         client, env_path = self.make_client(
             extra_env={
-                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM,
                 "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
                 "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
             }
@@ -893,7 +897,7 @@ class WebAppTests(unittest.TestCase):
     def test_whatsapp_wizard_surfaces_auth_repair_needed(self) -> None:
         client, env_path = self.make_client(
             extra_env={
-                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM,
                 "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
                 "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
                 "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
@@ -941,9 +945,58 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Save email integration", response.text)
         self.assertIn("Save calendar integration", response.text)
         self.assertIn("Save smart-home integration", response.text)
+        self.assertIn("Social-history learning", response.text)
+        self.assertIn("Learn from my social media history", response.text)
+        self.assertIn("Save and import now", response.text)
         self.assertIn("Gmail", response.text)
         self.assertIn("ICS file", response.text)
         self.assertIn("Philips Hue", response.text)
+
+    def test_integrations_post_saves_social_history_config_and_queues_import(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WHATSAPP_ALLOW_FROM": _TEST_WHATSAPP_ALLOW_FROM,
+                "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
+                "TWINR_WHATSAPP_WORKER_ROOT": "src/twinr/channels/whatsapp/worker",
+            }
+        )
+        auth_dir = env_path.parent / "state" / "channels" / "whatsapp" / "auth"
+        worker_root = env_path.parent / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        worker_root.mkdir(parents=True, exist_ok=True)
+        (worker_root / "package.json").write_text("{\"name\":\"worker\"}\n", encoding="utf-8")
+        (auth_dir / "creds.json").write_text("{\"me\":{}}\n", encoding="utf-8")
+
+        fake_queue = SimpleNamespace(
+            submit_request=lambda **_kwargs: SimpleNamespace(request_id="hist-req-1")
+        )
+
+        with patch(
+            "twinr.web.app.probe_whatsapp_runtime",
+            return_value=SimpleNamespace(paired=True),
+        ), patch(
+            "twinr.web.app.WhatsAppHistoryImportQueue.from_twinr_config",
+            return_value=fake_queue,
+        ):
+            response = client.post(
+                "/integrations",
+                data={
+                    "_integration_id": "social_history_learning",
+                    "_integration_action": "save_and_import_social_history",
+                    "enabled": "true",
+                    "source": "whatsapp",
+                    "lookback_key": "6m",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("social_history_learning")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("source"), "whatsapp")
+        self.assertEqual(record.value("lookback_key"), "6m")
+        self.assertEqual(record.value("last_import_status"), "queued")
+        self.assertEqual(record.value("last_import_request_id"), "hist-req-1")
 
     def test_integrations_post_saves_email_config_and_secret(self) -> None:
         client, env_path = self.make_client()

@@ -19,7 +19,9 @@ from twinr.hardware.servo_follow import (
     SysfsPWMServoPulseWriter,
     TwinrKernelServoPulseWriter,
 )
+from twinr.hardware.servo_segment_player import ServoPulseSegmentCompletion, ServoPulseSegmentPlayback
 from twinr.hardware.servo_state import AttentionServoRuntimeState, AttentionServoStateStore
+from twinr.hardware.servo_state import AttentionServoMovementSegment
 
 
 class FakeServoPulseWriter:
@@ -37,6 +39,7 @@ class FakeServoPulseWriter:
 
     def disable(self, *, gpio_chip: str, gpio: int) -> None:
         self.disables.append((gpio_chip, gpio))
+        self.current_pulse_width_us_value = None
 
     def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
         del gpio_chip, gpio
@@ -60,6 +63,57 @@ class RecoveringFakeServoPulseWriter(FakeServoPulseWriter):
             self.fail_next_write = False
             raise RuntimeError("maestro command port missing")
         super().write(gpio_chip=gpio_chip, gpio=gpio, pulse_width_us=pulse_width_us)
+
+
+class FakeServoPulseSegmentPlayer:
+    def __init__(self) -> None:
+        self.started: list[tuple[int, float]] = []
+        self.cancelled = 0
+        self.closed = False
+        self._active_segment: ServoPulseSegmentPlayback | None = None
+        self._completion_queue: list[ServoPulseSegmentCompletion] = []
+
+    def start_segment(self, *, pulse_width_us: int, duration_s: float) -> ServoPulseSegmentPlayback:
+        playback = ServoPulseSegmentPlayback(
+            pulse_width_us=int(pulse_width_us),
+            duration_s=float(duration_s),
+            started_at=0.0,
+            due_at=float(duration_s),
+        )
+        self.started.append((int(pulse_width_us), float(duration_s)))
+        self._active_segment = playback
+        return playback
+
+    def active_segment(self) -> ServoPulseSegmentPlayback | None:
+        return self._active_segment
+
+    def consume_completion(self) -> ServoPulseSegmentCompletion | None:
+        if not self._completion_queue:
+            return None
+        return self._completion_queue.pop(0)
+
+    def finish_active(self, *, error: str | None = None) -> None:
+        if self._active_segment is None:
+            raise AssertionError("expected an active replay segment before finishing it")
+        playback = self._active_segment
+        self._active_segment = None
+        self._completion_queue.append(
+            ServoPulseSegmentCompletion(
+                playback=playback,
+                error=error,
+            )
+        )
+
+    def cancel(self) -> ServoPulseSegmentPlayback | None:
+        self.cancelled += 1
+        active_segment = self._active_segment
+        self._active_segment = None
+        self._completion_queue.clear()
+        return active_segment
+
+    def close(self) -> None:
+        self.closed = True
+        self.cancel()
 
 
 class FakeLGPIOModule:
@@ -497,6 +551,7 @@ class AttentionServoControllerTests(unittest.TestCase):
         target_hold_s: float = 1.1,
         loss_extrapolation_s: float = 0.8,
         loss_extrapolation_gain: float = 0.65,
+        hold_min_confidence: float = 0.58,
         max_step_us: int = 45,
         target_smoothing_s: float = 0.0,
         max_velocity_us_per_s: float = 100000.0,
@@ -526,15 +581,29 @@ class AttentionServoControllerTests(unittest.TestCase):
         continuous_max_speed_degrees_per_s: float = 120.0,
         continuous_slow_zone_degrees: float = 45.0,
         continuous_stop_tolerance_degrees: float = 4.0,
+        estimated_zero_settle_tolerance_degrees: float = 1.0,
+        estimated_zero_speed_scale: float = 1.0,
         continuous_min_speed_pulse_delta_us: int = 70,
         continuous_max_speed_pulse_delta_us: int = 160,
+        estimated_zero_move_pulse_delta_us: int = 70,
+        estimated_zero_move_period_s: float = 0.8,
+        estimated_zero_move_duty_cycle: float = 0.2,
+        continuous_return_to_zero_after_s: float = 0.0,
+        state_path: str | None = None,
+        replay_segment_player: FakeServoPulseSegmentPlayer | None = None,
     ) -> tuple[AttentionServoController, FakeServoPulseWriter]:
         writer = FakeServoPulseWriter()
+        temporary_state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_state_dir.cleanup)
+        resolved_state_path = str(Path(temporary_state_dir.name) / "attention_servo_state.json")
+        if state_path is not None and str(state_path).strip():
+            resolved_state_path = str(state_path)
         controller = AttentionServoController(
             config=AttentionServoConfig(
                 enabled=True,
                 driver="lgpio",
                 control_mode=control_mode,
+                state_path=resolved_state_path,
                 gpio_chip="gpiochip0",
                 gpio=18,
                 invert_direction=invert_direction,
@@ -542,6 +611,7 @@ class AttentionServoControllerTests(unittest.TestCase):
                 loss_extrapolation_s=loss_extrapolation_s,
                 loss_extrapolation_gain=loss_extrapolation_gain,
                 min_confidence=0.58,
+                hold_min_confidence=hold_min_confidence,
                 deadband=0.045,
                 min_pulse_width_us=1050,
                 center_pulse_width_us=1500,
@@ -574,10 +644,17 @@ class AttentionServoControllerTests(unittest.TestCase):
                 continuous_max_speed_degrees_per_s=continuous_max_speed_degrees_per_s,
                 continuous_slow_zone_degrees=continuous_slow_zone_degrees,
                 continuous_stop_tolerance_degrees=continuous_stop_tolerance_degrees,
+                estimated_zero_settle_tolerance_degrees=estimated_zero_settle_tolerance_degrees,
+                estimated_zero_speed_scale=estimated_zero_speed_scale,
                 continuous_min_speed_pulse_delta_us=continuous_min_speed_pulse_delta_us,
                 continuous_max_speed_pulse_delta_us=continuous_max_speed_pulse_delta_us,
+                estimated_zero_move_pulse_delta_us=estimated_zero_move_pulse_delta_us,
+                estimated_zero_move_period_s=estimated_zero_move_period_s,
+                estimated_zero_move_duty_cycle=estimated_zero_move_duty_cycle,
+                continuous_return_to_zero_after_s=continuous_return_to_zero_after_s,
             ),
             pulse_writer=writer,
+            replay_segment_player=replay_segment_player,
         )
         return controller, writer
 
@@ -635,7 +712,7 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(right.commanded_pulse_width_us, 1410)
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1660), ("gpiochip0", 18, 1410)])
 
-    def test_continuous_rotation_mode_recenters_after_virtual_heading_reaches_target(self) -> None:
+    def test_continuous_rotation_mode_keeps_following_same_side_target(self) -> None:
         controller, writer = self._build_controller(
             control_mode="continuous_rotation",
             follow_exit_only=False,
@@ -659,54 +736,409 @@ class AttentionServoControllerTests(unittest.TestCase):
             for step in range(7)
         ]
         debug = controller.debug_snapshot(observed_at=11.4)
+        center_pulse_width_us = controller.config.center_pulse_width_us
 
-        self.assertEqual(decisions[0].commanded_pulse_width_us, 1660)
-        self.assertEqual(decisions[-1].target_pulse_width_us, 1500)
-        self.assertEqual(decisions[-1].commanded_pulse_width_us, 1500)
-        self.assertEqual(writer.writes[-1], ("gpiochip0", 18, 1500))
+        self.assertGreater(decisions[0].commanded_pulse_width_us or 0, center_pulse_width_us)
+        self.assertTrue(all((decision.target_pulse_width_us or 0) > center_pulse_width_us for decision in decisions))
+        self.assertTrue(all((decision.commanded_pulse_width_us or 0) > center_pulse_width_us for decision in decisions))
+        self.assertGreater(writer.writes[-1][2], center_pulse_width_us)
         self.assertIsNotNone(debug["continuous_estimated_heading_degrees"])
         debug_config = cast(dict[str, object], debug["config"])
         self.assertEqual(debug_config["control_mode"], "continuous_rotation")
 
-    def test_pololu_fault_recovers_on_later_update_when_writer_probe_succeeds(self) -> None:
-        writer = RecoveringFakeServoPulseWriter()
-        controller = AttentionServoController(
-            config=AttentionServoConfig(
-                enabled=True,
-                driver="pololu_maestro",
-                control_mode="continuous_rotation",
-                gpio_chip="gpiochip0",
-                gpio=0,
-                follow_exit_only=False,
-                max_step_us=250,
-                min_command_delta_us=1,
-                mechanical_range_degrees=360.0,
-            ),
-            pulse_writer=writer,
+    def test_continuous_rotation_mode_sparse_visible_updates_do_not_reverse_direction(self) -> None:
+        controller, writer = self._build_controller(
+            invert_direction=True,
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            reference_interval_s=2.0,
+            continuous_max_speed_degrees_per_s=35.0,
+            continuous_slow_zone_degrees=55.0,
+            continuous_stop_tolerance_degrees=4.0,
+            continuous_min_speed_pulse_delta_us=70,
+            continuous_max_speed_pulse_delta_us=90,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "maestro command port missing"):
+        decisions = [
             controller.update(
-                observed_at=10.0,
+                observed_at=10.0 + (2.0 * step),
+                active=True,
+                target_center_x=0.65,
+                confidence=0.95,
+            )
+            for step in range(4)
+        ]
+        center_pulse_width_us = controller.config.center_pulse_width_us
+
+        self.assertTrue(all(decision.reason == "following_target" for decision in decisions))
+        self.assertTrue(all((decision.target_pulse_width_us or 0) < center_pulse_width_us for decision in decisions))
+        self.assertTrue(all((decision.commanded_pulse_width_us or 0) < center_pulse_width_us for decision in decisions))
+        self.assertTrue(all(pulse_width_us < center_pulse_width_us for _, _, pulse_width_us in writer.writes))
+
+    def test_continuous_rotation_visible_follow_crosses_center_without_old_side_smoothing_barrier(self) -> None:
+        controller, _ = self._build_controller(
+            invert_direction=True,
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=45,
+            min_command_delta_us=1,
+            target_smoothing_s=1.8,
+            visible_retarget_tolerance_us=70,
+            continuous_max_speed_degrees_per_s=35.0,
+            continuous_slow_zone_degrees=55.0,
+            continuous_stop_tolerance_degrees=4.0,
+            continuous_min_speed_pulse_delta_us=70,
+            continuous_max_speed_pulse_delta_us=90,
+        )
+
+        same_side = [
+            controller.update(
+                observed_at=10.0 + float(step),
+                active=True,
+                target_center_x=0.82,
+                confidence=0.95,
+            )
+            for step in range(3)
+        ]
+        crossed = controller.update(
+            observed_at=13.0,
+            active=True,
+            target_center_x=0.44,
+            confidence=0.95,
+        )
+
+        center_pulse_width_us = controller.config.center_pulse_width_us
+        self.assertTrue(all((decision.target_pulse_width_us or 0) <= center_pulse_width_us for decision in same_side))
+        self.assertGreater(crossed.target_pulse_width_us or 0, center_pulse_width_us)
+        self.assertGreater(crossed.applied_center_x or 0.0, 0.0)
+
+    def test_continuous_rotation_idle_at_zero_releases_instead_of_driving_center(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+        )
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(decision.reason, "idle_released")
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+
+    def test_continuous_rotation_inactive_return_uses_heading_not_blind_center_pulse(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.0,
+            estimated_zero_move_period_s=0.1,
+            estimated_zero_move_duty_cycle=1.0,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=1.0,
+            confidence=0.95,
+        )
+        recentered = controller.update(
+            observed_at=10.2,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1660)
+        self.assertEqual(recentered.reason, "recentering")
+        self.assertIsNotNone(recentered.commanded_pulse_width_us)
+        self.assertLess(recentered.commanded_pulse_width_us or 0, 1470)
+        self.assertNotEqual(recentered.commanded_pulse_width_us, 1470)
+
+    def test_continuous_rotation_inactive_return_anchors_zero_return_phase_before_pause_window(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.0,
+            estimated_zero_move_period_s=1.0,
+            estimated_zero_move_duty_cycle=0.25,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=1.0,
+            confidence=0.95,
+        )
+        recenter_start = controller.update(
+            observed_at=10.26,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        paused = controller.update(
+            observed_at=10.52,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1660)
+        self.assertEqual(recenter_start.reason, "recentering")
+        self.assertIsNotNone(recenter_start.commanded_pulse_width_us)
+        self.assertLess(recenter_start.commanded_pulse_width_us or 0, 1470)
+        self.assertEqual(paused.reason, "recentering")
+        self.assertIsNone(paused.commanded_pulse_width_us)
+        self.assertFalse(paused.active)
+        self.assertEqual(len(writer.writes), 2)
+        self.assertEqual(writer.writes[0], ("gpiochip0", 18, 1660))
+        self.assertLess(writer.writes[1][2], 1470)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_continuous_rotation_inactive_return_uses_estimated_zero_settle_tolerance_not_tracking_tolerance(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=180.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.0,
+            continuous_max_speed_degrees_per_s=45.0,
+            continuous_slow_zone_degrees=40.0,
+            continuous_stop_tolerance_degrees=5.0,
+            estimated_zero_settle_tolerance_degrees=1.0,
+            estimated_zero_speed_scale=0.5,
+            continuous_min_speed_pulse_delta_us=70,
+            continuous_max_speed_pulse_delta_us=100,
+            estimated_zero_move_period_s=0.8,
+            estimated_zero_move_duty_cycle=0.2,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+        if controller._continuous_planner is None:
+            self.fail("expected continuous planner for continuous-rotation test")
+        controller._continuous_planner.reset(heading_degrees=-18.0, observed_at=0.0)
+
+        first = controller.update(
+            observed_at=0.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        second = controller.update(
+            observed_at=1.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.reason, "recentering")
+        self.assertGreater(first.commanded_pulse_width_us or 0, 1500)
+        self.assertEqual(second.reason, "recentering")
+        self.assertIsNone(second.commanded_pulse_width_us)
+        self.assertAlmostEqual(controller._continuous_planner.estimated_heading_degrees, -10.125, places=3)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, first.commanded_pulse_width_us or 0)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_continuous_rotation_inactive_return_rearms_move_after_sparse_pause_updates(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=180.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.0,
+            continuous_max_speed_degrees_per_s=45.0,
+            continuous_slow_zone_degrees=40.0,
+            continuous_stop_tolerance_degrees=5.0,
+            estimated_zero_settle_tolerance_degrees=1.0,
+            estimated_zero_speed_scale=0.5,
+            continuous_min_speed_pulse_delta_us=70,
+            continuous_max_speed_pulse_delta_us=100,
+            estimated_zero_move_period_s=0.8,
+            estimated_zero_move_duty_cycle=0.2,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+        if controller._continuous_planner is None:
+            self.fail("expected continuous planner for continuous-rotation test")
+        controller._continuous_planner.reset(heading_degrees=-18.0, observed_at=0.0)
+
+        first = controller.update(
+            observed_at=0.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        second = controller.update(
+            observed_at=1.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        third = controller.update(
+            observed_at=2.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.reason, "recentering")
+        self.assertEqual(second.reason, "recentering")
+        self.assertIsNone(second.commanded_pulse_width_us)
+        self.assertEqual(third.reason, "recentering")
+        self.assertGreater(third.commanded_pulse_width_us or 0, 1500)
+        self.assertEqual(len(writer.writes), 2)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_continuous_rotation_waits_before_returning_to_zero_after_absence(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.1,
+            continuous_return_to_zero_after_s=60.0,
+            estimated_zero_move_period_s=0.1,
+            estimated_zero_move_duty_cycle=1.0,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=1.0,
+            confidence=0.95,
+        )
+        absent = controller.update(
+            observed_at=10.3,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        returned = controller.update(
+            observed_at=70.5,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1660)
+        self.assertEqual(absent.reason, "absence_hold_released")
+        self.assertIsNone(absent.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+        self.assertEqual(returned.reason, "recentering")
+        self.assertIsNotNone(returned.commanded_pulse_width_us)
+        self.assertLess(returned.commanded_pulse_width_us or 0, 1470)
+
+    def test_continuous_rotation_inactive_return_stops_instead_of_reversing_after_zero_cross(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            follow_exit_only=False,
+            mechanical_range_degrees=360.0,
+            max_step_us=250,
+            min_command_delta_us=1,
+            target_hold_s=0.0,
+            continuous_return_to_zero_after_s=0.0,
+            continuous_max_speed_degrees_per_s=180.0,
+            continuous_stop_tolerance_degrees=1.0,
+            estimated_zero_move_period_s=0.1,
+            estimated_zero_move_duty_cycle=1.0,
+            rest_max_velocity_us_per_s=100000.0,
+            rest_max_acceleration_us_per_s2=100000.0,
+            rest_max_jerk_us_per_s3=1000000.0,
+        )
+        if controller._continuous_planner is None:
+            self.fail("expected continuous planner for continuous-rotation test")
+        controller._continuous_planner.reset(heading_degrees=-6.0, observed_at=10.0)
+
+        first = controller.update(
+            observed_at=10.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        second = controller.update(
+            observed_at=10.5,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.reason, "recentering")
+        self.assertGreater(first.commanded_pulse_width_us or 0, 1500)
+        self.assertEqual(second.reason, "idle_released")
+        self.assertIsNone(second.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_pololu_fault_recovers_on_later_update_when_writer_probe_succeeds(self) -> None:
+        writer = RecoveringFakeServoPulseWriter()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="pololu_maestro",
+                    control_mode="continuous_rotation",
+                    state_path=str(Path(temp_dir) / "attention_servo_state.json"),
+                    gpio_chip="gpiochip0",
+                    gpio=0,
+                    follow_exit_only=False,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    mechanical_range_degrees=360.0,
+                ),
+                pulse_writer=writer,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "maestro command port missing"):
+                controller.update(
+                    observed_at=10.0,
+                    active=True,
+                    target_center_x=1.0,
+                    confidence=0.95,
+                )
+
+            decision = controller.update(
+                observed_at=11.5,
                 active=True,
                 target_center_x=1.0,
                 confidence=0.95,
             )
 
-        decision = controller.update(
-            observed_at=11.5,
-            active=True,
-            target_center_x=1.0,
-            confidence=0.95,
-        )
-
-        self.assertEqual(writer.probes, [0])
-        self.assertTrue(writer.closed)
-        self.assertEqual(decision.reason, "following_target")
-        self.assertIsNone(controller.debug_snapshot(observed_at=11.5)["fault_reason"])
-        self.assertEqual(writer.writes, [("gpiochip0", 0, decision.commanded_pulse_width_us or 0)])
-        self.assertIsNotNone(decision.commanded_pulse_width_us)
-        self.assertGreater(decision.commanded_pulse_width_us or 0, 1500)
+            self.assertEqual(writer.probes, [0])
+            self.assertTrue(writer.closed)
+            self.assertEqual(decision.reason, "following_target")
+            self.assertIsNone(controller.debug_snapshot(observed_at=11.5)["fault_reason"])
+            self.assertEqual(writer.writes, [("gpiochip0", 0, decision.commanded_pulse_width_us or 0)])
+            self.assertIsNotNone(decision.commanded_pulse_width_us)
+            self.assertGreater(decision.commanded_pulse_width_us or 0, 1500)
 
     def test_disabled_controller_releases_stale_output_on_startup(self) -> None:
         writer = FakeServoPulseWriter()
@@ -792,6 +1224,29 @@ class AttentionServoControllerTests(unittest.TestCase):
             str(Path(temp_dir) / "state" / "custom-attention-servo.json"),
         )
 
+    def test_from_config_reads_estimated_zero_return_tuning(self) -> None:
+        config = TwinrConfig(
+            attention_servo_enabled=True,
+            attention_servo_control_mode="continuous_rotation",
+            attention_servo_estimated_zero_max_uncertainty_degrees=11.5,
+            attention_servo_estimated_zero_settle_tolerance_degrees=0.9,
+            attention_servo_estimated_zero_speed_scale=0.4,
+            attention_servo_estimated_zero_move_pulse_delta_us=72,
+            attention_servo_estimated_zero_move_period_s=1.2,
+            attention_servo_estimated_zero_move_duty_cycle=0.15,
+            attention_servo_continuous_return_to_zero_after_s=60.0,
+        )
+
+        servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
+
+        self.assertEqual(servo_config.estimated_zero_max_uncertainty_degrees, 11.5)
+        self.assertEqual(servo_config.estimated_zero_settle_tolerance_degrees, 0.9)
+        self.assertEqual(servo_config.estimated_zero_speed_scale, 0.4)
+        self.assertEqual(servo_config.estimated_zero_move_pulse_delta_us, 72)
+        self.assertEqual(servo_config.estimated_zero_move_period_s, 1.2)
+        self.assertEqual(servo_config.estimated_zero_move_duty_cycle, 0.15)
+        self.assertEqual(servo_config.continuous_return_to_zero_after_s, 60.0)
+
     def test_continuous_rotation_manual_hold_anchors_persisted_startup_heading(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "attention_servo_state.json"
@@ -833,8 +1288,9 @@ class AttentionServoControllerTests(unittest.TestCase):
 
         self.assertEqual(decision.reason, "manual_hold")
         self.assertFalse(decision.active)
-        self.assertEqual(decision.commanded_pulse_width_us, 1500)
-        self.assertEqual(writer.writes, [("gpiochip0", 18, 1500)])
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
         self.assertEqual(debug["continuous_estimated_heading_degrees"], 17.25)
         self.assertTrue(debug["startup_hold_until_armed"])
         self.assertTrue(debug["zero_reference_confirmed"])
@@ -844,6 +1300,49 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(persisted_state.heading_degrees, 17.25)
         self.assertTrue(persisted_state.hold_until_armed)
         self.assertTrue(persisted_state.zero_reference_confirmed)
+
+    def test_continuous_rotation_manual_hold_releases_stale_active_output_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            AttentionServoStateStore(state_path).save(
+                AttentionServoRuntimeState(
+                    heading_degrees=4.0,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=True,
+                    updated_at=123.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            writer.current_pulse_width_us_value = 1470
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=True,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                ),
+                pulse_writer=writer,
+            )
+
+            decision = controller.update(
+                observed_at=10.0,
+                active=True,
+                target_center_x=1.0,
+                confidence=0.95,
+                visible_target_present=True,
+            )
+
+        self.assertEqual(decision.reason, "manual_hold")
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
 
     def test_continuous_rotation_runtime_reloads_arm_state_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -901,10 +1400,424 @@ class AttentionServoControllerTests(unittest.TestCase):
             debug = controller.debug_snapshot(observed_at=10.5)
 
         self.assertEqual(held_decision.reason, "manual_hold")
-        self.assertEqual(held_decision.commanded_pulse_width_us, 1500)
+        self.assertIsNone(held_decision.commanded_pulse_width_us)
         self.assertNotEqual(armed_decision.reason, "manual_hold")
         self.assertIsNotNone(armed_decision.commanded_pulse_width_us)
         self.assertFalse(debug["startup_hold_until_armed"])
+
+    def test_continuous_rotation_arm_without_visible_target_starts_absence_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=17.25,
+                    hold_until_armed=True,
+                    zero_reference_confirmed=True,
+                    updated_at=123.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    target_hold_s=0.1,
+                    continuous_return_to_zero_after_s=60.0,
+                    mechanical_range_degrees=360.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    estimated_zero_move_period_s=0.1,
+                    estimated_zero_move_duty_cycle=1.0,
+                    rest_max_velocity_us_per_s=100000.0,
+                    rest_max_acceleration_us_per_s2=100000.0,
+                    rest_max_jerk_us_per_s3=1000000.0,
+                ),
+                pulse_writer=writer,
+            )
+
+            held = controller.update(
+                observed_at=10.0,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=17.25,
+                    hold_until_armed=False,
+                    zero_reference_confirmed=True,
+                    updated_at=124.0,
+                )
+            )
+
+            armed_absent = controller.update(
+                observed_at=10.2,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            returned = controller.update(
+                observed_at=70.5,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+
+        self.assertEqual(held.reason, "manual_hold")
+        self.assertEqual(armed_absent.reason, "absence_hold_released")
+        self.assertIsNone(armed_absent.commanded_pulse_width_us)
+        self.assertEqual(returned.reason, "recentering")
+        self.assertIsNotNone(returned.commanded_pulse_width_us)
+
+    def test_continuous_rotation_return_to_estimated_zero_rejects_high_uncertainty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=18.0,
+                    heading_uncertainty_degrees=24.0,
+                    hold_until_armed=False,
+                    return_to_zero_requested=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    estimated_zero_max_uncertainty_degrees=15.0,
+                    center_pulse_width_us=1470,
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                ),
+                pulse_writer=writer,
+            )
+
+            decision = controller.update(
+                observed_at=10.0,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            persisted_state = store.load()
+            debug = controller.debug_snapshot(observed_at=10.0)
+
+        self.assertEqual(decision.reason, "estimated_zero_rejected_uncertainty")
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertFalse(decision.active)
+        self.assertIsNotNone(persisted_state)
+        if persisted_state is None:
+            self.fail("expected estimated-zero rejection to persist state")
+        self.assertTrue(persisted_state.hold_until_armed)
+        self.assertFalse(persisted_state.return_to_zero_requested)
+        self.assertEqual(persisted_state.heading_uncertainty_degrees, 24.0)
+        self.assertTrue(debug["startup_hold_until_armed"])
+        self.assertFalse(debug["return_to_zero_requested"])
+
+    def test_continuous_rotation_return_to_estimated_zero_holds_virtual_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=18.0,
+                    heading_uncertainty_degrees=4.0,
+                    hold_until_armed=False,
+                    return_to_zero_requested=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    estimated_zero_max_uncertainty_degrees=15.0,
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    rest_max_velocity_us_per_s=100000.0,
+                    rest_max_acceleration_us_per_s2=100000.0,
+                    rest_max_jerk_us_per_s3=1000000.0,
+                    estimated_zero_move_pulse_delta_us=70,
+                    estimated_zero_move_period_s=0.1,
+                    estimated_zero_move_duty_cycle=1.0,
+                ),
+                pulse_writer=writer,
+            )
+
+            reasons: list[str] = []
+            final_decision = None
+            for step in range(24):
+                final_decision = controller.update(
+                    observed_at=10.0 + (0.1 * step),
+                    active=False,
+                    target_center_x=None,
+                    confidence=0.0,
+                )
+                reasons.append(final_decision.reason)
+                if final_decision.reason == "estimated_zero_hold":
+                    break
+            persisted_state = store.load()
+            debug = controller.debug_snapshot(observed_at=12.4)
+
+        self.assertIsNotNone(final_decision)
+        if final_decision is None:
+            self.fail("expected a final decision from the estimated-zero return loop")
+        self.assertIn("returning_to_estimated_zero", reasons)
+        self.assertEqual(final_decision.reason, "estimated_zero_hold")
+        self.assertIsNone(final_decision.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+        self.assertIsNotNone(persisted_state)
+        if persisted_state is None:
+            self.fail("expected estimated-zero return to persist state")
+        self.assertEqual(persisted_state.heading_degrees, 0.0)
+        self.assertTrue(persisted_state.hold_until_armed)
+        self.assertFalse(persisted_state.return_to_zero_requested)
+        self.assertEqual(persisted_state.heading_uncertainty_degrees, 4.0)
+        self.assertTrue(debug["startup_hold_until_armed"])
+        self.assertFalse(debug["return_to_zero_requested"])
+        self.assertEqual(debug["continuous_estimated_heading_degrees"], 0.0)
+
+    def test_continuous_rotation_return_to_estimated_zero_replays_logged_motion_in_reverse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=-25.5,
+                    heading_uncertainty_degrees=0.0,
+                    movement_journal=(
+                        AttentionServoMovementSegment(pulse_width_us=1390, duration_s=1.0),
+                    ),
+                    hold_until_armed=False,
+                    return_to_zero_requested=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            replay_player = FakeServoPulseSegmentPlayer()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    estimated_zero_max_uncertainty_degrees=15.0,
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    rest_max_velocity_us_per_s=100000.0,
+                    rest_max_acceleration_us_per_s2=100000.0,
+                    rest_max_jerk_us_per_s3=1000000.0,
+                ),
+                pulse_writer=writer,
+                replay_segment_player=replay_player,
+            )
+
+            first = controller.update(
+                observed_at=10.0,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            second = controller.update(
+                observed_at=10.5,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            replay_player.finish_active()
+            third = controller.update(
+                observed_at=10.6,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            persisted_state = store.load()
+            debug = controller.debug_snapshot(observed_at=10.6)
+
+        self.assertEqual(first.reason, "returning_to_estimated_zero")
+        self.assertEqual(first.commanded_pulse_width_us, 1610)
+        self.assertEqual(second.reason, "returning_to_estimated_zero")
+        self.assertEqual(second.commanded_pulse_width_us, 1610)
+        self.assertEqual(third.reason, "estimated_zero_hold")
+        self.assertIsNone(third.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+        self.assertEqual(replay_player.started, [(1610, 1.0)])
+        self.assertIsNotNone(persisted_state)
+        if persisted_state is None:
+            self.fail("expected reverse-replay return to persist state")
+        self.assertEqual(persisted_state.movement_journal, ())
+        self.assertTrue(persisted_state.hold_until_armed)
+        self.assertFalse(persisted_state.return_to_zero_requested)
+        self.assertEqual(debug["movement_journal_segments"], 0)
+        self.assertFalse(debug["movement_journal_replay_active"])
+
+    def test_continuous_rotation_return_to_estimated_zero_stops_on_sign_flip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=-6.0,
+                    heading_uncertainty_degrees=0.0,
+                    hold_until_armed=False,
+                    return_to_zero_requested=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    estimated_zero_max_uncertainty_degrees=15.0,
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    continuous_max_speed_degrees_per_s=180.0,
+                    continuous_stop_tolerance_degrees=1.0,
+                    rest_max_velocity_us_per_s=100000.0,
+                    rest_max_acceleration_us_per_s2=100000.0,
+                    rest_max_jerk_us_per_s3=1000000.0,
+                    estimated_zero_move_pulse_delta_us=70,
+                    estimated_zero_move_period_s=0.1,
+                    estimated_zero_move_duty_cycle=1.0,
+                ),
+                pulse_writer=writer,
+            )
+
+            first = controller.update(
+                observed_at=10.0,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            second = controller.update(
+                observed_at=10.5,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            persisted_state = store.load()
+
+        self.assertEqual(first.reason, "returning_to_estimated_zero")
+        self.assertGreater(first.commanded_pulse_width_us or 0, 1500)
+        self.assertEqual(second.reason, "estimated_zero_hold")
+        self.assertIsNone(second.commanded_pulse_width_us)
+        self.assertIsNotNone(persisted_state)
+        if persisted_state is None:
+            self.fail("expected estimated-zero sign-flip stop to persist state")
+        self.assertTrue(persisted_state.hold_until_armed)
+        self.assertFalse(persisted_state.return_to_zero_requested)
+        self.assertAlmostEqual(persisted_state.heading_degrees, 0.0, places=3)
+
+    def test_continuous_rotation_return_to_estimated_zero_uses_slow_move_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "attention_servo_state.json"
+            store = AttentionServoStateStore(state_path)
+            store.save(
+                AttentionServoRuntimeState(
+                    heading_degrees=18.0,
+                    heading_uncertainty_degrees=4.0,
+                    hold_until_armed=False,
+                    return_to_zero_requested=True,
+                    zero_reference_confirmed=True,
+                    updated_at=100.0,
+                )
+            )
+            writer = FakeServoPulseWriter()
+            controller = AttentionServoController(
+                config=AttentionServoConfig(
+                    enabled=True,
+                    driver="lgpio",
+                    control_mode="continuous_rotation",
+                    state_path=str(state_path),
+                    estimated_zero_max_uncertainty_degrees=15.0,
+                    estimated_zero_move_pulse_delta_us=70,
+                    estimated_zero_move_period_s=1.0,
+                    estimated_zero_move_duty_cycle=0.25,
+                    gpio_chip="gpiochip0",
+                    gpio=18,
+                    follow_exit_only=False,
+                    mechanical_range_degrees=360.0,
+                    exit_follow_max_degrees=90.0,
+                    max_step_us=250,
+                    min_command_delta_us=1,
+                    rest_max_velocity_us_per_s=100000.0,
+                    rest_max_acceleration_us_per_s2=100000.0,
+                    rest_max_jerk_us_per_s3=1000000.0,
+                ),
+                pulse_writer=writer,
+            )
+
+            moving = controller.update(
+                observed_at=10.0,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            paused = controller.update(
+                observed_at=10.26,
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            debug = controller.debug_snapshot(observed_at=10.26)
+
+        self.assertEqual(moving.reason, "returning_to_estimated_zero")
+        self.assertEqual(moving.commanded_pulse_width_us, 1430)
+        self.assertTrue(moving.active)
+        self.assertEqual(paused.reason, "returning_to_estimated_zero")
+        self.assertIsNone(paused.commanded_pulse_width_us)
+        self.assertFalse(paused.active)
+        self.assertEqual(
+            writer.writes,
+            [
+                ("gpiochip0", 18, 1430),
+            ],
+        )
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+        debug_config = cast(dict[str, object], debug["config"])
+        self.assertEqual(debug_config["estimated_zero_move_pulse_delta_us"], 70)
+        self.assertEqual(debug_config["estimated_zero_move_period_s"], 1.0)
+        self.assertEqual(debug_config["estimated_zero_move_duty_cycle"], 0.25)
 
     def test_exit_only_recentering_starts_from_writer_seed_instead_of_blind_center(self) -> None:
         writer = FakeServoPulseWriter()
@@ -1048,6 +1961,61 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(recentered.applied_center_x, 0.5)
         self.assertGreater(len(writer.writes), 1)
         self.assertLess(recentered.commanded_pulse_width_us or 0, held.commanded_pulse_width_us or 0)
+
+    def test_update_keeps_visible_target_following_across_confidence_dip_above_hold_floor(self) -> None:
+        controller, _writer = self._build_controller(
+            target_hold_s=1.0,
+            hold_min_confidence=0.5,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.78,
+            confidence=0.9,
+            visible_target_present=True,
+        )
+        dipped = controller.update(
+            observed_at=10.6,
+            active=True,
+            target_center_x=0.79,
+            confidence=0.53,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(first.reason, "following_target")
+        self.assertEqual(dipped.reason, "following_target")
+        self.assertTrue(dipped.active)
+        self.assertGreater(dipped.applied_center_x or 0.0, 0.5)
+
+    def test_update_recenters_visible_target_when_confidence_drops_below_hold_floor(self) -> None:
+        controller, _writer = self._build_controller(
+            target_hold_s=0.0,
+            hold_min_confidence=0.5,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            control_mode="continuous_rotation",
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.78,
+            confidence=0.9,
+            visible_target_present=True,
+        )
+        dipped = controller.update(
+            observed_at=10.6,
+            active=True,
+            target_center_x=0.79,
+            confidence=0.49,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(dipped.reason, "recentering")
+        self.assertEqual(dipped.applied_center_x, 0.5)
 
     def test_update_projects_recent_target_trajectory_on_loss(self) -> None:
         controller, writer = self._build_controller(
@@ -1468,6 +2436,35 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertIsNone(held_released.commanded_pulse_width_us)
         self.assertEqual(writer.disables, [("gpiochip0", 18)])
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1766)])
+
+    def test_continuous_follow_does_not_hold_released_visible_target(self) -> None:
+        controller, writer = self._build_controller(
+            control_mode="continuous_rotation",
+            max_step_us=400,
+            target_smoothing_s=0.0,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.78,
+            confidence=0.9,
+            visible_target_present=True,
+        )
+        controller._released_pulse_width_us = first.commanded_pulse_width_us
+        controller._last_commanded_pulse_width_us = None
+
+        resumed = controller.update(
+            observed_at=10.6,
+            active=True,
+            target_center_x=0.79,
+            confidence=0.9,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(resumed.reason, "following_target")
+        self.assertIsNotNone(resumed.commanded_pulse_width_us)
+        self.assertGreaterEqual(len(writer.writes), 2)
 
     def test_update_resumes_from_released_target_instead_of_center(self) -> None:
         controller, writer = self._build_controller(

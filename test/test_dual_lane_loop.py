@@ -222,6 +222,63 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertIn("Supervisor instructions", supervisor_decision_provider.calls[0]["instructions"])
         self.assertIn("DISPLAY OVERLAY", supervisor_decision_provider.calls[0]["instructions"])
 
+    def test_run_runtime_local_tool_only_executes_tool_without_specialist_hop(self) -> None:
+        tool_calls: list[dict[str, object]] = []
+
+        def runtime_tool(arguments: dict[str, object]) -> dict[str, object]:
+            tool_calls.append(dict(arguments))
+            return {
+                "status": "active",
+                "spoken_text": "Okay. Ich bin jetzt für 2 Minuten ruhig.",
+            }
+
+        loop = DualLaneToolLoop(
+            supervisor_provider=FakeSupervisorProvider(),
+            specialist_provider=FakeSpecialistProvider(),
+            tool_handlers={"manage_voice_quiet_mode": runtime_tool},
+            tool_schemas=(),
+            supervisor_decision_provider=None,
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+        lane_deltas: list[SpeechLaneDelta] = []
+
+        result = loop.run_runtime_local_tool_only(
+            "Sei bitte 2 Minuten ruhig.",
+            decision=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schalte mich kurz stumm.",
+                spoken_reply=None,
+                kind="automation",
+                goal="Set temporary quiet mode.",
+                allow_web_search=False,
+                context_scope="tiny_recent",
+                runtime_tool_name="manage_voice_quiet_mode",
+                runtime_tool_arguments={"action": "set", "duration_minutes": 2},
+                response_id="decision_1",
+                request_id="req_decision_1",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+            on_lane_text_delta=lane_deltas.append,
+            emit_filler=True,
+        )
+
+        self.assertEqual(
+            tool_calls,
+            [{"action": "set", "duration_minutes": 2}],
+        )
+        self.assertEqual(result.text, "Okay. Ich bin jetzt für 2 Minuten ruhig.")
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "manage_voice_quiet_mode")
+        self.assertEqual(
+            [(delta.lane, delta.text, delta.replace_current, delta.atomic) for delta in lane_deltas],
+            [
+                ("filler", "Ich schalte mich kurz stumm.", False, False),
+                ("final", "Okay. Ich bin jetzt für 2 Minuten ruhig.", True, True),
+            ],
+        )
+
     def test_prefetched_handoff_emits_filler_then_preempting_final_lane(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()

@@ -38,6 +38,7 @@ def _stable_packet_id(turn: LongTermConversationTurn) -> str:
         (
             turn.created_at.isoformat(),
             turn.source,
+            turn.modality,
             turn.transcript,
             turn.response,
         )
@@ -105,6 +106,7 @@ class LongTermTurnContinuityCompiler:
                 turn.transcript,
                 turn.response,
                 turn.source,
+                turn.modality,
                 limit=self.max_query_hints,
             ),
             sensitivity="normal",
@@ -112,6 +114,7 @@ class LongTermTurnContinuityCompiler:
             attributes={
                 "persistence_scope": _TURN_CONTINUITY_SCOPE,
                 "source_type": turn.source,
+                "source_modality": turn.modality,
                 "source_created_at": turn.created_at.isoformat(),
                 # Preserve short raw-turn anchors so downstream display code can
                 # ask natural follow-up questions without parsing English

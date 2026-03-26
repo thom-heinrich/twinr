@@ -198,6 +198,8 @@ The `Ops Logs` page reads the persistent local event log under `artifacts/stores
 The `Voice Profile` page manages a local-only speaker template. Phase 1 uses the normal conversation microphone only, stores no raw enrollment audio, and exposes only a soft confidence signal such as `likely user`, `uncertain`, or `unknown voice`. Support bundles omit the live voice-assessment fields.
 In realtime voice mode, Twinr can now also manage that profile by spoken request: it can enroll the current spoken turn into the local voice profile, read the current profile status, or reset the profile when the user explicitly asks for it.
 The live speaker signal is injected into the LLM context as a short redacted system hint, not as raw audio or a biometric template. When the signal is `uncertain` or `unknown voice`, Twinr now asks for extra confirmation before persistent changes such as saved memory/profile/personality updates or automation changes.
+The planned multimodal replacement for that voice-only confirmation path is documented in `docs/PRIVACY_AUTH_POLICY_V1.md`.
+The external browser benchmark integration plan for AgentLab, BrowserGym, and WebArena-Verified is documented in `docs/BROWSERGYM_AGENTLAB_WEB_ARENA_VERIFIED_PLAN.md`.
 
 ## High-level architecture
 
@@ -220,6 +222,7 @@ The live speaker signal is injected into the LLM context as a short redacted sys
 
 - Speech-to-text provider layer
 - Foundation model / agent layer
+- Optional bounded drone mission layer for inspect-only planning against a separate drone daemon
 - Text-to-speech provider layer
 - Memory layer
 - Hardware abstraction layer
@@ -230,6 +233,7 @@ The live speaker signal is injected into the LLM context as a short redacted sys
 - `docs/` — documentation and structured specifications
 - `docs/providers/` — provider-specific notes and setup guides
 - `hardware/` — Raspberry Pi setup scripts for buttons, PIR, audio, printer, and display hardware
+- `hardware/ops/drone_daemon.py` — development-host bounded drone daemon that owns mission preflight, manual-arm, and the first stationary-observe inspection slice
 - `personality/` — prompt-context files for system, user, and assistant style
 - `state/` — runtime-generated persistent snapshot and durable remembered facts (`gitignored`)
 - `src/twinr/agent/` — runtime orchestration, state machine, and hardware workflows
@@ -256,6 +260,7 @@ This repository defines the foundation for:
 - Optional body-orientation follow through a bounded Pi servo output fed by the existing multimodal attention target
 - A stateful social-trigger engine for cautious presence, attention, and safety nudges
 - Provider-based STT / LLM / TTS orchestration
+- Optional bounded drone inspection planning through a separate mission daemon with manual-arm-only safety defaults
 - Agentic task execution
 - Paper-based answer printing
 - Visual state feedback through eyes
@@ -345,6 +350,7 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_S`
 - `TWINR_ATTENTION_SERVO_LOSS_EXTRAPOLATION_GAIN`
 - `TWINR_ATTENTION_SERVO_MIN_CONFIDENCE`
+- `TWINR_ATTENTION_SERVO_HOLD_MIN_CONFIDENCE`
 - `TWINR_ATTENTION_SERVO_DEADBAND`
 - `TWINR_ATTENTION_SERVO_MIN_PULSE_WIDTH_US`
 - `TWINR_ATTENTION_SERVO_CENTER_PULSE_WIDTH_US`
@@ -370,6 +376,13 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_MIN_SPEED_PULSE_DELTA_US`
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_PULSE_DELTA_US`
 - `TWINR_ATTENTION_SERVO_STATE_PATH`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SPEED_SCALE`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S`
+- `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE`
+- `TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S`
 - `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
 - `TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S`
 
@@ -411,11 +424,57 @@ startup as virtual `0°`. If an operator hand-sets a forward-facing neutral
 pose, start or restart the runtime only after that pose is in place.
 
 Twinr now persists that virtual heading in `TWINR_ATTENTION_SERVO_STATE_PATH`.
-When the persisted state says `hold_until_armed`, startup keeps the Maestro
-at the neutral stop pulse and returns `manual_hold` instead of immediately
+When the persisted state says `hold_until_armed`, startup keeps the continuous
+servo output released and returns `manual_hold` instead of immediately
 leaving the operator-set `0°` pose. Operators can flip that persisted
 continuous-servo state explicitly with `python3 hardware/servo/attention_servo_state.py`
-using `hold-current-zero`, `hold`, and `arm`.
+using `hold-current-zero`, `hold`, `arm`, and `return-to-estimated-zero`.
+
+`return-to-estimated-zero` is still open-loop, but it no longer starts from a
+generic recenter pulse when a real movement journal exists. Twinr now persists
+the bounded outbound movement path from the operator-defined `0°` and, on
+return, replays those logged segments in reverse with inverse pulse widths
+before falling back to the older estimated-zero planner. Those replay segments
+now run through an exact bounded segment player that disables each pulse at
+its recorded deadline instead of holding it until the next runtime update
+tick. That makes return-to-zero track the actual commanded path instead of
+quantizing short segments into longer physical moves. Twinr still keeps a
+persisted `heading_uncertainty_degrees`
+alongside that journal and rejects the return request once the saved
+uncertainty exceeds
+`TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MAX_UNCERTAINTY_DEGREES`. When no
+journal is available, the fallback planner still uses its own tighter zero-
+settle threshold instead of the broader live-tracking tolerance:
+`TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SETTLE_TOLERANCE_DEGREES`. Because the
+gentle fallback return pulses can move the real hardware more slowly than the
+normal follow model expects, `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_SPEED_SCALE`
+lets the virtual heading decay more conservatively during return-to-zero.
+That fallback slow return is gated through move/release phases:
+`TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PULSE_DELTA_US`
+caps each movement pulse near neutral, while
+`TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S` plus
+`TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE` determine how long each
+slow nudge should stay active before Twinr releases the output again on the
+next servo update.
+For ordinary live tracking on a continuous servo, keep
+`TWINR_ATTENTION_SERVO_TARGET_HOLD_S` short so only brief tracker dropouts are
+projected. If Twinr should wait before drifting back to the persisted `0°`,
+use `TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S` instead. That
+separate no-user timer keeps the output released during absence and only starts
+the slow return-to-zero path after the configured delay has elapsed.
+If the visible target stays stable but its confidence bounces around the main
+acquisition threshold, `TWINR_ATTENTION_SERVO_HOLD_MIN_CONFIDENCE` lets Twinr
+keep following the already-visible track at a lower release threshold instead
+of snapping into `recentering` on every short confidence dip.
+For active visible follow on a continuous servo, Twinr now closes the loop on
+the live image offset itself and maps that error only into the configured
+continuous min/max speed pulse window. The persisted virtual heading remains
+for journaling and return-to-zero, but active follow no longer routes through
+the virtual-heading target calculation that can oscillate at sparse Pi refresh
+cadence.
+When the continuous-servo path is already at the estimated `0°`, Twinr now
+keeps the output released in idle instead of sending a nominal center pulse
+that could still drift a real 360-degree servo off the operator-set neutral.
 
 ### Social trigger engine
 
@@ -555,6 +614,8 @@ TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=medium
 TWINR_USER_DISPLAY_NAME=Thom
 OPENAI_VISION_DETAIL=auto
 TWINR_CAMERA_DEVICE=/dev/video0
+# For the Bitcraze AI-Deck WiFi streamer instead:
+# TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000
 TWINR_CAMERA_WIDTH=640
 TWINR_CAMERA_HEIGHT=480
 TWINR_CAMERA_FRAMERATE=30
@@ -607,7 +668,7 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-ob
 PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-audio-observe-once
 ```
 
-The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
+The vision path requires `ffmpeg` on the device when Twinr captures still images from V4L2. When `TWINR_CAMERA_DEVICE` is set to `aideck://192.168.4.1:5000`, Twinr instead reads one bounded AI-Deck WiFi frame directly, debayers raw streamer output into a normal PNG on demand, and then sends one or more images to the OpenAI Responses API in a single request. In that mode, the Twinr host itself must already be connected to the AI-Deck access point.
 The active realtime and streaming loops can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.

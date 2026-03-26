@@ -14,7 +14,8 @@ feedback on device.
 - drive one bounded body-orientation servo from an already-derived normalized attention target without owning speaker/person targeting policy, including calibrated center/invert controls, Twinr's custom kernel-module servo sysfs contract when available, kernel-PWM sysfs output when the GPIO exposes hardware PWM, `pigpio` as a secondary hardware-timed option, a calmer `lgpio.tx_pwm` software-PWM fallback ahead of the older jitter-prone `lgpio.tx_servo` helper, or a Pololu Mini Maestro command-port path over USB serial once the controller itself is configured for `USB_DUAL_PORT`/`USB_CHAINED`, plus soft end-stop margins, explicit target smoothing, visible-target latching so in-frame micro-jitter does not trigger constant re-justification, an optional exit-only mode where visible users do not trigger physical motion until either the image-exit trajectory is confirmed or the tracked person reaches a calibrated side-departure threshold long enough to justify one monotone pursuit, plus an explicit continuous-rotation control mode that keeps a bounded virtual heading estimate and maps heading error to calm time/speed pulses instead of pretending a 360-degree servo supports absolute position, a tiny persisted continuous-servo state file so an operator hand-set `0°` reference can survive restarts, an explicit `hold_until_armed` startup mode that keeps the Maestro released instead of blindly leaving that reference pose, an explicit visible-box edge gate so exit-only pursuit only starts when the authoritative person geometry is actually near the frame boundary instead of merely off-center, one monotone exit pursuit with a configurable off-center degree clamp, a short configurable settle-hold so loaded hardware can physically complete the exit move before release, centered visible reacquire cooldown once the user is back near the middle of frame, calm return to a rest position after longer absence with a dedicated slower rest-motion profile, acceleration- and jerk-limited motion shaping, small command hysteresis against dead-band chatter, startup seeding from the currently active writer's remembered pulse width so any non-center remembered pose gets recentered before exit-only waiting resumes, an exact-center snap before idle release so the remembered neutral state is not left skewed, calm idle release near neutral, and release-after-settle so loaded servos can move into place and then relax instead of buzzing under constant hold torque
 - in exit-only mode, allow one coarse periodic visible-user recenter against a latched target after a configurable off-center dwell interval, so Twinr can quietly re-center a user who stayed visibly off-axis for a long time without regressing into continuous in-frame jitter
 - fail closed when startup sees a proven conflicting GPIO18 servo environment such as a foreign `pwm-pio` overlay/process chain, so the HDMI face/runtime can stay up while the servo disables itself instead of jittering against a stolen line
-- capture still photos from V4L2 cameras, with a bounded `rpicam-still` fallback for Pi camera stacks when the default V4L2 node is missing and for Pi `unicam-image` devices when the V4L2 node is busy, or fetch the same still-photo contract from a dedicated peer Pi over a bounded HTTP snapshot proxy
+- capture still photos from V4L2 cameras, from a Bitcraze AI-Deck WiFi stream, with a bounded `rpicam-still` fallback for Pi camera stacks when the default V4L2 node is missing and for Pi `unicam-image` devices when the V4L2 node is busy, or fetch the same still-photo contract from a dedicated peer Pi over a bounded HTTP snapshot proxy
+- reach one bounded external drone daemon over HTTP so Twinr can queue high-level inspect missions, read state, cancel work, and enforce manual-arm-only safety gates without ever sending direct flight-control commands
 - persist local portrait identities with multiple reference images per user
 - perform bounded local portrait matching from enrolled identities plus still-camera captures
 - persist multi-user local household voice identities and assess current-turn audio against enrolled household members
@@ -71,12 +72,16 @@ feedback on device.
 | [camera_ai/gesture_candidate_capture.py](./camera_ai/gesture_candidate_capture.py) | Bounded JPEG + JSON capture helper for manual optical QA of suspected gesture frames |
 | [ai_camera.py](./ai_camera.py) | Stable compatibility facade for the public local AI-camera adapter surface |
 | [ai_camera_diagnostics.py](./ai_camera_diagnostics.py) | Bounded Pi-facing diagnostics for pose candidate selection and keypoint support |
+| [aideck_camera.py](./aideck_camera.py) | Bounded Bitcraze AI-Deck CPX-over-TCP still-frame adapter that can temporarily join the deck AP, capture one frame, and restore the previous WiFi link before Twinr resumes upstream work |
+| [aideck_wifi.py](./aideck_wifi.py) | Focused `nmcli`-backed WiFi handover helper for one bounded AI-Deck capture on single-WiFi hosts |
+| [drone_service.py](./drone_service.py) | Strict mission-level Twinr client for the external bounded drone daemon, including inspect-mission request contracts and normalized safety/state snapshots |
 | [hand_landmarks.py](./hand_landmarks.py) | Bounded MediaPipe hand-landmark ROI worker for full-frame-to-hand crop resolution |
 | [mediapipe_vision.py](./mediapipe_vision.py) | Stable compatibility facade for the public MediaPipe camera pipeline surface |
 | [buttons.py](./buttons.py) | GPIO button monitoring backends |
-| [servo_follow.py](./servo_follow.py) | Bounded body-orientation adapter for normalized attention targets, selecting among Twinr's custom kernel servo sysfs contract, kernel-PWM sysfs, hardware-timed `pigpio`, calmer `lgpio.tx_pwm`, older `lgpio` servo output, a focused local Pololu Mini Maestro USB command-port writer, or a peer-Pi Pololu Maestro HTTP writer, and layering visible-target latching, optional exit-only physical follow with loss-confirmation delay plus frame-edge-confirmed visible departure, one-way exit pursuit toward a bounded side target, coarse periodic visible-user recentering after a long off-center dwell instead of continuous in-frame tracking, a dedicated continuous-rotation mode that drives a virtual heading through bounded speed pulses for 360-degree servos, a short exit settle-hold before release, centered visible reacquire cooldown, a slower rest-position return profile after longer absence, startup seeding from the active writer's remembered pulse width so any non-center remembered pose is neutralized first, an explicit manual-hold branch that keeps a 360-degree servo at the neutral stop pulse until explicitly armed, live reload of the persisted hold/arm state file, an exact-center snap before idle release, acceleration/jerk motion shaping, soft end-stop margins, output hysteresis, calm idle release, release-after-settle for quieter loaded holds, and a fail-closed startup guard against proven foreign GPIO servo overlays/processes |
+| [servo_follow.py](./servo_follow.py) | Bounded body-orientation adapter for normalized attention targets, selecting among Twinr's custom kernel servo sysfs contract, kernel-PWM sysfs, hardware-timed `pigpio`, calmer `lgpio.tx_pwm`, older `lgpio` servo output, a focused local Pololu Mini Maestro USB command-port writer, or a peer-Pi Pololu Maestro HTTP writer, and layering visible-target latching, optional exit-only physical follow with loss-confirmation delay plus frame-edge-confirmed visible departure, one-way exit pursuit toward a bounded side target, coarse periodic visible-user recentering after a long off-center dwell instead of continuous in-frame tracking, a dedicated continuous-rotation mode that drives a virtual heading through bounded speed pulses for 360-degree servos, a short exit settle-hold before release, centered visible reacquire cooldown, a slower rest-position return profile after longer absence, startup seeding from the active writer's remembered pulse width so any non-center remembered pose is neutralized first, an explicit manual-hold branch that keeps a 360-degree servo electrically released until explicitly armed, live reload of the persisted hold/arm state file, an explicit return-to-estimated-zero branch that first replays the persisted movement journal through exact-duration bounded segments before falling back to the older slow planner, released idle semantics once the estimated heading is already back at `0°`, acceleration/jerk motion shaping, soft end-stop margins, output hysteresis, calm idle release, release-after-settle for quieter loaded holds, and a fail-closed startup guard against proven foreign GPIO servo overlays/processes |
 | [servo_continuous.py](./servo_continuous.py) | Focused open-loop planner for continuous-rotation servos that estimates one virtual heading, converts heading error into bounded direction/speed pulses, and keeps that motion model out of the higher follow-state machine |
-| [servo_state.py](./servo_state.py) | Tiny JSON-backed runtime-state store for continuous servos, persisting the operator-confirmed virtual heading plus explicit hold/arm transitions outside the main follow controller |
+| [servo_state.py](./servo_state.py) | Tiny JSON-backed runtime-state store for continuous servos, persisting the operator-confirmed virtual heading, bounded heading uncertainty, and explicit hold/arm or return-to-estimated-zero transitions outside the main follow controller |
+| [servo_segment_player.py](./servo_segment_player.py) | Exact-duration background segment player for continuous-servo reverse replay, starting one bounded pulse immediately and disabling it at the recorded deadline instead of holding it until the next runtime tick |
 | [servo_maestro.py](./servo_maestro.py) | Focused Pololu Mini Maestro command-port adapter that auto-discovers the stable `...-if00` USB serial endpoint when present, falls back to Maestro-tagged `ttyACM*` command ports when by-id links are absent, invalidates stale connections after USB faults, emits compact-protocol target commands, reads back current channel positions for startup alignment, fails clearly when the controller is still in the wrong UART serial mode, and keeps Maestro transport concerns out of the higher servo policy module |
 | [servo_peer.py](./servo_peer.py) | Focused peer-Pi Pololu Maestro HTTP client that lets the main Twinr runtime keep follow policy local while the helper Pi owns the actual Maestro USB command port |
 | [camera.py](./camera.py) | bounded still capture with ffmpeg/V4L2, Pi `rpicam-still` fallback for missing default `video0` nodes and busy `unicam-image` devices, or peer-Pi HTTP snapshot fetches when `TWINR_CAMERA_PROXY_SNAPSHOT_URL` is configured |
@@ -114,6 +119,57 @@ When the main Pi has no directly attached still camera, configure
 same `V4L2StillCamera.from_config(config)` entrypoint will fetch bounded PNG
 captures from the dedicated peer camera proxy Pi instead of opening
 `/dev/video0`.
+
+When the current camera is the Bitcraze AI-Deck WiFi streamer, configure
+`TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000`. The same
+`V4L2StillCamera.from_config(config)` entrypoint will then read one bounded
+AI-Deck frame, convert raw Bayer output into a standard PNG on demand, and
+keep the upstream Twinr vision contract unchanged. On single-WiFi hosts with
+`nmcli`, Twinr now performs one bounded handover to the AI-Deck AP for the
+capture itself and then restores the previous WiFi connection before the
+OpenAI/remote-memory path continues.
+
+If Twinr reports that the AI-Deck streamer "accepted the TCP connection but
+sent no frame bytes", Twinr has already proven the AP handover, DHCP, and TCP
+route to `192.168.4.1:5000`. The remaining blocker is the deck-side WiFi
+streamer not emitting image data. Bitcraze tracks this freeze upstream in
+`bitcraze/aideck-gap8-examples#150`; station mode on the household WiFi is the
+preferred path when stable continuous vision matters.
+
+For the bounded drone path, configure:
+
+```bash
+export TWINR_DRONE_ENABLED=true
+export TWINR_DRONE_BASE_URL=http://127.0.0.1:8791
+export TWINR_DRONE_REQUIRE_MANUAL_ARM=true
+export TWINR_DRONE_MISSION_TIMEOUT_S=45
+```
+
+Twinr stays above the flight layer:
+
+```python
+from twinr.hardware.drone_service import DroneServiceConfig, RemoteDroneServiceClient
+
+drone = RemoteDroneServiceClient.from_config(DroneServiceConfig.from_config(config))
+mission = drone.create_inspect_mission(target_hint="regal", capture_intent="object_check")
+state = drone.state()
+```
+
+The accepted v1 safety contract is:
+- Twinr only submits bounded inspect missions and never sends direct roll/pitch/yaw/thrust commands
+- the daemon must expose `manual_arm_required=true` by default
+- arming goes through the daemon's local ops route, not through free-form voice
+- the current first runtime slice is `stationary_observe_only`, so the daemon proves mission/state/evidence plumbing before any motion primitive is enabled
+
+The same bounded path is available to operators through:
+
+```bash
+python3 -m twinr --env-file .env --drone-status
+python3 -m twinr --env-file .env --drone-inspect "prüfe das regal"
+python3 -m twinr --env-file .env --drone-cancel-mission DRN-...
+python3 -m twinr --env-file .env --drone-manual-arm DRN-...
+python3 -m twinr --env-file .env --self-test drone_stack
+```
 
 ```python
 from twinr.hardware import VoiceProfileMonitor, configured_pir_monitor

@@ -57,7 +57,9 @@ class AmbientDisplayImpulseCandidate:
     """Describe one short silent impulse Twinr may show in the display reserve.
 
     Attributes:
-        topic_key: Stable dedupe/cooldown key for this impulse topic.
+        topic_key: Stable unique key for this concrete reserve-card candidate.
+        semantic_topic_key: Stable thread key shared by related card variants
+            that should retire and learn together.
         title: Human-readable topic title.
         source: Structured source family such as ``continuity`` or ``place``.
         action: Bounded engagement action this impulse reflects.
@@ -89,8 +91,16 @@ class AmbientDisplayImpulseCandidate:
     symbol: str
     accent: str
     reason: str
+    semantic_topic_key: str = ""
     candidate_family: str = "general"
     generation_context: Mapping[str, object] | None = None
+    expansion_angle: str = ""
+    support_sources: tuple[str, ...] = ()
+
+    def semantic_key(self) -> str:
+        """Return the grouped feedback/learning key for this candidate."""
+
+        return _topic_key(self.semantic_topic_key) or _topic_key(self.topic_key)
 
 
 def _topic_key(value: object | None) -> str:
@@ -134,6 +144,46 @@ def _candidate_family_for_source(source: object | None) -> str:
     return "general"
 
 
+def _mindshare_card_intent(
+    item: CompanionMindshareItem,
+    policy: PositiveEngagementTopicPolicy,
+    *,
+    summary: str,
+) -> dict[str, str]:
+    """Return structured semantic card intent for one mindshare candidate."""
+
+    anchor = _truncate_text(item.title, max_len=96) or "dem Thema"
+    family = _candidate_family_for_source(item.source)
+    if family == "memory_thread":
+        return {
+            "topic_semantics": f"gemeinsamer Faden zu {anchor}",
+            "statement_intent": f"Twinr soll eine konkrete Beobachtung oder einen ruhigen Rueckbezug zu {anchor} machen.",
+            "cta_intent": "Zu einer kurzen Meinung, Ergaenzung oder einem Weiterreden einladen.",
+            "relationship_stance": "warm und aufmerksam statt behauptend",
+        }
+    if family == "world":
+        return {
+            "topic_semantics": f"oeffentliches Thema zu {anchor}",
+            "statement_intent": f"Twinr soll eine konkrete Beobachtung dazu machen, was bei {anchor} gerade Thema ist.",
+            "cta_intent": "Zu einer kurzen Meinung oder Einordnung einladen.",
+            "relationship_stance": "ruhig beobachtend mit leichter Haltung",
+        }
+    if family == "place":
+        return {
+            "topic_semantics": f"Ort oder Region {anchor} im aktuellen Blick",
+            "statement_intent": f"Twinr soll eine konkrete Beobachtung zu {anchor} machen.",
+            "cta_intent": "Zu einer kurzen Reaktion oder Erinnerung einladen.",
+            "relationship_stance": "alltagsnah und lokal statt abstrakt",
+        }
+    topic_semantics = summary or anchor
+    return {
+        "topic_semantics": topic_semantics,
+        "statement_intent": f"Twinr soll zu {anchor} eine kurze konkrete Beobachtung machen.",
+        "cta_intent": "Zu einer kurzen Reaktion oder Meinung einladen.",
+        "relationship_stance": "ruhig, freundlich und leicht eigen",
+    }
+
+
 def _candidate_for_item(
     item: CompanionMindshareItem,
     policy: PositiveEngagementTopicPolicy,
@@ -157,6 +207,7 @@ def _candidate_for_item(
     summary = _truncate_text(item.summary, max_len=160)
     return AmbientDisplayImpulseCandidate(
         topic_key=topic_key,
+        semantic_topic_key=topic_key,
         title=item.title,
         source=item.source,
         action=policy.action,
@@ -173,6 +224,11 @@ def _candidate_for_item(
             "candidate_family": "mindshare",
             "display_anchor": item.title,
             "hook_hint": summary,
+            "card_intent": _mindshare_card_intent(
+                item,
+                policy,
+                summary=summary,
+            ),
             "topic_summary": summary,
             "topic_title": item.title,
             "conversation_depth": item.appetite.depth,

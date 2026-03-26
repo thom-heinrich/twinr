@@ -4,10 +4,12 @@ This module owns the operator workflow that turns the current authoritative
 repo state in ``/home/thh/twinr`` into a restarted and verified Pi acceptance
 runtime under ``/twinr``. It reuses the one-way repo mirror for code sync,
 optionally overwrites the Pi runtime ``.env`` from the leading repo, refreshes
-the editable install in the Pi virtualenv, installs the productive base units
-plus any repo-backed Pi runtime units that are already enabled on the host,
-supports explicit first-rollout activation for optional Pi units, restarts the
-selected services, and checks that they came back healthy.
+the editable install in the Pi virtualenv, installs optional mirrored local
+workspace runtime manifests such as ``browser_automation/runtime_requirements``
+before restart, installs the productive base units plus any repo-backed Pi
+runtime units that are already enabled on the host, supports explicit
+first-rollout activation for optional Pi units, restarts the selected
+services, and checks that they came back healthy.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from twinr.ops.pi_runtime_deploy_remote import (
     PiRemoteExecutor as _PiRemoteExecutor,
     PiSyncedFileResult,
     PiSystemdServiceState,
+    install_browser_automation_runtime_support as _install_browser_automation_runtime_support,
     install_editable_package as _install_editable_package,
     install_service_units as _install_service_units,
     restart_services as _restart_services,
@@ -40,6 +43,8 @@ DEFAULT_DEPLOY_SERVICES: tuple[str, ...] = (
     "twinr-runtime-supervisor.service",
     "twinr-web.service",
 )
+_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS = Path("browser_automation/runtime_requirements.txt")
+_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS = Path("browser_automation/playwright_browsers.txt")
 
 
 class _MirrorWatchdog(Protocol):
@@ -126,6 +131,10 @@ def deploy_pi_runtime(
             reinstall runtime dependencies. The default keeps dependency state
             unchanged and updates only the editable package, which avoids
             rebuilding Pi-host packages such as PyQt5 on every deploy.
+            When the local ignored ``browser_automation/`` workspace exposes
+            runtime manifests, the deploy also installs those mirrored
+            requirements after the editable refresh so the Pi can execute the
+            mirrored adapter code.
         install_systemd_units: Whether to copy the service unit files from
             ``/twinr/hardware/ops`` into ``/etc/systemd/system`` and reload systemd.
         verify_env_contract: Whether to run the bounded Pi env-contract probe.
@@ -158,6 +167,12 @@ def deploy_pi_runtime(
     env_source = (resolved_root / ".env") if env_source_path is None else Path(env_source_path).resolve()
     resolved_remote_root = remote_root.rstrip("/") or "/"
     env_target = remote_env_path or f"{resolved_remote_root}/.env"
+    install_browser_requirements = _has_nonempty_local_file(
+        resolved_root / _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS
+    )
+    install_playwright_browsers = _has_nonempty_local_file(
+        resolved_root / _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS
+    )
 
     remote = _PiRemoteExecutor(
         settings=settings,
@@ -207,6 +222,16 @@ def deploy_pi_runtime(
                 install_with_deps=install_with_deps,
             ),
         )
+        if install_browser_requirements or install_playwright_browsers:
+            _run_phase(
+                "browser_automation_runtime",
+                lambda: _install_browser_automation_runtime_support(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    install_python_requirements=install_browser_requirements,
+                    install_playwright_browsers=install_playwright_browsers,
+                ),
+            )
 
     if install_systemd_units:
         _run_phase(
@@ -272,6 +297,12 @@ def _run_phase(phase: str, fn: Any) -> Any:
         raise
     except Exception as exc:  # pragma: no cover - thin error normalization.
         raise PiRuntimeDeployError(phase, str(exc)) from exc
+
+
+def _has_nonempty_local_file(path: Path) -> bool:
+    """Return whether one local deploy manifest exists and contains data."""
+
+    return path.is_file() and bool(path.read_bytes().strip())
 
 
 def _normalize_services(services: Sequence[str]) -> tuple[str, ...]:

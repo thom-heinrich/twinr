@@ -2,17 +2,27 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.agent.personality.intelligence.models import (
     WorldFeedSubscription,
+    WorldInterestSignal,
     WorldIntelligenceState,
 )
+from twinr.agent.personality.models import (
+    ContinuityThread,
+    PersonalitySnapshot,
+    PlaceFocus,
+    WorldSignal,
+)
+from twinr.agent.personality.intelligence.store import RemoteStateWorldIntelligenceStore
+from twinr.agent.personality.service import PersonalityContextService
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
 from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
@@ -22,6 +32,7 @@ from twinr.memory.longterm.core.models import (
     LongTermSourceRefV1,
 )
 from twinr.proactive.runtime.display_reserve_flow import DisplayReserveCompanionFlow
+from twinr.proactive.runtime.display_reserve_generation import DisplayReserveCopyGenerator
 
 
 class _FakeObjectStore:
@@ -56,13 +67,17 @@ class _FakeMemoryService:
 
 
 class _FakePersonalityService:
+    def __init__(self, *, snapshot=None, engagement_signals=()):
+        self._snapshot = snapshot
+        self._engagement_signals = tuple(engagement_signals)
+
     def load_snapshot(self, *, config, remote_state=None):
         del config, remote_state
-        return None
+        return self._snapshot
 
     def load_engagement_signals(self, *, config, remote_state=None):
         del config, remote_state
-        return ()
+        return self._engagement_signals
 
 
 class _FakeWorldStore:
@@ -83,6 +98,12 @@ class _NoopCopyGenerator:
     def rewrite_candidates(self, *, config, snapshot, candidates, local_now):
         del config, snapshot, local_now
         return tuple(candidates)
+
+
+class _ExplodingCopyGenerator:
+    def rewrite_candidates(self, *, config, snapshot, candidates, local_now):
+        del config, snapshot, candidates, local_now
+        raise AssertionError("copy generator should not run on raw candidate load")
 
 
 class DisplayReserveCompanionFlowTests(unittest.TestCase):
@@ -202,9 +223,9 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                 packets=(reflection_packet,),
             )
             flow = DisplayReserveCompanionFlow(
-                personality_service=_FakePersonalityService(),
-                world_store=_FakeWorldStore(),
-                copy_generator=_NoopCopyGenerator(),
+                personality_service=cast(PersonalityContextService, _FakePersonalityService()),
+                world_store=cast(RemoteStateWorldIntelligenceStore, _FakeWorldStore()),
+                copy_generator=cast(DisplayReserveCopyGenerator, _NoopCopyGenerator()),
             )
 
             with patch(
@@ -221,18 +242,26 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                 )
 
         filtered_candidates = [candidate for candidate in candidates if candidate.source != "user_discovery"]
-        topic_keys = [candidate.topic_key for candidate in filtered_candidates]
-        self.assertEqual(topic_keys[0], "ai companions")
-        self.assertIn("thread:person:janina", topic_keys)
-        self.assertIn("dein kaffee am morgen", topic_keys)
+        semantic_topics = [candidate.semantic_key() for candidate in filtered_candidates]
+        self.assertEqual(semantic_topics[0], "ai companions")
+        self.assertIn("thread:person:janina", semantic_topics)
+        self.assertIn("dein kaffee am morgen", semantic_topics)
         janina_candidate = next(
             candidate
             for candidate in candidates
             if candidate.source == "memory_follow_up"
         )
         self.assertLess(janina_candidate.salience, 0.8)
-        ai_candidate = next(candidate for candidate in candidates if candidate.topic_key == "ai companions")
-        preference_candidate = next(candidate for candidate in candidates if candidate.topic_key == "dein kaffee am morgen")
+        ai_candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate.semantic_key() == "ai companions" and candidate.expansion_angle == "primary"
+        )
+        preference_candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate.semantic_key() == "dein kaffee am morgen" and candidate.expansion_angle == "primary"
+        )
         self.assertIn("ambient_learning", ai_candidate.generation_context or {})
         self.assertEqual(preference_candidate.candidate_family, "reflection_preference")
 
@@ -275,9 +304,12 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                 ),
             )
             flow = DisplayReserveCompanionFlow(
-                personality_service=_FakePersonalityService(),
-                world_store=_FakeWorldStore(subscriptions=subscriptions),
-                copy_generator=_NoopCopyGenerator(),
+                personality_service=cast(PersonalityContextService, _FakePersonalityService()),
+                world_store=cast(
+                    RemoteStateWorldIntelligenceStore,
+                    _FakeWorldStore(subscriptions=subscriptions),
+                ),
+                copy_generator=cast(DisplayReserveCopyGenerator, _NoopCopyGenerator()),
             )
             fake_memory = _FakeMemoryService()
 
@@ -294,12 +326,175 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                     max_items=12,
                 )
 
-        topic_keys = {candidate.topic_key for candidate in candidates}
-        self.assertIn("hamburg local politics", topic_keys)
-        self.assertIn("schwarzenbek civic life", topic_keys)
-        self.assertIn("agentic ai", topic_keys)
-        self.assertIn("peace and diplomacy", topic_keys)
+        semantic_topics = {candidate.semantic_key() for candidate in candidates}
+        self.assertIn("hamburg local politics", semantic_topics)
+        self.assertIn("schwarzenbek civic life", semantic_topics)
+        self.assertIn("agentic ai", semantic_topics)
+        self.assertIn("peace and diplomacy", semantic_topics)
+        self.assertEqual(len({candidate.topic_key for candidate in candidates}), len(candidates))
         self.assertGreaterEqual(len(candidates), 5)
+
+    def test_flow_backfills_semantic_topics_from_snapshot_when_primary_sources_are_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, display_reserve_bus_candidate_limit=12)
+            now = datetime(2026, 3, 26, 9, 0, tzinfo=timezone.utc)
+            subscriptions = (
+                WorldFeedSubscription(
+                    subscription_id="feed:hamburg-local",
+                    label="Hamburg Lokalpolitik",
+                    feed_url="https://example.test/hamburg.xml",
+                    scope="regional",
+                    priority=0.84,
+                    topics=("hamburg local politics",),
+                ),
+                WorldFeedSubscription(
+                    subscription_id="feed:mit-ai",
+                    label="MIT AI",
+                    feed_url="https://example.test/mit-ai.xml",
+                    scope="topic",
+                    priority=0.86,
+                    topics=("agentic ai",),
+                ),
+            )
+            snapshot = PersonalitySnapshot(
+                continuity_threads=(
+                    ContinuityThread(
+                        title="Arzttermin gestern",
+                        summary="Da war noch offen, was beim Termin herauskam.",
+                        salience=0.81,
+                    ),
+                    ContinuityThread(
+                        title="Janina und die neue Schule",
+                        summary="Das bleibt als gemeinsamer Familienfaden relevant.",
+                        salience=0.76,
+                    ),
+                    ContinuityThread(
+                        title="Melitta Kaffee am Morgen",
+                        summary="Das ist als kleine Alltagsroutine mehrfach aufgefallen.",
+                        salience=0.68,
+                    ),
+                ),
+                place_focuses=(
+                    PlaceFocus(
+                        name="Schwarzenbek",
+                        summary="Der Ort taucht weiter als praktischer lokaler Bezug auf.",
+                        geography="local",
+                        salience=0.66,
+                    ),
+                ),
+                world_signals=(
+                    WorldSignal(
+                        topic="OpenAI baut einen automatisierten Researcher",
+                        summary="Der konkrete Produkt- und Forschungswinkel ist gerade auffaellig.",
+                        source="world",
+                        salience=0.74,
+                        evidence_count=2,
+                    ),
+                    WorldSignal(
+                        topic="Fragestunde im Bundestag",
+                        summary="Die politische Lage wird dort gerade konkret verhandelt.",
+                        source="regional_news",
+                        salience=0.72,
+                        evidence_count=2,
+                    ),
+                ),
+            )
+            engagement_signals = (
+                WorldInterestSignal(
+                    signal_id="signal:topic:arzttermin",
+                    topic="Arzttermin gestern",
+                    summary="Das bleibt ein relevanter offener Faden.",
+                    salience=0.82,
+                    engagement_score=0.71,
+                    engagement_state="warm",
+                ),
+            )
+            flow = DisplayReserveCompanionFlow(
+                personality_service=cast(
+                    PersonalityContextService,
+                    _FakePersonalityService(
+                        snapshot=snapshot,
+                        engagement_signals=engagement_signals,
+                    ),
+                ),
+                world_store=cast(
+                    RemoteStateWorldIntelligenceStore,
+                    _FakeWorldStore(subscriptions=subscriptions),
+                ),
+                copy_generator=cast(DisplayReserveCopyGenerator, _NoopCopyGenerator()),
+            )
+            fake_memory = _FakeMemoryService()
+
+            with patch(
+                "twinr.proactive.runtime.display_reserve_flow.build_ambient_display_impulse_candidates",
+                return_value=(),
+            ), patch(
+                "twinr.proactive.runtime.display_reserve_flow.LongTermMemoryService.from_config",
+                return_value=fake_memory,
+            ):
+                candidates = flow.load_candidates(
+                    config,
+                    local_now=now,
+                    max_items=12,
+                )
+
+        semantic_topics = {candidate.semantic_key() for candidate in candidates}
+        self.assertIn("hamburg local politics", semantic_topics)
+        self.assertIn("agentic ai", semantic_topics)
+        self.assertIn("arzttermin gestern", semantic_topics)
+        self.assertIn("janina und die neue schule", semantic_topics)
+        self.assertIn("openai baut einen automatisierten researcher", semantic_topics)
+        self.assertIn("fragestunde im bundestag", semantic_topics)
+        self.assertGreaterEqual(len(semantic_topics), 6)
+
+    def test_load_raw_candidates_returns_selected_candidates_before_copy_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, display_reserve_bus_candidate_limit=6)
+            now = datetime(2026, 3, 22, 18, 0, tzinfo=timezone.utc)
+            personality_candidates = (
+                AmbientDisplayImpulseCandidate(
+                    topic_key="ai companions",
+                    title="AI companions",
+                    source="world",
+                    action="brief_update",
+                    attention_state="growing",
+                    salience=0.61,
+                    eyebrow="",
+                    headline="AI companions",
+                    body="Da ist heute etwas spannend.",
+                    symbol="sparkles",
+                    accent="info",
+                    reason="personality",
+                    candidate_family="mindshare",
+                ),
+            )
+            flow = DisplayReserveCompanionFlow(
+                personality_service=cast(PersonalityContextService, _FakePersonalityService()),
+                world_store=cast(RemoteStateWorldIntelligenceStore, _FakeWorldStore()),
+                copy_generator=cast(DisplayReserveCopyGenerator, _ExplodingCopyGenerator()),
+            )
+            fake_memory = _FakeMemoryService()
+
+            with patch(
+                "twinr.proactive.runtime.display_reserve_flow.build_ambient_display_impulse_candidates",
+                return_value=personality_candidates,
+            ), patch(
+                "twinr.proactive.runtime.display_reserve_flow.LongTermMemoryService.from_config",
+                return_value=fake_memory,
+            ):
+                snapshot, candidates = flow.load_raw_candidates(
+                    config,
+                    local_now=now,
+                    max_items=3,
+                )
+
+        self.assertIsNone(snapshot)
+        primary = next(
+            candidate
+            for candidate in candidates
+            if candidate.semantic_key() == "ai companions" and candidate.expansion_angle == "primary"
+        )
+        self.assertTrue(primary.topic_key.startswith("ai companions::primary::"))
 
     def test_flow_includes_user_discovery_candidate_when_setup_is_due(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -307,9 +502,9 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
             now = datetime(2026, 3, 22, 18, 0, tzinfo=timezone.utc)
             fake_memory = _FakeMemoryService()
             flow = DisplayReserveCompanionFlow(
-                personality_service=_FakePersonalityService(),
-                world_store=_FakeWorldStore(),
-                copy_generator=_NoopCopyGenerator(),
+                personality_service=cast(PersonalityContextService, _FakePersonalityService()),
+                world_store=cast(RemoteStateWorldIntelligenceStore, _FakeWorldStore()),
+                copy_generator=cast(DisplayReserveCopyGenerator, _NoopCopyGenerator()),
             )
 
             with patch(

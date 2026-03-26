@@ -17,6 +17,7 @@ import math
 import os
 import socket
 import time
+from typing import cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
@@ -35,6 +36,7 @@ from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
 from twinr.display.reserve_bus import resolve_display_reserve_bus
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
+from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
 _STATUS_ANIMATION_SPECS: dict[str, tuple[int, float]] = {
@@ -132,6 +134,7 @@ class TwinrStatusDisplayLoop:
     face_cue_store: DisplayFaceCueStore | None = None
     emoji_cue_store: DisplayEmojiCueStore | None = None
     ambient_impulse_cue_store: DisplayAmbientImpulseCueStore | None = None
+    service_connect_cue_store: DisplayServiceConnectCueStore | None = None
     presentation_cue_store: DisplayPresentationStore | None = None
     news_ticker_runtime: DisplayNewsTickerRuntime | None = None
     respeaker_hci_store: DisplayReSpeakerHciStore | None = None
@@ -183,6 +186,7 @@ class TwinrStatusDisplayLoop:
             face_cue_store=DisplayFaceCueStore.from_config(config),
             emoji_cue_store=DisplayEmojiCueStore.from_config(config),
             ambient_impulse_cue_store=DisplayAmbientImpulseCueStore.from_config(config),
+            service_connect_cue_store=DisplayServiceConnectCueStore.from_config(config),
             presentation_cue_store=DisplayPresentationStore.from_config(config),
             news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
             respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
@@ -221,6 +225,7 @@ class TwinrStatusDisplayLoop:
                 face_cue = self._active_face_cue()
                 emoji_cue = self._active_emoji_cue()
                 ambient_impulse_cue = self._active_ambient_impulse_cue()
+                service_connect_cue = self._active_service_connect_cue()
                 presentation_cue = self._active_presentation_cue()
                 debug_signals = self._active_debug_signals()
                 ticker_text = self._ticker_text()
@@ -235,6 +240,7 @@ class TwinrStatusDisplayLoop:
                     face_cue=face_cue,
                     emoji_cue=emoji_cue,
                     ambient_impulse_cue=ambient_impulse_cue,
+                    service_connect_cue=service_connect_cue,
                     presentation_cue=presentation_cue,
                     debug_signals=debug_signals,
                 )
@@ -252,6 +258,7 @@ class TwinrStatusDisplayLoop:
                         face_cue=face_cue,
                         emoji_cue=emoji_cue,
                         ambient_impulse_cue=ambient_impulse_cue,
+                        service_connect_cue=service_connect_cue,
                         presentation_cue=presentation_cue,
                         debug_signals=debug_signals,
                     ):
@@ -583,6 +590,7 @@ class TwinrStatusDisplayLoop:
         face_cue: DisplayFaceCue | None,
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
+        service_connect_cue: DisplayServiceConnectCue | None,
         presentation_cue: DisplayPresentationCue | None,
         debug_signals: tuple[DisplayDebugSignal, ...],
     ) -> bool:
@@ -598,6 +606,7 @@ class TwinrStatusDisplayLoop:
                 face_cue=face_cue,
                 emoji_cue=emoji_cue,
                 ambient_impulse_cue=ambient_impulse_cue,
+                service_connect_cue=service_connect_cue,
                 presentation_cue=presentation_cue,
                 debug_signals=debug_signals,
             )
@@ -619,6 +628,7 @@ class TwinrStatusDisplayLoop:
                     face_cue=face_cue,
                     emoji_cue=emoji_cue,
                     ambient_impulse_cue=ambient_impulse_cue,
+                    service_connect_cue=service_connect_cue,
                     presentation_cue=presentation_cue,
                     debug_signals=debug_signals,
                 )
@@ -713,8 +723,9 @@ class TwinrStatusDisplayLoop:
         tick = getattr(self.display, "tick", None)
         if not callable(tick):
             return
+        tick_callback = cast(Callable[[], None], tick)
         try:
-            tick()
+            tick_callback()  # pylint: disable=not-callable
         except Exception as exc:
             self._emit_error("display_tick_failed", exc)
             self._reopen_display()
@@ -791,6 +802,7 @@ class TwinrStatusDisplayLoop:
         face_cue: DisplayFaceCue | None,
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
+        service_connect_cue: DisplayServiceConnectCue | None,
         presentation_cue: DisplayPresentationCue | None,
         debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> tuple[object, ...]:
@@ -799,6 +811,7 @@ class TwinrStatusDisplayLoop:
             return (layout_mode, status, headline, log_sections)
         cue_signature = face_cue.signature() if face_cue is not None else None
         reserve_signature = resolve_display_reserve_bus(
+            service_connect_cue=service_connect_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
         ).signature()
@@ -899,6 +912,18 @@ class TwinrStatusDisplayLoop:
             return store.load_active()
         except Exception as exc:
             self._emit_error("display_emoji_cue_load_failed", exc)
+            return None
+
+    def _active_service_connect_cue(self) -> DisplayServiceConnectCue | None:
+        if self._display_layout() != "default":
+            return None
+        store = self.service_connect_cue_store
+        if store is None:
+            return None
+        try:
+            return store.load_active()
+        except Exception as exc:
+            self._emit_error("display_service_connect_cue_load_failed", exc)
             return None
 
     def _active_presentation_cue(self) -> DisplayPresentationCue | None:

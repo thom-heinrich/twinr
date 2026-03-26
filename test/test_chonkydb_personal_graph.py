@@ -15,6 +15,13 @@ from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
+_TEST_CORINNA_PHONE = "5551234"
+_TEST_CORINNA_NEIGHBOR_PHONE = "5559988"
+_TEST_CORINNA_ALT_PHONE = "5557777"
+_TEST_JANINA_PHONE_A = "+15555550011"
+_TEST_JANINA_PHONE_B = "+15555550012"
+
+
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
@@ -60,13 +67,13 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
             first = store.remember_contact(
                 given_name="Corinna",
                 family_name="Maier",
-                phone="01761234",
+                phone=_TEST_CORINNA_PHONE,
                 role="Physiotherapist",
             )
             second = store.remember_contact(
                 given_name="Corinna",
                 family_name="Schmidt",
-                phone="0309988",
+                phone=_TEST_CORINNA_NEIGHBOR_PHONE,
                 role="Neighbor",
             )
             lookup = store.lookup_contact(name="Corinna")
@@ -79,7 +86,39 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertEqual(len(lookup.options), 2)
         self.assertEqual(resolved.status, "found")
         self.assertEqual(resolved.match.label, "Corinna Maier")
-        self.assertEqual(resolved.match.phones, ("01761234",))
+        self.assertEqual(resolved.match.phones, (_TEST_CORINNA_PHONE,))
+
+    def test_contact_lookup_resolves_exact_contact_label_for_ambiguous_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            store = TwinrPersonalGraphStore.from_config(config)
+
+            store.remember_contact(
+                given_name="Janina",
+                family_name="Werner",
+                phone=_TEST_JANINA_PHONE_A,
+                role="Bekannte",
+            )
+            store.remember_contact(
+                given_name="Janina",
+                family_name="Werner privat",
+                phone=_TEST_JANINA_PHONE_B,
+                role="Privat",
+            )
+
+            resolved = store.lookup_contact(
+                name="Janina",
+                contact_label="Janina Werner privat",
+            )
+
+        self.assertEqual(resolved.status, "found")
+        assert resolved.match is not None
+        self.assertEqual(resolved.match.label, "Janina Werner privat")
+        self.assertEqual(resolved.match.phones, (_TEST_JANINA_PHONE_B,))
 
     def test_from_config_places_graph_lock_in_runtime_state_lock_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -105,9 +144,14 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
                 user_display_name="Erika",
             )
             store = TwinrPersonalGraphStore.from_config(config)
-            store.remember_contact(given_name="Corinna", family_name="Maier", phone="01761234", role="Physiotherapist")
+            store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone=_TEST_CORINNA_PHONE,
+                role="Physiotherapist",
+            )
 
-            result = store.remember_contact(given_name="Corinna", phone="040998877")
+            result = store.remember_contact(given_name="Corinna", phone=_TEST_CORINNA_ALT_PHONE)
 
         self.assertEqual(result.status, "needs_clarification")
         self.assertIn("Corinna", result.question or "")

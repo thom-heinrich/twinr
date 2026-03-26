@@ -3,8 +3,8 @@
 ## Scope
 
 This directory owns Raspberry Pi setup, probe, and smoke-test scripts for Twinr
-buttons, display, mic, servo peripherals, Pi AI Camera, PIR motion, and
-printer peripherals.
+buttons, display, mic, servo peripherals, Pi AI Camera, PIR motion, printer
+peripherals, and the optional Bitcraze Crazyradio workspace bootstrap path.
 
 Out of scope:
 - runtime device adapters in `src/twinr/hardware`
@@ -16,6 +16,8 @@ Out of scope:
 
 - `buttons/setup_buttons.sh` - persist button GPIO env settings and optional probe
 - `buttons/probe_buttons.py` - print button events for configured or ad-hoc lines
+- `bitcraze/setup_bitcraze.sh` - install Crazyradio access rules, stage pinned Crazyradio 2.0 firmware assets, provision `/twinr/bitcraze`, and validate the pinned Bitcraze Python workspace
+- `bitcraze/probe_crazyradio.py` - inspect connected Bitcraze USB devices, classify their current compatibility mode, and confirm whether the local workspace can open the Crazyradio through `cflib`
 - `display/setup_display.sh` - configure the active display backend and persist its env wiring
 - `display/display_test.py` - render a one-shot display test pattern
 - `display/run_display_loop.py` - run the standalone display loop
@@ -43,6 +45,8 @@ Out of scope:
 ## Invariants
 
 - Setup scripts that mutate OS or `.env` state must stay idempotent for repeated runs against the same target config.
+- `bitcraze/setup_bitcraze.sh` must keep the Twinr-side drone workspace isolated under `/twinr/bitcraze`; do not pollute the main repo `.venv` or Twinr runtime dependencies with vendor-only experimentation packages.
+- `bitcraze/setup_bitcraze.sh` must stage both recovery/native and PA-emulation UF2 assets, but default the automated Python-tooling path to the compatibility mode that the pinned `cflib` can actually open.
 - `mic/setup_audio.sh` must keep split playback/capture routing explicit when output and microphone devices differ.
 - Probe and smoke-test scripts must stay bounded; every hardware wait needs a duration or short fixed timeout.
 - Scripts here may persist only the hardware keys they own and must not silently rewrite unrelated `.env` entries.
@@ -64,9 +68,10 @@ Out of scope:
 After any edit in this directory, run:
 
 ```bash
-bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/servo/setup_pololu_maestro.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
+bash -n hardware/bitcraze/setup_bitcraze.sh hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/servo/setup_pololu_maestro.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
+PYTHONPATH=src python3 -m py_compile hardware/bitcraze/probe_crazyradio.py hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
 PYTHONPATH=src python3 -m py_compile hardware/servo/attention_servo_state.py
+PYTHONPATH=src ./.venv/bin/pytest test/test_bitcraze_probe.py -q
 ```
 
 If `hardware/ops/deploy_pi_runtime.py` changed, also run:
@@ -120,6 +125,11 @@ python3 hardware/display/display_test.py --env-file .env
 - `src/twinr/hardware/audio.py`
 - `src/twinr/hardware/respeaker/`
 - `hardware/mic/README.md`
+
+`bitcraze/setup_bitcraze.sh` or `bitcraze/probe_crazyradio.py` changes -> also check:
+- `hardware/bitcraze/README.md`
+- `hardware/README.md`
+- `hardware/component.yaml`
 
 `servo/setup_pololu_maestro.sh` changes -> also check:
 - `src/twinr/hardware/servo_maestro.py`

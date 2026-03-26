@@ -57,6 +57,10 @@ _FALLBACK_TINY_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl9l2sAAAAASUVORK5CYII="
 )
 _WRAPPER_TOOL_NAMES = frozenset({"handoff_specialist_worker"})
+_TEST_CORINNA_PHONE_OLD = "+15555551234"
+_TEST_CORINNA_PHONE_NEW = "+15555558877"
+_TEST_ANNA_PHONE = "555-0100"
+_TEST_ANNA_PHONE_NEEDLES = (_TEST_ANNA_PHONE, "5550100", "555 0100")
 
 
 def _load_static_camera_image() -> bytes:
@@ -310,22 +314,22 @@ class ToolMatrixContext:
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +491761234.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_OLD}.",
             source=_longterm_source("turn:1"),
             status="active",
             confidence=0.95,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+491761234",
+            value_key=_TEST_CORINNA_PHONE_OLD,
         )
         candidate = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_new",
             kind="contact_method_fact",
-            summary="Corinna Maier can be reached at +4940998877.",
+            summary=f"Corinna Maier can be reached at {_TEST_CORINNA_PHONE_NEW}.",
             source=_longterm_source("turn:2"),
             status="uncertain",
             confidence=0.92,
             slot_key="contact:person:corinna_maier:phone",
-            value_key="+4940998877",
+            value_key=_TEST_CORINNA_PHONE_NEW,
         )
         conflict = LongTermMemoryConflictV1(
             slot_key="contact:person:corinna_maier:phone",
@@ -890,7 +894,7 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
             loop = context.make_loop(emitted=[])
             artifact = run_text_turn(
                 loop,
-                "Bitte merk dir als Kontakt: Meine Tochter Anna Schulz hat die Telefonnummer 040 1234567.",
+                f"Bitte merk dir als Kontakt: Meine Tochter Anna Schulz hat die Telefonnummer {_TEST_ANNA_PHONE}.",
             )
             record("remember_contact_single", artifact)
             ok, detail = _assert_tools(artifact, required=("remember_contact",))
@@ -901,7 +905,7 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
             artifact = run_text_turn(loop, "Wie ist die Telefonnummer von Anna Schulz?")
             record("lookup_contact_multi", artifact)
             ok, detail = _assert_tools(artifact, required=("lookup_contact",))
-            if ok and _contains_any(artifact.answer, ("040", "1234567")):
+            if ok and _contains_any(artifact.answer, _TEST_ANNA_PHONE_NEEDLES):
                 _pass(entries, "lookup_contact", "single_turn", detail)
                 _pass(entries, "remember_contact", "multi_turn", "contact lookup succeeded in same session")
                 _pass(entries, "lookup_contact", "multi_turn", detail)
@@ -912,7 +916,7 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
             artifact = run_text_turn(loop, "Wie ist die Telefonnummer von Anna Schulz?")
             record("lookup_contact_persistence", artifact)
             ok, detail = _assert_tools(artifact, required=("lookup_contact",))
-            if ok and _contains_any(artifact.answer, ("040", "1234567")):
+            if ok and _contains_any(artifact.answer, _TEST_ANNA_PHONE_NEEDLES):
                 _pass(entries, "remember_contact", "persistence", "contact survived restart")
                 _pass(entries, "lookup_contact", "persistence", detail)
             else:

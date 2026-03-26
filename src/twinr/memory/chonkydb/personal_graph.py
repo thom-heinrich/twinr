@@ -316,6 +316,7 @@ class TwinrPersonalGraphStore:
                 given_name=clean_given,
                 family_name=clean_family,
                 role=match_role,
+                contact_label=None,
                 phone=clean_phone or None,
                 email=clean_email or None,
             )
@@ -325,6 +326,7 @@ class TwinrPersonalGraphStore:
                     candidates=candidates,
                     family_name=clean_family,
                     role=match_role,
+                    contact_label=None,
                     phone=clean_phone or None,
                     email=clean_email or None,
                 )
@@ -444,12 +446,14 @@ class TwinrPersonalGraphStore:
         name: str,
         family_name: str | None = None,
         role: str | None = None,
+        contact_label: str | None = None,
     ) -> TwinrGraphLookupResult:
         """Find a remembered contact and request clarification when needed."""
 
         clean_name = _normalize_text(name, limit=80)
         clean_family = _normalize_text(family_name or "", limit=80) or None
         clean_role = _normalize_text(role or "", limit=80) or None
+        clean_contact_label = _normalize_text(contact_label or "", limit=120) or None
         if not clean_name:
             raise ValueError("name is required.")
         document = self.load_document()
@@ -458,6 +462,7 @@ class TwinrPersonalGraphStore:
             given_name=clean_name,
             family_name=clean_family,
             role=clean_role,
+            contact_label=clean_contact_label,
             phone=None,
             email=None,
         )
@@ -468,6 +473,7 @@ class TwinrPersonalGraphStore:
             candidates=candidates,
             family_name=clean_family,
             role=clean_role,
+            contact_label=clean_contact_label,
             phone=None,
             email=None,
         )
@@ -1129,6 +1135,7 @@ class TwinrPersonalGraphStore:
         given_name: str,
         family_name: str | None,
         role: str | None,
+        contact_label: str | None,
         phone: str | None,
         email: str | None,
     ) -> list[TwinrGraphNodeV1]:
@@ -1136,12 +1143,14 @@ class TwinrPersonalGraphStore:
         given_tokens = set(_tokenize(given_name))
         family_tokens = set(_tokenize(family_name or ""))
         requested_role = (role or "").strip().lower()
+        requested_contact_label = (contact_label or "").strip().lower()
         ranked: list[tuple[int, TwinrGraphNodeV1]] = []
         for node in document.nodes:
             if node.node_type != "person":
                 continue
             stored_family = _normalize_text(str((node.attributes or {}).get("family_name", "")), limit=80) or None
             labels = {node.label, *node.aliases}
+            normalized_labels = {label.lower() for label in labels if label}
             label_tokens: set[str] = set()
             for label in labels:
                 label_tokens.update(_tokenize(label))
@@ -1150,6 +1159,8 @@ class TwinrPersonalGraphStore:
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
+            if requested_contact_label and requested_contact_label not in normalized_labels:
+                continue
             if family_name:
                 family_matches = bool(
                     exact_contact_match
@@ -1162,6 +1173,8 @@ class TwinrPersonalGraphStore:
                     continue
             score = 0
             if full_label and full_label.lower() == node.label.lower():
+                score += 8
+            if requested_contact_label and requested_contact_label in normalized_labels:
                 score += 8
             if given_tokens and given_tokens <= label_tokens:
                 score += 3
@@ -1189,6 +1202,7 @@ class TwinrPersonalGraphStore:
         candidates: list[TwinrGraphNodeV1],
         family_name: str | None,
         role: str | None,
+        contact_label: str | None,
         phone: str | None,
         email: str | None,
     ) -> TwinrGraphNodeV1 | None:
@@ -1197,10 +1211,19 @@ class TwinrPersonalGraphStore:
         if len(candidates) == 1:
             option = self._contact_option(document, candidates[0])
             candidate = candidates[0]
+            requested_contact_label = (contact_label or "").strip().lower()
             exact_contact_match = bool(
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
+            if requested_contact_label:
+                normalized_labels = {
+                    label.lower()
+                    for label in {candidate.label, *candidate.aliases}
+                    if label
+                }
+                if requested_contact_label not in normalized_labels:
+                    return None
             if family_name:
                 stored_family = _normalize_text(str((candidate.attributes or {}).get("family_name", "")), limit=80).lower()
                 family_tokens = set(_tokenize(family_name))
@@ -1221,8 +1244,24 @@ class TwinrPersonalGraphStore:
         if family_name or role or phone or email:
             first = candidates[0]
             second = candidates[1]
-            first_score = self._candidate_specificity(document, first, family_name=family_name, role=role, phone=phone, email=email)
-            second_score = self._candidate_specificity(document, second, family_name=family_name, role=role, phone=phone, email=email)
+            first_score = self._candidate_specificity(
+                document,
+                first,
+                family_name=family_name,
+                role=role,
+                contact_label=contact_label,
+                phone=phone,
+                email=email,
+            )
+            second_score = self._candidate_specificity(
+                document,
+                second,
+                family_name=family_name,
+                role=role,
+                contact_label=contact_label,
+                phone=phone,
+                email=email,
+            )
             if first_score > second_score:
                 return first
         return None
@@ -1234,13 +1273,20 @@ class TwinrPersonalGraphStore:
         *,
         family_name: str | None,
         role: str | None,
+        contact_label: str | None,
         phone: str | None,
         email: str | None,
     ) -> int:
         score = 0
-        tokens = set(_tokenize(node.label))
+        labels = {node.label, *node.aliases}
+        normalized_labels = {label.lower() for label in labels if label}
+        tokens: set[str] = set()
+        for label in labels:
+            tokens.update(_tokenize(label))
         if family_name and set(_tokenize(family_name)) <= tokens:
             score += 3
+        if contact_label and contact_label.lower() in normalized_labels:
+            score += 6
         role_detail = (self._contact_role(document, node.node_id) or "").lower()
         if role and role.lower() in role_detail:
             score += 3

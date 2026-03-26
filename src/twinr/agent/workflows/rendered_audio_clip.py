@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from threading import Lock
 import shutil
@@ -31,6 +32,7 @@ class RenderedAudioClipSpec:
     fade_out_start_s: float
     fade_out_duration_s: float
     output_gain: float
+    playback_speed: float = 1.0
     output_sample_rate_hz: int = _DEFAULT_OUTPUT_SAMPLE_RATE_HZ
     output_channels: int = _DEFAULT_OUTPUT_CHANNELS
     normalize_max_gain: float = 1.0
@@ -111,6 +113,7 @@ def _build_ffmpeg_command(
     source_path: Path,
     spec: RenderedAudioClipSpec,
 ) -> list[str]:
+    audio_filter = _build_audio_filter(spec)
     return [
         ffmpeg_binary,
         "-hide_banner",
@@ -127,11 +130,7 @@ def _build_ffmpeg_command(
         "-sn",
         "-dn",
         "-af",
-        (
-            f"volume={float(spec.output_gain):.3f},"
-            f"afade=t=in:st=0:d={float(spec.fade_in_duration_s):.3f},"
-            f"afade=t=out:st={float(spec.fade_out_start_s):.3f}:d={float(spec.fade_out_duration_s):.3f}"
-        ),
+        audio_filter,
         "-ac",
         str(int(spec.output_channels)),
         "-ar",
@@ -155,10 +154,34 @@ def _cache_key(*, source_path: Path, spec: RenderedAudioClipSpec) -> tuple[objec
         float(spec.fade_out_start_s),
         float(spec.fade_out_duration_s),
         float(spec.output_gain),
+        float(spec.playback_speed),
         int(spec.output_sample_rate_hz),
         int(spec.output_channels),
         float(spec.normalize_max_gain),
     )
+
+
+def _build_audio_filter(spec: RenderedAudioClipSpec) -> str:
+    playback_speed = _normalize_playback_speed(spec.playback_speed)
+    filter_parts = [f"volume={float(spec.output_gain):.3f}"]
+    if not math.isclose(playback_speed, 1.0, rel_tol=0.0, abs_tol=0.0005):
+        filter_parts.append(f"atempo={playback_speed:.3f}")
+    filter_parts.extend(
+        (
+            f"afade=t=in:st=0:d={float(spec.fade_in_duration_s):.3f}",
+            f"afade=t=out:st={float(spec.fade_out_start_s):.3f}:d={float(spec.fade_out_duration_s):.3f}",
+        )
+    )
+    return ",".join(filter_parts)
+
+
+def _normalize_playback_speed(playback_speed: float) -> float:
+    normalized = float(playback_speed)
+    if not math.isfinite(normalized):
+        raise RenderedAudioClipConfigurationError("playback_speed_invalid")
+    if not 0.5 <= normalized <= 2.0:
+        raise RenderedAudioClipConfigurationError("playback_speed_out_of_range")
+    return normalized
 
 
 def _summarize_process_error(stderr: bytes) -> str:

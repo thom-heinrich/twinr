@@ -473,6 +473,9 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
     ) -> bool:
         self._reset_speculative_supervisor_decision()
         turn_started = time.monotonic()
+        allow_remote_follow_up_rearm = self._voice_orchestrator_handles_follow_up(
+            initial_source=listen_source,
+        )
         self._trace_event(
             "streaming_text_turn_started",
             kind="span_start",
@@ -490,7 +493,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             turn_started=turn_started,
             capture_ms=0,
             stt_ms=0,
-            allow_follow_up_rearm=False,
+            allow_follow_up_rearm=allow_remote_follow_up_rearm,
         )
         self._trace_event(
             "streaming_text_turn_finished",
@@ -516,6 +519,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             kind="span_start",
             details={"listen_source": listen_source, "proactive_trigger": proactive_trigger, "transcript_len": len(transcript)},
         )
+        if self.voice_orchestrator is not None:
+            self._notify_voice_orchestrator_state("thinking", detail=listen_source)
         coordinator = StreamingTurnCoordinator(
             config=self.config,
             runtime=self.runtime,
@@ -549,12 +554,31 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 record_usage=self._record_usage,
                 evaluate_follow_up_closure=self._evaluate_follow_up_closure,
                 apply_follow_up_closure_evaluation=self._apply_follow_up_closure_evaluation,
+                follow_up_rearm_allowed_now=lambda request_source: self._follow_up_allowed_for_source(
+                    initial_source=request_source
+                ),
             ),
         )
         try:
             outcome = coordinator.execute()
         except InterruptedError:
+            if self.voice_orchestrator is not None:
+                self._notify_voice_orchestrator_state("waiting", detail=listen_source)
             return False
+        if self.voice_orchestrator is not None:
+            remote_follow_up = (
+                outcome.keep_listening
+                and allow_follow_up_rearm
+                and self._voice_orchestrator_handles_follow_up(initial_source=listen_source)
+            )
+            if outcome.keep_listening and remote_follow_up:
+                self._notify_voice_orchestrator_state(
+                    "follow_up_open",
+                    detail=listen_source,
+                    follow_up_allowed=True,
+                )
+            else:
+                self._notify_voice_orchestrator_state("waiting", detail=listen_source)
         return outcome.keep_listening
 
     def _segment_boundary(self, text: str) -> int | None:

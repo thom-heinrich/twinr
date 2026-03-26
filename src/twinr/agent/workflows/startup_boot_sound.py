@@ -22,7 +22,7 @@ _BOOT_SOUND_SPEC = RenderedAudioClipSpec(
     fade_in_duration_s=1.0,
     fade_out_start_s=4.0,
     fade_out_duration_s=3.0,
-    output_gain=0.2,
+    output_gain=0.1,
     normalize_max_gain=1.0,
 )
 _MAX_ERROR_TEXT_CHARS = 200

@@ -84,6 +84,14 @@ from twinr.integrations.runtime import (
     hue_application_key_env_key_for_host,
     validate_calendar_source,
 )
+from twinr.integrations.social_history import (
+    SOCIAL_HISTORY_ALLOWED_SOURCES,
+    SOCIAL_HISTORY_LEARNING_INTEGRATION_ID,
+    SOCIAL_HISTORY_LOOKBACK_OPTIONS,
+    SOCIAL_HISTORY_SOURCE_WHATSAPP,
+    SocialHistoryLearningConfig,
+    social_history_record_with_import_state,
+)
 from twinr.integrations.store import ManagedIntegrationConfig, TwinrIntegrationStore, integration_store_path
 from twinr.integrations.web_automation_families import (
     IntegrationAutomationFamilyBlock,
@@ -135,6 +143,10 @@ __all__ = [
     "RequestOrigin",
     "RiskLevel",
     "RoutedSmartHomeProvider",
+    "SOCIAL_HISTORY_ALLOWED_SOURCES",
+    "SOCIAL_HISTORY_LEARNING_INTEGRATION_ID",
+    "SOCIAL_HISTORY_LOOKBACK_OPTIONS",
+    "SOCIAL_HISTORY_SOURCE_WHATSAPP",
     "SMTPMailSender",
     "SMTPMailSenderConfig",
     "SafeIntegrationPolicy",
@@ -142,6 +154,7 @@ __all__ = [
     "SafetyProfile",
     "SecretReference",
     "SecretStorage",
+    "SocialHistoryLearningConfig",
     "SmartHomeAdapterSettings",
     "SmartHomeCommand",
     "SmartHomeController",
@@ -173,6 +186,7 @@ __all__ = [
     "manifest_for_id",
     "manifests_for_domain",
     "parse_routed_entity_id",
+    "social_history_record_with_import_state",
     "stricter_confirmation",
     "validate_calendar_source",
 ]

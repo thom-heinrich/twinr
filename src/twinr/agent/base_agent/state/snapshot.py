@@ -98,6 +98,10 @@ class RuntimeSnapshot:
         user_voice_user_id: Matched enrolled local household member id, if any.
         user_voice_user_display_name: Human-facing name for the matched member, if any.
         user_voice_match_source: Internal source tag for the current match, if any.
+        voice_quiet_until_utc: Optional UTC deadline until transcript-first
+            voice wake should stay quiet.
+        voice_quiet_reason: Optional short operator/user-facing reason for the
+            temporary quiet window.
         memory_turns: Canonical conversation turns kept in active memory.
         memory_raw_tail: Unsummarized recent turns kept alongside memory.
         memory_ledger: Structured ledger entries derived from memory events.
@@ -116,6 +120,8 @@ class RuntimeSnapshot:
     user_voice_user_id: str | None = None
     user_voice_user_display_name: str | None = None
     user_voice_match_source: str | None = None
+    voice_quiet_until_utc: str | None = None
+    voice_quiet_reason: str | None = None
     memory_turns: tuple[RuntimeSnapshotTurn, ...] = ()
     memory_raw_tail: tuple[RuntimeSnapshotTurn, ...] = ()
     memory_ledger: tuple[RuntimeSnapshotLedgerItem, ...] = ()
@@ -208,6 +214,8 @@ class RuntimeSnapshotStore:
         user_voice_user_id: str | None = None,
         user_voice_user_display_name: str | None = None,
         user_voice_match_source: str | None = None,
+        voice_quiet_until_utc: str | None = None,
+        voice_quiet_reason: str | None = None,
     ) -> RuntimeSnapshot:
         """Normalize and persist one runtime snapshot payload.
 
@@ -227,6 +235,9 @@ class RuntimeSnapshotStore:
             user_voice_user_id: Matched enrolled local household member id, if any.
             user_voice_user_display_name: Human-facing name for the matched member, if any.
             user_voice_match_source: Internal source tag for the current match, if any.
+            voice_quiet_until_utc: Optional UTC deadline for the temporary
+                voice-quiet window.
+            voice_quiet_reason: Optional short reason for that quiet window.
 
         Returns:
             The normalized snapshot object that was written to disk.
@@ -252,6 +263,8 @@ class RuntimeSnapshotStore:
             user_voice_user_id=_trimmed_str(user_voice_user_id),
             user_voice_user_display_name=_trimmed_str(user_voice_user_display_name),
             user_voice_match_source=_trimmed_str(user_voice_match_source),
+            voice_quiet_until_utc=_coerce_optional_datetime_string(voice_quiet_until_utc),
+            voice_quiet_reason=_coerce_optional_text(voice_quiet_reason),
             memory_turns=tuple(
                 RuntimeSnapshotTurn(
                     role=_coerce_text(getattr(turn, "role", "")),
@@ -332,6 +345,8 @@ class RuntimeSnapshotStore:
             "user_voice_user_id": snapshot.user_voice_user_id,
             "user_voice_user_display_name": snapshot.user_voice_user_display_name,
             "user_voice_match_source": snapshot.user_voice_match_source,
+            "voice_quiet_until_utc": snapshot.voice_quiet_until_utc,
+            "voice_quiet_reason": snapshot.voice_quiet_reason,
             "memory_turns": [
                 {
                     "role": turn.role,
@@ -424,6 +439,8 @@ class RuntimeSnapshotStore:
             user_voice_user_id=_trimmed_str(data.get("user_voice_user_id")),
             user_voice_user_display_name=_trimmed_str(data.get("user_voice_user_display_name")),
             user_voice_match_source=_trimmed_str(data.get("user_voice_match_source")),
+            voice_quiet_until_utc=_coerce_optional_datetime_string(data.get("voice_quiet_until_utc")),
+            voice_quiet_reason=_coerce_optional_text(data.get("voice_quiet_reason")),
             memory_turns=tuple(
                 turn
                 for turn in (_runtime_snapshot_turn(item) for item in _coerce_sequence(data.get("memory_turns")))

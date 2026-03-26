@@ -175,16 +175,28 @@ class RemoteMemoryWatchdog:
                         probe_result = self._call_probe_remote_ready(
                             probe_remote_ready=probe_remote_ready,
                             bootstrap=bootstrap_probe,
-                            include_archive=bootstrap_probe,
+                            include_archive=True,
                         )
                         probe_payload = self._normalize_probe_payload(
                             getattr(probe_result, "to_dict", lambda: None)()
                             if probe_result is not None
                             else None
                         )
-                        ready = bool(getattr(probe_result, "ready", False))
-                        status = "ok" if ready else "fail"
-                        detail = self._normalize_detail(getattr(probe_result, "detail", None)) or status_detail
+                        raw_ready = bool(getattr(probe_result, "ready", False))
+                        archive_safe = self._probe_result_archive_safe(
+                            probe_result=probe_result,
+                            include_archive=True,
+                        )
+                        ready = bool(raw_ready and archive_safe)
+                        if raw_ready and not archive_safe:
+                            status = "degraded"
+                            detail = (
+                                self._normalize_detail(getattr(probe_result, "detail", None))
+                                or "Remote readiness probe stayed current-only and is not archive-safe."
+                            )
+                        else:
+                            status = "ok" if ready else "fail"
+                            detail = self._normalize_detail(getattr(probe_result, "detail", None)) or status_detail
                         mode = str(
                             getattr(
                                 getattr(probe_result, "remote_status", None),
@@ -394,6 +406,23 @@ class RemoteMemoryWatchdog:
         if supports_kwargs or "include_archive" in signature.parameters:
             kwargs["include_archive"] = include_archive
         return probe_remote_ready(**kwargs)
+
+    @staticmethod
+    def _probe_result_archive_safe(*, probe_result, include_archive: bool) -> bool:
+        """Return whether one structured readiness result proves archive safety."""
+
+        if probe_result is None:
+            return False
+        warm_result = getattr(probe_result, "warm_result", None)
+        archive_safe = getattr(warm_result, "archive_safe", None)
+        if archive_safe is not None:
+            return bool(archive_safe)
+        probe_payload = getattr(probe_result, "to_dict", lambda: None)()
+        if isinstance(probe_payload, dict):
+            warm_payload = probe_payload.get("warm_result")
+            if isinstance(warm_payload, dict) and "archive_safe" in warm_payload:
+                return bool(warm_payload.get("archive_safe"))
+        return bool(getattr(probe_result, "ready", False) and include_archive)
 
     @staticmethod
     def _normalize_detail(value: object) -> str | None:

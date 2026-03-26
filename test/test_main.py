@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.ops.locks import TwinrInstanceAlreadyRunningError
 
+_TEST_WHATSAPP_ALLOW_FROM_DISPLAY = "+1 555 555 4567"
+
 
 class _FakeDisplayLoop:
     def __init__(self) -> None:
@@ -44,12 +46,35 @@ class _FakeRemoteMemoryWatchdog:
         return 0
 
 
+def _fake_runtime_env_module() -> ModuleType:
+    module = ModuleType("twinr.ops.runtime_env")
+    module.prime_user_session_audio_env = lambda: None
+    return module
+
+
+def _attach_fake_openai_image_input(module: ModuleType) -> None:
+    class _FakeImageInput:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        @classmethod
+        def from_path(cls, *_args, **_kwargs):
+            return cls()
+
+    module.OpenAIImageInput = _FakeImageInput
+
+
 class _FakeWhatsAppLoop:
-    def __init__(self, *, config, runtime, backend) -> None:
+    last_instance = None
+
+    def __init__(self, *, config, runtime, backend, tool_agent_provider=None, print_backend=None) -> None:
         self.config = config
         self.runtime = runtime
         self.backend = backend
+        self.tool_agent_provider = tool_agent_provider
+        self.print_backend = print_backend
         self.duration_s = None
+        type(self).last_instance = self
 
     def run(self, *, duration_s: float | None = None) -> int:
         self.duration_s = duration_s
@@ -236,7 +261,7 @@ class MainCliTests(unittest.TestCase):
                 main_mod = importlib.import_module("twinr.__main__")
                 with patch("twinr.display.TwinrStatusDisplayLoop.from_config", return_value=fake_loop):
                     with patch("twinr.ops.loop_instance_lock", _fake_lock):
-                        with patch.object(main_mod, "prime_user_session_audio_env") as priming:
+                        with patch("twinr.ops.runtime_env.prime_user_session_audio_env") as priming:
                             sys.argv = [
                                 "twinr",
                                 "--env-file",
@@ -346,6 +371,82 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(uvicorn_calls, [(fake_app, "127.0.0.1", 1447)])
 
+    def test_drone_status_dispatches_before_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_DRONE_ENABLED=true",
+                        "TWINR_DRONE_BASE_URL=http://127.0.0.1:8791",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_argv = list(sys.argv)
+            stdout = StringIO()
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch.object(
+                    main_mod,
+                    "_build_runtime",
+                    side_effect=AssertionError("drone-status must not bootstrap the runtime"),
+                ):
+                    with patch.object(main_mod, "_run_drone_cli_commands", return_value=0) as fake_drone:
+                        with patch("sys.stdout", stdout):
+                            sys.argv = [
+                                "twinr",
+                                "--env-file",
+                                str(env_path),
+                                "--drone-status",
+                            ]
+                            exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        fake_drone.assert_called_once()
+
+    def test_self_test_dispatches_before_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch.object(
+                    main_mod,
+                    "_build_runtime",
+                    side_effect=AssertionError("self-test must not bootstrap the runtime"),
+                ):
+                    with patch.object(main_mod, "_run_self_test_command", return_value=0) as fake_self_test:
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--self-test",
+                            "drone_stack",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        fake_self_test.assert_called_once()
+
     def test_run_whatsapp_channel_dispatches_to_channel_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -354,7 +455,7 @@ class MainCliTests(unittest.TestCase):
                 "\n".join(
                     (
                         f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
-                        "TWINR_WHATSAPP_ALLOW_FROM=+49 171 1234567",
+                        f"TWINR_WHATSAPP_ALLOW_FROM={_TEST_WHATSAPP_ALLOW_FROM_DISPLAY}",
                     )
                 )
                 + "\n",
@@ -362,15 +463,28 @@ class MainCliTests(unittest.TestCase):
             )
             fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
             fake_backend = object()
+            fake_tool_agent = object()
+            fake_print_backend = object()
             built_runtime_config = None
             lock_runtime_state_path = None
             fake_whatsapp_module = ModuleType("twinr.channels.whatsapp")
             fake_whatsapp_module.TwinrWhatsAppChannelLoop = _FakeWhatsAppLoop
+            fake_providers_module = ModuleType("twinr.providers")
+            fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: SimpleNamespace(
+                tool_agent=fake_tool_agent,
+                print_backend=fake_print_backend,
+            )
             original_argv = list(sys.argv)
 
             try:
                 sys.modules.pop("twinr.__main__", None)
-                with patch.dict(sys.modules, {"twinr.channels.whatsapp": fake_whatsapp_module}):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.channels.whatsapp": fake_whatsapp_module,
+                        "twinr.providers": fake_providers_module,
+                    },
+                ):
                     main_mod = importlib.import_module("twinr.__main__")
 
                     def _build_runtime(config):
@@ -403,8 +517,11 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(built_runtime_config)
         self.assertIn("runtime-scopes/whatsapp-channel", str(built_runtime_config.runtime_state_path))
-        self.assertFalse(built_runtime_config.restore_runtime_state_on_startup)
+        self.assertTrue(built_runtime_config.restore_runtime_state_on_startup)
         self.assertEqual(lock_runtime_state_path, str(root / "runtime-state.json"))
+        self.assertIsNotNone(_FakeWhatsAppLoop.last_instance)
+        self.assertIs(_FakeWhatsAppLoop.last_instance.tool_agent_provider, fake_tool_agent)
+        self.assertIs(_FakeWhatsAppLoop.last_instance.print_backend, fake_print_backend)
 
     def test_run_whatsapp_channel_ensures_remote_watchdog_before_runtime_boot_on_pi(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -415,7 +532,7 @@ class MainCliTests(unittest.TestCase):
                     (
                         f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
                         "TWINR_OPENAI_API_KEY=sk-test",
-                        "TWINR_WHATSAPP_ALLOW_FROM=+49 171 1234567",
+                        f"TWINR_WHATSAPP_ALLOW_FROM={_TEST_WHATSAPP_ALLOW_FROM_DISPLAY}",
                         "TWINR_LONG_TERM_MEMORY_ENABLED=true",
                         "TWINR_LONG_TERM_MEMORY_MODE=remote_primary",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true",
@@ -428,8 +545,15 @@ class MainCliTests(unittest.TestCase):
             events: list[str] = []
             fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
             fake_backend = object()
+            fake_tool_agent = object()
+            fake_print_backend = object()
             fake_whatsapp_module = ModuleType("twinr.channels.whatsapp")
             fake_whatsapp_module.TwinrWhatsAppChannelLoop = _FakeWhatsAppLoop
+            fake_providers_module = ModuleType("twinr.providers")
+            fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: SimpleNamespace(
+                tool_agent=fake_tool_agent,
+                print_backend=fake_print_backend,
+            )
             fake_watchdog_module = ModuleType("twinr.ops.remote_memory_watchdog_companion")
 
             def _ensure_remote_memory_watchdog_process(_config, *, env_file):
@@ -445,6 +569,7 @@ class MainCliTests(unittest.TestCase):
                     sys.modules,
                     {
                         "twinr.channels.whatsapp": fake_whatsapp_module,
+                        "twinr.providers": fake_providers_module,
                         "twinr.ops.remote_memory_watchdog_companion": fake_watchdog_module,
                     },
                 ):
@@ -504,6 +629,7 @@ class MainCliTests(unittest.TestCase):
                     self.config = config
 
             fake_openai_module.OpenAIBackend = _FakeBackend
+            _attach_fake_openai_image_input(fake_openai_module)
             fake_providers_module = ModuleType("twinr.providers")
             fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: SimpleNamespace(
                 print_backend=SimpleNamespace(),
@@ -535,6 +661,7 @@ class MainCliTests(unittest.TestCase):
             fake_watchdog_module.ensure_remote_memory_watchdog_process = _ensure_remote_memory_watchdog_process
             fake_ops_module = ModuleType("twinr.ops")
             fake_ops_module.loop_instance_lock = _fake_lock
+            fake_runtime_env_module = _fake_runtime_env_module()
             fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
             original_argv = list(sys.argv)
 
@@ -549,6 +676,7 @@ class MainCliTests(unittest.TestCase):
                         "twinr.display.companion": fake_companion_module,
                         "twinr.hardware.respeaker.companion": fake_respeaker_led_module,
                         "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
                         "twinr.ops.remote_memory_watchdog_companion": fake_watchdog_module,
                     },
                 ):
@@ -602,6 +730,7 @@ class MainCliTests(unittest.TestCase):
                     events.append("backend_init")
 
             fake_openai_module.OpenAIBackend = _FakeBackend
+            _attach_fake_openai_image_input(fake_openai_module)
             fake_providers_module = ModuleType("twinr.providers")
             fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: (
                 events.append("bundle_init")
@@ -636,6 +765,7 @@ class MainCliTests(unittest.TestCase):
 
             fake_respeaker_led_module.optional_respeaker_led_companion = _fake_led_companion
             fake_ops_module = ModuleType("twinr.ops")
+            fake_runtime_env_module = _fake_runtime_env_module()
 
             @contextmanager
             def _recording_lock(_config, _name: str):
@@ -660,6 +790,7 @@ class MainCliTests(unittest.TestCase):
                         "twinr.display.companion": fake_companion_module,
                         "twinr.hardware.respeaker.companion": fake_respeaker_led_module,
                         "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
                     },
                 ):
                     main_mod = importlib.import_module("twinr.__main__")
@@ -731,6 +862,7 @@ class MainCliTests(unittest.TestCase):
                     events.append("backend_init")
 
             fake_openai_module.OpenAIBackend = _FakeBackend
+            _attach_fake_openai_image_input(fake_openai_module)
             fake_providers_module = ModuleType("twinr.providers")
             fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: (
                 events.append("bundle_init")
@@ -766,6 +898,7 @@ class MainCliTests(unittest.TestCase):
             fake_respeaker_led_module.optional_respeaker_led_companion = _fake_led_companion
             fake_ops_module = ModuleType("twinr.ops")
             fake_ops_module.loop_instance_lock = _fake_lock
+            fake_runtime_env_module = _fake_runtime_env_module()
             fake_hold_module = ModuleType("twinr.agent.workflows.runtime_error_hold")
 
             def _fake_hold_runtime_error_state(*, runtime, error, duration_s, **_kwargs):
@@ -794,6 +927,7 @@ class MainCliTests(unittest.TestCase):
                         "twinr.display.companion": fake_companion_module,
                         "twinr.hardware.respeaker.companion": fake_respeaker_led_module,
                         "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
                     },
                 ):
                     main_mod = importlib.import_module("twinr.__main__")
@@ -834,11 +968,18 @@ class MainCliTests(unittest.TestCase):
             fake_ops_module = ModuleType("twinr.ops")
             fake_ops_module.loop_instance_lock = _fake_lock
             fake_ops_module.RemoteMemoryWatchdog = SimpleNamespace(from_config=lambda _config: fake_watchdog)
+            fake_runtime_env_module = _fake_runtime_env_module()
             original_argv = list(sys.argv)
 
             try:
                 sys.modules.pop("twinr.__main__", None)
-                with patch.dict(sys.modules, {"twinr.ops": fake_ops_module}):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
+                    },
+                ):
                     main_mod = importlib.import_module("twinr.__main__")
                     with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
                         sys.argv = [
@@ -872,6 +1013,7 @@ class MainCliTests(unittest.TestCase):
             )
             fake_ops_module = ModuleType("twinr.ops")
             fake_ops_module.loop_instance_lock = _fake_lock
+            fake_runtime_env_module = _fake_runtime_env_module()
             original_argv = list(sys.argv)
 
             try:
@@ -880,6 +1022,7 @@ class MainCliTests(unittest.TestCase):
                     sys.modules,
                     {
                         "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
                         "twinr.ops.runtime_supervisor": fake_supervisor_module,
                     },
                 ):
