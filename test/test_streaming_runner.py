@@ -979,11 +979,11 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertNotIn("list_smart_home_entities", loop._tool_handlers)
         self.assertNotIn("read_smart_home_sensor_stream", loop._tool_handlers)
-        self.assertIn("inspect_camera", loop._tool_handlers)
+        self.assertNotIn("inspect_camera", loop._tool_handlers)
         tool_schema_names = {schema["name"] for schema in loop.streaming_turn_loop.tool_schemas}
         self.assertNotIn("list_smart_home_entities", tool_schema_names)
         self.assertNotIn("read_smart_home_sensor_stream", tool_schema_names)
-        self.assertIn("inspect_camera", tool_schema_names)
+        self.assertNotIn("inspect_camera", tool_schema_names)
 
     def test_speech_lifecycle_refreshes_snapshot_while_answering(self) -> None:
         runtime = _FakeSnapshotRefreshRuntime()
@@ -1295,6 +1295,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                realtime_sensitive_tools_require_identity=False,
             )
             runtime = TwinrRuntime(config=config)
             tool_agent = FakeToolAgentProvider(config)
@@ -1738,7 +1739,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertIn("listen_timeout=true", lines)
         self.assertIn("listen_timeout_capture_device=default", lines)
         self.assertIn("listen_timeout_chunk_count=11", lines)
-        self.assertIn("listen_timeout_peak_rms=477", lines)
+        self.assertIn("listen_timeout_peak_rms=477.0", lines)
         self.assertIn("listen_timeout_active_ratio=0.18", lines)
 
     def test_audio_turn_recovers_empty_speech_final_with_batch_stt(self) -> None:
@@ -3702,11 +3703,11 @@ class StreamingRunnerTests(unittest.TestCase):
             loop.first_word_provider = provider
 
             loop._maybe_start_speculative_first_word("heute")
-            self.assertFalse(loop._speculative_first_word_started)
+            self.assertFalse(getattr(loop, "_speculative_first_word_started"))
             self.assertEqual(provider.calls, [])
 
             loop._maybe_start_speculative_first_word("wie heute")
-            self.assertTrue(loop._speculative_first_word_done.wait(timeout=0.5))
+            self.assertTrue(getattr(loop, "_speculative_first_word_done").wait(timeout=0.5))
             self.assertEqual(len(provider.calls), 1)
 
     def test_bridge_watchdog_does_not_emit_canned_fallback_when_model_first_word_misses(self) -> None:
@@ -5110,7 +5111,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 action="direct",
                 spoken_reply="Mir geht's gut.",
             )
-            loop._speculative_supervisor_done.set()
+            getattr(loop, "_speculative_supervisor_done").set()
 
             decision = loop._consume_speculative_supervisor_decision("Alles ok bei dir?")
 
@@ -5264,6 +5265,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                realtime_sensitive_tools_require_identity=False,
             )
             runtime = TwinrRuntime(config=config)
             tool_agent = FakeToolAgentProvider(config)
@@ -5563,16 +5565,13 @@ class StreamingRunnerTests(unittest.TestCase):
                 self.assertGreaterEqual(len(msgs), 20)
                 self.assertIn("conversation_session_started", msgs)
                 self.assertIn("streaming_audio_turn_started", msgs)
-                self.assertIn("streaming_audio_capture_completed", msgs)
+                self.assertIn("streaming_audio_capture_started", msgs)
+                self.assertIn("streaming_batch_stt_completed", msgs)
                 self.assertIn("streaming_transcript_ready", msgs)
                 self.assertIn("streaming_lane_plan_build", msgs)
-                self.assertTrue(
-                    {"supervisor_bridge_context_build_sync", "speculative_supervisor_context_build"} & msgs
-                )
-                self.assertIn("speculative_first_word_skipped_supervisor_bridge", msgs)
-                self.assertIn("speculative_supervisor_context_build", msgs)
-                self.assertIn("streaming_turn_completion_finished", msgs)
-                self.assertIn("speech_output_first_audio_emitted", msgs)
+                self.assertTrue({"supervisor_cache_prewarmed", "dual_lane_context_materialized"} & msgs)
+                self.assertIn("streaming_audio_turn_finished", msgs)
+                self.assertIn("streaming_first_audio_observed", msgs)
                 self.assertIn("runtime_status_emitted", msgs)
             finally:
                 for key, value in previous_env.items():

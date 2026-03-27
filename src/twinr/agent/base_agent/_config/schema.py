@@ -85,6 +85,7 @@ class TwinrConfig:
     turn_controller_interrupt_min_active_ratio: float = 0.18
     turn_controller_interrupt_min_transcript_chars: int = 4
     turn_controller_interrupt_consecutive_windows: int = 2
+    turn_controller_interrupt_min_transcribe_interval_ms: int = 0
     streaming_early_transcript_enabled: bool = True
     streaming_early_transcript_min_chars: int = 10
     streaming_early_transcript_wait_ms: int = 250
@@ -110,6 +111,10 @@ class TwinrConfig:
     streaming_final_lane_hard_timeout_ms: int = 15000
     streaming_search_final_lane_watchdog_timeout_ms: int = 6000
     streaming_search_final_lane_hard_timeout_ms: int = 30000
+    realtime_sensitive_tools_require_identity: bool = True
+    realtime_sensitive_tools_start_authorized: bool = False
+    realtime_sensitive_tool_fragments: tuple[str, ...] = ()
+    realtime_sensitive_tool_names: tuple[str, ...] = ()
     streaming_supervisor_model: str = ""
     streaming_supervisor_reasoning_effort: str = "low"
     streaming_supervisor_context_turns: int = 4

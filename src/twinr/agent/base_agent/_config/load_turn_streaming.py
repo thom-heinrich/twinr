@@ -6,6 +6,7 @@ from .context import ConfigLoadContext
 from .parsing import (
     _parse_bool,
     _parse_clamped_float,
+    _parse_csv_strings,
     _parse_float,
     _parse_local_semantic_router_mode,
     _parse_optional_text,
@@ -64,6 +65,16 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         ),
         "turn_controller_interrupt_consecutive_windows": int(
             get_value("TWINR_TURN_CONTROLLER_INTERRUPT_CONSECUTIVE_WINDOWS", "2") or "2"
+        ),
+        "turn_controller_interrupt_min_transcribe_interval_ms": max(
+            0,
+            int(
+                get_value(
+                    "TWINR_TURN_CONTROLLER_INTERRUPT_MIN_TRANSCRIBE_INTERVAL_MS",
+                    "0",
+                )
+                or "0"
+            ),
         ),
         "streaming_early_transcript_enabled": _parse_bool(
             get_value("TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED"), True
@@ -179,6 +190,20 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
                 get_value("TWINR_STREAMING_SEARCH_FINAL_LANE_HARD_TIMEOUT_MS", "30000")
                 or "30000"
             ),
+        ),
+        "realtime_sensitive_tools_require_identity": _parse_bool(
+            get_value("TWINR_REALTIME_SENSITIVE_TOOLS_REQUIRE_IDENTITY"), True
+        ),
+        "realtime_sensitive_tools_start_authorized": _parse_bool(
+            get_value("TWINR_REALTIME_SENSITIVE_TOOLS_START_AUTHORIZED"), False
+        ),
+        "realtime_sensitive_tool_fragments": _parse_csv_strings(
+            get_value("TWINR_REALTIME_SENSITIVE_TOOL_FRAGMENTS", ""),
+            (),
+        ),
+        "realtime_sensitive_tool_names": _parse_csv_strings(
+            get_value("TWINR_REALTIME_SENSITIVE_TOOL_NAMES", ""),
+            (),
         ),
         "streaming_supervisor_model": get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "")
         or "",
