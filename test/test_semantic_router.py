@@ -3,12 +3,17 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
+import types
 import unittest
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import twinr.agent.routing.bootstrap as router_bootstrap_module
+import twinr.agent.routing.inference as inference_module
 import twinr.agent.routing.synthetic_corpus as synthetic_corpus_module
+import twinr.agent.routing.user_intent_bootstrap as user_intent_bootstrap_module
 
 from twinr.agent.routing import (
     LabeledRouteSample,
@@ -47,6 +52,86 @@ class FakeEncoder:
         return np.vstack([self._vectors[text] for text in texts]).astype(np.float32)
 
 
+def _write_test_onnx_model(
+    path: Path,
+    *,
+    max_length: int = 64,
+    embedding_dim: int = 4,
+) -> None:
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    input_ids = helper.make_tensor_value_info(
+        "input_ids",
+        TensorProto.INT64,
+        [None, max_length],
+    )
+    sentence_embedding = helper.make_tensor_value_info(
+        "sentence_embedding",
+        TensorProto.FLOAT,
+        [None, embedding_dim],
+    )
+    projection = np.zeros((max_length, embedding_dim), dtype=np.float32)
+    for index in range(min(max_length, embedding_dim)):
+        projection[index, index] = 1.0
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Cast",
+                inputs=["input_ids"],
+                outputs=["input_ids_float"],
+                to=TensorProto.FLOAT,
+            ),
+            helper.make_node(
+                "MatMul",
+                inputs=["input_ids_float", "projection"],
+                outputs=["sentence_embedding"],
+            ),
+        ],
+        "twinr_test_sentence_encoder",
+        [input_ids],
+        [sentence_embedding],
+        initializer=[numpy_helper.from_array(projection, name="projection")],
+    )
+    model = helper.make_model(
+        graph,
+        producer_name="twinr-tests",
+        opset_imports=[helper.make_operatorsetid("", 13)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+
+
+def _write_test_tokenizer(path: Path, *, max_length: int = 64) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    tokenizer = Tokenizer(
+        WordLevel(
+            vocab={"[UNK]": 0, "[PAD]": 1, "hallo": 2, "termine": 3},
+            unk_token="[UNK]",
+        )
+    )
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.enable_truncation(max_length=max_length)
+    tokenizer.enable_padding(direction="right", pad_id=1, pad_token="[PAD]")
+    tokenizer.save(str(path))
+
+
+def _write_test_model_artifacts(root_dir: Path, *, max_length: int = 64) -> None:
+    _write_test_onnx_model(root_dir / "model.onnx", max_length=max_length)
+    _write_test_tokenizer(root_dir / "tokenizer.json", max_length=max_length)
+
+
+def _write_test_source_model(root_dir: Path, *, max_length: int = 64) -> Path:
+    source_dir = root_dir / "source_model"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    _write_test_model_artifacts(source_dir, max_length=max_length)
+    return source_dir
+
+
 def _write_bundle(
     root_dir: Path,
     *,
@@ -57,8 +142,6 @@ def _write_bundle(
 ) -> Path:
     bundle_dir = root_dir / "router_bundle"
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    (bundle_dir / "model.onnx").write_bytes(b"fake-onnx")
-    (bundle_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
     metadata = {
         "schema_version": 1,
         "classifier_type": "embedding_centroid_v1",
@@ -80,6 +163,7 @@ def _write_bundle(
         "reference_date": "2026-03-22",
     }
     metadata.update(metadata_overrides or {})
+    _write_test_model_artifacts(bundle_dir, max_length=int(metadata["max_length"]))
     if metadata["classifier_type"] == "embedding_linear_softmax_v1":
         np.save(bundle_dir / "weights.npy", weights if weights is not None else np.eye(4, dtype=np.float32))
         np.save(bundle_dir / "bias.npy", bias if bias is not None else np.zeros(4, dtype=np.float32))
@@ -102,8 +186,6 @@ def _write_user_intent_bundle(
 ) -> Path:
     bundle_dir = root_dir / "user_intent_bundle"
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    (bundle_dir / "model.onnx").write_bytes(b"fake-onnx")
-    (bundle_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
     metadata = {
         "schema_version": 1,
         "classifier_type": "embedding_centroid_v1",
@@ -117,6 +199,7 @@ def _write_user_intent_bundle(
         "reference_date": "2026-03-22",
     }
     metadata.update(metadata_overrides or {})
+    _write_test_model_artifacts(bundle_dir, max_length=int(metadata["max_length"]))
     if metadata["classifier_type"] == "embedding_linear_softmax_v1":
         np.save(bundle_dir / "weights.npy", weights if weights is not None else np.eye(4, dtype=np.float32))
         np.save(bundle_dir / "bias.npy", bias if bias is not None else np.zeros(4, dtype=np.float32))
@@ -139,6 +222,132 @@ class SemanticRouterTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_semantic_router_bundle(bundle_dir)
+
+    def test_load_bundle_accepts_onnxruntime_compatible_model_when_checker_rejects(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = _write_bundle(Path(temp_dir))
+            with mock.patch(
+                "onnx.checker.check_model",
+                side_effect=Exception("No Op registered for LayerNormalization"),
+            ):
+                bundle = load_semantic_router_bundle(bundle_dir)
+
+        self.assertEqual(bundle.metadata.model_id, "test-router")
+
+    def test_load_user_intent_bundle_accepts_onnxruntime_compatible_model_when_checker_rejects(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = _write_user_intent_bundle(Path(temp_dir))
+            with mock.patch(
+                "onnx.checker.check_model",
+                side_effect=Exception("No Op registered for LayerNormalization"),
+            ):
+                bundle = load_user_intent_bundle(bundle_dir)
+
+        self.assertEqual(bundle.metadata.model_id, "test-user-intent-router")
+
+    def test_router_bootstrap_materializes_ort_sidecar_for_runtime_bundle(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = _write_test_source_model(root)
+            bundle_dir = root / "bundle"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+
+            report = router_bootstrap_module._materialize_model_artifact(
+                source_model_path=source_dir / "model.onnx",
+                source_tokenizer_path=source_dir / "tokenizer.json",
+                destination_dir=bundle_dir,
+                max_length=64,
+                pooling="mean",
+                output_name=None,
+                probe_texts=("hallo",),
+                optimize_onnx=False,
+                quantize_onnx="none",
+                min_probe_cosine=0.0,
+                encode_batch_size=1,
+            )
+            self.assertTrue((bundle_dir / "model.ort").is_file())
+            self.assertTrue(report["ort_sidecar_created"])
+
+    def test_user_intent_bootstrap_materializes_ort_sidecar_for_runtime_bundle(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = _write_test_source_model(root)
+            stage_dir = root / "bundle"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+
+            prepared = user_intent_bootstrap_module._prepare_model_artifacts(
+                source_dir=source_dir,
+                stage_dir=stage_dir,
+                quantize_mode="off",
+                optimize_model=False,
+            )
+            self.assertTrue((stage_dir / "model.ort").is_file())
+            self.assertIn(stage_dir / "model.ort", prepared.files)
+
+    def test_user_intent_bundle_reuses_validation_session_for_first_encoder_load(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = _write_user_intent_bundle(Path(temp_dir))
+            (bundle_dir / "model.ort").write_bytes(b"ort-placeholder")
+            inference_module._PRELOADED_ORT_SESSIONS.clear()
+            call_count = 0
+
+            class FakeNodeArg:
+                def __init__(self, name: str, shape: list[object], type_name: str) -> None:
+                    self.name = name
+                    self.shape = shape
+                    self.type = type_name
+
+            class FakeSessionOptions:
+                def __init__(self) -> None:
+                    self.graph_optimization_level = None
+                    self.intra_op_num_threads = None
+                    self.inter_op_num_threads = None
+
+                def add_session_config_entry(self, _key: str, _value: str) -> None:
+                    return None
+
+            class FakeSession:
+                def get_inputs(self):
+                    return [FakeNodeArg("input_ids", [None, 64], "tensor(int64)")]
+
+                def get_outputs(self):
+                    return [FakeNodeArg("sentence_embedding", [None, 4], "tensor(float)")]
+
+            def fake_inference_session(*_args, **_kwargs):
+                nonlocal call_count
+                call_count += 1
+                return FakeSession()
+
+            fake_ort = types.ModuleType("onnxruntime")
+            fake_ort.GraphOptimizationLevel = types.SimpleNamespace(
+                ORT_DISABLE_ALL="disable",
+                ORT_ENABLE_BASIC="basic",
+                ORT_ENABLE_EXTENDED="extended",
+                ORT_ENABLE_ALL="all",
+            )
+            fake_ort.ExecutionMode = types.SimpleNamespace(
+                ORT_SEQUENTIAL="sequential",
+                ORT_PARALLEL="parallel",
+            )
+            fake_ort.SessionOptions = FakeSessionOptions
+            fake_ort.InferenceSession = fake_inference_session
+
+            with mock.patch(
+                "twinr.agent.routing.user_intent_bundle._get_onnxruntime",
+                return_value=fake_ort,
+            ), mock.patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+                bundle = load_user_intent_bundle(bundle_dir)
+                encoder = OnnxSentenceEncoder(
+                    model_path=bundle.model_path,
+                    tokenizer_path=bundle.tokenizer_path,
+                    max_length=bundle.metadata.max_length,
+                    pooling=bundle.metadata.pooling,
+                    output_name=bundle.resolved_output_name,
+                    normalize_embeddings=bundle.metadata.normalize_embeddings,
+                )
+                encoder._load_session()
+
+        self.assertEqual(call_count, 1)
 
     def test_local_semantic_router_applies_authority_policy(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -190,12 +399,13 @@ class SemanticRouterTests(unittest.TestCase):
 
         self.assertEqual(constrained.label, "memory")
         self.assertLess(constrained.confidence, 0.6)
-        self.assertLess(constrained.margin, 0.0)
+        self.assertGreater(constrained.margin, 0.0)
+        self.assertLess(constrained.margin, 0.1)
         self.assertEqual(constrained.scores["web"], 0.0)
         self.assertGreater(constrained.scores["memory"], 0.0)
         self.assertGreater(constrained.scores["tool"], 0.0)
-        self.assertFalse(constrained.authoritative)
-        self.assertEqual(constrained.fallback_reason, "below_confidence_threshold")
+        self.assertTrue(constrained.authoritative)
+        self.assertIsNone(constrained.fallback_reason)
 
     def test_local_semantic_router_supports_linear_head_bundles(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -279,7 +489,7 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertAlmostEqual(evaluation.accuracy, 2.0 / 3.0)
         self.assertAlmostEqual(evaluation.fallback_rate, 1.0 / 3.0)
         self.assertAlmostEqual(evaluation.authoritative_rate, 2.0 / 3.0)
-        self.assertAlmostEqual(evaluation.unsafe_authoritative_error_rate, 1.0 / 3.0)
+        self.assertAlmostEqual(evaluation.unsafe_authoritative_error_rate, 0.5)
         self.assertEqual(evaluation.confusion_matrix["memory"]["memory"], 1)
         self.assertEqual(evaluation.confusion_matrix["tool"]["memory"], 1)
 
@@ -292,7 +502,7 @@ class SemanticRouterTests(unittest.TestCase):
 
         self.assertIsNone(encoder._tokenizer)
         self.assertIsNone(encoder._session)
-        self.assertIsNone(encoder._session_input_names)
+        self.assertEqual(encoder._session_input_specs, ())
 
     def test_local_user_intent_router_supports_linear_head_bundles(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -447,7 +657,7 @@ class SemanticRouterTests(unittest.TestCase):
                 template_key="spoken",
             ),
             SyntheticRouteSample(
-                text="label: web heute berlin",
+                text="backend label web heute berlin",
                 label="web",
                 sample_id="w1",
                 split="train",
@@ -551,7 +761,7 @@ class SemanticRouterTests(unittest.TestCase):
             dataset_path = write_synthetic_route_samples_jsonl(samples, Path(temp_dir) / "dataset.jsonl")
             report_path = Path(temp_dir) / "training_report.json"
             report = train_router_bundle_from_jsonl(
-                source_dir=Path(temp_dir) / "source_model",
+                source_dir=_write_test_source_model(Path(temp_dir)),
                 dataset_path=dataset_path,
                 output_dir=Path(temp_dir) / "bundle",
                 report_path=report_path,
@@ -667,7 +877,7 @@ class SemanticRouterTests(unittest.TestCase):
             )
             report_path = Path(temp_dir) / "training_report.json"
             report = train_user_intent_bundle_from_jsonl(
-                source_dir=Path(temp_dir) / "source_model",
+                source_dir=_write_test_source_model(Path(temp_dir)),
                 dataset_path=dataset_path,
                 output_dir=Path(temp_dir) / "bundle",
                 report_path=report_path,

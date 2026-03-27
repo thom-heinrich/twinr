@@ -40,6 +40,7 @@ offline training, and dataset-definition concerns stay separated.
 Each bundle directory must contain:
 
 - `model.onnx`
+- `model.ort` is optional but preferred on the Pi when present
 - `tokenizer.json`
 - `router_metadata.json`
 
@@ -61,6 +62,11 @@ Classifier files depend on `classifier_type`:
 
 User-intent bundles use the same model/tokenizer/classifier-file layout but
 store their metadata in `user_intent_metadata.json`.
+
+The bootstrap builders now emit `model.ort` sidecars when ONNX Runtime's
+conversion tooling is available. The runtime loaders automatically prefer
+`model.ort` over `model.onnx` so Pi startups avoid re-optimizing large graphs
+on-device.
 
 ## Usage
 

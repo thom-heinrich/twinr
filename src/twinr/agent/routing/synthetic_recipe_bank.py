@@ -1,9 +1,35 @@
-"""Synthetic recipe registry for routing bootstrap corpus generation."""
+# CHANGELOG: 2026-03-27
+# BUG-1: Fixed malformed "how_to_without_action" utterances by supporting template-specific slot overrides for infinitive vs. clause forms.
+# BUG-2: Fixed duplicate utterances across memory families and repaired grammatically broken routine/reminder surfaces that polluted bootstrap labels.
+# BUG-3: Fixed invalid home-control Cartesian products by replacing impossible device/state combinations with template-scoped valid combinations.
+# SEC-1: Hardened the registry against unsafe placeholder rendering and accidental runtime mutation by validating placeholders and freezing nested mappings.
+# IMP-1: Added a typed, validated, immutable registry API with deterministic corpus/example generation for threshold fitting and evaluation workflows.
+# IMP-2: Added import-time global registry validation and public lookup/build helpers so bad synthetic data fails fast instead of silently poisoning routing corpora.
+
+"""Synthetic recipe registry for routing bootstrap corpus generation.
+
+This module defines validated, immutable recipe families for generating bootstrap
+utterances used by TWINR routing. The registry is optimized for German senior-
+assistant traffic and is intentionally lightweight enough for Raspberry Pi 4
+deployments.
+
+Frontier-oriented upgrades in this revision:
+- safe placeholder parsing and rendering without raw ``str.format`` field access
+- template-scoped slot overrides to express grammar-safe and device-safe variants
+- deterministic example generation for router ``fit`` / ``evaluate`` workflows
+- import-time duplicate detection across families to prevent poisoned labels
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping
+from collections import Counter
+from dataclasses import dataclass, field
+import itertools
+from math import prod
+from random import Random
+from string import Formatter
+from types import MappingProxyType
+from typing import Iterator, Mapping, Sequence
 
 from .contracts import normalize_route_label
 from .user_intent import (
@@ -11,6 +37,10 @@ from .user_intent import (
     normalize_user_intent_label,
 )
 
+REGISTRY_VERSION = "2026-03-27"
+
+_ALLOWED_DIFFICULTIES: frozenset[str] = frozenset({"standard", "boundary", "hard"})
+_PLACEHOLDER_FORMATTER = Formatter()
 
 _DEFAULT_NOISE_POOL: tuple[str, ...] = (
     "clean",
@@ -27,12 +57,175 @@ _DEFAULT_NOISE_POOL: tuple[str, ...] = (
 )
 
 
+def _normalize_string(value: object, *, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} must not be empty.")
+    return text
+
+
+def _normalize_identifier(value: object, *, field_name: str) -> str:
+    text = _normalize_string(value, field_name=field_name).lower()
+    if not text.isascii() or not text.replace("_", "").isalnum():
+        raise ValueError(
+            f"{field_name} must contain only ASCII letters, digits, and underscores."
+        )
+    return text
+
+
+def _freeze_weighted_pool(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
+    pool = tuple(_normalize_string(value, field_name=field_name) for value in values)
+    if not pool:
+        raise ValueError(f"{field_name} must not be empty.")
+    return pool
+
+
+def _freeze_slot_mapping(
+    values: Mapping[str, Sequence[str]] | None,
+    *,
+    field_name: str,
+) -> Mapping[str, tuple[str, ...]]:
+    if not values:
+        return MappingProxyType({})
+
+    frozen: dict[str, tuple[str, ...]] = {}
+    for raw_slot_name, raw_slot_values in values.items():
+        slot_name = _normalize_identifier(raw_slot_name, field_name=f"{field_name} slot")
+        slot_values = tuple(
+            dict.fromkeys(
+                _normalize_string(
+                    raw_value,
+                    field_name=f"{field_name}.{slot_name}",
+                )
+                for raw_value in raw_slot_values
+            )
+        )
+        if not slot_values:
+            raise ValueError(f"{field_name}.{slot_name} must not be empty.")
+        frozen[slot_name] = slot_values
+    return MappingProxyType(frozen)
+
+
+def _extract_placeholders(text: str) -> tuple[str, ...]:
+    placeholders: list[str] = []
+    for _, field_name, format_spec, conversion in _PLACEHOLDER_FORMATTER.parse(text):
+        if field_name is None:
+            continue
+        if format_spec or conversion:
+            raise ValueError(
+                f"Unsupported placeholder formatting in template {text!r}. "
+                "Use bare {slot_name} placeholders only."
+            )
+        normalized_name = _normalize_identifier(field_name, field_name="placeholder name")
+        placeholders.append(normalized_name)
+    return tuple(placeholders)
+
+
+def _render_template(text: str, values: Mapping[str, str]) -> str:
+    rendered: list[str] = []
+    for literal_text, field_name, format_spec, conversion in _PLACEHOLDER_FORMATTER.parse(text):
+        rendered.append(literal_text)
+        if field_name is None:
+            continue
+        if format_spec or conversion:
+            raise ValueError(
+                f"Unsupported placeholder formatting in template {text!r}. "
+                "Use bare {slot_name} placeholders only."
+            )
+        normalized_name = _normalize_identifier(field_name, field_name="placeholder name")
+        if normalized_name not in values:
+            raise KeyError(
+                f"Missing slot value for placeholder {normalized_name!r} in template {text!r}."
+            )
+        rendered.append(values[normalized_name])
+    return "".join(rendered)
+
+
 @dataclass(frozen=True, slots=True)
 class SyntheticRouteTemplate:
     """Describe one utterance surface form for a semantic-router family."""
 
     key: str
     text: str
+    slot_overrides: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    weight: int = 1
+    placeholders: tuple[str, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "key",
+            _normalize_identifier(self.key, field_name="SyntheticRouteTemplate.key"),
+        )
+        object.__setattr__(
+            self,
+            "text",
+            _normalize_string(self.text, field_name="SyntheticRouteTemplate.text"),
+        )
+        object.__setattr__(
+            self,
+            "slot_overrides",
+            _freeze_slot_mapping(
+                self.slot_overrides,
+                field_name=f"SyntheticRouteTemplate[{self.key}].slot_overrides",
+            ),
+        )
+        object.__setattr__(self, "placeholders", _extract_placeholders(self.text))
+        if self.weight < 1:
+            raise ValueError("SyntheticRouteTemplate.weight must be >= 1.")
+
+    def resolved_slot_values(
+        self,
+        recipe_slot_values: Mapping[str, tuple[str, ...]],
+    ) -> Mapping[str, tuple[str, ...]]:
+        if not self.placeholders:
+            return MappingProxyType({})
+        resolved = dict(recipe_slot_values)
+        resolved.update(self.slot_overrides)
+        missing = [name for name in self.placeholders if name not in resolved]
+        if missing:
+            raise ValueError(
+                f"Template {self.key!r} is missing slot values for placeholders: {missing!r}."
+            )
+        return MappingProxyType({name: resolved[name] for name in self.placeholders})
+
+    def iter_slot_assignments(
+        self,
+        recipe_slot_values: Mapping[str, tuple[str, ...]],
+    ) -> Iterator[Mapping[str, str]]:
+        resolved = self.resolved_slot_values(recipe_slot_values)
+        if not self.placeholders:
+            yield MappingProxyType({})
+            return
+
+        value_matrix = [resolved[name] for name in self.placeholders]
+        for combination in itertools.product(*value_matrix):
+            yield MappingProxyType(dict(zip(self.placeholders, combination)))
+
+    def render(self, slot_assignment: Mapping[str, str]) -> str:
+        # BREAKING: unknown slot names now raise instead of being silently ignored.
+        unknown_slots = sorted(set(slot_assignment) - set(self.placeholders))
+        if unknown_slots:
+            raise ValueError(
+                f"Template {self.key!r} received unknown slots: {unknown_slots!r}."
+            )
+        return _render_template(self.text, slot_assignment)
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticRouteExample:
+    """One fully rendered bootstrap utterance with provenance metadata."""
+
+    text: str
+    label: str
+    family_key: str
+    difficulty: str
+    user_label: str
+    template_key: str
+    locale: str
+    domain: str
+    slots: Mapping[str, str]
+    noise_pool: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,34 +239,357 @@ class SyntheticRouteRecipe:
     slot_values: Mapping[str, tuple[str, ...]]
     user_label: str | None = None
     noise_pool: tuple[str, ...] = _DEFAULT_NOISE_POOL
+    locale: str = "de-de"
+    domain: str = "senior_assistant"
+    _template_index: Mapping[str, SyntheticRouteTemplate] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "label", normalize_route_label(self.label))
+        normalized_label = normalize_route_label(self.label)
+        object.__setattr__(self, "label", normalized_label)
         object.__setattr__(
             self,
             "user_label",
             normalize_user_intent_label(
-                self.user_label or default_user_intent_for_route_label(self.label)
+                self.user_label or default_user_intent_for_route_label(normalized_label)
             ),
         )
-        object.__setattr__(self, "family_key", str(self.family_key or "").strip().lower())
-        object.__setattr__(self, "difficulty", str(self.difficulty or "standard").strip().lower())
-        if not self.family_key:
-            raise ValueError("SyntheticRouteRecipe.family_key must not be empty.")
-        if not self.templates:
+        object.__setattr__(
+            self,
+            "family_key",
+            _normalize_identifier(
+                self.family_key,
+                field_name="SyntheticRouteRecipe.family_key",
+            ),
+        )
+        normalized_difficulty = _normalize_identifier(
+            self.difficulty or "standard",
+            field_name="SyntheticRouteRecipe.difficulty",
+        )
+        if normalized_difficulty not in _ALLOWED_DIFFICULTIES:
+            raise ValueError(
+                f"SyntheticRouteRecipe.difficulty must be one of {_ALLOWED_DIFFICULTIES!r}."
+            )
+        object.__setattr__(self, "difficulty", normalized_difficulty)
+
+        templates = tuple(self.templates)
+        if not templates:
             raise ValueError("SyntheticRouteRecipe.templates must not be empty.")
+        template_keys = [template.key for template in templates]
+        if len(template_keys) != len(set(template_keys)):
+            raise ValueError(
+                f"SyntheticRouteRecipe {self.family_key!r} contains duplicate template keys."
+            )
+        object.__setattr__(self, "templates", templates)
+        object.__setattr__(
+            self,
+            "slot_values",
+            _freeze_slot_mapping(
+                self.slot_values,
+                field_name=f"SyntheticRouteRecipe[{self.family_key}].slot_values",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "noise_pool",
+            _freeze_weighted_pool(
+                self.noise_pool,
+                field_name=f"SyntheticRouteRecipe[{self.family_key}].noise_pool",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "locale",
+            _normalize_identifier(
+                str(self.locale).replace("-", "_"),
+                field_name=f"SyntheticRouteRecipe[{self.family_key}].locale",
+            ).replace("_", "-"),
+        )
+        object.__setattr__(
+            self,
+            "domain",
+            _normalize_identifier(
+                self.domain,
+                field_name=f"SyntheticRouteRecipe[{self.family_key}].domain",
+            ),
+        )
+
+        for template in templates:
+            _ = template.resolved_slot_values(self.slot_values)
+
+        object.__setattr__(
+            self,
+            "_template_index",
+            MappingProxyType({template.key: template for template in templates}),
+        )
+
+    @property
+    def template_count(self) -> int:
+        return len(self.templates)
+
+    @property
+    def max_example_count(self) -> int:
+        total = 0
+        for template in self.templates:
+            resolved = template.resolved_slot_values(self.slot_values)
+            total += (
+                1
+                if not template.placeholders
+                else prod(len(resolved[name]) for name in template.placeholders)
+            )
+        return total
+
+    def get_template(self, template_key: str) -> SyntheticRouteTemplate:
+        normalized_key = _normalize_identifier(template_key, field_name="template_key")
+        try:
+            return self._template_index[normalized_key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown template_key {template_key!r} for family {self.family_key!r}."
+            ) from exc
+
+    def render(self, template_key: str, /, **slots: str) -> SyntheticRouteExample:
+        template = self.get_template(template_key)
+        normalized_slots = MappingProxyType(
+            {
+                _normalize_identifier(name, field_name="slot name"): _normalize_string(
+                    value,
+                    field_name=f"slot[{name}]",
+                )
+                for name, value in slots.items()
+            }
+        )
+        text = template.render(normalized_slots)
+        return SyntheticRouteExample(
+            text=text,
+            label=self.label,
+            family_key=self.family_key,
+            difficulty=self.difficulty,
+            user_label=self.user_label or "",
+            template_key=template.key,
+            locale=self.locale,
+            domain=self.domain,
+            slots=normalized_slots,
+            noise_pool=self.noise_pool,
+        )
+
+    def iter_examples(
+        self,
+        *,
+        template_keys: Sequence[str] | None = None,
+        shuffle: bool = False,
+        seed: int | None = None,
+        limit: int | None = None,
+        dedupe_text: bool = True,
+    ) -> Iterator[SyntheticRouteExample]:
+        selected_templates = (
+            tuple(self.get_template(template_key) for template_key in template_keys)
+            if template_keys
+            else self.templates
+        )
+
+        examples: list[SyntheticRouteExample] = []
+        seen_texts: set[str] = set()
+
+        for template in selected_templates:
+            for slot_assignment in template.iter_slot_assignments(self.slot_values):
+                rendered_text = template.render(slot_assignment)
+                if dedupe_text and rendered_text in seen_texts:
+                    continue
+                seen_texts.add(rendered_text)
+                examples.append(
+                    SyntheticRouteExample(
+                        text=rendered_text,
+                        label=self.label,
+                        family_key=self.family_key,
+                        difficulty=self.difficulty,
+                        user_label=self.user_label or "",
+                        template_key=template.key,
+                        locale=self.locale,
+                        domain=self.domain,
+                        slots=slot_assignment,
+                        noise_pool=self.noise_pool,
+                    )
+                )
+
+        if shuffle:
+            Random(seed).shuffle(examples)
+        elif seed is not None:
+            _ = seed
+
+        if limit is not None:
+            examples = examples[:limit]
+
+        yield from examples
+
+    def utterances(
+        self,
+        *,
+        template_keys: Sequence[str] | None = None,
+        shuffle: bool = False,
+        seed: int | None = None,
+        limit: int | None = None,
+        dedupe_text: bool = True,
+    ) -> tuple[str, ...]:
+        return tuple(
+            example.text
+            for example in self.iter_examples(
+                template_keys=template_keys,
+                shuffle=shuffle,
+                seed=seed,
+                limit=limit,
+                dedupe_text=dedupe_text,
+            )
+        )
+
+
+def _validate_recipe_registry(recipes: Sequence[SyntheticRouteRecipe]) -> None:
+    # BREAKING: invalid registries now fail fast at import time instead of poisoning
+    # downstream corpus generation with silent duplicates / collisions.
+    family_keys = [recipe.family_key for recipe in recipes]
+    if len(family_keys) != len(set(family_keys)):
+        duplicates = sorted(
+            family_key
+            for family_key, count in Counter(family_keys).items()
+            if count > 1
+        )
+        raise ValueError(f"Duplicate family_key values detected: {duplicates!r}")
+
+    utterance_index: dict[str, tuple[str, str]] = {}
+    collisions: list[str] = []
+    for recipe in recipes:
+        for example in recipe.iter_examples(dedupe_text=False):
+            existing = utterance_index.get(example.text)
+            current = (recipe.family_key, example.template_key)
+            if existing is not None and existing != current:
+                collisions.append(
+                    f"{example.text!r} -> {existing[0]}/{existing[1]} vs. {current[0]}/{current[1]}"
+                )
+            else:
+                utterance_index[example.text] = current
+    if collisions:
+        joined = "; ".join(collisions[:10])
+        raise ValueError(
+            f"Duplicate rendered utterances detected across families: {joined}"
+        )
+
+
+def iter_route_recipes(
+    *,
+    label: str | None = None,
+    user_label: str | None = None,
+    difficulty: str | None = None,
+) -> Iterator[SyntheticRouteRecipe]:
+    normalized_label = normalize_route_label(label) if label is not None else None
+    normalized_user_label = (
+        normalize_user_intent_label(user_label) if user_label is not None else None
+    )
+    normalized_difficulty = (
+        _normalize_identifier(difficulty, field_name="difficulty")
+        if difficulty is not None
+        else None
+    )
+
+    for recipe in _ROUTE_RECIPES:
+        if normalized_label is not None and recipe.label != normalized_label:
+            continue
+        if normalized_user_label is not None and recipe.user_label != normalized_user_label:
+            continue
+        if normalized_difficulty is not None and recipe.difficulty != normalized_difficulty:
+            continue
+        yield recipe
+
+
+def get_route_recipes(
+    *,
+    label: str | None = None,
+    user_label: str | None = None,
+    difficulty: str | None = None,
+) -> tuple[SyntheticRouteRecipe, ...]:
+    return tuple(
+        iter_route_recipes(
+            label=label,
+            user_label=user_label,
+            difficulty=difficulty,
+        )
+    )
+
+
+def get_route_recipe(family_key: str) -> SyntheticRouteRecipe:
+    normalized_family_key = _normalize_identifier(family_key, field_name="family_key")
+    try:
+        return _ROUTE_RECIPE_BY_FAMILY_KEY[normalized_family_key]
+    except KeyError as exc:
+        raise KeyError(f"Unknown SyntheticRouteRecipe family_key: {family_key!r}") from exc
+
+
+def iter_bootstrap_examples(
+    *,
+    label: str | None = None,
+    user_label: str | None = None,
+    difficulty: str | None = None,
+    per_recipe_limit: int | None = None,
+    shuffle: bool = False,
+    seed: int | None = None,
+    dedupe_text: bool = True,
+) -> Iterator[SyntheticRouteExample]:
+    rng = Random(seed)
+    recipes = list(
+        iter_route_recipes(
+            label=label,
+            user_label=user_label,
+            difficulty=difficulty,
+        )
+    )
+    if shuffle:
+        rng.shuffle(recipes)
+
+    for recipe in recipes:
+        recipe_seed = rng.randrange(0, 2**32) if shuffle else seed
+        yield from recipe.iter_examples(
+            limit=per_recipe_limit,
+            shuffle=shuffle,
+            seed=recipe_seed,
+            dedupe_text=dedupe_text,
+        )
+
+
+def build_bootstrap_corpus(
+    *,
+    label: str | None = None,
+    user_label: str | None = None,
+    difficulty: str | None = None,
+    per_recipe_limit: int | None = None,
+    shuffle: bool = False,
+    seed: int | None = None,
+    dedupe_text: bool = True,
+) -> tuple[SyntheticRouteExample, ...]:
+    return tuple(
+        iter_bootstrap_examples(
+            label=label,
+            user_label=user_label,
+            difficulty=difficulty,
+            per_recipe_limit=per_recipe_limit,
+            shuffle=shuffle,
+            seed=seed,
+            dedupe_text=dedupe_text,
+        )
+    )
+
+
+T = SyntheticRouteTemplate
+R = SyntheticRouteRecipe
 
 
 _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="stable_explanation",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("plain", "Erklaer mir {concept} in einfachen Worten."),
-            SyntheticRouteTemplate("question", "Was bedeutet {concept}?"),
-            SyntheticRouteTemplate("function", "Wie funktioniert {concept} genau?"),
-            SyntheticRouteTemplate("spoken", "Kannst du mir {concept} kurz erklaeren?"),
+            T("plain", "Erklaer mir {concept} in einfachen Worten."),
+            T("question", "Was bedeutet {concept}?"),
+            T("function", "Wie funktioniert {concept} genau?"),
+            T("spoken", "Kannst du mir {concept} kurz erklaeren?"),
         ),
         slot_values={
             "concept": (
@@ -100,14 +616,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="stable_comparison",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("difference", "Was ist der Unterschied zwischen {pair}?"),
-            SyntheticRouteTemplate("recognize", "Woran erkennt man den Unterschied zwischen {pair}?"),
-            SyntheticRouteTemplate("simple", "Vergleich mir {pair} in einfachen Worten."),
+            T("difference", "Was ist der Unterschied zwischen {pair}?"),
+            T("recognize", "Woran erkennt man den Unterschied zwischen {pair}?"),
+            T("simple", "Vergleich mir {pair} in einfachen Worten."),
         ),
         slot_values={
             "pair": (
@@ -126,14 +642,33 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="how_to_without_action",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("how_to", "Wie kann man {task}?"),
-            SyntheticRouteTemplate("explain_steps", "Erklaer mir Schritt fuer Schritt, wie man {task}."),
-            SyntheticRouteTemplate("learn", "Ich moechte lernen, wie man {task}."),
+            T(
+                "how_to",
+                "Wie kann man {task}?",
+                slot_overrides={
+                    "task": (
+                        "einen Timer einstellen",
+                        "einen Brief formulieren",
+                        "Nudeln kochen",
+                        "Blutdruck messen",
+                        "einen Videocall vorbereiten",
+                        "eine Zimmerpflanze umtopfen",
+                        "eine E Mail beantworten",
+                        "eine Einkaufsliste schreiben",
+                        "das Smartphone lauter stellen",
+                        "die Heizung entlueften",
+                        "einen Verband wechseln",
+                        "ein Passwort sicher aufschreiben",
+                    ),
+                },
+            ),
+            T("explain_steps", "Erklaer mir Schritt fuer Schritt, wie man {task}."),
+            T("learn", "Ich moechte lernen, wie man {task}."),
         ),
         slot_values={
             "task": (
@@ -152,14 +687,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="history_and_people",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("who", "Wer war {person}?"),
-            SyntheticRouteTemplate("known_for", "Warum ist {person} bekannt?"),
-            SyntheticRouteTemplate("when", "Wann lebte {person}?"),
+            T("who", "Wer war {person}?"),
+            T("known_for", "Warum ist {person} bekannt?"),
+            T("when", "Wann lebte {person}?"),
         ),
         slot_values={
             "person": (
@@ -178,14 +713,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="translation_and_phrase_help",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("translate", "Wie sagt man {phrase} auf {language}?"),
-            SyntheticRouteTemplate("means", "Was heisst {phrase} auf {language}?"),
-            SyntheticRouteTemplate("phrase_help", "Uebersetz mir {phrase} in {language}."),
+            T("translate", "Wie sagt man {phrase} auf {language}?"),
+            T("means", "Was heisst {phrase} auf {language}?"),
+            T("phrase_help", "Uebersetz mir {phrase} in {language}."),
         ),
         slot_values={
             "phrase": (
@@ -200,17 +735,24 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
                 "Kannst du mir helfen",
                 "Ich komme morgen wieder",
             ),
-            "language": ("Italienisch", "Spanisch", "Englisch", "Franzoesisch", "Portugiesisch", "Niederlaendisch"),
+            "language": (
+                "Italienisch",
+                "Spanisch",
+                "Englisch",
+                "Franzoesisch",
+                "Portugiesisch",
+                "Niederlaendisch",
+            ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="stable_short_explanation",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("short", "Erklaer mir kurz {concept}."),
-            SyntheticRouteTemplate("simple", "Kannst du mir einfach erklaeren, was {concept} ist?"),
-            SyntheticRouteTemplate("spoken", "Sag mir bitte kurz, was {concept} bedeutet."),
+            T("short", "Erklaer mir kurz {concept}."),
+            T("simple", "Kannst du mir einfach erklaeren, was {concept} ist?"),
+            T("spoken", "Sag mir bitte kurz, was {concept} bedeutet."),
         ),
         slot_values={
             "concept": (
@@ -229,14 +771,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="stable_why_questions",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("why", "Warum {phenomenon}?"),
-            SyntheticRouteTemplate("wieso", "Wieso {phenomenon}?"),
-            SyntheticRouteTemplate("explain_why", "Kannst du mir erklaeren, warum {phenomenon}?"),
+            T("why", "Warum {phenomenon}?"),
+            T("wieso", "Wieso {phenomenon}?"),
+            T("explain_why", "Kannst du mir erklaeren, warum {phenomenon}?"),
         ),
         slot_values={
             "phenomenon": (
@@ -255,14 +797,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="general_tech_and_daily_knowledge",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("works", "Wie funktioniert {thing} eigentlich?"),
-            SyntheticRouteTemplate("means", "Was genau ist {thing}?"),
-            SyntheticRouteTemplate("learn", "Ich moechte verstehen, wie {thing} funktioniert."),
+            T("works", "Wie funktioniert {thing} eigentlich?"),
+            T("means", "Was genau ist {thing}?"),
+            T("learn", "Ich moechte verstehen, wie {thing} funktioniert."),
         ),
         slot_values={
             "thing": (
@@ -281,14 +823,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="parametric",
         family_key="stable_usage_questions",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("usage", "Wofuer braucht man {thing}?"),
-            SyntheticRouteTemplate("purpose", "Wozu ist {thing} gut?"),
-            SyntheticRouteTemplate("body", "Was macht {system_part}?"),
+            T("usage", "Wofuer braucht man {thing}?"),
+            T("purpose", "Wozu ist {thing} gut?"),
+            T("body", "Was macht {system_part}?"),
         ),
         slot_values={
             "thing": (
@@ -317,17 +859,24 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="current_weather",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("forecast", "Wie wird das Wetter {time_ref} in {place}?"),
-            SyntheticRouteTemplate("umbrella", "Brauche ich {time_ref} in {place} einen Schirm?"),
-            SyntheticRouteTemplate("temperature", "Wie warm wird es {time_ref} in {place}?"),
+            T("forecast", "Wie wird das Wetter {time_ref} in {place}?"),
+            T("umbrella", "Brauche ich {time_ref} in {place} einen Schirm?"),
+            T("temperature", "Wie warm wird es {time_ref} in {place}?"),
         ),
         slot_values={
-            "time_ref": ("heute", "morgen", "am Wochenende", "heute Abend", "morgen Mittag", "in der Nacht"),
+            "time_ref": (
+                "heute",
+                "morgen",
+                "am Wochenende",
+                "heute Abend",
+                "morgen Mittag",
+                "in der Nacht",
+            ),
             "place": (
                 "Berlin",
                 "Hamburg",
@@ -344,18 +893,34 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="current_news",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("today_news", "Was ist {time_ref} in {place} passiert?"),
-            SyntheticRouteTemplate("latest_topic", "Gibt es {time_ref} Neuigkeiten zu {topic}?"),
-            SyntheticRouteTemplate("summary", "Fass mir die aktuellen Meldungen zu {topic} zusammen."),
+            T("today_news", "Was ist {time_ref} in {place} passiert?"),
+            T("latest_topic", "Gibt es {time_ref} Neuigkeiten zu {topic}?"),
+            T("summary", "Fass mir die aktuellen Meldungen zu {topic} zusammen."),
         ),
         slot_values={
-            "time_ref": ("heute", "gerade", "im Moment", "seit heute Morgen", "heute Abend", "in den letzten Stunden"),
-            "place": ("Berlin", "Deutschland", "Europa", "Hamburg", "Muenchen", "Brandenburg", "Sachsen", "Nordrhein Westfalen"),
+            "time_ref": (
+                "heute",
+                "gerade",
+                "im Moment",
+                "seit heute Morgen",
+                "heute Abend",
+                "in den letzten Stunden",
+            ),
+            "place": (
+                "Berlin",
+                "Deutschland",
+                "Europa",
+                "Hamburg",
+                "Muenchen",
+                "Brandenburg",
+                "Sachsen",
+                "Nordrhein Westfalen",
+            ),
             "topic": (
                 "der Bahn",
                 "dem Bundestag",
@@ -372,18 +937,36 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="live_schedule_and_opening",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("train", "Wann faehrt der naechste Zug von {origin} nach {destination}?"),
-            SyntheticRouteTemplate("open_now", "Hat {place} {time_ref} geoeffnet?"),
-            SyntheticRouteTemplate("traffic", "Ist {route} {time_ref} gesperrt?"),
+            T("train", "Wann faehrt der naechste Zug von {origin} nach {destination}?"),
+            T("open_now", "Hat {place} {time_ref} geoeffnet?"),
+            T("traffic", "Ist {route} {time_ref} gesperrt?"),
         ),
         slot_values={
-            "origin": ("Berlin", "Hamburg", "Koeln", "Leipzig", "Dresden", "Kiel", "Potsdam", "Erfurt"),
-            "destination": ("Potsdam", "Hannover", "Dresden", "Bremen", "Magdeburg", "Rostock", "Jena", "Luebeck"),
+            "origin": (
+                "Berlin",
+                "Hamburg",
+                "Koeln",
+                "Leipzig",
+                "Dresden",
+                "Kiel",
+                "Potsdam",
+                "Erfurt",
+            ),
+            "destination": (
+                "Potsdam",
+                "Hannover",
+                "Dresden",
+                "Bremen",
+                "Magdeburg",
+                "Rostock",
+                "Jena",
+                "Luebeck",
+            ),
             "place": (
                 "die Apotheke am Markt",
                 "das Buero vom Buergerservice",
@@ -394,7 +977,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
                 "die Sparkasse am Platz",
                 "die Physiopraxis",
             ),
-            "time_ref": ("heute", "jetzt", "morgen frueh", "am Sonntag", "heute Nachmittag", "naechste Woche"),
+            "time_ref": (
+                "heute",
+                "jetzt",
+                "morgen frueh",
+                "am Sonntag",
+                "heute Nachmittag",
+                "naechste Woche",
+            ),
             "route": (
                 "die A9",
                 "die Ringbahn",
@@ -407,17 +997,28 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="current_price_and_availability",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("price_now", "Wie teuer ist {asset} gerade?"),
-            SyntheticRouteTemplate("price_current", "Wie hoch ist aktuell der Preis von {asset}?"),
-            SyntheticRouteTemplate("availability", "Ist {product} im Moment lieferbar?"),
+            T("price_now", "Wie teuer ist {asset} gerade?"),
+            T("price_current", "Wie hoch ist aktuell der Preis von {asset}?"),
+            T("availability", "Ist {product} im Moment lieferbar?"),
         ),
         slot_values={
-            "asset": ("Heizoel", "Gold", "Bitcoin", "eine Monatskarte", "Strom", "Gas", "Silber", "Diesel", "Superbenzin", "Fernwaerme"),
+            "asset": (
+                "Heizoel",
+                "Gold",
+                "Bitcoin",
+                "eine Monatskarte",
+                "Strom",
+                "Gas",
+                "Silber",
+                "Diesel",
+                "Superbenzin",
+                "Fernwaerme",
+            ),
             "product": (
                 "das Diabetes Messgeraet",
                 "das Druckerpapier",
@@ -430,17 +1031,26 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="safety_lookup",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("meds", "Kann ich {med_a} mit {med_b} zusammen nehmen?"),
-            SyntheticRouteTemplate("recall", "Gibt es aktuell Rueckrufe fuer {product}?"),
-            SyntheticRouteTemplate("warning", "Gibt es {time_ref} eine Warnung fuer {hazard} in {place}?"),
+            T("meds", "Kann ich {med_a} mit {med_b} zusammen nehmen?"),
+            T("recall", "Gibt es aktuell Rueckrufe fuer {product}?"),
+            T("warning", "Gibt es {time_ref} eine Warnung fuer {hazard} in {place}?"),
         ),
         slot_values={
-            "med_a": ("Ibuprofen", "Aspirin", "Paracetamol", "Magnesium", "Diclofenac", "Nasenspray", "Johanniskraut", "Vitamin K"),
+            "med_a": (
+                "Ibuprofen",
+                "Aspirin",
+                "Paracetamol",
+                "Magnesium",
+                "Diclofenac",
+                "Nasenspray",
+                "Johanniskraut",
+                "Vitamin K",
+            ),
             "med_b": (
                 "Blutverduenner",
                 "meine Herztabletten",
@@ -462,18 +1072,36 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
                 "Tiefkuehlbeeren",
             ),
             "time_ref": ("heute", "gerade", "fuer morgen", "im Moment"),
-            "hazard": ("Sturm", "Glatteis", "Hochwasser", "starke Hitze", "Waldbrand", "Feinstaub", "starker Regen", "Gewitter"),
-            "place": ("Berlin", "Hamburg", "Sachsen", "Brandenburg", "Bayern", "Thueringen", "Hessen", "Rheinland Pfalz"),
+            "hazard": (
+                "Sturm",
+                "Glatteis",
+                "Hochwasser",
+                "starke Hitze",
+                "Waldbrand",
+                "Feinstaub",
+                "starker Regen",
+                "Gewitter",
+            ),
+            "place": (
+                "Berlin",
+                "Hamburg",
+                "Sachsen",
+                "Brandenburg",
+                "Bayern",
+                "Thueringen",
+                "Hessen",
+                "Rheinland Pfalz",
+            ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="current_role_holder",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("derzeit", "Wer ist derzeit {role}?"),
-            SyntheticRouteTemplate("aktuell", "Wer ist aktuell {role}?"),
-            SyntheticRouteTemplate("amt", "Wer hat im Moment das Amt {role}?"),
+            T("derzeit", "Wer ist derzeit {role}?"),
+            T("aktuell", "Wer ist aktuell {role}?"),
+            T("amt", "Wer hat im Moment das Amt {role}?"),
         ),
         slot_values={
             "role": (
@@ -490,14 +1118,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="live_topic_status",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("what_now", "Was ist aktuell mit {topic} los?"),
-            SyntheticRouteTemplate("situation", "Wie ist momentan die Lage bei {topic}?"),
-            SyntheticRouteTemplate("new", "Gibt es derzeit etwas Neues zu {topic}?"),
+            T("what_now", "Was ist aktuell mit {topic} los?"),
+            T("situation", "Wie ist momentan die Lage bei {topic}?"),
+            T("new", "Gibt es derzeit etwas Neues zu {topic}?"),
         ),
         slot_values={
             "topic": (
@@ -516,14 +1144,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="web",
         family_key="mutable_role_plain_question",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("plain_role", "Wer ist {role}?"),
-            SyntheticRouteTemplate("holds_office", "Wer hat das Amt {role}?"),
-            SyntheticRouteTemplate("leads_org", "Wer leitet {institution}?"),
+            T("plain_role", "Wer ist {role}?"),
+            T("holds_office", "Wer hat das Amt {role}?"),
+            T("leads_org", "Wer leitet {institution}?"),
         ),
         slot_values={
             "role": (
@@ -546,14 +1174,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="personal_fact",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("name", "Wie heisst {relation}?"),
-            SyntheticRouteTemplate("birthday", "Wann hat {relation} Geburtstag?"),
-            SyntheticRouteTemplate("doctor", "Wie heisst mein {role}?"),
+            T("name", "Wie heisst {relation}?"),
+            T("birthday", "Wann hat {relation} Geburtstag?"),
+            T("doctor", "Wie heisst mein {role}?"),
         ),
         slot_values={
             "relation": (
@@ -584,27 +1212,40 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="preferences",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("favorite", "Welchen {item} mag ich am liebsten?"),
-            SyntheticRouteTemplate("music", "Welche Musik hoere ich gern, wenn ich unruhig bin?"),
-            SyntheticRouteTemplate("routine", "Welchen Tee trinke ich abends am liebsten?"),
+            T("favorite", "Welchen {item} mag ich am liebsten?"),
+            T("music", "Welche Musik hoere ich gern, wenn ich unruhig bin?"),
+            T("routine", "Welchen Tee trinke ich abends am liebsten?"),
         ),
         slot_values={
-            "item": ("Kuchen", "Tee", "Saft", "Pullover", "Filmgenre", "Suppe", "Marmelade", "Musikrichtung", "Kissen", "Schal", "Buchgenre", "Brot"),
+            "item": (
+                "Kuchen",
+                "Tee",
+                "Saft",
+                "Pullover",
+                "Filmgenre",
+                "Suppe",
+                "Marmelade",
+                "Musikrichtung",
+                "Kissen",
+                "Schal",
+                "Buchgenre",
+                "Brot",
+            ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="household_location",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("where", "Wo haben wir {object_name} hingelegt?"),
-            SyntheticRouteTemplate("kept", "Wo liegt {object_name} normalerweise?"),
-            SyntheticRouteTemplate("stored", "In welchem Schrank bewahren wir {object_name} auf?"),
+            T("where", "Wo haben wir {object_name} hingelegt?"),
+            T("kept", "Wo liegt {object_name} normalerweise?"),
+            T("stored", "In welchem Schrank bewahren wir {object_name} auf?"),
         ),
         slot_values={
             "object_name": (
@@ -623,14 +1264,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="prior_conversation",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("remember_plan", "Was hatten wir ueber {topic} festgehalten?"),
-            SyntheticRouteTemplate("reminder_context", "Woran wollte ich mich {time_ref} erinnern?"),
-            SyntheticRouteTemplate("trip_plan", "Welchen Plan hatten wir fuer {event}?"),
+            T("remember_plan", "Was hatten wir ueber {topic} festgehalten?"),
+            T("reminder_context", "Woran wollte ich mich {time_ref} erinnern?"),
+            T("trip_plan", "Welchen Plan hatten wir fuer {event}?"),
         ),
         slot_values={
             "topic": (
@@ -645,7 +1286,16 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
                 "den Zahnarzttermin",
                 "die Bahnfahrt",
             ),
-            "time_ref": ("morgen", "naechste Woche", "am Wochenende", "im April", "im Mai", "naechsten Monat", "an Weihnachten", "uebermorgen"),
+            "time_ref": (
+                "morgen",
+                "naechste Woche",
+                "am Wochenende",
+                "im April",
+                "im Mai",
+                "naechsten Monat",
+                "an Weihnachten",
+                "uebermorgen",
+            ),
             "event": (
                 "Ostern",
                 "den Familienbesuch",
@@ -660,14 +1310,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="personal_health_notes",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("allergies", "Welche Allergien habe ich?"),
-            SyntheticRouteTemplate("meds", "Welche Tabletten nehme ich morgens?"),
-            SyntheticRouteTemplate("notes", "Was steht in meinen Notizen zu {topic}?"),
+            T("allergies", "Welche Allergien habe ich?"),
+            T("meds", "Welche Tabletten nehme ich morgens?"),
+            T("notes", "Was steht in meinen Notizen zu {topic}?"),
         ),
         slot_values={
             "topic": (
@@ -684,14 +1334,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="contact_details",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("phone", "Welche Telefonnummer hat {contact}?"),
-            SyntheticRouteTemplate("address", "Welche Adresse habe ich fuer {contact} gespeichert?"),
-            SyntheticRouteTemplate("details", "Welche Kontaktdaten habe ich zu {contact} notiert?"),
+            T("phone", "Welche Telefonnummer hat {contact}?"),
+            T("address", "Welche Adresse habe ich fuer {contact} gespeichert?"),
+            T("details", "Welche Kontaktdaten habe ich zu {contact} notiert?"),
         ),
         slot_values={
             "contact": (
@@ -710,40 +1360,40 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="personal_routines",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("when_usually", "Wann mache ich normalerweise {routine}?"),
-            SyntheticRouteTemplate("day", "An welchem Tag ist bei mir {routine} dran?"),
-            SyntheticRouteTemplate("time", "Zu welcher Uhrzeit mache ich meistens {routine}?"),
+            T("when_usually", "Wann ist bei mir normalerweise {routine}?"),
+            T("day", "An welchem Tag ist bei mir {routine} dran?"),
+            T("time", "Zu welcher Uhrzeit ist bei mir meistens {routine}?"),
         ),
         slot_values={
             "routine": (
                 "die Gymnastik",
-                "den Wocheneinkauf",
+                "der Wocheneinkauf",
                 "das Blumen giessen",
-                "den Blutdruck",
-                "den Anruf bei meiner Tochter",
-                "das Medikamente sortieren",
-                "den Spaziergang",
-                "das Tagebuch schreiben",
-                "das Hoergeraet Laden",
-                "den Muell rausbringen",
+                "das Blutdruckmessen",
+                "der Anruf bei meiner Tochter",
+                "das Sortieren der Medikamente",
+                "der Spaziergang",
+                "das Tagebuchschreiben",
+                "das Laden des Hoergeraets",
+                "das Muell rausbringen",
                 "das Bett beziehen",
-                "den Chorabend",
+                "der Chorabend",
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="known_people_preferences",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("likes", "Was mag {person} besonders gern?"),
-            SyntheticRouteTemplate("prefers", "Worueber freut sich {person} am meisten?"),
-            SyntheticRouteTemplate("notes", "Was hatten wir ueber {person} festgehalten?"),
+            T("likes", "Was mag {person} besonders gern?"),
+            T("prefers", "Worueber freut sich {person} am meisten?"),
+            T("notes", "Was hatten wir ueber {person} festgehalten?"),
         ),
         slot_values={
             "person": (
@@ -760,14 +1410,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="short_known_people_preferences",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("short_like", "Was mag {person}?"),
-            SyntheticRouteTemplate("likes", "Was mag {person} gern?"),
-            SyntheticRouteTemplate("happy", "Worueber freut sich {person}?"),
+            T("short_like", "Was mag {person}?"),
+            T("likes", "Was mag {person} gern?"),
+            T("happy", "Worueber freut sich {person}?"),
         ),
         slot_values={
             "person": (
@@ -784,14 +1434,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="remembered_people_context",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("about_person", "Was hatten wir ueber {person} besprochen?"),
-            SyntheticRouteTemplate("notes", "Was weiss ich ueber {person}?"),
-            SyntheticRouteTemplate("stored", "Was hatten wir uns zu {person} notiert?"),
+            T("about_person", "Was hatten wir ueber {person} besprochen?"),
+            T("notes", "Was weiss ich ueber {person}?"),
+            T("stored", "Was hatten wir uns zu {person} notiert?"),
         ),
         slot_values={
             "person": (
@@ -810,14 +1460,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="person_reason_memory",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("call_reason", "Warum hat {person} angerufen?"),
-            SyntheticRouteTemplate("visit_reason", "Warum kommt {person} zu mir?"),
-            SyntheticRouteTemplate("wanted_reason", "Weshalb wollte {person} mich sprechen?"),
+            T("call_reason", "Warum hat {person} angerufen?"),
+            T("visit_reason", "Aus welchem Grund kommt {person} zu mir?"),
+            T("wanted_reason", "Weshalb wollte {person} mich sprechen?"),
         ),
         slot_values={
             "person": (
@@ -834,14 +1484,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="memory",
         family_key="personal_reason_context",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("why_visit", "Warum kommt {person} zu mir?"),
-            SyntheticRouteTemplate("why_call", "Warum wollte {person} mich anrufen?"),
-            SyntheticRouteTemplate("why_note", "Weshalb hatten wir {topic} fuer mich festgehalten?"),
+            T("why_visit", "Warum kommt {person} zu mir?"),
+            T("why_call", "Warum wollte {person} mich anrufen?"),
+            T("why_note", "Weshalb hatten wir {topic} fuer mich festgehalten?"),
         ),
         slot_values={
             "person": (
@@ -866,15 +1516,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         user_label="persoenlich",
         family_key="personal_schedule_lookup",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("appointments", "Was habe ich {time_ref} fuer Termine?"),
-            SyntheticRouteTemplate("calendar", "Was steht {time_ref} in meinem Kalender?"),
-            SyntheticRouteTemplate("visit", "Kommt {time_ref} jemand zu mir?"),
+            T("appointments", "Was habe ich {time_ref} fuer Termine?"),
+            T("calendar", "Was steht {time_ref} in meinem Kalender?"),
+            T("visit", "Kommt {time_ref} jemand zu mir?"),
         ),
         slot_values={
             "time_ref": (
@@ -889,15 +1539,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         user_label="persoenlich",
         family_key="personal_pending_state",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("meds_open", "Habe ich {time_ref} noch Medikamente offen?"),
-            SyntheticRouteTemplate("reminders", "Welche Erinnerung habe ich {time_ref}?"),
-            SyntheticRouteTemplate("tasks", "Welche Aufgaben habe ich {time_ref} noch offen?"),
+            T("meds_open", "Habe ich {time_ref} noch Medikamente offen?"),
+            T("reminders", "Welche Erinnerung habe ich {time_ref}?"),
+            T("tasks", "Welche Aufgaben habe ich {time_ref} noch offen?"),
         ),
         slot_values={
             "time_ref": (
@@ -912,15 +1562,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         user_label="persoenlich",
         family_key="personal_day_overview",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("today", "Was ist {time_ref} bei mir los?"),
-            SyntheticRouteTemplate("for_me", "Was steht {time_ref} fuer mich an?"),
-            SyntheticRouteTemplate("overview", "Was habe ich {time_ref} noch vor?"),
+            T("today", "Was ist {time_ref} bei mir los?"),
+            T("for_me", "Was steht {time_ref} fuer mich an?"),
+            T("overview", "Was habe ich {time_ref} noch vor?"),
         ),
         slot_values={
             "time_ref": (
@@ -935,15 +1585,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         user_label="persoenlich",
         family_key="personal_short_schedule_status",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("have_plan", "Hab ich {time_ref} was vor?"),
-            SyntheticRouteTemplate("planned", "Ist {time_ref} bei mir was geplant?"),
-            SyntheticRouteTemplate("coming_up", "Steht {time_ref} bei mir etwas an?"),
+            T("have_plan", "Hab ich {time_ref} was vor?"),
+            T("planned", "Ist {time_ref} bei mir was geplant?"),
+            T("coming_up", "Steht {time_ref} bei mir etwas an?"),
         ),
         slot_values={
             "time_ref": (
@@ -958,15 +1608,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         user_label="persoenlich",
         family_key="care_support_visits",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("when_arrive", "Wann kommt {visitor} zu mir?"),
-            SyntheticRouteTemplate("is_scheduled", "Ist {visitor} {time_ref} bei mir eingetragen?"),
-            SyntheticRouteTemplate("coming", "Kommt {visitor} {time_ref} zu mir?"),
+            T("when_arrive", "Wann kommt {visitor} zu mir?"),
+            T("is_scheduled", "Ist {visitor} {time_ref} bei mir eingetragen?"),
+            T("coming", "Kommt {visitor} {time_ref} zu mir?"),
         ),
         slot_values={
             "visitor": (
@@ -991,14 +1641,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="house_state_snapshot",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("house_now", "Was ist im Haus los?"),
-            SyntheticRouteTemplate("doors", "Ist {door} gerade offen?"),
-            SyntheticRouteTemplate("room_state", "Wie ist der Status im {room}?"),
+            T("house_now", "Was ist im Haus los?"),
+            T("doors", "Ist {door} gerade offen?"),
+            T("room_state", "Wie ist der Status im {room}?"),
         ),
         slot_values={
             "door": (
@@ -1019,14 +1669,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="home_environment_state",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("temperature", "Wie warm ist es gerade im {room}?"),
-            SyntheticRouteTemplate("light", "Ist im {room} noch Licht an?"),
-            SyntheticRouteTemplate("appliance", "Ist {appliance} gerade an?"),
+            T("temperature", "Wie warm ist es gerade im {room}?"),
+            T("light", "Ist im {room} noch Licht an?"),
+            T("appliance", "Ist {appliance} gerade an?"),
         ),
         slot_values={
             "room": (
@@ -1051,60 +1701,90 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="doorbell_and_presence_check",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("doorbell", "Hat es gerade geklingelt?"),
-            SyntheticRouteTemplate("door", "War jemand an der Haustuer?"),
-            SyntheticRouteTemplate("arrival", "Ist eben jemand gekommen?"),
+            T("doorbell", "Hat es gerade geklingelt?"),
+            T("door", "War jemand an der Haustuer?"),
+            T("arrival", "Ist eben jemand gekommen?"),
         ),
         slot_values={},
     ),
-    SyntheticRouteRecipe(
+    # BREAKING: home_scene_control template keys changed from
+    # ("lights", "switch", "set") to domain-safe control groups
+    # ("binary_power", "volume", "heating", "fan_speed") so impossible
+    # device/state Cartesian products can no longer be generated.
+    R(
         label="tool",
         family_key="home_scene_control",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("lights", "Mach {device} bitte {state}."),
-            SyntheticRouteTemplate("switch", "Schalte {device} {state}."),
-            SyntheticRouteTemplate("set", "Stell {device} auf {state}."),
+            T(
+                "binary_power",
+                "Mach {device} bitte {state}.",
+                slot_overrides={
+                    "device": (
+                        "das Licht im Wohnzimmer",
+                        "die Lampe im Flur",
+                        "den Fernseher",
+                        "die Steckdose an der Kaffeemaschine",
+                        "das Radio",
+                        "die Nachttischlampe",
+                    ),
+                    "state": ("an", "aus"),
+                },
+            ),
+            T(
+                "volume",
+                "Mach {device} bitte {state}.",
+                slot_overrides={
+                    "device": ("den Fernseher", "das Radio"),
+                    "state": ("leiser", "lauter"),
+                },
+            ),
+            T(
+                "heating",
+                "Stell {device} auf {state}.",
+                slot_overrides={
+                    "device": ("die Heizung im Bad",),
+                    "state": ("waermer", "kuehler"),
+                },
+            ),
+            T(
+                "fan_speed",
+                "Stell {device} auf Stufe {state}.",
+                slot_overrides={
+                    "device": ("den Ventilator",),
+                    "state": ("eins", "zwei", "drei"),
+                },
+            ),
         ),
-        slot_values={
-            "device": (
-                "das Licht im Wohnzimmer",
-                "die Lampe im Flur",
-                "den Fernseher",
-                "die Heizung im Bad",
-                "den Ventilator",
-                "die Steckdose an der Kaffeemaschine",
-                "das Radio",
-                "die Nachttischlampe",
-            ),
-            "state": (
-                "an",
-                "aus",
-                "leiser",
-                "lauter",
-                "waermer",
-                "kuehler",
-                "niedriger",
-                "hoeher",
-            ),
-        },
+        slot_values={},
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="timers_and_reminders",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("timer", "Stell einen Timer auf {duration}."),
-            SyntheticRouteTemplate("alarm", "Mach mir einen Wecker fuer {clock_time}."),
-            SyntheticRouteTemplate("remind", "Erinnere mich {time_ref} an {task}."),
+            T("timer", "Stell einen Timer auf {duration}."),
+            T("alarm", "Mach mir einen Wecker fuer {clock_time}."),
+            T("remind", "Erinnere mich {time_ref} an {task}."),
         ),
         slot_values={
-            "duration": ("5 Minuten", "10 Minuten", "15 Minuten", "20 Minuten", "25 Minuten", "30 Minuten", "45 Minuten", "eine Stunde", "zwei Stunden", "90 Minuten"),
+            "duration": (
+                "5 Minuten",
+                "10 Minuten",
+                "15 Minuten",
+                "20 Minuten",
+                "25 Minuten",
+                "30 Minuten",
+                "45 Minuten",
+                "eine Stunde",
+                "zwei Stunden",
+                "90 Minuten",
+            ),
             "clock_time": (
                 "7 Uhr",
                 "8 Uhr 30",
@@ -1130,29 +1810,29 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
                 "in einer Stunde",
             ),
             "task": (
-                "die Tabletten",
+                "die Tabletteneinnahme",
                 "den Anruf bei meiner Tochter",
-                "das Blumen giessen",
+                "das Giessen der Blumen",
                 "den Arzttermin",
                 "das Wasser trinken",
                 "die Waesche",
                 "die Gymnastikuebungen",
-                "den Blutdruck",
+                "das Blutdruckmessen",
                 "den Muell",
                 "das Abendessen",
                 "den Spaziergang",
-                "das Hoergeraet Laden",
+                "das Laden des Hoergeraets",
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="print_and_write",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("print", "Druck {item}."),
-            SyntheticRouteTemplate("list", "Schreib {item} auf die Liste."),
-            SyntheticRouteTemplate("note", "Notier dir bitte {item}."),
+            T("print", "Druck {item}."),
+            T("list", "Schreib {item} auf die Liste."),
+            T("note", "Notier dir bitte {item}."),
         ),
         slot_values={
             "item": (
@@ -1169,15 +1849,15 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="device_control",
         difficulty="standard",
         templates=(
-            SyntheticRouteTemplate("louder", "Mach bitte lauter."),
-            SyntheticRouteTemplate("quieter", "Stell die Lautstaerke leiser."),
-            SyntheticRouteTemplate("play", "Starte {media_item}."),
-            SyntheticRouteTemplate("stop", "Stoppe {media_item}."),
+            T("louder", "Mach bitte lauter."),
+            T("quieter", "Stell die Lautstaerke leiser."),
+            T("play", "Starte {media_item}."),
+            T("stop", "Stoppe {media_item}."),
         ),
         slot_values={
             "media_item": (
@@ -1194,17 +1874,28 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="live_state_check",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("printer", "Pruef, ob der {device} verbunden ist."),
-            SyntheticRouteTemplate("status", "Schau nach, ob {status_item}."),
-            SyntheticRouteTemplate("show", "Zeig mir {system_view}."),
+            T("printer", "Pruef, ob der {device} verbunden ist."),
+            T("status", "Schau nach, ob {status_item}."),
+            T("show", "Zeig mir {system_view}."),
         ),
         slot_values={
-            "device": ("Drucker", "Bildschirm", "WLAN Adapter", "Lautsprecher", "Scanner", "Mikrofon", "Kopfhoerer", "Touchdisplay", "Router", "Ladestation"),
+            "device": (
+                "Drucker",
+                "Bildschirm",
+                "WLAN Adapter",
+                "Lautsprecher",
+                "Scanner",
+                "Mikrofon",
+                "Kopfhoerer",
+                "Touchdisplay",
+                "Router",
+                "Ladestation",
+            ),
             "status_item": (
                 "noch Erinnerungen offen sind",
                 "der Drucker Papier hat",
@@ -1229,14 +1920,14 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
-    SyntheticRouteRecipe(
+    R(
         label="tool",
         family_key="messages_and_actions",
         difficulty="boundary",
         templates=(
-            SyntheticRouteTemplate("message", "Schick {person} die Nachricht {message}."),
-            SyntheticRouteTemplate("call", "Ruf bitte {person} an."),
-            SyntheticRouteTemplate("open", "Oeffne {view}."),
+            T("message", "Schick {person} die Nachricht {message}."),
+            T("call", "Ruf bitte {person} an."),
+            T("open", "Oeffne {view}."),
         ),
         slot_values={
             "person": (
@@ -1275,4 +1966,27 @@ _ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = (
             ),
         },
     ),
+)
+
+_validate_recipe_registry(_ROUTE_RECIPES)
+
+_ROUTE_RECIPE_BY_FAMILY_KEY: Mapping[str, SyntheticRouteRecipe] = MappingProxyType(
+    {recipe.family_key: recipe for recipe in _ROUTE_RECIPES}
+)
+
+ROUTE_RECIPES: tuple[SyntheticRouteRecipe, ...] = _ROUTE_RECIPES
+ROUTE_RECIPE_BY_FAMILY_KEY: Mapping[str, SyntheticRouteRecipe] = _ROUTE_RECIPE_BY_FAMILY_KEY
+
+__all__ = (
+    "REGISTRY_VERSION",
+    "ROUTE_RECIPES",
+    "ROUTE_RECIPE_BY_FAMILY_KEY",
+    "SyntheticRouteTemplate",
+    "SyntheticRouteRecipe",
+    "SyntheticRouteExample",
+    "get_route_recipe",
+    "get_route_recipes",
+    "iter_route_recipes",
+    "iter_bootstrap_examples",
+    "build_bootstrap_corpus",
 )
