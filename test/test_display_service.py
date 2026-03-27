@@ -256,6 +256,63 @@ class DisplayServiceTests(unittest.TestCase):
                 ],
             )
 
+    def test_display_loop_shows_sleeping_face_cue_while_waiting_in_voice_quiet_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Ich bin jetzt ruhig.",
+                voice_quiet_until_utc="2026-03-13T13:00:00+00:00",
+            )
+            display = FakeDisplay()
+            loop = TwinrStatusDisplayLoop(
+                config=TwinrConfig(
+                    runtime_state_path=str(snapshot_path),
+                    display_poll_interval_s=0.0,
+                    openai_api_key="sk-test",
+                ),
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=lambda: datetime(2026, 3, 13, 12, 34, tzinfo=timezone.utc),
+            )
+
+            loop.run(max_cycles=1)
+
+            face_cue = display.calls[0][7]
+            self.assertIsNotNone(face_cue)
+            assert face_cue is not None
+            self.assertEqual(face_cue.source, "runtime_voice_quiet")
+            self.assertTrue(face_cue.blink)
+            self.assertEqual(face_cue.brows, "soft")
+            self.assertEqual(face_cue.mouth, "neutral")
+
+    def test_voice_quiet_face_cue_waits_for_idle_status(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            clock=lambda: datetime(2026, 3, 13, 12, 34, tzinfo=timezone.utc),
+        )
+
+        face_cue = loop._active_face_cue(
+            snapshot=RuntimeSnapshot(
+                status="answering",
+                voice_quiet_until_utc="2026-03-13T13:00:00+00:00",
+            )
+        )
+
+        self.assertIsNone(face_cue)
+
     def test_display_loop_persists_display_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

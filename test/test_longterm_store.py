@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.core.models import (
@@ -334,6 +334,39 @@ class _Http503ScopeTopKClient(_FakeChonkyClient):
                 },
             )
         return super().topk_records(request)
+
+
+class _TransientSegmentTimeoutClient(_FakeChonkyClient):
+    def __init__(self, *, failing_document_id: str, failing_uri: str) -> None:
+        super().__init__()
+        self.fetch_attempts_by_document_id: dict[str, int] = {}
+        self.fetch_attempts_by_uri: dict[str, int] = {}
+        self._remaining_document_failures = {failing_document_id: 1}
+        self._remaining_uri_failures = {failing_uri: 1}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        if isinstance(document_id, str) and document_id:
+            self.fetch_attempts_by_document_id[document_id] = self.fetch_attempts_by_document_id.get(document_id, 0) + 1
+            remaining_failures = self._remaining_document_failures.get(document_id, 0)
+            if remaining_failures > 0:
+                self._remaining_document_failures[document_id] = remaining_failures - 1
+                raise ChonkyDBError(
+                    "ChonkyDB request failed for GET /v1/external/documents/full: The read operation timed out"
+                )
+        if isinstance(origin_uri, str) and origin_uri:
+            self.fetch_attempts_by_uri[origin_uri] = self.fetch_attempts_by_uri.get(origin_uri, 0) + 1
+            remaining_failures = self._remaining_uri_failures.get(origin_uri, 0)
+            if remaining_failures > 0:
+                self._remaining_uri_failures[origin_uri] = remaining_failures - 1
+                raise ChonkyDBError(
+                    "ChonkyDB request failed for GET /v1/external/documents/full: The read operation timed out"
+                )
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
+        )
 
 
 class _AsyncBulkEventuallyVisibleClient(_FakeChonkyClient):
@@ -1140,6 +1173,7 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             response_json={"results": []},
         )
         try:
+            classified_dns = ""
             try:
                 raise socket.gaierror(-3, "Temporary failure in name resolution")
             except socket.gaierror as inner:
@@ -1884,6 +1918,66 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(catalog_entries), 1)
         self.assertEqual(catalog_entries[0].document_id, "doc-1")
+
+    def test_remote_catalog_segment_read_retries_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.long_term_memory_remote_retry_attempts = 2
+            remote_state.config.long_term_memory_remote_retry_backoff_s = 0.0
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            segment_document_id = "segment-doc-1"
+            segment_uri = remote_catalog._catalog_segment_uri(snapshot_kind="objects", segment_index=0)
+            client = _TransientSegmentTimeoutClient(
+                failing_document_id=segment_document_id,
+                failing_uri=segment_uri,
+            )
+            remote_state.client = client
+            remote_state.read_client = client
+            remote_state.write_client = client
+            client.records_by_document_id[segment_document_id] = {
+                "document_id": segment_document_id,
+                "payload": {
+                    "schema": "twinr_memory_object_catalog_segment_v1",
+                    "version": 1,
+                    "snapshot_kind": "objects",
+                    "segment_index": 0,
+                    "items": [
+                        {
+                            "item_id": "fact:jam_preference",
+                            "document_id": "doc-1",
+                            "summary": "Du magst Aprikosenmarmelade.",
+                            "kind": "fact",
+                            "status": "active",
+                        }
+                    ],
+                },
+                "metadata": {},
+                "content": "segment",
+                "uri": segment_uri,
+            }
+            client.records_by_uri[segment_uri] = dict(client.records_by_document_id[segment_document_id])
+
+            entries = remote_catalog._load_segmented_catalog_entries(
+                definition=remote_catalog._require_definition("objects"),
+                payload={
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "document_id": segment_document_id,
+                            "uri": segment_uri,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].item_id, "fact:jam_preference")
+        self.assertEqual(entries[0].document_id, "doc-1")
+        self.assertEqual(client.fetch_attempts_by_document_id[segment_document_id], 2)
+        self.assertEqual(client.fetch_attempts_by_uri[segment_uri], 1)
 
     def test_remote_catalog_bulk_write_prefers_async_job_document_ids_over_same_uri_head(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

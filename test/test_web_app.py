@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from typing import cast
 from unittest.mock import patch
 import wave
 
@@ -17,8 +18,17 @@ import warnings
 from fastapi.testclient import TestClient
 from test.self_coding_test_utils import stable_sha256
 
-from twinr.agent.base_agent import AdaptiveTimingStore, RuntimeSnapshotStore, TwinrConfig
-from twinr.automations import AutomationAction, AutomationDefinition, AutomationStore, IfThenAutomationTrigger, build_sensor_trigger
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveTimingStore
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
+from twinr.automations import (
+    AutomationAction,
+    AutomationDefinition,
+    AutomationStore,
+    IfThenAutomationTrigger,
+    TimeAutomationTrigger,
+    build_sensor_trigger,
+)
 from twinr.agent.self_coding.contracts import (
     ActivationRecord,
     CompileJobRecord,
@@ -51,13 +61,14 @@ from twinr.integrations import (
     TwinrIntegrationStore,
     hue_application_key_env_key_for_host,
 )
+from twinr.integrations.email.connectivity import EmailConnectionTestResult, EmailTransportProbe
 from twinr.ops import DeviceFact, DeviceOverview, DeviceStatus, TwinrOpsEventStore, resolve_ops_paths
 from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogSample,
     RemoteMemoryWatchdogSnapshot,
     RemoteMemoryWatchdogStore,
 )
-from twinr.web import create_app
+from twinr.web.app import create_app
 from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
 
 _TEST_WHATSAPP_ALLOW_FROM = "+15555554567"
@@ -97,11 +108,14 @@ def _voice_sample_wav_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
         )
         frames.append(max(-32767, min(32767, int(sample * 32767))))
     buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav_file:
+    # Pylint resolves this stdlib writer handle as ``Wave_read`` even in ``wb`` mode.
+    # pylint: disable=no-member
+    with cast(wave.Wave_write, wave.open(buffer, "wb")) as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(frames.tobytes())
+    # pylint: enable=no-member
     return buffer.getvalue()
 
 
@@ -572,11 +586,17 @@ class WebAppTests(unittest.TestCase):
 
         restored = store.load_activation("morning_briefing", version=1)
         paused = store.load_activation("morning_briefing", version=2)
+        restored_automation = automation_store.get("ase_morning_briefing_v1")
+        paused_automation = automation_store.get("ase_morning_briefing_v2")
         self.assertEqual(response.status_code, 303)
         self.assertEqual(restored.status, LearnedSkillStatus.ACTIVE)
         self.assertEqual(paused.status, LearnedSkillStatus.PAUSED)
-        self.assertTrue(automation_store.get("ase_morning_briefing_v1").enabled)
-        self.assertFalse(automation_store.get("ase_morning_briefing_v2").enabled)
+        self.assertIsNotNone(restored_automation)
+        self.assertIsNotNone(paused_automation)
+        assert restored_automation is not None
+        assert paused_automation is not None
+        self.assertTrue(restored_automation.enabled)
+        self.assertFalse(paused_automation.enabled)
 
     def test_ops_self_coding_cleanup_retires_version(self) -> None:
         client, env_path = self.make_client()
@@ -932,23 +952,317 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("badSession", response.text)
         self.assertIn("Start fresh pairing window", response.text)
 
-    def test_integrations_page_renders_mail_and_calendar_forms(self) -> None:
+    def test_email_wizard_renders_setup_flow(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/integrations/email")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Email setup wizard", response.text)
+        self.assertIn("Choose the mail provider", response.text)
+        self.assertIn("Save the mailbox login", response.text)
+        self.assertIn("Review the server settings", response.text)
+        self.assertIn("Enable mail with clear guardrails", response.text)
+        self.assertIn("United Domains", response.text)
+        self.assertIn("iCloud Mail", response.text)
+        self.assertIn("Outlook.com / Microsoft mail", response.text)
+        self.assertIn("Run connection test", response.text)
+
+    def test_email_wizard_post_saves_profile_step(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_profile",
+                "profile": "united_domains",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=account")
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("email_mailbox")
+        self.assertEqual(record.value("profile"), "united_domains")
+        self.assertFalse(record.enabled)
+
+    def test_email_wizard_post_saves_account_step_and_secret(self) -> None:
+        client, env_path = self.make_client()
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=False,
+                settings={"profile": "gmail"},
+            )
+        )
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_account",
+                "account_email": "anna@gmail.com",
+                "from_address": "anna@gmail.com",
+                "TWINR_INTEGRATION_EMAIL_APP_PASSWORD": "abcd efgh ijkl mnop",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=transport")
+        record = store.get("email_mailbox")
+        self.assertEqual(record.value("account_email"), "anna@gmail.com")
+        self.assertEqual(record.value("from_address"), "anna@gmail.com")
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("TWINR_INTEGRATION_EMAIL_APP_PASSWORD=abcdefghijklmnop", env_text)
+
+    def test_email_wizard_post_saves_transport_step(self) -> None:
+        client, env_path = self.make_client()
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=False,
+                settings={"profile": "united_domains"},
+            )
+        )
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_transport",
+                "imap_host": "",
+                "imap_port": "",
+                "imap_mailbox": "INBOX",
+                "smtp_host": "",
+                "smtp_port": "",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=guardrails")
+        record = store.get("email_mailbox")
+        self.assertEqual(record.value("imap_host"), "imaps.udag.de")
+        self.assertEqual(record.value("smtp_host"), "smtps.udag.de")
+        self.assertEqual(record.value("imap_port"), "993")
+        self.assertEqual(record.value("smtp_port"), "587")
+
+    def test_email_wizard_post_saves_guardrails_and_enables_integration(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={"TWINR_INTEGRATION_EMAIL_APP_PASSWORD": "abcdefghijklmnop"}
+        )
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=False,
+                settings={
+                    "profile": "gmail",
+                    "account_email": "anna@gmail.com",
+                    "from_address": "anna@gmail.com",
+                    "imap_host": "imap.gmail.com",
+                    "imap_port": "993",
+                    "imap_mailbox": "INBOX",
+                    "smtp_host": "smtp.gmail.com",
+                    "smtp_port": "587",
+                    "connection_test_status": "ok",
+                    "connection_test_summary": "Connection test passed",
+                    "connection_test_detail": "Twinr reached both servers.",
+                    "connection_test_imap_status": "ok",
+                    "connection_test_imap_summary": "Connected",
+                    "connection_test_imap_detail": "IMAP worked.",
+                    "connection_test_smtp_status": "ok",
+                    "connection_test_smtp_summary": "Connected",
+                    "connection_test_smtp_detail": "SMTP worked.",
+                    "connection_test_tested_at": "2026-03-26T17:00:00+00:00",
+                },
+            )
+        )
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_guardrails",
+                "enabled": "true",
+                "unread_only_default": "true",
+                "restrict_reads_to_known_senders": "false",
+                "restrict_recipients_to_known_contacts": "true",
+                "known_contacts_text": "Anna <anna@gmail.com>",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=guardrails")
+        record = store.get("email_mailbox")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("restrict_recipients_to_known_contacts"), "true")
+        self.assertEqual(record.value("known_contacts_text"), "Anna <anna@gmail.com>")
+
+    def test_email_wizard_post_runs_connection_test_and_saves_redacted_result(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={"TWINR_INTEGRATION_EMAIL_APP_PASSWORD": "abcdefghijklmnop"}
+        )
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=False,
+                settings={
+                    "profile": "gmail",
+                    "account_email": "anna@gmail.com",
+                    "from_address": "anna@gmail.com",
+                    "imap_host": "imap.gmail.com",
+                    "imap_port": "993",
+                    "imap_mailbox": "INBOX",
+                    "smtp_host": "smtp.gmail.com",
+                    "smtp_port": "587",
+                },
+            )
+        )
+
+        with patch(
+            "twinr.web.app.run_email_connectivity_test",
+            return_value=EmailConnectionTestResult(
+                status="ok",
+                summary="Connection test passed",
+                detail="Twinr reached both servers.",
+                imap=EmailTransportProbe(status="ok", summary="Connected", detail="IMAP worked."),
+                smtp=EmailTransportProbe(status="ok", summary="Connected", detail="SMTP worked."),
+                tested_at="2026-03-26T18:00:00+00:00",
+            ),
+        ):
+            response = client.post(
+                "/integrations/email",
+                data={
+                    "_action": "run_connection_test",
+                    "enabled": "false",
+                    "unread_only_default": "true",
+                    "restrict_reads_to_known_senders": "false",
+                    "restrict_recipients_to_known_contacts": "true",
+                    "known_contacts_text": "Anna <anna@gmail.com>",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=guardrails")
+        record = store.get("email_mailbox")
+        self.assertEqual(record.value("connection_test_status"), "ok")
+        self.assertEqual(record.value("connection_test_imap_summary"), "Connected")
+        self.assertEqual(record.value("connection_test_smtp_summary"), "Connected")
+        self.assertFalse(record.enabled)
+        self.assertEqual(record.value("restrict_recipients_to_known_contacts"), "true")
+
+    def test_email_wizard_requires_connection_test_before_enabling(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={"TWINR_INTEGRATION_EMAIL_APP_PASSWORD": "abcdefghijklmnop"}
+        )
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=False,
+                settings={
+                    "profile": "gmail",
+                    "account_email": "anna@gmail.com",
+                    "from_address": "anna@gmail.com",
+                    "imap_host": "imap.gmail.com",
+                    "imap_port": "993",
+                    "imap_mailbox": "INBOX",
+                    "smtp_host": "smtp.gmail.com",
+                    "smtp_port": "587",
+                },
+            )
+        )
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_guardrails",
+                "enabled": "true",
+                "unread_only_default": "true",
+                "restrict_reads_to_known_senders": "false",
+                "restrict_recipients_to_known_contacts": "false",
+                "known_contacts_text": "",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("/integrations/email?error=", response.headers["location"])
+        self.assertIn("Run+the+connection+test+successfully+before+enabling+email.", response.headers["location"])
+        self.assertFalse(store.get("email_mailbox").enabled)
+
+    def test_email_wizard_transport_change_disables_mail_until_retested(self) -> None:
+        client, env_path = self.make_client()
+        store = TwinrIntegrationStore.from_project_root(env_path.parent)
+        store.save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=True,
+                settings={
+                    "profile": "gmail",
+                    "account_email": "anna@gmail.com",
+                    "from_address": "anna@gmail.com",
+                    "imap_host": "imap.gmail.com",
+                    "imap_port": "993",
+                    "imap_mailbox": "INBOX",
+                    "smtp_host": "smtp.gmail.com",
+                    "smtp_port": "587",
+                    "connection_test_status": "ok",
+                    "connection_test_summary": "Connection test passed",
+                    "connection_test_detail": "Twinr reached both servers.",
+                    "connection_test_imap_status": "ok",
+                    "connection_test_imap_summary": "Connected",
+                    "connection_test_imap_detail": "IMAP worked.",
+                    "connection_test_smtp_status": "ok",
+                    "connection_test_smtp_summary": "Connected",
+                    "connection_test_smtp_detail": "SMTP worked.",
+                    "connection_test_tested_at": "2026-03-26T17:00:00+00:00",
+                },
+            )
+        )
+
+        response = client.post(
+            "/integrations/email",
+            data={
+                "_action": "save_transport",
+                "imap_host": "imap2.gmail.com",
+                "imap_port": "993",
+                "imap_mailbox": "INBOX",
+                "smtp_host": "smtp.gmail.com",
+                "smtp_port": "587",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/integrations/email?saved=1&step=guardrails")
+        record = store.get("email_mailbox")
+        self.assertFalse(record.enabled)
+        self.assertEqual(record.value("imap_host"), "imap2.gmail.com")
+        self.assertEqual(record.value("connection_test_status"), "")
+
+    def test_integrations_page_renders_mail_and_calendar_flows(self) -> None:
         client, _env_path = self.make_client()
 
         response = client.get("/integrations")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Integration overview", response.text)
+        self.assertIn("Email mailbox", response.text)
+        self.assertIn("Open email wizard", response.text)
+        self.assertIn("/integrations/email", response.text)
         self.assertIn("WhatsApp self-chat", response.text)
         self.assertIn("Open WhatsApp wizard", response.text)
         self.assertIn("/connect/whatsapp", response.text)
-        self.assertIn("Save email integration", response.text)
         self.assertIn("Save calendar integration", response.text)
         self.assertIn("Save smart-home integration", response.text)
         self.assertIn("Social-history learning", response.text)
         self.assertIn("Learn from my social media history", response.text)
         self.assertIn("Save and import now", response.text)
-        self.assertIn("Gmail", response.text)
         self.assertIn("ICS file", response.text)
         self.assertIn("Philips Hue", response.text)
 
@@ -1037,8 +1351,9 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/integrations")
         self.assertNotIn("abcd", response.text)
         self.assertNotIn("mnop", response.text)
-        self.assertIn("Credential state: Configured.", response.text)
-        self.assertIn("credential stored separately in .env", response.text)
+        self.assertIn("Configured", response.text)
+        self.assertIn("Open email wizard", response.text)
+        self.assertIn("Stored separately in .env as the app password.", response.text)
 
     def test_integrations_post_saves_calendar_config(self) -> None:
         client, env_path = self.make_client()
@@ -1294,6 +1609,7 @@ class WebAppTests(unittest.TestCase):
         entries = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").load_entries()
         self.assertEqual(len(entries), 1)
         entry = entries[0]
+        assert isinstance(entry.trigger, TimeAutomationTrigger)
         self.assertEqual(entry.name, "Daily headlines")
         self.assertEqual(entry.trigger.schedule, "daily")
         self.assertEqual(entry.trigger.time_of_day, "08:00")
@@ -1329,6 +1645,7 @@ class WebAppTests(unittest.TestCase):
         entries = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").load_entries()
         self.assertEqual(len(entries), 1)
         entry = entries[0]
+        assert isinstance(entry.trigger, IfThenAutomationTrigger)
         self.assertEqual(entry.name, "Welcome after motion")
         self.assertEqual(entry.actions[0].kind, "say")
         self.assertEqual(entry.actions[0].text, "Hallo, ich bin bereit.")
@@ -1355,6 +1672,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(toggle_response.status_code, 303)
         toggled = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").get(entry.automation_id)
         self.assertIsNotNone(toggled)
+        assert toggled is not None
         self.assertFalse(toggled.enabled)
 
         delete_response = client.post(

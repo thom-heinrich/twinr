@@ -1,4 +1,5 @@
 from pathlib import Path
+import imaplib
 import sys
 import unittest
 
@@ -11,8 +12,11 @@ from twinr.integrations.email import (
     EmailDraft,
     EmailMailboxAdapter,
     EmailMessageSummary,
+    IMAPMailboxConfig,
+    IMAPMailboxReader,
     SMTPMailSender,
     SMTPMailSenderConfig,
+    run_email_connectivity_test,
 )
 
 
@@ -55,6 +59,39 @@ class _FakeSMTPConnection:
 
     def quit(self) -> None:
         self.calls.append("quit")
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeout = None
+
+    def settimeout(self, value: float) -> None:
+        self.timeout = value
+
+
+class _FakeIMAPConnection:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.sock = _FakeSocket()
+
+    def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+        self.calls.append(f"login:{username}:{password}")
+        return ("OK", [b"logged in"])
+
+    def select(self, mailbox: str, readonly: bool) -> tuple[str, list[bytes]]:
+        self.calls.append(f"select:{mailbox}:{readonly}")
+        return ("OK", [b"1"])
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+    def logout(self) -> None:
+        self.calls.append("logout")
+
+
+class _FakeIMAPAuthFailureConnection(_FakeIMAPConnection):
+    def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+        raise imaplib.IMAP4.error("bad credentials")
 
 
 class EmailAllowlistTests(unittest.TestCase):
@@ -256,6 +293,95 @@ class SMTPMailSenderTests(unittest.TestCase):
         self.assertIn("send_message", connection.calls)
         self.assertEqual(connection.message["To"], "anna@example.com")
         self.assertTrue(str(message_id).startswith("<"))
+
+    def test_probe_connection_runs_greeting_and_login(self) -> None:
+        connection = _FakeSMTPConnection()
+        sender = SMTPMailSender(
+            SMTPMailSenderConfig(
+                host="smtp.example.com",
+                username="anna",
+                password="secret",
+                from_address="twinr@example.com",
+            ),
+            connection_factory=lambda config: connection,
+        )
+
+        sender.probe_connection()
+
+        self.assertIn("ehlo", connection.calls)
+        self.assertIn("starttls", connection.calls)
+        self.assertIn("login:anna:secret", connection.calls)
+
+
+class IMAPMailboxReaderTests(unittest.TestCase):
+    def test_probe_connection_logs_in_and_selects_mailbox(self) -> None:
+        connection = _FakeIMAPConnection()
+        reader = IMAPMailboxReader(
+            IMAPMailboxConfig(
+                host="imap.example.com",
+                username="anna@example.com",
+                password="secret",
+                mailbox="INBOX",
+            ),
+            connection_factory=lambda config: connection,
+        )
+
+        reader.probe_connection()
+
+        self.assertIn("login:anna@example.com:secret", connection.calls)
+        self.assertIn("select:INBOX:True", connection.calls)
+        self.assertEqual(connection.sock.timeout, 10.0)
+
+
+class EmailConnectivityTestTests(unittest.TestCase):
+    def test_connectivity_test_reports_success_when_both_transports_work(self) -> None:
+        result = run_email_connectivity_test(
+            IMAPMailboxConfig(
+                host="imap.example.com",
+                username="anna@example.com",
+                password="secret",
+                mailbox="INBOX",
+            ),
+            SMTPMailSenderConfig(
+                host="smtp.example.com",
+                username="anna@example.com",
+                password="secret",
+                from_address="anna@example.com",
+            ),
+            mailbox_reader_factory=lambda config: IMAPMailboxReader(config, connection_factory=lambda _config: _FakeIMAPConnection()),
+            mail_sender_factory=lambda config: SMTPMailSender(config, connection_factory=lambda _config: _FakeSMTPConnection()),
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.summary, "Connection test passed")
+        self.assertEqual(result.imap.status, "ok")
+        self.assertEqual(result.smtp.status, "ok")
+
+    def test_connectivity_test_redacts_imap_auth_failure(self) -> None:
+        result = run_email_connectivity_test(
+            IMAPMailboxConfig(
+                host="imap.example.com",
+                username="anna@example.com",
+                password="secret",
+                mailbox="INBOX",
+            ),
+            SMTPMailSenderConfig(
+                host="smtp.example.com",
+                username="anna@example.com",
+                password="secret",
+                from_address="anna@example.com",
+            ),
+            mailbox_reader_factory=lambda config: IMAPMailboxReader(
+                config,
+                connection_factory=lambda _config: _FakeIMAPAuthFailureConnection(),
+            ),
+            mail_sender_factory=lambda config: SMTPMailSender(config, connection_factory=lambda _config: _FakeSMTPConnection()),
+        )
+
+        self.assertEqual(result.status, "fail")
+        self.assertEqual(result.imap.status, "fail")
+        self.assertEqual(result.smtp.status, "ok")
+        self.assertIn("mailbox login was rejected", result.imap.detail.lower())
 
 
 if __name__ == "__main__":

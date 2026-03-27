@@ -869,6 +869,10 @@ class StreamingTurnCoordinator:
             return
         close_timeout_s = self._speech_output_close_timeout()
         interrupted = self.hooks.should_stop()
+        # Stop feedback owners before waiting on speech-output drain so they
+        # cannot keep reacquiring the speaker while the final reply is closing.
+        self.hooks.stop_search_feedback()
+        self.processing_feedback.stop()
         try:
             if interrupted:
                 stopped = self._speech_output.abort(timeout_s=min(0.25, close_timeout_s))

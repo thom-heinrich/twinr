@@ -18,6 +18,7 @@ import logging
 import math
 from threading import RLock
 import time
+from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -2060,7 +2061,58 @@ class LongTermRemoteCatalogStore:
             snapshot_kind=definition.snapshot_kind,
             segment_index=segment_index or 0,
         )
+        retry_attempts = self._remote_retry_attempts()
+        retry_backoff_s = self._remote_retry_backoff_s()
         started_monotonic = time.monotonic()
+        last_error: Exception | None = None
+        for attempt_index in range(retry_attempts):
+            try:
+                return self._fetch_catalog_segment_document(
+                    read_client,
+                    document_id=document_id,
+                    fallback_uri=fallback_uri,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt_index + 1 >= retry_attempts:
+                    break
+                if retry_backoff_s > 0.0:
+                    time.sleep(retry_backoff_s)
+        assert last_error is not None
+        record_remote_read_diagnostic(
+            remote_state=remote_state,
+            context=LongTermRemoteReadContext(
+                snapshot_kind=definition.snapshot_kind,
+                operation="fetch_catalog_segment",
+                request_method="GET",
+                request_payload_kind="catalog_segment_document",
+                document_id_hint=document_id,
+                uri_hint=fallback_uri,
+                segment_index=segment_index,
+                request_path="/v1/external/documents/full",
+                attempt_index=retry_attempts,
+                attempt_count=retry_attempts,
+                retry_attempts_configured=retry_attempts,
+                retry_backoff_s=retry_backoff_s,
+                retry_mode="document_id_then_uri",
+            ),
+            exc=last_error,
+            started_monotonic=started_monotonic,
+            outcome="failed",
+        )
+        raise LongTermRemoteUnavailableError(
+            f"Failed to read remote long-term {definition.snapshot_kind!r} catalog segment."
+        ) from last_error
+
+    def _fetch_catalog_segment_document(
+        self,
+        read_client: Any,
+        *,
+        document_id: str | None,
+        fallback_uri: str,
+    ) -> Mapping[str, object]:
+        """Read one segment by exact document id, then by the canonical segment URI."""
+
         try:
             return read_client.fetch_full_document(
                 document_id=document_id,
@@ -2068,53 +2120,14 @@ class LongTermRemoteCatalogStore:
                 include_content=True,
                 max_content_chars=self._max_content_chars(),
             )
-        except Exception as exc:
-            if document_id:
-                try:
-                    return read_client.fetch_full_document(
-                        origin_uri=fallback_uri,
-                        include_content=True,
-                        max_content_chars=self._max_content_chars(),
-                    )
-                except Exception as fallback_exc:
-                    record_remote_read_diagnostic(
-                        remote_state=remote_state,
-                        context=LongTermRemoteReadContext(
-                            snapshot_kind=definition.snapshot_kind,
-                            operation="fetch_catalog_segment",
-                            request_method="GET",
-                            request_payload_kind="catalog_segment_document",
-                            document_id_hint=document_id,
-                            uri_hint=fallback_uri,
-                            segment_index=segment_index,
-                            request_path="/v1/external/documents/full",
-                        ),
-                        exc=fallback_exc,
-                        started_monotonic=started_monotonic,
-                        outcome="failed",
-                    )
-                    raise LongTermRemoteUnavailableError(
-                        f"Failed to read remote long-term {definition.snapshot_kind!r} catalog segment."
-                    ) from fallback_exc
-            record_remote_read_diagnostic(
-                remote_state=remote_state,
-                context=LongTermRemoteReadContext(
-                    snapshot_kind=definition.snapshot_kind,
-                    operation="fetch_catalog_segment",
-                    request_method="GET",
-                    request_payload_kind="catalog_segment_document",
-                    document_id_hint=document_id,
-                    uri_hint=fallback_uri,
-                    segment_index=segment_index,
-                    request_path="/v1/external/documents/full",
-                ),
-                exc=exc,
-                started_monotonic=started_monotonic,
-                outcome="failed",
-            )
-            raise LongTermRemoteUnavailableError(
-                f"Failed to read remote long-term {definition.snapshot_kind!r} catalog segment."
-            ) from exc
+        except Exception:
+            if not document_id:
+                raise
+        return read_client.fetch_full_document(
+            origin_uri=fallback_uri,
+            include_content=True,
+            max_content_chars=self._max_content_chars(),
+        )
 
     def _extract_segment_entries(
         self,

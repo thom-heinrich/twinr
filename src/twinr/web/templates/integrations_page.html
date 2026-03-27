@@ -25,6 +25,30 @@
 <section class="panel">
   <div class="section-header">
     <div>
+      <h2>{{ email_summary.title }}</h2>
+      <p class="section-description">{{ email_summary.detail }}</p>
+    </div>
+    <span class="status-pill is-{{ email_summary.status }}">{{ email_summary.status_label }}</span>
+  </div>
+  <div class="check-list">
+    {% for item in email_summary.checks %}
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">{{ item.label }}</div>
+        <div class="check-row-detail">{{ item.detail }}</div>
+      </div>
+      <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+    </article>
+    {% endfor %}
+  </div>
+  <div class="link-row">
+    <a class="link-button" href="{{ email_summary.action_href }}">{{ email_summary.action_label }}</a>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
       <h2>{{ whatsapp_summary.title }}</h2>
       <p class="section-description">{{ whatsapp_summary.detail }}</p>
     </div>
@@ -97,34 +121,12 @@
     <h2>Scope</h2>
     <ul class="plain-list">
       <li><strong>WhatsApp</strong> One guided self-chat wizard with QR pairing, one allowed number, and groups blocked</li>
-      <li><strong>Email</strong> IMAP/SMTP setup, Gmail-friendly, approval-first</li>
+      <li><strong>Email</strong> One guided mailbox wizard with provider presets, approval-first IMAP/SMTP, and visible guardrails</li>
       <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
       <li><strong>Smart Home</strong> Local Hue bridge setup for low-risk device control and bounded sensor streams</li>
     </ul>
   </div>
 </section>
-
-<form method="post" action="/integrations" class="stack">
-  <input type="hidden" name="_integration_id" value="email_mailbox">
-  {% for section in email_sections %}
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ section.title }}</h2>
-        <p class="section-description">{{ section.description }}</p>
-      </div>
-    </div>
-    <div class="form-grid">
-      {% for field in section.fields %}
-      {{ render_setting_field(field) }}
-      {% endfor %}
-    </div>
-  </section>
-  {% endfor %}
-  <div class="actions">
-    <button type="submit">Save email integration</button>
-  </div>
-</form>
 
 <form method="post" action="/integrations" class="stack top-gap">
   <input type="hidden" name="_integration_id" value="calendar_agenda">

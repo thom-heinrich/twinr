@@ -1,0 +1,1 @@
+cmd_/home/thh/twinr/hardware/bitcraze/twinr_on_device_failsafe/built-in.o :=  arm-none-eabi-gcc --specs=nosys.specs --specs=nano.specs -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -nostdlib  -r -o /home/thh/twinr/hardware/bitcraze/twinr_on_device_failsafe/built-in.o /home/thh/twinr/hardware/bitcraze/twinr_on_device_failsafe/src/built-in.o

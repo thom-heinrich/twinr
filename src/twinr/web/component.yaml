@@ -3,7 +3,7 @@ name: web
 path: src/twinr/web
 kind: python-package
 visibility: internal
-summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets, including managed portal sign-in plus the self-coding, tabbed debug, Conversation Lab, and WhatsApp setup wizard pages with bounded channel-onboarding state.
+summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets, including managed portal sign-in plus the self-coding, tabbed debug, Conversation Lab, and guided WhatsApp/email setup wizard pages with bounded mailbox connection checks.
 owned_concerns:
   - Build the FastAPI app factory, control-plane middleware, and route handlers for Twinr's local dashboard and settings pages
   - Enforce managed portal sign-in, including first-login password change for the permanent Pi web service
@@ -13,6 +13,7 @@ owned_concerns:
   - Persist and replay portal Conversation Lab sessions with human-readable turn traces while delegating real text-turn execution to focused helpers
   - Provide camera-backed helper surfaces for Conversation Lab tool turns such as local portrait enrollment and inspect-camera requests
   - Expose the `/connect/whatsapp` wizard for one-number WhatsApp self-chat setup, including allowlist, runtime, a bounded pairing window, live worker status, and the final self-chat test
+  - Expose the `/integrations/email` wizard for managed mailbox setup, including provider presets, mailbox login storage, transport review, bounded IMAP/SMTP connection tests, and final mail guardrails
   - Persist and read generic per-channel onboarding snapshots so pairing, reconnect, and repair-needed state survive page reloads
   - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
   - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers, including Hue-backed smart-home configuration on `/integrations`
@@ -28,7 +29,7 @@ files:
     exports:
       - create_app
   - path: app.py
-    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp setup wizard routes plus managed smart-home integration persistence
+    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp/email setup wizard routes, bounded mailbox connection-test orchestration, and managed smart-home integration persistence
     exports:
       - create_app
   - path: conversation_lab.py

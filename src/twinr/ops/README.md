@@ -166,10 +166,12 @@ installs via `browser_automation/runtime_requirements.txt` plus
 installation/restart, and bounded post-restart verification. By default it
 always manages the base runtime units and also picks up any repo-backed Pi unit
 that is already enabled on the acceptance host, which keeps optional services
-such as WhatsApp inside the same restart proof once they are live there. Opt
-into a dependency-refreshing install only when you deliberately want the Pi to
-re-resolve runtime packages. For first rollout of an optional Pi unit that is
-present in the repo but not enabled on the host yet, add
+such as WhatsApp inside the same restart proof once they are live there. The
+same default path also repairs an optional Pi unit whose install symlink still
+exists but whose installed unit file became masked or otherwise corrupted on the
+host. Opt into a dependency-refreshing install only when you deliberately want
+the Pi to re-resolve runtime packages. For first rollout of an optional Pi unit
+that is present in the repo but not enabled on the host yet, add
 `--rollout-service <unit>` so the deploy includes, enables, restarts, and
 verifies that unit without replacing the default base service set.
 

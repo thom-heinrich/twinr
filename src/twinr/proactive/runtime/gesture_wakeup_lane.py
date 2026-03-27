@@ -10,6 +10,7 @@ emoji publish policy, or workflow orchestration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import SupportsFloat, SupportsIndex, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_decision
@@ -52,6 +53,7 @@ class GestureWakeupLane:
         self.calibration = calibration
         self._pending_count = 0
         self._pending_seen_at: float | None = None
+        self._pending_started_at: float | None = None
         self._last_triggered_at: float | None = None
 
     @classmethod
@@ -83,7 +85,11 @@ class GestureWakeupLane:
                 reason="gesture_wakeup_disabled",
                 trigger_gesture=self.trigger_gesture,
             )
-            self._trace_wakeup_decision(observation=observation, decision=decision)
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
             return decision
 
         observed_gesture = observation.fine_hand_gesture
@@ -93,6 +99,7 @@ class GestureWakeupLane:
             fallback_min_confidence=0.78,
             fallback_confirm_samples=1,
             fallback_hold_s=0.40,
+            fallback_min_visible_s=1.0,
         )
         if observed_gesture != self.trigger_gesture:
             self._reset_pending_if_stale(observed_at)
@@ -102,7 +109,11 @@ class GestureWakeupLane:
                 observed_gesture=observed_gesture,
                 confidence=confidence,
             )
-            self._trace_wakeup_decision(observation=observation, decision=decision)
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
             return decision
         if confidence < policy.min_confidence:
             self._reset_pending_if_stale(observed_at)
@@ -112,21 +123,17 @@ class GestureWakeupLane:
                 observed_gesture=observed_gesture,
                 confidence=confidence,
             )
-            self._trace_wakeup_decision(observation=observation, decision=decision)
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
             return decision
 
         self._pending_seen_at = observed_at
+        if self._pending_count <= 0:
+            self._pending_started_at = observed_at
         self._pending_count += 1
-        if self._pending_count < policy.confirm_samples:
-            decision = GestureWakeupDecision(
-                reason="awaiting_gesture_wakeup_confirmation",
-                trigger_gesture=self.trigger_gesture,
-                observed_gesture=observed_gesture,
-                confidence=confidence,
-            )
-            self._trace_wakeup_decision(observation=observation, decision=decision)
-            return decision
-
         if (
             self._last_triggered_at is not None
             and (observed_at - self._last_triggered_at) < self.cooldown_s
@@ -137,7 +144,37 @@ class GestureWakeupLane:
                 observed_gesture=observed_gesture,
                 confidence=confidence,
             )
-            self._trace_wakeup_decision(observation=observation, decision=decision)
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
+            return decision
+        if self._pending_count < policy.confirm_samples:
+            decision = GestureWakeupDecision(
+                reason="awaiting_gesture_wakeup_confirmation",
+                trigger_gesture=self.trigger_gesture,
+                observed_gesture=observed_gesture,
+                confidence=confidence,
+            )
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
+            return decision
+        if self._pending_visible_s(observed_at) < policy.min_visible_s:
+            decision = GestureWakeupDecision(
+                reason="awaiting_gesture_wakeup_visibility",
+                trigger_gesture=self.trigger_gesture,
+                observed_gesture=observed_gesture,
+                confidence=confidence,
+            )
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
             return decision
 
         self._last_triggered_at = observed_at
@@ -150,7 +187,11 @@ class GestureWakeupLane:
             observed_gesture=observed_gesture,
             confidence=confidence,
         )
-        self._trace_wakeup_decision(observation=observation, decision=decision)
+        self._trace_wakeup_decision(
+            observed_at=observed_at,
+            observation=observation,
+            decision=decision,
+        )
         return decision
 
     def _reset_pending_if_stale(self, observed_at: float) -> None:
@@ -161,10 +202,18 @@ class GestureWakeupLane:
             return
         self._pending_count = 0
         self._pending_seen_at = None
+        self._pending_started_at = None
+
+    def _pending_visible_s(self, observed_at: float) -> float:
+        started_at = self._pending_started_at
+        if started_at is None:
+            return 0.0
+        return max(0.0, observed_at - started_at)
 
     def _trace_wakeup_decision(
         self,
         *,
+        observed_at: float,
         observation: SocialVisionObservation,
         decision: GestureWakeupDecision,
     ) -> None:
@@ -184,6 +233,7 @@ class GestureWakeupLane:
             options=[
                 {"id": "dispatch", "summary": "Dispatch the configured wake gesture immediately."},
                 {"id": "awaiting_gesture_wakeup_confirmation", "summary": "Keep the wake gesture pending until confirmation."},
+                {"id": "awaiting_gesture_wakeup_visibility", "summary": "Keep the wake gesture pending until it stayed visible long enough."},
                 {"id": "gesture_wakeup_low_confidence", "summary": "Reject the wake gesture because confidence is too low."},
                 {"id": "gesture_wakeup_cooldown", "summary": "Suppress a repeated wake gesture during cooldown."},
                 {"id": "no_gesture_wakeup_candidate", "summary": "Ignore the frame because the trigger gesture is absent."},
@@ -193,6 +243,7 @@ class GestureWakeupLane:
                 "observed_gesture": observation.fine_hand_gesture.value,
                 "observed_confidence": _coerce_confidence(observation.fine_hand_gesture_confidence),
                 "pending_count": self._pending_count,
+                "pending_visible_s": round(self._pending_visible_s(observed_at), 3),
                 "cooldown_s": self.cooldown_s,
             },
             confidence=decision.confidence,
@@ -228,7 +279,7 @@ def _coerce_confidence(value: object) -> float:
     """Clamp one optional confidence score into a bounded ratio."""
 
     try:
-        numeric = float(value)
+        numeric = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
     except (TypeError, ValueError):
         return 0.0
     if numeric != numeric:
@@ -244,7 +295,7 @@ def _coerce_non_negative_float(value: object, *, default: float) -> float:
     """Return one finite non-negative float with fallback."""
 
     try:
-        numeric = float(value)
+        numeric = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
     except (TypeError, ValueError):
         return default
     if numeric != numeric or numeric < 0.0:

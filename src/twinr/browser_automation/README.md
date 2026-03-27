@@ -4,7 +4,8 @@
 package intentionally does **not** ship a real browser stack yet. Instead, it
 defines the stable request/response contracts and the loader that may attach a
 local implementation from the gitignored repo-root `browser_automation/`
-workspace.
+workspace. Tracked, evaluator-facing helpers that belong to Twinr's public
+runtime contract live under `src/twinr/browser_automation/runtime/`.
 
 ## Responsibility
 
@@ -12,6 +13,7 @@ workspace.
 - define the stable in/out contract for optional browser tasks
 - define the driver protocol Twinr code may call
 - load one local implementation from the repo-root workspace when explicitly enabled
+- keep small tracked runtime helpers for typed browser results, auth-state summaries, document/PDF reading, and bounded provider retries
 - fail closed when the feature is disabled, missing, malformed, or outside the configured workspace
 
 `browser_automation` does **not** own:
@@ -64,4 +66,5 @@ result = driver.execute(
 
 - [AGENTS.md](./AGENTS.md)
 - [component.yaml](./component.yaml)
+- [runtime](./runtime)
 - [../README.md](../README.md)

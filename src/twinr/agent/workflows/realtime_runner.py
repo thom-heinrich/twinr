@@ -261,6 +261,7 @@ class TwinrRealtimeHardwareLoop(
                 emit=self.emit,
                 on_voice_activation=self.handle_voice_activation,
                 on_transcript_committed=self.handle_remote_transcript_committed,
+                on_follow_up_closed=self.handle_remote_follow_up_closed,
                 on_barge_in_interrupt=lambda: self._request_answer_interrupt("voice_orchestrator"),
                 forensics=self.workflow_forensics,
             )
@@ -1051,6 +1052,9 @@ class TwinrRealtimeHardwareLoop(
             transcript,
             source,
         )
+
+    def handle_remote_follow_up_closed(self, reason: str) -> None:
+        voice_orchestrator_runtime.handle_remote_follow_up_closed(self, reason)
 
     def _voice_orchestrator_owns_live_listening(self) -> bool:
         return voice_orchestrator_runtime.voice_orchestrator_owns_live_listening(self)

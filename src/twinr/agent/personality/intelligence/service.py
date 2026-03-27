@@ -577,7 +577,11 @@ class WorldIntelligenceService:
         discovered: list[str] = []
         seen: set[str] = set()
         for source_url in source_urls:
-            for feed_url in self._discover_feeds_from_source(source_url):
+            try:
+                discovered_from_source = self._discover_feeds_from_source(source_url)
+            except Exception:
+                continue
+            for feed_url in discovered_from_source:
                 if feed_url in seen:
                     continue
                 seen.add(feed_url)
@@ -830,7 +834,8 @@ class WorldIntelligenceService:
             (
                 item
                 for item in state.interest_signals
-                if item.engagement_state not in {"cooling", "avoid"}
+                if self._signal_can_seed_feed_discovery(item)
+                and item.engagement_state not in {"cooling", "avoid"}
                 and (
                     item.ongoing_interest in {"active", "growing"}
                     or (item.explicit and item.engagement_score >= 0.72)
@@ -859,6 +864,17 @@ class WorldIntelligenceService:
             if len(selected) >= 2:
                 break
         return tuple(selected)
+
+    def _signal_can_seed_feed_discovery(self, signal: WorldInterestSignal) -> bool:
+        """Return whether one learned interest should drive durable feed discovery.
+
+        Tool-origin live-search signals capture one-off situational awareness.
+        They remain useful as recent-interest evidence, but recalibration should
+        only discover durable feeds from conversation-derived or explicit
+        world-intelligence interests.
+        """
+
+        return not signal.signal_id.startswith("interest:tool:")
 
     def _subscription_covers_interest(
         self,

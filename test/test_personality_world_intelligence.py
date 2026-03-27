@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -268,6 +267,62 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(search_backend.calls[0][1], "Hamburg")
         self.assertIn(DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND, remote_state.snapshots)
         self.assertIn(DEFAULT_WORLD_INTELLIGENCE_STATE_KIND, remote_state.snapshots)
+
+    def test_service_discovery_skips_failing_source_pages_and_keeps_other_candidates(self) -> None:
+        remote_state = _FakeRemoteState()
+        search_backend = _FakeSearchBackend(
+            sources=(
+                "https://example.com/too-large",
+                "https://example.com/hamburg",
+            )
+        )
+        config = TwinrConfig(project_root=".")
+        documents = {
+            "https://example.com/hamburg": _FetchedDocument(
+                url="https://example.com/hamburg",
+                content_type="text/html; charset=utf-8",
+                text="""
+                <html>
+                  <head>
+                    <title>Hamburg News</title>
+                    <link rel="alternate" type="application/rss+xml" title="Hamburg RSS" href="/feeds/local.xml">
+                  </head>
+                </html>
+                """,
+            ),
+        }
+
+        def _page_loader(url: str) -> _FetchedDocument:
+            if url == "https://example.com/too-large":
+                raise ValueError("world_intelligence_document_too_large")
+            return documents[url]
+
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            page_loader=_page_loader,
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+
+        result = service.configure(
+            request=WorldIntelligenceConfigRequest(
+                action="discover",
+                query="Find RSS feeds for Hamburg local politics.",
+                label="Hamburg local politics",
+                location_hint="Hamburg",
+                region="Hamburg",
+                topics=("local politics",),
+                scope="local",
+                priority=0.82,
+                auto_subscribe=True,
+                created_by="tool",
+            ),
+            search_backend=search_backend,
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.discovered_feed_urls, ("https://example.com/feeds/local.xml",))
+        self.assertEqual(result.subscriptions[0].feed_url, "https://example.com/feeds/local.xml")
 
     def test_service_refreshes_due_feeds_into_world_signals_and_threads(self) -> None:
         remote_state = _FakeRemoteState()
@@ -977,6 +1032,60 @@ class WorldIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(refresh.status, "skipped")
         self.assertEqual(subscriptions, ())
+
+    def test_recalibration_ignores_live_search_tool_interest_for_new_feed_discovery(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+
+        candidates = service._select_recalibration_candidates(
+            subscriptions=(),
+            state=WorldIntelligenceState(
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:tool:call:search:1",
+                        topic="What changed in Hamburg local politics today?",
+                        summary="Recent live search suggests the user wanted fresh situational awareness about Hamburg.",
+                        region="Hamburg",
+                        scope="local",
+                        salience=0.72,
+                        confidence=0.7,
+                        engagement_score=0.82,
+                        engagement_state="warm",
+                        ongoing_interest="active",
+                        ongoing_interest_score=0.88,
+                        evidence_count=1,
+                        engagement_count=2,
+                        positive_signal_count=2,
+                        updated_at="2026-03-20T11:40:00+00:00",
+                    ),
+                    WorldInterestSignal(
+                        signal_id="interest:conversation:hamburg_local_politics",
+                        topic="local politics",
+                        summary="Recurring conversation interest in Hamburg local politics.",
+                        region="Hamburg",
+                        scope="local",
+                        salience=0.74,
+                        confidence=0.82,
+                        engagement_score=0.8,
+                        engagement_state="warm",
+                        ongoing_interest="active",
+                        ongoing_interest_score=0.9,
+                        evidence_count=3,
+                        engagement_count=4,
+                        positive_signal_count=3,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(tuple(item.signal_id for item in candidates), ("interest:conversation:hamburg_local_politics",))
 
     def test_recalibration_relaxes_subscription_back_to_baseline_after_engagement_decays(self) -> None:
         remote_state = _FakeRemoteState()

@@ -14,6 +14,7 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Callable, Protocol, cast
 import logging
+import time
 
 from twinr.agent.tools.runtime.speech_lane import SpeechLaneDelta
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
@@ -53,6 +54,7 @@ _TTS_CHUNK_POLL_TIMEOUT_SECONDS = 0.02
 _TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.05
 _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.01
 _TTS_STREAM_CLOSE_TIMEOUT_SECONDS = 0.05
+_POST_IDLE_WORKER_JOIN_TIMEOUT_SECONDS = 0.25
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -324,13 +326,36 @@ class InterruptibleSpeechOutput:
     def close(self, *, timeout_s: float | None = None) -> None:
         """Flush the worker and wait for a bounded clean shutdown."""
 
+        close_started = time.monotonic()
         self._trace("speech_output_close_requested", timeout_s=timeout_s)
         self._queue.put(None)
-        self._worker.join(timeout=timeout_s)
+        idle_ready = self.wait_until_idle(timeout_s=timeout_s)
+        join_timeout_s = timeout_s
+        if timeout_s is not None:
+            elapsed_s = max(0.0, time.monotonic() - close_started)
+            join_timeout_s = max(0.0, timeout_s - elapsed_s)
+        if idle_ready:
+            join_timeout_s = (
+                _POST_IDLE_WORKER_JOIN_TIMEOUT_SECONDS
+                if join_timeout_s is None
+                else min(join_timeout_s, _POST_IDLE_WORKER_JOIN_TIMEOUT_SECONDS)
+            )
+        self._trace(
+            "speech_output_close_join_started",
+            timeout_s=timeout_s,
+            idle_ready=idle_ready,
+            join_timeout_s=join_timeout_s,
+        )
+        self._worker.join(timeout=join_timeout_s)
         if self._worker.is_alive():
             self._trace("speech_output_close_timeout", timeout_s=timeout_s)
             raise RuntimeError("Text-to-speech playback worker did not exit before timeout")
-        self._trace("speech_output_close_completed", timeout_s=timeout_s)
+        self._trace(
+            "speech_output_close_completed",
+            timeout_s=timeout_s,
+            idle_ready=idle_ready,
+            join_timeout_s=join_timeout_s,
+        )
 
     def abort(self, *, timeout_s: float | None = 0.25) -> bool:
         """Stop playback immediately without waiting for a slow provider drain.

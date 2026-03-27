@@ -15,6 +15,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - validate and repair remote catalog/pointer consistency before long-term memory is exposed to runtime callers
 - direct-assemble catalog-backed remote object snapshots from rich segment entries when possible, and use bounded-parallel `retrieve` plus `allowed_doc_ids` only for sparse legacy catalogs
 - load compact remote catalog segment documents through bounded-parallel reads so required startup does not serialize every segment fetch
+- consume the configured remote retry/backoff budget for catalog segment reads across exact-document plus same-URI fetches, so one transient `/v1/external/documents/full` spike does not abort required provider-context assembly
 - keep required-readiness probes read-only even for sparse legacy object catalogs, so watchdog startup never blocks on catalog rewrites
 - reuse successful remote snapshot probes within one readiness cycle so store bootstrap and health attestation do not refetch the same snapshot twice
 - let ordinary warm readiness probes reuse already learned exact snapshot document ids before re-walking the current pointer history, so required health checks stay fail-closed without paying repeated multi-second pointer lookups

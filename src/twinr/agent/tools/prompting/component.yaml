@@ -11,7 +11,7 @@ owned_concerns:
   - Teach tool-capable lanes when a spoken connect/link/pair request should use the bounded `connect_service_integration` tool and mention the right info panel as the QR/status surface
   - Teach tool-capable lanes when a remembered-contact messaging request should use `send_whatsapp_message`, follow clarification results, and require an explicit final confirmation before claiming success
   - Teach tool-capable lanes when a bounded stay-quiet request should use `manage_voice_quiet_mode` instead of `end_conversation` or a persistent setting change
-  - Teach tool-capable lanes to prefer generic web search before optional browser automation and to ask the user before deeper site checks when web research proved insufficient
+  - Teach tool-capable lanes to prefer generic web search before optional browser automation and to proactively offer one model-authored slower-but-stronger site-check method when web research proved insufficient
   - Teach tool-capable lanes when to start discovery from explicit intent or free self-disclosure and when to review, correct, or delete learned discovery facts through the dedicated discovery tool contract
   - Export the public prompt-builder surface used by workflow, orchestrator, and package-level callers
 out_of_scope:

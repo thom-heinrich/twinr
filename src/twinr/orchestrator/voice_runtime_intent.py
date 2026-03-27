@@ -12,6 +12,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 
+_STRONG_SPEAKER_BIAS_MIN_CONFIDENCE = 0.82
+
+
 def _coerce_mapping(value: object) -> Mapping[str, object]:
     """Return a read-only mapping view for mapping-like payloads."""
 
@@ -40,6 +43,22 @@ def _coerce_optional_text(value: object) -> str | None:
 
     text = str(value or "").strip().lower()
     return text or None
+
+
+def _coerce_optional_ratio(value: object) -> float | None:
+    """Normalize one optional ratio into ``[0.0, 1.0]`` or ``None``."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    if normalized < 0.0 or normalized > 1.0:
+        return None
+    return normalized
 
 
 def _axis_state(mapping: Mapping[str, object], key: str) -> str | None:
@@ -103,6 +122,8 @@ class VoiceRuntimeIntentContext:
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
+    speaker_associated: bool | None = None
+    speaker_association_confidence: float | None = None
 
     @classmethod
     def from_sensor_facts(
@@ -114,6 +135,7 @@ class VoiceRuntimeIntentContext:
         fact_mapping = _coerce_mapping(facts)
         person_state = _coerce_mapping(fact_mapping.get("person_state"))
         camera = _coerce_mapping(fact_mapping.get("camera"))
+        speaker_association = _coerce_mapping(fact_mapping.get("speaker_association"))
         attention_target = _coerce_mapping(fact_mapping.get("attention_target"))
         camera_person_visible = _coerce_optional_bool(camera.get("person_visible"))
         presence_active = _coerce_optional_bool(person_state.get("presence_active"))
@@ -155,6 +177,10 @@ class VoiceRuntimeIntentContext:
                 person_state.get("targeted_inference_blocked")
             ),
             recommended_channel=_coerce_optional_text(person_state.get("recommended_channel")),
+            speaker_associated=_coerce_optional_bool(speaker_association.get("associated")),
+            speaker_association_confidence=_coerce_optional_ratio(
+                speaker_association.get("confidence")
+            ),
         )
 
     @classmethod
@@ -173,6 +199,10 @@ class VoiceRuntimeIntentContext:
                 getattr(event, "targeted_inference_blocked", None)
             ),
             recommended_channel=_coerce_optional_text(getattr(event, "recommended_channel", None)),
+            speaker_associated=_coerce_optional_bool(getattr(event, "speaker_associated", None)),
+            speaker_association_confidence=_coerce_optional_ratio(
+                getattr(event, "speaker_association_confidence", None)
+            ),
         )
 
     def to_event_fields(self) -> dict[str, object | None]:
@@ -186,6 +216,8 @@ class VoiceRuntimeIntentContext:
             "interaction_ready": self.interaction_ready,
             "targeted_inference_blocked": self.targeted_inference_blocked,
             "recommended_channel": self.recommended_channel,
+            "speaker_associated": self.speaker_associated,
+            "speaker_association_confidence": self.speaker_association_confidence,
         }
 
     def trace_details(self) -> dict[str, object]:
@@ -199,7 +231,10 @@ class VoiceRuntimeIntentContext:
             "intent_interaction_ready": self.interaction_ready,
             "intent_targeted_inference_blocked": self.targeted_inference_blocked,
             "intent_recommended_channel": self.recommended_channel,
+            "intent_speaker_associated": self.speaker_associated,
+            "intent_speaker_association_confidence": self.speaker_association_confidence,
             "intent_audio_bias_allowed": self.audio_bias_allowed(),
+            "intent_strong_speaker_bias_allowed": self.strong_speaker_bias_allowed(),
         }
 
     def audio_bias_allowed(self) -> bool:
@@ -210,6 +245,17 @@ class VoiceRuntimeIntentContext:
         if self.person_visible is False:
             return False
         return self.interaction_ready is True and self.recommended_channel == "speech"
+
+    def strong_speaker_bias_allowed(self) -> bool:
+        """Return whether waiting wake may use the stronger speaker-associated bias."""
+
+        if not self.audio_bias_allowed():
+            return False
+        if self.speaker_associated is not True:
+            return False
+        if self.speaker_association_confidence is None:
+            return False
+        return self.speaker_association_confidence >= _STRONG_SPEAKER_BIAS_MIN_CONFIDENCE
 
     def waiting_activation_allowed(self) -> bool:
         """Return whether idle transcript-first activation may scan this context.

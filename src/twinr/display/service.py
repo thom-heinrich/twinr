@@ -60,6 +60,13 @@ _ERROR_LOG_THROTTLE_S = 30.0
 _HEARTBEAT_IDLE_REFRESH_S = 5.0
 
 _LOGGER = logging.getLogger(__name__)
+_VOICE_QUIET_FACE_CUE = DisplayFaceCue(
+    source="runtime_voice_quiet",
+    head_dy=1,
+    mouth="neutral",
+    brows="soft",
+    blink=True,
+)
 
 
 def _default_emit(line: str) -> None:
@@ -222,7 +229,7 @@ class TwinrStatusDisplayLoop:
                 log_sections = self._build_log_sections(snapshot, stale=snapshot_stale)
                 status = self._snapshot_status(snapshot)
                 frame = self._display_animation_frame(status)
-                face_cue = self._active_face_cue()
+                face_cue = self._active_face_cue(snapshot=snapshot)
                 emoji_cue = self._active_emoji_cue()
                 ambient_impulse_cue = self._active_ambient_impulse_cue()
                 service_connect_cue = self._active_service_connect_cue()
@@ -890,9 +897,11 @@ class TwinrStatusDisplayLoop:
         presentation_signature = presentation_cue.telemetry_signature() if presentation_cue is not None else None
         return (layout_mode, status, presentation_signature)
 
-    def _active_face_cue(self) -> DisplayFaceCue | None:
+    def _active_face_cue(self, *, snapshot: RuntimeSnapshot | None = None) -> DisplayFaceCue | None:
         if self._display_layout() != "default":
             return None
+        if self._snapshot_voice_quiet_active(snapshot):
+            return _VOICE_QUIET_FACE_CUE
         store = self.face_cue_store
         if store is None:
             return None
@@ -983,6 +992,40 @@ class TwinrStatusDisplayLoop:
         if snapshot is None:
             return ""
         return self._compact_text(getattr(snapshot, "error_message", None), max_len=_EMIT_LINE_MAX_LEN)
+
+    def _snapshot_voice_quiet_active(self, snapshot: RuntimeSnapshot | None) -> bool:
+        if self._snapshot_status(snapshot) != "waiting":
+            return False
+        deadline = self._snapshot_voice_quiet_deadline_utc(snapshot)
+        if deadline is None:
+            return False
+        return deadline > self._current_time_utc()
+
+    def _snapshot_voice_quiet_deadline_utc(self, snapshot: RuntimeSnapshot | None) -> datetime | None:
+        if snapshot is None:
+            return None
+        raw_deadline = self._compact_text(getattr(snapshot, "voice_quiet_until_utc", None), max_len=64)
+        if not raw_deadline:
+            return None
+        normalized = raw_deadline[:-1] + "+00:00" if raw_deadline.endswith("Z") else raw_deadline
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _current_time_utc(self) -> datetime:
+        try:
+            current = self.clock()
+        except Exception:
+            return datetime.now(timezone.utc)
+        if not isinstance(current, datetime):
+            return datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            return current.replace(tzinfo=timezone.utc)
+        return current.astimezone(timezone.utc)
 
     def _compact_text(self, value: object | None, *, max_len: int | None = None) -> str:
         if value is None:

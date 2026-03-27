@@ -319,6 +319,14 @@ class WhatsAppWorkerBridge:
                 is_from_self=bool(payload.get("is_from_self", False)),
                 metadata={
                     "account_jid": self._optional_string(payload.get("account_jid")) or "",
+                    "worker_upsert_type": self._optional_string(payload.get("upsert_type")) or "",
+                    "worker_request_id": self._optional_string(payload.get("worker_request_id")) or "",
+                    "worker_remote_jid": self._optional_string(payload.get("raw_remote_jid")) or "",
+                    "worker_remote_jid_alt": self._optional_string(payload.get("raw_remote_jid_alt")) or "",
+                    "worker_participant": self._optional_string(payload.get("raw_participant")) or "",
+                    "worker_participant_alt": self._optional_string(payload.get("raw_participant_alt")) or "",
+                    "worker_message_timestamp": self._optional_string(payload.get("message_timestamp")) or "",
+                    "worker_context_stanza_id": self._optional_string(payload.get("context_stanza_id")) or "",
                 },
             )
             self._event_queue.put(message)

@@ -325,6 +325,25 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertIn("voice_orchestrator_transcript_committed=follow_up", lines)
         self.assertIn("voice_orchestrator_follow_up_closed=timeout", lines)
 
+    def test_follow_up_closed_event_dispatches_local_callback(self) -> None:
+        closed: list[str] = []
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_follow_up_closed=closed.append,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        orchestrator._handle_server_event(
+            OrchestratorVoiceFollowUpClosedEvent(reason="timeout")
+        )
+
+        self.assertEqual(closed, ["timeout"])
+
     def test_capture_loop_retries_transient_respeaker_process_exit_before_first_frame(self) -> None:
         orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
         failed_process = _FakeCaptureProcess(returncode=1)

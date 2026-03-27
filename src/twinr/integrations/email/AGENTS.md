@@ -14,7 +14,9 @@ Out of scope:
 ## Key files
 
 - `models.py` — canonical email normalization, drafts, summaries, and approved contacts
+- `profiles.py` — reviewed provider presets and compatibility notes shared by the wizard and managed runtime defaults
 - `adapter.py` — integration request validation, contact policy enforcement, and result shaping
+- `connectivity.py` — bounded IMAP/SMTP login probes and redacted operator-facing test results for the setup wizard
 - `imap.py` — bounded IMAP mailbox reader and preview extraction
 - `smtp.py` — bounded SMTP sender and transport validation
 - `__init__.py` — public export surface; treat export changes as API-impacting
@@ -22,9 +24,10 @@ Out of scope:
 ## Invariants
 
 - `models.py` is the source of truth for email normalization and approved-contact resolution; do not duplicate address or alias parsing rules elsewhere in this package.
+- `profiles.py` is the source of truth for reviewed provider presets and password-vs-OAuth compatibility notes; keep dashboard defaults and runtime defaults aligned through it.
 - `adapter.py` must require explicit approval before draft or send operations and must return structured `IntegrationResult` failures instead of leaking provider exceptions.
 - Recipient restrictions flow through `ApprovedEmailContacts` and `EmailAdapterSettings`; transport modules must not bypass those policy decisions.
-- `imap.py` and `smtp.py` must keep network work bounded with validated timeouts and encrypted transport defaults.
+- `imap.py`, `smtp.py`, and `connectivity.py` must keep network work bounded with validated timeouts, encrypted transport defaults, and redacted failure text.
 - Public exports are defined in `__init__.py` and re-exported from `src/twinr/integrations/__init__.py`; changing them is a compatibility change.
 
 ## Verification
@@ -65,11 +68,13 @@ cd /twinr && PYTHONPATH=src ./.venv/bin/pytest test/test_integrations_email.py t
 
 `imap.py` changes → also check:
 - `src/twinr/integrations/runtime.py`
+- `connectivity.py`
 - `test/test_integrations_email.py`
 - `test/test_integration_runtime.py`
 
 `smtp.py` changes → also check:
 - `src/twinr/integrations/runtime.py`
+- `connectivity.py`
 - `test/test_integrations_email.py`
 - `test/test_integration_runtime.py`
 
@@ -87,6 +92,7 @@ cd /twinr && PYTHONPATH=src ./.venv/bin/pytest test/test_integrations_email.py t
 
 ## Output expectations
 
-- Preserve strict separation of concerns: normalization in `models.py`, integration orchestration in `adapter.py`, IMAP transport in `imap.py`, SMTP transport in `smtp.py`.
+- Preserve strict separation of concerns: normalization in `models.py`, integration orchestration in `adapter.py`, IMAP transport in `imap.py`, SMTP transport in `smtp.py`, and setup-only verification in `connectivity.py`.
+- Keep provider-profile defaults and compatibility notes centralized in `profiles.py`; do not reintroduce Gmail-only special cases in runtime or web code.
 - Update [component.yaml](./component.yaml), [README.md](./README.md), and in-script docstrings when exports, invariants, or ownership change.
 - Keep user-facing error summaries plain, short, and safe for voice output.

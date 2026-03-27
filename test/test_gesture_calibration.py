@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.proactive.social.engine import SocialFineHandGesture
 from twinr.proactive.social.gesture_calibration import GestureCalibrationProfile
 
@@ -22,6 +22,9 @@ class GestureCalibrationProfileTests(unittest.TestCase):
         self.assertEqual(profile.fine_hand[SocialFineHandGesture.THUMBS_DOWN].confirm_samples, 1)
         self.assertEqual(profile.fine_hand[SocialFineHandGesture.OK_SIGN].confirm_samples, 1)
         self.assertEqual(profile.fine_hand[SocialFineHandGesture.MIDDLE_FINGER].confirm_samples, 1)
+        self.assertAlmostEqual(profile.fine_hand[SocialFineHandGesture.THUMBS_UP].min_visible_s, 1.0, places=3)
+        self.assertAlmostEqual(profile.fine_hand[SocialFineHandGesture.THUMBS_DOWN].min_visible_s, 1.0, places=3)
+        self.assertAlmostEqual(profile.fine_hand[SocialFineHandGesture.PEACE_SIGN].min_visible_s, 1.0, places=3)
 
     def test_runtime_profile_loads_json_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -35,6 +38,7 @@ class GestureCalibrationProfileTests(unittest.TestCase):
                                 "min_confidence": 0.79,
                                 "confirm_samples": 3,
                                 "hold_s": 0.51,
+                                "min_visible_s": 1.2,
                             }
                         }
                     }
@@ -48,4 +52,5 @@ class GestureCalibrationProfileTests(unittest.TestCase):
         self.assertEqual(policy.confirm_samples, 3)
         self.assertAlmostEqual(policy.min_confidence, 0.79, places=3)
         self.assertAlmostEqual(policy.hold_s, 0.51, places=3)
+        self.assertAlmostEqual(policy.min_visible_s, 1.2, places=3)
         self.assertTrue(str(profile.source_path or "").endswith("state/mediapipe/gesture_calibration.json"))

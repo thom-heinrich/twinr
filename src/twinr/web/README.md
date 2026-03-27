@@ -22,6 +22,7 @@ templates and CSS that power the operator dashboard.
 - keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
 - render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls
 - render the `/connect/whatsapp` wizard that guides one internal WhatsApp self-chat setup through allowlist, runtime, a bounded pairing window, and the final self-chat test
+- render the `/integrations/email` wizard that guides mailbox-provider selection, login storage, transport review, a bounded IMAP/SMTP connection test, and final mail guardrails before the managed email integration is enabled
 - persist per-channel onboarding snapshots so web-driven channel setup can show live QR-needed, paired, reconnect, and repair-needed status without moving runtime state into templates
 - compose presenters, support helpers, templates, and static assets into operator pages
 - persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context, including Hue-backed smart-home settings on `/integrations`
@@ -44,6 +45,7 @@ templates and CSS that power the operator dashboard.
 | [`automations.py`](./automations.py) | Automation page/form helpers |
 | [`support/channel_onboarding.py`](./support/channel_onboarding.py) | Generic file-backed onboarding snapshots and bounded in-process pairing registry |
 | [`support/whatsapp.py`](./support/whatsapp.py) | WhatsApp wizard validation, runtime probes, and bounded pairing coordination |
+| [`templates/setup_wizard.html`](./templates/setup_wizard.html) | Shared server-rendered wizard template used by guided setup flows such as email |
 | [`presenters`](./presenters/README.md) | Template-ready section builders |
 | [`support`](./support/README.md) | Shared contracts and file helpers |
 | [`templates`](./templates/) | Jinja page templates |

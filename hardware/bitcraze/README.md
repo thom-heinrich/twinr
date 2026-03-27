@@ -32,6 +32,12 @@ compatibility.
 | [probe_crazyradio.py](./probe_crazyradio.py) | Inspect connected Bitcraze USB devices, classify the current mode, and validate the local workspace/`cflib` access path |
 | [prepare_olimex_jtag.sh](./prepare_olimex_jtag.sh) | Check or prepare host prerequisites for AI-Deck GAP8 JTAG recovery with the Olimex ARM-USB-TINY-H bundle, including optional `openocd`/`docker` installation and runtime-user group prep |
 | [probe_multiranger.py](./probe_multiranger.py) | Connect to the Crazyflie, read the current deck flags, and sample Multi-ranger directions plus supporting Flow/Z-ranger presence for immediate post-install acceptance |
+| [on_device_failsafe.py](./on_device_failsafe.py) | Minimal host-side Appchannel helper that proves the firmware app is loaded, sends heartbeat/config packets, and records returned failsafe status packets |
+| [hover_primitive.py](./hover_primitive.py) | Internal helper module that owns deterministic hover pre-arm params, Kalman-settling gating, and the explicit bounded hover-setpoint primitive used by the operator-facing hover worker |
+| [run_hover_test.py](./run_hover_test.py) | Run one bounded takeoff-hover-land flight test with deck, battery, and in-flight stability telemetry gates through the isolated Bitcraze workspace |
+| [build_on_device_failsafe.sh](./build_on_device_failsafe.sh) | Build the Crazyflie STM32 on-device failsafe app as an out-of-tree firmware image against a Crazyflie firmware checkout |
+| [flash_on_device_failsafe.py](./flash_on_device_failsafe.py) | Flash the built STM32 image through `cfloader` and verify the new `twinrFs` firmware app over the normal radio link |
+| [twinr_on_device_failsafe/](./twinr_on_device_failsafe) | Crazyflie app-layer failsafe in C that keeps local safe-land and obstacle-repel behavior alive without the host |
 
 ## Usage
 
@@ -41,6 +47,8 @@ python3 hardware/bitcraze/probe_crazyradio.py --workspace /twinr/bitcraze
 python3 hardware/bitcraze/probe_crazyradio.py --workspace /twinr/bitcraze --json
 sudo ./hardware/bitcraze/prepare_olimex_jtag.sh --workspace /twinr/bitcraze --install-apt --ensure-user-groups
 /twinr/bitcraze/.venv/bin/python hardware/bitcraze/probe_multiranger.py --workspace /twinr/bitcraze --require-deck multiranger --json
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --json
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/run_hover_test.py --workspace /twinr/bitcraze --json
 ```
 
 Once the AI-Deck WiFi streamer is flashed, Twinr can treat it as a normal
@@ -66,6 +74,82 @@ For the incoming Multi-ranger deck, Twinr now has a dedicated bounded probe
 that checks `deck.bcMultiranger`, `deck.bcFlow2`, `deck.bcZRanger2`, and
 samples `front/back/left/right/up/down` range data over the normal radio URI.
 That gives us an immediate acceptance test as soon as the deck is mounted.
+
+For the first live flight primitive, Twinr now also ships one bounded hover
+worker that only does `takeoff -> hover -> land` after explicit deck and
+battery preflight. When the Multi-ranger deck is present, the same preflight
+samples one short clearance snapshot and blocks takeoff if front/back/left/
+right/up obstacles are already too close for a safe hover envelope. Before the
+first takeoff setpoint, the worker now also applies and verifies a
+deterministic hover-time firmware setup:
+- `stabilizer.estimator=2`
+- `stabilizer.controller=1`
+- `motion.disable=0`
+- `kalman.resetEstimation` pulse and verification back to `0`
+
+Takeoff is then gated behind a bounded Kalman-settling check that waits for
+stable `kalman.varPX/PY/PZ`, quiet roll/pitch, usable `motion.squal`, and a
+valid downward `range.zrange` reading. Only after that does the worker run the
+explicit stateful hover-setpoint primitive from [hover_primitive.py](./hover_primitive.py),
+which owns the `takeoff -> hold -> land` state machine and its abort/landing
+path instead of relying on the more implicit `MotionCommander` context-manager
+behavior.
+
+The worker also writes bounded in-flight telemetry for attitude, position and
+velocity estimates, gyro motion, optical-flow quality, downward and directional
+range sensing, battery sag, radio RSSI, thrust, and supervisor safety flags so
+a successful run includes real stability evidence rather than only a pass/fail
+outcome. The persisted artifact now also includes the verified pre-arm param
+snapshot, the estimator-settle summary, and the primitive outcome in addition
+to the in-air telemetry summary. It lives beside the other Bitcraze scripts and
+also runs through `/twinr/bitcraze/.venv`, not the repo-local `.venv`.
+
+The landing side of the primitive is now staged as well instead of dropping
+straight from hover to stop-setpoints: it first descends to a low near-ground
+floor, briefly settles there, then switches to a slower touchdown stage,
+briefly holds zero-height setpoints, and only then allows motor cutoff after a
+deterministic landing-complete signal. The primary completion signal is fresh
+downward `range.zrange` confirmation at or below the current `5 cm` cutoff for
+three consecutive samples; the secondary completion signal is the firmware
+supervisor no longer reporting `is flying`. This is deliberate: Bitcraze's
+`send_stop_setpoint()` is a hard motor stop that can otherwise make the drone
+fall. Once airborne, the hover worker therefore keeps driving the landing path
+until one of those completion signals arrives instead of aborting the active
+landing by exception.
+
+For timeout/debug forensics it also accepts `--trace-file` and streams phase
+breadcrumbs such as `sync_connect`, `pre_arm_params`, `estimator_settle`,
+`telemetry_stop`, `sync_disconnect`, `report_build`, and `json_emit` to a
+JSONL file so teardown hangs still leave durable evidence. The persisted
+telemetry summary uses the inferred airborne window instead of mixing in
+pre-takeoff estimator-settle samples, and it drops invalid range sentinels
+like `0` and `32766` so drift and clearance numbers better reflect the actual
+hover. Hover acceptance is fail-closed as well: runs are marked unstable when
+the measured altitude rises far above the requested hover height or when
+battery sag under load drops below the bounded safety floor, even if the
+telemetry stream itself stayed alive.
+
+For host-loss safety, the hover path now has a second layer below Python: a
+Crazyflie app-layer failsafe in [twinr_on_device_failsafe/](./twinr_on_device_failsafe)
+runs directly on the STM32 in C with a `20 ms` local control loop. The host
+only sends bounded Appchannel heartbeats plus thresholds through
+[on_device_failsafe.py](./on_device_failsafe.py). If that heartbeat stops,
+the on-device app can still locally brake, repel away from nearby obstacles,
+descend, and only disarm after touchdown confirmation. This is the correct
+language/runtime split for performance and determinism: the real emergency path
+stays on the aircraft, Python only configures and observes it.
+
+Build and flash that firmware path before relying on bounded hover acceptance:
+
+```bash
+bash hardware/bitcraze/build_on_device_failsafe.sh
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
+```
+
+The post-flash helper reconnects over the normal radio URI and proves the app
+through `twinrFs.protocolVersion`, `twinrFs.enable`, `twinrFs.state`, and
+`twinrFs.reason`. The hover worker's default `--on-device-failsafe-mode required`
+now blocks takeoff unless that proof is present.
 
 Run the Bitcraze probes with `/twinr/bitcraze/.venv` rather than the repo-local
 `.venv`. The Bitcraze stack currently wants a newer `numpy` line than Twinr, so

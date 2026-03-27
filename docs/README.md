@@ -355,6 +355,9 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_MIN_PULSE_WIDTH_US`
 - `TWINR_ATTENTION_SERVO_CENTER_PULSE_WIDTH_US`
 - `TWINR_ATTENTION_SERVO_MAX_PULSE_WIDTH_US`
+- For wide-angle positional servos, set these to the servo datasheet range instead of
+  leaving them at a narrower generic calibration. A DS3225-class 270 degree servo
+  typically expects a full `500-2500 us` positional range with `1500 us` center.
 - `TWINR_ATTENTION_SERVO_MAX_STEP_US`
 - `TWINR_ATTENTION_SERVO_TARGET_SMOOTHING_S`
 - `TWINR_ATTENTION_SERVO_MAX_VELOCITY_US_PER_S`

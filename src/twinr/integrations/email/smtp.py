@@ -95,6 +95,19 @@ class SMTPMailSender(MailSender):
             # AUDIT-FIX(#5): Best-effort cleanup must never replace the original SMTP/send exception.
             self._close_connection(connection)
 
+    def probe_connection(self) -> None:
+        """Open one bounded SMTP session and complete the login handshake.
+
+        The setup wizard uses this to verify the saved outgoing-mail transport
+        before Twinr allows the managed mailbox integration to be re-enabled.
+        """
+
+        connection = self._connection_factory(self.config)
+        try:
+            self._start_session(connection)
+        finally:
+            self._close_connection(connection)
+
     def _build_message(self, draft: EmailDraft) -> EmailMessage:
         """Convert a validated draft into an RFC 5322 message object."""
         to_recipients = self._normalize_recipients(draft.to)

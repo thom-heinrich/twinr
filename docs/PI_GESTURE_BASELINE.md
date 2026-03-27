@@ -102,22 +102,25 @@ person ROI exists but yields `0` hand detections.
 ### HDMI Ack Lane Floors
 
 All current HDMI ack gestures use `confirm_samples=1`.
+Thumbs and `peace_sign` also require `min_visible_s=1.0`, so one isolated frame
+does not publish immediately.
 
-| Gesture | Effective min confidence | Hold |
-|---|---|---|
-| `thumbs_up` | `0.56` | `0.35 s` |
-| `thumbs_down` | `0.44` | `0.35 s` |
-| `pointing` | `0.66` | `0.32 s` |
-| `peace_sign` | `0.60` | `0.40 s` |
-| `ok_sign` | `0.86` | `0.46 s` |
-| `middle_finger` | `0.90` | `0.28 s` |
-| `wave` coarse event | `0.68` | `0.35 s` |
+| Gesture | Effective min confidence | Min visible | Cooldown |
+|---|---|---|---|
+| `thumbs_up` | `0.48` | `1.0 s` | `0.35 s` |
+| `thumbs_down` | `0.37` | `1.0 s` | `0.35 s` |
+| `pointing` | `0.66` | `0.0 s` | `0.32 s` |
+| `peace_sign` | `0.60` | `1.0 s` | `0.40 s` |
+| `ok_sign` | `0.86` | `0.0 s` | `0.46 s` |
+| `middle_finger` | `0.90` | `0.0 s` | `0.28 s` |
+| `wave` coarse event | `0.68` | `0.0 s` | `0.35 s` |
 
 These floors are Pi-tuned acknowledgement floors for the HDMI emoji lane only.
 They are intentionally separate from broader social/wakeup policy.
-`thumbs_down` is intentionally lower than the earlier freeze because fresh Pi
-runtime rows on 2026-03-23 still showed valid live ROI detections around
-`0.446` and `0.489`, while `0.360` remained safely below the floor.
+`thumbs_up` and `thumbs_down` are intentionally lower than the earlier freeze
+because fresh Pi traces on 2026-03-26 showed valid hand-localized person-ROI
+thumb recoveries around `0.48` and `0.393`/`0.420`, while `0.470` and `0.360`
+still remained below the new floors.
 
 ### Candidate Capture Debugging
 

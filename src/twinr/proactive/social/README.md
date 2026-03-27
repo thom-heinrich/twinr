@@ -23,7 +23,7 @@ scored proactive trigger candidates and optional visual second opinions.
 - Keep the gesture acknowledgement surface fast enough for HDMI HCI, so changed user symbols like `🖐️` then `👍` are not blocked for several seconds by the slower proactive inspect cadence
 - Preserve short explicit fine-hand symbols such as `👍`, `👎`, `👉`, `✌️`, `👌`, or `🖕` across brief motion/dropout jitter so users do not need to freeze unnaturally for the camera path
 - Keep per-symbol fine-hand acceptance configurable and bounded, because `👌` and `🖕` are materially easier to confuse than built-in `👍`, `👎`, `✌️`, or `👉`
-- Keep default confirmation counts tight enough for sub-second HDMI acknowledgement on the Pi; prefer stricter confidence floors over extra confirmation frames whenever a target gesture still needs to feel realtime
+- Keep per-symbol acceptance bounded for live HDMI HCI: prefer a short explicit visibility window for deliberate symbols such as `👍`, `👎`, and `✌️` over brittle single-frame publishes, but do not let that grow into multi-second frozen-pose requirements
 - Let the staged custom gesture model supplement built-in MediaPipe hand symbols instead of globally overriding them, so custom-only `👌` / `🖕` support does not steal `✌️` or `👉` from the built-in recognizer
 - Expose a low-latency ReSpeaker signal-only audio snapshot path for HDMI attention refresh, so local gesture/gaze HCI does not inherit the longer ambient PCM sampling window
 - Share low-risk social-contract normalization helpers across modules without regrowing duplicate coercion code in hot runtime paths

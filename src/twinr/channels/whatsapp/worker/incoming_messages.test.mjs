@@ -108,6 +108,14 @@ test("buildIncomingMessagePayload normalizes a self-chat message", () => {
     is_group: false,
     is_from_self: true,
     account_jid: TEST_ACCOUNT_JID,
+    upsert_type: null,
+    worker_request_id: null,
+    raw_remote_jid: TEST_ACCOUNT_JID,
+    raw_remote_jid_alt: null,
+    raw_participant: null,
+    raw_participant_alt: null,
+    message_timestamp: null,
+    context_stanza_id: null,
   });
 });
 
@@ -142,7 +150,58 @@ test("buildIncomingMessagePayload canonicalizes own account lid traffic to the s
     is_group: false,
     is_from_self: true,
     account_jid: TEST_ACCOUNT_JID,
+    upsert_type: null,
+    worker_request_id: null,
+    raw_remote_jid: TEST_ACCOUNT_LID,
+    raw_remote_jid_alt: null,
+    raw_participant: null,
+    raw_participant_alt: null,
+    message_timestamp: null,
+    context_stanza_id: null,
   });
+});
+
+test("buildIncomingMessagePayload carries worker provenance fields", () => {
+  const payload = buildIncomingMessagePayload(
+    {
+      key: {
+        id: "msg-debug",
+        remoteJid: TEST_ACCOUNT_PHONE_JID,
+        remoteJidAlt: TEST_ACCOUNT_LID,
+        participant: TEST_ACCOUNT_PHONE_JID,
+        participantAlt: TEST_ACCOUNT_LID,
+        fromMe: false,
+      },
+      text: "Hallo Twinr",
+      messageTimestamp: 1774539523,
+      message: {
+        extendedTextMessage: {
+          text: "Hallo Twinr",
+          contextInfo: {
+            stanzaId: "stanza-123",
+          },
+        },
+      },
+    },
+    {
+      extractText,
+      normalizeJid,
+      accountJid: TEST_ACCOUNT_JID,
+      accountLid: TEST_ACCOUNT_LID,
+      receivedAt: "2026-03-25T19:00:00Z",
+      upsertType: "append",
+      workerRequestId: "req-123",
+    },
+  );
+
+  assert.equal(payload?.upsert_type, "append");
+  assert.equal(payload?.worker_request_id, "req-123");
+  assert.equal(payload?.raw_remote_jid, TEST_ACCOUNT_PHONE_JID);
+  assert.equal(payload?.raw_remote_jid_alt, TEST_ACCOUNT_LID);
+  assert.equal(payload?.raw_participant, TEST_ACCOUNT_PHONE_JID);
+  assert.equal(payload?.raw_participant_alt, TEST_ACCOUNT_LID);
+  assert.equal(payload?.message_timestamp, "1774539523");
+  assert.equal(payload?.context_stanza_id, "stanza-123");
 });
 
 test("collectIncomingMessagePayloads forwards append self-chat turns", () => {

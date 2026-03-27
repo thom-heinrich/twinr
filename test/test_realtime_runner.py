@@ -2262,6 +2262,51 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(captured_kwargs["seed_transcript"], "wie geht es dir")
         self.assertFalse(captured_kwargs["play_initial_beep"])
 
+    def test_remote_follow_up_closed_resets_local_runtime_to_waiting(self) -> None:
+        config = TwinrConfig(conversation_follow_up_enabled=True)
+        loop, _lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config
+        )
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie spaet ist es?",
+                response_text="Es ist zehn Uhr.",
+                response_id="resp_rt_123",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_single_text_turn(
+            transcript="wie spaet ist es",
+            listen_source="voice_activation",
+            proactive_trigger=None,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("follow_up_open", "voice_activation", True))
+
+        loop.handle_remote_follow_up_closed("timeout")
+
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("waiting", "timeout", False))
+        self.assertIn(("waiting", "timeout", False), fake_voice.states)
+
+    def test_remote_follow_up_closed_ignores_newer_non_follow_up_listening_state(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop.runtime.begin_listening(request_source="voice_activation")
+        loop._notify_voice_orchestrator_state("listening", detail="voice_activation", follow_up_allowed=False)
+
+        loop.handle_remote_follow_up_closed("timeout")
+
+        self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("listening", "voice_activation", False))
+        self.assertIn("voice_orchestrator_follow_up_closed_ignored=stale_state", lines)
+
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
         loop.runtime.last_response = "Guten Tag"

@@ -13,6 +13,7 @@ from threading import Event, Lock, Thread
 from twinr.agent.base_agent.contracts import (
     FirstWordReply,
     SupervisorDecision,
+    normalize_supervisor_decision_runtime_tool_name,
     supervisor_decision_requires_full_context,
 )
 from twinr.agent.base_agent.conversation.decision_core import normalize_turn_text
@@ -571,7 +572,14 @@ class StreamingSpeculationController:
                 ).strip()
                 fallback_mode = "direct" if fallback_text else fallback_mode
             elif action == "handoff":
-                fallback_text = str(getattr(prefetched_decision, "spoken_ack", None) or "").strip()
+                # One-shot runtime-local handoffs already speak through the
+                # direct tool result; replaying spoken_ack here duplicates the
+                # confirmation and widens the speaking window unnecessarily.
+                runtime_tool_name = normalize_supervisor_decision_runtime_tool_name(
+                    getattr(prefetched_decision, "runtime_tool_name", None)
+                )
+                if runtime_tool_name is None:
+                    fallback_text = str(getattr(prefetched_decision, "spoken_ack", None) or "").strip()
         if not fallback_text:
             return None
         return FirstWordReply(

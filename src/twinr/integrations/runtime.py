@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from twinr.integrations.calendar import CalendarAdapterSettings, ICSCalendarSource, ReadOnlyCalendarAdapter
@@ -35,6 +35,7 @@ from twinr.integrations.email import (
     SMTPMailSenderConfig,
     normalize_email,
 )
+from twinr.integrations.email.profiles import DEFAULT_EMAIL_PROFILE_ID, email_provider_profile
 from twinr.integrations.smarthome import (
     AggregatedSmartHomeProvider,
     RoutedSmartHomeProvider,
@@ -318,16 +319,28 @@ def _build_email_mailbox_runtime(
             detail="No mailbox connection is active. Configure account data and enable it when ready.",
         )
 
-    profile = (_coerce_text(record.value("profile", "gmail"), default="gmail").strip().lower() or "gmail")  # AUDIT-FIX(#5): Coerce config values to text and normalize casing before calling string methods.
+    profile_config = email_provider_profile(
+        record.value("profile", DEFAULT_EMAIL_PROFILE_ID),
+        default=DEFAULT_EMAIL_PROFILE_ID,
+    )
     account_email = _coerce_text(record.value("account_email", "")).strip()  # AUDIT-FIX(#5): Avoid AttributeError when the config store returns None or non-string values.
     from_address = _coerce_text(record.value("from_address", "")).strip() or account_email  # AUDIT-FIX(#5): Same guard for sender addresses.
     imap_host = _coerce_text(
-        record.value("imap_host", "imap.gmail.com" if profile == "gmail" else "")
+        record.value("imap_host", profile_config.default_imap_host)
     ).strip()  # AUDIT-FIX(#5): Same guard for IMAP host values.
     smtp_host = _coerce_text(
-        record.value("smtp_host", "smtp.gmail.com" if profile == "gmail" else "")
+        record.value("smtp_host", profile_config.default_smtp_host)
     ).strip()  # AUDIT-FIX(#5): Same guard for SMTP host values.
     secret_value = _coerce_text(env_values.get(EMAIL_APP_PASSWORD_ENV_KEY, "")).strip()
+
+    if not profile_config.supported:
+        return None, IntegrationReadiness(
+            integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
+            label="Email",
+            status="warn",
+            summary="Needs OAuth2",
+            detail=profile_config.support_detail,
+        )
 
     missing: list[str] = []
     if not account_email:
@@ -350,8 +363,16 @@ def _build_email_mailbox_runtime(
     try:
         normalized_account = _validate_email_address(account_email, label="Email account address")
         normalized_from = _validate_email_address(from_address, label="Email sender address")
-        imap_port = _parse_positive_int(record.value("imap_port", "993"), label="IMAP port", max_value=65535)  # AUDIT-FIX(#6): Reject invalid TCP ports during config parsing instead of failing later at connection time.
-        smtp_port = _parse_positive_int(record.value("smtp_port", "587"), label="SMTP port", max_value=65535)  # AUDIT-FIX(#6): Same range check for SMTP.
+        imap_port = _parse_positive_int(
+            record.value("imap_port", profile_config.default_imap_port or "993"),
+            label="IMAP port",
+            max_value=65535,
+        )  # AUDIT-FIX(#6): Reject invalid TCP ports during config parsing instead of failing later at connection time.
+        smtp_port = _parse_positive_int(
+            record.value("smtp_port", profile_config.default_smtp_port or "587"),
+            label="SMTP port",
+            max_value=65535,
+        )  # AUDIT-FIX(#6): Same range check for SMTP.
         contacts, contact_warnings = _parse_known_contacts(_coerce_text(record.value("known_contacts_text", "")))  # AUDIT-FIX(#5): Parse contacts from a safe text coercion path.
         unread_only_default = _parse_bool(
             record.value("unread_only_default", "true"),
@@ -410,7 +431,11 @@ def _build_email_mailbox_runtime(
                 port=imap_port,
                 username=normalized_account,
                 password=secret_value,
-                mailbox=_coerce_text(record.value("imap_mailbox", "INBOX"), default="INBOX").strip() or "INBOX",  # AUDIT-FIX(#5): Guard mailbox name parsing the same way as the rest of the config surface.
+                mailbox=_coerce_text(
+                    record.value("imap_mailbox", profile_config.default_mailbox),
+                    default=profile_config.default_mailbox,
+                ).strip()
+                or profile_config.default_mailbox,  # AUDIT-FIX(#5): Guard mailbox name parsing the same way as the rest of the config surface.
                 use_ssl=True,
             )
         ),
@@ -434,7 +459,7 @@ def _build_email_mailbox_runtime(
     status = "warn" if warning_items else "ok"
     summary = "Ready with warnings" if warning_items else "Ready"
     detail = (
-        f"{normalized_account} via {profile.replace('_', ' ')} · "
+        f"{normalized_account} via {profile_config.label.lower()} · "
         f"IMAP {imap_host}:{imap_port} · SMTP {smtp_host}:{smtp_port} · "
         "credential stored separately in .env"
     )

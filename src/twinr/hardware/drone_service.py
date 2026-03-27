@@ -308,6 +308,24 @@ class RemoteDroneServiceClient:
             )
         )
 
+    def create_hover_test_mission(
+        self,
+        *,
+        target_hint: str = "bounded hover test",
+        max_duration_s: float = _DEFAULT_DRONE_MISSION_TIMEOUT_S,
+    ) -> DroneMissionStatus:
+        """Create one bounded takeoff-hover-land test mission."""
+
+        return self.create_mission(
+            DroneMissionRequest(
+                mission_type="hover_test",
+                target_hint=target_hint,
+                capture_intent="hover_test",
+                max_duration_s=max_duration_s,
+                return_policy="return_and_land",
+            )
+        )
+
     def mission_status(self, mission_id: str) -> DroneMissionStatus:
         """Return one existing mission record."""
 

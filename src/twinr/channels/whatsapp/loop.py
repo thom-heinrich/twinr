@@ -24,6 +24,7 @@ from twinr.integrations import (
 from .config import WhatsAppChannelConfig
 from .history_import import WhatsAppHistoryImportQueue, WhatsAppHistoryImportResult
 from .history_learning import WhatsAppHistoryLearningService
+from .inbound_event_log import WhatsAppInboundEventLog
 from .outbound import WhatsAppOutboundQueue, WhatsAppOutboundResult
 from .policy import WhatsAppMessagePolicy
 from .worker_bridge import (
@@ -56,6 +57,7 @@ class TwinrWhatsAppChannelLoop:
     turn_service: _ChannelTurnService = field(init=False, repr=False)
     outbound_queue: WhatsAppOutboundQueue = field(init=False, repr=False)
     history_import_queue: WhatsAppHistoryImportQueue = field(init=False, repr=False)
+    inbound_event_log: WhatsAppInboundEventLog = field(init=False, repr=False)
     _account_jid: str | None = field(init=False, repr=False, default=None)
     _transport_open: bool = field(init=False, repr=False, default=False)
 
@@ -76,6 +78,7 @@ class TwinrWhatsAppChannelLoop:
             self.turn_service = TwinrTextChannelTurnService(runtime=self.runtime, backend=self.backend)
         self.outbound_queue = WhatsAppOutboundQueue.from_whatsapp_config(self.whatsapp_config)
         self.history_import_queue = WhatsAppHistoryImportQueue.from_whatsapp_config(self.whatsapp_config)
+        self.inbound_event_log = WhatsAppInboundEventLog(self.whatsapp_config.auth_dir.parent / "debug")
 
     def run(self, *, duration_s: float | None = None) -> int:
         """Run the listener until interrupted, fatal logout, or optional timeout."""
@@ -128,7 +131,13 @@ class TwinrWhatsAppChannelLoop:
                     self._process_outbound_queue_once()
                     continue
 
+                self.inbound_event_log.record_received(event)
                 decision = self.policy.evaluate(event, account_jid=self._account_jid)
+                self.inbound_event_log.record_policy_decision(
+                    event,
+                    accepted=decision.accepted,
+                    reason=decision.reason,
+                )
                 if not decision.accepted:
                     LOGGER.info(
                         "Ignoring WhatsApp message %s from %s: %s",
@@ -154,6 +163,11 @@ class TwinrWhatsAppChannelLoop:
                         reply_to_message_id=reply.reply_to_message_id,
                     )
                     self.policy.remember_outbound(send_result.message_id)
+                    self.inbound_event_log.record_delivery(
+                        event,
+                        outbound_message_id=send_result.message_id,
+                        reply_text=reply.text,
+                    )
                     LOGGER.info(
                         "Delivered WhatsApp reply %s for inbound %s.",
                         send_result.message_id,
@@ -161,6 +175,7 @@ class TwinrWhatsAppChannelLoop:
                     )
                 except Exception as exc:
                     LOGGER.exception("Failed to deliver WhatsApp reply for %s.", event.message_id)
+                    self.inbound_event_log.record_delivery_error(event, error=str(exc))
                     self.runtime.fail(f"WhatsApp delivery failed: {exc}")
                 self._process_history_import_queue_once()
                 self._process_outbound_queue_once()

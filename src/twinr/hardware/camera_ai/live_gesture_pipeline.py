@@ -60,6 +60,7 @@ _PRIMARY_PERSON_HINT_MIN_IOU = 0.6
 _LIVE_HAND_CROP_PADDING = 0.14
 _LIVE_HAND_MIN_CONTEXT_RATIO = 0.18
 _PERSON_ROI_SOURCE_PRIORITY_MARGIN = 0.12
+_PERSON_ROI_POSE_HINT_SHORT_CIRCUIT_REASON = "primary_pose_hint_confident_gesture"
 _PERSON_ROI_SOURCE_PRIORITY = {
     HandRoiSource.FULL_FRAME.value: 5,
     HandRoiSource.LEFT_WRIST.value: 4,
@@ -437,30 +438,27 @@ class LiveGesturePipeline:
             }
             person_roi_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
             if effective_visible_person_boxes:
-                if fresh_live_results_confirm_no_hand:
-                    debug_snapshot["person_roi_skipped_reason"] = "fresh_live_no_hand_evidence"
-                else:
-                    person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
-                        runtime=runtime,
-                        frame_rgb=frame_rgb,
-                        timestamp_ms=timestamp_ms,
-                        primary_person_box=effective_primary_person_box,
-                        person_boxes=effective_visible_person_boxes,
-                        sparse_keypoints=sparse_keypoints,
-                    )
-                    debug_snapshot.update(person_roi_debug)
-                    if person_roi_choice[0] != AICameraFineHandGesture.NONE:
-                        fine_hand_gesture, fine_hand_confidence = person_roi_choice
-                        if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
-                            debug_snapshot["resolved_source"] = (
-                                "visible_person_roi"
-                                if visible_person_box_source == "live"
-                                else "recent_visible_person_roi"
-                            )
-                        else:
-                            debug_snapshot["resolved_source"] = (
-                                "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
-                            )
+                person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
+                    runtime=runtime,
+                    frame_rgb=frame_rgb,
+                    timestamp_ms=timestamp_ms,
+                    primary_person_box=effective_primary_person_box,
+                    person_boxes=effective_visible_person_boxes,
+                    sparse_keypoints=sparse_keypoints,
+                )
+                debug_snapshot.update(person_roi_debug)
+                if person_roi_choice[0] != AICameraFineHandGesture.NONE:
+                    fine_hand_gesture, fine_hand_confidence = person_roi_choice
+                    if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
+                        debug_snapshot["resolved_source"] = (
+                            "visible_person_roi"
+                            if visible_person_box_source == "live"
+                            else "recent_visible_person_roi"
+                        )
+                    else:
+                        debug_snapshot["resolved_source"] = (
+                            "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
+                        )
             if fine_hand_gesture == AICameraFineHandGesture.NONE:
                 rescue_choice, live_roi_debug = self._recognize_from_live_hand_rois(
                     runtime=runtime,
@@ -490,23 +488,20 @@ class LiveGesturePipeline:
                 ),
             )
             if full_frame_rescue_reason is not None:
-                if fresh_live_results_confirm_no_hand:
-                    debug_snapshot["full_frame_hand_skipped_reason"] = "fresh_live_no_hand_evidence"
-                else:
-                    full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
-                        runtime=runtime,
-                        frame_rgb=frame_rgb,
-                        timestamp_ms=timestamp_ms,
-                    )
-                    debug_snapshot.update(full_frame_debug)
-                    debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
-                    hand_count = max(
-                        hand_count,
-                        _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
-                    )
-                    if full_frame_choice[0] != AICameraFineHandGesture.NONE:
-                        fine_hand_gesture, fine_hand_confidence = full_frame_choice
-                        debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+                full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                    runtime=runtime,
+                    frame_rgb=frame_rgb,
+                    timestamp_ms=timestamp_ms,
+                )
+                debug_snapshot.update(full_frame_debug)
+                debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
+                hand_count = max(
+                    hand_count,
+                    _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
+                )
+                if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                    fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                    debug_snapshot["resolved_source"] = "full_frame_hand_roi"
         else:
             debug_snapshot = {
                 "resolved_source": "live_stream",
@@ -616,6 +611,10 @@ class LiveGesturePipeline:
                 "person_roi_combined_confidence": None,
                 "person_roi_combined_source": None,
                 "person_roi_pose_hint_match_index": None,
+                "person_roi_short_circuit_used": False,
+                "person_roi_short_circuit_index": None,
+                "person_roi_short_circuit_confidence": None,
+                "person_roi_short_circuit_reason": None,
             }
             best_builtin_choice = _PersonRoiGestureChoice()
             best_custom_choice = _PersonRoiGestureChoice()
@@ -630,6 +629,7 @@ class LiveGesturePipeline:
                     primary_person_box=primary_person_box,
                     sparse_keypoints=sparse_keypoints,
                 )
+                pose_hint_attached = bool(candidate_sparse_keypoints)
                 if candidate_sparse_keypoints and pose_hint_match_index is None:
                     pose_hint_match_index = index
                 hand_landmark_result = self._ensure_hand_landmark_worker().analyze(
@@ -670,7 +670,7 @@ class LiveGesturePipeline:
                             "combined_gesture": combined.gesture.value,
                             "combined_confidence": _round_optional_confidence(combined.confidence),
                             "combined_source": combined.roi_source or None,
-                            "pose_hint_attached": bool(candidate_sparse_keypoints),
+                            "pose_hint_attached": pose_hint_attached,
                         },
                         "constraints_violated": (
                             []
@@ -687,6 +687,20 @@ class LiveGesturePipeline:
                     best_combined_choice = combined
                     best_detection_debug = detection_debug
                     best_match_index = index
+                if _should_short_circuit_person_roi_scan(
+                    config=self.config,
+                    pose_hint_attached=pose_hint_attached,
+                    candidate=combined,
+                ):
+                    debug["person_roi_short_circuit_used"] = True
+                    debug["person_roi_short_circuit_index"] = index
+                    debug["person_roi_short_circuit_confidence"] = _round_optional_confidence(
+                        combined.confidence
+                    )
+                    debug["person_roi_short_circuit_reason"] = (
+                        _PERSON_ROI_POSE_HINT_SHORT_CIRCUIT_REASON
+                    )
+                    break
             debug.update(
                 {
                     "person_roi_detection_debug": best_detection_debug,
@@ -776,6 +790,7 @@ class LiveGesturePipeline:
             if gesture_frame is None:
                 continue
             roi_source = _coerce_roi_source_value(getattr(detection, "roi_source", None))
+            gesture_frame_source = _resolve_detection_gesture_frame_source(detection)
             gesture_context_frame = _resolve_gesture_context_retry_frame(
                 primary_frame=gesture_frame,
                 context_frame=getattr(detection, "gesture_context_frame_rgb", None),
@@ -798,6 +813,7 @@ class LiveGesturePipeline:
             builtin_candidate = _guard_person_roi_gesture_choice(
                 candidate=builtin_raw_candidate,
                 roi_source=roi_source,
+                gesture_frame_source=gesture_frame_source,
                 detection_index=index,
             )
             next_builtin_choice = _prefer_person_roi_gesture_choice(
@@ -848,6 +864,7 @@ class LiveGesturePipeline:
             custom_candidate = _guard_person_roi_gesture_choice(
                 candidate=custom_raw_candidate,
                 roi_source=roi_source,
+                gesture_frame_source=gesture_frame_source,
                 detection_index=index,
             )
             next_custom_choice = _prefer_person_roi_gesture_choice(
@@ -1498,16 +1515,18 @@ def _summarize_roi_gesture_debug(
     """Return one bounded per-hand gesture debug summary."""
 
     roi_source_value = _coerce_roi_source_value(getattr(detection, "roi_source", None))
-    source_min_confidence = _person_roi_source_min_confidence(roi_source_value)
+    gesture_frame_source = _resolve_detection_gesture_frame_source(detection)
+    source_min_confidence = _effective_person_roi_source_min_confidence(
+        roi_source=roi_source_value,
+        gesture_frame_source=gesture_frame_source,
+    )
     gesture_frame = _resolve_detection_gesture_frame(detection)
     return {
         "roi_source": roi_source_value,
         "handedness": getattr(detection, "handedness", None),
         "handedness_score": _round_optional_confidence(getattr(detection, "handedness_score", None)),
         "detection_confidence": _round_optional_confidence(getattr(detection, "confidence", None)),
-        "gesture_frame_source": (
-            "full_frame_landmark_crop" if getattr(detection, "gesture_frame_rgb", None) is not None else "roi_local_crop"
-        ),
+        "gesture_frame_source": gesture_frame_source,
         "roi_frame_shape": _summarize_frame_shape(getattr(detection, "roi_frame_rgb", None)),
         "gesture_frame_shape": _summarize_frame_shape(gesture_frame),
         "gesture_context_frame_shape": _summarize_frame_shape(
@@ -1546,6 +1565,14 @@ def _resolve_detection_gesture_frame(detection: object) -> object | None:
     if gesture_frame is not None:
         return gesture_frame
     return getattr(detection, "roi_frame_rgb", None)
+
+
+def _resolve_detection_gesture_frame_source(detection: object) -> str:
+    """Report whether gesture classification used a hand-localized full-frame crop."""
+
+    if getattr(detection, "gesture_frame_rgb", None) is not None:
+        return "full_frame_landmark_crop"
+    return "roi_local_crop"
 
 
 def _live_custom_gesture_enabled(config: MediaPipeVisionConfig) -> bool:
@@ -1677,23 +1704,83 @@ def _person_roi_source_min_confidence(roi_source: str) -> float | None:
     return _coerce_unit_interval(value) if value is not None else None
 
 
+def _effective_person_roi_source_min_confidence(
+    *,
+    roi_source: str,
+    gesture_frame_source: str,
+) -> float | None:
+    """Return one extra person-ROI floor only while the classifier still sees the ROI crop.
+
+    The broader person-ROI floors were added to block torso-wide false positives.
+    Once the hand-landmark worker already re-cropped the gesture classifier onto
+    a hand-localized full-frame crop, that body-ROI floor becomes over-aggressive
+    and suppresses valid thumb gestures on the real Pi.
+    """
+
+    if gesture_frame_source == "full_frame_landmark_crop":
+        return None
+    return _person_roi_source_min_confidence(roi_source)
+
+
+def _person_roi_short_circuit_min_confidence(config: MediaPipeVisionConfig) -> float:
+    """Return the minimum score that justifies skipping later visible-person ROIs.
+
+    MediaPipe's live-stream lane already uses tracking to keep the hot path
+    low-latency. Once Twinr falls back into IMAGE-mode person-ROI rescans, the
+    main latency driver becomes per-person serial hand reclassification. If the
+    pose-hinted primary ROI already produced a supported gesture above the
+    active model floors, later ROI rescans only add delay for the HDMI HCI path.
+    """
+
+    builtin_min_score = _coerce_unit_interval(getattr(config, "builtin_gesture_min_score", None)) or 0.0
+    custom_min_score = _live_custom_min_score(config) if _live_custom_gesture_enabled(config) else 0.0
+    return max(builtin_min_score, custom_min_score, _LIVE_CUSTOM_MIN_SCORE_FLOOR)
+
+
+def _should_short_circuit_person_roi_scan(
+    *,
+    config: MediaPipeVisionConfig,
+    pose_hint_attached: bool,
+    candidate: _PersonRoiGestureChoice,
+) -> bool:
+    """Return whether the primary pose-hinted ROI is strong enough to stop scanning.
+
+    Only the ROI that still matches the tracked primary person receives sparse
+    pose hints. When that ROI already resolves one supported gesture above the
+    active model floors, continuing through every additional visible person adds
+    substantial Pi latency while rarely changing the outcome.
+    """
+
+    if not pose_hint_attached or candidate.gesture == AICameraFineHandGesture.NONE:
+        return False
+    confidence = _coerce_unit_interval(candidate.confidence)
+    if confidence is None:
+        return False
+    return confidence >= _person_roi_short_circuit_min_confidence(config)
+
+
 def _guard_person_roi_gesture_choice(
     *,
     candidate: tuple[AICameraFineHandGesture, float | None],
     roi_source: str,
+    gesture_frame_source: str,
     detection_index: int,
 ) -> _PersonRoiGestureChoice:
     """Reject weak person-ROI symbols from broad crops before arbitration.
 
     Pi forensic captures showed broad torso ROIs resolving concrete thumb
-    gestures on frames that did not contain a reliable hand pose. Apply an
-    extra source-aware confidence floor here so only tighter wrist crops or
-    clearly strong body-crop symbols can survive into the final winner logic.
+    gestures on frames that did not contain a reliable hand pose. Keep that
+    source-aware guard for raw ROI-local crops, but do not keep applying it
+    after the hand-landmark worker already emitted a hand-localized full-frame
+    gesture crop.
     """
 
     gesture, confidence = candidate
     score = _coerce_unit_interval(confidence)
-    required_score = _person_roi_source_min_confidence(roi_source)
+    required_score = _effective_person_roi_source_min_confidence(
+        roi_source=roi_source,
+        gesture_frame_source=gesture_frame_source,
+    )
     if gesture == AICameraFineHandGesture.NONE or score is None:
         return _PersonRoiGestureChoice(
             roi_source=roi_source,

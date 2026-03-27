@@ -316,6 +316,92 @@ class PeerAICameraObservationProxyTests(unittest.TestCase):
         self.assertEqual(cached_payload["observation"]["person_count"], 1)
         self.assertEqual(cached_payload["cache_state"], "busy_reused")
 
+    def test_frame_bundle_returns_busy_timeout_after_stale_cache_expires(self) -> None:
+        adapter = _FakeAdapter()
+        service = _MODULE.AICameraObservationProxyService(
+            adapter=adapter,
+            busy_cache_max_age_s=0.05,
+        )
+
+        first_payload = service.observe_frame_bundle_payload(width=320, height=240)
+        self.assertEqual(first_payload["observation"]["person_count"], 1)
+        self.assertEqual(adapter.bundle_calls, 1)
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_lock() -> None:
+            with service._request_lock:  # pylint: disable=protected-access
+                entered.set()
+                release.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        try:
+            import time
+
+            time.sleep(0.08)
+            timed_out_payload = service.observe_frame_bundle_payload(
+                width=320,
+                height=240,
+                timeout_ms=250,
+            )
+        finally:
+            release.set()
+            holder.join(timeout=1.0)
+
+        self.assertEqual(adapter.bundle_calls, 1)
+        self.assertFalse(timed_out_payload["observation"]["camera_ready"])
+        self.assertEqual(
+            timed_out_payload["observation"]["camera_error"],
+            "camera_proxy_busy_timeout",
+        )
+        self.assertEqual(
+            timed_out_payload["debug_details"]["pipeline_error"],
+            "camera_proxy_busy_timeout",
+        )
+
+    def test_snapshot_handler_returns_gateway_timeout_when_helper_stays_busy(self) -> None:
+        adapter = _FakeAdapter()
+        service = _MODULE.AICameraObservationProxyService(adapter=adapter)
+        handler_class = _MODULE.build_handler(service)
+        written = bytearray()
+        headers: list[tuple[str, str]] = []
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_lock() -> None:
+            with service._request_lock:  # pylint: disable=protected-access
+                entered.set()
+                release.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        try:
+            handler = handler_class.__new__(handler_class)
+            handler.path = "/snapshot.png?width=320&height=240&timeout_ms=250"
+            handler.wfile = SimpleNamespace(write=written.extend)
+            handler.client_address = ("10.42.0.1", 4242)
+            handler.server = SimpleNamespace()
+            handler.command = "GET"
+            handler.request_version = "HTTP/1.1"
+            handler.requestline = f"GET {handler.path} HTTP/1.1"
+            handler.send_response = lambda status: headers.append(("status", str(status)))
+            handler.send_header = lambda name, value: headers.append((name, value))
+            handler.end_headers = lambda: None
+            handler.log_message = lambda fmt, *args: None
+
+            handler.do_GET()
+        finally:
+            release.set()
+            holder.join(timeout=1.0)
+
+        self.assertIn(("status", "504"), headers)
+        self.assertEqual(written.decode("utf-8"), "camera_proxy_busy_timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

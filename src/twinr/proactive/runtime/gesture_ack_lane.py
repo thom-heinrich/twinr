@@ -38,12 +38,11 @@ _SUPPORTED_COARSE_GESTURES: frozenset[SocialGestureEvent] = frozenset()
 _PENDING_RESET_AFTER_S = 0.9
 _DISPLAY_ACK_FALLBACK_POLICIES = {
     # Pi-side live/ROI gesture scores are materially lower than the broader
-    # social-path defaults. Keep the HDMI ack lane tuned to real device traces
-    # so clear user gestures publish, while still blocking the weakest false
-    # positives seen in candidate-frame QA.
-    SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.56, 2, 0.35),
-    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.44, 2, 0.35),
-    SocialFineHandGesture.PEACE_SIGN: FineHandGesturePolicy(0.60, 1, 0.40),
+    # social-path defaults. Keep the HDMI ack lane tuned to current Pi traces
+    # while still requiring a deliberate held gesture before user-facing publish.
+    SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.48, 1, 0.35, 1.0),
+    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.37, 1, 0.35, 1.0),
+    SocialFineHandGesture.PEACE_SIGN: FineHandGesturePolicy(0.60, 1, 0.40, 1.0),
 }
 
 
@@ -55,6 +54,7 @@ class _GestureCandidate:
     decision: DisplayGestureEmojiDecision
     confirm_samples: int
     hold_s: float
+    min_visible_s: float
 
 
 class GestureAckLane:
@@ -69,6 +69,7 @@ class GestureAckLane:
         self._pending_key: str | None = None
         self._pending_count = 0
         self._pending_seen_at: float | None = None
+        self._pending_started_at: float | None = None
         self._last_emitted_key: str | None = None
         self._last_emitted_at: float | None = None
 
@@ -92,19 +93,41 @@ class GestureAckLane:
         if candidate is None:
             self._reset_pending_if_stale(observed_at)
             decision = DisplayGestureEmojiDecision(reason="no_supported_live_gesture")
-            self._trace_ack_decision(observation=observation, candidate=None, decision=decision)
+            self._trace_ack_decision(
+                observed_at=observed_at,
+                observation=observation,
+                candidate=None,
+                decision=decision,
+            )
             return decision
 
         if self._pending_key == candidate.key:
+            if self._pending_started_at is None:
+                self._pending_started_at = observed_at
             self._pending_count += 1
         else:
             self._pending_key = candidate.key
             self._pending_count = 1
+            self._pending_started_at = observed_at
         self._pending_seen_at = observed_at
 
         if self._pending_count < candidate.confirm_samples:
             decision = DisplayGestureEmojiDecision(reason="awaiting_live_gesture_confirmation")
-            self._trace_ack_decision(observation=observation, candidate=candidate, decision=decision)
+            self._trace_ack_decision(
+                observed_at=observed_at,
+                observation=observation,
+                candidate=candidate,
+                decision=decision,
+            )
+            return decision
+        if self._pending_visible_s(observed_at) < candidate.min_visible_s:
+            decision = DisplayGestureEmojiDecision(reason="awaiting_live_gesture_visibility")
+            self._trace_ack_decision(
+                observed_at=observed_at,
+                observation=observation,
+                candidate=candidate,
+                decision=decision,
+            )
             return decision
 
         if (
@@ -113,12 +136,22 @@ class GestureAckLane:
             and (observed_at - self._last_emitted_at) < candidate.hold_s
         ):
             decision = DisplayGestureEmojiDecision(reason="live_gesture_cooldown")
-            self._trace_ack_decision(observation=observation, candidate=candidate, decision=decision)
+            self._trace_ack_decision(
+                observed_at=observed_at,
+                observation=observation,
+                candidate=candidate,
+                decision=decision,
+            )
             return decision
 
         self._last_emitted_key = candidate.key
         self._last_emitted_at = observed_at
-        self._trace_ack_decision(observation=observation, candidate=candidate, decision=candidate.decision)
+        self._trace_ack_decision(
+            observed_at=observed_at,
+            observation=observation,
+            candidate=candidate,
+            decision=candidate.decision,
+        )
         return candidate.decision
 
     def _candidate_from_observation(
@@ -138,6 +171,7 @@ class GestureAckLane:
                         decision=decision,
                         confirm_samples=1,
                         hold_s=0.35,
+                        min_visible_s=0.0,
                     )
 
         fine_gesture = observation.fine_hand_gesture
@@ -153,11 +187,13 @@ class GestureAckLane:
             fallback_min_confidence=fallback_policy.min_confidence,
             fallback_confirm_samples=fallback_policy.confirm_samples,
             fallback_hold_s=fallback_policy.hold_s,
+            fallback_min_visible_s=fallback_policy.min_visible_s,
         )
         effective_policy = FineHandGesturePolicy(
             min_confidence=min(policy.min_confidence, fallback_policy.min_confidence),
             confirm_samples=max(policy.confirm_samples, fallback_policy.confirm_samples),
             hold_s=policy.hold_s,
+            min_visible_s=max(policy.min_visible_s, fallback_policy.min_visible_s),
         )
         if confidence < effective_policy.min_confidence:
             return None
@@ -169,6 +205,7 @@ class GestureAckLane:
             decision=decision,
             confirm_samples=effective_policy.confirm_samples,
             hold_s=effective_policy.hold_s,
+            min_visible_s=effective_policy.min_visible_s,
         )
 
     def _reset_pending_if_stale(self, observed_at: float) -> None:
@@ -178,10 +215,18 @@ class GestureAckLane:
         self._pending_key = None
         self._pending_count = 0
         self._pending_seen_at = None
+        self._pending_started_at = None
+
+    def _pending_visible_s(self, observed_at: float) -> float:
+        started_at = self._pending_started_at
+        if started_at is None:
+            return 0.0
+        return max(0.0, observed_at - started_at)
 
     def _trace_ack_decision(
         self,
         *,
+        observed_at: float,
         observation: SocialVisionObservation,
         candidate: _GestureCandidate | None,
         decision: DisplayGestureEmojiDecision,
@@ -202,6 +247,7 @@ class GestureAckLane:
             options=[
                 {"id": "emit", "summary": "Emit the current gesture acknowledgement immediately."},
                 {"id": "awaiting_live_gesture_confirmation", "summary": "Keep the current gesture pending until confirmation."},
+                {"id": "awaiting_live_gesture_visibility", "summary": "Keep the current gesture pending until it stayed visible long enough."},
                 {"id": "live_gesture_cooldown", "summary": "Suppress a repeated gesture during cooldown."},
                 {"id": "no_supported_live_gesture", "summary": "Ignore the frame because no supported gesture survived gating."},
             ],
@@ -213,6 +259,7 @@ class GestureAckLane:
                 "candidate_key": None if candidate is None else candidate.key,
                 "pending_key": self._pending_key,
                 "pending_count": self._pending_count,
+                "pending_visible_s": round(self._pending_visible_s(observed_at), 3),
                 "last_emitted_key": self._last_emitted_key,
             },
             confidence=_coerce_confidence(observation.fine_hand_gesture_confidence or observation.gesture_confidence),

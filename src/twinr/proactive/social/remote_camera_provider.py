@@ -24,7 +24,12 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.hardware.ai_camera import AICameraObservation, LocalAICameraAdapter
+from twinr.hardware.ai_camera import (
+    AICameraFineHandGesture,
+    AICameraGestureEvent,
+    AICameraObservation,
+    LocalAICameraAdapter,
+)
 
 from .local_camera_provider import LocalAICameraObservationProvider, LocalAICameraProviderConfig
 from .observers import ProactiveVisionSnapshot
@@ -206,7 +211,18 @@ class RemoteAICameraObservationProvider(_RemoteAICameraTransport):
     def observe_gesture(self) -> ProactiveVisionSnapshot:
         """Fetch one low-latency HDMI gesture snapshot from the proxy Pi."""
 
-        snapshot, debug_details = self._observe_remote("observe_gesture")
+        observation, captured_at, model, debug_details = self._fetch_remote_observation("observe_gesture")
+        if _remote_debug_cache_state(debug_details) == "busy_reused" and _camera_observation_ready(observation):
+            observation = _suppress_observed_gesture(observation)
+            debug_details = dict(debug_details or {})
+            debug_details["gesture_processing_skipped"] = True
+            debug_details["gesture_skip_reason"] = "busy_reused_frame_not_counted_as_fresh_gesture"
+            debug_details["transport_mode"] = "remote_proxy_busy_reused_passthrough"
+        snapshot = self._snapshot_from_observation(
+            observation,
+            captured_at=captured_at,
+            model=model,
+        )
         self._last_gesture_debug_details = debug_details
         return snapshot
 
@@ -438,6 +454,25 @@ class RemoteFrameAICameraObservationProvider(_RemoteAICameraTransport):
                 captured_at=captured_at,
                 model=observation.model,
             )
+        if _remote_debug_cache_state(remote_debug) == "busy_reused":
+            debug_details = _merge_debug_details(
+                None,
+                remote_debug=remote_debug,
+                transport_mode="remote_frame_busy_reused_passthrough",
+                remote_route="observe_frame_bundle",
+            )
+            debug_details["gesture_processing_skipped"] = True
+            debug_details["gesture_skip_reason"] = "busy_reused_frame_not_counted_as_fresh_gesture"
+            self._last_gesture_debug_details = _append_provider_stage_ms(
+                debug_details,
+                remote_fetch_ms=remote_fetch_ms,
+                provider_total_ms=_elapsed_ms(provider_started_ns),
+            )
+            return self._snapshot_from_observation(
+                observation,
+                captured_at=captured_at,
+                model=observation.model,
+            )
 
         process_started_ns = time.monotonic_ns()
         processed_observation = self._processor.observe_gesture_from_frame(
@@ -610,6 +645,30 @@ def _remote_frame_gesture_model_name(model: str | None) -> str:
     if model == "local-imx500+mediapipe-live-gesture+pose-fallback":
         return "remote-imx500-detection+local-mediapipe-live-gesture+pose-fallback"
     return "remote-imx500-detection+local-mediapipe-live-gesture"
+
+
+def _remote_debug_cache_state(debug_details: dict[str, object] | None) -> str | None:
+    """Return the helper cache state carried by the current remote debug payload."""
+
+    if not isinstance(debug_details, dict):
+        return None
+    value = debug_details.get("cache_state")
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _suppress_observed_gesture(observation: AICameraObservation) -> AICameraObservation:
+    """Strip gesture outputs from one reused helper frame so it cannot count twice."""
+
+    return replace(
+        observation,
+        gesture_event=AICameraGestureEvent.NONE,
+        gesture_confidence=None,
+        fine_hand_gesture=AICameraFineHandGesture.NONE,
+        fine_hand_gesture_confidence=None,
+    )
 
 
 def _decode_remote_frame_bundle_png(value: object) -> bytes:

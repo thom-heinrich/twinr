@@ -79,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Queue one bounded inspect mission through the configured drone daemon.",
     )
     parser.add_argument(
+        "--drone-hover-test",
+        action="store_true",
+        help="Queue one bounded takeoff-hover-land test mission through the configured drone daemon.",
+    )
+    parser.add_argument(
         "--drone-cancel-mission",
         help="Cancel one existing drone mission by id.",
     )
@@ -459,6 +464,12 @@ def _run_drone_cli_commands(config: TwinrConfig, args: argparse.Namespace) -> in
         print(f"drone_mission_state={mission.state}")
         print(f"drone_mission_summary={mission.summary}")
         return 0
+    if args.drone_hover_test:
+        mission = client.create_hover_test_mission(max_duration_s=drone_config.mission_timeout_s)
+        print(f"drone_mission_id={mission.mission_id}")
+        print(f"drone_mission_state={mission.state}")
+        print(f"drone_mission_summary={mission.summary}")
+        return 0
     if args.drone_cancel_mission:
         mission = client.cancel_mission(args.drone_cancel_mission)
         print(f"drone_mission_id={mission.mission_id}")
@@ -601,7 +612,7 @@ def main() -> int:
     if args.self_test:
         return _run_self_test_command(config, args.self_test)
 
-    if args.drone_status or args.drone_inspect or args.drone_cancel_mission or args.drone_manual_arm:
+    if args.drone_status or args.drone_inspect or args.drone_hover_test or args.drone_cancel_mission or args.drone_manual_arm:
         return _run_drone_cli_commands(config, args)
 
     uses_openai = any(

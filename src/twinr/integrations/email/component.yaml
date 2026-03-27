@@ -3,10 +3,12 @@ name: email
 path: src/twinr/integrations/email
 kind: python-package
 visibility: internal
-summary: Provide Twinr's email integration models, adapter orchestration, IMAP mailbox reader, and SMTP sender.
+summary: Provide Twinr's email integration models, reviewed provider profiles, adapter orchestration, bounded IMAP mailbox reader probes, SMTP sender probes, and runtime-facing mail helpers.
 owned_concerns:
   - Define the canonical email contacts, drafts, mailbox summaries, and address normalization rules used across Twinr
+  - Define the reviewed provider presets and compatibility notes shared by the dashboard wizard and managed runtime defaults
   - Translate integration requests into bounded read, draft, and send email operations
+  - Probe IMAP and SMTP login reachability with redacted, bounded operator-facing connection-test results before activation
   - Read recent mailbox summaries from IMAP and sanitize provider payloads into Twinr data models
   - Send validated drafts through SMTP with explicit transport and recipient checks
 out_of_scope:
@@ -19,10 +21,12 @@ files:
     exports:
       - ApprovedEmailContacts
       - EmailAdapterSettings
+      - EmailConnectionTestResult
       - EmailContact
       - EmailDraft
       - EmailMailboxAdapter
       - EmailMessageSummary
+      - EmailTransportProbe
       - IMAPMailboxConfig
       - IMAPMailboxReader
       - MailboxReader
@@ -30,6 +34,7 @@ files:
       - SMTPMailSender
       - SMTPMailSenderConfig
       - normalize_email
+      - run_email_connectivity_test
   - path: models.py
     role: Canonical email models and normalization helpers
     exports:
@@ -38,6 +43,8 @@ files:
       - EmailDraft
       - EmailMessageSummary
       - normalize_email
+  - path: profiles.py
+    role: Reviewed provider presets and compatibility notes shared by the dashboard wizard and managed runtime defaults
   - path: adapter.py
     role: Integration request adapter and safety settings
     exports:
@@ -45,13 +52,19 @@ files:
       - EmailMailboxAdapter
       - MailboxReader
       - MailSender
+  - path: connectivity.py
+    role: Bounded IMAP/SMTP login probe helpers that return redacted operator-facing connection-test results
+    exports:
+      - EmailConnectionTestResult
+      - EmailTransportProbe
+      - run_email_connectivity_test
   - path: imap.py
-    role: IMAP mailbox configuration and recent-message reader
+    role: IMAP mailbox configuration, recent-message reader, and bounded mailbox-login probe
     exports:
       - IMAPMailboxConfig
       - IMAPMailboxReader
   - path: smtp.py
-    role: SMTP transport configuration and mail sender
+    role: SMTP transport configuration, mail sender, and bounded outgoing-login probe
     exports:
       - SMTPMailSender
       - SMTPMailSenderConfig
@@ -60,10 +73,12 @@ public_api:
   exports:
     - ApprovedEmailContacts
     - EmailAdapterSettings
+    - EmailConnectionTestResult
     - EmailContact
     - EmailDraft
     - EmailMailboxAdapter
     - EmailMessageSummary
+    - EmailTransportProbe
     - IMAPMailboxConfig
     - IMAPMailboxReader
     - MailboxReader
@@ -71,6 +86,7 @@ public_api:
     - SMTPMailSender
     - SMTPMailSenderConfig
     - normalize_email
+    - run_email_connectivity_test
 compatibility_reexports:
   - path: src/twinr/integrations/__init__.py
     names:

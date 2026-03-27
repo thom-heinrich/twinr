@@ -475,10 +475,102 @@ class _FakeUrlOpenResponse:
 
 
 class VoiceActivationMatcherTests(unittest.TestCase):
-    def test_match_voice_activation_transcript_accepts_tynna_alias(self) -> None:
+    _EXPLICIT_ALIAS_FAMILY = (
+        "hey twinr",
+        "he twinr",
+        "hey twinna",
+        "hey tynna",
+        "hey twina",
+        "hey twinner",
+        "hallo twinr",
+        "hallo twinna",
+        "hallo tynna",
+        "hallo twina",
+        "hallo twinner",
+        "twinr hallo",
+        "twinr hey",
+        "twinna hallo",
+        "twinna hey",
+        "tynna hallo",
+        "tynna hey",
+        "twina hallo",
+        "twina hey",
+        "twinner hallo",
+        "twinner hey",
+        "twinr",
+        "twinna",
+        "tynna",
+        "twina",
+        "twinner",
+    )
+
+    def test_default_voice_activation_phrases_keep_safe_exact_alias_family(self) -> None:
+        self.assertEqual(
+            DEFAULT_VOICE_ACTIVATION_PHRASES,
+            (
+                "hey twinr",
+                "he twinr",
+                "hey twinna",
+                "hey twina",
+                "hey twinner",
+                "hallo twinr",
+                "hallo twinna",
+                "hallo twina",
+                "hallo twinner",
+                "twinr hallo",
+                "twinr hey",
+                "twinna hallo",
+                "twinna hey",
+                "twina hallo",
+                "twina hey",
+                "twinner hallo",
+                "twinner hey",
+                "twinr",
+                "twinna",
+                "twina",
+                "twinner",
+            ),
+        )
+
+    def test_match_voice_activation_transcript_default_rejects_alias_like_ambient_heads(self) -> None:
+        for transcript in (
+            "Tynna, wie ist das Wetter heute?",
+            "Twitter wie Google, Meta oder Snapshell.",
+            "Ich bin gerade Twinril unterwegs.",
+            "Was über Twinrang dazu liefern, würde er mich in seine Einheit holen.",
+            "Gewinner des Tages ist Max.",
+        ):
+            with self.subTest(transcript=transcript):
+                match = match_voice_activation_transcript(
+                    transcript,
+                    phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+                )
+
+                self.assertFalse(match.detected)
+                self.assertIsNone(match.matched_phrase)
+
+    def test_match_voice_activation_transcript_default_accepts_exact_safe_alias_family(self) -> None:
+        scenarios = (
+            ("Twinna, wie ist das Wetter heute?", "twinna", "wie ist das Wetter heute"),
+            ("Twina, wie spät ist es?", "twina", "wie spät ist es"),
+            ("Hey Twinner, schau mal im Web", "hey twinner", "schau mal im Web"),
+        )
+
+        for transcript, phrase, remaining_text in scenarios:
+            with self.subTest(transcript=transcript):
+                match = match_voice_activation_transcript(
+                    transcript,
+                    phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+                )
+
+                self.assertTrue(match.detected)
+                self.assertEqual(match.matched_phrase, phrase)
+                self.assertEqual(match.remaining_text, remaining_text)
+
+    def test_match_voice_activation_transcript_accepts_tynna_alias_when_explicitly_configured(self) -> None:
         match = match_voice_activation_transcript(
             "Tynna, wie ist das Wetter heute?",
-            phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+            phrases=self._EXPLICIT_ALIAS_FAMILY,
         )
 
         self.assertTrue(match.detected)
@@ -509,7 +601,7 @@ class VoiceActivationMatcherTests(unittest.TestCase):
             with self.subTest(transcript=transcript):
                 match = match_voice_activation_transcript(
                     transcript,
-                    phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+                    phrases=self._EXPLICIT_ALIAS_FAMILY,
                 )
 
                 self.assertTrue(match.detected)
@@ -527,7 +619,7 @@ class VoiceActivationMatcherTests(unittest.TestCase):
             with self.subTest(transcript=transcript):
                 match = match_voice_activation_transcript(
                     transcript,
-                    phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+                    phrases=self._EXPLICIT_ALIAS_FAMILY,
                 )
 
                 self.assertFalse(match.detected)
@@ -544,7 +636,7 @@ class VoiceActivationMatcherTests(unittest.TestCase):
             with self.subTest(transcript=transcript):
                 match = match_voice_activation_transcript(
                     transcript,
-                    phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
+                    phrases=self._EXPLICIT_ALIAS_FAMILY,
                 )
 
                 self.assertFalse(match.detected)
@@ -552,16 +644,56 @@ class VoiceActivationMatcherTests(unittest.TestCase):
 
     def test_match_voice_activation_transcript_accepts_generic_head_leadin_before_wake(self) -> None:
         match = match_voice_activation_transcript(
-            "Okay hey Twinna, wie spät ist es?",
+            "Okay hey Twinr, wie spät ist es?",
             phrases=DEFAULT_VOICE_ACTIVATION_PHRASES,
         )
 
         self.assertTrue(match.detected)
-        self.assertEqual(match.matched_phrase, "hey twinna")
+        self.assertEqual(match.matched_phrase, "hey twinr")
         self.assertEqual(match.remaining_text, "wie spät ist es")
 
 
 class VoiceRuntimeIntentContextTests(unittest.TestCase):
+    def test_from_sensor_facts_surfaces_speaker_association_bias(self) -> None:
+        facts = {
+            "camera": {
+                "person_visible": True,
+            },
+            "person_state": {
+                "presence_active": True,
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+            "speaker_association": {
+                "associated": True,
+                "confidence": 0.86,
+            },
+        }
+
+        context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
+
+        self.assertTrue(context.audio_bias_allowed())
+        self.assertTrue(context.speaker_associated)
+        self.assertEqual(context.speaker_association_confidence, 0.86)
+        self.assertTrue(context.strong_speaker_bias_allowed())
+
+    def test_strong_speaker_bias_requires_association_confidence(self) -> None:
+        context = VoiceRuntimeIntentContext(
+            person_visible=True,
+            presence_active=True,
+            interaction_ready=True,
+            targeted_inference_blocked=False,
+            recommended_channel="speech",
+            speaker_associated=True,
+            speaker_association_confidence=0.79,
+        )
+
+        self.assertTrue(context.audio_bias_allowed())
+        self.assertFalse(context.strong_speaker_bias_allowed())
+
     def test_from_sensor_facts_keeps_waiting_activation_allowed_during_focus_hold(self) -> None:
         facts = {
             "camera": {
@@ -903,6 +1035,8 @@ class OrchestratorClientTests(unittest.TestCase):
                 interaction_ready=True,
                 targeted_inference_blocked=False,
                 recommended_channel="speech",
+                speaker_associated=True,
+                speaker_association_confidence=0.88,
                 voice_quiet_until_utc="2026-03-25T12:15:00Z",
             ),
         )
@@ -921,6 +1055,8 @@ class OrchestratorClientTests(unittest.TestCase):
         self.assertTrue(decoded.runtime_state.interaction_ready)
         self.assertFalse(decoded.runtime_state.targeted_inference_blocked)
         self.assertEqual(decoded.runtime_state.recommended_channel, "speech")
+        self.assertTrue(decoded.runtime_state.speaker_associated)
+        self.assertEqual(decoded.runtime_state.speaker_association_confidence, 0.88)
         self.assertEqual(decoded.runtime_state.voice_quiet_until_utc, "2026-03-25T12:15:00Z")
 
     def test_client_handles_ack_tool_request_and_completion(self) -> None:
@@ -2076,6 +2212,182 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
         self.assertEqual(strict_events, [])
         self.assertEqual(biased_events[0]["type"], "wake_confirmed")
         self.assertEqual(biased_events[0]["matched_phrase"], "twinna")
+
+    def test_voice_session_strong_speaker_bias_accepts_tynna_only_when_speaker_is_associated(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1,
+                voice_orchestrator_remote_asr_min_wake_duration_ms=300,
+                voice_orchestrator_intent_min_wake_duration_relief_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            strict_session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(
+                    transcribe=lambda *args, **kwargs: "Tynna, wie ist das Wetter heute?"
+                ),
+            )
+            biased_session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(
+                    transcribe=lambda *args, **kwargs: "Tynna, wie ist das Wetter heute?"
+                ),
+            )
+
+            for session in (strict_session, biased_session):
+                session.handle_hello(
+                    OrchestratorVoiceHelloRequest(
+                        session_id="voice-1",
+                        sample_rate=16000,
+                        channels=1,
+                        chunk_ms=100,
+                    )
+                )
+
+            strict_session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="attending_to_device",
+                    interaction_intent_state="showing_intent",
+                    person_visible=True,
+                    presence_active=True,
+                    interaction_ready=True,
+                    targeted_inference_blocked=False,
+                    recommended_channel="speech",
+                )
+            )
+            biased_session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="attending_to_device",
+                    interaction_intent_state="showing_intent",
+                    person_visible=True,
+                    presence_active=True,
+                    interaction_ready=True,
+                    targeted_inference_blocked=False,
+                    recommended_channel="speech",
+                    speaker_associated=True,
+                    speaker_association_confidence=0.85,
+                )
+            )
+
+            for session in (strict_session, biased_session):
+                session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+                )
+                session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(2))
+                )
+
+            strict_events = strict_session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+            )
+            biased_events = biased_session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+            )
+
+        self.assertEqual(strict_events, [])
+        self.assertEqual(biased_events[0]["type"], "wake_confirmed")
+        self.assertEqual(biased_events[0]["matched_phrase"], "tynna")
+
+    def test_voice_session_strong_speaker_bias_accepts_winner_family_only_when_speaker_is_associated(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1,
+                voice_orchestrator_remote_asr_min_wake_duration_ms=300,
+                voice_orchestrator_intent_min_wake_duration_relief_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            strict_session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(
+                    transcribe=lambda *args, **kwargs: "Gewinner, wie spät ist es?"
+                ),
+            )
+            biased_session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(
+                    transcribe=lambda *args, **kwargs: "Gewinner, wie spät ist es?"
+                ),
+            )
+
+            for session in (strict_session, biased_session):
+                session.handle_hello(
+                    OrchestratorVoiceHelloRequest(
+                        session_id="voice-1",
+                        sample_rate=16000,
+                        channels=1,
+                        chunk_ms=100,
+                    )
+                )
+
+            strict_session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="attending_to_device",
+                    interaction_intent_state="showing_intent",
+                    person_visible=True,
+                    presence_active=True,
+                    interaction_ready=True,
+                    targeted_inference_blocked=False,
+                    recommended_channel="speech",
+                )
+            )
+            biased_session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="attending_to_device",
+                    interaction_intent_state="showing_intent",
+                    person_visible=True,
+                    presence_active=True,
+                    interaction_ready=True,
+                    targeted_inference_blocked=False,
+                    recommended_channel="speech",
+                    speaker_associated=True,
+                    speaker_association_confidence=0.85,
+                )
+            )
+
+            for session in (strict_session, biased_session):
+                session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+                )
+                session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(2))
+                )
+
+            strict_events = strict_session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+            )
+            biased_events = biased_session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+            )
+
+        self.assertEqual(strict_events, [])
+        self.assertEqual(biased_events[0]["type"], "wake_confirmed")
+        self.assertEqual(biased_events[0]["matched_phrase"], "twinner")
 
     def test_voice_session_waiting_activation_is_blocked_when_person_state_disallows_speech(self) -> None:
         with TemporaryDirectory() as temp_dir:

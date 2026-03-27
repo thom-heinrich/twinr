@@ -341,7 +341,11 @@ def _resolve_deploy_services(
     )
     if requested_services is not None:
         return _normalize_services((*requested_services, *normalized_rollout_services))
-    enabled_repo_services = _load_enabled_repo_services(remote=remote, services=repo_services)
+    enabled_repo_services = _load_enabled_repo_services(
+        project_root=project_root,
+        remote=remote,
+        services=repo_services,
+    )
     return _normalize_services((*DEFAULT_DEPLOY_SERVICES, *enabled_repo_services, *normalized_rollout_services))
 
 
@@ -402,6 +406,7 @@ def _is_repo_pi_runtime_service_unit(service_text: str) -> bool:
 
 def _load_enabled_repo_services(
     *,
+    project_root: Path,
     remote: _PiRemoteExecutor,
     services: Sequence[str],
 ) -> tuple[str, ...]:
@@ -410,12 +415,18 @@ def _load_enabled_repo_services(
     normalized_services = _normalize_services(services) if services else ()
     if not normalized_services:
         return ()
+    install_targets_by_service = _load_repo_service_install_targets(
+        project_root=project_root,
+        services=normalized_services,
+    )
     script = "\n".join(
         (
             "python3 - <<'PY'",
             "import json",
+            "from pathlib import Path",
             "import subprocess",
             f"services = {json.dumps(list(normalized_services), ensure_ascii=False)}",
+            f"install_targets_by_service = {json.dumps(install_targets_by_service, ensure_ascii=False)}",
             "payload = []",
             "for name in services:",
             "    completed = subprocess.run(",
@@ -431,7 +442,19 @@ def _load_enabled_repo_services(
             "        if raw_line.startswith('UnitFileState='):",
             "            state = raw_line.split('=', 1)[1].strip()",
             "            break",
-            "    payload.append({'name': name, 'unit_file_state': state})",
+            "    install_link_present = False",
+            "    for target in install_targets_by_service.get(name, []):",
+            "        wants_path = Path('/etc/systemd/system') / f'{target}.wants' / name",
+            "        if wants_path.is_symlink() or wants_path.exists():",
+            "            install_link_present = True",
+            "            break",
+            "    payload.append(",
+            "        {",
+            "            'name': name,",
+            "            'unit_file_state': state,",
+            "            'install_link_present': install_link_present,",
+            "        }",
+            "    )",
             "print(json.dumps(payload, ensure_ascii=False))",
             "PY",
         )
@@ -441,10 +464,60 @@ def _load_enabled_repo_services(
     enabled: list[str] = []
     for item in payload:
         state = str(item.get("unit_file_state", "") or "").strip().lower()
-        if not _is_enabled_unit_file_state(state):
+        install_link_present = bool(item.get("install_link_present"))
+        if not _is_enabled_unit_file_state(state) and not install_link_present:
             continue
         enabled.append(str(item.get("name", "") or "").strip())
     return tuple(enabled)
+
+
+def _load_repo_service_install_targets(
+    *,
+    project_root: Path,
+    services: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    """Return the repo-declared WantedBy install targets for each Pi service."""
+
+    ops_root = project_root / "hardware" / "ops"
+    install_targets: dict[str, tuple[str, ...]] = {}
+    for service_name in services:
+        service_path = ops_root / service_name
+        targets = _parse_service_install_targets(service_path)
+        if targets:
+            install_targets[service_name] = targets
+    return install_targets
+
+
+def _parse_service_install_targets(service_path: Path) -> tuple[str, ...]:
+    """Return the ordered WantedBy targets declared in one systemd unit file."""
+
+    try:
+        service_text = service_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+
+    in_install_section = False
+    targets: list[str] = []
+    seen: set[str] = set()
+    for raw_line in service_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_install_section = line == "[Install]"
+            continue
+        if not in_install_section:
+            continue
+        if not line.startswith("WantedBy="):
+            continue
+        _, raw_targets = line.split("=", 1)
+        for raw_target in raw_targets.split():
+            target = raw_target.strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+    return tuple(targets)
 
 
 def _is_enabled_unit_file_state(state: str) -> bool:

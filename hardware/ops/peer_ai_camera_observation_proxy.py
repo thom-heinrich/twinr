@@ -38,7 +38,7 @@ from __future__ import annotations
 import argparse
 import base64
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -60,9 +60,18 @@ _MIN_SNAPSHOT_HEIGHT = 64
 _MAX_SNAPSHOT_HEIGHT = 3040
 _MIN_TIMEOUT_MS = 250
 _MAX_TIMEOUT_MS = 10000
+_DEFAULT_BUSY_CACHE_MAX_AGE_S = 0.5
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedPayloadEntry:
+    """Keep one helper payload together with the time it entered the busy cache."""
+
+    payload: dict[str, object]
+    stored_at: float
 
 
 class AICameraObservationProxyService:
@@ -76,10 +85,12 @@ class AICameraObservationProxyService:
         adapter: object | None = None,
         default_snapshot_width: int = _DEFAULT_SNAPSHOT_WIDTH,
         default_snapshot_height: int = _DEFAULT_SNAPSHOT_HEIGHT,
+        busy_cache_max_age_s: float = _DEFAULT_BUSY_CACHE_MAX_AGE_S,
     ) -> None:
         """Initialize one proxy service from the repo root or a test adapter."""
 
         self._request_lock = threading.RLock()
+        self.busy_cache_max_age_s = _bounded_busy_cache_age_s(busy_cache_max_age_s)
         self.default_snapshot_width = _bounded_int(
             "default_snapshot_width",
             default_snapshot_width,
@@ -92,10 +103,10 @@ class AICameraObservationProxyService:
             minimum=_MIN_SNAPSHOT_HEIGHT,
             maximum=_MAX_SNAPSHOT_HEIGHT,
         )
-        self._last_observe_payload: dict[str, object] | None = None
-        self._last_attention_payload: dict[str, object] | None = None
-        self._last_gesture_payload: dict[str, object] | None = None
-        self._last_frame_bundle_payloads: dict[tuple[int, int], dict[str, object]] = {}
+        self._last_observe_payload: _CachedPayloadEntry | None = None
+        self._last_attention_payload: _CachedPayloadEntry | None = None
+        self._last_gesture_payload: _CachedPayloadEntry | None = None
+        self._last_frame_bundle_payloads: dict[tuple[int, int], _CachedPayloadEntry] = {}
         if adapter is not None:
             self._adapter: Any = adapter
             self.repo_root = None
@@ -158,7 +169,13 @@ class AICameraObservationProxyService:
             producer=self._observe_gesture_uncached,
         )
 
-    def observe_frame_bundle_payload(self, *, width: int, height: int) -> dict[str, object]:
+    def observe_frame_bundle_payload(
+        self,
+        *,
+        width: int,
+        height: int,
+        timeout_ms: int | None = None,
+    ) -> dict[str, object]:
         """Return one detection-plus-frame bundle from one coherent helper round."""
 
         bounded_width = _bounded_int(
@@ -174,30 +191,53 @@ class AICameraObservationProxyService:
             maximum=_MAX_SNAPSHOT_HEIGHT,
         )
         cache_key = (bounded_width, bounded_height)
+        effective_timeout_ms = _effective_timeout_ms(timeout_ms)
         if self._request_lock.acquire(blocking=False):
             try:
                 payload = self._build_frame_bundle_payload_locked(
                     width=bounded_width,
                     height=bounded_height,
                 )
-                self._last_frame_bundle_payloads[cache_key] = payload
+                self._last_frame_bundle_payloads[cache_key] = self._cache_payload_entry(payload)
                 return deepcopy(payload)
             finally:
                 self._request_lock.release()
-        cached_payload = self._last_frame_bundle_payloads.get(cache_key)
-        if isinstance(cached_payload, dict):
-            payload = deepcopy(cached_payload)
-            payload["cache_state"] = "busy_reused"
-            return payload
-        with self._request_lock:
+        cached_payload = self._reuse_cached_payload(self._last_frame_bundle_payloads.get(cache_key))
+        if cached_payload is not None:
+            return cached_payload
+        if not self._request_lock.acquire(timeout=effective_timeout_ms / 1000.0):
+            observed_at = time.time()
+            return self._serialize_observation_payload(
+                _health_only_observation(
+                    observed_at=observed_at,
+                    online=True,
+                    ready=False,
+                    ai_ready=False,
+                    error="camera_proxy_busy_timeout",
+                ),
+                debug_details={
+                    "bundle_mode": "detection_frame",
+                    "pipeline_error": "camera_proxy_busy_timeout",
+                    "request_timeout_ms": effective_timeout_ms,
+                },
+            )
+        try:
             payload = self._build_frame_bundle_payload_locked(
                 width=bounded_width,
                 height=bounded_height,
             )
-            self._last_frame_bundle_payloads[cache_key] = payload
+            self._last_frame_bundle_payloads[cache_key] = self._cache_payload_entry(payload)
             return deepcopy(payload)
+        finally:
+            self._request_lock.release()
 
-    def snapshot_png(self, *, width: int, height: int) -> bytes:
+    def snapshot_png(
+        self,
+        *,
+        width: int,
+        height: int,
+        timeout_ms: int | None = None,
+    ) -> bytes:
         """Return one bounded PNG snapshot from the shared AI-camera session."""
 
         bounded_width = _bounded_int(
@@ -212,7 +252,10 @@ class AICameraObservationProxyService:
             minimum=_MIN_SNAPSHOT_HEIGHT,
             maximum=_MAX_SNAPSHOT_HEIGHT,
         )
-        with self._request_lock:
+        effective_timeout_ms = _effective_timeout_ms(timeout_ms)
+        if not self._request_lock.acquire(timeout=effective_timeout_ms / 1000.0):
+            raise TimeoutError("camera_proxy_busy_timeout")
+        try:
             capture_snapshot_png = getattr(self._adapter, "capture_snapshot_png", None)
             if callable(capture_snapshot_png):
                 payload = capture_snapshot_png(width=bounded_width, height=bounded_height)
@@ -228,6 +271,8 @@ class AICameraObservationProxyService:
                 width=bounded_width,
                 height=bounded_height,
             )
+        finally:
+            self._request_lock.release()
 
     def _observation_payload_with_busy_cache(
         self,
@@ -250,22 +295,20 @@ class AICameraObservationProxyService:
                     observation,
                     debug_details=debug_details,
                 )
-                setattr(self, cache_name, payload)
+                setattr(self, cache_name, self._cache_payload_entry(payload))
                 return deepcopy(payload)
             finally:
                 self._request_lock.release()
-        cached_payload = getattr(self, cache_name, None)
-        if isinstance(cached_payload, dict):
-            payload = deepcopy(cached_payload)
-            payload["cache_state"] = "busy_reused"
-            return payload
+        cached_payload = self._reuse_cached_payload(getattr(self, cache_name, None))
+        if cached_payload is not None:
+            return cached_payload
         with self._request_lock:
             observation, debug_details = producer()
             payload = self._serialize_observation_payload(
                 observation,
                 debug_details=debug_details,
             )
-            setattr(self, cache_name, payload)
+            setattr(self, cache_name, self._cache_payload_entry(payload))
             return deepcopy(payload)
 
     def _observe_attention_uncached(self) -> tuple[Any, dict[str, object] | None]:
@@ -372,6 +415,28 @@ class AICameraObservationProxyService:
             payload["debug_details"] = dict(debug_details)
         return payload
 
+    def _cache_payload_entry(self, payload: dict[str, object]) -> _CachedPayloadEntry:
+        """Store one payload together with the frame time it represents."""
+
+        return _CachedPayloadEntry(
+            payload=dict(payload),
+            stored_at=time.time(),
+        )
+
+    def _reuse_cached_payload(
+        self,
+        entry: _CachedPayloadEntry | None,
+    ) -> dict[str, object] | None:
+        """Return one cached helper payload only while it is still fresh enough."""
+
+        if entry is None:
+            return None
+        if (time.time() - entry.stored_at) > self.busy_cache_max_age_s:
+            return None
+        payload = deepcopy(entry.payload)
+        payload["cache_state"] = "busy_reused"
+        return payload
+
 
 def build_handler(service: AICameraObservationProxyService):
     """Build one request handler bound to the configured proxy service."""
@@ -420,9 +485,20 @@ def build_handler(service: AICameraObservationProxyService):
                         minimum=_MIN_TIMEOUT_MS,
                         maximum=_MAX_TIMEOUT_MS,
                     )
+                    timeout_ms = _query_int(
+                        parsed.query,
+                        "timeout_ms",
+                        default=4000,
+                        minimum=_MIN_TIMEOUT_MS,
+                        maximum=_MAX_TIMEOUT_MS,
+                    )
                     self._write_json(
                         HTTPStatus.OK,
-                        service.observe_frame_bundle_payload(width=width, height=height),
+                        service.observe_frame_bundle_payload(
+                            width=width,
+                            height=height,
+                            timeout_ms=timeout_ms,
+                        ),
                     )
                     return
                 if parsed.path in {"/snapshot", "/snapshot.png"}:
@@ -447,13 +523,26 @@ def build_handler(service: AICameraObservationProxyService):
                         minimum=_MIN_TIMEOUT_MS,
                         maximum=_MAX_TIMEOUT_MS,
                     )
+                    timeout_ms = _query_int(
+                        parsed.query,
+                        "timeout_ms",
+                        default=4000,
+                        minimum=_MIN_TIMEOUT_MS,
+                        maximum=_MAX_TIMEOUT_MS,
+                    )
                     self._write_bytes(
                         HTTPStatus.OK,
-                        service.snapshot_png(width=width, height=height),
+                        service.snapshot_png(
+                            width=width,
+                            height=height,
+                            timeout_ms=timeout_ms,
+                        ),
                         content_type="image/png",
                     )
                     return
                 self._write_text(HTTPStatus.NOT_FOUND, "not found")
+            except TimeoutError as exc:
+                self._write_text(HTTPStatus.GATEWAY_TIMEOUT, str(exc))
             except ValueError as exc:
                 self._write_text(HTTPStatus.BAD_REQUEST, str(exc))
             except Exception as exc:  # pragma: no cover - defensive runtime guard.
@@ -512,6 +601,31 @@ def _query_int(raw_query: str, name: str, *, default: int, minimum: int, maximum
     if not values:
         return default
     return _bounded_int(name, values[-1], minimum=minimum, maximum=maximum)
+
+
+def _effective_timeout_ms(value: int | None) -> int:
+    """Normalize one optional request timeout to the supported helper range."""
+
+    return _bounded_int(
+        "timeout_ms",
+        _MAX_TIMEOUT_MS if value is None else value,
+        minimum=_MIN_TIMEOUT_MS,
+        maximum=_MAX_TIMEOUT_MS,
+    )
+
+
+def _bounded_busy_cache_age_s(value: object) -> float:
+    """Clamp the busy-cache reuse window to one small transport-only range."""
+
+    try:
+        numeric = float(cast(Any, value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("busy_cache_max_age_s must be numeric") from exc
+    if numeric != numeric or numeric <= 0.0:
+        raise ValueError("busy_cache_max_age_s must be positive")
+    return min(2.0, max(0.05, numeric))
+
+
 
 
 def _coerce_png_bytes(payload: object) -> bytes:

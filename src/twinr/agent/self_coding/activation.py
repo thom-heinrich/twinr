@@ -484,10 +484,66 @@ class SelfCodingActivationService:
             enabled=False,
         )
 
+    def _staged_automations_for_activation(self, activation: ActivationRecord) -> tuple[AutomationDefinition, ...]:
+        artifact = self.store.load_artifact(activation.artifact_id)
+        if artifact.kind == ArtifactKind.AUTOMATION_MANIFEST:
+            manifest = self._load_manifest_payload(artifact)
+            return (
+                self._versioned_automation_from_manifest(
+                    manifest,
+                    version=activation.version,
+                    skill_id=activation.skill_id,
+                ),
+            )
+        if artifact.kind == ArtifactKind.SKILL_PACKAGE:
+            document = skill_package_document_from_document(
+                self.store.read_text_artifact(artifact.artifact_id),
+            )
+            return tuple(
+                skill_package_automation_entries(
+                    skill_id=activation.skill_id,
+                    skill_name=activation.skill_name,
+                    version=activation.version,
+                    package=document.package,
+                )
+            )
+        raise ValueError(f"activation artifact {artifact.artifact_id!r} is not activatable")
+
+    def _restore_missing_activation_automations(
+        self,
+        activation: ActivationRecord,
+        *,
+        missing_ids: tuple[str, ...],
+    ) -> None:
+        staged_automations = self._staged_automations_for_activation(activation)
+        staged_by_id = {entry.automation_id: entry for entry in staged_automations}
+        unresolved = tuple(automation_id for automation_id in missing_ids if automation_id not in staged_by_id)
+        if unresolved:
+            raise ValueError(
+                f"activation {activation.skill_id!r} v{activation.version} references missing automation ids "
+                f"that could not be rebuilt from artifact {activation.artifact_id!r}: {', '.join(repr(item) for item in unresolved)}"
+            )
+        LOGGER.warning(
+            "Self-coding activation restored %d missing automation entries for %s v%s from artifact %s.",
+            len(missing_ids),
+            activation.skill_id,
+            activation.version,
+            activation.artifact_id,
+        )
+        for automation_id in missing_ids:
+            self.automation_store.upsert(staged_by_id[automation_id])
+
     def _set_automation_enabled(self, activation: ActivationRecord, *, enabled: bool) -> None:
         automation_ids = self._activation_automation_ids(activation)
         if not automation_ids:
             raise ValueError("activation record is missing automation_ids metadata")
+        missing_ids = tuple(
+            automation_id
+            for automation_id in automation_ids
+            if self.automation_store.get(automation_id) is None
+        )
+        if missing_ids:
+            self._restore_missing_activation_automations(activation, missing_ids=missing_ids)
         for automation_id in automation_ids:
             entry = self.automation_store.get(automation_id)
             if entry is None:

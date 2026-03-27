@@ -16,7 +16,8 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - shape the `/ops/debug` memory-search tab, including grouped durable/midterm/episodic/conflict hits from the real long-term retrieval path
 - shape the `/ops/debug` Conversation Lab tab from stored portal session traces without moving turn execution into templates
 - build the `/connect/whatsapp` wizard context, including step status, guarded runtime probes, persisted channel-onboarding snapshots, live portal QR rendering, and operator-facing pairing/repair guidance
-- build the compact WhatsApp setup summary for `/integrations`, while keeping the stateful QR pairing flow in the dedicated wizard
+- build the `/integrations/email` wizard context plus stepwise validated record updates for provider choice, mailbox login, transport, bounded connection-test state, and final guardrails
+- build the compact email and WhatsApp setup summaries for `/integrations`, while keeping the stateful WhatsApp QR pairing flow in the dedicated wizard
 - build the social-history learning consent/status panel for `/integrations`, including source selection, bounded lookback windows, and import-status copy
 - expose the presenter import surface through [`__init__.py`](./__init__.py)
 
@@ -33,7 +34,8 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`__init__.py`](./__init__.py) | Curated presenter export surface |
 | [`common.py`](./common.py) | Shared nav and reminder helpers |
 | [`settings.py`](./settings.py) | Global settings page builders |
-| [`integrations.py`](./integrations.py) | Email/calendar/smart-home sections, including Hue multi-bridge host/secret validation, plus the compact WhatsApp setup summary for `/integrations` |
+| [`integrations.py`](./integrations.py) | Integration overview rows, compact email/WhatsApp setup summaries, and validated email/calendar/smart-home form builders |
+| [`email_wizard.py`](./email_wizard.py) | Guided email mailbox setup wizard page context, bounded connection-test state, and stepwise record validation |
 | [`social_history.py`](./social_history.py) | Presenter shaping and form validation for the `/integrations` social-history learning panel |
 | [`voice.py`](./voice.py) | Voice profile page helpers |
 | [`ops.py`](./ops.py) | Ops row formatters and redaction |

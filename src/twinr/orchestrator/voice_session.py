@@ -28,6 +28,7 @@ from twinr.orchestrator.remote_asr import RemoteAsrBackendAdapter
 from twinr.orchestrator.voice_activation import (
     VoiceActivationMatch,
     VoiceActivationPhraseMatcher,
+    contextual_bias_voice_activation_phrases,
 )
 from twinr.orchestrator.voice_audio_debug_store import VoiceAudioDebugArtifactStore
 from twinr.orchestrator.voice_forensics import (
@@ -120,6 +121,8 @@ class EdgeOrchestratorVoiceSession:
     _SUPPORTED_RUNTIME_STATES = frozenset({"waiting", "listening", "thinking", "speaking", "follow_up_open"})
     _WAITING_VISIBILITY_GRACE_S = 6.0
     _REMOTE_ASR_SPEECH_CONTINUE_RATIO = 0.35
+    _STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS = 250
+    _STRONG_SPEAKER_MIN_WAKE_DURATION_RELIEF_MS = 50
 
     def __init__(
         self,
@@ -271,6 +274,13 @@ class EdgeOrchestratorVoiceSession:
             config,
             backend=self.backend,
         )
+        self._strong_bias_wake_phrase_spotter = _build_wake_phrase_spotter(
+            config,
+            backend=self.backend,
+            phrases=contextual_bias_voice_activation_phrases(
+                getattr(config, "voice_activation_phrases", ())
+            ),
+        )
         self._audio_debug_store = VoiceAudioDebugArtifactStore.from_config(config)
         self._transcript_debug_stream = VoiceTranscriptDebugStream.from_config(config)
         self._forensics: WorkflowForensics | None = None
@@ -311,6 +321,40 @@ class EdgeOrchestratorVoiceSession:
         if details:
             payload.update(details)
         return payload
+
+    def _strong_speaker_wake_bias_active(self, *, origin_state: str | None = None) -> bool:
+        """Return whether the stronger waiting-only speaker bias may be used."""
+
+        resolved_origin_state = str(origin_state or "").strip().lower() or self._state
+        if resolved_origin_state != "waiting":
+            return False
+        return self._intent_context.strong_speaker_bias_allowed()
+
+    def _wake_phrase_spotter_for_origin_state(
+        self,
+        *,
+        origin_state: str | None = None,
+    ) -> VoiceActivationPhraseMatcher:
+        """Return the wake matcher appropriate for the current bias context."""
+
+        if self._strong_speaker_wake_bias_active(origin_state=origin_state):
+            return self._strong_bias_wake_phrase_spotter
+        return self._wake_phrase_spotter
+
+    def _wake_bias_details(self, *, origin_state: str | None = None) -> dict[str, object]:
+        """Return trace/debug details for the current wake bias tier."""
+
+        return {
+            "wake_audio_bias_active": self._intent_audio_bias_active(),
+            "wake_strong_speaker_bias_active": self._strong_speaker_wake_bias_active(
+                origin_state=origin_state
+            ),
+            "wake_alias_expansion_active": self._strong_speaker_wake_bias_active(
+                origin_state=origin_state
+            ),
+            "wake_speaker_associated": self._intent_context.speaker_associated,
+            "wake_speaker_association_confidence": self._intent_context.speaker_association_confidence,
+        }
 
     def _trace_event(
         self,
@@ -449,13 +493,14 @@ class EdgeOrchestratorVoiceSession:
 
         origin_state_value = None if details is None else details.get("origin_state")
         origin_state = str(origin_state_value).strip() or None
+        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(origin_state=origin_state)
         try:
             with self._backend_request_context(
                 stage=stage,
                 capture=capture,
                 origin_state=origin_state,
             ):
-                return self._wake_phrase_spotter.detect(capture)
+                return wake_phrase_spotter.detect(capture)
         except Exception as exc:
             error_message = str(exc).strip()
             resolved_details: dict[str, object] = {
@@ -552,7 +597,10 @@ class EdgeOrchestratorVoiceSession:
         have not implemented transcript matching yet.
         """
 
-        match_transcript = getattr(self._wake_phrase_spotter, "match_transcript", None)
+        origin_state_value = None if details is None else details.get("origin_state")
+        origin_state = str(origin_state_value).strip() or None
+        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(origin_state=origin_state)
+        match_transcript = getattr(wake_phrase_spotter, "match_transcript", None)
         if callable(match_transcript):
             try:
                 return match_transcript(transcript)
@@ -1014,27 +1062,28 @@ class EdgeOrchestratorVoiceSession:
     def _effective_remote_asr_stage1_window_ms(self) -> int:
         """Return the current transcript-first stage-one scan window."""
 
-        if not self._intent_audio_bias_active():
-            return self.remote_asr_stage1_window_ms
-        return min(
-            self.history_ms,
-            self.remote_asr_stage1_window_ms + self.intent_stage1_window_bonus_ms,
-        )
+        window_ms = self.remote_asr_stage1_window_ms
+        if self._intent_audio_bias_active():
+            window_ms = min(
+                self.history_ms,
+                window_ms + self.intent_stage1_window_bonus_ms,
+            )
+        if self._strong_speaker_wake_bias_active(origin_state="waiting"):
+            window_ms = min(
+                self.history_ms,
+                window_ms + self._STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS,
+            )
+        return window_ms
 
     def _effective_remote_asr_min_activation_duration_ms(self) -> int:
         """Return the bounded minimum activation duration for the current context."""
 
-        if not self._intent_audio_bias_active():
-            if self._waiting_visibility_grace_active():
-                return max(
-                    self.chunk_ms,
-                    self.remote_asr_min_wake_duration_ms - self.intent_min_wake_duration_relief_ms,
-                )
-            return self.remote_asr_min_wake_duration_ms
-        return max(
-            self.chunk_ms,
-            self.remote_asr_min_wake_duration_ms - self.intent_min_wake_duration_relief_ms,
-        )
+        required_ms = self.remote_asr_min_wake_duration_ms
+        if self._intent_audio_bias_active() or self._waiting_visibility_grace_active():
+            required_ms -= self.intent_min_wake_duration_relief_ms
+        if self._strong_speaker_wake_bias_active(origin_state="waiting"):
+            required_ms -= self._STRONG_SPEAKER_MIN_WAKE_DURATION_RELIEF_MS
+        return max(self.chunk_ms, required_ms)
 
     def _effective_follow_up_timeout_s(self) -> float:
         """Return the bounded follow-up timeout for the current multimodal context."""
@@ -1196,11 +1245,12 @@ class EdgeOrchestratorVoiceSession:
                     stage="activation_utterance",
                     outcome="buffering_short_utterance",
                     capture=self._pending_transcript_capture_window(pending),
-                    details={
+                details={
                         "origin_state": pending.origin_state,
                         "active_ms": pending.active_ms,
                         "required_active_ms": self._effective_remote_asr_min_activation_duration_ms(),
                         **self._pending_utterance_details(pending),
+                        **self._wake_bias_details(origin_state=pending.origin_state),
                         **self._intent_context.trace_details(),
                     },
                 )
@@ -1283,6 +1333,7 @@ class EdgeOrchestratorVoiceSession:
             details={
                 "origin_state": pending.origin_state,
                 **self._pending_utterance_details(pending),
+                **self._wake_bias_details(origin_state=pending.origin_state),
             },
         )
         if match.detected:
@@ -1883,12 +1934,17 @@ def _build_wake_phrase_spotter(
     config: TwinrConfig,
     *,
     backend: _TranscriptBackend,
+    phrases: tuple[str, ...] | None = None,
 ) -> VoiceActivationPhraseMatcher:
     """Build the bounded transcript matcher used for wake confirmation."""
 
     return VoiceActivationPhraseMatcher(
         backend=backend,
-        phrases=getattr(config, "voice_activation_phrases", ()),
+        phrases=(
+            getattr(config, "voice_activation_phrases", ())
+            if phrases is None
+            else phrases
+        ),
         language=config.openai_realtime_language,
         suppress_transcription_errors=False,
     )

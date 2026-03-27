@@ -15,6 +15,7 @@ Out of scope:
 
 - `contracts.py` — canonical request/result/availability dataclasses plus the driver protocol
 - `loader.py` — safe local-workspace resolution and dynamic import bridge
+- `runtime/` — tracked typed-result, auth-state, document-reader, and provider-retry helpers consumed by browser runtimes and benchmark adapters
 - `__init__.py` — stable package export surface
 - `README.md` — package boundary and local workspace contract
 - `component.yaml` — structured ownership metadata
@@ -22,6 +23,7 @@ Out of scope:
 ## Invariants
 
 - Keep this package small and versioned; concrete browser stacks must stay outside git in the repo-root `browser_automation/` workspace.
+- Keep tracked runtime helpers here small, JSON-friendly, and independent from Playwright/browser-use specifics.
 - `loader.py` must fail closed on disabled, missing, malformed, or escaping workspace paths. No silent fallback to other folders is allowed.
 - The contract surface must stay stable and JSON-friendly so future tool/runtime callers can depend on it without importing a concrete backend.
 - Do not add Playwright- or browser-use-specific business logic here; that belongs in the local implementation until Twinr intentionally adopts one.

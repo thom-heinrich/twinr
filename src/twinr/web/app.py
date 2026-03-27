@@ -25,7 +25,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
-from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveTimingStore
 from twinr.agent.workflows.required_remote_snapshot import assess_required_remote_watchdog_snapshot
 from twinr.agent.self_coding import SelfCodingActivationService
 from twinr.agent.self_coding.retest import run_self_coding_skill_retest
@@ -41,6 +42,7 @@ from twinr.integrations import (
     integration_automation_family_providers,
     social_history_record_with_import_state,
 )
+from twinr.integrations.email.connectivity import run_email_connectivity_test
 from twinr.memory.reminders import format_due_label
 from twinr.memory.longterm.retrieval.operator_search import run_long_term_operator_search
 from twinr.ops import (
@@ -88,8 +90,15 @@ from twinr.web.support.whatsapp import (
 )
 from twinr.web.presenters import (
     _adaptive_timing_view,
+    _apply_email_wizard_connection_test_result,
     _build_calendar_integration_record,
     _build_email_integration_record,
+    _build_email_wizard_account_record,
+    _build_email_wizard_connection_test_configs,
+    _build_email_wizard_connection_test_record,
+    _build_email_wizard_guardrail_record,
+    _build_email_wizard_profile_record,
+    _build_email_wizard_transport_record,
     _build_social_history_learning_record,
     _build_smart_home_integration_record,
     _calendar_integration_sections,
@@ -98,7 +107,7 @@ from twinr.web.presenters import (
     _connect_sections,
     coerce_ops_debug_tab,
     _default_reminder_due_at,
-    _email_integration_sections,
+    _email_integration_context,
     _format_log_rows,
     _format_usage_rows,
     _health_card_detail,
@@ -113,6 +122,7 @@ from twinr.web.presenters import (
     _smart_home_integration_sections,
     _settings_sections,
     _whatsapp_integration_context,
+    build_email_wizard_page_context,
     build_self_coding_ops_page_context,
     build_whatsapp_wizard_page_context,
     _voice_action_result,
@@ -608,9 +618,9 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         default=bool(security_env_values.get("TWINR_WEB_USERNAME") or security_env_values.get("TWINR_WEB_PASSWORD")),
     )
     auth_username = str(security_env_values.get("TWINR_WEB_USERNAME", "")).strip()
-    auth_password = str(security_env_values.get("TWINR_WEB_PASSWORD", ""))
-    static_auth_partially_configured = bool(auth_username or auth_password)
-    if static_auth_partially_configured and not (auth_username and auth_password):
+    auth_password_value = str(security_env_values.get("TWINR_WEB_PASSWORD", ""))
+    static_auth_partially_configured = bool(auth_username or auth_password_value)
+    if static_auth_partially_configured and not (auth_username and auth_password_value):
         raise RuntimeError("Twinr Control static web auth requires both TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD.")
     managed_auth_enabled = bool(require_auth and not static_auth_partially_configured)
     managed_auth_store = ctx.web_auth_store() if managed_auth_enabled else None
@@ -648,6 +658,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         managed_auth_state: WebAuthState | None = None
         managed_session_username: str | None = None
         if managed_auth_enabled:
+            assert managed_auth_store is not None
             try:
                 managed_auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
             except Exception as exc:
@@ -678,7 +689,11 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 ),
             )
         # AUDIT-FIX(#1,#2): Require auth when configured and block cross-site state-changing requests.
-        if require_auth and not managed_auth_enabled and not _has_valid_basic_auth(request, auth_username, auth_password):
+        if require_auth and not managed_auth_enabled and not _has_valid_basic_auth(
+            request,
+            auth_username,
+            auth_password_value,
+        ):
             response = _error_response(
                 request,
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -725,7 +740,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         )
 
     @app.get("/auth/login", response_class=HTMLResponse)
-    async def auth_login(request: Request) -> HTMLResponse:
+    async def auth_login(request: Request) -> Response:
         """Render the managed-login page used by the permanent Pi web service."""
 
         if not managed_auth_enabled or managed_auth_store is None:
@@ -797,7 +812,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         return response
 
     @app.get("/auth/password", response_class=HTMLResponse)
-    async def auth_password(request: Request) -> HTMLResponse:
+    async def auth_password(request: Request) -> Response:
         """Render the password-change page for managed web sign-in."""
 
         if not managed_auth_enabled or managed_auth_store is None:
@@ -932,7 +947,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             for entry in recent_event_rows
             if str(entry.get("level", "")).lower() == "error"
         ][-3:]
-        cards = (
+        cards: tuple[DashboardCard, ...] = (
             DashboardCard(
                 title="Conversation",
                 value=snapshot.status.title(),
@@ -1601,6 +1616,11 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             ),
             integration_store_path=str(store.path),
             overview_rows=_integration_overview_rows(runtime.readiness),
+            email_summary=_email_integration_context(
+                email_record,
+                env_values,
+                readiness=runtime.readiness_for("email_mailbox"),
+            ),
             whatsapp_summary=_whatsapp_integration_context(
                 config,
                 env_values,
@@ -1609,7 +1629,6 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             ),
             social_history_panel=_social_history_learning_panel(social_history_record),
             social_history_sections=_social_history_learning_sections(social_history_record),
-            email_sections=_email_integration_sections(email_record, env_values),
             calendar_sections=_calendar_integration_sections(calendar_record),
             smart_home_sections=_smart_home_integration_sections(smart_home_record, env_values),
         )
@@ -1671,6 +1690,98 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 _public_error_message(exc, fallback="Twinr could not save that integration. Please check the fields and try again."),
             )
         return _redirect_saved("/integrations")
+
+    @app.get("/integrations/email", response_class=HTMLResponse)
+    async def integrations_email_wizard(request: Request) -> HTMLResponse:
+        """Render the guided email mailbox setup wizard."""
+
+        _config, env_values = await _call_sync(ctx.load_state)
+        store = ctx.integration_store()
+        email_record = await _call_sync(store.get, "email_mailbox")
+        runtime = await _call_sync(build_managed_integrations, ctx.project_root, env_path=ctx.env_path)
+        page_context = await _call_sync(
+            build_email_wizard_page_context,
+            email_record,
+            env_values,
+            readiness=runtime.readiness_for("email_mailbox"),
+            requested_step=request.query_params.get("step"),
+        )
+        return ctx.render(
+            request,
+            "setup_wizard.html",
+            page_title="Email Setup",
+            active_page="integrations",
+            restart_notice="Mailbox credentials stay in .env. The wizard stores only non-secret mail settings in the integration store.",
+            intro=(
+                "Use this wizard to connect one mailbox for readouts and approval-first replies. "
+                "Twinr keeps mail access bounded and operator-visible."
+            ),
+            wizard_kicker="Integrations / Email",
+            wizard_title="Email setup wizard",
+            wizard_form_action="/integrations/email",
+            wizard_path="/integrations/email",
+            back_href="/integrations",
+            back_label="Back to Integrations",
+            **page_context,
+        )
+
+    @app.post("/integrations/email")
+    async def save_integrations_email_wizard(request: Request) -> RedirectResponse:
+        """Persist one guided email wizard step."""
+
+        current_step = "profile"
+        try:
+            _config, env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = _require_non_empty(
+                form.get("_action", ""),
+                message="Please choose a valid email setup step.",
+            )
+            store = ctx.integration_store()
+            current_record = await _call_sync(store.get, "email_mailbox")
+
+            if action == "save_profile":
+                record, env_updates = await _call_sync(_build_email_wizard_profile_record, form, current_record)
+                next_step = "account"
+            elif action == "save_account":
+                current_step = "account"
+                record, env_updates = await _call_sync(_build_email_wizard_account_record, form, current_record, env_values)
+                next_step = "transport"
+            elif action == "save_transport":
+                current_step = "transport"
+                record, env_updates = await _call_sync(_build_email_wizard_transport_record, form, current_record)
+                next_step = "guardrails"
+            elif action == "run_connection_test":
+                current_step = "guardrails"
+                record, env_updates = await _call_sync(
+                    _build_email_wizard_connection_test_record,
+                    form,
+                    current_record,
+                    env_values,
+                )
+                imap_config, smtp_config = await _call_sync(_build_email_wizard_connection_test_configs, record, env_values)
+                test_result = await _call_sync(run_email_connectivity_test, imap_config, smtp_config)
+                record = await _call_sync(_apply_email_wizard_connection_test_result, record, test_result)
+                next_step = "guardrails"
+            elif action == "save_guardrails":
+                current_step = "guardrails"
+                record, env_updates = await _call_sync(_build_email_wizard_guardrail_record, form, current_record, env_values)
+                next_step = "guardrails"
+            else:
+                raise ValueError("Please choose a valid email setup step.")
+
+            async with state_write_lock:
+                await _call_sync(store.save, record)
+                if env_updates:
+                    await _call_sync(write_env_updates, ctx.env_path, env_updates)
+            return _redirect_saved("/integrations/email", step=next_step)
+        except Exception as exc:
+            logger.exception("Twinr email setup save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/integrations/email",
+                _public_error_message(exc, fallback="Twinr could not save that email setup step. Please check the fields and try again."),
+                step=current_step,
+            )
 
     @app.get("/voice-profile", response_class=HTMLResponse)
     async def voice_profile_page(request: Request) -> HTMLResponse:

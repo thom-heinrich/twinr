@@ -552,6 +552,7 @@ def _run_live_auth_check(
                 codex_path,
                 "exec",
                 "--json",
+                "--skip-git-repo-check",
                 "-m",
                 model,
                 "-c",

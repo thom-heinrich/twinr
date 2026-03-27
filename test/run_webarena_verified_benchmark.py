@@ -14,12 +14,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from tempfile import gettempdir
 from typing import Any
 import argparse
 import json
 import subprocess
 import sys
 import time
+import uuid
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
@@ -32,6 +34,7 @@ from test.browser_benchmarks.webarena_verified_adapter import (
     load_webarena_verified_task,
     run_twinr_task,
 )
+from test.browser_benchmarks.webarena_verified_auth_bootstrap import ensure_task_auth_context
 from test.browser_benchmarks.webarena_verified_subset import (
     collect_compatible_cases,
     load_official_subset_task_ids,
@@ -74,6 +77,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gitlab-url", default="http://localhost:8023", help="URL for the official gitlab site.")
     parser.add_argument("--wikipedia-url", default="http://localhost:8888/wikipedia_en_all_maxi_2022-05/A/", help="URL for the official wikipedia site.")
     parser.add_argument("--map-url", default="http://localhost:3000", help="URL for the official map site.")
+    parser.add_argument(
+        "--auth-state-root",
+        default="",
+        help="Optional root directory containing official benchmark browser storage-state files such as .auth/shopping_state.json.",
+    )
+    parser.add_argument("--gitlab-username", default="", help="Optional official GitLab benchmark username.")
+    parser.add_argument("--gitlab-password", default="", help="Optional official GitLab benchmark password.")
+    parser.add_argument("--shopping-admin-username", default="", help="Optional official shopping_admin benchmark username.")
+    parser.add_argument("--shopping-admin-password", default="", help="Optional official shopping_admin benchmark password.")
+    parser.add_argument(
+        "--shopping-admin-use-header-login",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use official header-based benchmark login metadata for shopping_admin.",
+    )
     parser.add_argument(
         "--start-official-envs",
         action="store_true",
@@ -136,6 +154,23 @@ def _stop_official_envs(*, repo_root: Path, site_names: list[str]) -> None:
         )
 
 
+def resolve_benchmark_auth_state_root(*, raw_auth_state_root: str, repo_root: Path) -> Path:
+    """Return one isolated auth-state root for the current benchmark invocation."""
+
+    cleaned = str(raw_auth_state_root or "").strip()
+    if cleaned:
+        root = Path(cleaned).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    run_root = (
+        Path(gettempdir())
+        / "twinr_webarena_verified_runs"
+        / f"benchmark_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    ).resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    return run_root
+
+
 def main() -> int:
     args = _parse_args()
     repo_root = _REPO_ROOT
@@ -148,6 +183,23 @@ def main() -> int:
         gitlab_url=args.gitlab_url or None,
         wikipedia_url=args.wikipedia_url or None,
         map_url=args.map_url or None,
+        gitlab_credentials={
+            key: value
+            for key, value in {"username": args.gitlab_username, "password": args.gitlab_password}.items()
+            if value
+        }
+        or None,
+        shopping_admin_credentials={
+            key: value
+            for key, value in {"username": args.shopping_admin_username, "password": args.shopping_admin_password}.items()
+            if value
+        }
+        or None,
+        shopping_admin_use_header_login=bool(args.shopping_admin_use_header_login),
+    )
+    auth_state_root = resolve_benchmark_auth_state_root(
+        raw_auth_state_root=str(args.auth_state_root or ""),
+        repo_root=repo_root,
     )
     subset_task_ids = load_official_subset_task_ids(subset_name=str(args.subset_name))
     benchmark, _ = load_webarena_verified_task(task_id=int(subset_task_ids[0]), config=benchmark_config)
@@ -181,7 +233,23 @@ def main() -> int:
             started_at = time.perf_counter()
             task = benchmark.get_task(int(case.task_id))
             try:
+                auth_context = ensure_task_auth_context(
+                    task=task,
+                    config=benchmark_config,
+                    benchmark=benchmark,
+                    auth_state_root=auth_state_root,
+                )
                 task_run = build_webarena_task_run(task=task, config=benchmark_config)
+                task_run = task_run.__class__(
+                    task_id=task_run.task_id,
+                    site_name=task_run.site_name,
+                    intent=task_run.intent,
+                    start_url=task_run.start_url,
+                    goal=task_run.goal,
+                    results_schema=task_run.results_schema,
+                    browser_context_storage_state_path=auth_context.storage_state_path,
+                    browser_context_extra_http_headers=dict(auth_context.extra_http_headers or {}),
+                )
                 browser_result = run_twinr_task(
                     env_file=env_path,
                     task_run=task_run,
@@ -209,6 +277,10 @@ def main() -> int:
                         "visited_urls": list(browser_result.data.get("visited_urls") or []),
                         "answer_markdown": browser_result.data.get("answer_markdown"),
                         "trace_path": browser_result.data.get("trace_path"),
+                        "require_login": bool(auth_context.require_login),
+                        "bootstrap_storage_state_path": auth_context.storage_state_path,
+                        "bootstrap_extra_http_headers": dict(auth_context.extra_http_headers or {}),
+                        "auth_state_root": str(auth_state_root),
                         "eval_pass": bool(evaluation["pass"]),
                         "eval_score": float(evaluation["eval_result"]["score"]),
                         "eval_status": str(evaluation["eval_result"]["status"]),
@@ -245,6 +317,7 @@ def main() -> int:
                         "visited_urls": [],
                         "answer_markdown": None,
                         "trace_path": None,
+                        "auth_state_root": str(auth_state_root),
                         "eval_pass": False,
                         "eval_score": 0.0,
                         "eval_status": "RUNNER_ERROR",
@@ -294,6 +367,7 @@ def main() -> int:
             "selected_task_ids": [int(case.task_id) for case in selected_cases],
             "compatible_task_count": len(compatible_cases),
             "selected_task_count": len(selected_cases),
+            "auth_state_root": str(auth_state_root),
         },
         "versions": {
             "twinr_git_commit": _git_commit(repo_root),

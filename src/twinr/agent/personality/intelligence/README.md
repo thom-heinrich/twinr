@@ -14,6 +14,7 @@ threads.
 - persist subscriptions and refresh/discovery timing through remote-primary snapshots
 - reuse the parent package's shared payload-normalization and remote-state adapter helpers so RSS state decoding stays aligned with the rest of the personality package
 - derive slow-changing topic/region interest signals from structured conversation or tool evidence
+- keep live-search tool interests as situational evidence only; only conversation-derived or explicit world-intelligence interests may seed durable feed discovery during recalibration
 - derive stronger engagement evidence from explicit structured follow-up reactions so topics the user asks to revisit are weighted above passive affinity
 - translate explicit topic aversion into durable `avoid` state so Twinr backs off both conversationally and in source calibration
 - track bounded user engagement with those interests so Twinr can prioritize the topics that repeatedly draw the user back in
@@ -22,6 +23,7 @@ threads.
 - persist a bounded `co-attention` layer so Twinr can distinguish a merely interesting topic from a genuinely shared running thread that both the user and the RSS/world layer keep returning to
 - derive mild cross-session cooling from repeated topic switches or non-reengagement, but only when there was prior positive exposure evidence
 - discover RSS or Atom feeds from source pages returned by the live web backend
+- skip individual broken or oversized source pages during discovery instead of aborting the entire discovery/recalibration pass
 - recalibrate feed coverage during reflection-style maintenance windows instead of treating discovery as a daily poll
 - refresh due feeds on a calm cadence and translate fresh items into world signals, continuity threads, and condensed awareness threads
 - only let `co-attention` grow on genuinely new shared evidence such as fresh unseen feed items or new awareness-thread updates, not on every successful stale refresh

@@ -75,6 +75,65 @@ class _FakeCompileDriver:
         )
 
 
+class _SkillPackageCompileDriver:
+    def __init__(self, *, spoken_text: str) -> None:
+        self.spoken_text = spoken_text
+
+    def run_compile(self, request, *, event_sink=None) -> CodexCompileResult:
+        del request, event_sink
+        return CodexCompileResult(
+            status="ok",
+            summary="Compiled a skill package.",
+            artifacts=(
+                CodexCompileArtifact(
+                    kind=ArtifactKind.SKILL_PACKAGE,
+                    artifact_name="skill_package.json",
+                    media_type="application/json",
+                    content=json.dumps(
+                        {
+                            "skill_package": {
+                                "name": "Morning Briefing",
+                                "description": "Research in the morning and read one short spoken summary aloud.",
+                                "entry_module": "skill_main.py",
+                                "files": [
+                                    {
+                                        "path": "skill_main.py",
+                                        "content": (
+                                            "from __future__ import annotations\n\n"
+                                            "def refresh_job(ctx):\n"
+                                            "    ctx.store_json('briefing', {'text': 'bereit'})\n\n"
+                                            "def deliver_job(ctx, *, event_name=None):\n"
+                                            f"    ctx.say({self.spoken_text!r})\n"
+                                        ),
+                                    }
+                                ],
+                                "scheduled_triggers": [
+                                    {
+                                        "trigger_id": "refresh_job",
+                                        "schedule": "daily",
+                                        "time_of_day": "08:00",
+                                        "timezone_name": "Europe/Berlin",
+                                        "handler": "refresh_job",
+                                    }
+                                ],
+                                "sensor_triggers": [
+                                    {
+                                        "trigger_id": "deliver_job",
+                                        "sensor_trigger_kind": "camera_person_visible",
+                                        "hold_seconds": 2,
+                                        "cooldown_seconds": 600,
+                                        "handler": "deliver_job",
+                                    }
+                                ],
+                            }
+                        }
+                    ),
+                    summary="Morning briefing package.",
+                ),
+            ),
+        )
+
+
 def _ready_session(*, session_id: str, request_summary: str) -> RequirementsDialogueSession:
     return RequirementsDialogueSession(
         session_id=session_id,
@@ -92,6 +151,26 @@ def _ready_session(*, session_id: str, request_summary: str) -> RequirementsDial
         trigger_conditions=("new_email",),
         scope={"channel": "email"},
         constraints=("ask_first",),
+    )
+
+
+def _skill_package_ready_session(*, session_id: str, request_summary: str) -> RequirementsDialogueSession:
+    return RequirementsDialogueSession(
+        session_id=session_id,
+        request_summary=request_summary,
+        skill_name="Morning Briefing",
+        action="Read a morning briefing aloud",
+        capabilities=("web_search", "llm_call", "memory", "speaker", "camera", "scheduler", "safety"),
+        feasibility=FeasibilityResult(
+            outcome=FeasibilityOutcome.YELLOW,
+            summary="Needs the skill_package path.",
+            suggested_target=CompileTarget.SKILL_PACKAGE,
+        ),
+        status=RequirementsDialogueStatus.READY_FOR_COMPILE,
+        trigger_mode="push",
+        trigger_conditions=("daily_0800", "camera_person_visible"),
+        scope={"channel": "voice"},
+        constraints=("read_once_per_morning", "quiet_at_night"),
     )
 
 
@@ -153,6 +232,53 @@ class SelfCodingActivationServiceTests(unittest.TestCase):
         self.assertEqual(rolled_back.status, LearnedSkillStatus.ACTIVE)
         self.assertTrue(restored_entry_v1.enabled)
         self.assertFalse(paused_entry_v2.enabled)
+
+    def test_confirm_activation_restores_missing_skill_package_automations_for_active_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = SelfCodingStore.from_project_root(root)
+            automation_store = AutomationStore(root / "state" / "automations.json", timezone_name="Europe/Berlin")
+            activation = SelfCodingActivationService(store=store, automation_store=automation_store)
+
+            worker_v1 = SelfCodingCompileWorker(
+                store=store,
+                driver=_SkillPackageCompileDriver(spoken_text="Guten Morgen."),
+            )
+            job_v1 = worker_v1.ensure_job_for_session(
+                _skill_package_ready_session(
+                    session_id="dialogue_briefing_v1",
+                    request_summary="Read a morning briefing aloud.",
+                )
+            )
+            completed_v1 = worker_v1.run_job(job_v1.job_id)
+            active_v1 = activation.confirm_activation(job_id=completed_v1.job_id, confirmed=True)
+            v1_automation_ids = tuple(str(item) for item in active_v1.metadata["automation_ids"])
+            for automation_id in v1_automation_ids:
+                automation_store.delete(automation_id)
+
+            worker_v2 = SelfCodingCompileWorker(
+                store=store,
+                driver=_SkillPackageCompileDriver(spoken_text="Hier ist dein Morgenbriefing."),
+            )
+            job_v2 = worker_v2.ensure_job_for_session(
+                _skill_package_ready_session(
+                    session_id="dialogue_briefing_v2",
+                    request_summary="Read an updated morning briefing aloud.",
+                )
+            )
+            completed_v2 = worker_v2.run_job(job_v2.job_id)
+            active_v2 = activation.confirm_activation(job_id=completed_v2.job_id, confirmed=True)
+            paused_v1 = activation.load_activation(skill_id=active_v1.skill_id, version=active_v1.version)
+
+            restored_v1_entries = tuple(automation_store.get(automation_id) for automation_id in v1_automation_ids)
+            v2_entries = tuple(automation_store.get(str(item)) for item in active_v2.metadata["automation_ids"])
+
+        self.assertEqual(paused_v1.status, LearnedSkillStatus.PAUSED)
+        self.assertEqual(active_v2.status, LearnedSkillStatus.ACTIVE)
+        self.assertTrue(all(entry is not None for entry in restored_v1_entries))
+        self.assertTrue(all(entry is not None for entry in v2_entries))
+        self.assertTrue(all(not bool(entry.enabled) for entry in restored_v1_entries if entry is not None))
+        self.assertTrue(all(bool(entry.enabled) for entry in v2_entries if entry is not None))
 
     def test_pause_and_reactivate_activation_version(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

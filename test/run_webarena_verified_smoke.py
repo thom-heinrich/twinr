@@ -30,6 +30,7 @@ from test.browser_benchmarks.webarena_verified_adapter import (
     load_webarena_verified_task,
     run_twinr_task,
 )
+from test.browser_benchmarks.webarena_verified_auth_bootstrap import ensure_task_auth_context
 
 
 def _parse_args() -> argparse.Namespace:
@@ -50,6 +51,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gitlab-url", default="", help="URL for the official gitlab site.")
     parser.add_argument("--wikipedia-url", default="", help="URL for the official wikipedia site.")
     parser.add_argument("--map-url", default="", help="URL for the official map site.")
+    parser.add_argument(
+        "--auth-state-root",
+        default="",
+        help="Optional root directory containing official benchmark browser storage-state files.",
+    )
+    parser.add_argument("--gitlab-username", default="", help="Optional official GitLab benchmark username.")
+    parser.add_argument("--gitlab-password", default="", help="Optional official GitLab benchmark password.")
+    parser.add_argument("--shopping-admin-username", default="", help="Optional official shopping_admin benchmark username.")
+    parser.add_argument("--shopping-admin-password", default="", help="Optional official shopping_admin benchmark password.")
+    parser.add_argument(
+        "--shopping-admin-use-header-login",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use official header-based benchmark login metadata for shopping_admin.",
+    )
     parser.add_argument(
         "--start-official-env",
         default="",
@@ -91,9 +107,38 @@ def main() -> int:
         gitlab_url=args.gitlab_url or None,
         wikipedia_url=args.wikipedia_url or None,
         map_url=args.map_url or None,
+        gitlab_credentials={
+            key: value
+            for key, value in {"username": args.gitlab_username, "password": args.gitlab_password}.items()
+            if value
+        }
+        or None,
+        shopping_admin_credentials={
+            key: value
+            for key, value in {"username": args.shopping_admin_username, "password": args.shopping_admin_password}.items()
+            if value
+        }
+        or None,
+        shopping_admin_use_header_login=bool(args.shopping_admin_use_header_login),
     )
     benchmark, task = load_webarena_verified_task(task_id=int(args.task_id), config=benchmark_config)
+    auth_context = ensure_task_auth_context(
+        task=task,
+        config=benchmark_config,
+        benchmark=benchmark,
+        auth_state_root=Path(args.auth_state_root).expanduser().resolve() if args.auth_state_root else None,
+    )
     task_run = build_webarena_task_run(task=task, config=benchmark_config)
+    task_run = task_run.__class__(
+        task_id=task_run.task_id,
+        site_name=task_run.site_name,
+        intent=task_run.intent,
+        start_url=task_run.start_url,
+        goal=task_run.goal,
+        results_schema=task_run.results_schema,
+        browser_context_storage_state_path=auth_context.storage_state_path,
+        browser_context_extra_http_headers=dict(auth_context.extra_http_headers or {}),
+    )
     browser_result = run_twinr_task(
         env_file=env_path,
         task_run=task_run,
@@ -128,6 +173,8 @@ def main() -> int:
             "start_url": task_run.start_url,
             "goal": task_run.goal,
             "results_schema": task_run.results_schema,
+            "browser_context_storage_state_path": task_run.browser_context_storage_state_path,
+            "browser_context_extra_http_headers": dict(task_run.browser_context_extra_http_headers or {}),
         },
         "browser_result": {
             "ok": bool(browser_result.ok),

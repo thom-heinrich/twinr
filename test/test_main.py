@@ -413,6 +413,46 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         fake_drone.assert_called_once()
 
+    def test_drone_hover_test_dispatches_before_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_DRONE_ENABLED=true",
+                        "TWINR_DRONE_BASE_URL=http://127.0.0.1:8791",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch.object(
+                    main_mod,
+                    "_build_runtime",
+                    side_effect=AssertionError("drone-hover-test must not bootstrap the runtime"),
+                ):
+                    with patch.object(main_mod, "_run_drone_cli_commands", return_value=0) as fake_drone:
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--drone-hover-test",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        fake_drone.assert_called_once()
+
     def test_self_test_dispatches_before_runtime_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

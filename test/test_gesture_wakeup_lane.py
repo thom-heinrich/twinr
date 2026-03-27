@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupLane
 from twinr.proactive.social.engine import SocialFineHandGesture, SocialVisionObservation
 
@@ -15,14 +15,23 @@ class GestureWakeupLaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = GestureWakeupLane.from_config(TwinrConfig(project_root=temp_dir))
 
-            decision = lane.observe(
+            first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
             )
+            decision = lane.observe(
+                observed_at=11.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                    fine_hand_gesture_confidence=0.91,
+                ),
+            )
 
+        self.assertFalse(first.active)
+        self.assertEqual(first.reason, "awaiting_gesture_wakeup_visibility")
         self.assertTrue(decision.active)
         self.assertEqual(decision.trigger_gesture, SocialFineHandGesture.PEACE_SIGN)
         self.assertEqual(decision.request_source, "gesture")
@@ -56,16 +65,25 @@ class GestureWakeupLaneTests(unittest.TestCase):
                 ),
             )
             second = lane.observe(
-                observed_at=10.4,
+                observed_at=11.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                    fine_hand_gesture_confidence=0.91,
+                ),
+            )
+            third = lane.observe(
+                observed_at=11.4,
                 observation=SocialVisionObservation(
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
             )
 
-        self.assertTrue(first.active)
-        self.assertFalse(second.active)
-        self.assertEqual(second.reason, "gesture_wakeup_cooldown")
+        self.assertFalse(first.active)
+        self.assertEqual(first.reason, "awaiting_gesture_wakeup_visibility")
+        self.assertTrue(second.active)
+        self.assertFalse(third.active)
+        self.assertEqual(third.reason, "gesture_wakeup_cooldown")
 
     def test_lane_can_be_disabled_from_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

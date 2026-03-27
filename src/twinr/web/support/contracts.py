@@ -131,6 +131,9 @@ class WizardStep:
         action: Optional POST action token used by the page form.
         action_label: Button label for the step form.
         action_enabled: Whether the main form action should be clickable.
+        secondary_action: Optional second POST action token for the same step.
+        secondary_action_label: Button label for the optional second step action.
+        secondary_action_enabled: Whether the optional second action should be clickable.
         action_hint: Optional plain-language note shown near the action.
         media_src: Optional image or media URL rendered inside the step.
         media_alt: Alternative text for the optional media block.
@@ -153,6 +156,9 @@ class WizardStep:
     action: str = ""
     action_label: str = ""
     action_enabled: bool = True
+    secondary_action: str = ""
+    secondary_action_label: str = ""
+    secondary_action_enabled: bool = True
     action_hint: str = ""
     media_src: str = ""
     media_alt: str = ""

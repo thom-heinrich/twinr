@@ -17,6 +17,29 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 
 class ToolInstructionTests(unittest.TestCase):
+    def test_browser_follow_up_prompt_uses_model_authored_alternate_method_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "browser_automation"
+            workspace.mkdir()
+            (workspace / "adapter.py").write_text(
+                "def create_browser_automation_driver(*, config, project_root):\n    return object()\n",
+                encoding="utf-8",
+            )
+            env_path = root / ".env"
+            env_path.write_text("TWINR_BROWSER_AUTOMATION_ENABLED=true\n", encoding="utf-8")
+            config = TwinrConfig.from_env(env_path)
+
+            tool_instructions = build_tool_agent_instructions(config)
+            supervisor_instructions = build_supervisor_decision_instructions(config)
+
+        self.assertIn("offer the user one short model-authored follow-up", tool_instructions)
+        self.assertIn("different method", tool_instructions)
+        self.assertIn("may take a little longer", tool_instructions)
+        self.assertIn("Do not turn that offer into a fixed stock sentence", tool_instructions)
+        self.assertIn("proactively offer a different method", supervisor_instructions)
+        self.assertIn("fixed canned permission sentence", supervisor_instructions)
+
     def test_default_tool_instructions_prevent_repeated_search_calls_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             instructions = build_tool_agent_instructions(

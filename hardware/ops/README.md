@@ -31,7 +31,7 @@ contract to the Pi.
 | [twinr-remote-memory-watchdog.service](./twinr-remote-memory-watchdog.service) | Dedicated unit: keep the fail-closed remote-memory watchdog warm and continuously refreshing its artifact |
 | [twinr-runtime-supervisor.service](./twinr-runtime-supervisor.service) | Productive unit: authoritatively supervise the streaming loop while consuming the external remote-memory-watchdog artifact |
 | [twinr-web.service](./twinr-web.service) | Productive unit: keep the Twinr web control portal running with managed sign-in |
-| [drone_daemon.py](./drone_daemon.py) | Development-host bounded drone mission daemon: preflight, manual-arm gate, stationary-observe evidence capture, and future primitive boundary |
+| [drone_daemon.py](./drone_daemon.py) | Development-host bounded drone mission daemon: preflight, manual-arm gate, stationary-observe evidence capture by default, plus an explicit hover-test mode for the first takeoff-hover-land primitive |
 | [twinr-drone-daemon.service](./twinr-drone-daemon.service) | Development-host unit: keep the bounded drone daemon alive on a stable local HTTP endpoint for Twinr mission planning |
 | [twinr-orchestrator-server.service](./twinr-orchestrator-server.service) | Development-host unit: keep the host-side orchestrator websocket endpoint plus embedded `/v1/transcribe` remote-ASR surface alive on `127.0.0.1:8798` |
 | [twinr-voice-gateway-bridge.service](./twinr-voice-gateway-bridge.service) | Development-host unit: expose `0.0.0.0:8797` to the Pi and forward it byte-for-byte into the host-side `127.0.0.1:8798` orchestrator endpoint |
@@ -41,7 +41,7 @@ contract to the Pi.
 | [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: mirror the repo, sync the authoritative runtime `.env`, reinstall Twinr into the Pi venv, restart the base services plus any already-enabled repo-backed Pi runtime units, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [peer_ai_camera_observation_proxy.py](./peer_ai_camera_observation_proxy.py) | Transport-only peer-Pi HTTP service that exposes bounded live IMX500 observation payloads plus a coherent detection-plus-frame bundle from the dedicated AI-camera proxy Pi on `10.42.0.2:8767` |
 | [peer_camera_snapshot_proxy.py](./peer_camera_snapshot_proxy.py) | Transport-only peer-Pi HTTP snapshot service that exposes bounded `rpicam-still` captures from the dedicated AI-camera proxy Pi on `10.42.0.2:8766` |
-| [peer_servo_proxy.py](./peer_servo_proxy.py) | Transport-only peer-Pi HTTP service that exposes one locally attached Pololu Maestro command port from the helper Pi on `10.42.0.2:8768` |
+| [peer_servo_proxy.py](./peer_servo_proxy.py) | Transport-only peer-Pi HTTP service that exposes one local helper-Pi servo writer on `10.42.0.2:8768`, either a Pololu Maestro command port or a direct GPIO servo output such as GPIO18 via `lgpio_pwm` |
 | [twinr-peer-ai-camera-proxy.service](./twinr-peer-ai-camera-proxy.service) | Proxy-Pi unit: keep the peer AI-camera observation service alive on the dedicated direct-link address |
 | [twinr-peer-camera-proxy.service](./twinr-peer-camera-proxy.service) | Proxy-Pi unit: keep the peer camera snapshot service alive on the dedicated direct-link address |
 | [twinr-peer-servo-proxy.service](./twinr-peer-servo-proxy.service) | Proxy-Pi unit: keep the peer Pololu Maestro service alive on the dedicated direct-link address |
@@ -72,7 +72,10 @@ policy, camera interpretation, or ad-hoc SSH orchestration into the service.
 The peer AI-camera observation proxy is equally transport-only. It may expose
 bounded IMX500 observation payloads and debug facts from the helper Pi, but it
 must not grow main-runtime orchestration, HDMI policy, or gesture/UI decisions
-into the helper service.
+into the helper service. Its busy-cache path is intentionally short-lived only:
+the helper may reuse one just-captured payload to bridge immediate lock
+overlap, but stale helper frames must time out explicitly instead of being
+replayed indefinitely as if they were fresh.
 
 The drone daemon is intentionally mission-bounded as well. Twinr may only queue
 high-level inspect missions, read state, cancel work, or request local manual
@@ -80,7 +83,10 @@ arm approval. Direct roll/pitch/yaw/thrust commands do not belong in this
 surface. The current `stationary_observe_only` mode is the accepted first
 runtime slice: it proves the API, preflight gates, and artifact path while
 keeping motion disabled until the future primitive executor and external
-pose-provider stack are ready.
+pose-provider stack are ready. A second explicit mode,
+`bounded_hover_test_only`, is now available for the first live
+`takeoff -> hover -> land` primitive, but it must be enabled intentionally by
+the operator and is not the default service mode.
 
 Retired standalone break-glass units are no longer tracked here. The dedicated
 remote-memory watchdog service is not break-glass; it is the productive owner
@@ -144,11 +150,42 @@ python3 -m twinr --env-file .env --drone-inspect "self test"
 python3 -m twinr --env-file .env --drone-manual-arm DRN-...
 ```
 
+For the first live hover test, start the daemon in the explicit hover-test
+mode and queue the new bounded mission type:
+
+```bash
+python3 hardware/ops/drone_daemon.py --repo-root /home/thh/twinr --env-file /home/thh/twinr/.env --pose-provider stub_ok --skill-layer-mode bounded_hover_test_only --bind 127.0.0.1 --port 8791
+python3 -m twinr --env-file .env --drone-hover-test
+python3 -m twinr --env-file .env --drone-manual-arm DRN-...
+```
+
 The bounded operator proof is:
 - `POST /missions` returns `pending_manual_arm`
 - `POST /ops/missions/<id>/arm` is local-host only by default
-- mission execution captures stationary evidence instead of moving the aircraft
+- mission execution captures stationary evidence by default instead of moving the aircraft
+- hover motion is only available when the daemon was explicitly started in `bounded_hover_test_only`
+- before any live takeoff setpoint, the hover worker now explicitly applies and verifies `stabilizer.estimator=2`, `stabilizer.controller=1`, `motion.disable=0`, and a bounded `kalman.resetEstimation` pulse; those final values are persisted into the mission artifact
+- the hover worker now blocks takeoff until a bounded estimator-settle gate sees stable `kalman.varPX/PY/PZ`, quiet roll/pitch, adequate `motion.squal`, and a valid downward `range.zrange`
+- hover execution now runs through an explicit stateful hover-setpoint primitive with its own abort/landing path instead of depending on the more implicit `MotionCommander` context-manager flow
+- the landing path no longer permits blind motor cutoff: after the staged descent it waits for deterministic landing-complete signals before issuing `send_stop_setpoint()`, first preferring fresh downward `range.zrange` confirmation at or below the current `5 cm` touchdown-cut gate for three consecutive samples and otherwise accepting the firmware supervisor reporting `is flying = false`
+- once the aircraft is airborne, the hover primitive no longer aborts the active landing path by touchdown-timeout exception; instead it keeps driving the bounded zero-height landing sequence until one of the completion signals arrives
+- successful hover missions now persist the worker's bounded stability telemetry alongside the mission summary so the operator can inspect flow, z-range, directional clearance, velocity, gyro, thrust, radio RSSI, and attitude evidence after each run; the hover summary is computed from the inferred airborne window so ground-settle transients do not inflate drift metrics
+- when the Multi-ranger deck is present, the hover worker now takes one short clearance snapshot before takeoff and blocks the mission if nearby front/back/left/right/up obstacles are already inside the configured hover envelope
+- completed hover runs are now fail-closed on the recorded telemetry: large altitude overshoot above the requested hover height or excessive under-load battery sag downgrade the run to `unstable` instead of reporting `completed`
+- if the hover worker times out or is cancelled after a real flight, the daemon now also persists a partial hover artifact with the worker trace file, last trace phase/status, and stdout/stderr tails so teardown hangs can be debugged without losing the run
+- the first bounded hover path now also expects the Twinr STM32 app-layer failsafe (`twinrFs`) to be flashed on the Crazyflie; the worker sends Appchannel heartbeats while the host is healthy, but heartbeat-loss, low-battery, and clearance-triggered safe-land logic then continues locally on the aircraft without the daemon
 - `GET /state` keeps `manual_arm_required=true` and exposes preflight reasons when radio or pose is unhealthy
+
+Before relying on live hover missions, build and flash the on-device failsafe:
+
+```bash
+bash hardware/bitcraze/build_on_device_failsafe.sh
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
+```
+
+The post-flash probe is important: it reconnects over the normal radio URI and
+only passes when the Crazyflie exposes the `twinrFs.*` param surface that
+proves the firmware app is live.
 
 Install the peer camera snapshot proxy only on the dedicated camera proxy Pi:
 
@@ -175,8 +212,11 @@ curl --fail http://10.42.0.2:8767/healthz
 ```
 
 Install the peer servo proxy on the helper Pi when the main Twinr Pi should
-keep the high-level attention logic but the physical Pololu Maestro is plugged
-into the helper Pi instead of the main host:
+keep the high-level attention logic but the physical servo output lives on the
+helper Pi instead of the main host. The checked-in service unit now targets the
+current direct helper-Pi GPIO wiring on `GPIO18` and exposes that as logical
+channel `1`. For an older local Pololu Maestro transport, run the same proxy
+without the GPIO-specific flags.
 
 ```bash
 sudo install -d -m 0755 /opt/twinr-peer-servo/repo/hardware/ops
@@ -245,6 +285,10 @@ Use `--skip-env-sync` only when the Pi env must intentionally stay divergent
 from the leading repo. Use `--live-text` or `--live-search` when you want the
 post-deploy verification to include one real OpenAI-backed proof, not just the
 fail-closed env-contract plus service-health checks.
+If an optional Pi runtime unit such as `twinr-whatsapp-channel.service` was
+already enabled before but its installed unit file later became masked or
+corrupted, the default deploy path now repairs it automatically as long as the
+original enable symlink still exists on the host.
 Use `--rollout-service ...` when you are rolling out a new optional Pi unit for
 the first time and it is not enabled on the target host yet. Use explicit
 `--service ...` flags only when you intentionally want to replace the automatic

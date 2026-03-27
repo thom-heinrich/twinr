@@ -15,7 +15,8 @@ from urllib.parse import quote  # AUDIT-FIX(#5): Encode filenames safely when co
 
 from fastapi import HTTPException
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.integrations.email.profiles import email_profile_choice_options
 from twinr.integrations import EMAIL_APP_PASSWORD_ENV_KEY, HUE_APPLICATION_KEY_ENV_KEY
 from twinr.memory.reminders import format_due_label, now_in_timezone
 from twinr.web.support.store import mask_secret
@@ -33,7 +34,7 @@ _SEARCH_CONTEXT_OPTIONS = (("low", "Low"), ("medium", "Medium"), ("high", "High"
 _CONVERSATION_WEB_SEARCH_OPTIONS = (("auto", "Auto"), ("always", "Always"), ("never", "Never"))
 _VISION_DETAIL_OPTIONS = (("auto", "Auto"), ("low", "Low"), ("high", "High"))
 _GPIO_BIAS_OPTIONS = (("pull-up", "Pull-up"), ("pull-down", "Pull-down"), ("disabled", "Off"))
-_EMAIL_PROFILE_OPTIONS = (("gmail", "Gmail"), ("generic_imap_smtp", "Generic IMAP/SMTP"))
+_EMAIL_PROFILE_OPTIONS = email_profile_choice_options()
 _CALENDAR_SOURCE_OPTIONS = (("ics_file", "ICS file"), ("ics_url", "ICS URL"))
 _SMART_HOME_PROVIDER_OPTIONS = (("hue", "Philips Hue"),)
 _EMAIL_SECRET_KEY = EMAIL_APP_PASSWORD_ENV_KEY

@@ -1,0 +1,1 @@
+obj-y += twinr_on_device_failsafe.o

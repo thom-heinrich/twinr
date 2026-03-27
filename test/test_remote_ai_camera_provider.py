@@ -93,6 +93,42 @@ class RemoteAICameraProviderTests(unittest.TestCase):
             },
         )
 
+    def test_provider_suppresses_busy_reused_proxy_gesture_payload(self) -> None:
+        provider = RemoteAICameraObservationProvider(
+            config=RemoteAICameraProviderConfig(base_url="http://10.42.0.2:8767")
+        )
+        payload = {
+            "observation": {
+                "observed_at": 56.0,
+                "camera_online": True,
+                "camera_ready": True,
+                "camera_ai_ready": True,
+                "fine_hand_gesture": "peace_sign",
+                "fine_hand_gesture_confidence": 0.79,
+                "gesture_event": "none",
+            },
+            "debug_details": {
+                "resolved_source": "builtin",
+                "cache_state": "busy_reused",
+            },
+        }
+
+        with patch.object(provider, "_request_json", return_value=payload):
+            snapshot = provider.observe_gesture()
+
+        self.assertEqual(snapshot.observation.fine_hand_gesture, SocialFineHandGesture.NONE)
+        self.assertIsNone(snapshot.observation.fine_hand_gesture_confidence)
+        self.assertEqual(
+            provider.gesture_debug_details(),
+            {
+                "resolved_source": "builtin",
+                "cache_state": "busy_reused",
+                "gesture_processing_skipped": True,
+                "gesture_skip_reason": "busy_reused_frame_not_counted_as_fresh_gesture",
+                "transport_mode": "remote_proxy_busy_reused_passthrough",
+            },
+        )
+
     def test_provider_degrades_to_health_snapshot_when_proxy_is_unreachable(self) -> None:
         provider = RemoteAICameraObservationProvider(
             config=RemoteAICameraProviderConfig(base_url="http://10.42.0.2:8767")
@@ -178,7 +214,7 @@ class RemoteAICameraProviderTests(unittest.TestCase):
                     remote_observation,
                     69.5,
                     "local-imx500+mediapipe",
-                    {"cache_state": "busy_reused"},
+                    {"bundle_mode": "detection_frame"},
                     "rgb-frame",
                 ),
             ),
@@ -194,8 +230,75 @@ class RemoteAICameraProviderTests(unittest.TestCase):
         self.assertIsNotNone(gesture_debug)
         assert gesture_debug is not None
         self.assertEqual(gesture_debug["transport_mode"], "remote_frame_local_gesture")
-        self.assertEqual(cast(dict[str, object], gesture_debug["remote_debug"])["cache_state"], "busy_reused")
+        self.assertEqual(cast(dict[str, object], gesture_debug["remote_debug"])["bundle_mode"], "detection_frame")
         self.assertIn("provider_stage_ms", gesture_debug)
+
+    def test_remote_frame_provider_skips_busy_reused_bundle_for_gesture_confirmation(self) -> None:
+        class _FakeProcessor:
+            def __init__(self) -> None:
+                self.gesture_calls: list[dict[str, object]] = []
+
+            def _coerce_detection_result(self, detection):
+                return detection
+
+            def _needs_rgb_frame_for_attention(self, *, detection):
+                return True
+
+            def observe_gesture_from_frame(self, **kwargs):
+                self.gesture_calls.append(dict(kwargs))
+                raise AssertionError("busy_reused bundle must not run local gesture inference")
+
+            def get_last_gesture_debug_details(self):
+                return None
+
+            def get_last_attention_debug_details(self):
+                return None
+
+            def close(self):
+                return None
+
+        processor = _FakeProcessor()
+        provider = RemoteFrameAICameraObservationProvider(
+            config=RemoteAICameraProviderConfig(
+                base_url="http://10.42.0.2:8767",
+                input_format="remote-ai-frame",
+            ),
+            processor=cast(Any, processor),
+        )
+        remote_observation = AICameraObservation(
+            observed_at=70.0,
+            camera_online=True,
+            camera_ready=True,
+            camera_ai_ready=True,
+            person_count=1,
+            primary_person_zone=AICameraZone.CENTER,
+            model="local-imx500-detection-bundle",
+        )
+
+        with patch.object(
+            provider,
+            "_fetch_remote_frame_bundle",
+            return_value=(
+                remote_observation,
+                69.5,
+                "local-imx500-detection-bundle",
+                {"cache_state": "busy_reused"},
+                "rgb-frame",
+            ),
+        ):
+            snapshot = provider.observe_gesture()
+
+        self.assertEqual(processor.gesture_calls, [])
+        self.assertEqual(snapshot.observation.fine_hand_gesture, SocialFineHandGesture.NONE)
+        gesture_debug = provider.gesture_debug_details()
+        self.assertIsNotNone(gesture_debug)
+        assert gesture_debug is not None
+        self.assertEqual(gesture_debug["transport_mode"], "remote_frame_busy_reused_passthrough")
+        self.assertTrue(gesture_debug["gesture_processing_skipped"])
+        self.assertEqual(
+            gesture_debug["gesture_skip_reason"],
+            "busy_reused_frame_not_counted_as_fresh_gesture",
+        )
 
     def test_remote_frame_provider_runs_attention_hot_path_from_bundle(self) -> None:
         class _FakeProcessor:

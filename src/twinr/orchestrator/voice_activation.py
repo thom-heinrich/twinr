@@ -21,32 +21,31 @@ DEFAULT_VOICE_ACTIVATION_PHRASES: tuple[str, ...] = (
     "hey twinr",
     "he twinr",
     "hey twinna",
-    "hey tynna",
     "hey twina",
     "hey twinner",
-    "hey twitter",
     "hallo twinr",
     "hallo twinna",
-    "hallo tynna",
     "hallo twina",
     "hallo twinner",
-    "hallo twitter",
     "twinr hallo",
     "twinr hey",
     "twinna hallo",
     "twinna hey",
-    "tynna hallo",
-    "tynna hey",
     "twina hallo",
     "twina hey",
     "twinner hallo",
     "twinner hey",
     "twinr",
     "twinna",
-    "tynna",
     "twina",
     "twinner",
-    "twitter",
+)
+_CONTEXTUAL_TYNNA_VOICE_ACTIVATION_PHRASES: tuple[str, ...] = (
+    "hey tynna",
+    "hallo tynna",
+    "tynna hallo",
+    "tynna hey",
+    "tynna",
 )
 
 _PROMPT_CONTAMINATION_MARKERS = (
@@ -58,7 +57,7 @@ _PROMPT_CONTAMINATION_MARKERS = (
 )
 _GENERIC_ACTIVATION_WORDS = frozenset({"hey", "hallo", "he", "hi", "ok", "okay"})
 _DEFAULT_MIN_PREFIX_RATIO = 0.9
-_FALLBACK_PROMPT_NAMES = ("Twinr", "Twinna", "Tynna", "Twina", "Twinner")
+_FALLBACK_PROMPT_NAMES = ("Twinr", "Twinna", "Twina", "Twinner")
 _TWI_HEURISTIC_PREFIX = "twi"
 _TWI_HEAD_VARIANT_MAX_EXTRA_PREFIX_CHARS = 4
 _TWI_HEAD_VARIANT_MIN_RATIO = 0.7
@@ -304,23 +303,28 @@ def match_voice_activation_transcript(
             detector_label=detector_label,
             score=score,
         )
-    heuristic_match = _match_twi_activation_heuristic(
-        original_words=original_words,
-        normalized_words=normalized_words,
-        normalized_phrases=normalized_phrases,
-    )
-    if heuristic_match is not None:
-        matched_phrase, remaining_text = heuristic_match
-        return VoiceActivationMatch(
-            detected=True,
-            transcript=cleaned_transcript,
-            matched_phrase=matched_phrase,
-            remaining_text=remaining_text,
-            normalized_transcript=normalized_transcript,
-            backend=backend,
-            detector_label=detector_label,
-            score=score,
+    if _allows_twi_head_variant_recovery(normalized_phrases):
+        head_variant_match = _match_twi_head_variant(
+            original_words=original_words,
+            normalized_words=normalized_words,
+            activation_aliases=tuple(
+                phrase
+                for phrase in normalized_phrases
+                if phrase.startswith(_TWI_HEURISTIC_PREFIX) and " " not in phrase
+            ),
         )
+        if head_variant_match is not None:
+            matched_phrase, remaining_text = head_variant_match
+            return VoiceActivationMatch(
+                detected=True,
+                transcript=cleaned_transcript,
+                matched_phrase=matched_phrase,
+                remaining_text=remaining_text,
+                normalized_transcript=normalized_transcript,
+                backend=backend,
+                detector_label=detector_label,
+                score=score,
+            )
     return VoiceActivationMatch(
         detected=False,
         transcript=cleaned_transcript,
@@ -406,43 +410,6 @@ def _candidate_segments(
     return segments
 
 
-def _match_twi_activation_heuristic(
-    *,
-    original_words: list[str],
-    normalized_words: list[str],
-    normalized_phrases: tuple[str, ...],
-) -> tuple[str, str] | None:
-    """Apply the approved `twi*` activation fallback for transcript-first ASR."""
-
-    activation_aliases = tuple(
-        phrase
-        for phrase in normalized_phrases
-        if phrase.startswith(_TWI_HEURISTIC_PREFIX) and " " not in phrase
-    )
-    if not activation_aliases:
-        return None
-    for index in _utterance_head_start_indices(normalized_words):
-        word = normalized_words[index]
-        if not word or word in _GENERIC_ACTIVATION_WORDS:
-            continue
-        for candidate, consumed_word_count in _twi_heuristic_candidates(normalized_words, index):
-            if candidate in _TWI_HEURISTIC_BLOCKLIST or not candidate.startswith(_TWI_HEURISTIC_PREFIX):
-                continue
-            matched_phrase = _best_twi_heuristic_phrase(candidate, activation_aliases)
-            if not matched_phrase:
-                continue
-            remaining_text = " ".join(original_words[index + consumed_word_count :]).strip(" ,.!?:;")
-            return matched_phrase, remaining_text
-    head_variant_match = _match_twi_head_variant(
-        original_words=original_words,
-        normalized_words=normalized_words,
-        activation_aliases=activation_aliases,
-    )
-    if head_variant_match is not None:
-        return head_variant_match
-    return None
-
-
 def _twi_heuristic_candidates(
     normalized_words: list[str],
     index: int,
@@ -526,34 +493,6 @@ def _best_twi_head_variant_phrase(candidate: str, aliases: tuple[str, ...]) -> s
             best_phrase = phrase
     return best_phrase
 
-
-def _best_twi_heuristic_phrase(candidate: str, aliases: tuple[str, ...]) -> str | None:
-    if not aliases:
-        return None
-    best_phrase: str | None = None
-    best_key: tuple[int, float, int, str] | None = None
-    for phrase in aliases:
-        key = (
-            _shared_prefix_length(candidate, phrase),
-            SequenceMatcher(a=candidate, b=phrase).ratio(),
-            -abs(len(candidate) - len(phrase)),
-            phrase,
-        )
-        if best_key is None or key > best_key:
-            best_key = key
-            best_phrase = phrase
-    return best_phrase
-
-
-def _shared_prefix_length(left: str, right: str) -> int:
-    shared = 0
-    for left_char, right_char in zip(left, right, strict=False):
-        if left_char != right_char:
-            break
-        shared += 1
-    return shared
-
-
 def _normalize_text(text: str | bytes | bytearray | None) -> str:
     return folded_lookup_text(_coerce_text(text))
 
@@ -589,6 +528,30 @@ def _coerce_text(value: object | None) -> str:
 
 def _clean_text(value: object | None) -> str:
     return " ".join(_coerce_text(value).split()).strip()
+
+
+_DEFAULT_SAFE_ACTIVATION_PHRASE_SET = frozenset(_normalize_phrases(DEFAULT_VOICE_ACTIVATION_PHRASES))
+
+
+def contextual_bias_voice_activation_phrases(
+    phrases: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Return the contextual alias family used only in strong speaker-bias mode."""
+
+    normalized_phrases = _normalize_phrases(phrases)
+    if not normalized_phrases:
+        return ()
+    if any(phrase not in _DEFAULT_SAFE_ACTIVATION_PHRASE_SET for phrase in normalized_phrases):
+        return normalized_phrases
+    return _normalize_phrases(
+        (*normalized_phrases, *_CONTEXTUAL_TYNNA_VOICE_ACTIVATION_PHRASES)
+    )
+
+
+def _allows_twi_head_variant_recovery(normalized_phrases: tuple[str, ...]) -> bool:
+    """Enable riskier ``*winner``-style recovery only for explicit broader alias sets."""
+
+    return any(phrase not in _DEFAULT_SAFE_ACTIVATION_PHRASE_SET for phrase in normalized_phrases)
 
 
 def _coerce_min_prefix_ratio(value: object) -> float:
@@ -628,6 +591,7 @@ __all__ = [
     "VoiceActivationMatch",
     "VoiceActivationPhraseMatcher",
     "VoiceActivationTailExtractor",
+    "contextual_bias_voice_activation_phrases",
     "match_voice_activation_transcript",
     "normalize_activation_detector_label",
     "phrase_from_activation_detector_label",

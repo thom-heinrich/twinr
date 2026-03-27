@@ -147,6 +147,24 @@ class IMAPMailboxReader(MailboxReader):
             raise RuntimeError("Unable to read mailbox.") from last_error
         raise RuntimeError("Unable to read mailbox.")
 
+    def probe_connection(self) -> None:
+        """Log in once and open the configured mailbox with bounded timeouts.
+
+        This reuses the same transport policy as normal mailbox reads but skips
+        message search and fetch work. The method is intended for operator setup
+        checks where Twinr must prove that the mailbox login and selected folder
+        are reachable before the integration is enabled.
+        """
+
+        connection = self._connection_factory(self.config)
+        try:
+            self._prepare_connection(connection)
+            self._expect_ok(self._call(connection, "login", self.config.username, self.config.password))
+            self._expect_ok(self._call(connection, "select", self.config.mailbox, True))
+        finally:
+            self._safe_call(connection, "close")
+            self._safe_call(connection, "logout")
+
     def _list_recent_once(self, *, limit: int, unread_only: bool) -> list[EmailMessageSummary]:
         """Run one IMAP search/fetch pass without retry handling."""
         connection = self._connection_factory(self.config)

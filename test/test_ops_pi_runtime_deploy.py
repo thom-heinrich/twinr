@@ -464,6 +464,106 @@ class PiRuntimeDeployTests(unittest.TestCase):
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("twinr-whatsapp-channel.service", joined)
 
+    def test_default_deploy_repairs_masked_optional_pi_unit_with_existing_enable_link(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ops_root = root / "hardware" / "ops"
+            ops_root.mkdir(parents=True, exist_ok=True)
+            (ops_root / "twinr-runtime-supervisor.service").write_text(
+                "[Install]\nWantedBy=multi-user.target\n[Service]\nWorkingDirectory=/twinr\nExecStart=/usr/bin/env bash -lc 'cd /twinr && run'\n",
+                encoding="utf-8",
+            )
+            (ops_root / "twinr-remote-memory-watchdog.service").write_text(
+                "[Install]\nWantedBy=multi-user.target\n[Service]\nWorkingDirectory=/twinr\nExecStart=/usr/bin/env bash -lc 'cd /twinr && run'\n",
+                encoding="utf-8",
+            )
+            (ops_root / "twinr-web.service").write_text(
+                "[Install]\nWantedBy=multi-user.target\n[Service]\nWorkingDirectory=/twinr\nExecStart=/usr/bin/env bash -lc 'cd /twinr && run'\n",
+                encoding="utf-8",
+            )
+            (ops_root / "twinr-whatsapp-channel.service").write_text(
+                "[Install]\nWantedBy=multi-user.target\n[Service]\nWorkingDirectory=/twinr\nExecStart=/twinr/.venv/bin/python -m twinr --env-file .env --run-whatsapp-channel\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "UnitFileState" in rendered and "ActiveState,SubState" not in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '[{"name": "twinr-remote-memory-watchdog.service", "unit_file_state": "enabled", "install_link_present": true},'
+                            ' {"name": "twinr-runtime-supervisor.service", "unit_file_state": "enabled", "install_link_present": true},'
+                            ' {"name": "twinr-web.service", "unit_file_state": "enabled", "install_link_present": true},'
+                            ' {"name": "twinr-whatsapp-channel.service", "unit_file_state": "masked", "install_link_present": true}]\n'
+                        ),
+                    )
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '[{"name": "twinr-remote-memory-watchdog.service", "active_state": "active",'
+                            ' "sub_state": "running", "unit_file_state": "enabled", "main_pid": "101",'
+                            ' "exec_main_status": "0"},'
+                            ' {"name": "twinr-runtime-supervisor.service", "active_state": "active",'
+                            ' "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102",'
+                            ' "exec_main_status": "0"},'
+                            ' {"name": "twinr-web.service", "active_state": "active",'
+                            ' "sub_state": "running", "unit_file_state": "enabled", "main_pid": "103",'
+                            ' "exec_main_status": "0"},'
+                            ' {"name": "twinr-whatsapp-channel.service", "active_state": "active",'
+                            ' "sub_state": "running", "unit_file_state": "enabled", "main_pid": "104",'
+                            ' "exec_main_status": "0"}]\n'
+                        ),
+                    )
+                if "pip install" in rendered:
+                    return _completed(command, stdout="Successfully installed twinr\n")
+                if "check_pi_openai_env_contract.py" in rendered:
+                    return _completed(command, stdout='{"ok": true}\n')
+                if "actual_sha=$(sha256sum" in rendered:
+                    return _completed(command, stdout="")
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+            )
+
+        self.assertEqual(
+            result.restarted_services,
+            (
+                "twinr-remote-memory-watchdog.service",
+                "twinr-runtime-supervisor.service",
+                "twinr-web.service",
+                "twinr-whatsapp-channel.service",
+            ),
+        )
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("twinr-whatsapp-channel.service", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

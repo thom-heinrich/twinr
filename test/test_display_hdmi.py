@@ -536,6 +536,25 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(str(cued["brow_style"]), "inward_tilt")
         self.assertTrue(bool(cued["blink"]))
 
+    def test_runtime_voice_quiet_face_cue_closes_waiting_eyes_with_soft_brows(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        quiet_cue = DisplayFaceCue(
+            source="runtime_voice_quiet",
+            head_dy=1,
+            mouth="neutral",
+            brows="soft",
+            blink=True,
+        )
+
+        eye = renderer._eye_state("waiting", 0, "left", face_cue=quiet_cue)
+        face_offset = renderer._face_offset("waiting", 0, face_cue=quiet_cue)
+
+        self.assertTrue(bool(eye["blink"]))
+        self.assertEqual(str(eye["brow_style"]), "soft")
+        self.assertEqual(int(eye["brow_raise"]), -3)
+        self.assertEqual(face_offset, (0, 2))
+
     def test_error_eye_baseline_no_longer_stares_off_to_the_side(self) -> None:
         display = self.make_display()
         renderer = display._scene_renderer()

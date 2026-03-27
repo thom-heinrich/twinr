@@ -9,7 +9,8 @@ owned_concerns:
   - Normalize malformed persisted values into stable operator-facing defaults instead of letting dashboard pages crash
   - Validate and canonicalize managed email and calendar form submissions before route handlers persist them
   - Validate and canonicalize managed smart-home Hue form submissions, including multi-bridge host lists and per-bridge application keys, before route handlers persist them
-  - Build the compact WhatsApp setup summary for `/integrations` while keeping QR pairing in the dedicated wizard
+  - Build the compact email and WhatsApp setup summaries for `/integrations` while keeping the full guided flows in dedicated wizard presenters
+  - Build and validate the `/integrations/email` guided mailbox setup wizard, including provider selection, mailbox login storage, transport defaults, bounded connection-test state, and final guardrails
   - Build and validate the `/integrations` social-history learning consent panel, including bounded source/window choices and operator-facing import status
   - Build the WhatsApp self-chat wizard page context, including bounded pairing-state rows, persisted onboarding snapshots, and live portal QR rendering, without moving route orchestration or subprocess calls into templates
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
@@ -29,12 +30,20 @@ files:
       - _adaptive_timing_view
       - _build_calendar_integration_record
       - _build_email_integration_record
+      - _apply_email_wizard_connection_test_result
+      - _build_email_wizard_account_record
+      - _build_email_wizard_connection_test_configs
+      - _build_email_wizard_connection_test_record
+      - _build_email_wizard_guardrail_record
+      - _build_email_wizard_profile_record
+      - _build_email_wizard_transport_record
       - _build_smart_home_integration_record
       - _build_social_history_learning_record
       - _calendar_integration_sections
       - _capture_voice_profile_sample
       - _connect_sections
       - _default_reminder_due_at
+      - _email_integration_context
       - _email_integration_sections
       - _smart_home_integration_sections
       - _format_log_rows
@@ -51,6 +60,7 @@ files:
       - _social_history_learning_panel
       - _social_history_learning_sections
       - _whatsapp_integration_context
+      - build_email_wizard_page_context
       - build_self_coding_ops_page_context
       - build_whatsapp_wizard_page_context
       - _voice_action_result
@@ -73,13 +83,25 @@ files:
     role: WhatsApp self-chat wizard page context builder with bounded pairing, live QR rendering, and live status shaping
     exports:
       - build_whatsapp_wizard_page_context
+  - path: email_wizard.py
+    role: Guided email mailbox setup wizard page context builder, bounded connection-test state shaper, and stepwise record validators
+    exports:
+      - _apply_email_wizard_connection_test_result
+      - _build_email_wizard_account_record
+      - _build_email_wizard_connection_test_configs
+      - _build_email_wizard_connection_test_record
+      - _build_email_wizard_guardrail_record
+      - _build_email_wizard_profile_record
+      - _build_email_wizard_transport_record
+      - build_email_wizard_page_context
   - path: integrations.py
-    role: Integration overview rows, email/calendar/smart-home form sections including Hue multi-bridge validation, and the compact WhatsApp setup summary for `/integrations`
+    role: Integration overview rows, compact email/WhatsApp setup summaries, and email/calendar/smart-home form sections including Hue multi-bridge validation
     exports:
       - _build_calendar_integration_record
       - _build_email_integration_record
       - _build_smart_home_integration_record
       - _calendar_integration_sections
+      - _email_integration_context
       - _email_integration_sections
       - _integration_overview_rows
       - _smart_home_integration_sections
@@ -131,12 +153,20 @@ public_api:
     - _adaptive_timing_view
     - _build_calendar_integration_record
     - _build_email_integration_record
+    - _apply_email_wizard_connection_test_result
+    - _build_email_wizard_account_record
+    - _build_email_wizard_connection_test_configs
+    - _build_email_wizard_connection_test_record
+    - _build_email_wizard_guardrail_record
+    - _build_email_wizard_profile_record
+    - _build_email_wizard_transport_record
     - _build_smart_home_integration_record
     - _build_social_history_learning_record
     - _calendar_integration_sections
     - _capture_voice_profile_sample
     - _connect_sections
     - _default_reminder_due_at
+    - _email_integration_context
     - _email_integration_sections
     - _smart_home_integration_sections
     - _format_log_rows
@@ -155,6 +185,7 @@ public_api:
     - _social_history_learning_panel
     - _social_history_learning_sections
     - _whatsapp_integration_context
+    - build_email_wizard_page_context
     - build_self_coding_ops_page_context
     - build_whatsapp_wizard_page_context
     - _voice_action_result

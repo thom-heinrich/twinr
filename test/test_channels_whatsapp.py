@@ -29,6 +29,7 @@ from twinr.channels.whatsapp import (
     WhatsAppOutboundQueue,
     WhatsAppOutboundResult,
 )
+from twinr.channels.whatsapp.inbound_event_log import WhatsAppInboundEventLog
 from twinr.channels.whatsapp.history_learning import build_import_turns
 from twinr.channels.whatsapp.node_runtime import detect_whatsapp_node_runtime_spec, resolve_whatsapp_node_binary
 from twinr.channels.whatsapp.worker_dependencies import (
@@ -2358,6 +2359,85 @@ class WhatsAppChannelTests(unittest.TestCase):
         self.assertEqual(event.progress, 88)
         self.assertEqual(len(event.messages), 1)
         self.assertEqual(event.messages[0].sender_label, "Thomas")
+
+    def test_worker_bridge_parses_incoming_worker_provenance_fields(self) -> None:
+        config = _test_whatsapp_channel_config(
+            auth_dir=Path("/tmp/twinr-whatsapp-auth"),
+            worker_root=Path("/tmp/twinr-whatsapp-worker"),
+        )
+        bridge = WhatsAppWorkerBridge(config)
+
+        bridge._dispatch_worker_payload(
+            {
+                "type": "incoming_message",
+                "message_id": "msg-debug",
+                "conversation_id": _TEST_ACCOUNT_JID,
+                "sender_id": _TEST_ACCOUNT_JID,
+                "text": "Hallo Twinr",
+                "received_at": "2026-03-26T15:00:00Z",
+                "is_group": False,
+                "is_from_self": False,
+                "account_jid": _TEST_ACCOUNT_JID,
+                "upsert_type": "append",
+                "worker_request_id": "req-1",
+                "raw_remote_jid": "15555554567:18@s.whatsapp.net",
+                "raw_remote_jid_alt": "15555554567@lid",
+                "raw_participant": "15555554567:18@s.whatsapp.net",
+                "raw_participant_alt": "15555554567@lid",
+                "message_timestamp": "1774539523",
+                "context_stanza_id": "stanza-1",
+            }
+        )
+
+        event = bridge.next_event(timeout_s=0.01)
+        self.assertIsInstance(event, ChannelInboundMessage)
+        assert isinstance(event, ChannelInboundMessage)
+        self.assertEqual(event.metadata["worker_upsert_type"], "append")
+        self.assertEqual(event.metadata["worker_request_id"], "req-1")
+        self.assertEqual(event.metadata["worker_remote_jid"], "15555554567:18@s.whatsapp.net")
+        self.assertEqual(event.metadata["worker_remote_jid_alt"], "15555554567@lid")
+        self.assertEqual(event.metadata["worker_participant"], "15555554567:18@s.whatsapp.net")
+        self.assertEqual(event.metadata["worker_participant_alt"], "15555554567@lid")
+        self.assertEqual(event.metadata["worker_message_timestamp"], "1774539523")
+        self.assertEqual(event.metadata["worker_context_stanza_id"], "stanza-1")
+
+    def test_inbound_event_log_records_redacted_worker_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audit = WhatsAppInboundEventLog(Path(temp_dir) / "debug")
+            message = ChannelInboundMessage(
+                channel="whatsapp",
+                message_id="msg-1",
+                conversation_id=_TEST_ACCOUNT_JID,
+                sender_id=_TEST_ACCOUNT_JID,
+                text="Bitte schreibe Janina Werner privat.",
+                received_at="2026-03-26T15:38:43Z",
+                is_group=False,
+                is_from_self=False,
+                metadata={
+                    "account_jid": _TEST_ACCOUNT_JID,
+                    "worker_upsert_type": "append",
+                    "worker_request_id": "req-123",
+                    "worker_remote_jid": "15555554567:18@s.whatsapp.net",
+                    "worker_remote_jid_alt": "15555554567@lid",
+                    "worker_participant": "15555554567:18@s.whatsapp.net",
+                    "worker_participant_alt": "15555554567@lid",
+                    "worker_message_timestamp": "1774539523",
+                    "worker_context_stanza_id": "stanza-123",
+                },
+            )
+
+            audit.record_received(message)
+            audit.record_policy_decision(message, accepted=True, reason="self_chat_inbound")
+            audit.record_delivery(message, outbound_message_id="wa-1", reply_text="Erledigt.")
+
+            lines = (Path(temp_dir) / "debug" / "inbound_events.jsonl").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(len(lines), 3)
+        self.assertNotIn("Bitte schreibe Janina Werner privat.", lines[0])
+        self.assertIn("\"text_sha256\":", lines[0])
+        self.assertIn("\"worker_upsert_type\": \"append\"", lines[0])
+        self.assertIn("\"worker_request_id\": \"req-123\"", lines[0])
+        self.assertIn("\"worker_message_timestamp\": \"1774539523\"", lines[0])
 
     def test_build_import_turns_groups_user_authored_history_and_skips_contact_only_leads(self) -> None:
         now_ms = int(time.time() * 1000)

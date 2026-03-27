@@ -42,6 +42,20 @@ def _coerce_optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _coerce_optional_ratio(value: Any) -> float | None:
+    """Parse one optional ratio in ``[0.0, 1.0]``."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0.0 or parsed > 1.0:
+        return None
+    return parsed
+
+
 def _coerce_positive_int(value: Any, *, default: int) -> int:
     """Parse a positive integer and fall back to ``default`` when invalid."""
 
@@ -107,6 +121,8 @@ class OrchestratorVoiceHelloRequest:
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
+    speaker_associated: bool | None = None
+    speaker_association_confidence: float | None = None
     voice_quiet_until_utc: str | None = None
     state_attested: bool = True
 
@@ -139,6 +155,10 @@ class OrchestratorVoiceHelloRequest:
             payload["targeted_inference_blocked"] = self.targeted_inference_blocked
         if self.recommended_channel is not None:
             payload["recommended_channel"] = self.recommended_channel
+        if self.speaker_associated is not None:
+            payload["speaker_associated"] = self.speaker_associated
+        if self.speaker_association_confidence is not None:
+            payload["speaker_association_confidence"] = self.speaker_association_confidence
         if self.voice_quiet_until_utc is not None:
             payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
@@ -180,6 +200,14 @@ class OrchestratorVoiceHelloRequest:
                 else None
             ),
             recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
+            speaker_associated=(
+                _coerce_bool(payload_dict.get("speaker_associated"))
+                if payload_dict.get("speaker_associated") is not None
+                else None
+            ),
+            speaker_association_confidence=_coerce_optional_ratio(
+                payload_dict.get("speaker_association_confidence")
+            ),
             voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
             state_attested=_coerce_bool(payload_dict.get("state_attested"), default=False),
         )
@@ -232,6 +260,8 @@ class OrchestratorVoiceRuntimeStateEvent:
     interaction_ready: bool | None = None
     targeted_inference_blocked: bool | None = None
     recommended_channel: str | None = None
+    speaker_associated: bool | None = None
+    speaker_association_confidence: float | None = None
     voice_quiet_until_utc: str | None = None
 
     def to_payload(self, *, include_type: bool = True) -> dict[str, Any]:
@@ -257,6 +287,10 @@ class OrchestratorVoiceRuntimeStateEvent:
             payload["targeted_inference_blocked"] = self.targeted_inference_blocked
         if self.recommended_channel is not None:
             payload["recommended_channel"] = self.recommended_channel
+        if self.speaker_associated is not None:
+            payload["speaker_associated"] = self.speaker_associated
+        if self.speaker_association_confidence is not None:
+            payload["speaker_association_confidence"] = self.speaker_association_confidence
         if self.voice_quiet_until_utc is not None:
             payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
@@ -293,6 +327,14 @@ class OrchestratorVoiceRuntimeStateEvent:
                 else None
             ),
             recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
+            speaker_associated=(
+                _coerce_bool(payload_dict.get("speaker_associated"))
+                if payload_dict.get("speaker_associated") is not None
+                else None
+            ),
+            speaker_association_confidence=_coerce_optional_ratio(
+                payload_dict.get("speaker_association_confidence")
+            ),
             voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
         )
 

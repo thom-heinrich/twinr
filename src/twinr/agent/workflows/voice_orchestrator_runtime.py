@@ -211,6 +211,45 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
         return False
 
 
+def handle_remote_follow_up_closed(loop: Any, reason: str) -> None:
+    """Return the local runtime to waiting when a remote follow-up window closes.
+
+    The server owns the transcript-first follow-up timeout window, but the Pi
+    still re-arms its local runtime snapshot to ``listening`` so display and
+    operator cues stay in sync. When the server later emits
+    ``follow_up_closed``, the edge must collapse that local follow-up state back
+    to ``waiting``. Otherwise the runtime snapshot remains stuck in
+    ``listening`` until the supervisor recycles the streaming loop for
+    ``runtime_snapshot_stale``.
+    """
+
+    try:
+        cached_state = getattr(loop, "_last_voice_orchestrator_runtime_state", None)
+        cached_mode = cached_state[0] if isinstance(cached_state, tuple) and cached_state else None
+        if cached_mode != "follow_up_open":
+            loop.emit("voice_orchestrator_follow_up_closed_ignored=stale_state")
+            return
+        if bool(getattr(loop, "_conversation_session_active", False)):
+            loop.emit("voice_orchestrator_follow_up_closed_ignored=session_active")
+            return
+        runtime_status = getattr(getattr(loop, "runtime", None), "status", None)
+        if getattr(runtime_status, "value", None) != "listening":
+            loop.emit("voice_orchestrator_follow_up_closed_ignored=runtime_not_listening")
+            loop._notify_voice_orchestrator_state("waiting", detail=reason)
+            return
+        loop.runtime.cancel_listening()
+        loop._emit_status(force=True)
+        loop._notify_voice_orchestrator_state("waiting", detail=reason)
+        loop.emit(f"voice_orchestrator_follow_up_closed_local_waiting={reason}")
+        loop._trace_event(
+            "voice_orchestrator_follow_up_closed_local_waiting",
+            kind="mutation",
+            details={"reason": reason},
+        )
+    except Exception as exc:
+        loop._handle_error(exc)
+
+
 def voice_orchestrator_owns_live_listening(loop: Any) -> bool:
     """Return whether the current voice path is server-owned after wake."""
 

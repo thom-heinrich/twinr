@@ -17,6 +17,7 @@ import json
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.browser_automation import BrowserAutomationRequest, BrowserAutomationResult, load_browser_automation_driver
+from twinr.browser_automation.runtime import normalize_typed_result, results_schema_expects_null
 
 from webarena_verified.api import WebArenaVerified
 from webarena_verified.types.config import EnvironmentConfig, WebArenaVerifiedConfig
@@ -37,6 +38,8 @@ class WebArenaVerifiedTaskRun:
     start_url: str
     goal: str
     results_schema: dict[str, Any]
+    browser_context_storage_state_path: str | None = None
+    browser_context_extra_http_headers: dict[str, str] | None = None
 
 
 def build_webarena_verified_config(
@@ -47,20 +50,32 @@ def build_webarena_verified_config(
     gitlab_url: str | None = None,
     wikipedia_url: str | None = None,
     map_url: str | None = None,
+    shopping_credentials: Mapping[str, str] | None = None,
+    shopping_admin_credentials: Mapping[str, str] | None = None,
+    reddit_credentials: Mapping[str, str] | None = None,
+    gitlab_credentials: Mapping[str, str] | None = None,
+    shopping_use_header_login: bool = False,
+    shopping_admin_use_header_login: bool = False,
+    reddit_use_header_login: bool = False,
+    gitlab_use_header_login: bool = False,
 ) -> WebArenaVerifiedConfig:
     """Build a small WebArena Verified config from explicit site URLs."""
 
     environment_map: dict[str, EnvironmentConfig] = {}
-    for placeholder, url in (
-        ("__SHOPPING__", shopping_url),
-        ("__SHOPPING_ADMIN__", shopping_admin_url),
-        ("__REDDIT__", reddit_url),
-        ("__GITLAB__", gitlab_url),
-        ("__WIKIPEDIA__", wikipedia_url),
-        ("__MAP__", map_url),
+    for placeholder, url, credentials, use_header_login in (
+        ("__SHOPPING__", shopping_url, shopping_credentials, shopping_use_header_login),
+        ("__SHOPPING_ADMIN__", shopping_admin_url, shopping_admin_credentials, shopping_admin_use_header_login),
+        ("__REDDIT__", reddit_url, reddit_credentials, reddit_use_header_login),
+        ("__GITLAB__", gitlab_url, gitlab_credentials, gitlab_use_header_login),
+        ("__WIKIPEDIA__", wikipedia_url, None, False),
+        ("__MAP__", map_url, None, False),
     ):
         if url:
-            environment_map[placeholder] = EnvironmentConfig(urls=[url])
+            environment_map[placeholder] = EnvironmentConfig(
+                urls=[url],
+                credentials=dict(credentials or {}) or None,
+                use_header_login=bool(use_header_login),
+            )
     return WebArenaVerifiedConfig(environments=environment_map or None)
 
 
@@ -95,6 +110,14 @@ def build_twinr_goal(*, intent: str, results_schema: dict[str, Any]) -> str:
     """Append one explicit JSON contract without changing the task objective."""
 
     schema_text = json.dumps(results_schema or {"type": "array"}, ensure_ascii=False, sort_keys=True)
+    if results_schema_expects_null(results_schema):
+        return (
+            f"{intent}\n\n"
+            "Return your final answer as valid JSON only.\n"
+            'If no matching result is supported by the visible evidence, return exactly {"results": null}.\n'
+            'If one or more matching results are supported, return exactly {"results": [...]} with only the supported matches.\n'
+            "Do not add prose, explanations, or markdown fences."
+        )
     return (
         f"{intent}\n\n"
         "Return your final answer as valid JSON only, with this exact shape: "
@@ -126,6 +149,9 @@ def build_twinr_request(
 
     allowed_host = str(task_run.start_url.split("://", 1)[-1].split("/", 1)[0]).split(":", 1)[0]
     allowed_domains = tuple(domain for domain in (allowed_host, "127.0.0.1", "localhost") if domain)
+    task_kind = "auth_read" if (
+        task_run.browser_context_storage_state_path or task_run.browser_context_extra_http_headers
+    ) else "read"
     return BrowserAutomationRequest(
         task_id=f"webarena_{task_run.task_id}",
         goal=task_run.goal,
@@ -136,11 +162,15 @@ def build_twinr_request(
         capture_screenshot=True,
         capture_html=False,
         metadata={
-            "task_kind": "read",
+            "task_kind": task_kind,
             "eval_case_id": f"webarena_verified_{task_run.task_id}",
             "eval_suite": "webarena_verified_smoke",
             "webarena_task_id": int(task_run.task_id),
             "webarena_site": task_run.site_name,
+            "source_intent": task_run.intent,
+            "results_schema": dict(task_run.results_schema or {}),
+            "browser_context_storage_state_path": task_run.browser_context_storage_state_path,
+            "browser_context_extra_http_headers": dict(task_run.browser_context_extra_http_headers or {}),
         },
     )
 
@@ -176,6 +206,14 @@ def parse_json_answer(answer_markdown: str) -> Any:
         if len(lines) >= 3 and lines[-1].strip().startswith("```"):
             text = "\n".join(lines[1:-1]).strip()
     decoder = json.JSONDecoder()
+    try:
+        payload, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        payload = None
+        end = -1
+    else:
+        if not text[end:].strip():
+            return payload
     for index, character in enumerate(text):
         if character not in "[{":
             continue
@@ -195,13 +233,59 @@ def build_agent_response_payload(
     """Translate a Twinr result into WebArena Verified's final agent-response shape."""
 
     task_type = str(task.expected_action).upper()
+    task_results_schema = None
+    if getattr(task, "eval", None):
+        task_results_schema = getattr(task.eval[0], "results_schema", None)
+    expects_null_results = results_schema_expects_null(task_results_schema)
     if not browser_result.ok:
+        error_status = "UNKNOWN_ERROR"
+        if str(browser_result.error_code or "").strip().lower() == "not_found":
+            error_status = "NOT_FOUND_ERROR"
         return {
             "task_type": task_type,
-            "status": "UNKNOWN_ERROR",
+            "status": error_status,
             "retrieved_data": None,
             "error_details": browser_result.summary,
         }
+
+    typed_result = normalize_typed_result(browser_result.data.get("typed_result"))
+    if typed_result is not None:
+        if str(typed_result.get("status") or "").strip().lower() == "not_found":
+            return {
+                "task_type": task_type,
+                "status": "NOT_FOUND_ERROR",
+                "retrieved_data": None,
+                "error_details": None,
+            }
+        typed_results = typed_result.get("results")
+        if typed_results is None:
+            answer_text = str(typed_result.get("answer_text") or "").strip()
+            if answer_text:
+                typed_results = [answer_text]
+        elif not isinstance(typed_results, list):
+            typed_results = [typed_results]
+        if isinstance(typed_results, list):
+            typed_results = list(typed_results)
+            if not typed_results or all(item is None for item in typed_results):
+                return {
+                    "task_type": task_type,
+                    "status": "NOT_FOUND_ERROR",
+                    "retrieved_data": None,
+                    "error_details": None,
+                }
+            if expects_null_results:
+                return {
+                    "task_type": task_type,
+                    "status": "SUCCESS",
+                    "retrieved_data": None,
+                    "error_details": None,
+                }
+            return {
+                "task_type": task_type,
+                "status": "SUCCESS",
+                "retrieved_data": typed_results,
+                "error_details": None,
+            }
 
     try:
         payload = parse_json_answer(str(browser_result.data.get("answer_markdown") or ""))
@@ -214,13 +298,35 @@ def build_agent_response_payload(
         }
 
     if isinstance(payload, dict) and "results" in payload:
-        retrieved_data = payload["results"]
+        raw_retrieved_data = payload["results"]
     elif isinstance(payload, list):
-        retrieved_data = payload
+        raw_retrieved_data = payload
     else:
-        retrieved_data = [payload]
-    if not isinstance(retrieved_data, list):
+        raw_retrieved_data = [payload]
+    if raw_retrieved_data is None:
+        return {
+            "task_type": task_type,
+            "status": "NOT_FOUND_ERROR",
+            "retrieved_data": None,
+            "error_details": None,
+        }
+    if expects_null_results:
+        return {
+            "task_type": task_type,
+            "status": "SUCCESS",
+            "retrieved_data": None,
+            "error_details": None,
+        }
+    if not isinstance(raw_retrieved_data, list):
         raise WebArenaVerifiedAdapterError("Benchmark response contract must resolve to a results list.")
+    retrieved_data = list(raw_retrieved_data)
+    if not retrieved_data or all(item is None for item in retrieved_data):
+        return {
+            "task_type": task_type,
+            "status": "NOT_FOUND_ERROR",
+            "retrieved_data": None,
+            "error_details": None,
+        }
     return {
         "task_type": task_type,
         "status": "SUCCESS",

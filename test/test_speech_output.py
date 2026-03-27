@@ -504,6 +504,25 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
         self.assertLess(elapsed, 0.5)
         self.assertTrue(player.played)
 
+    def test_close_uses_short_worker_join_after_idle(self) -> None:
+        tts_provider = SlowTTSProvider()
+        player = InterruptiblePlayer()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: None,
+        )
+
+        with mock.patch.object(output, "wait_until_idle", return_value=True), mock.patch.object(
+            output._worker, "join", autospec=False
+        ) as join_mock, mock.patch.object(output._worker, "is_alive", return_value=False):
+            output.close(timeout_s=2.0)
+
+        self.assertEqual(join_mock.call_count, 1)
+        self.assertLessEqual(join_mock.call_args.kwargs["timeout"], 0.25)
+
     def test_interrupt_path_uses_short_pump_join_timeout_with_playback_coordinator(self) -> None:
         tts_provider = GatedFirstChunkTTSProvider()
         player = InterruptiblePlayer()

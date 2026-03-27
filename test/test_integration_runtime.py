@@ -98,6 +98,62 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
         self.assertEqual(readiness.status, "warn")
         self.assertIn("credential", readiness.detail)
 
+    def test_email_runtime_uses_united_domains_profile_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f'{EMAIL_APP_PASSWORD_ENV_KEY}="mailbox-secret"\n', encoding="utf-8")
+            store = TwinrIntegrationStore.from_project_root(root)
+            store.save(
+                ManagedIntegrationConfig(
+                    integration_id="email_mailbox",
+                    enabled=True,
+                    settings={
+                        "profile": "united_domains",
+                        "account_email": "anna@example.de",
+                        "from_address": "anna@example.de",
+                    },
+                )
+            )
+
+            runtime = build_managed_integrations(root, env_path=env_path)
+
+        self.assertIsNotNone(runtime.email_mailbox)
+        assert runtime.email_mailbox is not None
+        self.assertEqual(runtime.email_mailbox.mailbox_reader.config.host, "imaps.udag.de")
+        self.assertEqual(runtime.email_mailbox.mail_sender.config.host, "smtps.udag.de")
+        readiness = runtime.readiness_for("email_mailbox")
+        assert readiness is not None
+        self.assertIn("imaps.udag.de:993", readiness.detail)
+        self.assertIn("smtps.udag.de:587", readiness.detail)
+
+    def test_email_runtime_warns_for_oauth_only_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f'{EMAIL_APP_PASSWORD_ENV_KEY}="mailbox-secret"\n', encoding="utf-8")
+            store = TwinrIntegrationStore.from_project_root(root)
+            store.save(
+                ManagedIntegrationConfig(
+                    integration_id="email_mailbox",
+                    enabled=True,
+                    settings={
+                        "profile": "outlook_oauth",
+                        "account_email": "anna@outlook.com",
+                        "from_address": "anna@outlook.com",
+                    },
+                )
+            )
+
+            runtime = build_managed_integrations(root, env_path=env_path)
+
+        self.assertIsNone(runtime.email_mailbox)
+        readiness = runtime.readiness_for("email_mailbox")
+        assert readiness is not None
+        self.assertEqual(readiness.status, "warn")
+        self.assertEqual(readiness.summary, "Needs OAuth2")
+        self.assertIn("OAuth2 / Modern Auth", readiness.detail)
+
     def test_calendar_runtime_blocks_tokenized_url_before_it_can_leak(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -33,9 +33,10 @@ from twinr.browser_automation import (
 
 from browser_automation.api_discovery import collect_inline_api_packets
 from browser_automation.completion_verifier import SameUrlCompletionVerifier, derive_trace_navigation_state
-from browser_automation.dense_reader import DensePageReaderResult
+from browser_automation.dense_reader import DensePageReader, DensePageReaderResult, _content_block_packets_from_evidence
 from browser_automation.tessairact_bridge import (
     TessairactVendoredDriver,
+    _SessionState,
     _TessairactToolRegistry,
     _VendoredLoopRuntime,
     _local_host_safety_flags,
@@ -261,7 +262,8 @@ class BrowserAutomationRuntimeTests(unittest.TestCase):
         self.assertEqual(schema["name"], "browser_automation")
         self.assertIn("specific website", schema["description"])
         self.assertIn("search_live_info", schema["description"])
-        self.assertIn("asking the user", schema["description"])
+        self.assertIn("different method", schema["description"])
+        self.assertIn("take a little longer", schema["description"])
         self.assertIn("could not be verified", schema["description"])
         self.assertEqual(set(schema["parameters"]["required"]), {"goal", "allowed_domains"})
         self.assertIn("allowed_domains", schema["parameters"]["properties"])
@@ -460,17 +462,20 @@ class BrowserAutomationRuntimeTests(unittest.TestCase):
         self.assertNotIn("browser interaction on a specific website", disabled_supervisor)
         self.assertIn("browser_automation", enabled_tool)
         self.assertIn("Use search_live_info first", enabled_tool)
-        self.assertIn("ask the user one short follow-up question", enabled_tool)
+        self.assertIn("offer the user one short model-authored follow-up", enabled_tool)
+        self.assertIn("different method", enabled_tool)
+        self.assertIn("Do not turn that offer into a fixed stock sentence", enabled_tool)
         self.assertIn("treat that as unresolved rather than as the final answer", enabled_tool)
         self.assertIn("short assent or go-ahead", enabled_tool)
         self.assertIn("already explicitly asked Twinr to check", enabled_tool)
         self.assertIn("does not by itself count as explicit browser authorization", enabled_tool)
         self.assertIn("Do not tack on an extra website-check offer", enabled_tool)
-        self.assertIn("prefer the short permission question", enabled_tool)
+        self.assertIn("prefer the short proactive alternate-method offer", enabled_tool)
         self.assertIn("may take a little longer", enabled_tool)
         self.assertIn("reuse that exact site_follow_up_url or site_follow_up_domain", enabled_tool)
         self.assertIn("Prefer a normal web-search handoff", enabled_supervisor)
-        self.assertIn("ask the user for permission", enabled_supervisor)
+        self.assertIn("proactively offer a different method", enabled_supervisor)
+        self.assertIn("rather than a fixed canned permission sentence", enabled_supervisor)
         self.assertIn("should stay unresolved rather than being treated as a finished answer", enabled_supervisor)
         self.assertIn("short assent or go-ahead", enabled_supervisor)
         self.assertIn("does not by itself make browser work explicit", enabled_supervisor)
@@ -659,6 +664,96 @@ class BrowserDecisionModuleTests(unittest.TestCase):
         )
         self.assertEqual(trace_state.latest_url_source, "active_frame_url")
 
+    def test_trace_navigation_state_ignores_truncated_active_urls(self) -> None:
+        full_url = (
+            "http://localhost:7770/"
+            "6s-wireless-headphones-over-ear-noise-canceling-hi-fi-bass-foldable-stereo-"
+            "wireless-kid-headsets-earbuds-with-built-in-mic-micro-sd-tf-fm-for-iphone-"
+            "samsung-ipad-pc-black-gold.html"
+        )
+        raw_result = {
+            "visited_urls": [full_url],
+            "steps": [
+                {
+                    "final_url": full_url,
+                    "url": full_url,
+                    "tabs_excerpt": [
+                        {
+                            "tab_index": 0,
+                            "active": True,
+                            "url": "http://localhost:7770/6s-wireless-headphones-over-ear-noise-canceling…",
+                        }
+                    ],
+                    "frames_excerpt": [
+                        {
+                            "frame_index": 0,
+                            "active": True,
+                            "url": "http://localhost:7770/6s-wireless-headphones-over-ear-noise-canceling%E2%80%A6",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        trace_state = derive_trace_navigation_state(
+            raw_result=raw_result,
+            start_url=full_url,
+        )
+
+        self.assertEqual(trace_state.final_url, full_url)
+        self.assertEqual(trace_state.latest_url_source, "final_url")
+
+    def test_content_block_packets_from_evidence_prioritizes_and_dedupes_matches(self) -> None:
+        packets = _content_block_packets_from_evidence(
+            evidence_packets=[
+                {
+                    "kind": "section_activation",
+                    "url": "http://localhost:7770/product",
+                    "content_blocks": [
+                        {
+                            "heading": "Reviews",
+                            "secondary_text": "Review by Catso",
+                            "text": "The ear cups are way too small for adult sized ears.",
+                            "links": [{"text": "Page 2", "href": "http://localhost:7770/product?p=2"}],
+                        },
+                        {
+                            "heading": "Reviews",
+                            "secondary_text": "Review by Catso",
+                            "text": "The ear cups are way too small for adult sized ears.",
+                            "links": [{"text": "Page 2", "href": "http://localhost:7770/product?p=2"}],
+                        },
+                        {
+                            "heading": "Reviews",
+                            "secondary_text": "Review by Anglebert Dinkherhump",
+                            "text": "They feel too small around the ears during long workouts.",
+                            "links": [],
+                        },
+                    ],
+                },
+                {
+                    "kind": "scroll_window",
+                    "url": "http://localhost:7770/product",
+                    "content_blocks": [
+                        {
+                            "heading": "Specs",
+                            "secondary_text": "",
+                            "text": "Battery life is 18 hours.",
+                            "links": [],
+                        }
+                    ],
+                },
+            ],
+            priority_terms=("ear cups", "small", "reviews"),
+            limit=3,
+        )
+
+        self.assertEqual(len(packets), 3)
+        self.assertEqual(packets[0]["kind"], "content_block")
+        self.assertEqual(packets[0]["source_packet_kind"], "section_activation")
+        self.assertIn("Catso", packets[0]["secondary_text"])
+        self.assertIn("Anglebert", packets[1]["secondary_text"])
+        self.assertEqual(packets[2]["heading"], "Specs")
+
     def test_inline_api_packets_collect_framework_payloads(self) -> None:
         fake_page = SimpleNamespace(
             evaluate=lambda _script: {
@@ -742,6 +837,511 @@ class BrowserDecisionModuleTests(unittest.TestCase):
 
 
 class DenseReaderRescueTests(unittest.TestCase):
+    def test_dense_reader_keeps_observational_negative_unresolved_until_classifier_runs(self) -> None:
+        normalized = DensePageReader._normalize_freeform_verification(
+            {
+                "supported": False,
+                "not_found": True,
+                "observational_page_check": True,
+                "answer_scoped_to_current_page": True,
+                "answer_markdown": "Auf der aktuell sichtbaren Seite ist kein Mittagsmenü für heute erkennbar.",
+                "key_points": ["kein Mittagsmenü für heute sichtbar"],
+                "reason": "The inspected current page only shows general site information.",
+            }
+        )
+
+        self.assertFalse(normalized["supported"])
+        self.assertTrue(normalized["not_found"])
+        self.assertTrue(normalized["observational_page_check"])
+        self.assertTrue(normalized["answer_scoped_to_current_page"])
+
+    def test_dense_reader_does_not_auto_promote_positive_scoped_observation(self) -> None:
+        normalized = DensePageReader._normalize_freeform_verification(
+            {
+                "supported": False,
+                "not_found": False,
+                "observational_page_check": True,
+                "answer_scoped_to_current_page": True,
+                "answer_markdown": "Three Stars",
+                "key_points": ["One review title is Three Stars."],
+                "reason": "The answer stays scoped to the inspected current page, but the verifier did not prove a supported match.",
+            }
+        )
+
+        self.assertFalse(normalized["supported"])
+        self.assertFalse(normalized["not_found"])
+
+    def test_dense_reader_observation_classifier_returns_structured_flags(self) -> None:
+        reader = DensePageReader.__new__(DensePageReader)
+        with mock.patch.object(
+            reader,
+            "_call_json",
+            return_value={
+                "observational_page_check": True,
+                "supported_negative_observation": True,
+                "reason": "The goal is a visible-state check and the inspected page supports a scoped negative answer.",
+            },
+        ):
+            verdict = reader._classify_negative_observational_support(
+                goal="Prüfe auf der sichtbaren Seite, ob ein Mittagsmenü sichtbar ist.",
+                evidence_packets=(
+                    {
+                        "kind": "page_snapshot",
+                        "url": "https://example.test/",
+                        "text_excerpt": "Allgemeine Inhalte ohne Mittagsmenü.",
+                    },
+                ),
+                verification={
+                    "supported": False,
+                    "not_found": True,
+                    "observational_page_check": False,
+                    "answer_scoped_to_current_page": True,
+                    "answer_markdown": "",
+                    "key_points": [],
+                    "reason": "Die Seite zeigt kein Mittagsmenü.",
+                },
+            )
+
+        self.assertTrue(verdict["observational_page_check"])
+        self.assertTrue(verdict["supported_negative_observation"])
+
+    def test_session_close_preserves_session_for_late_follow_up_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = _VendoredLoopRuntime(
+                workspace_root=root,
+                task_token="late_follow_up",
+                allowed_domains=("example.com",),
+                default_capture_screenshot=False,
+                default_capture_html=False,
+                max_runtime_s=30.0,
+            )
+
+            class _FakePage:
+                def __init__(self) -> None:
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+                def is_closed(self) -> bool:
+                    return self.closed
+
+            class _FakeContext:
+                def __init__(self, page: _FakePage) -> None:
+                    self._page = page
+                    self.closed = False
+
+                @property
+                def pages(self) -> list[_FakePage]:
+                    return [self._page]
+
+                def storage_state(self, *, path: str) -> None:
+                    Path(path).write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+
+                def close(self) -> None:
+                    self.closed = True
+
+            page = _FakePage()
+            context = _FakeContext(page)
+            runtime._sessions["sess_test"] = _SessionState(
+                session_id="sess_test",
+                context=cast(Any, context),
+                page=cast(Any, page),
+                trace_enabled=False,
+            )
+
+            payload = runtime._browser_session_close(arguments={"session_id": "sess_test"})
+
+            self.assertTrue(payload["ok"])
+            self.assertIn("sess_test", runtime._sessions)
+            self.assertIsNotNone(payload["storage_state_path"])
+            self.assertTrue(Path(str(payload["storage_state_path"])).is_file())
+            self.assertEqual(runtime.latest_storage_state_path, payload["storage_state_path"])
+
+            runtime.close_all()
+
+            self.assertTrue(page.closed)
+            self.assertTrue(context.closed)
+
+    def test_driver_passes_browser_context_metadata_to_dense_reader_rescue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bootstrap_state = root / "shopping_state.json"
+            bootstrap_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+            config = TwinrConfig.from_env(env_path)
+            driver = TessairactVendoredDriver(config=config, workspace_root=root / "browser_automation")
+
+            class _FakeSpecialist:
+                BrowserLoopConfig = staticmethod(lambda **kwargs: dict(kwargs))
+
+                @staticmethod
+                def run_browser_loop(**_: object) -> dict[str, object]:
+                    return {
+                        "ok": False,
+                        "error": "insufficient_evidence",
+                        "visited_urls": [
+                            "http://localhost:7770/",
+                            "http://localhost:7770/sales/guest/form/",
+                        ],
+                        "steps": [{"final_url": "http://localhost:7770/sales/guest/form/"}],
+                    }
+
+            class _FakeLoader:
+                def load(self) -> object:
+                    return _FakeSpecialist()
+
+            captured: dict[str, object] = {}
+
+            class _UnsupportedReader:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def read(self, **kwargs: object) -> DensePageReaderResult:
+                    captured.update(kwargs)
+                    return DensePageReaderResult(
+                        supported=False,
+                        answer_markdown="",
+                        key_points=(),
+                        reason="Missing order evidence.",
+                        evidence_packets=(),
+                        artifacts=(),
+                    )
+
+            driver._specialist_loader = cast(Any, _FakeLoader())
+            driver._dense_reader_factory = cast(Any, _UnsupportedReader)
+
+            result = driver.execute(
+                BrowserAutomationRequest(
+                    task_id="shopping_order_state_bootstrap",
+                    goal="Get the status of my latest order.",
+                    start_url="http://localhost:7770/",
+                    allowed_domains=("localhost", "127.0.0.1"),
+                    metadata={
+                        "browser_context_storage_state_path": str(bootstrap_state),
+                        "browser_context_extra_http_headers": {"X-Test-Login": "benchmark-user"},
+                        "source_intent": "Get the status of my latest order.",
+                        "results_schema": {"type": "array", "items": {"type": "string"}},
+                    },
+                )
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(captured["storage_state_path"], str(bootstrap_state))
+        self.assertEqual(captured["extra_http_headers"], {"X-Test-Login": "benchmark-user"})
+        self.assertEqual(captured["goal"], "Get the status of my latest order.")
+        self.assertEqual(captured["results_schema"], {"type": "array", "items": {"type": "string"}})
+
+    def test_driver_completed_structured_answer_is_refined_by_dense_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bootstrap_state = root / "shopping_state.json"
+            bootstrap_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+            config = TwinrConfig.from_env(env_path)
+            driver = TessairactVendoredDriver(config=config, workspace_root=root / "browser_automation")
+
+            class _FakeSpecialist:
+                BrowserLoopConfig = staticmethod(lambda **kwargs: dict(kwargs))
+
+                @staticmethod
+                def run_browser_loop(**_: object) -> dict[str, object]:
+                    return {
+                        "ok": True,
+                        "done_reason": "completed",
+                        "answer_markdown": '{"results":["Catso","Dibbins"]}',
+                        "key_points": ["Partial list from the page."],
+                        "visited_urls": [
+                            "http://localhost:7770/product.html",
+                            "http://localhost:7770/product-reviews.html",
+                        ],
+                        "steps": [{"final_url": "http://localhost:7770/product-reviews.html"}],
+                    }
+
+            class _FakeLoader:
+                def load(self) -> object:
+                    return _FakeSpecialist()
+
+            captured: dict[str, object] = {}
+
+            class _FakeReader:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so completed-answer refinement can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
+                    captured.update(kwargs)
+                    return DensePageReaderResult(
+                        supported=True,
+                        answer_markdown='{"results":["Catso","Dibbins","Anglebert Dinkherhump","Michelle Davis"]}',
+                        key_points=("All four matching reviewers were visible on the review page.",),
+                        reason="Dense reader extracted the full supported reviewer set.",
+                        evidence_packets=(
+                            {
+                                "kind": "find_text",
+                                "url": "http://localhost:7770/product-reviews.html",
+                                "query": "small",
+                                "text": "Catso ... Dibbins ... Anglebert Dinkherhump ... Michelle Davis",
+                            },
+                        ),
+                        artifacts=(),
+                    )
+
+            driver._specialist_loader = cast(Any, _FakeLoader())
+            driver._dense_reader_factory = cast(Any, _FakeReader)
+            driver._task_intent_classifier = cast(
+                Any,
+                SimpleNamespace(
+                    classify=lambda **_kwargs: {
+                        "auth_navigation_needed": False,
+                        "task_profile": "generic_read",
+                        "reason": "test_override",
+                    }
+                ),
+            )
+
+            result = driver.execute(
+                BrowserAutomationRequest(
+                    task_id="shopping_structured_refine",
+                    goal="Return the reviewer names who mention that the ear cups are too small as JSON only.",
+                    start_url="http://localhost:7770/product.html",
+                    allowed_domains=("localhost", "127.0.0.1"),
+                    metadata={
+                        "task_kind": "auth_read",
+                        "source_intent": "Return the reviewer names who mention that the ear cups are too small.",
+                        "results_schema": {"type": "array", "items": {"type": "string"}},
+                        "browser_context_storage_state_path": str(bootstrap_state),
+                    },
+                )
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.final_url, "http://localhost:7770/product-reviews.html")
+        self.assertEqual(result.data["mode"], "tessairact_completed_plus_dense_reader")
+        self.assertEqual(
+            result.data["answer_markdown"],
+            '{"results":["Catso","Dibbins","Anglebert Dinkherhump","Michelle Davis"]}',
+        )
+        self.assertEqual(
+            captured["goal"],
+            "Return the reviewer names who mention that the ear cups are too small.",
+        )
+        self.assertEqual(captured["storage_state_path"], str(bootstrap_state))
+        self.assertEqual(captured["results_schema"], {"type": "array", "items": {"type": "string"}})
+        self.assertTrue(result.data["verifier_decision"]["supported"])
+
+    def test_dense_reader_finalize_structured_answer_uses_correction_pass(self) -> None:
+        reader = object.__new__(DensePageReader)
+        extract_mock = mock.Mock(
+            return_value={
+                "results": ["Catso", "Dibbins", "Michelle Davis"],
+                "key_points": ["Initial partial candidate."],
+                "reason": "Initial extraction missed one supported reviewer.",
+            }
+        )
+        correct_mock = mock.Mock(
+            return_value={
+                "results": ["Catso", "Dibbins", "Anglebert Dinkherhump", "Michelle Davis"],
+                "key_points": ["Corrected to the full supported reviewer set."],
+                "reason": "Validation added the missing supported reviewer.",
+            }
+        )
+        cast(Any, reader)._extract_structured_answer = extract_mock
+        cast(Any, reader)._correct_structured_answer = correct_mock
+
+        finalized = DensePageReader._finalize_structured_answer(
+            reader,
+            goal="Get name(s) of reviewer(s) who mention ear cups being small.",
+            navigator_data={"answer_markdown": '{"results":["Catso","Dibbins","Michelle Davis"]}'},
+            evidence_packets=(),
+            results_schema={"type": "array", "items": {"type": "string"}},
+        )
+
+        self.assertEqual(
+            finalized["results"],
+            ["Catso", "Dibbins", "Anglebert Dinkherhump", "Michelle Davis"],
+        )
+        self.assertEqual(finalized["reason"], "Validation added the missing supported reviewer.")
+        extract_mock.assert_called_once()
+        correct_mock.assert_called_once()
+
+    def test_driver_recovers_auth_task_with_auth_navigation_rescue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bootstrap_state = root / "shopping_state.json"
+            bootstrap_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+            config = TwinrConfig.from_env(env_path)
+            driver = TessairactVendoredDriver(config=config, workspace_root=root / "browser_automation")
+
+            class _FakeSpecialist:
+                BrowserLoopConfig = staticmethod(lambda **kwargs: dict(kwargs))
+
+                @staticmethod
+                def run_browser_loop(**_: object) -> dict[str, object]:
+                    return {
+                        "ok": True,
+                        "done_reason": "No supported evidence of the latest order status or arrival date was available.",
+                        "answer_markdown": '{"results":[{"status":"unavailable","arrival_date":null}]}',
+                        "visited_urls": [
+                            "http://localhost:7770/",
+                            "http://localhost:7770/customer/account/login/",
+                        ],
+                        "steps": [{"final_url": "http://localhost:7770/customer/account/login/"}],
+                    }
+
+            class _FakeLoader:
+                def load(self) -> object:
+                    return _FakeSpecialist()
+
+            captured: dict[str, object] = {}
+
+            class _FakeAuthRescue:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def run(self, **kwargs: object) -> object:
+                    captured.update(kwargs)
+                    return SimpleNamespace(
+                        supported=True,
+                        not_found=False,
+                        answer_markdown='{"results":[{"status":"canceled","arrival_date":null}]}',
+                        key_points=("Latest order is canceled and has no arrival date.",),
+                        reason="Authenticated navigation rescue reached the order detail page.",
+                        evidence_packets=(
+                            {
+                                "kind": "auth_navigation_snapshot",
+                                "url": "http://localhost:7770/sales/order/view/order_id/123/",
+                            },
+                        ),
+                        artifacts=(),
+                        used_api_sources=(),
+                        visited_urls=(
+                            "http://localhost:7770/",
+                            "http://localhost:7770/customer/account/",
+                            "http://localhost:7770/sales/order/view/order_id/123/",
+                        ),
+                    )
+
+            class _UnexpectedReader:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def read(self, **_: object) -> DensePageReaderResult:
+                    raise AssertionError("dense reader should not run before auth navigation rescue succeeds")
+
+            driver._specialist_loader = cast(Any, _FakeLoader())
+            driver._auth_navigation_rescue_factory = cast(Any, _FakeAuthRescue)
+            driver._dense_reader_factory = cast(Any, _UnexpectedReader)
+            driver._task_intent_classifier = cast(
+                Any,
+                SimpleNamespace(
+                    classify=lambda **_kwargs: {
+                        "auth_navigation_needed": True,
+                        "task_profile": "account_read",
+                        "reason": "test_override",
+                    }
+                ),
+            )
+
+            result = driver.execute(
+                BrowserAutomationRequest(
+                    task_id="auth_navigation_rescue",
+                    goal="Get the status of my latest order and when will it arrive.",
+                    start_url="http://localhost:7770/",
+                    allowed_domains=("localhost", "127.0.0.1"),
+                    metadata={
+                        "task_kind": "auth_read",
+                        "source_intent": "Get the status of my latest order and when will it arrive.",
+                        "results_schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "status": {"type": "string"},
+                                    "arrival_date": {"type": "string"},
+                                },
+                            },
+                        },
+                        "browser_context_storage_state_path": str(bootstrap_state),
+                    },
+                )
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.data["mode"], "tessairact_auth_navigation_rescue")
+        self.assertEqual(result.final_url, "http://localhost:7770/sales/order/view/order_id/123/")
+        self.assertEqual(captured["storage_state_path"], str(bootstrap_state))
+        self.assertEqual(
+            captured["goal"],
+            "Get the status of my latest order and when will it arrive.",
+        )
+        self.assertTrue(result.data["verifier_decision"]["supported"])
+
+    def test_driver_reader_storage_state_prefers_bootstrap_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bootstrap_state = root / "bootstrap_state.json"
+            latest_state = root / "latest_state.json"
+            bootstrap_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+            latest_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+            request = BrowserAutomationRequest(
+                task_id="state-preference",
+                goal="Read the latest order.",
+                start_url="http://localhost:7770/",
+                allowed_domains=("localhost",),
+                metadata={"browser_context_storage_state_path": str(bootstrap_state)},
+            )
+
+            preferred = TessairactVendoredDriver._reader_storage_state_path(
+                request=request,
+                latest_storage_state_path=str(latest_state),
+            )
+
+        self.assertEqual(preferred, str(bootstrap_state))
+
     def test_driver_recovers_same_page_completion_with_dense_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -796,6 +1396,15 @@ class DenseReaderRescueTests(unittest.TestCase):
                     pass
 
                 def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so same-page rescue can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
                     captured.update(kwargs)
                     return DensePageReaderResult(
                         supported=True,
@@ -880,7 +1489,16 @@ class DenseReaderRescueTests(unittest.TestCase):
                 def __init__(self, **_: object) -> None:
                     pass
 
-                def read(self, **_: object) -> DensePageReaderResult:
+                def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so navigation rescue can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
                     return DensePageReaderResult(
                         supported=True,
                         answer_markdown="useEffectEvent lets you separate events from effects.",
@@ -922,6 +1540,101 @@ class DenseReaderRescueTests(unittest.TestCase):
         self.assertIn("separate events from effects", result.data["answer_markdown"])
         self.assertTrue(result.data["verifier_decision"]["supported"])
         self.assertTrue(any(artifact.kind == "reader_evidence" for artifact in result.artifacts))
+
+    def test_driver_recovers_fail_closed_same_page_read_with_dense_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig.from_env(env_path)
+            driver = TessairactVendoredDriver(config=config, workspace_root=root / "browser_automation")
+
+            class _FakeSpecialist:
+                BrowserLoopConfig = staticmethod(lambda **kwargs: dict(kwargs))
+
+                @staticmethod
+                def run_browser_loop(**_: object) -> dict[str, object]:
+                    return {
+                        "ok": False,
+                        "error": "insufficient_evidence",
+                        "visited_urls": [
+                            "http://localhost:7770/product.html",
+                        ],
+                        "steps": [
+                            {
+                                "final_url": "http://localhost:7770/product.html",
+                                "title": "Product details",
+                                "text_excerpt": "Customer reviews mention multiple ear-cup sizes.",
+                            }
+                        ],
+                    }
+
+            class _FakeLoader:
+                def load(self) -> object:
+                    return _FakeSpecialist()
+
+            captured: dict[str, object] = {}
+
+            class _FakeReader:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so same-page fail-closed rescue can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
+                    captured.update(kwargs)
+                    return DensePageReaderResult(
+                        supported=True,
+                        answer_markdown='{"results":["Catso","Dibbins"]}',
+                        key_points=("Catso and Dibbins mention the ear cups being small.",),
+                        reason="Dense reader confirmed the reviewer names directly from the current product page.",
+                        evidence_packets=(
+                            {
+                                "kind": "find_text",
+                                "url": "http://localhost:7770/product.html",
+                                "query": "ear cups small",
+                                "text": "Review by Catso ... very small ears ... Review by Dibbins ... ear cups MAY be ok for children ... way too small",
+                            },
+                        ),
+                        artifacts=(),
+                    )
+
+            driver._specialist_loader = cast(Any, _FakeLoader())
+            driver._dense_reader_factory = cast(Any, _FakeReader)
+
+            result = driver.execute(
+                BrowserAutomationRequest(
+                    task_id="same_page_read_rescue",
+                    goal="Get the reviewer names who mention the ear cups being small.",
+                    start_url="http://localhost:7770/product.html",
+                    allowed_domains=("localhost", "127.0.0.1"),
+                    metadata={"task_kind": "read"},
+                )
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.final_url, "http://localhost:7770/product.html")
+        self.assertEqual(captured["url"], "http://localhost:7770/product.html")
+        self.assertEqual(result.data["mode"], "tessairact_navigation_plus_dense_reader")
+        self.assertEqual(result.data["answer_markdown"], '{"results":["Catso","Dibbins"]}')
+        self.assertTrue(result.data["verifier_decision"]["supported"])
 
     def test_driver_keeps_fail_closed_result_when_dense_reader_is_unsupported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -987,6 +1700,83 @@ class DenseReaderRescueTests(unittest.TestCase):
         self.assertEqual(result.error_code, "browser_loop_failed")
         self.assertEqual(result.final_url, "https://tailwindcss.com/docs/dark-mode")
 
+    def test_driver_maps_dense_reader_not_found_to_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_BROWSER_AUTOMATION_ENABLED=true",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig.from_env(env_path)
+            driver = TessairactVendoredDriver(config=config, workspace_root=root / "browser_automation")
+
+            class _FakeSpecialist:
+                BrowserLoopConfig = staticmethod(lambda **kwargs: dict(kwargs))
+
+                @staticmethod
+                def run_browser_loop(**_: object) -> dict[str, object]:
+                    return {
+                        "ok": False,
+                        "error": "insufficient_evidence",
+                        "visited_urls": ["http://localhost:7770/product.html"],
+                        "steps": [{"final_url": "http://localhost:7770/product.html"}],
+                    }
+
+            class _FakeLoader:
+                def load(self) -> object:
+                    return _FakeSpecialist()
+
+            class _NotFoundReader:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so not-found rescue can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
+                    return DensePageReaderResult(
+                        supported=False,
+                        not_found=True,
+                        answer_markdown="",
+                        key_points=(),
+                        reason="The inspected review list does not contain any 2-star-or-below review titles.",
+                        evidence_packets=(),
+                        artifacts=(),
+                    )
+
+            driver._specialist_loader = cast(Any, _FakeLoader())
+            driver._dense_reader_factory = cast(Any, _NotFoundReader)
+
+            result = driver.execute(
+                BrowserAutomationRequest(
+                    task_id="review_not_found",
+                    goal="Get all review titles with 2 stars or below for the product on the current page.",
+                    start_url="http://localhost:7770/product.html",
+                    allowed_domains=("localhost", "127.0.0.1"),
+                    metadata={"task_kind": "read"},
+                )
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error_code, "not_found")
+        self.assertIn("not_found:", result.summary)
+        self.assertTrue(result.data["reader_rescue"]["not_found"])
+        self.assertTrue(result.data["verifier_decision"]["not_found"])
+
     def test_driver_allows_dense_reader_rescue_after_returning_to_start_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1034,6 +1824,15 @@ class DenseReaderRescueTests(unittest.TestCase):
                     pass
 
                 def read(self, **kwargs: object) -> DensePageReaderResult:
+                    if bool(kwargs.get("document_fast_path_only")):
+                        return DensePageReaderResult(
+                            supported=False,
+                            answer_markdown="",
+                            key_points=(),
+                            reason="Preflight skipped in this test so return-to-start rescue can be exercised.",
+                            evidence_packets=(),
+                            artifacts=(),
+                        )
                     captured.update(kwargs)
                     return DensePageReaderResult(
                         supported=True,

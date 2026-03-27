@@ -159,13 +159,16 @@ The accepted v1 safety contract is:
 - Twinr only submits bounded inspect missions and never sends direct roll/pitch/yaw/thrust commands
 - the daemon must expose `manual_arm_required=true` by default
 - arming goes through the daemon's local ops route, not through free-form voice
-- the current first runtime slice is `stationary_observe_only`, so the daemon proves mission/state/evidence plumbing before any motion primitive is enabled
+- the default runtime slice remains `stationary_observe_only`, so the daemon proves mission/state/evidence plumbing before motion is enabled
+- the first live motion primitive is a separate bounded `hover_test` mission, and it is only accepted when the daemon was explicitly started in `bounded_hover_test_only`
+- the first hover path now also requires the Twinr on-device Crazyflie failsafe app (`twinrFs`) by default, so heartbeat-loss, low-battery, and clearance-triggered safe-land behavior lives on the aircraft in C instead of depending on the host process
 
 The same bounded path is available to operators through:
 
 ```bash
 python3 -m twinr --env-file .env --drone-status
 python3 -m twinr --env-file .env --drone-inspect "prüfe das regal"
+python3 -m twinr --env-file .env --drone-hover-test
 python3 -m twinr --env-file .env --drone-cancel-mission DRN-...
 python3 -m twinr --env-file .env --drone-manual-arm DRN-...
 python3 -m twinr --env-file .env --self-test drone_stack

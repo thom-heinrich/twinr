@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+remote_name="${1:-origin}"
+
+exec "${repo_root}/scripts/git_guard.py" scan-push --remote "${remote_name}"

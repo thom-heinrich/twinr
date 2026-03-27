@@ -184,7 +184,10 @@ class EmailMailboxAdapter(IntegrationAdapter):
 
         try:
             # AUDIT-FIX(3): Isolate mailbox provider failures behind a user-safe RuntimeError.
-            raw_messages = self.mailbox_reader.list_recent(limit=limit, unread_only=unread_only)
+            raw_messages = self.mailbox_reader.list_recent(  # pylint: disable=assignment-from-no-return
+                limit=limit,
+                unread_only=unread_only,
+            )
         except Exception as exc:
             raise RuntimeError("I couldn't read recent email right now.") from exc
 

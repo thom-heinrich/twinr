@@ -49,3 +49,6 @@ hardware/display/vendor/
 *.env
 .ruff_*/
 .mypy_*/
+build*/
+cache*/
+.git_guard*

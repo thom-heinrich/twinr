@@ -17,11 +17,22 @@ from twinr.web.presenters.common import (
 )
 from twinr.web.presenters.connect import _connect_sections
 from twinr.web.presenters.debug import build_ops_debug_page_context, coerce_ops_debug_tab
+from twinr.web.presenters.email_wizard import (
+    _apply_email_wizard_connection_test_result,
+    _build_email_wizard_account_record,
+    _build_email_wizard_connection_test_configs,
+    _build_email_wizard_connection_test_record,
+    _build_email_wizard_guardrail_record,
+    _build_email_wizard_profile_record,
+    _build_email_wizard_transport_record,
+    build_email_wizard_page_context,
+)
 from twinr.web.presenters.integrations import (
     _build_calendar_integration_record,
     _build_email_integration_record,
     _build_smart_home_integration_record,
     _calendar_integration_sections,
+    _email_integration_context,
     _email_integration_sections,
     _integration_overview_rows,
     _smart_home_integration_sections,
@@ -48,11 +59,19 @@ __all__ = [
     "_adaptive_timing_view",
     "_build_calendar_integration_record",
     "_build_email_integration_record",
+    "_apply_email_wizard_connection_test_result",
+    "_build_email_wizard_account_record",
+    "_build_email_wizard_connection_test_configs",
+    "_build_email_wizard_connection_test_record",
+    "_build_email_wizard_guardrail_record",
+    "_build_email_wizard_profile_record",
+    "_build_email_wizard_transport_record",
     "_build_smart_home_integration_record",
     "_calendar_integration_sections",
     "_capture_voice_profile_sample",
     "_connect_sections",
     "_default_reminder_due_at",
+    "_email_integration_context",
     "_email_integration_sections",
     "_format_log_rows",
     "_format_usage_rows",
@@ -77,4 +96,5 @@ __all__ = [
     "_voice_action_result",
     "_voice_profile_page_context",
     "_voice_snapshot_label",
+    "build_email_wizard_page_context",
 ]

@@ -55,6 +55,7 @@ class EdgeVoiceOrchestrator:
         emit: Callable[[str], None],
         on_voice_activation: Callable[[VoiceActivationMatch], bool],
         on_transcript_committed: Callable[[str, str], bool],
+        on_follow_up_closed: Callable[[str], None] | None = None,
         on_barge_in_interrupt: Callable[[], bool],
         forensics: WorkflowForensics | None = None,
     ) -> None:
@@ -62,6 +63,7 @@ class EdgeVoiceOrchestrator:
         self.emit = emit
         self._on_voice_activation = on_voice_activation
         self._on_transcript_committed = on_transcript_committed
+        self._on_follow_up_closed = on_follow_up_closed
         self._on_barge_in_interrupt = on_barge_in_interrupt
         self._device = resolve_capture_device(
             config.voice_orchestrator_audio_device,
@@ -230,6 +232,8 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        speaker_associated: bool | None = None,
+        speaker_association_confidence: float | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Send the current edge runtime state to the server."""
@@ -245,6 +249,8 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            speaker_associated=speaker_associated,
+            speaker_association_confidence=speaker_association_confidence,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
@@ -273,6 +279,8 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        speaker_associated: bool | None = None,
+        speaker_association_confidence: float | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Cache one runtime state before the websocket opens.
@@ -295,6 +303,8 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            speaker_associated=speaker_associated,
+            speaker_association_confidence=speaker_association_confidence,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
@@ -346,6 +356,8 @@ class EdgeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        speaker_associated: bool | None = None,
+        speaker_association_confidence: float | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> OrchestratorVoiceRuntimeStateEvent:
         """Construct one normalized runtime-state event for caching and send."""
@@ -361,6 +373,8 @@ class EdgeVoiceOrchestrator:
             interaction_ready=interaction_ready,
             targeted_inference_blocked=targeted_inference_blocked,
             recommended_channel=recommended_channel,
+            speaker_associated=speaker_associated,
+            speaker_association_confidence=speaker_association_confidence,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
 
@@ -390,6 +404,10 @@ class EdgeVoiceOrchestrator:
                 runtime_state.targeted_inference_blocked if runtime_state is not None else None
             ),
             recommended_channel=runtime_state.recommended_channel if runtime_state is not None else None,
+            speaker_associated=runtime_state.speaker_associated if runtime_state is not None else None,
+            speaker_association_confidence=(
+                runtime_state.speaker_association_confidence if runtime_state is not None else None
+            ),
             voice_quiet_until_utc=runtime_state.voice_quiet_until_utc if runtime_state is not None else None,
             state_attested=runtime_state is not None,
         )
@@ -621,6 +639,8 @@ class EdgeVoiceOrchestrator:
                 details={"reason": event.reason},
             )
             self.emit(f"voice_orchestrator_follow_up_closed={event.reason}")
+            if self._on_follow_up_closed is not None:
+                self._on_follow_up_closed(event.reason)
             return
         if isinstance(event, OrchestratorVoiceBargeInInterruptEvent):
             self._trace_event(

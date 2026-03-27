@@ -111,6 +111,25 @@ The practical rules for that utterance scanner are:
   mid-sentence `... Twinna` mention as a fresh wake
 - do not route the turn into any retired local detector or rescue capture path
 
+The default transcript-first wake phrase set now keeps the exact safe alias
+family `Twinr`, `Twinna`, `Twina`, and `Twinner`, including their bounded
+greeting forms such as `hey twinna`. Earlier broad `twi*` recovery rules and
+an explicit `twitter` alias recovered some ASR misses, but live Pi/host
+artifacts also showed they could wake Twinr from ordinary TV or room speech.
+Twinr therefore keeps only the exact safe alias family by default and blocks
+broader recovery like `twitter`, `tynna`, or generic `*winner` head variants.
+Operators who intentionally want that broader alias recovery must opt into it
+explicitly via `TWINR_VOICE_ACTIVATION_PHRASES` and accept the corresponding
+false-positive tradeoff.
+
+There is one narrower runtime-owned exception for the live idle wake path: when
+the Pi currently attests a speech-directed local person with strong
+speaker-association confidence, the `waiting` wake scanner may temporarily
+expand that exact safe family to include `Tynna` and the existing `*winner`
+head recovery. That stronger alias tier never becomes the global default, never
+applies outside `waiting`, and still requires an explicit utterance-head wake
+alias instead of manufacturing wake from vision alone.
+
 That keeps the websocket frame loop stable because the gateway performs one
 decode per utterance instead of multiple overlapping synchronous ASR calls on
 consecutive frames. The remote ASR adapter still keeps a narrow retry budget for
@@ -153,10 +172,13 @@ targeted debugging because it persists raw room audio by design.
 The edge runtime now also projects the latest compact `person_state` summary
 into each `voice_runtime_state` update: `attention_state`,
 `interaction_intent_state`, `person_visible`, `presence_active`, `interaction_ready`,
-`targeted_inference_blocked`, and `recommended_channel`. The gateway may use
-that summary only as an audio-owned bias, for example by keeping the
-transcript-first wake window a bit richer or the follow-up window open a bit
-longer when the runtime already sees speech-directed intent. It must never
+`targeted_inference_blocked`, `recommended_channel`, plus the compact
+speaker-association fields `speaker_associated` and
+`speaker_association_confidence`. The gateway may use that summary only as an
+audio-owned bias, for example by keeping the transcript-first wake window a bit
+richer, lowering the minimum activation duration a little, or temporarily
+unlocking the stronger `Tynna`/`*winner` alias tier while the runtime already
+sees speech-directed intent from the same nearby person. It must never
 manufacture a wake from vision alone.
 
 The same runtime-state payload now also carries an optional

@@ -24,7 +24,14 @@ from twinr.agent.base_agent.conversation.closure import ConversationClosureDecis
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
 from twinr.agent.workflows.streaming_semantic_router import _synthesize_supervisor_decision
-from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan, _SpeechLifecycle
+from twinr.agent.workflows.streaming_turn_coordinator import (
+    StreamingTurnCoordinator,
+    StreamingTurnCoordinatorHooks,
+    StreamingTurnLanePlan,
+    StreamingTurnRequest,
+    StreamingTurnSpeechServices,
+    _SpeechLifecycle,
+)
 from twinr.agent.workflows.streaming_turn_orchestrator import FinalLaneTimeoutError
 from twinr.agent.base_agent import TwinrConfig
 from twinr.hardware.audio import ListenTimeoutCaptureDiagnostics, SpeechStartTimeoutError
@@ -1001,6 +1008,76 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(runtime.resume_processing_calls, 1)
         self.assertGreaterEqual(refresh_calls_after_resume, 1)
         self.assertEqual(runtime.refresh_snapshot_activity_calls, refresh_calls_after_resume)
+
+    def test_close_speech_output_stops_feedback_before_waiting_for_close(self) -> None:
+        events: list[str] = []
+        runtime = SimpleNamespace(
+            status=SimpleNamespace(value="processing"),
+            submit_transcript=lambda transcript: None,
+            begin_answering=lambda: None,
+            resume_processing=lambda: None,
+            resume_answering_after_print=lambda: None,
+            finalize_agent_turn=lambda response_text: response_text,
+            finish_speaking=lambda: None,
+            rearm_follow_up=lambda request_source="follow_up": None,
+            refresh_snapshot_activity=lambda: None,
+        )
+        coordinator = StreamingTurnCoordinator(
+            config=TwinrConfig(),
+            runtime=runtime,
+            request=StreamingTurnRequest(
+                transcript="Hallo Twinr",
+                listen_source="button",
+                proactive_trigger=None,
+                turn_started=time.monotonic(),
+                capture_ms=0,
+                stt_ms=0,
+            ),
+            lane_plan_factory=lambda: StreamingTurnLanePlan(turn_instructions=None),
+            speech_services=StreamingTurnSpeechServices(
+                tts_provider=SimpleNamespace(),
+                player=SimpleNamespace(),
+                playback_coordinator=None,
+                segment_boundary=lambda _text: None,
+            ),
+            hooks=StreamingTurnCoordinatorHooks(
+                emit=lambda _line: None,
+                emit_status=lambda: None,
+                trace_event=lambda *args, **kwargs: None,
+                trace_decision=lambda *args, **kwargs: None,
+                start_processing_feedback_loop=lambda _kind: (lambda: None),
+                is_search_feedback_active=lambda: False,
+                stop_search_feedback=lambda: events.append("search_stop"),
+                should_stop=lambda: False,
+                request_turn_stop=lambda _reason: None,
+                cancel_interrupted_turn=lambda: None,
+                record_usage=lambda **kwargs: None,
+                evaluate_follow_up_closure=lambda **kwargs: SimpleNamespace(),
+                apply_follow_up_closure_evaluation=lambda **kwargs: False,
+                follow_up_rearm_allowed_now=lambda _source: False,
+            ),
+        )
+
+        class _FakeSpeechOutput:
+            def close(self, *, timeout_s: float | None = None) -> None:
+                del timeout_s
+                events.append("speech_close")
+
+        coordinator._speech_output = _FakeSpeechOutput()
+        coordinator.processing_feedback = SimpleNamespace(stop=lambda: events.append("processing_stop"))
+
+        coordinator._close_speech_output()
+
+        self.assertEqual(
+            events,
+            [
+                "search_stop",
+                "processing_stop",
+                "speech_close",
+                "search_stop",
+                "processing_stop",
+            ],
+        )
 
     def test_audio_turn_uses_same_stream_remote_commit_when_voice_orchestrator_owns_listening(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -4725,6 +4802,67 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.text, "Okay. Ich bin jetzt für 2 Minuten ruhig.")
         self.assertEqual(len(dual_lane.run_runtime_local_tool_only_calls), 1)
+        self.assertEqual(len(dual_lane.run_handoff_calls), 0)
+        self.assertEqual(len(dual_lane.run_calls), 0)
+
+    def test_runtime_local_tool_handoff_omits_supervisor_bridge_ack_in_full_turn(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            tts_provider = FakeTextToSpeechProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.search_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("search context must not be requested for runtime-local direct tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("heavy tool context must not be requested for runtime-local direct tool handoff"))  # type: ignore[method-assign]
+            runtime.tool_provider_tiny_recent_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("tiny_recent tool context must not be requested once the supervisor already resolved the direct runtime-local tool"))  # type: ignore[method-assign]
+            loop._resolve_local_semantic_route = lambda transcript: None  # type: ignore[method-assign]
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="handoff",
+                spoken_ack="Ich schalte mich kurz stumm.",
+                spoken_reply=None,
+                kind="automation",
+                goal="Set temporary quiet mode.",
+                allow_web_search=False,
+                context_scope="tiny_recent",
+                runtime_tool_name="manage_voice_quiet_mode",
+                runtime_tool_arguments={"action": "set", "duration_minutes": 2},
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Sei bitte 2 Minuten ruhig.",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(tts_provider.stream_calls, ["Okay. Ich bin jetzt für 2 Minuten ruhig."])
+        self.assertEqual(runtime.last_response, "Okay. Ich bin jetzt für 2 Minuten ruhig.")
+        self.assertEqual(len(dual_lane.run_runtime_local_tool_only_calls), 1)
+        self.assertFalse(dual_lane.run_runtime_local_tool_only_calls[0]["emit_filler"])
         self.assertEqual(len(dual_lane.run_handoff_calls), 0)
         self.assertEqual(len(dual_lane.run_calls), 0)
 

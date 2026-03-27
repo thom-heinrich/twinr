@@ -12,10 +12,11 @@ import re
 from collections.abc import Iterable, Mapping
 from email.utils import parseaddr
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.integrations.email.profiles import DEFAULT_EMAIL_PROFILE_ID, email_provider_profile
 from twinr.integrations import (
     HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
     ManagedIntegrationConfig,
@@ -60,10 +61,13 @@ def _string_settings(settings: object) -> dict[str, str]:
     # AUDIT-FIX(#6): Degrade safely when persisted settings contain non-string or malformed values.
     if not settings:
         return {}
-    try:
-        items = dict(settings).items()
-    except (TypeError, ValueError):
-        return {}
+    if isinstance(settings, Mapping):
+        items = settings.items()
+    else:
+        try:
+            items = dict(cast(Iterable[tuple[object, object]], settings)).items()
+        except (TypeError, ValueError):
+            return {}
     return {str(key): _coerce_text(value) for key, value in items}
 
 
@@ -208,7 +212,7 @@ def _normalize_secret_value(raw: object, *, profile: str) -> str:
     # AUDIT-FIX(#1): Validate and normalize secrets before passing them to env persistence.
     secret = _coerce_text(raw).strip()
     _reject_control_characters(secret, "Email app password")
-    if profile == "gmail":
+    if email_provider_profile(profile, default=DEFAULT_EMAIL_PROFILE_ID).strip_secret_spaces:
         secret = "".join(secret.split())
     return secret
 
@@ -473,6 +477,131 @@ def _integration_overview_rows(
     )
 
 
+def _email_integration_context(
+    record: ManagedIntegrationConfig,
+    env_values: Mapping[str, object],
+    *,
+    readiness: Any | None = None,
+) -> dict[str, object]:
+    """Build the compact email setup summary shown on ``/integrations``."""
+
+    values = _string_settings(getattr(record, "settings", {}))
+    profile = _safe_normalize_choice(
+        values.get("profile", DEFAULT_EMAIL_PROFILE_ID),
+        default=DEFAULT_EMAIL_PROFILE_ID,
+        options=_EMAIL_PROFILE_OPTIONS,
+        fallback=("generic",),
+    )
+    provider_profile = email_provider_profile(profile, default=DEFAULT_EMAIL_PROFILE_ID)
+    profile = provider_profile.profile_id
+    account_email = values.get("account_email", "").strip()
+    secret_present = bool(_normalize_persisted_secret(env_values.get(_EMAIL_SECRET_KEY)))
+    imap_host = values.get("imap_host", provider_profile.default_imap_host).strip()
+    imap_port = values.get("imap_port", provider_profile.default_imap_port).strip()
+    smtp_host = values.get("smtp_host", provider_profile.default_smtp_host).strip()
+    smtp_port = values.get("smtp_port", provider_profile.default_smtp_port).strip()
+    known_contacts_text = _coerce_text(values.get("known_contacts_text", "")).strip()
+    restrict_reads = _safe_bool_string(values.get("restrict_reads_to_known_senders", "false"), default=False) == "true"
+    restrict_recipients = _safe_bool_string(values.get("restrict_recipients_to_known_contacts", "false"), default=False) == "true"
+
+    if not record.enabled:
+        status = "muted"
+        status_label = "Disabled"
+        detail = "Open the wizard to choose a provider profile, save the mailbox login, and enable mail when ready."
+    elif readiness is not None:
+        status = _coerce_text(getattr(readiness, "status", "warn"), default="warn") or "warn"
+        status_label = _coerce_text(getattr(readiness, "summary", "Needs setup"), default="Needs setup") or "Needs setup"
+        detail = _coerce_text(getattr(readiness, "detail", provider_profile.setup_hint), default=provider_profile.setup_hint) or provider_profile.setup_hint
+    elif provider_profile.supported:
+        status = "warn"
+        status_label = "Needs setup"
+        detail = "The mailbox still needs account details, a credential, and the server settings."
+    else:
+        status = "fail"
+        status_label = "Needs OAuth2"
+        detail = provider_profile.support_detail
+
+    if not provider_profile.supported:
+        provider_summary = f"{provider_profile.label} (not yet supported)"
+        provider_status = "fail" if record.enabled else "warn"
+        provider_detail = provider_profile.support_detail
+    else:
+        provider_summary = provider_profile.label
+        provider_status = "ok"
+        provider_detail = provider_profile.setup_hint or "Twinr will use this provider preset for the usual secure defaults."
+
+    if imap_host and smtp_host:
+        transport_summary = f"IMAP {imap_host}:{imap_port or '?'} / SMTP {smtp_host}:{smtp_port or '?'}"
+        transport_status = "ok"
+        transport_detail = provider_profile.transport_hint or "Twinr has the incoming and outgoing server targets it needs."
+    else:
+        transport_summary = "Not saved yet"
+        transport_status = "warn"
+        transport_detail = "Save the transport step so Twinr knows which IMAP and SMTP servers to use."
+
+    if restrict_recipients and known_contacts_text:
+        safety_summary = "Known contacts required"
+        safety_status = "ok"
+        safety_detail = "Twinr keeps outbound mail limited to the contacts listed in the wizard."
+    elif restrict_recipients:
+        safety_summary = "Contact list missing"
+        safety_status = "warn"
+        safety_detail = "Sending is fenced to known contacts, but none are saved yet."
+    elif restrict_reads:
+        safety_summary = "Known senders preferred"
+        safety_status = "ok" if known_contacts_text else "warn"
+        safety_detail = (
+            "Twinr narrows spoken summaries to saved senders."
+            if known_contacts_text
+            else "Read restriction is on, but there are no saved contacts yet."
+        )
+    else:
+        safety_summary = "Explicit approval only"
+        safety_status = "ok"
+        safety_detail = "Mail drafts and sends still require explicit approval in Twinr."
+
+    return {
+        "title": "Email mailbox",
+        "status": status,
+        "status_label": status_label,
+        "detail": detail,
+        "action_href": "/integrations/email",
+        "action_label": "Open email wizard",
+        "checks": (
+            WizardCheckRow(
+                label="Provider",
+                summary=provider_summary,
+                detail=provider_detail,
+                status=provider_status,
+            ),
+            WizardCheckRow(
+                label="Mailbox account",
+                summary=account_email or "Not saved yet",
+                detail="Twinr reads from and usually sends from this mailbox address.",
+                status="ok" if account_email else "warn",
+            ),
+            WizardCheckRow(
+                label="Credential",
+                summary=_credential_state_label(_normalize_persisted_secret(env_values.get(_EMAIL_SECRET_KEY))),
+                detail=f"Stored separately in .env as the {provider_profile.secret_label.lower()}.",
+                status="ok" if secret_present else "warn",
+            ),
+            WizardCheckRow(
+                label="Transport",
+                summary=transport_summary,
+                detail=transport_detail,
+                status=transport_status,
+            ),
+            WizardCheckRow(
+                label="Safety",
+                summary=safety_summary,
+                detail=safety_detail,
+                status=safety_status,
+            ),
+        ),
+    }
+
+
 def _whatsapp_integration_context(
     config: TwinrConfig,
     env_values: Mapping[str, object],
@@ -610,11 +739,13 @@ def _email_integration_sections(
 
     values = _string_settings(getattr(record, "settings", {}))
     profile = _safe_normalize_choice(
-        values.get("profile", "gmail"),
-        default="gmail",
+        values.get("profile", DEFAULT_EMAIL_PROFILE_ID),
+        default=DEFAULT_EMAIL_PROFILE_ID,
         options=_EMAIL_PROFILE_OPTIONS,
         fallback=("generic",),
     )
+    provider_profile = email_provider_profile(profile, default=DEFAULT_EMAIL_PROFILE_ID)
+    profile = provider_profile.profile_id
     account_email = values.get("account_email", "").strip()
     values["profile"] = profile  # AUDIT-FIX(#6): Canonicalize select-backed state before rendering the form.
     values["account_email"] = account_email  # AUDIT-FIX(#6): Render trimmed persisted values consistently.
@@ -628,7 +759,6 @@ def _email_integration_sections(
         values.get("restrict_recipients_to_known_contacts", "false"),
         default=False,
     )
-    gmail_default = profile == "gmail"
     return (
         SettingsSection(
             title="Email",
@@ -648,14 +778,14 @@ def _email_integration_sections(
                     values,
                     _EMAIL_PROFILE_OPTIONS,
                     profile,
-                    tooltip_text="Gmail pre-fills the standard IMAP/SMTP defaults. Generic keeps everything manual.",
+                    tooltip_text="Choose a reviewed provider preset or keep everything manual with Generic IMAP/SMTP.",
                 ),
                 _text_field(
                     "account_email",
                     "Account email",
                     values,
                     account_email,
-                    placeholder="name@gmail.com",
+                    placeholder=provider_profile.account_placeholder,
                     tooltip_text="The mailbox address Twinr will read from and usually also send from.",
                 ),
                 _text_field(
@@ -663,65 +793,65 @@ def _email_integration_sections(
                     "From address",
                     values,
                     values["from_address"],
-                    placeholder="name@gmail.com",
+                    placeholder=provider_profile.from_placeholder,
                     tooltip_text="Outgoing sender address. Leave it equal to the account unless you know you need a different sender.",
                 ),
                 FileBackedSetting(
                     key=_EMAIL_SECRET_KEY,
-                    label="App password",
+                    label=provider_profile.secret_label,
                     value="",
                     help_text=(
                         # AUDIT-FIX(#6): Derive credential state from a sanitized persisted secret so the UI stays accurate.
                         f"Credential state: {_credential_state_label(_normalize_persisted_secret(env_values.get(_EMAIL_SECRET_KEY)))}. "
-                        "Leave blank to keep it unchanged."
+                        f"Leave blank to keep it unchanged. {provider_profile.secret_help_text}"
                     ),
-                    tooltip_text="For Gmail use a Google app password, not the normal Google account password.",
+                    tooltip_text=provider_profile.setup_hint or provider_profile.secret_help_text,
                     input_type="password",
-                    placeholder="16-character app password",
+                    placeholder=provider_profile.secret_placeholder,
                     secret=True,
                 ),
             ),
         ),
         SettingsSection(
             title="Mailbox transport",
-            description="These values are stored locally for the future live adapter wiring. Gmail works with the defaults shown here.",
+            description="These values are stored locally for the future live adapter wiring. Provider presets pre-fill the usual secure defaults.",
             fields=(
                 _text_field(
                     "imap_host",
                     "IMAP host",
                     values,
-                    values.get("imap_host", "imap.gmail.com" if gmail_default else "").strip(),
-                    placeholder="imap.gmail.com",
-                    tooltip_text="Incoming mail server hostname.",
+                    values.get("imap_host", provider_profile.default_imap_host).strip(),
+                    placeholder=provider_profile.default_imap_host or "imap.example.com",
+                    tooltip_text=provider_profile.transport_hint or "Incoming mail server hostname.",
                 ),
                 _text_field(
                     "imap_port",
                     "IMAP port",
                     values,
-                    values.get("imap_port", "993" if gmail_default else "").strip(),
-                    tooltip_text="Incoming mail server port. Gmail uses 993.",
+                    values.get("imap_port", provider_profile.default_imap_port).strip(),
+                    tooltip_text="Incoming mail server port.",
                 ),
                 _text_field(
                     "imap_mailbox",
                     "Mailbox",
                     values,
-                    values.get("imap_mailbox", "INBOX").strip(),
+                    values.get("imap_mailbox", provider_profile.default_mailbox).strip(),
                     tooltip_text="Mailbox folder Twinr should read from.",
                 ),
                 _text_field(
                     "smtp_host",
                     "SMTP host",
                     values,
-                    values.get("smtp_host", "smtp.gmail.com" if gmail_default else "").strip(),
-                    placeholder="smtp.gmail.com",
+                    values.get("smtp_host", provider_profile.default_smtp_host).strip(),
+                    placeholder=provider_profile.default_smtp_host or "smtp.example.com",
                     tooltip_text="Outgoing mail server hostname.",
                 ),
                 _text_field(
                     "smtp_port",
                     "SMTP port",
                     values,
-                    values.get("smtp_port", "587" if gmail_default else "").strip(),
-                    tooltip_text="Outgoing mail server port. Gmail uses 587 with STARTTLS.",
+                    values.get("smtp_port", provider_profile.default_smtp_port).strip(),
+                    tooltip_text="Outgoing mail server port.",
                 ),
             ),
         ),
@@ -984,12 +1114,14 @@ def _build_email_integration_record(
 
     enabled = _parse_bool_choice(form.get("enabled", "false"), "Email enabled", default=False)  # AUDIT-FIX(#3): Parse booleans strictly.
     profile = _normalize_choice(  # AUDIT-FIX(#4): Accept only supported profile values.
-        form.get("profile", "gmail"),
+        form.get("profile", DEFAULT_EMAIL_PROFILE_ID),
         "Profile",
-        default="gmail",
+        default=DEFAULT_EMAIL_PROFILE_ID,
         options=_EMAIL_PROFILE_OPTIONS,
         fallback=("generic",),
     )
+    provider_profile = email_provider_profile(profile, default=DEFAULT_EMAIL_PROFILE_ID)
+    profile = provider_profile.profile_id
     account_email = _coerce_text(form.get("account_email", "")).strip()
     if account_email:
         account_email = _validate_email_address(account_email, "Account email")  # AUDIT-FIX(#4): Validate addresses before persisting.
@@ -997,11 +1129,14 @@ def _build_email_integration_record(
     if from_address:
         from_address = _validate_email_address(from_address, "From address")  # AUDIT-FIX(#4): Prevent malformed sender addresses.
 
-    imap_host = _coerce_text(form.get("imap_host", "")).strip() or ("imap.gmail.com" if profile == "gmail" else "")
-    smtp_host = _coerce_text(form.get("smtp_host", "")).strip() or ("smtp.gmail.com" if profile == "gmail" else "")
-    imap_port = _coerce_text(form.get("imap_port", "")).strip() or ("993" if profile == "gmail" else "")
-    smtp_port = _coerce_text(form.get("smtp_port", "")).strip() or ("587" if profile == "gmail" else "")
-    imap_mailbox = _coerce_text(form.get("imap_mailbox", "")).strip() or "INBOX"
+    imap_host = _coerce_text(form.get("imap_host", "")).strip() or provider_profile.default_imap_host
+    smtp_host = _coerce_text(form.get("smtp_host", "")).strip() or provider_profile.default_smtp_host
+    imap_port = _coerce_text(form.get("imap_port", "")).strip() or provider_profile.default_imap_port
+    smtp_port = _coerce_text(form.get("smtp_port", "")).strip() or provider_profile.default_smtp_port
+    imap_mailbox = _coerce_text(form.get("imap_mailbox", "")).strip() or provider_profile.default_mailbox
+
+    if enabled and not provider_profile.supported:
+        raise ValueError(provider_profile.support_detail)
 
     if enabled and not account_email:
         raise ValueError("Email account address is required when email is enabled.")
@@ -1027,7 +1162,7 @@ def _build_email_integration_record(
     existing_secret = _normalize_persisted_secret(env_values.get(_EMAIL_SECRET_KEY))
     secret_value = _normalize_secret_value(form.get(_EMAIL_SECRET_KEY, ""), profile=profile)  # AUDIT-FIX(#1): Sanitize env-backed secret input.
     if enabled and not (secret_value or existing_secret):
-        raise ValueError("Email app password is required when email is enabled.")
+        raise ValueError(f"{provider_profile.secret_label} is required when email is enabled.")
 
     env_updates: dict[str, str] = {}
     if secret_value:

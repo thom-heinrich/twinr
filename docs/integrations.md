@@ -90,9 +90,19 @@ Twinr now has two concrete reviewed phase-1 adapters:
   - optional stricter mode can still restrict recipients or senders to known contacts
   - optional stdlib helpers: `IMAPMailboxReader` and `SMTPMailSender`
 
-The local portal now also has a simple setup page at `/integrations` for storing mail and calendar configuration per device. Email secrets stay in `.env`; non-secret integration settings are written to `artifacts/stores/integrations/integrations.json`.
+The local portal now also has a guided mailbox setup wizard at `/integrations/email` plus the broader `/integrations` overview page for storing mail and calendar configuration per device. Email secrets stay in `.env`; non-secret integration settings are written to `artifacts/stores/integrations/integrations.json`.
+
+Before the final enable step, the wizard now runs one bounded IMAP/SMTP login probe and stores only a redacted result such as passed, failed, and which side broke. Changing provider, mailbox login, password, or transport settings clears that probe state and disables the managed mailbox integration until the operator tests again.
 
 Readiness is derived from the same runtime builder that future Twinr flows will use. The portal only shows redacted state such as `credential stored separately in .env`; it does not echo secret characters back.
+
+The email wizard now exposes a small reviewed provider set:
+
+- Gmail
+- United Domains
+- iCloud Mail
+- Generic IMAP/SMTP
+- Outlook.com / Microsoft mail as a visible "needs OAuth2" stress case
 
 Phase-1 limits are intentional:
 

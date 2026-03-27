@@ -405,7 +405,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                     "Use bounded live browser automation for a specific website when the task requires page interaction, "
                     "multi-step navigation, form filling, or verifying live page state that generic web research cannot answer reliably. "
                     "Prefer search_live_info for broad web research or fresh questions that do not require site interaction. "
-                    "If this would only be a deeper follow-up after ordinary web research, prefer asking the user before starting the browser run unless the user already explicitly asked for site interaction. "
+                    "If this would only be a deeper follow-up after ordinary web research, prefer a short model-authored offer to try a different method that may take a little longer but can inspect the site more directly before starting the browser run, unless the user already explicitly asked for site interaction. "
                     "If ordinary web research said the exact detail could not be verified or that no current evidence was found, treat that as unresolved rather than as a final answer when a specific site check could still clarify it. "
                     "A short follow-up assent to an already proposed deeper site check counts as explicit approval for that browser run. "
                     "A freshness-sensitive question about a place, business, organization, or event does not by itself count as explicit browser authorization. "

@@ -321,6 +321,14 @@ schema stable while still allowing other modules to steer:
 - `blink`
 - `head_dx` / `head_dy`
 
+The display loop also owns one small runtime-only exception for quiet mode:
+when the runtime snapshot says Twinr has returned to `waiting` while
+`voice_quiet_until_utc` is still active, HDMI injects a local sleeping-face
+cue with closed eyes and soft brows. That cue is deliberately local to the
+display loop instead of being written into the generic external face-cue store,
+so temporary voice-quiet stays an explicit runtime state rather than looking
+like another producer-owned face event.
+
 `gaze_x` / `gaze_y` are intentionally finer-grained than the producer-facing
 emotion presets: low-level cues may use bounded multi-step eye offsets in the
 range `-3..3` so physical HCI paths like person-following can look smoother on

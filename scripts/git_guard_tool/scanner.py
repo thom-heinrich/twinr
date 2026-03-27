@@ -1,0 +1,360 @@
+"""Apply the repo-local git guard policy to changed paths and added lines."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from git_guard_tool.policy import GuardPolicy
+from git_guard_tool.types import AddedLine, PathChange, ScanIssue, ScanResult
+
+_PHONE_SEPARATORS = set(" +()-./")
+_PLACEHOLDER_CHARS = set("*xX#.")
+_TEST_PATH_MARKERS = ("/test/", "/tests/", ".test.", "_test.")
+
+
+def _trim_excerpt(text: str, *, max_len: int = 120) -> str:
+    cleaned = " ".join(text.strip().split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return f"{cleaned[: max_len - 3]}..."
+
+
+def _normalize_key(text: str) -> str:
+    normalized: list[str] = []
+    for character in text.casefold():
+        if character.isalnum():
+            normalized.append(character)
+        else:
+            normalized.append("_")
+    return "".join(normalized)
+
+
+def _normalize_value(text: str) -> str:
+    return text.strip().strip(",").strip("\"'").casefold()
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    if not value:
+        return True
+    if all(character in _PLACEHOLDER_CHARS for character in value):
+        return True
+    return False
+
+
+def _is_test_like_path(path: str) -> bool:
+    lowered_path = path.casefold()
+    file_name = Path(lowered_path).name
+    if lowered_path.startswith("test/") or lowered_path.startswith("tests/"):
+        return True
+    if file_name.startswith("test_") or file_name.endswith("_test.py"):
+        return True
+    return any(marker in lowered_path for marker in _TEST_PATH_MARKERS)
+
+
+def _line_defines_blocked_terms(text: str) -> bool:
+    normalized = _normalize_key(text)
+    return "blocked_terms" in normalized or "blocked_term" in normalized
+
+
+def _iter_token_like_fragments(text: str) -> tuple[str, ...]:
+    fragments: list[str] = []
+    current: list[str] = []
+    for character in text:
+        if character.isalnum() or character in {"-", "_"}:
+            current.append(character)
+            continue
+        if current:
+            fragments.append("".join(current))
+            current.clear()
+    if current:
+        fragments.append("".join(current))
+    return tuple(fragments)
+
+
+def _find_assignment(text: str) -> tuple[str, str] | None:
+    if "=" in text:
+        left, right = text.split("=", maxsplit=1)
+        key = left.strip()
+        if ":" in key:
+            key = key.split(":", maxsplit=1)[0].strip()
+        if any(character in key for character in "[]{}(),"):
+            return None
+        if key and right.strip():
+            return key, right
+    stripped = text.strip()
+    if ":" not in stripped:
+        return None
+    left, right = stripped.split(":", maxsplit=1)
+    key = left.strip().strip("\"'")
+    if not key or not right.strip():
+        return None
+    if any(character.isspace() for character in key):
+        return None
+    if any(character in key for character in "()[],"):
+        return None
+    return key, right
+
+
+def _looks_like_date(candidate: str) -> bool:
+    for separator in ("-", ".", "/"):
+        parts = [part for part in candidate.split(separator) if part]
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            continue
+        lengths = [len(part) for part in parts]
+        if lengths in ([4, 2, 2], [2, 2, 4]):
+            return True
+    return False
+
+
+def _looks_like_ip(candidate: str) -> bool:
+    parts = candidate.split(".")
+    if len(parts) != 4:
+        return False
+    if not all(part.isdigit() for part in parts):
+        return False
+    return all(0 <= int(part) <= 255 for part in parts)
+
+
+def _looks_like_small_version(candidate: str, digit_count: int) -> bool:
+    parts = candidate.split(".")
+    if len(parts) not in {2, 3}:
+        return False
+    if not all(part.isdigit() for part in parts):
+        return False
+    return digit_count <= 6 and all(len(part) <= 3 for part in parts)
+
+
+def _looks_like_phone_shape(candidate: str) -> bool:
+    if candidate and not candidate[-1].isdigit():
+        return False
+    separator_count = sum(character in _PHONE_SEPARATORS for character in candidate)
+    if "+" in candidate or "(" in candidate or ")" in candidate:
+        return True
+    return separator_count >= 2
+
+
+def _iter_phone_candidates(text: str, *, min_digits: int, max_digits: int) -> tuple[str, ...]:
+    candidates: list[str] = []
+    start: int | None = None
+    for index, character in enumerate(text):
+        is_phone_character = character.isdigit() or character in _PHONE_SEPARATORS
+        if start is None:
+            if character.isdigit() or (character == "+" and index + 1 < len(text) and text[index + 1].isdigit()):
+                start = index
+            continue
+        if is_phone_character:
+            continue
+        candidate = text[start:index].strip()
+        start = None
+        if not candidate:
+            continue
+        digit_count = sum(character.isdigit() for character in candidate)
+        if digit_count < min_digits or digit_count > max_digits:
+            continue
+        if not _looks_like_phone_shape(candidate):
+            continue
+        if _looks_like_date(candidate) or _looks_like_ip(candidate) or _looks_like_small_version(candidate, digit_count):
+            continue
+        candidates.append(candidate)
+    if start is not None:
+        candidate = text[start:].strip()
+        digit_count = sum(character.isdigit() for character in candidate)
+        if digit_count >= min_digits and digit_count <= max_digits and _looks_like_phone_shape(candidate):
+            if not _looks_like_date(candidate) and not _looks_like_ip(candidate) and not _looks_like_small_version(candidate, digit_count):
+                candidates.append(candidate)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    stripped = text.strip().strip(",")
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", "\""}:
+        return stripped[1:-1]
+    return stripped
+
+
+def _looks_like_literal_value(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("f\"", "f'", "r\"", "r'", "b\"", "b'")):
+        stripped = stripped[1:]
+    if stripped[0] in {"'", "\""}:
+        return True
+    if any(character in stripped for character in "()[]{}"):
+        return False
+    if any(character.isspace() for character in stripped):
+        return False
+    return True
+
+
+def _looks_like_sensitive_literal_value(value_text: str, *, min_length: int) -> bool:
+    if not _looks_like_literal_value(value_text):
+        return False
+    unwrapped = _strip_wrapping_quotes(value_text)
+    normalized = _normalize_value(unwrapped)
+    if normalized in {"true", "false", "none", "null"}:
+        return False
+    if normalized in {"yes", "no"}:
+        return False
+    if normalized in {"0", "1"}:
+        return False
+    if normalized in {"admin", "password"}:
+        return False
+    if normalized.isidentifier():
+        return False
+    if normalized not in {"password.123"} and len(normalized) < min_length:
+        return False
+    if any(character.isspace() for character in unwrapped):
+        return False
+    return True
+
+
+def _scan_path_change(path_change: PathChange, policy: GuardPolicy, issues: list[ScanIssue]) -> None:
+    for candidate_path in filter(None, (path_change.path, path_change.previous_path)):
+        lowered_path = candidate_path.casefold()
+        file_name = Path(candidate_path).name.casefold()
+        if policy.ignores_path(candidate_path):
+            continue
+        if file_name in policy.files.blocked_exact_names:
+            issues.append(
+                ScanIssue(
+                    rule_id="blocked-path-name",
+                    message=f"blocked file name detected: {file_name}",
+                    path=path_change.path,
+                    commit=path_change.commit,
+                )
+            )
+            return
+        if any(lowered_path.endswith(suffix) for suffix in policy.files.blocked_suffixes):
+            issues.append(
+                ScanIssue(
+                    rule_id="blocked-path-suffix",
+                    message=f"blocked file suffix detected in {candidate_path}",
+                    path=path_change.path,
+                    commit=path_change.commit,
+                )
+            )
+            return
+        for term in policy.content.blocked_terms:
+            if term in lowered_path:
+                issues.append(
+                    ScanIssue(
+                        rule_id="blocked-term-path",
+                        message=f"blocked term `{term}` detected in path",
+                        path=path_change.path,
+                        commit=path_change.commit,
+                    )
+                )
+                return
+
+
+def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[ScanIssue]) -> None:
+    if policy.ignores_path(added_line.path):
+        return
+    is_test_like_path = _is_test_like_path(added_line.path)
+    lowered = added_line.text.casefold()
+
+    if not is_test_like_path and not _line_defines_blocked_terms(added_line.text):
+        for term in policy.content.blocked_terms:
+            if term in lowered:
+                issues.append(
+                    ScanIssue(
+                        rule_id="blocked-term-content",
+                        message=f"blocked term `{term}` detected in added content",
+                        path=added_line.path,
+                        line_number=added_line.line_number,
+                        excerpt=_trim_excerpt(added_line.text),
+                        commit=added_line.commit,
+                    )
+                )
+                return
+
+    stripped = added_line.text.strip()
+    if stripped.startswith("-----BEGIN "):
+        issues.append(
+            ScanIssue(
+                rule_id="pem-material",
+                message="PEM/private-key material detected in added content",
+                path=added_line.path,
+                line_number=added_line.line_number,
+                excerpt=_trim_excerpt(added_line.text),
+                commit=added_line.commit,
+            )
+        )
+        return
+
+    for fragment in _iter_token_like_fragments(added_line.text):
+        for prefix in policy.content.secret_prefixes:
+            if not fragment.startswith(prefix):
+                continue
+            if len(fragment) < len(prefix) + policy.content.secret_min_length:
+                continue
+            issues.append(
+                ScanIssue(
+                    rule_id="secret-prefix",
+                    message=f"secret-like token with prefix `{prefix}` detected",
+                    path=added_line.path,
+                    line_number=added_line.line_number,
+                    excerpt=_trim_excerpt(fragment),
+                    commit=added_line.commit,
+                )
+            )
+            return
+
+    assignment = _find_assignment(added_line.text)
+    if assignment is not None and not is_test_like_path:
+        key_text, value_text = assignment
+        normalized_key = _normalize_key(key_text)
+        normalized_value = _normalize_value(value_text)
+        if any(fragment in normalized_key for fragment in policy.content.sensitive_key_fragments):
+            if normalized_value not in policy.content.placeholder_values and not _looks_like_placeholder(normalized_value):
+                if _looks_like_sensitive_literal_value(value_text, min_length=policy.content.secret_min_length):
+                    issues.append(
+                        ScanIssue(
+                            rule_id="sensitive-assignment",
+                            message=f"sensitive assignment detected for key `{key_text}`",
+                            path=added_line.path,
+                            line_number=added_line.line_number,
+                            excerpt=_trim_excerpt(added_line.text),
+                            commit=added_line.commit,
+                        )
+                    )
+                    return
+
+    if not is_test_like_path:
+        phone_candidates = _iter_phone_candidates(
+            added_line.text,
+            min_digits=policy.phones.min_digits,
+            max_digits=policy.phones.max_digits,
+        )
+        if phone_candidates:
+            issues.append(
+                ScanIssue(
+                    rule_id="phone-number",
+                    message="phone-like number detected in added content",
+                    path=added_line.path,
+                    line_number=added_line.line_number,
+                    excerpt=_trim_excerpt(phone_candidates[0]),
+                    commit=added_line.commit,
+                )
+            )
+
+
+def scan_changes(
+    *,
+    path_changes: tuple[PathChange, ...],
+    added_lines: tuple[AddedLine, ...],
+    policy: GuardPolicy,
+) -> ScanResult:
+    """Run all configured checks over the supplied git changes."""
+
+    issues: list[ScanIssue] = []
+    for path_change in path_changes:
+        _scan_path_change(path_change, policy, issues)
+        if len(issues) >= policy.max_issues:
+            return ScanResult(issues=tuple(issues[: policy.max_issues]))
+    for added_line in added_lines:
+        _scan_added_line(added_line, policy, issues)
+        if len(issues) >= policy.max_issues:
+            return ScanResult(issues=tuple(issues[: policy.max_issues]))
+    return ScanResult(issues=tuple(issues))
