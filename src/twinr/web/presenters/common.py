@@ -1,8 +1,7 @@
 """Provide shared presenter helpers for Twinr's web control surface.
 
-This module owns navigation rows, provider-status labels, reminder row
-normalization, and the safe file-link helpers shared by multiple presenter
-modules.
+This module owns provider-status labels, reminder row normalization, and the
+safe file-link helpers shared by multiple presenter modules.
 """
 
 from __future__ import annotations
@@ -42,31 +41,6 @@ _HUE_SECRET_KEY = HUE_APPLICATION_KEY_ENV_KEY
 
 _FILE_NOT_FOUND_DETAIL = "File not found"  # AUDIT-FIX(#1,#3): Standardize fail-closed file rejection behavior.
 _UNAVAILABLE_LABEL = "Unavailable"  # AUDIT-FIX(#2): Degrade visibly instead of crashing on malformed reminder state.
-
-
-def _nav_items() -> tuple[tuple[str, str, str], ...]:
-    """Return the canonical sidebar navigation items in display order."""
-
-    return (
-        ("dashboard", "Dashboard", "/"),
-        ("ops_self_coding", "Self-Coding", "/ops/self-coding"),
-        ("ops_self_test", "Self-Test", "/ops/self-test"),
-        ("ops_devices", "Devices", "/ops/devices"),
-        ("ops_debug", "Debug View", "/ops/debug"),
-        ("ops_usage", "LLM Usage", "/ops/usage"),
-        ("ops_health", "System Health", "/ops/health"),
-        ("ops_logs", "Ops Logs", "/ops/logs"),
-        ("ops_config", "Config Checks", "/ops/config"),
-        ("ops_support", "Support", "/ops/support"),
-        ("integrations", "Integrations", "/integrations"),
-        ("voice_profile", "Voice Profile", "/voice-profile"),
-        ("automations", "Automations", "/automations"),
-        ("personality", "Personality", "/personality"),
-        ("memory", "Memory", "/memory"),
-        ("connect", "Connect", "/connect"),
-        ("settings", "Settings", "/settings"),
-        ("user", "User", "/user"),
-    )
 
 
 def _provider_status(env_values: dict[str, str]) -> tuple[tuple[str, str], ...]:

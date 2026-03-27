@@ -9,7 +9,7 @@ templates and CSS that power the operator dashboard.
 `web` owns:
 - assemble the local FastAPI app, middleware, and page/form routes
 - load config, runtime snapshot, and store handles through [`context.py`](./context.py)
-- enforce local or managed sign-in policy for the portal, including first-login password change for the permanent Pi web service over LAN
+- enforce the portal's fail-closed local-only default plus the managed-sign-in LAN mode that activates only when `TWINR_WEB_ALLOW_REMOTE=1`, including first-login password change for the permanent Pi web service
 - keep state-changing form requests fail-closed while still accepting trusted same-origin browser posts behind an HTTPS reverse proxy
 - render the ops health page with the persisted remote-memory watchdog state
 - render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
@@ -25,6 +25,7 @@ templates and CSS that power the operator dashboard.
 - render the `/integrations/email` wizard that guides mailbox-provider selection, login storage, transport review, a bounded IMAP/SMTP connection test, and final mail guardrails before the managed email integration is enabled
 - persist per-channel onboarding snapshots so web-driven channel setup can show live QR-needed, paired, reconnect, and repair-needed status without moving runtime state into templates
 - compose presenters, support helpers, templates, and static assets into operator pages
+- keep the primary shell flatter by grouping deeper technical pages behind `/advanced` while exposing calmer Home, Activity, Automations, and Settings entry points
 - persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context, including Hue-backed smart-home settings on `/integrations`
 
 `web` does **not** own:
@@ -60,6 +61,10 @@ from twinr.web import create_app
 
 app = create_app(Path(".env"))
 ```
+
+Remote browser access is opt-in. The Pi portal only accepts non-loopback
+clients when `TWINR_WEB_ALLOW_REMOTE=1`, `TWINR_WEB_REQUIRE_AUTH=1`, and
+`TWINR_WEB_ALLOWED_HOSTS` explicitly permit the requested host name.
 
 ## See also
 

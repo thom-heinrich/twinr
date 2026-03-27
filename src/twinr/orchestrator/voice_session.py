@@ -24,6 +24,7 @@ from uuid import uuid4
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample, pcm16_signal_profile
+from twinr.hardware.household_voice_identity import HouseholdVoiceProfile
 from twinr.orchestrator.remote_asr import RemoteAsrBackendAdapter
 from twinr.orchestrator.voice_activation import (
     VoiceActivationMatch,
@@ -35,6 +36,10 @@ from twinr.orchestrator.voice_forensics import (
     VoiceFrameTelemetryBucket,
     prefixed_signal_profile_details,
 )
+from twinr.orchestrator.voice_familiarity import (
+    FamiliarSpeakerWakeAssessment,
+    assess_familiar_speaker_pcm16,
+)
 from twinr.orchestrator.voice_transcript_debug_stream import VoiceTranscriptDebugStream
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 
@@ -43,6 +48,7 @@ from .voice_contracts import (
     OrchestratorVoiceBargeInInterruptEvent,
     OrchestratorVoiceFollowUpClosedEvent,
     OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceRuntimeStateEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
@@ -269,6 +275,8 @@ class EdgeOrchestratorVoiceSession:
         self._follow_up_opened_at: float | None = None
         self._voice_quiet_until_utc: str | None = None
         self._intent_context = VoiceRuntimeIntentContext()
+        self._voice_identity_profiles: tuple[HouseholdVoiceProfile, ...] = ()
+        self._voice_identity_profiles_revision: str | None = None
         self.backend = backend or _build_transcript_backend(config)
         self._wake_phrase_spotter = wake_phrase_spotter or _build_wake_phrase_spotter(
             config,
@@ -323,25 +331,43 @@ class EdgeOrchestratorVoiceSession:
         return payload
 
     def _strong_speaker_wake_bias_active(self, *, origin_state: str | None = None) -> bool:
-        """Return whether the stronger waiting-only speaker bias may be used."""
+        """Return whether strong local speaker context exists for waiting wake."""
 
         resolved_origin_state = str(origin_state or "").strip().lower() or self._state
         if resolved_origin_state != "waiting":
             return False
-        return self._intent_context.strong_speaker_bias_allowed()
+        return self._intent_context.familiar_speaker_bias_allowed()
+
+    def _familiar_speaker_wake_bias_active(
+        self,
+        assessment: FamiliarSpeakerWakeAssessment | None,
+        *,
+        origin_state: str | None = None,
+    ) -> bool:
+        """Return whether contextual alias expansion may use familiar-speaker bias."""
+
+        if not self._strong_speaker_wake_bias_active(origin_state=origin_state):
+            return False
+        return bool(assessment is not None and assessment.familiar)
 
     def _wake_phrase_spotter_for_origin_state(
         self,
         *,
         origin_state: str | None = None,
+        allow_contextual_aliases: bool = False,
     ) -> VoiceActivationPhraseMatcher:
         """Return the wake matcher appropriate for the current bias context."""
 
-        if self._strong_speaker_wake_bias_active(origin_state=origin_state):
+        if allow_contextual_aliases:
             return self._strong_bias_wake_phrase_spotter
         return self._wake_phrase_spotter
 
-    def _wake_bias_details(self, *, origin_state: str | None = None) -> dict[str, object]:
+    def _wake_bias_details(
+        self,
+        *,
+        origin_state: str | None = None,
+        familiar_speaker_assessment: FamiliarSpeakerWakeAssessment | None = None,
+    ) -> dict[str, object]:
         """Return trace/debug details for the current wake bias tier."""
 
         return {
@@ -349,11 +375,17 @@ class EdgeOrchestratorVoiceSession:
             "wake_strong_speaker_bias_active": self._strong_speaker_wake_bias_active(
                 origin_state=origin_state
             ),
-            "wake_alias_expansion_active": self._strong_speaker_wake_bias_active(
-                origin_state=origin_state
+            "wake_alias_expansion_active": self._familiar_speaker_wake_bias_active(
+                familiar_speaker_assessment,
+                origin_state=origin_state,
             ),
             "wake_speaker_associated": self._intent_context.speaker_associated,
             "wake_speaker_association_confidence": self._intent_context.speaker_association_confidence,
+            **(
+                {}
+                if familiar_speaker_assessment is None
+                else familiar_speaker_assessment.trace_details()
+            ),
         }
 
     def _trace_event(
@@ -482,6 +514,33 @@ class EdgeOrchestratorVoiceSession:
             details=resolved_details,
         )
 
+    def _assess_familiar_speaker_capture(
+        self,
+        capture: AmbientAudioCaptureWindow,
+        *,
+        origin_state: str | None,
+    ) -> FamiliarSpeakerWakeAssessment | None:
+        """Assess whether this wake candidate sounds like an enrolled speaker."""
+
+        resolved_origin_state = str(origin_state or "").strip().lower() or self._state
+        if resolved_origin_state != "waiting":
+            return None
+        if not self._voice_identity_profiles:
+            return FamiliarSpeakerWakeAssessment(
+                assessment=None,
+                familiar=False,
+                revision=self._voice_identity_profiles_revision,
+                profile_count=0,
+            )
+        return assess_familiar_speaker_pcm16(
+            self.config,
+            pcm_bytes=bytes(capture.pcm_bytes or b""),
+            sample_rate=capture.sample_rate,
+            channels=capture.channels,
+            profiles=self._voice_identity_profiles,
+            revision=self._voice_identity_profiles_revision,
+        )
+
     def _detect_wake_capture(
         self,
         *,
@@ -493,7 +552,17 @@ class EdgeOrchestratorVoiceSession:
 
         origin_state_value = None if details is None else details.get("origin_state")
         origin_state = str(origin_state_value).strip() or None
-        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(origin_state=origin_state)
+        familiar_speaker_assessment = self._assess_familiar_speaker_capture(
+            capture,
+            origin_state=origin_state,
+        )
+        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(
+            origin_state=origin_state,
+            allow_contextual_aliases=self._familiar_speaker_wake_bias_active(
+                familiar_speaker_assessment,
+                origin_state=origin_state,
+            ),
+        )
         try:
             with self._backend_request_context(
                 stage=stage,
@@ -510,6 +579,12 @@ class EdgeOrchestratorVoiceSession:
                 resolved_details["error_message"] = error_message[:240]
             if details:
                 resolved_details.update(details)
+            resolved_details.update(
+                self._wake_bias_details(
+                    origin_state=origin_state,
+                    familiar_speaker_assessment=familiar_speaker_assessment,
+                )
+            )
             self._record_transcript_debug(
                 stage=stage,
                 outcome="backend_error",
@@ -599,7 +674,17 @@ class EdgeOrchestratorVoiceSession:
 
         origin_state_value = None if details is None else details.get("origin_state")
         origin_state = str(origin_state_value).strip() or None
-        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(origin_state=origin_state)
+        familiar_speaker_assessment = self._assess_familiar_speaker_capture(
+            capture,
+            origin_state=origin_state,
+        )
+        wake_phrase_spotter = self._wake_phrase_spotter_for_origin_state(
+            origin_state=origin_state,
+            allow_contextual_aliases=self._familiar_speaker_wake_bias_active(
+                familiar_speaker_assessment,
+                origin_state=origin_state,
+            ),
+        )
         match_transcript = getattr(wake_phrase_spotter, "match_transcript", None)
         if callable(match_transcript):
             try:
@@ -613,6 +698,12 @@ class EdgeOrchestratorVoiceSession:
                     resolved_details["error_message"] = error_message[:240]
                 if details:
                     resolved_details.update(details)
+                resolved_details.update(
+                    self._wake_bias_details(
+                        origin_state=origin_state,
+                        familiar_speaker_assessment=familiar_speaker_assessment,
+                    )
+                )
                 self._record_transcript_debug(
                     stage=stage,
                     outcome="matcher_error",
@@ -653,6 +744,8 @@ class EdgeOrchestratorVoiceSession:
         self._follow_up_opened_at = None
         self._voice_quiet_until_utc = None
         self._last_waiting_visible_at = None
+        self._voice_identity_profiles = ()
+        self._voice_identity_profiles_revision = None
 
     def handle_hello(self, request: OrchestratorVoiceHelloRequest) -> list[dict[str, Any]]:
         """Accept one new edge voice session and validate stream metadata."""
@@ -724,6 +817,41 @@ class EdgeOrchestratorVoiceSession:
             trace_event_name="voice_runtime_state_received",
             trace_kind="mutation",
         )
+
+    def handle_identity_profiles(
+        self,
+        event: OrchestratorVoiceIdentityProfilesEvent,
+    ) -> list[dict[str, Any]]:
+        """Update the read-only household voice profiles used for wake bias."""
+
+        profiles: list[HouseholdVoiceProfile] = []
+        for profile_event in event.profiles:
+            profile = HouseholdVoiceProfile.from_dict(
+                {
+                    "user_id": profile_event.user_id,
+                    "display_name": profile_event.display_name,
+                    "primary_user": profile_event.primary_user,
+                    "embedding": list(profile_event.embedding),
+                    "sample_count": profile_event.sample_count,
+                    "average_duration_ms": profile_event.average_duration_ms,
+                    "updated_at": profile_event.updated_at,
+                }
+            )
+            if profile is not None:
+                profiles.append(profile)
+        self._voice_identity_profiles = tuple(
+            sorted(profiles, key=lambda item: (not item.primary_user, item.user_id))
+        )
+        self._voice_identity_profiles_revision = str(event.revision or "").strip() or None
+        self._trace_event(
+            "voice_identity_profiles_received",
+            kind="mutation",
+            details={
+                "voice_identity_profiles_revision": self._voice_identity_profiles_revision,
+                "voice_identity_profiles_count": len(self._voice_identity_profiles),
+            },
+        )
+        return []
 
     def _apply_runtime_state(
         self,
@@ -1068,11 +1196,6 @@ class EdgeOrchestratorVoiceSession:
                 self.history_ms,
                 window_ms + self.intent_stage1_window_bonus_ms,
             )
-        if self._strong_speaker_wake_bias_active(origin_state="waiting"):
-            window_ms = min(
-                self.history_ms,
-                window_ms + self._STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS,
-            )
         return window_ms
 
     def _effective_remote_asr_min_activation_duration_ms(self) -> int:
@@ -1081,8 +1204,6 @@ class EdgeOrchestratorVoiceSession:
         required_ms = self.remote_asr_min_wake_duration_ms
         if self._intent_audio_bias_active() or self._waiting_visibility_grace_active():
             required_ms -= self.intent_min_wake_duration_relief_ms
-        if self._strong_speaker_wake_bias_active(origin_state="waiting"):
-            required_ms -= self._STRONG_SPEAKER_MIN_WAKE_DURATION_RELIEF_MS
         return max(self.chunk_ms, required_ms)
 
     def _effective_follow_up_timeout_s(self) -> float:
@@ -1294,6 +1415,11 @@ class EdgeOrchestratorVoiceSession:
                 },
             )
             return None
+        familiar_speaker_assessment = (
+            self._assess_familiar_speaker_capture(capture, origin_state=pending.origin_state)
+            if pending.origin_state == "waiting"
+            else None
+        )
         match_details = {
             "origin_state": pending.origin_state,
             **self._pending_utterance_details(pending),
@@ -1333,7 +1459,10 @@ class EdgeOrchestratorVoiceSession:
             details={
                 "origin_state": pending.origin_state,
                 **self._pending_utterance_details(pending),
-                **self._wake_bias_details(origin_state=pending.origin_state),
+                **self._wake_bias_details(
+                    origin_state=pending.origin_state,
+                    familiar_speaker_assessment=familiar_speaker_assessment,
+                ),
             },
         )
         if match.detected:
@@ -1348,6 +1477,10 @@ class EdgeOrchestratorVoiceSession:
                     "matched_phrase": match.matched_phrase,
                     "remaining_text_chars": len(str(match.remaining_text or "").strip()),
                     "transcript_chars": len(str(match.transcript or "").strip()),
+                    **self._wake_bias_details(
+                        origin_state=pending.origin_state,
+                        familiar_speaker_assessment=familiar_speaker_assessment,
+                    ),
                 },
             )
             return OrchestratorVoiceWakeConfirmedEvent(
@@ -1472,7 +1605,11 @@ class EdgeOrchestratorVoiceSession:
             frames = self._recent_frames_window(self.history_ms)
         return self._capture_window_from_frames(frames)
 
-    def _recent_remote_asr_stage1_capture(self) -> AmbientAudioCaptureWindow:
+    def _recent_remote_asr_stage1_capture(
+        self,
+        *,
+        window_ms: int | None = None,
+    ) -> AmbientAudioCaptureWindow:
         """Prefer the start of the latest active speech burst over the newest tail.
 
         Transcript-first wake scans are intentionally short so the server-side
@@ -1484,19 +1621,24 @@ class EdgeOrchestratorVoiceSession:
         so delayed scans still see the wake prefix.
         """
 
+        target_window_ms = (
+            self._effective_remote_asr_stage1_window_ms()
+            if window_ms is None
+            else max(self.chunk_ms, min(self.history_ms, int(window_ms)))
+        )
         recent_frames = self._recent_frames_window(self.history_ms)
         burst_frames = self._latest_active_speech_burst_frames(recent_frames)
         if burst_frames:
             return self._capture_window_from_frames(
                 self._leading_frames_window(
                     burst_frames,
-                    duration_ms=self._effective_remote_asr_stage1_window_ms(),
+                    duration_ms=target_window_ms,
                 )
             )
         return self._capture_window_from_frames(
             self._leading_frames_window(
                 recent_frames,
-                duration_ms=self._effective_remote_asr_stage1_window_ms(),
+                duration_ms=target_window_ms,
             )
         )
 
@@ -1680,9 +1822,30 @@ class EdgeOrchestratorVoiceSession:
                     guardrails=["wake_candidate_min_active_ratio"],
                 )
                 return None
+            familiar_speaker_assessment = self._assess_familiar_speaker_capture(
+                capture,
+                origin_state="waiting",
+            )
+            if self._familiar_speaker_wake_bias_active(
+                familiar_speaker_assessment,
+                origin_state="waiting",
+            ):
+                expanded_capture = self._recent_remote_asr_stage1_capture(
+                    window_ms=(
+                        self._effective_remote_asr_stage1_window_ms()
+                        + self._STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS
+                    )
+                )
+                if expanded_capture.sample.duration_ms > capture.sample.duration_ms:
+                    capture = expanded_capture
+                    familiar_speaker_assessment = self._assess_familiar_speaker_capture(
+                        capture,
+                        origin_state="waiting",
+                    )
             match = self._detect_wake_capture(
                 capture=capture,
                 stage="activation_stage1",
+                details={"origin_state": "waiting"},
             )
             if match is None:
                 return None
@@ -1696,6 +1859,10 @@ class EdgeOrchestratorVoiceSession:
                     detector_label=match.detector_label,
                     score=match.score,
                     capture=capture,
+                    details=self._wake_bias_details(
+                        origin_state="waiting",
+                        familiar_speaker_assessment=familiar_speaker_assessment,
+                    ),
                 )
                 self._trace_event(
                     "voice_remote_asr_stage1_no_match",
@@ -1703,6 +1870,10 @@ class EdgeOrchestratorVoiceSession:
                     details={
                         "active_ratio": round(float(capture.sample.active_ratio), 4),
                         "transcript_chars": len(str(match.transcript or "").strip()),
+                        **self._wake_bias_details(
+                            origin_state="waiting",
+                            familiar_speaker_assessment=familiar_speaker_assessment,
+                        ),
                     },
                 )
                 return None
@@ -1719,6 +1890,10 @@ class EdgeOrchestratorVoiceSession:
                     details={
                         "reason": "wake_candidate_min_transcript_chars",
                         "required_transcript_chars": self.wake_candidate_min_transcript_chars,
+                        **self._wake_bias_details(
+                            origin_state="waiting",
+                            familiar_speaker_assessment=familiar_speaker_assessment,
+                        ),
                     },
                 )
                 self._trace_decision(
@@ -1746,6 +1921,10 @@ class EdgeOrchestratorVoiceSession:
                 detector_label=match.detector_label,
                 score=match.score,
                 capture=capture,
+                details=self._wake_bias_details(
+                    origin_state="waiting",
+                    familiar_speaker_assessment=familiar_speaker_assessment,
+                ),
             )
             self._trace_event(
                 "voice_remote_asr_stage1_match",
@@ -1754,6 +1933,10 @@ class EdgeOrchestratorVoiceSession:
                     "matched_phrase": match.matched_phrase,
                     "transcript_chars": len(str(match.transcript or "").strip()),
                     "remaining_text_chars": len(str(match.remaining_text or "").strip()),
+                    **self._wake_bias_details(
+                        origin_state="waiting",
+                        familiar_speaker_assessment=familiar_speaker_assessment,
+                    ),
                 },
             )
             return match

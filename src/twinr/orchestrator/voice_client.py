@@ -21,6 +21,7 @@ from websockets.sync.client import connect as websocket_connect
 from .voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceRuntimeStateEvent,
     VoiceServerEvent,
     decode_voice_server_event,
@@ -85,7 +86,7 @@ class OrchestratorVoiceWebSocketClient:
         self.ping_timeout_seconds = ping_timeout_seconds
         self.max_message_bytes = int(max_message_bytes)
         self.max_queue = int(max_queue)
-        self._socket = None
+        self._socket: Any | None = None
         self._socket_lock = Lock()
         self._send_lock = Lock()
         self._receiver_stop = Event()
@@ -102,17 +103,17 @@ class OrchestratorVoiceWebSocketClient:
             headers = None
             if self.shared_secret is not None:
                 headers = {"x-twinr-secret": self.shared_secret}
-            connector_kwargs = {
-                "additional_headers": headers,
-                "open_timeout": self.open_timeout_seconds,
-                "close_timeout": self.close_timeout_seconds,
-                "ping_interval": self.ping_interval_seconds,
-                "ping_timeout": self.ping_timeout_seconds,
-                "max_size": self.max_message_bytes,
-                "max_queue": self.max_queue,
-            }
             try:
-                socket = self._connector(self.url, **connector_kwargs)
+                socket = self._connector(
+                    self.url,
+                    additional_headers=headers,
+                    open_timeout=self.open_timeout_seconds,
+                    close_timeout=self.close_timeout_seconds,
+                    ping_interval=self.ping_interval_seconds,
+                    ping_timeout=self.ping_timeout_seconds,
+                    max_size=self.max_message_bytes,
+                    max_queue=self.max_queue,
+                )
                 entered_socket = socket.__enter__()
                 self._socket = entered_socket if entered_socket is not None else socket
             except (InvalidURI, InvalidHandshake, OSError) as exc:
@@ -166,6 +167,11 @@ class OrchestratorVoiceWebSocketClient:
         """Send one runtime-state update to the server."""
 
         self._send_payload(event.to_payload(), context="voice runtime state")
+
+    def send_identity_profiles(self, event: OrchestratorVoiceIdentityProfilesEvent) -> None:
+        """Send the current read-only household voice profile snapshot."""
+
+        self._send_payload(event.to_payload(), context="voice identity profiles")
 
     def _send_payload(self, payload: dict[str, Any], *, context: str) -> None:
         socket = self._require_socket()

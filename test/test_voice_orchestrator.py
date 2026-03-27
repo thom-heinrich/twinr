@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from threading import Lock, Thread
 import time
+from typing import Any
 from unittest import mock
 import sys
 import unittest
@@ -22,9 +23,9 @@ class _FakeVoiceClient:
     def __init__(self) -> None:
         self.open_calls = 0
         self.close_calls = 0
-        self.hello_requests = []
-        self.runtime_states = []
-        self.audio_frames = []
+        self.hello_requests: list[Any] = []
+        self.runtime_states: list[Any] = []
+        self.audio_frames: list[Any] = []
         self.fail_audio_sends = 0
         self.fail_open_calls = 0
 
@@ -94,11 +95,26 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         orchestrator._client = fake_client
         return orchestrator, fake_client, lines, committed
 
-    def test_generic_voice_device_alias_resolves_to_specific_input_device(self) -> None:
+    def test_explicit_voice_device_alias_is_respected(self) -> None:
         orchestrator = EdgeVoiceOrchestrator(
             TwinrConfig(
                 voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
                 voice_orchestrator_audio_device="default",
+                audio_input_device="sysdefault:CARD=Array",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        self.assertEqual(orchestrator._device, "default")
+
+    def test_missing_voice_device_still_falls_back_to_specific_input_device(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="",
                 audio_input_device="sysdefault:CARD=Array",
             ),
             emit=lambda _msg: None,
@@ -349,14 +365,14 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         failed_process = _FakeCaptureProcess(returncode=1)
         recovered_process = _FakeCaptureProcess()
         sent_frames: list[bytes] = []
+        select_call_count = 0
 
         def fake_select(read_fds, _write_fds, _error_fds, _timeout):
-            fake_select.calls += 1
-            if fake_select.calls == 1:
+            nonlocal select_call_count
+            select_call_count += 1
+            if select_call_count == 1:
                 return [], [], []
             return [read_fds[0]], [], []
-
-        fake_select.calls = 0
 
         def fake_send_frame(frame: bytes) -> None:
             sent_frames.append(frame)

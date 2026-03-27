@@ -52,7 +52,14 @@ Out of scope:
 - `gesture_wakeup_lane.py` — dedicated visual wakeup stabilizer for one configured fine-hand symbol, separate from emoji acknowledgement and workflow entry orchestration
 - `gesture_wakeup_priority.py` — interaction-priority guard that lets button/voice outrank visual wakeups before a gesture can steal shared audio capture
 - `gesture_debug_stream.py` — bounded continuous JSONL debug stream for HDMI gesture refresh ticks, including raw observations, ack decisions, publish outcomes, and stage timings
-- `service.py` — runtime monitor orchestration plus the opt-in end-to-end gesture-refresh workflow run-pack binding used for hard Pi repro forensics
+- `service.py` — compatibility shim that preserves the historic import/helper surface while delegating to `service_impl/`
+- `service_impl/coordinator_core.py` — dependency wiring, trigger review, and main proactive tick orchestration extracted from the legacy service monolith
+- `service_impl/coordinator_display.py` — dedicated HDMI attention and gesture refresh workflows extracted from the legacy service monolith
+- `service_impl/coordinator_observation.py` — stable observation-mixin facade that composes the focused observation helper modules behind the historic path
+- `service_impl/coordinator_observation_display.py` — automation-dispatch, HDMI display, gesture, and camera-surface helper bridges extracted from the legacy observation mixin
+- `service_impl/coordinator_observation_facts.py` — automation fact payload assembly and rising-edge sensor-event derivation extracted from the legacy observation mixin
+- `service_impl/monitor.py` — bounded background worker lifecycle wrapper around the coordinator
+- `service_impl/builder.py` — default monitor assembly path that keeps wrapper-level monkeypatch points stable
 - `audio_perception.py` — runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries for operator checks and recovery smokes
 - `pir_open_gate.py` — bounded startup gate that retries only exact transient PIR GPIO busy overlaps during runtime handover
 - `respeaker_capture_gate.py` — bounded startup gate that requires consecutive readable-frame probes before ReSpeaker capture is considered stable
@@ -60,7 +67,7 @@ Out of scope:
 - `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
 - `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
 - `presence.py` — source of truth for voice-activation presence-session arming
-- `service.py` — monitor orchestration, degraded-mode handling, lifecycle, and shared attention-surface fanout to HDMI plus optional body-follow servo
+- `service.py` — thin compatibility wrapper only; real runtime logic belongs in `service_impl/` and the focused helper modules
 - `__init__.py` — package export surface; treat changes as API-impacting
 - `component.yaml` — structured metadata, callers, and tests
 
@@ -141,6 +148,7 @@ Out of scope:
 - When hard Pi gesture repros still are not explained by `gesture_debug_stream.py`, `service.py` may bind an opt-in end-to-end workflow run-pack around the gesture refresh, but that path must stay bounded, redacted by default, and debugging-only.
 - `service_attention_helpers.py` owns HDMI attention-follow live-context export, changed-only follow traces, servo decision logging, and per-tick attention debug packaging. `service.py` should orchestrate those helpers rather than regrowing attention logic inline.
 - `service_gesture_helpers.py` owns HDMI gesture acknowledgement publish, accepted gesture wakeup dispatch, and gesture debug/trace packaging. `service.py` should remain the lifecycle/tick coordinator, not the gesture-policy implementation file.
+- `service_impl/coordinator_core.py`, `service_impl/coordinator_display.py`, `service_impl/coordinator_observation.py`, `service_impl/coordinator_observation_display.py`, and `service_impl/coordinator_observation_facts.py` are the approved homes for additional proactive-service runtime logic; keep `service.py` as a compatibility shim and keep `service_impl/monitor.py` orchestration-only.
 - The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
 - The fast HDMI attention-refresh path may stay active while the main runtime is in `error`, but only for local face-cue following; it must not be used to re-enable agent turns, remote-memory work, or other degraded runtime behavior.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.

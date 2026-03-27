@@ -172,10 +172,23 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Twinr", response.text)
-        self.assertIn("Dashboard", response.text)
+        self.assertIn("Home", response.text)
+        self.assertIn("Advanced", response.text)
         self.assertIn("Reminders", response.text)
-        self.assertIn("****1234", response.text)
-        self.assertIn("Status and failures", response.text)
+        self.assertIn("Twinr now", response.text)
+        self.assertIn("Needs attention", response.text)
+
+    def test_advanced_page_groups_operator_tools(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/advanced")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Advanced", response.text)
+        self.assertIn("Health and recovery", response.text)
+        self.assertIn("Operator tools", response.text)
+        self.assertIn("/ops/self-coding", response.text)
+        self.assertIn("/ops/health", response.text)
 
     def test_managed_web_auth_redirects_unauthenticated_requests_to_login(self) -> None:
         client, env_path = self.make_client(
@@ -300,7 +313,7 @@ class WebAppTests(unittest.TestCase):
         dashboard = client.get("/")
 
         self.assertEqual(dashboard.status_code, 200)
-        self.assertIn("Dashboard", dashboard.text)
+        self.assertIn("Home", dashboard.text)
 
     def test_whatsapp_runtime_step_accepts_https_proxy_same_origin_headers(self) -> None:
         client, env_path = self.make_client(
@@ -709,6 +722,42 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("run_self_coding_stale", response.text)
         self.assertIn("Clean up stale compile", response.text)
         self.assertIn("Clean up stale run", response.text)
+
+    def test_ops_self_coding_page_degrades_unreadable_health_file(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        activation = store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=4,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_self_coding_health_perm",
+                artifact_id="artifact_self_coding_health_perm",
+                metadata={"artifact_kind": "skill_package"},
+            )
+        )
+        health_path = store._health_path(activation.skill_id, activation.version)
+        store.save_skill_health(
+            SkillHealthRecord(
+                skill_id=activation.skill_id,
+                version=activation.version,
+                status="healthy",
+                trigger_count=3,
+                delivered_count=1,
+                error_count=0,
+            )
+        )
+        original_mode = os.stat(health_path).st_mode & 0o777
+        os.chmod(health_path, 0)
+        try:
+            response = client.get("/ops/self-coding")
+        finally:
+            os.chmod(health_path, original_mode)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Self-coding operations", response.text)
+        self.assertIn("Morning Briefing", response.text)
 
     def test_ops_self_coding_cleanup_watchdog_rows_updates_store(self) -> None:
         client, env_path = self.make_client()
@@ -1730,6 +1779,9 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/settings")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("Open a setup area", response.text)
+        self.assertIn("/voice-profile", response.text)
+        self.assertIn("/integrations", response.text)
         self.assertIn("Models and voices", response.text)
         self.assertIn("Search", response.text)
         self.assertIn("Camera and vision", response.text)

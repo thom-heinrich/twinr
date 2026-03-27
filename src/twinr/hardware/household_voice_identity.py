@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -84,6 +85,10 @@ def _resolve_store_path(config: TwinrConfig) -> Path:
 
 
 def _coerce_positive_int(value: object | None, *, default: int) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -91,7 +96,23 @@ def _coerce_positive_int(value: object | None, *, default: int) -> int:
     return max(1, parsed)
 
 
+def _coerce_non_negative_int(value: object | None, *, default: int) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
 def _coerce_ratio(value: object | None, *, default: float) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -136,7 +157,10 @@ class HouseholdVoiceProfile:
         if not all(math.isfinite(value) for value in embedding):
             return None
         sample_count = _coerce_positive_int(payload.get("sample_count"), default=1)
-        average_duration_ms = max(0, int(payload.get("average_duration_ms", 0) or 0))
+        average_duration_ms = _coerce_non_negative_int(
+            payload.get("average_duration_ms"),
+            default=0,
+        )
         return cls(
             user_id=_normalize_user_id(payload.get("user_id")),
             display_name=_normalize_display_name(payload.get("display_name")),
@@ -186,6 +210,177 @@ class _VoiceCandidate:
     display_name: str | None
     primary_user: bool
     confidence: float
+
+
+def household_voice_profiles_revision(
+    profiles: tuple[HouseholdVoiceProfile, ...],
+) -> str:
+    """Return one stable revision token for a profile snapshot."""
+
+    digest = hashlib.sha256()
+    for profile in sorted(profiles, key=lambda item: item.user_id):
+        encoded = json.dumps(
+            profile.to_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        digest.update(encoded)
+    return digest.hexdigest()[:16]
+
+
+def assess_household_voice_embedding(
+    embedding: tuple[float, ...],
+    *,
+    checked_at: str | None,
+    profiles: tuple[HouseholdVoiceProfile, ...],
+    primary_user_id: str,
+    likely_threshold: float,
+    uncertain_threshold: float,
+    identity_margin: float,
+) -> HouseholdVoiceAssessment:
+    """Score one embedding against the enrolled household voices."""
+
+    if not profiles:
+        return HouseholdVoiceAssessment(
+            status="not_enrolled",
+            label="Not enrolled",
+            detail="No enrolled household voice identity is available on this device yet.",
+        )
+    normalized_primary_user_id = _normalize_user_id(primary_user_id)
+    normalized_likely_threshold = _coerce_ratio(likely_threshold, default=0.72)
+    normalized_uncertain_threshold = _coerce_ratio(uncertain_threshold, default=0.55)
+    if normalized_likely_threshold < normalized_uncertain_threshold:
+        normalized_likely_threshold, normalized_uncertain_threshold = (
+            normalized_uncertain_threshold,
+            normalized_likely_threshold,
+        )
+    normalized_identity_margin = _coerce_ratio(identity_margin, default=_DEFAULT_IDENTITY_MARGIN)
+    resolved_checked_at = _normalize_text(checked_at).strip() or _utc_iso()
+
+    candidates: list[_VoiceCandidate] = []
+    for profile in profiles:
+        try:
+            confidence = voice_embedding_confidence(profile.embedding, embedding)
+        except ValueError:
+            continue
+        candidates.append(
+            _VoiceCandidate(
+                user_id=profile.user_id,
+                display_name=profile.display_name,
+                primary_user=(
+                    profile.primary_user or profile.user_id == normalized_primary_user_id
+                ),
+                confidence=confidence,
+            )
+        )
+    if not candidates:
+        return HouseholdVoiceAssessment(
+            status="invalid_sample",
+            label="Could not verify",
+            detail="The current voice sample could not be compared to the enrolled household profiles.",
+            checked_at=resolved_checked_at,
+        )
+    candidates.sort(key=lambda item: item.confidence, reverse=True)
+    best = candidates[0]
+    second = None if len(candidates) < 2 else candidates[1]
+    ambiguous = (
+        second is not None
+        and best.confidence >= normalized_uncertain_threshold
+        and second.confidence >= normalized_uncertain_threshold
+        and (best.confidence - second.confidence) < normalized_identity_margin
+    )
+    if ambiguous:
+        return HouseholdVoiceAssessment(
+            status="ambiguous_match",
+            label="Ambiguous household match",
+            detail="The current voice could match more than one enrolled household member.",
+            confidence=best.confidence,
+            checked_at=resolved_checked_at,
+            matched_user_id=best.user_id,
+            matched_user_display_name=best.display_name,
+            candidate_user_count=len(candidates),
+        )
+    if best.confidence >= normalized_likely_threshold:
+        return HouseholdVoiceAssessment(
+            status="likely_user" if best.primary_user else "known_other_user",
+            label="Enrolled household user",
+            detail=(
+                "This voice sounds like the enrolled main user."
+                if best.primary_user
+                else "This voice sounds like another enrolled household user."
+            ),
+            confidence=best.confidence,
+            checked_at=resolved_checked_at,
+            matched_user_id=best.user_id,
+            matched_user_display_name=best.display_name,
+            candidate_user_count=len(candidates),
+        )
+    if best.confidence >= normalized_uncertain_threshold:
+        return HouseholdVoiceAssessment(
+            status="uncertain_match",
+            label="Uncertain household match",
+            detail="This voice may belong to an enrolled household member, but the match is still uncertain.",
+            confidence=best.confidence,
+            checked_at=resolved_checked_at,
+            matched_user_id=best.user_id,
+            matched_user_display_name=best.display_name,
+            candidate_user_count=len(candidates),
+        )
+    return HouseholdVoiceAssessment(
+        status="unknown_voice",
+        label="Unknown voice",
+        detail="This voice does not match an enrolled household voice identity confidently.",
+        confidence=best.confidence,
+        checked_at=resolved_checked_at,
+        candidate_user_count=len(candidates),
+    )
+
+
+def assess_household_voice_pcm16(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    checked_at: str | None,
+    profiles: tuple[HouseholdVoiceProfile, ...],
+    primary_user_id: str,
+    likely_threshold: float,
+    uncertain_threshold: float,
+    identity_margin: float,
+    min_sample_ms: int,
+) -> HouseholdVoiceAssessment:
+    """Extract one embedding from PCM16 audio and score it against the household."""
+
+    if not profiles:
+        return HouseholdVoiceAssessment(
+            status="not_enrolled",
+            label="Not enrolled",
+            detail="No enrolled household voice identity is available on this device yet.",
+        )
+    try:
+        embedding = extract_voice_embedding_from_pcm16(
+            pcm_bytes,
+            sample_rate=sample_rate,
+            channels=channels,
+            min_sample_ms=min_sample_ms,
+        )
+    except ValueError as exc:
+        return HouseholdVoiceAssessment(
+            status="invalid_sample",
+            label="Could not verify",
+            detail=f"{str(exc).strip()} Please ask the speaker to try again in a quiet room.",
+            checked_at=_normalize_text(checked_at).strip() or _utc_iso(),
+        )
+    return assess_household_voice_embedding(
+        embedding.vector,
+        checked_at=checked_at,
+        profiles=profiles,
+        primary_user_id=primary_user_id,
+        likely_threshold=likely_threshold,
+        uncertain_threshold=uncertain_threshold,
+        identity_margin=identity_margin,
+    )
 
 
 class HouseholdVoiceIdentityStore:
@@ -443,6 +638,16 @@ class HouseholdVoiceIdentityMonitor:
             for profile in self.store.list_profiles()
         )
 
+    def voice_profiles(self) -> tuple[HouseholdVoiceProfile, ...]:
+        """Return the current enrolled profile snapshot."""
+
+        return self.store.list_profiles()
+
+    def profile_revision(self) -> str:
+        """Return one stable revision token for the current profile snapshot."""
+
+        return household_voice_profiles_revision(self.voice_profiles())
+
     def summary(self, user_id: str) -> HouseholdVoiceSummary:
         return self.store.summary(user_id)
 
@@ -521,28 +726,18 @@ class HouseholdVoiceIdentityMonitor:
         sample_rate: int,
         channels: int,
     ) -> HouseholdVoiceAssessment:
-        profiles = self.store.list_profiles()
-        if not profiles:
-            return HouseholdVoiceAssessment(
-                status="not_enrolled",
-                label="Not enrolled",
-                detail="No enrolled household voice identity is available on this device yet.",
-            )
-        try:
-            embedding = extract_voice_embedding_from_pcm16(
-                pcm_bytes,
-                sample_rate=sample_rate,
-                channels=channels,
-                min_sample_ms=self.min_sample_ms,
-            )
-        except ValueError as exc:
-            return HouseholdVoiceAssessment(
-                status="invalid_sample",
-                label="Could not verify",
-                detail=f"{str(exc).strip()} Please ask the speaker to try again in a quiet room.",
-                checked_at=_utc_iso(),
-            )
-        return self._assessment_for_embedding(embedding.vector, checked_at=_utc_iso(), profiles=profiles)
+        return assess_household_voice_pcm16(
+            pcm_bytes,
+            sample_rate=sample_rate,
+            channels=channels,
+            checked_at=_utc_iso(),
+            profiles=self.voice_profiles(),
+            primary_user_id=self.primary_user_id,
+            likely_threshold=self.likely_threshold,
+            uncertain_threshold=self.uncertain_threshold,
+            identity_margin=self.identity_margin,
+            min_sample_ms=self.min_sample_ms,
+        )
 
     def assess_wav_bytes(self, wav_bytes: bytes) -> HouseholdVoiceAssessment:
         profiles = self.store.list_profiles()
@@ -573,74 +768,21 @@ class HouseholdVoiceIdentityMonitor:
         checked_at: str,
         profiles: tuple[HouseholdVoiceProfile, ...],
     ) -> HouseholdVoiceAssessment:
-        candidates: list[_VoiceCandidate] = []
-        for profile in profiles:
-            confidence = voice_embedding_confidence(profile.embedding, embedding)
-            candidates.append(
-                _VoiceCandidate(
-                    user_id=profile.user_id,
-                    display_name=profile.display_name,
-                    primary_user=profile.primary_user or profile.user_id == self.primary_user_id,
-                    confidence=confidence,
-                )
-            )
-        candidates.sort(key=lambda item: item.confidence, reverse=True)
-        best = candidates[0]
-        second = None if len(candidates) < 2 else candidates[1]
-        ambiguous = (
-            second is not None
-            and best.confidence >= self.uncertain_threshold
-            and second.confidence >= self.uncertain_threshold
-            and (best.confidence - second.confidence) < self.identity_margin
-        )
-        if ambiguous:
-            return HouseholdVoiceAssessment(
-                status="ambiguous_match",
-                label="Ambiguous household match",
-                detail="The current voice could match more than one enrolled household member.",
-                confidence=best.confidence,
-                checked_at=checked_at,
-                matched_user_id=best.user_id,
-                matched_user_display_name=best.display_name,
-                candidate_user_count=len(candidates),
-            )
-        if best.confidence >= self.likely_threshold:
-            return HouseholdVoiceAssessment(
-                status="likely_user" if best.primary_user else "known_other_user",
-                label="Enrolled household user",
-                detail=(
-                    "This voice sounds like the enrolled main user."
-                    if best.primary_user
-                    else "This voice sounds like another enrolled household user."
-                ),
-                confidence=best.confidence,
-                checked_at=checked_at,
-                matched_user_id=best.user_id,
-                matched_user_display_name=best.display_name,
-                candidate_user_count=len(candidates),
-            )
-        if best.confidence >= self.uncertain_threshold:
-            return HouseholdVoiceAssessment(
-                status="uncertain_match",
-                label="Uncertain household match",
-                detail="This voice may belong to an enrolled household member, but the match is still uncertain.",
-                confidence=best.confidence,
-                checked_at=checked_at,
-                matched_user_id=best.user_id,
-                matched_user_display_name=best.display_name,
-                candidate_user_count=len(candidates),
-            )
-        return HouseholdVoiceAssessment(
-            status="unknown_voice",
-            label="Unknown voice",
-            detail="This voice does not match an enrolled household voice identity confidently.",
-            confidence=best.confidence,
+        return assess_household_voice_embedding(
+            embedding,
             checked_at=checked_at,
-            candidate_user_count=len(candidates),
+            profiles=profiles,
+            primary_user_id=self.primary_user_id,
+            likely_threshold=self.likely_threshold,
+            uncertain_threshold=self.uncertain_threshold,
+            identity_margin=self.identity_margin,
         )
 
 
 __all__ = [
+    "assess_household_voice_embedding",
+    "assess_household_voice_pcm16",
+    "household_voice_profiles_revision",
     "HouseholdVoiceAssessment",
     "HouseholdVoiceIdentityMonitor",
     "HouseholdVoiceIdentityStore",

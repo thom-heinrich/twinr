@@ -1,7 +1,9 @@
+from array import array
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
@@ -19,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.voice_profile import extract_voice_embedding_from_pcm16
 from twinr.orchestrator.acks import ack_text_for_id
 from twinr.orchestrator.client import OrchestratorWebSocketClient
 from twinr.orchestrator.contracts import OrchestratorToolResponse, OrchestratorTurnCompleteEvent
@@ -39,6 +42,8 @@ from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceIdentityProfile,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceRuntimeStateEvent,
 )
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
@@ -145,6 +150,10 @@ class _FakeVoiceServerSession:
     def handle_hello(self, request):
         del request
         return [{"type": "voice_ready", "session_id": "voice-1", "backend": "remote_asr"}]
+
+    def handle_identity_profiles(self, event):
+        self.last_identity_profiles = event
+        return []
 
     def handle_runtime_state(self, event):
         del event
@@ -456,6 +465,74 @@ def _pcm_frame(value: int) -> bytes:
     return sample * 1600
 
 
+def _voice_sample_pcm_bytes(
+    *,
+    frequency_hz: float = 175.0,
+    amplitude: float = 0.35,
+    duration_s: float = 1.8,
+) -> bytes:
+    sample_rate = 16000
+    total_frames = int(sample_rate * duration_s)
+    frames = array("h")
+    for index in range(total_frames):
+        t = index / sample_rate
+        envelope = min(
+            1.0,
+            index / (sample_rate * 0.2),
+            (total_frames - index) / (sample_rate * 0.2),
+        )
+        sample = amplitude * envelope * (
+            (0.70 * math.sin(2.0 * math.pi * frequency_hz * t))
+            + (0.20 * math.sin(2.0 * math.pi * frequency_hz * 2.0 * t))
+            + (0.10 * math.sin(2.0 * math.pi * (frequency_hz + 35.0) * t))
+        )
+        frames.append(max(-32767, min(32767, int(sample * 32767))))
+    return frames.tobytes()
+
+
+def _voice_identity_profiles_event(
+    *,
+    user_id: str,
+    display_name: str,
+    pcm_bytes: bytes,
+    primary_user: bool = True,
+    revision: str = "rev-test",
+) -> OrchestratorVoiceIdentityProfilesEvent:
+    embedding = extract_voice_embedding_from_pcm16(
+        pcm_bytes,
+        sample_rate=16000,
+        channels=1,
+        min_sample_ms=1200,
+    )
+    return OrchestratorVoiceIdentityProfilesEvent(
+        revision=revision,
+        profiles=(
+            OrchestratorVoiceIdentityProfile(
+                user_id=user_id,
+                display_name=display_name,
+                primary_user=primary_user,
+                embedding=embedding.vector,
+                sample_count=3,
+                average_duration_ms=embedding.duration_ms,
+                updated_at="2026-03-27T11:00:00+00:00",
+            ),
+        ),
+    )
+
+
+def _pcm_frames_from_audio(pcm_bytes: bytes) -> tuple[bytes, ...]:
+    frame_bytes = 1600 * 2
+    frames: list[bytes] = []
+    for start in range(0, len(pcm_bytes), frame_bytes):
+        chunk = pcm_bytes[start : start + frame_bytes]
+        if not chunk:
+            continue
+        if len(chunk) < frame_bytes:
+            chunk = chunk + (b"\x00" * (frame_bytes - len(chunk)))
+        frames.append(chunk)
+    return tuple(frames)
+
+
 class _FakeUrlOpenResponse:
     def __init__(self, payload: bytes, *, status: int = 200) -> None:
         self._payload = payload
@@ -671,6 +748,10 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
                 "associated": True,
                 "confidence": 0.86,
             },
+            "audio_policy": {
+                "background_media_likely": False,
+                "speech_overlap_likely": False,
+            },
         }
 
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
@@ -679,6 +760,7 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
         self.assertTrue(context.speaker_associated)
         self.assertEqual(context.speaker_association_confidence, 0.86)
         self.assertTrue(context.strong_speaker_bias_allowed())
+        self.assertTrue(context.familiar_speaker_bias_allowed())
 
     def test_strong_speaker_bias_requires_association_confidence(self) -> None:
         context = VoiceRuntimeIntentContext(
@@ -693,6 +775,22 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
 
         self.assertTrue(context.audio_bias_allowed())
         self.assertFalse(context.strong_speaker_bias_allowed())
+
+    def test_familiar_speaker_bias_is_blocked_by_background_media(self) -> None:
+        context = VoiceRuntimeIntentContext(
+            person_visible=True,
+            presence_active=True,
+            interaction_ready=True,
+            targeted_inference_blocked=False,
+            recommended_channel="speech",
+            speaker_associated=True,
+            speaker_association_confidence=0.86,
+            background_media_likely=True,
+            speech_overlap_likely=False,
+        )
+
+        self.assertTrue(context.strong_speaker_bias_allowed())
+        self.assertFalse(context.familiar_speaker_bias_allowed())
 
     def test_from_sensor_facts_keeps_waiting_activation_allowed_during_focus_hold(self) -> None:
         facts = {
@@ -1037,6 +1135,8 @@ class OrchestratorClientTests(unittest.TestCase):
                 recommended_channel="speech",
                 speaker_associated=True,
                 speaker_association_confidence=0.88,
+                background_media_likely=False,
+                speech_overlap_likely=False,
                 voice_quiet_until_utc="2026-03-25T12:15:00Z",
             ),
         )
@@ -1057,7 +1157,34 @@ class OrchestratorClientTests(unittest.TestCase):
         self.assertEqual(decoded.runtime_state.recommended_channel, "speech")
         self.assertTrue(decoded.runtime_state.speaker_associated)
         self.assertEqual(decoded.runtime_state.speaker_association_confidence, 0.88)
+        self.assertFalse(decoded.runtime_state.background_media_likely)
+        self.assertFalse(decoded.runtime_state.speech_overlap_likely)
         self.assertEqual(decoded.runtime_state.voice_quiet_until_utc, "2026-03-25T12:15:00Z")
+
+    def test_voice_identity_profiles_event_round_trips(self) -> None:
+        event = OrchestratorVoiceIdentityProfilesEvent(
+            revision="rev-123",
+            profiles=(
+                OrchestratorVoiceIdentityProfile(
+                    user_id="main_user",
+                    display_name="Theo",
+                    primary_user=True,
+                    embedding=(0.1, 0.2, 0.3),
+                    sample_count=4,
+                    average_duration_ms=2600,
+                    updated_at="2026-03-27T11:00:00+00:00",
+                ),
+            ),
+        )
+
+        decoded = OrchestratorVoiceIdentityProfilesEvent.from_payload(event.to_payload())
+
+        self.assertEqual(decoded.revision, "rev-123")
+        self.assertEqual(len(decoded.profiles), 1)
+        self.assertEqual(decoded.profiles[0].user_id, "main_user")
+        self.assertEqual(decoded.profiles[0].display_name, "Theo")
+        self.assertTrue(decoded.profiles[0].primary_user)
+        self.assertEqual(decoded.profiles[0].embedding, (0.1, 0.2, 0.3))
 
     def test_client_handles_ack_tool_request_and_completion(self) -> None:
         class _FakeSocket:
@@ -2213,7 +2340,7 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
         self.assertEqual(biased_events[0]["type"], "wake_confirmed")
         self.assertEqual(biased_events[0]["matched_phrase"], "twinna")
 
-    def test_voice_session_strong_speaker_bias_accepts_tynna_only_when_speaker_is_associated(self) -> None:
+    def test_voice_session_familiar_speaker_bias_accepts_tynna_only_with_known_voice_profile(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -2227,6 +2354,8 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                 voice_orchestrator_intent_min_wake_duration_relief_ms=100,
                 voice_orchestrator_wake_tail_endpoint_silence_ms=100,
             )
+            familiar_pcm = _voice_sample_pcm_bytes(frequency_hz=175.0)
+            familiar_frames = _pcm_frames_from_audio(familiar_pcm)
             strict_session = EdgeOrchestratorVoiceSession(
                 config,
                 backend=SimpleNamespace(
@@ -2238,6 +2367,13 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                 backend=SimpleNamespace(
                     transcribe=lambda *args, **kwargs: "Tynna, wie ist das Wetter heute?"
                 ),
+            )
+            biased_session.handle_identity_profiles(
+                _voice_identity_profiles_event(
+                    user_id="main_user",
+                    display_name="Theo",
+                    pcm_bytes=familiar_pcm,
+                )
             )
 
             for session in (strict_session, biased_session):
@@ -2278,29 +2414,33 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                     recommended_channel="speech",
                     speaker_associated=True,
                     speaker_association_confidence=0.85,
+                    background_media_likely=False,
+                    speech_overlap_likely=False,
                 )
             )
 
-            for session in (strict_session, biased_session):
-                session.handle_audio_frame(
-                    OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+            strict_events: list[dict[str, object]] = []
+            biased_events: list[dict[str, object]] = []
+            for sequence, frame in enumerate(familiar_frames):
+                strict_events = strict_session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=sequence, pcm_bytes=frame)
                 )
-                session.handle_audio_frame(
-                    OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(2))
+                biased_events = biased_session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=sequence, pcm_bytes=frame)
                 )
 
             strict_events = strict_session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+                OrchestratorVoiceAudioFrame(sequence=len(familiar_frames), pcm_bytes=_pcm_frame(0))
             )
             biased_events = biased_session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+                OrchestratorVoiceAudioFrame(sequence=len(familiar_frames), pcm_bytes=_pcm_frame(0))
             )
 
         self.assertEqual(strict_events, [])
         self.assertEqual(biased_events[0]["type"], "wake_confirmed")
         self.assertEqual(biased_events[0]["matched_phrase"], "tynna")
 
-    def test_voice_session_strong_speaker_bias_accepts_winner_family_only_when_speaker_is_associated(
+    def test_voice_session_familiar_speaker_bias_accepts_winner_family_only_with_known_voice_profile(
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2316,6 +2456,8 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                 voice_orchestrator_intent_min_wake_duration_relief_ms=100,
                 voice_orchestrator_wake_tail_endpoint_silence_ms=100,
             )
+            familiar_pcm = _voice_sample_pcm_bytes(frequency_hz=175.0)
+            familiar_frames = _pcm_frames_from_audio(familiar_pcm)
             strict_session = EdgeOrchestratorVoiceSession(
                 config,
                 backend=SimpleNamespace(
@@ -2327,6 +2469,14 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                 backend=SimpleNamespace(
                     transcribe=lambda *args, **kwargs: "Gewinner, wie spät ist es?"
                 ),
+            )
+            biased_session.handle_identity_profiles(
+                _voice_identity_profiles_event(
+                    user_id="guest_user",
+                    display_name="Guest",
+                    pcm_bytes=familiar_pcm,
+                    primary_user=False,
+                )
             )
 
             for session in (strict_session, biased_session):
@@ -2367,27 +2517,98 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
                     recommended_channel="speech",
                     speaker_associated=True,
                     speaker_association_confidence=0.85,
+                    background_media_likely=False,
+                    speech_overlap_likely=False,
                 )
             )
 
-            for session in (strict_session, biased_session):
-                session.handle_audio_frame(
-                    OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+            strict_events: list[dict[str, object]] = []
+            biased_events: list[dict[str, object]] = []
+            for sequence, frame in enumerate(familiar_frames):
+                strict_events = strict_session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=sequence, pcm_bytes=frame)
                 )
-                session.handle_audio_frame(
-                    OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(2))
+                biased_events = biased_session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=sequence, pcm_bytes=frame)
                 )
 
             strict_events = strict_session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+                OrchestratorVoiceAudioFrame(sequence=len(familiar_frames), pcm_bytes=_pcm_frame(0))
             )
             biased_events = biased_session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=_pcm_frame(0))
+                OrchestratorVoiceAudioFrame(sequence=len(familiar_frames), pcm_bytes=_pcm_frame(0))
             )
 
         self.assertEqual(strict_events, [])
         self.assertEqual(biased_events[0]["type"], "wake_confirmed")
         self.assertEqual(biased_events[0]["matched_phrase"], "twinner")
+
+    def test_voice_session_familiar_speaker_bias_is_blocked_by_background_media(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1,
+                voice_orchestrator_remote_asr_min_wake_duration_ms=300,
+                voice_orchestrator_intent_min_wake_duration_relief_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            familiar_pcm = _voice_sample_pcm_bytes(frequency_hz=175.0)
+            familiar_frames = _pcm_frames_from_audio(familiar_pcm)
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(
+                    transcribe=lambda *args, **kwargs: "Tynna, wie ist das Wetter heute?"
+                ),
+            )
+            session.handle_identity_profiles(
+                _voice_identity_profiles_event(
+                    user_id="main_user",
+                    display_name="Theo",
+                    pcm_bytes=familiar_pcm,
+                )
+            )
+            session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            session.handle_runtime_state(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="idle",
+                    follow_up_allowed=False,
+                    attention_state="attending_to_device",
+                    interaction_intent_state="showing_intent",
+                    person_visible=True,
+                    presence_active=True,
+                    interaction_ready=True,
+                    targeted_inference_blocked=False,
+                    recommended_channel="speech",
+                    speaker_associated=True,
+                    speaker_association_confidence=0.85,
+                    background_media_likely=True,
+                    speech_overlap_likely=False,
+                )
+            )
+
+            events: list[dict[str, object]] = []
+            for sequence, frame in enumerate(familiar_frames):
+                events = session.handle_audio_frame(
+                    OrchestratorVoiceAudioFrame(sequence=sequence, pcm_bytes=frame)
+                )
+            events = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=len(familiar_frames), pcm_bytes=_pcm_frame(0))
+            )
+
+        self.assertEqual(events, [])
 
     def test_voice_session_waiting_activation_is_blocked_when_person_state_disallows_speech(self) -> None:
         with TemporaryDirectory() as temp_dir:

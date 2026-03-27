@@ -30,9 +30,21 @@ files:
     exports:
       - LongTermMidtermStore
   - path: remote_catalog.py
-    role: Fine-grained remote object/conflict/archive document and catalog adapter
+    role: Public compatibility wrapper for the fine-grained remote object/conflict/archive catalog adapter
     exports:
       - LongTermRemoteCatalogStore
+  - path: _remote_catalog/shared.py
+    role: Shared remote-catalog constants, dataclasses, and workflow-trace helpers
+  - path: _remote_catalog/base.py
+    role: Small remote-catalog base class that composes the focused implementation mixins
+  - path: _remote_catalog/catalog.py
+    role: Remote catalog cache and snapshot-assembly helpers
+  - path: _remote_catalog/search.py
+    role: Remote catalog search and selector logic
+  - path: _remote_catalog/documents.py
+    role: Remote catalog document hydration and payload-extraction helpers
+  - path: _remote_catalog/writes.py
+    role: Remote catalog segment persistence, bulk-write attestation, and reuse helpers
   - path: remote_read_diagnostics.py
     role: Structured ops diagnostics for remote long-term I/O failures and fallbacks
   - path: remote_read_observability.py
@@ -62,6 +74,7 @@ primary_callers:
   - path: src/twinr/memory/chonkydb/personal_graph.py
   - path: src/twinr/agent/base_agent/prompting/personality.py
 tests:
+  - path: test/test_remote_catalog_refactor.py
   - path: test/test_longterm_store.py
   - path: test/test_longterm_midterm.py
   - path: test/test_longterm_retriever.py

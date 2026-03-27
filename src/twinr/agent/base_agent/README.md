@@ -22,7 +22,14 @@ root imports together while pushing behavior into focused subpackages.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Lazy root export surface |
-| [config.py](./config.py) | Canonical runtime config, including bounded HDMI attention-refresh cadence, session-focus hold tuning for gaze-follow, high-level onboard-vs-helper camera topology defaults, calibrated attention-servo driver selection across the Twinr kernel-servo writer and Pololu Mini Maestro command-port path, calm-motion safety knobs such as visible-target latching, optional exit-only physical follow with a configurable degree clamp plus loss-confirmation delay, periodic visible-user recenter interval/tolerance knobs for calmer long-lived off-axis correction, visible side-departure threshold, and visible-box edge threshold, a short exit settle-hold, centered visible-reacquire cooldown, cooldown and long-absence rest-return timing, a dedicated slower rest-motion profile for startup/recenter moves, exact-center snap/release semantics for neutral alignment, exit-trajectory extrapolation, an opt-in forensic trace flag for per-tick servo ledgers, release-after-settle for quiet loaded holds, smart-home background-worker tuning, and the default reserve-lane day budget such as `display_reserve_bus_items_per_day=20` |
+| [config.py](./config.py) | Stable import facade for the canonical runtime config surface |
+| [_config/schema.py](./_config/schema.py) | Immutable `TwinrConfig` dataclass shape, helper properties, and delegated `from_env()` entry |
+| [_config/loading.py](./_config/loading.py) | Canonical `.env` + process-env loading flow that composes domain loaders |
+| [_config/load_*.py](./_config/loading.py) | Domain-separated env loaders for providers, streaming, channels, vision, memory, and hardware |
+| [_config/normalization.py](./_config/normalization.py) | Post-init normalization and validation orchestration for bounded config values |
+| [_config/normalization_updates.py](./_config/normalization_updates.py) | Grouped frozen-dataclass update helpers for normalized config fields |
+| [_config/parsing.py](./_config/parsing.py) | Primitive env parsing helpers kept separate from the dataclass and loaders |
+| [_config/constants.py](./_config/constants.py) | Shared runtime-config constants and default value anchors |
 | [contracts.py](./contracts.py) | Provider/runtime contracts |
 | [conversation/](./conversation/README.md) | Conversation micro-policies |
 | [prompting/](./prompting/README.md) | Hidden instruction assembly |
@@ -38,6 +45,11 @@ from twinr.agent.base_agent import TwinrConfig, TwinrRuntime
 config = TwinrConfig.from_env(".env")
 runtime = TwinrRuntime(config=config)
 ```
+
+No migration is required: callers still import `TwinrConfig` and helper symbols
+from [`config.py`](./config.py), while the implementation now lives in the
+focused [`_config/`](./_config/schema.py) package with domain-specific loaders
+and grouped normalization helpers.
 
 ## See also
 

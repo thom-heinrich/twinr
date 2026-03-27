@@ -68,6 +68,18 @@ def _coerce_positive_int(value: Any, *, default: int) -> int:
     return parsed
 
 
+def _coerce_non_negative_int(value: Any, *, default: int) -> int:
+    """Parse a non-negative integer and fall back to ``default`` when invalid."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
     """Parse bounded websocket booleans from scalars and strings."""
 
@@ -81,6 +93,23 @@ def _coerce_bool(value: Any, *, default: bool = False) -> bool:
     if normalized in _FALSE_STRINGS:
         return False
     return default
+
+
+def _coerce_embedding(value: Any) -> tuple[float, ...]:
+    """Normalize one embedding payload into a finite float tuple."""
+
+    if not isinstance(value, list) or not value:
+        return ()
+    embedding: list[float] = []
+    for item in value:
+        try:
+            normalized = float(item)
+        except (TypeError, ValueError):
+            return ()
+        if normalized != normalized or normalized in {float("inf"), float("-inf")}:
+            return ()
+        embedding.append(normalized)
+    return tuple(embedding)
 
 
 def _decode_audio_bytes(value: Any) -> bytes:
@@ -123,6 +152,8 @@ class OrchestratorVoiceHelloRequest:
     recommended_channel: str | None = None
     speaker_associated: bool | None = None
     speaker_association_confidence: float | None = None
+    background_media_likely: bool | None = None
+    speech_overlap_likely: bool | None = None
     voice_quiet_until_utc: str | None = None
     state_attested: bool = True
 
@@ -159,6 +190,10 @@ class OrchestratorVoiceHelloRequest:
             payload["speaker_associated"] = self.speaker_associated
         if self.speaker_association_confidence is not None:
             payload["speaker_association_confidence"] = self.speaker_association_confidence
+        if self.background_media_likely is not None:
+            payload["background_media_likely"] = self.background_media_likely
+        if self.speech_overlap_likely is not None:
+            payload["speech_overlap_likely"] = self.speech_overlap_likely
         if self.voice_quiet_until_utc is not None:
             payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
@@ -207,6 +242,16 @@ class OrchestratorVoiceHelloRequest:
             ),
             speaker_association_confidence=_coerce_optional_ratio(
                 payload_dict.get("speaker_association_confidence")
+            ),
+            background_media_likely=(
+                _coerce_bool(payload_dict.get("background_media_likely"))
+                if payload_dict.get("background_media_likely") is not None
+                else None
+            ),
+            speech_overlap_likely=(
+                _coerce_bool(payload_dict.get("speech_overlap_likely"))
+                if payload_dict.get("speech_overlap_likely") is not None
+                else None
             ),
             voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
             state_attested=_coerce_bool(payload_dict.get("state_attested"), default=False),
@@ -262,6 +307,8 @@ class OrchestratorVoiceRuntimeStateEvent:
     recommended_channel: str | None = None
     speaker_associated: bool | None = None
     speaker_association_confidence: float | None = None
+    background_media_likely: bool | None = None
+    speech_overlap_likely: bool | None = None
     voice_quiet_until_utc: str | None = None
 
     def to_payload(self, *, include_type: bool = True) -> dict[str, Any]:
@@ -291,6 +338,10 @@ class OrchestratorVoiceRuntimeStateEvent:
             payload["speaker_associated"] = self.speaker_associated
         if self.speaker_association_confidence is not None:
             payload["speaker_association_confidence"] = self.speaker_association_confidence
+        if self.background_media_likely is not None:
+            payload["background_media_likely"] = self.background_media_likely
+        if self.speech_overlap_likely is not None:
+            payload["speech_overlap_likely"] = self.speech_overlap_likely
         if self.voice_quiet_until_utc is not None:
             payload["voice_quiet_until_utc"] = self.voice_quiet_until_utc
         return payload
@@ -335,7 +386,98 @@ class OrchestratorVoiceRuntimeStateEvent:
             speaker_association_confidence=_coerce_optional_ratio(
                 payload_dict.get("speaker_association_confidence")
             ),
+            background_media_likely=(
+                _coerce_bool(payload_dict.get("background_media_likely"))
+                if payload_dict.get("background_media_likely") is not None
+                else None
+            ),
+            speech_overlap_likely=(
+                _coerce_bool(payload_dict.get("speech_overlap_likely"))
+                if payload_dict.get("speech_overlap_likely") is not None
+                else None
+            ),
             voice_quiet_until_utc=_coerce_optional_text(payload_dict.get("voice_quiet_until_utc")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OrchestratorVoiceIdentityProfile:
+    """Describe one read-only household voice profile snapshot."""
+
+    user_id: str
+    embedding: tuple[float, ...]
+    display_name: str | None = None
+    primary_user: bool = False
+    sample_count: int = 1
+    average_duration_ms: int = 0
+    updated_at: str | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "user_id": self.user_id,
+            "embedding": list(self.embedding),
+            "primary_user": self.primary_user,
+            "sample_count": self.sample_count,
+            "average_duration_ms": self.average_duration_ms,
+        }
+        if self.display_name is not None:
+            payload["display_name"] = self.display_name
+        if self.updated_at is not None:
+            payload["updated_at"] = self.updated_at
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "OrchestratorVoiceIdentityProfile | None":
+        payload_dict = _coerce_dict(payload)
+        embedding = _coerce_embedding(payload_dict.get("embedding"))
+        if not embedding:
+            return None
+        user_id = _coerce_text(payload_dict.get("user_id"))
+        if not user_id:
+            return None
+        return cls(
+            user_id=user_id,
+            embedding=embedding,
+            display_name=_coerce_optional_text(payload_dict.get("display_name")),
+            primary_user=_coerce_bool(payload_dict.get("primary_user"), default=False),
+            sample_count=_coerce_positive_int(payload_dict.get("sample_count"), default=1),
+            average_duration_ms=_coerce_non_negative_int(
+                payload_dict.get("average_duration_ms"),
+                default=0,
+            ),
+            updated_at=_coerce_optional_text(payload_dict.get("updated_at")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OrchestratorVoiceIdentityProfilesEvent:
+    """Sync the current household voice profile snapshot to the voice gateway."""
+
+    revision: str | None
+    profiles: tuple[OrchestratorVoiceIdentityProfile, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "voice_identity_profiles",
+            "profiles": [profile.to_payload() for profile in self.profiles],
+        }
+        if self.revision is not None:
+            payload["revision"] = self.revision
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "OrchestratorVoiceIdentityProfilesEvent":
+        payload_dict = _coerce_dict(payload)
+        profiles_raw = payload_dict.get("profiles")
+        profiles: list[OrchestratorVoiceIdentityProfile] = []
+        if isinstance(profiles_raw, list):
+            for item in profiles_raw:
+                profile = OrchestratorVoiceIdentityProfile.from_payload(item)
+                if profile is not None:
+                    profiles.append(profile)
+        return cls(
+            revision=_coerce_optional_text(payload_dict.get("revision")),
+            profiles=tuple(profiles),
         )
 
 
@@ -512,6 +654,8 @@ __all__ = [
     "OrchestratorVoiceErrorEvent",
     "OrchestratorVoiceFollowUpClosedEvent",
     "OrchestratorVoiceHelloRequest",
+    "OrchestratorVoiceIdentityProfile",
+    "OrchestratorVoiceIdentityProfilesEvent",
     "OrchestratorVoiceReadyEvent",
     "OrchestratorVoiceRuntimeStateEvent",
     "OrchestratorVoiceTranscriptCommittedEvent",

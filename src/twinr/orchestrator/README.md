@@ -124,11 +124,15 @@ false-positive tradeoff.
 
 There is one narrower runtime-owned exception for the live idle wake path: when
 the Pi currently attests a speech-directed local person with strong
-speaker-association confidence, the `waiting` wake scanner may temporarily
-expand that exact safe family to include `Tynna` and the existing `*winner`
-head recovery. That stronger alias tier never becomes the global default, never
-applies outside `waiting`, and still requires an explicit utterance-head wake
-alias instead of manufacturing wake from vision alone.
+speaker-association confidence, no background media, and no overlapping speech,
+the gateway may check the wake candidate audio against the Pi-owned enrolled
+household voice profiles that were synced over the websocket as a read-only
+session snapshot. Only when that wake candidate also sounds like a known
+household speaker may the `waiting` wake scanner temporarily expand the exact
+safe family to include `Tynna` and the existing `*winner` head recovery. That
+stronger alias tier never becomes the global default, never applies outside
+`waiting`, and still requires an explicit utterance-head wake alias instead of
+manufacturing wake from vision alone.
 
 That keeps the websocket frame loop stable because the gateway performs one
 decode per utterance instead of multiple overlapping synchronous ASR calls on
@@ -171,15 +175,21 @@ targeted debugging because it persists raw room audio by design.
 
 The edge runtime now also projects the latest compact `person_state` summary
 into each `voice_runtime_state` update: `attention_state`,
-`interaction_intent_state`, `person_visible`, `presence_active`, `interaction_ready`,
-`targeted_inference_blocked`, `recommended_channel`, plus the compact
-speaker-association fields `speaker_associated` and
-`speaker_association_confidence`. The gateway may use that summary only as an
-audio-owned bias, for example by keeping the transcript-first wake window a bit
-richer, lowering the minimum activation duration a little, or temporarily
-unlocking the stronger `Tynna`/`*winner` alias tier while the runtime already
-sees speech-directed intent from the same nearby person. It must never
-manufacture a wake from vision alone.
+`interaction_intent_state`, `person_visible`, `presence_active`,
+`interaction_ready`, `targeted_inference_blocked`, `recommended_channel`, the
+compact speaker-association fields `speaker_associated` and
+`speaker_association_confidence`, plus the media/overlap suppressors
+`background_media_likely` and `speech_overlap_likely`. Separately, the edge may
+sync a read-only `voice_identity_profiles` snapshot that contains only the
+bounded enrolled household voice embeddings needed for wake-time familiar
+speaker scoring. The gateway may use those summaries only as an audio-owned
+bias, for example by keeping the transcript-first wake window a bit richer,
+lowering the minimum activation duration a little, or temporarily unlocking the
+stronger `Tynna`/`*winner` alias tier while the runtime already sees
+speech-directed intent from the same nearby person and the current wake audio
+sounds like a known household speaker. It must never manufacture a wake from
+vision alone, and unfamiliar speakers must still be able to wake Twinr through
+the exact safe alias family.
 
 The same runtime-state payload now also carries an optional
 `voice_quiet_until_utc` deadline. When that bounded runtime-owned quiet window

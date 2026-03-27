@@ -18,7 +18,7 @@ feedback on device.
 - reach one bounded external drone daemon over HTTP so Twinr can queue high-level inspect missions, read state, cancel work, and enforce manual-arm-only safety gates without ever sending direct flight-control commands
 - persist local portrait identities with multiple reference images per user
 - perform bounded local portrait matching from enrolled identities plus still-camera captures
-- persist multi-user local household voice identities and assess current-turn audio against enrolled household members
+- persist multi-user local household voice identities, assess current-turn audio against enrolled household members, and expose read-only bounded profile snapshots for the live gateway's familiar-speaker wake bias
 - coordinate one bounded local household identity manager across portrait matching, multi-user voice matching, explicit confirm or deny feedback, and short session history
 - run bounded hybrid IMX500 + MediaPipe camera inference for proactive sensing, with IMX500 always-on gating, MediaPipe pose enrichment, dedicated hand-landmark ROI work, stable full-frame gesture recognition, coarse motion, coarse-arm gestures, and bounded fine-hand gesture output
 - preserve bounded multi-person IMX500 person anchors in the camera contract so downstream runtime layers can track visible people continuously instead of collapsing every frame to a single primary box
@@ -87,7 +87,7 @@ feedback on device.
 | [camera.py](./camera.py) | bounded still capture with ffmpeg/V4L2, Pi `rpicam-still` fallback for missing default `video0` nodes and busy `unicam-image` devices, or peer-Pi HTTP snapshot fetches when `TWINR_CAMERA_PROXY_SNAPSHOT_URL` is configured |
 | [portrait_identity.py](./portrait_identity.py) | Atomic local portrait-identity store with enrolled reference-image management |
 | [portrait_match.py](./portrait_match.py) | Local YuNet/SFace portrait-match adapter with enrollment flow, multi-reference scoring, and temporal fusion |
-| [household_voice_identity.py](./household_voice_identity.py) | Multi-user local voice-identity store and matcher for enrolled household members |
+| [household_voice_identity.py](./household_voice_identity.py) | Multi-user local voice-identity store and matcher for enrolled household members, including bounded read-only snapshot export for the live voice gateway |
 | [household_identity.py](./household_identity.py) | Shared local household identity manager for portrait, voice, feedback, and bounded session fusion |
 | [pir.py](./pir.py) | PIR motion wrapper on buttons |
 | [printer.py](./printer.py) | Receipt formatting and CUPS submission |

@@ -26,6 +26,7 @@ kept as the bounded fallback path.
 - the status model for capabilities, compile jobs, artifacts, and learned skills
 - the file-backed store rooted at `state/self_coding`
 - the persisted compile-status record used for operator/debug visibility
+- operator-facing activation, health, execution-run, compile-status, and live-e2e records that stay readable across root/runtime and Pi-web service boundaries
 - the deterministic capability registry for the MVP module set
 - the Codex-readable trusted module-library shims under `modules/`
 - the deterministic feasibility checker for Phase 1
@@ -58,7 +59,7 @@ kept as the bounded fallback path.
 | [__init__.py](./__init__.py) | Package export surface |
 | [contracts.py](./contracts.py) | Versioned ASE contract dataclasses |
 | [status.py](./status.py) | Shared ASE enums and lifecycle states |
-| [store.py](./store.py) | File-backed store under `state/self_coding` |
+| [store.py](./store.py) | File-backed store under `state/self_coding`, including cross-service-readable operator status records for the Pi web portal |
 | [compiler/](./compiler) | Deterministic compile-target validation and canonicalization |
 | [compiler/prompting.py](./compiler/prompting.py) | Deterministic compile-prompt builder for Twinr artifact contracts |
 | [capability_registry.py](./capability_registry.py) | Deterministic MVP capability readiness view |

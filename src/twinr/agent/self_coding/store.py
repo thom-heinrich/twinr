@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 _SAFE_SUFFIX_PATTERN = re.compile(r"^\.[a-z0-9][a-z0-9._-]{0,15}$")
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _INTEGER_TEXT_PATTERN = re.compile(r"^[+-]?\d+$")
+_PRIVATE_FILE_MODE = 0o600
+_OPERATOR_READABLE_FILE_MODE = 0o644
 
 
 def self_coding_store_root(project_root: str | Path) -> Path:
@@ -109,7 +111,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+def _write_bytes_atomic(path: Path, payload: bytes, *, file_mode: int = _PRIVATE_FILE_MODE) -> None:
     if os.name != "posix":
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temp_path: Path | None = None
@@ -122,6 +124,7 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
                 delete=False,
             ) as handle:
                 temp_path = Path(handle.name)
+                os.chmod(temp_path, file_mode)
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -144,8 +147,9 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
         if hasattr(os, "O_NOFOLLOW"):
             create_flags |= os.O_NOFOLLOW
         # AUDIT-FIX(#1): Use dir_fd-based create/replace so writes stay anchored to the validated store directory.
-        temp_fd = os.open(temp_name, create_flags, 0o600, dir_fd=parent_fd)
+        temp_fd = os.open(temp_name, create_flags, _PRIVATE_FILE_MODE, dir_fd=parent_fd)
         try:
+            os.fchmod(temp_fd, file_mode)
             with os.fdopen(temp_fd, "wb", closefd=True) as handle:
                 temp_fd = -1
                 handle.write(payload)
@@ -168,9 +172,9 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
         os.close(parent_fd)
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: dict[str, Any], *, file_mode: int = _PRIVATE_FILE_MODE) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-    _write_bytes_atomic(path, encoded)
+    _write_bytes_atomic(path, encoded, file_mode=file_mode)
 
 
 def _read_bytes_file_safe(path: Path) -> bytes:
@@ -389,7 +393,7 @@ class SelfCodingStore:
         normalized = self._normalize_compile_status_record(record)
         path = self._record_json_path(self.status_dir, normalized.job_id)
         with self._lock:
-            _write_json_atomic(path, normalized.to_payload())
+            _write_json_atomic(path, normalized.to_payload(), file_mode=_OPERATOR_READABLE_FILE_MODE)
         return normalized
 
     def load_compile_status(self, job_id: str) -> CompileRunStatusRecord:
@@ -430,7 +434,7 @@ class SelfCodingStore:
         normalized = self._normalize_activation_record(record)
         path = self._activation_path(normalized.skill_id, normalized.version)
         with self._lock:
-            _write_json_atomic(path, normalized.to_payload())
+            _write_json_atomic(path, normalized.to_payload(), file_mode=_OPERATOR_READABLE_FILE_MODE)
         return normalized
 
     def load_activation(self, skill_id: str, *, version: int) -> ActivationRecord:
@@ -483,7 +487,7 @@ class SelfCodingStore:
         normalized = self._normalize_skill_health_record(record)
         path = self._health_path(normalized.skill_id, normalized.version)
         with self._lock:
-            _write_json_atomic(path, normalized.to_payload())
+            _write_json_atomic(path, normalized.to_payload(), file_mode=_OPERATOR_READABLE_FILE_MODE)
         return normalized
 
     def load_skill_health(self, skill_id: str, *, version: int) -> SkillHealthRecord:
@@ -554,7 +558,7 @@ class SelfCodingStore:
         normalized = self._normalize_execution_run_record(candidate)
         path = self._execution_run_path(normalized.run_id)
         with self._lock:
-            _write_json_atomic(path, normalized.to_payload())
+            _write_json_atomic(path, normalized.to_payload(), file_mode=_OPERATOR_READABLE_FILE_MODE)
         return normalized
 
     def load_execution_run(self, run_id: str) -> ExecutionRunStatusRecord:
@@ -613,7 +617,7 @@ class SelfCodingStore:
         normalized = self._normalize_live_e2e_status_record(record)
         path = self._live_e2e_path(normalized.suite_id, normalized.environment)
         with self._lock:
-            _write_json_atomic(path, normalized.to_payload())
+            _write_json_atomic(path, normalized.to_payload(), file_mode=_OPERATOR_READABLE_FILE_MODE)
         return normalized
 
     def load_live_e2e_status(self, suite_id: str, *, environment: str) -> LiveE2EStatusRecord:

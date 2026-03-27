@@ -584,7 +584,14 @@ source .venv/bin/activate
 twinr --env-file /twinr/.env --run-web
 ```
 
-By default, the UI binds to `0.0.0.0:1337`, so it is reachable from the local network.
+By default, the UI binds to `0.0.0.0:1337`, but remote browser access still
+fails closed unless `TWINR_WEB_ALLOW_REMOTE=1`, `TWINR_WEB_REQUIRE_AUTH=1`,
+and `TWINR_WEB_ALLOWED_HOSTS` are set in `/twinr/.env`.
+
+When remote access is enabled without static `TWINR_WEB_USERNAME` /
+`TWINR_WEB_PASSWORD` credentials, Twinr uses the managed Pi sign-in flow: the
+first login is `admin / admin`, and the portal immediately requires a password
+change.
 
 ## OpenAI backend
 

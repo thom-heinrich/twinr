@@ -19,6 +19,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - build the `/integrations/email` wizard context plus stepwise validated record updates for provider choice, mailbox login, transport, bounded connection-test state, and final guardrails
 - build the compact email and WhatsApp setup summaries for `/integrations`, while keeping the stateful WhatsApp QR pairing flow in the dedicated wizard
 - build the social-history learning consent/status panel for `/integrations`, including source selection, bounded lookback windows, and import-status copy
+- own the flatter primary shell grouping, home destination cards, and grouped `/advanced` operator hub context so top-level navigation stays short and consistent
 - expose the presenter import surface through [`__init__.py`](./__init__.py)
 
 `presenters` does **not** own:
@@ -32,7 +33,8 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | File | Purpose |
 |---|---|
 | [`__init__.py`](./__init__.py) | Curated presenter export surface |
-| [`common.py`](./common.py) | Shared nav and reminder helpers |
+| [`common.py`](./common.py) | Shared reminder, provider-status, and safe file-link helpers |
+| [`shell.py`](./shell.py) | Grouped primary shell navigation plus flatter Home, Settings shortcut, and Advanced hub card builders |
 | [`settings.py`](./settings.py) | Global settings page builders |
 | [`integrations.py`](./integrations.py) | Integration overview rows, compact email/WhatsApp setup summaries, and validated email/calendar/smart-home form builders |
 | [`email_wizard.py`](./email_wizard.py) | Guided email mailbox setup wizard page context, bounded connection-test state, and stepwise record validation |

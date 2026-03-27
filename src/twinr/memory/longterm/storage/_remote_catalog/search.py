@@ -1,0 +1,977 @@
+"""Search and selector helpers for remote catalog storage."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+import time
+
+from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
+from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.chonkydb.models import ChonkyDBRetrieveRequest, ChonkyDBTopKRecordsRequest
+from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteReadContext,
+    build_remote_read_failure_details,
+    record_remote_read_diagnostic,
+)
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError
+
+from .shared import (
+    LongTermRemoteCatalogEntry,
+    _run_timed_workflow_step,
+    _trace_search_details,
+)
+
+
+class RemoteCatalogSearchMixin:
+    def search_current_item_payloads(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+        allow_catalog_fallback: bool = False,
+    ) -> tuple[dict[str, object], ...] | None:
+        """Search the current remote scope directly without hydrating the full catalog."""
+
+        clean_query = self._normalize_text(query_text)
+        if not clean_query:
+            return ()
+        cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        topk_records = getattr(read_client, "topk_records", None)
+        supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
+        can_scope_search = bool(supports_topk_records and callable(topk_records) and scope_ref and namespace)
+        workflow_decision(
+            msg="longterm_remote_catalog_current_scope_strategy",
+            question="Which remote catalog route should resolve the current snapshot search?",
+            selected={
+                "id": (
+                    "scope_topk_records"
+                    if can_scope_search
+                    else "cached_catalog_selector"
+                    if cached_entries is not None
+                    else "return_none_for_caller_fallback"
+                ),
+                "summary": (
+                    "Use current-scope one-shot top-k retrieval."
+                    if can_scope_search
+                    else "Use the cached catalog selector and hydrate only selected payloads."
+                    if cached_entries is not None
+                    else "Return None so the caller can choose a broader fallback path."
+                ),
+            },
+            options=[
+                {
+                    "id": "scope_topk_records",
+                    "summary": "Query the authoritative current-scope top-k endpoint.",
+                    "score_components": {
+                        "supports_topk_records": bool(supports_topk_records and callable(topk_records)),
+                        "has_scope_ref": bool(scope_ref),
+                        "has_namespace": bool(namespace),
+                    },
+                    "constraints_violated": [] if can_scope_search else ["scope_ref_or_topk_unavailable"],
+                },
+                {
+                    "id": "cached_catalog_selector",
+                    "summary": "Search the cached catalog projection locally and hydrate only selected payloads.",
+                    "score_components": {
+                        "cached_catalog_entries": 0 if cached_entries is None else len(cached_entries),
+                    },
+                    "constraints_violated": [] if cached_entries is not None else ["cached_catalog_missing"],
+                },
+                {
+                    "id": "return_none_for_caller_fallback",
+                    "summary": "Signal the caller to try a broader catalog-backed fallback path.",
+                    "score_components": {
+                        "cached_catalog_entries": 0 if cached_entries is None else len(cached_entries),
+                    },
+                    "constraints_violated": [] if cached_entries is None and not can_scope_search else ["better_route_available"],
+                },
+            ],
+            context=_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                result_limit=limit,
+                scope_ref=scope_ref,
+                namespace=namespace,
+                cached_catalog_entries=0 if cached_entries is None else len(cached_entries),
+            ),
+            confidence="high",
+            guardrails=[
+                "Prefer the authoritative current-scope top-k path when the backend supports it.",
+                "Use cached catalog selection only as a bounded fallback, not the default hot path.",
+            ],
+            kpi_impact_estimate={
+                "allow_catalog_fallback": bool(allow_catalog_fallback),
+            },
+        )
+        if can_scope_search:
+            definition = self._require_definition(snapshot_kind)
+            bounded_limit = max(1, int(limit))
+            max_request_limit = max(bounded_limit, self._retrieve_batch_size())
+            scope_search_failed = False
+            request_limit = self._initial_scope_search_limit(
+                bounded_limit=bounded_limit,
+                max_request_limit=max_request_limit,
+                requires_client_filter=eligible is not None,
+            )
+            selected_payloads: list[dict[str, object]] = []
+            selected_entries: list[LongTermRemoteCatalogEntry] = []
+            seen_item_ids: set[str] = set()
+            while True:
+                try:
+                    candidates = _run_timed_workflow_step(
+                        name="longterm_remote_catalog_scope_search_attempt",
+                        kind="retrieval",
+                        details=_trace_search_details(
+                            snapshot_kind=snapshot_kind,
+                            query_text=clean_query,
+                            result_limit=bounded_limit,
+                            candidate_limit=request_limit,
+                            scope_ref=scope_ref,
+                            namespace=namespace,
+                        ),
+                        operation=lambda request_limit=request_limit: self._search_remote_candidates(
+                            snapshot_kind=snapshot_kind,
+                            read_client=read_client,
+                            query_text=clean_query,
+                            result_limit=request_limit,
+                            allowed_doc_ids=(),
+                            scope_ref=scope_ref,
+                            namespace=namespace,
+                            catalog_entry_count=0,
+                        ),
+                    )
+                except ChonkyDBError:
+                    scope_search_failed = True
+                    workflow_event(
+                        kind="branch",
+                        msg="longterm_remote_catalog_scope_search_failed",
+                        level="WARNING",
+                        details=_trace_search_details(
+                            snapshot_kind=snapshot_kind,
+                            query_text=clean_query,
+                            result_limit=bounded_limit,
+                            candidate_limit=request_limit,
+                            scope_ref=scope_ref,
+                            namespace=namespace,
+                        ),
+                        reason={
+                            "selected": {"id": "cached_catalog_fallback", "summary": "Scope search failed; use the already cached catalog projection if present."},
+                            "options": [
+                                {"id": "cached_catalog_fallback", "summary": "Try the cached catalog projection.", "constraints_violated": []},
+                                {"id": "abort_remote_lookup", "summary": "Return no payloads.", "constraints_violated": ["would_hide_recoverable_memory"]},
+                            ],
+                        },
+                    )
+                    break
+                candidate_count = 0
+                for candidate in candidates:
+                    candidate_count += 1
+                    entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
+                    if entry is None or entry.item_id in seen_item_ids:
+                        continue
+                    if eligible is not None and not eligible(entry):
+                        continue
+                    payload = self._extract_item_payload(
+                        definition=definition,
+                        item_id=entry.item_id,
+                        payload=candidate,
+                    )
+                    if not isinstance(payload, Mapping):
+                        continue
+                    payload_dict = dict(payload)
+                    self._store_item_payload(
+                        snapshot_kind=snapshot_kind,
+                        item_id=entry.item_id,
+                        payload=payload_dict,
+                    )
+                    selected_payloads.append(payload_dict)
+                    selected_entries.append(entry)
+                    seen_item_ids.add(entry.item_id)
+                    if len(selected_payloads) >= bounded_limit:
+                        break
+                if len(selected_payloads) >= bounded_limit:
+                    break
+                if candidate_count < request_limit or request_limit >= max_request_limit:
+                    break
+                next_limit = min(max_request_limit, request_limit * 2)
+                if next_limit <= request_limit:
+                    break
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_remote_catalog_scope_search_widen",
+                    details=_trace_search_details(
+                        snapshot_kind=snapshot_kind,
+                        query_text=clean_query,
+                        result_limit=bounded_limit,
+                        candidate_limit=request_limit,
+                        scope_ref=scope_ref,
+                        namespace=namespace,
+                    ),
+                    reason={
+                        "selected": {"id": "widen_request_limit", "summary": "The current scope-search window was too narrow; widen the candidate request."},
+                        "options": [
+                            {"id": "widen_request_limit", "summary": "Increase the request window.", "constraints_violated": []},
+                            {"id": "stop_early", "summary": "Keep the smaller window.", "constraints_violated": ["risk_underfilled_results"]},
+                        ],
+                    },
+                    kpi={
+                        "previous_request_limit": request_limit,
+                        "next_request_limit": next_limit,
+                    },
+                )
+                request_limit = next_limit
+            if not scope_search_failed:
+                if allow_catalog_fallback:
+                    with workflow_span(
+                        name="longterm_remote_catalog_scope_rescue",
+                        kind="retrieval",
+                        details=_trace_search_details(
+                            snapshot_kind=snapshot_kind,
+                            query_text=clean_query,
+                            result_limit=bounded_limit,
+                            candidate_limit=request_limit,
+                            scope_ref=scope_ref,
+                            namespace=namespace,
+                        ),
+                    ):
+                        rescued = self._rescue_scope_search_payloads_with_current_catalog(
+                            snapshot_kind=snapshot_kind,
+                            query_text=clean_query,
+                            limit=bounded_limit,
+                            eligible=eligible,
+                            selected_entries=tuple(selected_entries),
+                            selected_payloads=tuple(selected_payloads),
+                        )
+                    if rescued is not None:
+                        return rescued
+                return tuple(selected_payloads)
+
+        if cached_entries is None:
+            return None
+        with workflow_span(
+            name="longterm_remote_catalog_cached_selector_search",
+            kind="retrieval",
+            details=_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                result_limit=limit,
+                cached_catalog_entries=len(cached_entries),
+            ),
+        ):
+            selected_entries = self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=cached_entries,
+                query_text=clean_query,
+                limit=limit,
+                eligible=eligible,
+            )
+        if not selected_entries:
+            return ()
+        with workflow_span(
+            name="longterm_remote_catalog_cached_selector_hydrate",
+            kind="retrieval",
+            details=_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                result_limit=limit,
+                cached_catalog_entries=len(cached_entries),
+                candidate_limit=len(selected_entries),
+            ),
+        ):
+            return self.load_item_payloads(
+                snapshot_kind=snapshot_kind,
+                item_ids=(entry.item_id for entry in selected_entries),
+            )
+
+    def _rescue_fast_scope_search_with_current_catalog(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        failure_details: Mapping[str, object],
+    ) -> tuple[dict[str, object], ...] | None:
+        """Recover fast scope reads from the current remote catalog when possible."""
+
+        try:
+            current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        except Exception:
+            return None
+        if not current_entries:
+            return None
+        with workflow_span(
+            name="longterm_remote_catalog_fast_scope_cached_selector_search",
+            kind="retrieval",
+            details={
+                **_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=query_text,
+                    result_limit=limit,
+                    cached_catalog_entries=len(current_entries),
+                ),
+                "rescue_trigger": str(failure_details.get("classification") or "unknown"),
+            },
+        ):
+            selected_entries = self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=current_entries,
+                query_text=query_text,
+                limit=limit,
+            )
+        if not selected_entries:
+            return ()
+        with workflow_span(
+            name="longterm_remote_catalog_fast_scope_cached_selector_hydrate",
+            kind="retrieval",
+            details={
+                **_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=query_text,
+                    result_limit=limit,
+                    cached_catalog_entries=len(current_entries),
+                    candidate_limit=len(selected_entries),
+                ),
+                "rescue_trigger": str(failure_details.get("classification") or "unknown"),
+            },
+        ):
+            payloads = self.load_item_payloads(
+                snapshot_kind=snapshot_kind,
+                item_ids=(entry.item_id for entry in selected_entries),
+            )
+        workflow_event(
+            kind="branch",
+            msg="longterm_remote_catalog_fast_scope_search_rescued",
+            details={
+                "snapshot_kind": snapshot_kind,
+                "result_limit": max(1, int(limit)),
+                "cached_catalog_entries": len(current_entries),
+                "rescued_payload_count": len(payloads),
+                "failure_classification": failure_details.get("classification"),
+                "failure_status_code": failure_details.get("status_code"),
+                "failure_timeout_reason": failure_details.get("timeout_reason"),
+            },
+        )
+        return payloads
+
+    def search_current_item_payloads_fast(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        timeout_s: float | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Run one current-scope top-k read without widening or catalog rescue."""
+
+        clean_query = self._normalize_text(query_text)
+        if not clean_query:
+            return ()
+        remote_state = self._require_remote_state()
+        base_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        read_client = self._client_with_timeout(base_client, timeout_s=timeout_s)
+        scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
+        if not scope_ref or not namespace:
+            raise ChonkyDBError("Current-scope topk_records is required for fast current-scope retrieval.")
+        bounded_limit = max(1, int(limit))
+        definition = self._require_definition(snapshot_kind)
+        fast_read_context = LongTermRemoteReadContext(
+            snapshot_kind=snapshot_kind,
+            operation="fast_topic_topk_search",
+            request_method="POST",
+            request_payload_kind="topk_scope_query",
+            query_text=clean_query,
+            catalog_entry_count=0,
+            allowed_doc_count=0,
+            result_limit=bounded_limit,
+            request_path="/v1/external/retrieve/topk_records",
+            timeout_s=timeout_s,
+            scope_ref=scope_ref,
+            namespace=namespace,
+            attempt_index=1,
+            attempt_count=1,
+            retry_attempts_configured=1,
+            retry_backoff_s=0.0,
+            retry_mode="disabled_for_fast_topic_budget",
+        )
+        started_monotonic = time.monotonic()
+        try:
+            candidates = _run_timed_workflow_step(
+                name="longterm_remote_catalog_fast_scope_search",
+                kind="retrieval",
+                details={
+                    **_trace_search_details(
+                        snapshot_kind=snapshot_kind,
+                        query_text=clean_query,
+                        result_limit=bounded_limit,
+                        scope_ref=scope_ref,
+                        namespace=namespace,
+                        catalog_entry_count=0,
+                    ),
+                    "timeout_s": None if timeout_s is None else round(max(0.0, float(timeout_s)), 3),
+                    "retry_attempts_configured": 1,
+                    "retry_mode": "disabled_for_fast_topic_budget",
+                },
+                operation=lambda: self._search_remote_candidates(
+                    snapshot_kind=snapshot_kind,
+                    read_client=read_client,
+                    query_text=clean_query,
+                    result_limit=bounded_limit,
+                    allowed_doc_ids=(),
+                    scope_ref=scope_ref,
+                    namespace=namespace,
+                    catalog_entry_count=0,
+                    timeout_s=timeout_s,
+                    remote_read_context=fast_read_context,
+                    topk_failure_outcome="failed",
+                ),
+            )
+        except Exception as exc:
+            if isinstance(exc, LongTermRemoteReadFailedError):
+                failure_details = dict(exc.details)
+            else:
+                failure_details = build_remote_read_failure_details(
+                    remote_state=remote_state,
+                    context=fast_read_context,
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="failed",
+                )
+                workflow_event(
+                    kind="warning",
+                    msg="longterm_remote_catalog_fast_scope_search_failed",
+                    details=failure_details,
+                )
+            rescued = self._rescue_fast_scope_search_with_current_catalog(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                limit=bounded_limit,
+                failure_details=failure_details,
+            )
+            if rescued is not None:
+                return rescued
+            if isinstance(exc, LongTermRemoteReadFailedError):
+                raise
+            raise LongTermRemoteReadFailedError(
+                "Required remote long-term fast-topic retrieval failed.",
+                details=failure_details,
+            ) from exc
+        selected_payloads: list[dict[str, object]] = []
+        seen_item_ids: set[str] = set()
+        for candidate in candidates:
+            entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
+            if entry is None or entry.item_id in seen_item_ids:
+                continue
+            payload = self._extract_item_payload(
+                definition=definition,
+                item_id=entry.item_id,
+                payload=candidate,
+            )
+            if not isinstance(payload, Mapping):
+                continue
+            payload_dict = dict(payload)
+            self._store_item_payload(
+                snapshot_kind=snapshot_kind,
+                item_id=entry.item_id,
+                payload=payload_dict,
+            )
+            selected_payloads.append(payload_dict)
+            seen_item_ids.add(entry.item_id)
+            if len(selected_payloads) >= bounded_limit:
+                break
+        return tuple(selected_payloads)
+
+    def _rescue_scope_search_payloads_with_current_catalog(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None,
+        selected_entries: tuple[LongTermRemoteCatalogEntry, ...],
+        selected_payloads: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...] | None:
+        """Reconcile empty/stale scope-search hits against the current catalog head."""
+
+        current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        if not current_entries:
+            return ()
+        current_by_id = {entry.item_id: entry for entry in current_entries}
+        needs_rescue = not selected_payloads
+        if not needs_rescue:
+            for entry, payload in zip(selected_entries, selected_payloads, strict=False):
+                current_entry = current_by_id.get(entry.item_id)
+                if current_entry is None:
+                    needs_rescue = True
+                    break
+                current_sha256 = self._normalize_text(current_entry.metadata.get("payload_sha256"))
+                if not current_sha256:
+                    continue
+                if self._payload_sha256(payload) != current_sha256:
+                    needs_rescue = True
+                    break
+        if not needs_rescue:
+            return None
+        selected_catalog_entries = self._local_search_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            entries=current_entries,
+            query_text=query_text,
+            limit=limit,
+            eligible=eligible,
+        )
+        if not selected_catalog_entries:
+            return ()
+        return self.load_item_payloads(
+            snapshot_kind=snapshot_kind,
+            item_ids=(entry.item_id for entry in selected_catalog_entries),
+        )
+
+    def _initial_scope_search_limit(
+        self,
+        *,
+        bounded_limit: int,
+        max_request_limit: int,
+        requires_client_filter: bool,
+    ) -> int:
+        """Choose the first one-shot top-k window for current-scope searches."""
+
+        if not requires_client_filter:
+            return bounded_limit
+        return min(
+            max_request_limit,
+            max(bounded_limit * 8, min(max_request_limit, 16)),
+        )
+
+    def search_catalog_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+    ) -> tuple[LongTermRemoteCatalogEntry, ...]:
+        """Search one loaded catalog locally against the current remote projection."""
+
+        all_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        if not all_entries:
+            return ()
+        entries = tuple(entry for entry in all_entries if eligible is None or eligible(entry))
+        if not entries:
+            return ()
+        result_limit = max(1, int(limit))
+        if len(entries) <= result_limit:
+            return tuple(entries[:result_limit])
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        allowed_doc_ids = [
+            entry.document_id
+            for entry in entries
+            if isinstance(entry.document_id, str) and entry.document_id
+        ]
+        if not allowed_doc_ids:
+            return ()
+        filtered_item_ids = tuple(entry.item_id for entry in entries)
+        by_item_id = {entry.item_id: entry for entry in entries}
+        topk_scope_ref, topk_namespace = self._topk_scope_request_context(
+            snapshot_kind=snapshot_kind,
+            entries=entries,
+            all_entries=all_entries,
+        )
+        definition = self._require_definition(snapshot_kind)
+        try:
+            candidates = _run_timed_workflow_step(
+                name="longterm_remote_catalog_search_catalog_remote",
+                kind="retrieval",
+                details=_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    scope_ref=topk_scope_ref,
+                    namespace=topk_namespace,
+                    catalog_entry_count=len(entries),
+                ),
+                operation=lambda: self._search_remote_candidates(
+                    snapshot_kind=snapshot_kind,
+                    read_client=read_client,
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    allowed_doc_ids=tuple(allowed_doc_ids),
+                    scope_ref=topk_scope_ref,
+                    namespace=topk_namespace,
+                    catalog_entry_count=len(entries),
+                ),
+            )
+        except Exception:
+            return self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
+        if not candidates:
+            return self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
+
+        selected: list[LongTermRemoteCatalogEntry] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            metadata = candidate.get("metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            item_id = self._normalize_item_id(metadata.get("twinr_memory_item_id"))
+            if not item_id or item_id in seen:
+                continue
+            entry = by_item_id.get(item_id)
+            if entry is None:
+                continue
+            cached_payload = self._extract_item_payload(
+                definition=definition,
+                item_id=item_id,
+                payload=candidate,
+            )
+            if cached_payload is not None:
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=item_id,
+                    payload=cached_payload,
+                )
+            selected.append(entry)
+            seen.add(item_id)
+            if len(selected) >= max(1, int(limit)):
+                break
+        if not selected:
+            return self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
+        self._store_search_result(
+            snapshot_kind=snapshot_kind,
+            query_text=query_text,
+            limit=result_limit,
+            filtered_item_ids=filtered_item_ids,
+            selected_item_ids=tuple(entry.item_id for entry in selected),
+        )
+        return tuple(selected)
+
+    def _search_remote_candidates(
+        self,
+        *,
+        snapshot_kind: str,
+        read_client: object,
+        query_text: str,
+        result_limit: int,
+        allowed_doc_ids: tuple[str, ...],
+        scope_ref: str | None = None,
+        namespace: str | None = None,
+        catalog_entry_count: int,
+        timeout_s: float | None = None,
+        remote_read_context: LongTermRemoteReadContext | None = None,
+        topk_failure_outcome: str = "fallback",
+    ) -> tuple[Mapping[str, object], ...]:
+        """Run remote search, preferring one-shot structured top-k responses."""
+
+        remote_state = self._require_remote_state()
+        scope_search = bool(scope_ref and namespace)
+        retrieve_fallback_allowed = bool(allowed_doc_ids) or not scope_search
+        topk_records = getattr(read_client, "topk_records", None)
+        supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        workflow_decision(
+            msg="longterm_remote_catalog_search_api",
+            question="Which remote API contract should serve this catalog candidate search?",
+            selected={
+                "id": "topk_records" if supports_topk_records and callable(topk_records) else "retrieve",
+                "summary": (
+                    "Use one-shot structured top-k retrieval."
+                    if supports_topk_records and callable(topk_records)
+                    else "Use the legacy retrieve endpoint."
+                ),
+            },
+            options=[
+                {
+                    "id": "topk_records",
+                    "summary": "Request structured top-k records directly from ChonkyDB.",
+                    "score_components": {
+                        "supports_topk_records": bool(supports_topk_records and callable(topk_records)),
+                        "scope_search": scope_search,
+                    },
+                    "constraints_violated": [] if supports_topk_records and callable(topk_records) else ["topk_records_unavailable"],
+                },
+                {
+                    "id": "retrieve",
+                    "summary": "Use the legacy retrieve endpoint with ranked candidate handles.",
+                    "score_components": {
+                        "retrieve_fallback_allowed": retrieve_fallback_allowed,
+                        "allowed_doc_count": len(allowed_doc_ids),
+                    },
+                    "constraints_violated": [] if retrieve_fallback_allowed else ["scope_search_requires_topk_records"],
+                },
+            ],
+            context=_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=query_text,
+                result_limit=result_limit,
+                allowed_doc_count=len(allowed_doc_ids),
+                scope_ref=scope_ref,
+                namespace=namespace,
+                catalog_entry_count=catalog_entry_count,
+            ),
+            confidence="high",
+            guardrails=[
+                "Prefer topk_records whenever the backend supports structured one-shot responses.",
+                "Use retrieve only when allowed_doc_ids or non-scope searches make fallback safe.",
+            ],
+            kpi_impact_estimate={
+                "retrieve_fallback_allowed": retrieve_fallback_allowed,
+            },
+        )
+        last_topk_error: Exception | None = None
+        topk_context = remote_read_context or LongTermRemoteReadContext(
+            snapshot_kind=snapshot_kind,
+            operation="topk_search",
+            request_method="POST",
+            request_payload_kind="topk_scope_query" if scope_ref and namespace else "topk_allowed_doc_query",
+            query_text=query_text,
+            catalog_entry_count=catalog_entry_count,
+            allowed_doc_count=len(allowed_doc_ids),
+            result_limit=result_limit,
+            request_path="/v1/external/retrieve/topk_records",
+            timeout_s=timeout_s,
+            scope_ref=scope_ref,
+            namespace=namespace,
+        )
+        if supports_topk_records and callable(topk_records):
+            started_monotonic = time.monotonic()
+            try:
+                response = _run_timed_workflow_step(
+                    name="longterm_remote_catalog_topk_request",
+                    kind="http",
+                    details=_trace_search_details(
+                        snapshot_kind=snapshot_kind,
+                        query_text=query_text,
+                        result_limit=result_limit,
+                        allowed_doc_count=len(allowed_doc_ids),
+                        scope_ref=scope_ref,
+                        namespace=namespace,
+                        catalog_entry_count=catalog_entry_count,
+                    ),
+                    operation=lambda: topk_records(
+                        ChonkyDBTopKRecordsRequest(
+                            query_text=query_text,
+                            result_limit=result_limit,
+                            include_content=False,
+                            include_metadata=True,
+                            allowed_doc_ids=None if scope_ref and namespace else allowed_doc_ids,
+                            namespace=namespace,
+                            scope_ref=scope_ref,
+                            timeout_seconds=timeout_s,
+                        )
+                    ),
+                )
+                record_remote_read_observation(
+                    remote_state=remote_state,
+                    context=topk_context,
+                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                    outcome="ok",
+                    classification="ok",
+                )
+                return tuple(self._iter_retrieve_result_candidates(response))
+            except Exception as exc:
+                last_topk_error = exc
+                record_remote_read_diagnostic(
+                    remote_state=remote_state,
+                    context=topk_context,
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome=topk_failure_outcome,
+                )
+
+        if not retrieve_fallback_allowed:
+            if last_topk_error is not None:
+                raise last_topk_error
+            raise ChonkyDBError(
+                "ChonkyDB topk_records is required for current-scope remote retrieval",
+            )
+
+        if last_topk_error is not None:
+            workflow_event(
+                kind="branch",
+                msg="longterm_remote_catalog_fallback_to_retrieve",
+                level="WARNING",
+                details=_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    scope_ref=scope_ref,
+                    namespace=namespace,
+                    catalog_entry_count=catalog_entry_count,
+                ),
+                reason={
+                    "selected": {"id": "retrieve", "summary": "Structured top-k failed; fall back to retrieve."},
+                    "options": [
+                        {"id": "retrieve", "summary": "Use the legacy retrieve endpoint.", "constraints_violated": []},
+                        {"id": "raise_topk_error", "summary": "Abort immediately on top-k failure.", "constraints_violated": ["fallback_is_safe_for_this_search"]},
+                    ],
+                },
+            )
+        started_monotonic = time.monotonic()
+        try:
+            response = _run_timed_workflow_step(
+                name="longterm_remote_catalog_retrieve_request",
+                kind="http",
+                details=_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    scope_ref=scope_ref,
+                    namespace=namespace,
+                    catalog_entry_count=catalog_entry_count,
+                ),
+                operation=lambda: read_client.retrieve(
+                    ChonkyDBRetrieveRequest(
+                        query_text=query_text,
+                        result_limit=result_limit,
+                        include_content=False,
+                        include_metadata=True,
+                        allowed_doc_ids=allowed_doc_ids,
+                    )
+                ),
+            )
+        except Exception as exc:
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="retrieve_search",
+                    request_method="POST",
+                    request_payload_kind="retrieve_allowed_doc_query",
+                    query_text=query_text,
+                    catalog_entry_count=catalog_entry_count,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    result_limit=result_limit,
+                    request_path="/v1/external/retrieve",
+                ),
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="degraded",
+            )
+            raise
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=LongTermRemoteReadContext(
+                snapshot_kind=snapshot_kind,
+                operation="retrieve_search",
+                request_method="POST",
+                request_payload_kind="retrieve_allowed_doc_query",
+                query_text=query_text,
+                catalog_entry_count=catalog_entry_count,
+                allowed_doc_count=len(allowed_doc_ids),
+                result_limit=result_limit,
+                request_path="/v1/external/retrieve",
+            ),
+            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+            outcome="ok",
+            classification="ok",
+        )
+        return tuple(self._iter_retrieve_result_candidates(response))
+
+    def _topk_scope_request_context(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+        all_entries: tuple[LongTermRemoteCatalogEntry, ...],
+    ) -> tuple[str | None, str | None]:
+        """Return the server-side scope context for full current-snapshot searches only."""
+
+        if len(entries) != len(all_entries):
+            return None, None
+        return self._current_scope_request_context(snapshot_kind=snapshot_kind)
+
+    def _local_search_catalog_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+    ) -> tuple[LongTermRemoteCatalogEntry, ...]:
+        """Rank already-loaded catalog entries locally through the cached selector."""
+
+        bounded_limit = max(1, int(limit))
+        cached_selector = self._local_search_selector(snapshot_kind=snapshot_kind, entries=entries)
+        selector = self._build_local_search_selector(entries=entries) if cached_selector is None else cached_selector.selector
+        by_item_id = {entry.item_id: entry for entry in entries} if cached_selector is None else cached_selector.by_item_id
+        search_limit = bounded_limit if eligible is None else len(entries)
+        selected_ids = selector.search(
+            query_text,
+            limit=max(1, search_limit),
+            category="remote_catalog",
+            allow_fallback=False,
+        )
+        selected: list[LongTermRemoteCatalogEntry] = []
+        for item_id in selected_ids:
+            entry = by_item_id.get(item_id)
+            if entry is None:
+                continue
+            if eligible is not None and not eligible(entry):
+                continue
+            selected.append(entry)
+            if len(selected) >= bounded_limit:
+                break
+        return tuple(selected)
+
+    def _catalog_entry_search_text(self, entry: LongTermRemoteCatalogEntry) -> str:
+        """Build one local fallback search document from catalog metadata."""
+
+        parts: list[str] = [entry.item_id]
+        for field_name in self._catalog_entry_text_fields():
+            value = self._normalize_text(entry.metadata.get(field_name))
+            if value:
+                parts.append(value)
+        for field_name in self._catalog_entry_list_fields():
+            values = self._normalize_text_list(entry.metadata.get(field_name))
+            if values:
+                parts.extend(values)
+        return " ".join(parts)
+
+    def top_catalog_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+        preserve_order: bool = False,
+    ) -> tuple[LongTermRemoteCatalogEntry, ...]:
+        """Return current catalog entries ordered either by recency or catalog order."""
+
+        entries = [
+            entry
+            for entry in self.load_catalog_entries(snapshot_kind=snapshot_kind)
+            if eligible is None or eligible(entry)
+        ]
+        if not preserve_order:
+            entries.sort(key=lambda entry: (entry.updated_at(), entry.item_id), reverse=True)
+        return tuple(entries[: max(1, int(limit))])
+
+
+__all__ = [
+    "RemoteCatalogSearchMixin",
+]

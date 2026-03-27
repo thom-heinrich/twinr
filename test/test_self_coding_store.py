@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -17,8 +18,10 @@ from twinr.agent.self_coding import (
     FeasibilityOutcome,
     FeasibilityResult,
     LearnedSkillStatus,
+    LiveE2EStatusRecord,
     RequirementsDialogueSession,
     RequirementsDialogueStatus,
+    SkillHealthRecord,
     SelfCodingStore,
     self_coding_store_root,
 )
@@ -156,6 +159,57 @@ class SelfCodingStoreTests(unittest.TestCase):
         self.assertEqual(loaded.status, LearnedSkillStatus.ACTIVE)
         self.assertEqual(tuple(record.version for record in listed), (2, 1))
         self.assertEqual(by_job.version, 2)
+
+    def test_operator_readable_records_use_cross_service_file_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SelfCodingStore.from_project_root(temp_dir)
+            activation = store.save_activation(
+                ActivationRecord(
+                    skill_id="morning_briefing",
+                    skill_name="Morning Briefing",
+                    version=4,
+                    status=LearnedSkillStatus.ACTIVE,
+                    job_id="job_morning_briefing_v4",
+                    artifact_id="artifact_morning_briefing_v4",
+                )
+            )
+            store.save_skill_health(
+                SkillHealthRecord(
+                    skill_id="morning_briefing",
+                    version=4,
+                    status="healthy",
+                    trigger_count=1,
+                    delivered_count=1,
+                    error_count=0,
+                )
+            )
+            execution = store.save_execution_run(
+                run_id="run_morning_briefing_v4",
+                run_kind="scheduled",
+                skill_id="morning_briefing",
+                version=4,
+                status="completed",
+            )
+            store.save_live_e2e_status(
+                LiveE2EStatusRecord(
+                    suite_id="morning_briefing",
+                    environment="pi",
+                    status="passed",
+                    duration_seconds=12.5,
+                    model="gpt-5-codex",
+                    reasoning_effort="high",
+                )
+            )
+
+            activation_mode = os.stat(store._activation_path(activation.skill_id, activation.version)).st_mode & 0o777
+            health_mode = os.stat(store._health_path("morning_briefing", 4)).st_mode & 0o777
+            execution_mode = os.stat(store._execution_run_path(execution.run_id)).st_mode & 0o777
+            live_e2e_mode = os.stat(store._live_e2e_path("morning_briefing", "pi")).st_mode & 0o777
+
+        self.assertEqual(activation_mode, 0o644)
+        self.assertEqual(health_mode, 0o644)
+        self.assertEqual(execution_mode, 0o644)
+        self.assertEqual(live_e2e_mode, 0o644)
 
 
 if __name__ == "__main__":

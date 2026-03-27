@@ -9,6 +9,8 @@ back into the realtime loop.
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
 import os
 import select
 import shutil
@@ -30,6 +32,7 @@ from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceFollowUpClosedEvent,
     OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceRuntimeStateEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
@@ -37,6 +40,14 @@ from twinr.orchestrator.voice_contracts import (
 )
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.orchestrator.voice_forensics import VoiceFrameTelemetryBucket
+
+
+@dataclass(slots=True)
+class _BufferedRemoteAudioFrame:
+    """Keep a short rolling copy of streamed remote-listening audio."""
+
+    pcm_bytes: bytes
+    duration_ms: int
 
 
 class EdgeVoiceOrchestrator:
@@ -57,6 +68,7 @@ class EdgeVoiceOrchestrator:
         on_transcript_committed: Callable[[str, str], bool],
         on_follow_up_closed: Callable[[str], None] | None = None,
         on_barge_in_interrupt: Callable[[], bool],
+        on_recent_remote_audio: Callable[[bytes, str], object] | None = None,
         forensics: WorkflowForensics | None = None,
     ) -> None:
         self.config = config
@@ -65,10 +77,16 @@ class EdgeVoiceOrchestrator:
         self._on_transcript_committed = on_transcript_committed
         self._on_follow_up_closed = on_follow_up_closed
         self._on_barge_in_interrupt = on_barge_in_interrupt
-        self._device = resolve_capture_device(
-            config.voice_orchestrator_audio_device,
-            config.proactive_audio_input_device,
-            config.audio_input_device,
+        self._on_recent_remote_audio = on_recent_remote_audio
+        explicit_voice_device = str(config.voice_orchestrator_audio_device or "").strip()
+        self._device = (
+            explicit_voice_device
+            if explicit_voice_device
+            else resolve_capture_device(
+                config.voice_orchestrator_audio_device,
+                config.proactive_audio_input_device,
+                config.audio_input_device,
+            )
         )
         self._sample_rate = int(config.audio_sample_rate)
         self._channels = int(config.audio_channels)
@@ -94,6 +112,7 @@ class EdgeVoiceOrchestrator:
         self._connected = False
         self._next_reconnect_at = 0.0
         self._last_runtime_state: OrchestratorVoiceRuntimeStateEvent | None = None
+        self._last_identity_profiles: OrchestratorVoiceIdentityProfilesEvent | None = None
         self._ready_backend: str | None = None
         self._forensics = forensics if isinstance(forensics, WorkflowForensics) and forensics.enabled else None
         self._trace_id = self._session_id
@@ -102,6 +121,12 @@ class EdgeVoiceOrchestrator:
             speech_threshold=self._speech_threshold,
         )
         self._skipped_frame_count = 0
+        self._recent_remote_audio_buffer_ms = max(
+            4000,
+            int(getattr(config, "voice_profile_passive_update_min_duration_ms", 2500) or 2500)
+            + 1500,
+        )
+        self._recent_remote_frames: deque[_BufferedRemoteAudioFrame] = deque()
 
     def _trace_event(
         self,
@@ -167,6 +192,7 @@ class EdgeVoiceOrchestrator:
                 speech_threshold=self._speech_threshold,
             )
             self._skipped_frame_count = 0
+            self._recent_remote_frames.clear()
             try:
                 self._connect_client()
             except Exception as exc:
@@ -202,6 +228,7 @@ class EdgeVoiceOrchestrator:
             self._connected = False
             self._next_reconnect_at = 0.0
             self._ready_backend = None
+            self._recent_remote_frames.clear()
 
     def __enter__(self) -> "EdgeVoiceOrchestrator":
         return self.open()
@@ -234,6 +261,8 @@ class EdgeVoiceOrchestrator:
         recommended_channel: str | None = None,
         speaker_associated: bool | None = None,
         speaker_association_confidence: float | None = None,
+        background_media_likely: bool | None = None,
+        speech_overlap_likely: bool | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Send the current edge runtime state to the server."""
@@ -251,6 +280,8 @@ class EdgeVoiceOrchestrator:
             recommended_channel=recommended_channel,
             speaker_associated=speaker_associated,
             speaker_association_confidence=speaker_association_confidence,
+            background_media_likely=background_media_likely,
+            speech_overlap_likely=speech_overlap_likely,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
@@ -281,6 +312,8 @@ class EdgeVoiceOrchestrator:
         recommended_channel: str | None = None,
         speaker_associated: bool | None = None,
         speaker_association_confidence: float | None = None,
+        background_media_likely: bool | None = None,
+        speech_overlap_likely: bool | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> None:
         """Cache one runtime state before the websocket opens.
@@ -305,6 +338,8 @@ class EdgeVoiceOrchestrator:
             recommended_channel=recommended_channel,
             speaker_associated=speaker_associated,
             speaker_association_confidence=speaker_association_confidence,
+            background_media_likely=background_media_likely,
+            speech_overlap_likely=speech_overlap_likely,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
         with self._state_lock:
@@ -322,9 +357,28 @@ class EdgeVoiceOrchestrator:
 
         return True
 
+    def notify_identity_profiles(
+        self,
+        event: OrchestratorVoiceIdentityProfilesEvent,
+    ) -> None:
+        """Cache and, when connected, send the current household voice profiles."""
+
+        self._last_identity_profiles = event
+        if not self._ensure_connected():
+            return
+        try:
+            with self._runtime_state_send_lock:
+                self._client.send_identity_profiles(event)
+        except Exception as exc:
+            self._mark_disconnected(
+                emit_message=f"voice_orchestrator_identity_failed={type(exc).__name__}",
+                retry_delay_s=0.0,
+            )
+
     def _connect_client(self) -> None:
         with self._state_lock:
             last_runtime_state = self._last_runtime_state
+            last_identity_profiles = self._last_identity_profiles
         self._client.open()
         self._client.send_hello(self._build_hello_request(last_runtime_state))
         self._connected = True
@@ -334,12 +388,20 @@ class EdgeVoiceOrchestrator:
                 current_runtime_state = self._last_runtime_state
             if current_runtime_state is not None:
                 self._client.send_runtime_state(current_runtime_state)
+            if last_identity_profiles is not None:
+                self._client.send_identity_profiles(last_identity_profiles)
         self._trace_event(
             "voice_edge_client_connected",
             kind="io",
             details={
                 "state_attested": current_runtime_state is not None,
                 "initial_state": current_runtime_state.state if current_runtime_state is not None else "waiting",
+                "identity_profiles_revision": (
+                    last_identity_profiles.revision if last_identity_profiles is not None else None
+                ),
+                "identity_profiles_count": (
+                    len(last_identity_profiles.profiles) if last_identity_profiles is not None else 0
+                ),
             },
         )
 
@@ -358,6 +420,8 @@ class EdgeVoiceOrchestrator:
         recommended_channel: str | None = None,
         speaker_associated: bool | None = None,
         speaker_association_confidence: float | None = None,
+        background_media_likely: bool | None = None,
+        speech_overlap_likely: bool | None = None,
         voice_quiet_until_utc: str | None = None,
     ) -> OrchestratorVoiceRuntimeStateEvent:
         """Construct one normalized runtime-state event for caching and send."""
@@ -375,6 +439,8 @@ class EdgeVoiceOrchestrator:
             recommended_channel=recommended_channel,
             speaker_associated=speaker_associated,
             speaker_association_confidence=speaker_association_confidence,
+            background_media_likely=background_media_likely,
+            speech_overlap_likely=speech_overlap_likely,
             voice_quiet_until_utc=voice_quiet_until_utc,
         )
 
@@ -407,6 +473,12 @@ class EdgeVoiceOrchestrator:
             speaker_associated=runtime_state.speaker_associated if runtime_state is not None else None,
             speaker_association_confidence=(
                 runtime_state.speaker_association_confidence if runtime_state is not None else None
+            ),
+            background_media_likely=(
+                runtime_state.background_media_likely if runtime_state is not None else None
+            ),
+            speech_overlap_likely=(
+                runtime_state.speech_overlap_likely if runtime_state is not None else None
             ),
             voice_quiet_until_utc=runtime_state.voice_quiet_until_utc if runtime_state is not None else None,
             state_attested=runtime_state is not None,
@@ -571,6 +643,7 @@ class EdgeVoiceOrchestrator:
                     runtime_state=latest_runtime_state,
                 )
             )
+            self._remember_recent_remote_frame(pcm_bytes)
             self._skipped_frame_count = 0
             self._sent_frame_bucket.add_frame(sequence=self._sequence, pcm_bytes=pcm_bytes)
             if self._sent_frame_bucket.should_flush():
@@ -588,6 +661,46 @@ class EdgeVoiceOrchestrator:
                 retry_delay_s=0.0,
             )
 
+    def _remember_recent_remote_frame(self, pcm_bytes: bytes) -> None:
+        """Retain a short rolling audio buffer for remote commit/passive update use."""
+
+        if not pcm_bytes:
+            return
+        frame = _BufferedRemoteAudioFrame(
+            pcm_bytes=bytes(pcm_bytes),
+            duration_ms=self._chunk_ms,
+        )
+        self._recent_remote_frames.append(frame)
+        buffered_ms = sum(item.duration_ms for item in self._recent_remote_frames)
+        while buffered_ms > self._recent_remote_audio_buffer_ms and self._recent_remote_frames:
+            removed = self._recent_remote_frames.popleft()
+            buffered_ms = max(0, buffered_ms - removed.duration_ms)
+
+    def _recent_remote_audio_bytes(self) -> bytes:
+        """Return the buffered remote-user audio window in chronological order."""
+
+        return b"".join(frame.pcm_bytes for frame in self._recent_remote_frames)
+
+    def _emit_recent_remote_audio(self, *, source: str) -> None:
+        """Forward the latest buffered remote audio to the runtime when needed."""
+
+        callback = self._on_recent_remote_audio
+        if callback is None:
+            return
+        pcm_bytes = self._recent_remote_audio_bytes()
+        if not pcm_bytes:
+            return
+        try:
+            callback(pcm_bytes, source)
+        except Exception as exc:
+            self._trace_event(
+                "voice_edge_recent_remote_audio_callback_failed",
+                kind="warning",
+                level="WARN",
+                details={"source": source, "error_type": type(exc).__name__},
+            )
+            self.emit(f"voice_orchestrator_recent_audio_failed={type(exc).__name__}")
+
     def _handle_server_event(self, event) -> None:
         if isinstance(event, OrchestratorVoiceReadyEvent):
             self._ready_backend = str(event.backend or "").strip().lower() or None
@@ -601,6 +714,7 @@ class EdgeVoiceOrchestrator:
             self._next_reconnect_at = 0.0
             return
         if isinstance(event, OrchestratorVoiceWakeConfirmedEvent):
+            self._emit_recent_remote_audio(source="wake")
             self._trace_event(
                 "voice_edge_server_wake_confirmed",
                 kind="decision",
@@ -624,6 +738,7 @@ class EdgeVoiceOrchestrator:
             )
             return
         if isinstance(event, OrchestratorVoiceTranscriptCommittedEvent):
+            self._emit_recent_remote_audio(source=event.source)
             self._trace_event(
                 "voice_edge_server_transcript_committed",
                 kind="decision",

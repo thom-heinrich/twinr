@@ -2,6 +2,26 @@
 {% from "_form_fields.html" import render_setting_field %}
 
 {% block content %}
+{% if shortcut_cards %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Open a setup area</h2>
+      <p class="section-description">These deeper pages stay grouped under Settings so the main navigation can stay short.</p>
+    </div>
+  </div>
+  <section class="card-grid">
+    {% for card in shortcut_cards %}
+    <a class="card" href="{{ card.href }}">
+      <div class="card-title">{{ card.title }}</div>
+      <div class="card-value">{{ card.value }}</div>
+      <div class="card-detail">{{ card.detail }}</div>
+    </a>
+    {% endfor %}
+  </section>
+</section>
+{% endif %}
+
 <form method="post" action="{{ form_action }}" class="stack">
   {% for section in sections %}
   <section class="panel">

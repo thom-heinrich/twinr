@@ -56,8 +56,8 @@
           </div>
         </div>
         <nav class="nav">
-          {% for key, label, href in nav_items %}
-          <a class="nav-link {% if active_page == key %}active{% endif %}" href="{{ href }}">{{ label }}</a>
+          {% for key, label, href, is_active in nav_items %}
+          <a class="nav-link {% if is_active %}active{% endif %}" href="{{ href }}">{{ label }}</a>
           {% endfor %}
         </nav>
       </aside>

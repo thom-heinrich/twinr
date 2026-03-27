@@ -17,7 +17,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
-from twinr.agent.base_agent import RuntimeSnapshot, RuntimeSnapshotStore, TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
 from twinr.agent.self_coding.store import SelfCodingStore
 from twinr.automations import AutomationStore
 from twinr.integrations import TwinrIntegrationStore
@@ -271,7 +272,7 @@ class WebAppContext:
                 "request": request,
                 "page_title": page_title,
                 "active_page": active_page,
-                "nav_items": _nav_items(),
+                "nav_items": _nav_items(active_page),
                 "saved": saved,
                 "error_message": error_message,
                 "restart_notice": restart_notice,

@@ -1,0 +1,729 @@
+"""Observation recording and composition layer for the coordinator.
+
+Purpose: keep changed-only ops recording at the historic mixin path while
+delegating display/camera-surface bridges and automation-fact assembly into
+focused sibling mixins.
+
+Invariants: fact payloads, rising-edge event names, ops-event schemas, and
+display helper calls must remain compatible with the legacy implementation.
+"""
+
+# mypy: ignore-errors
+
+from __future__ import annotations
+
+from typing import Callable, cast
+
+from .coordinator_observation_display import ProactiveCoordinatorObservationDisplayMixin
+from .coordinator_observation_facts import ProactiveCoordinatorObservationFactsMixin
+from twinr.hardware.respeaker import resolve_respeaker_indicator_state
+from twinr.proactive.runtime.service_impl.compat import (
+    _VISION_REVIEW_FAIL_OPEN_TRIGGERS,
+    _format_firmware_version,
+    _record_respeaker_dead_capture_blocker,
+    _round_optional_ratio,
+    _round_optional_seconds,
+)
+
+from ...social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision
+from ..audio_policy import ReSpeakerAudioPolicySnapshot
+from ..runtime_contract import is_respeaker_runtime_hard_block
+
+
+class ProactiveCoordinatorObservationMixin(
+    ProactiveCoordinatorObservationDisplayMixin,
+    ProactiveCoordinatorObservationFactsMixin,
+):
+    """Provide changed-only ops recording plus composed observation helpers."""
+
+    def _is_low_motion(self, now: float, *, motion_active: bool) -> bool:
+        """Return whether recent PIR history qualifies as low motion."""
+
+        if motion_active:
+            return False
+        if self._last_motion_at is None:
+            return False
+        return (now - self._last_motion_at) >= self.config.proactive_low_motion_after_s
+
+    def _note_audio_observer_runtime_context(
+        self,
+        *,
+        now: float,
+        motion_active: bool,
+        inspect_requested: bool,
+        runtime_status_value: str,
+    ) -> None:
+        """Forward current runtime context to schedulable audio observers."""
+
+        callback = getattr(self.audio_observer, "note_runtime_context", None)
+        if not callable(callback):
+            return
+        note_runtime_context = cast(Callable[..., None], callback)
+        presence_snapshot = self.latest_presence_snapshot
+        note_runtime_context(
+            observed_at=now,
+            motion_active=motion_active,
+            inspect_requested=inspect_requested,
+            presence_session_armed=bool(
+                presence_snapshot is not None and getattr(presence_snapshot, "armed", False)
+            ),
+            assistant_output_active=runtime_status_value == "answering",
+        )
+
+    def _observe_audio_policy(
+        self,
+        *,
+        now: float,
+        audio_observation: SocialAudioObservation,
+    ) -> ReSpeakerAudioPolicySnapshot:
+        """Derive one conservative ReSpeaker policy snapshot for this tick."""
+
+        snapshot = self.audio_policy_tracker.observe(now=now, audio=audio_observation)
+        self.latest_audio_policy_snapshot = snapshot
+        return snapshot
+
+    def _record_observation_if_changed(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+        vision_snapshot=None,
+        audio_snapshot=None,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None,
+        presence_snapshot=None,
+        runtime_status_value: str | None = None,
+    ) -> None:
+        """Append one observation event only when the visible state changed."""
+
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        observation_key = (
+            inspected,
+            runtime_status_value,
+            observation.pir_motion_detected,
+            observation.low_motion,
+            observation.vision.person_visible,
+            observation.vision.looking_toward_device,
+            observation.vision.body_pose.value,
+            observation.vision.smiling,
+            observation.vision.hand_or_object_near_camera,
+            observation.audio.speech_detected,
+            observation.audio.distress_detected,
+            observation.audio.assistant_output_active,
+            observation.audio.device_runtime_mode,
+            observation.audio.host_control_ready,
+            observation.audio.transport_reason,
+            observation.audio.non_speech_audio_likely,
+            observation.audio.background_media_likely,
+            observation.audio.signal_source,
+            observation.audio.direction_confidence,
+            observation.audio.speech_overlap_likely,
+            observation.audio.barge_in_detected,
+            observation.audio.mute_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.initiative_block_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code,
+            None if presence_snapshot is None else presence_snapshot.armed,
+            None if presence_snapshot is None else presence_snapshot.reason,
+            presence_session_id,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.state,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.associated,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.confidence,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.ready,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.confidence,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.block_reason,
+            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.guard_active,
+            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.reason,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.state,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.matches_main_user,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.claim.confidence,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.state,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.matches_reference_user,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.claim.confidence,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.state,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.matches_main_user,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.claim.confidence,
+            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.state,
+            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.claim.confidence,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source,
+        )
+        if observation_key == self._last_observation_key:
+            return
+        if not inspected and self._last_observation_key is None:
+            self._last_observation_key = observation_key
+            return
+        self._last_observation_key = observation_key
+        if audio_policy_snapshot is not None:
+            self._record_respeaker_runtime_alert_if_changed(
+                observation.audio,
+                audio_policy_snapshot=audio_policy_snapshot,
+            )
+        indicator_state = self._indicator_state_for_observation(
+            observation=observation,
+            audio_policy_snapshot=audio_policy_snapshot,
+            runtime_status_value=runtime_status_value,
+        )
+        data = {
+            "inspected": inspected,
+            "runtime_status": runtime_status_value,
+            "pir_motion_detected": observation.pir_motion_detected,
+            "low_motion": observation.low_motion,
+            "person_visible": observation.vision.person_visible,
+            "camera_person_count": observation.vision.person_count,
+            "camera_primary_person_zone": observation.vision.primary_person_zone.value,
+            "camera_primary_person_center_x": _round_optional_ratio(observation.vision.primary_person_center_x),
+            "camera_primary_person_center_y": _round_optional_ratio(observation.vision.primary_person_center_y),
+            "looking_toward_device": observation.vision.looking_toward_device,
+            "camera_person_near_device": observation.vision.person_near_device,
+            "camera_engaged_with_device": observation.vision.engaged_with_device,
+            "camera_visual_attention_score": _round_optional_ratio(observation.vision.visual_attention_score),
+            "body_pose": observation.vision.body_pose.value,
+            "camera_pose_confidence": _round_optional_ratio(observation.vision.pose_confidence),
+            "camera_motion_state": observation.vision.motion_state.value,
+            "camera_motion_confidence": _round_optional_ratio(observation.vision.motion_confidence),
+            "smiling": observation.vision.smiling,
+            "hand_or_object_near_camera": observation.vision.hand_or_object_near_camera,
+            "camera_gesture_event": observation.vision.gesture_event.value,
+            "camera_gesture_confidence": _round_optional_ratio(observation.vision.gesture_confidence),
+            "camera_fine_hand_gesture": observation.vision.fine_hand_gesture.value,
+            "camera_fine_hand_gesture_confidence": _round_optional_ratio(
+                observation.vision.fine_hand_gesture_confidence
+            ),
+            "camera_online": observation.vision.camera_online,
+            "camera_ready": observation.vision.camera_ready,
+            "camera_ai_ready": observation.vision.camera_ai_ready,
+            "camera_error": observation.vision.camera_error,
+            "speech_detected": observation.audio.speech_detected,
+            "distress_detected": observation.audio.distress_detected,
+            "audio_room_quiet": observation.audio.room_quiet,
+            "audio_recent_speech_age_s": _round_optional_seconds(observation.audio.recent_speech_age_s),
+            "audio_assistant_output_active": observation.audio.assistant_output_active,
+            "audio_azimuth_deg": observation.audio.azimuth_deg,
+            "audio_direction_confidence": observation.audio.direction_confidence,
+            "audio_signal_source": observation.audio.signal_source,
+            "audio_device_runtime_mode": observation.audio.device_runtime_mode,
+            "audio_host_control_ready": observation.audio.host_control_ready,
+            "audio_transport_reason": observation.audio.transport_reason,
+            "audio_non_speech_audio_likely": observation.audio.non_speech_audio_likely,
+            "audio_background_media_likely": observation.audio.background_media_likely,
+            "audio_speech_overlap_likely": observation.audio.speech_overlap_likely,
+            "audio_barge_in_detected": observation.audio.barge_in_detected,
+            "audio_mute_active": observation.audio.mute_active,
+            "audio_indicator_mode": indicator_state.mode,
+            "audio_indicator_semantics": indicator_state.semantics,
+        }
+        if self.latest_speaker_association_snapshot is not None:
+            data.update(self.latest_speaker_association_snapshot.event_data())
+        if self.latest_multimodal_initiative_snapshot is not None:
+            data.update(self.latest_multimodal_initiative_snapshot.event_data())
+        if self.latest_ambiguous_room_guard_snapshot is not None:
+            data.update(self.latest_ambiguous_room_guard_snapshot.event_data())
+        if self.latest_identity_fusion_snapshot is not None:
+            data.update(self.latest_identity_fusion_snapshot.event_data())
+        if self.latest_portrait_match_snapshot is not None:
+            data.update(self.latest_portrait_match_snapshot.event_data())
+        if self.latest_known_user_hint_snapshot is not None:
+            data.update(self.latest_known_user_hint_snapshot.event_data())
+        if self.latest_affect_proxy_snapshot is not None:
+            data.update(self.latest_affect_proxy_snapshot.event_data())
+        if self.latest_attention_target_snapshot is not None:
+            data.update(self.latest_attention_target_snapshot.event_data())
+        if self.latest_person_state_snapshot is not None:
+            data.update(self.latest_person_state_snapshot.event_data())
+        if audio_policy_snapshot is not None:
+            data.update(
+                {
+                    "presence_audio_active": audio_policy_snapshot.presence_audio_active,
+                    "recent_follow_up_speech": audio_policy_snapshot.recent_follow_up_speech,
+                    "room_busy_or_overlapping": audio_policy_snapshot.room_busy_or_overlapping,
+                    "quiet_window_open": audio_policy_snapshot.quiet_window_open,
+                    "non_speech_audio_likely": audio_policy_snapshot.non_speech_audio_likely,
+                    "background_media_likely": audio_policy_snapshot.background_media_likely,
+                    "barge_in_recent": audio_policy_snapshot.barge_in_recent,
+                    "speaker_direction_stable": audio_policy_snapshot.speaker_direction_stable,
+                    "mute_blocks_voice_capture": audio_policy_snapshot.mute_blocks_voice_capture,
+                    "resume_window_open": audio_policy_snapshot.resume_window_open,
+                    "audio_initiative_block_reason": audio_policy_snapshot.initiative_block_reason,
+                    "audio_speech_delivery_defer_reason": audio_policy_snapshot.speech_delivery_defer_reason,
+                    "respeaker_runtime_alert_code": audio_policy_snapshot.runtime_alert_code,
+                }
+            )
+        if presence_snapshot is not None:
+            data.update(
+                {
+                    "voice_activation_armed": presence_snapshot.armed,
+                    "voice_activation_presence_reason": presence_snapshot.reason,
+                    "voice_activation_presence_session_id": presence_session_id,
+                    "voice_activation_presence_audio_active": presence_snapshot.presence_audio_active,
+                    "voice_activation_recent_follow_up_speech": presence_snapshot.recent_follow_up_speech,
+                    "voice_activation_room_busy_or_overlapping": presence_snapshot.room_busy_or_overlapping,
+                    "voice_activation_quiet_window_open": presence_snapshot.quiet_window_open,
+                    "voice_activation_barge_in_recent": presence_snapshot.barge_in_recent,
+                    "voice_activation_speaker_direction_stable": presence_snapshot.speaker_direction_stable,
+                    "voice_activation_mute_blocks_voice_capture": presence_snapshot.mute_blocks_voice_capture,
+                    "voice_activation_resume_window_open": presence_snapshot.resume_window_open,
+                }
+            )
+        if vision_snapshot is not None:
+            data.update(
+                {
+                    "vision_model": vision_snapshot.model,
+                    "vision_request_id": vision_snapshot.request_id,
+                    "vision_response_id": vision_snapshot.response_id,
+                }
+            )
+        if audio_snapshot is not None and audio_snapshot.sample is not None:
+            data.update(
+                {
+                    "audio_average_rms": audio_snapshot.sample.average_rms,
+                    "audio_peak_rms": audio_snapshot.sample.peak_rms,
+                    "audio_active_ratio": audio_snapshot.sample.active_ratio,
+                    "audio_active_chunks": audio_snapshot.sample.active_chunk_count,
+                    "audio_chunk_count": audio_snapshot.sample.chunk_count,
+                }
+            )
+        if audio_snapshot is not None and audio_snapshot.signal_snapshot is not None:
+            data.update(
+                {
+                    "audio_requires_elevated_permissions": audio_snapshot.signal_snapshot.requires_elevated_permissions,
+                    "audio_firmware_version": _format_firmware_version(audio_snapshot.signal_snapshot.firmware_version),
+                    "audio_gpo_logic_levels": audio_snapshot.signal_snapshot.gpo_logic_levels,
+                }
+            )
+        top_evaluation = self._safety_trigger_fusion.best_evaluation
+        if top_evaluation is not None and top_evaluation.score > 0.0:
+            data.update(
+                {
+                    "top_trigger": top_evaluation.trigger_id,
+                    "top_score": top_evaluation.score,
+                    "top_threshold": top_evaluation.threshold,
+                    "top_trigger_passed": top_evaluation.passed,
+                }
+            )
+            if top_evaluation.blocked_reason is not None:
+                data["top_blocked_reason"] = top_evaluation.blocked_reason
+            if top_evaluation.passed and audio_policy_snapshot is not None:
+                data["top_audio_policy_block_reason"] = audio_policy_snapshot.initiative_block_reason
+        self._append_ops_event(
+            event="proactive_observation",
+            message="Proactive monitor recorded a changed observation.",
+            data=data,
+        )
+
+    def _indicator_state_for_observation(
+        self,
+        *,
+        observation: SocialObservation,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        runtime_status_value: str | None,
+    ):
+        """Return the bounded indicator-state projection for one observation event."""
+
+        return resolve_respeaker_indicator_state(
+            runtime_status=runtime_status_value,
+            runtime_alert_code=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+            ),
+            mute_active=observation.audio.mute_active,
+        )
+
+    def _record_presence_if_changed(self, snapshot) -> None:
+        """Append one ops event when the presence-session state changes."""
+
+        session_id = getattr(snapshot, "session_id", None)
+        key = (
+            snapshot.armed,
+            snapshot.reason,
+            session_id,
+            snapshot.presence_audio_active,
+            snapshot.recent_follow_up_speech,
+            snapshot.room_busy_or_overlapping,
+            snapshot.quiet_window_open,
+            snapshot.barge_in_recent,
+            snapshot.speaker_direction_stable,
+            snapshot.mute_blocks_voice_capture,
+            snapshot.resume_window_open,
+            snapshot.device_runtime_mode,
+            snapshot.transport_reason,
+        )
+        if key == self._last_presence_key:
+            return
+        self._last_presence_key = key
+        self._append_ops_event(
+            event="voice_activation_presence_changed",
+            message="Voice-activation presence session changed.",
+            data={
+                "armed": snapshot.armed,
+                "reason": snapshot.reason,
+                "session_id": session_id,
+                "person_visible": snapshot.person_visible,
+                "last_person_seen_age_s": snapshot.last_person_seen_age_s,
+                "last_motion_age_s": snapshot.last_motion_age_s,
+                "last_speech_age_s": snapshot.last_speech_age_s,
+                "presence_audio_active": snapshot.presence_audio_active,
+                "recent_follow_up_speech": snapshot.recent_follow_up_speech,
+                "room_busy_or_overlapping": snapshot.room_busy_or_overlapping,
+                "quiet_window_open": snapshot.quiet_window_open,
+                "barge_in_recent": snapshot.barge_in_recent,
+                "speaker_direction_stable": snapshot.speaker_direction_stable,
+                "mute_blocks_voice_capture": snapshot.mute_blocks_voice_capture,
+                "resume_window_open": snapshot.resume_window_open,
+                "device_runtime_mode": snapshot.device_runtime_mode,
+                "transport_reason": snapshot.transport_reason,
+            },
+        )
+
+    def _record_respeaker_runtime_alert_if_changed(
+        self,
+        audio: SocialAudioObservation,
+        *,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot,
+    ) -> None:
+        """Append one explicit operator-readable ReSpeaker runtime alert on change."""
+
+        alert_code = audio_policy_snapshot.runtime_alert_code
+        if alert_code is None:
+            return
+        if alert_code == self._last_respeaker_runtime_alert_code:
+            return
+        self._last_respeaker_runtime_alert_code = alert_code
+        level = "warning" if alert_code != "ready" else "info"
+        message = audio_policy_snapshot.runtime_alert_message or "ReSpeaker runtime state changed."
+        self._emit(f"respeaker_runtime_alert={alert_code}")
+        self._append_ops_event(
+            event="respeaker_runtime_alert",
+            level=level,
+            message=message,
+            data={
+                "alert_code": alert_code,
+                "device_runtime_mode": audio.device_runtime_mode,
+                "host_control_ready": audio.host_control_ready,
+                "transport_reason": audio.transport_reason,
+                "mute_active": audio.mute_active,
+            },
+        )
+        self._record_respeaker_runtime_blocker_if_changed(
+            alert_code=alert_code,
+            message=message,
+            audio=audio,
+        )
+
+    def _record_respeaker_runtime_blocker_if_changed(
+        self,
+        *,
+        alert_code: str,
+        message: str,
+        audio: SocialAudioObservation,
+    ) -> None:
+        """Emit explicit hard-block lifecycle events for DFU runtime states."""
+
+        if is_respeaker_runtime_hard_block(alert_code):
+            if alert_code == self._last_respeaker_runtime_blocker_code:
+                return
+            self._last_respeaker_runtime_blocker_code = alert_code
+            self._emit(f"respeaker_runtime_blocker={alert_code}")
+            self._append_ops_event(
+                event="respeaker_runtime_blocker",
+                level="error",
+                message=message,
+                data={
+                    "alert_code": alert_code,
+                    "device_runtime_mode": audio.device_runtime_mode,
+                    "host_control_ready": audio.host_control_ready,
+                    "transport_reason": audio.transport_reason,
+                    "mute_active": audio.mute_active,
+                },
+            )
+            return
+
+        if self._last_respeaker_runtime_blocker_code is None:
+            return
+        cleared_code = self._last_respeaker_runtime_blocker_code
+        self._last_respeaker_runtime_blocker_code = None
+        self._emit(f"respeaker_runtime_blocker_cleared={cleared_code}")
+        self._append_ops_event(
+            event="respeaker_runtime_blocker_cleared",
+            message="ReSpeaker hard runtime blocker cleared and capture is usable again.",
+            data={
+                "cleared_alert_code": cleared_code,
+                "current_alert_code": alert_code,
+                "device_runtime_mode": audio.device_runtime_mode,
+                "host_control_ready": audio.host_control_ready,
+            },
+        )
+
+    def _block_respeaker_dead_capture(self, error) -> None:
+        """Fail closed on unreadable ReSpeaker capture during live monitoring."""
+
+        self.audio_observer = self._null_audio_observer
+        self._audio_observer_fallback_factory = None
+        if self._last_respeaker_runtime_blocker_code == "dead_capture":
+            self._last_respeaker_runtime_alert_code = "capture_unknown"
+            return
+        _record_respeaker_dead_capture_blocker(
+            runtime=self.runtime,
+            emit=self.emit,
+            probe=error.probe,
+            stage="runtime",
+            signal=None,
+        )
+        self._last_respeaker_runtime_alert_code = "capture_unknown"
+        self._last_respeaker_runtime_blocker_code = "dead_capture"
+
+    def _record_trigger_detected(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        observation: SocialObservation,
+        review=None,
+    ) -> None:
+        """Record one proactive trigger that reached dispatch evaluation."""
+
+        data = {
+            "trigger": decision.trigger_id,
+            "reason": decision.reason,
+            "priority": int(decision.priority),
+            "prompt": decision.prompt,
+            "score": decision.score,
+            "threshold": decision.threshold,
+            "evidence": [item.to_dict() for item in decision.evidence],
+            "person_visible": observation.vision.person_visible,
+            "body_pose": observation.vision.body_pose.value,
+            "speech_detected": observation.audio.speech_detected,
+            "distress_detected": observation.audio.distress_detected,
+            "low_motion": observation.low_motion,
+            "trigger_source": self._safety_trigger_fusion.last_selected_source,
+        }
+        fused_claim = self._safety_trigger_fusion.last_selected_claim
+        if fused_claim is not None:
+            data.update(
+                {
+                    "fused_claim_state": fused_claim.state,
+                    "fused_claim_confidence": fused_claim.confidence,
+                    "fused_claim_action_level": fused_claim.action_level.value,
+                    "fused_claim_supporting_audio_events": list(fused_claim.supporting_audio_events),
+                    "fused_claim_supporting_vision_events": list(fused_claim.supporting_vision_events),
+                    "fused_claim_blocked_by": list(fused_claim.blocked_by),
+                }
+            )
+        if review is not None:
+            data.update(
+                {
+                    "vision_review_decision": review.decision,
+                    "vision_review_confidence": review.confidence,
+                    "vision_review_reason": review.reason,
+                    "vision_review_scene": review.scene,
+                    "vision_review_frame_count": review.frame_count,
+                    "vision_review_response_id": review.response_id,
+                    "vision_review_request_id": review.request_id,
+                    "vision_review_model": review.model,
+                }
+            )
+        self._append_ops_event(
+            event="proactive_trigger_detected",
+            message="Proactive trigger conditions were met.",
+            data=data,
+        )
+
+    def _record_vision_review(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        review,
+    ) -> None:
+        """Record one buffered vision review result."""
+
+        self._append_ops_event(
+            event="proactive_vision_reviewed",
+            message="Buffered proactive camera frames were reviewed before speaking.",
+            data={
+                "trigger": decision.trigger_id,
+                "approved": review.approved,
+                "decision": review.decision,
+                "confidence": review.confidence,
+                "reason": review.reason,
+                "scene": review.scene,
+                "frame_count": review.frame_count,
+                "response_id": review.response_id,
+                "request_id": review.request_id,
+                "model": review.model,
+            },
+        )
+
+    def _record_trigger_skipped_vision_review(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        review,
+    ) -> None:
+        """Record that buffered vision review rejected one trigger."""
+
+        self._emit("social_trigger_skipped=vision_review_rejected")
+        self._append_ops_event(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because buffered frame review rejected it.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": "vision_review_rejected",
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+                "vision_review_decision": review.decision,
+                "vision_review_confidence": review.confidence,
+                "vision_review_reason": review.reason,
+                "vision_review_scene": review.scene,
+                "vision_review_frame_count": review.frame_count,
+                "vision_review_response_id": review.response_id,
+                "vision_review_request_id": review.request_id,
+                "vision_review_model": review.model,
+            },
+        )
+
+    def _record_trigger_skipped_vision_review_unavailable(
+        self,
+        decision: SocialTriggerDecision,
+    ) -> None:
+        """Record that buffered vision review was unavailable for one trigger."""
+
+        self._emit("social_trigger_skipped=vision_review_unavailable")
+        self._append_ops_event(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because buffered frame review was unavailable.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": "vision_review_unavailable",
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+            },
+        )
+
+    def _presence_session_block_reason(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot,
+    ) -> str | None:
+        """Return a presence-session block reason for one trigger if any."""
+
+        session_id = getattr(presence_snapshot, "session_id", None)
+        if decision.trigger_id != "possible_fall":
+            return None
+        if not self.config.proactive_possible_fall_once_per_presence_session:
+            return None
+        if not presence_snapshot.armed or session_id is None:
+            return None
+        if self._last_possible_fall_prompted_session_id != session_id:
+            return None
+        return "already_prompted_this_presence_session"
+
+    def _record_trigger_skipped_presence_session(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot,
+        reason: str,
+    ) -> None:
+        """Record that a trigger was skipped by per-session suppression."""
+
+        session_id = getattr(presence_snapshot, "session_id", None)
+        self._emit(f"social_trigger_skipped={reason}")
+        self._append_ops_event(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because it already fired in the current presence session.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": reason,
+                "presence_session_id": session_id,
+                "presence_reason": presence_snapshot.reason,
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+            },
+        )
+
+    def _audio_policy_block_reason(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+    ) -> str | None:
+        """Return a conservative ReSpeaker-driven suppression reason for one trigger."""
+
+        del presence_snapshot
+        if decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS:
+            return None
+        if audio_policy_snapshot is None:
+            return None
+        return audio_policy_snapshot.initiative_block_reason
+
+    def _record_trigger_skipped_audio_policy(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        reason: str,
+    ) -> None:
+        """Record that a trigger was skipped by conservative ReSpeaker policy hooks."""
+
+        session_id = getattr(presence_snapshot, "session_id", None)
+        self._emit(f"social_trigger_skipped={reason}")
+        self._append_ops_event(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped by conservative ReSpeaker audio policy.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": reason,
+                "presence_session_id": session_id,
+                "presence_reason": presence_snapshot.reason,
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+                "presence_audio_active": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active
+                ),
+                "recent_follow_up_speech": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech
+                ),
+                "room_busy_or_overlapping": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping
+                ),
+                "quiet_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open
+                ),
+                "non_speech_audio_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely
+                ),
+                "background_media_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely
+                ),
+                "barge_in_recent": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent
+                ),
+                "resume_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open
+                ),
+                "mute_blocks_voice_capture": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture
+                ),
+                "speech_delivery_defer_reason": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason
+                ),
+                "runtime_alert_code": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+                ),
+            },
+        )

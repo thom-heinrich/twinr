@@ -124,6 +124,8 @@ class VoiceRuntimeIntentContext:
     recommended_channel: str | None = None
     speaker_associated: bool | None = None
     speaker_association_confidence: float | None = None
+    background_media_likely: bool | None = None
+    speech_overlap_likely: bool | None = None
 
     @classmethod
     def from_sensor_facts(
@@ -136,6 +138,7 @@ class VoiceRuntimeIntentContext:
         person_state = _coerce_mapping(fact_mapping.get("person_state"))
         camera = _coerce_mapping(fact_mapping.get("camera"))
         speaker_association = _coerce_mapping(fact_mapping.get("speaker_association"))
+        audio_policy = _coerce_mapping(fact_mapping.get("audio_policy"))
         attention_target = _coerce_mapping(fact_mapping.get("attention_target"))
         camera_person_visible = _coerce_optional_bool(camera.get("person_visible"))
         presence_active = _coerce_optional_bool(person_state.get("presence_active"))
@@ -181,6 +184,12 @@ class VoiceRuntimeIntentContext:
             speaker_association_confidence=_coerce_optional_ratio(
                 speaker_association.get("confidence")
             ),
+            background_media_likely=_coerce_optional_bool(
+                audio_policy.get("background_media_likely")
+            ),
+            speech_overlap_likely=_coerce_optional_bool(
+                audio_policy.get("speech_overlap_likely")
+            ),
         )
 
     @classmethod
@@ -203,6 +212,12 @@ class VoiceRuntimeIntentContext:
             speaker_association_confidence=_coerce_optional_ratio(
                 getattr(event, "speaker_association_confidence", None)
             ),
+            background_media_likely=_coerce_optional_bool(
+                getattr(event, "background_media_likely", None)
+            ),
+            speech_overlap_likely=_coerce_optional_bool(
+                getattr(event, "speech_overlap_likely", None)
+            ),
         )
 
     def to_event_fields(self) -> dict[str, object | None]:
@@ -218,6 +233,8 @@ class VoiceRuntimeIntentContext:
             "recommended_channel": self.recommended_channel,
             "speaker_associated": self.speaker_associated,
             "speaker_association_confidence": self.speaker_association_confidence,
+            "background_media_likely": self.background_media_likely,
+            "speech_overlap_likely": self.speech_overlap_likely,
         }
 
     def trace_details(self) -> dict[str, object]:
@@ -233,8 +250,11 @@ class VoiceRuntimeIntentContext:
             "intent_recommended_channel": self.recommended_channel,
             "intent_speaker_associated": self.speaker_associated,
             "intent_speaker_association_confidence": self.speaker_association_confidence,
+            "intent_background_media_likely": self.background_media_likely,
+            "intent_speech_overlap_likely": self.speech_overlap_likely,
             "intent_audio_bias_allowed": self.audio_bias_allowed(),
             "intent_strong_speaker_bias_allowed": self.strong_speaker_bias_allowed(),
+            "intent_familiar_speaker_bias_allowed": self.familiar_speaker_bias_allowed(),
         }
 
     def audio_bias_allowed(self) -> bool:
@@ -256,6 +276,17 @@ class VoiceRuntimeIntentContext:
         if self.speaker_association_confidence is None:
             return False
         return self.speaker_association_confidence >= _STRONG_SPEAKER_BIAS_MIN_CONFIDENCE
+
+    def familiar_speaker_bias_allowed(self) -> bool:
+        """Return whether known-speaker wake bias may apply in the current context."""
+
+        if not self.strong_speaker_bias_allowed():
+            return False
+        if self.background_media_likely is True:
+            return False
+        if self.speech_overlap_likely is True:
+            return False
+        return True
 
     def waiting_activation_allowed(self) -> bool:
         """Return whether idle transcript-first activation may scan this context.

@@ -46,6 +46,7 @@ _DOCUMENT_ID_HINTS_SCHEMA = "twinr_remote_snapshot_document_hints_v1"
 _DOCUMENT_ID_HINTS_FILENAME = "remote_snapshot_document_hints.json"
 _DEFAULT_REMOTE_READ_TIMEOUT_S = 10.0  # AUDIT-FIX(#7): Safe fallback defaults for malformed .env values.
 _DEFAULT_REMOTE_WRITE_TIMEOUT_S = 15.0
+_DEFAULT_REMOTE_FLUSH_TIMEOUT_S = 60.0
 _DEFAULT_RETRY_ATTEMPTS = 3
 _DEFAULT_RETRY_BACKOFF_S = 0.5
 _DEFAULT_MAX_CONTENT_CHARS = 262_144
@@ -58,6 +59,8 @@ _DEFAULT_STATUS_PROBE_TIMEOUT_S = 20.0
 _DEFAULT_STATUS_PROBE_TIMEOUT_CAP_S = 45.0
 _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S = 20.0
 _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 45.0
+_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S = 20.0
+_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S = 180.0
 _DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
 _MAX_NAMESPACE_LENGTH = 255
 _MAX_SNAPSHOT_KIND_LENGTH = 255
@@ -221,6 +224,16 @@ def _extract_store_document_id(result: Mapping[str, object] | None) -> str | Non
         if document_id:
             return document_id
     return None
+
+
+def _extract_store_job_id(result: Mapping[str, object] | None) -> str | None:
+    """Extract one async ChonkyDB job identifier from a store response when present."""
+
+    if not isinstance(result, Mapping):
+        return None
+    raw_job_id = result.get("job_id")
+    normalized = _strip_text(raw_job_id if isinstance(raw_job_id, str) else None)
+    return normalized or None
 
 
 def _store_result_failure_detail(result: Mapping[str, object] | None) -> str | None:
@@ -1556,7 +1569,10 @@ class LongTermRemoteStateStore:
                         response_json=dict(result) if isinstance(result, Mapping) else None,
                     )
                 self._note_remote_success()
-                return _extract_store_document_id(result)
+                document_id = _extract_store_document_id(result)
+                if document_id is not None:
+                    return document_id
+                return self._await_async_store_document_id(write_client, result=result)
             except Exception as exc:  # AUDIT-FIX(#5): Catch all remote client failures, not only ChonkyDBError subclasses.
                 last_error = exc
                 self._note_remote_failure()
@@ -1586,6 +1602,60 @@ class LongTermRemoteStateStore:
         raise LongTermRemoteUnavailableError(
             self._remote_failure_detail("write", snapshot_kind, exc=last_error)  # AUDIT-FIX(#8): Keep outward-facing errors generic and secret-safe.
         ) from last_error
+
+    def _await_async_store_document_id(
+        self,
+        write_client: ChonkyDBClient,
+        *,
+        result: Mapping[str, object] | None,
+    ) -> str | None:
+        """Resolve one accepted async snapshot write to its exact document id.
+
+        ChonkyDB may accept the bulk write immediately and expose the stable
+        ``document_id`` only on the async job result. When available, Twinr
+        should use that exact id for attestation so snapshot readback does not
+        depend on an eventually consistent same-URI head.
+        """
+
+        job_id = _extract_store_job_id(result)
+        if job_id is None:
+            return None
+        job_status_client = self._status_probe_client(write_client)
+        poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        total_timeout_s = self._async_job_visibility_timeout_s()
+        attempts = max(1, int(math.ceil(total_timeout_s / poll_interval_s)))
+        for attempt in range(attempts):
+            payload = job_status_client.job_status(job_id)
+            if isinstance(payload, Mapping):
+                raw_status = payload.get("status")
+                status = _normalize_text(raw_status if isinstance(raw_status, str) else None).lower()
+                result_payload = payload.get("result")
+                result_mapping = result_payload if isinstance(result_payload, Mapping) else None
+                if status in {"failed", "cancelled", "rejected"}:
+                    detail = _store_result_failure_detail(result_mapping)
+                    if not detail:
+                        raw_error = payload.get("error")
+                        raw_error_type = payload.get("error_type")
+                        detail = (
+                            _normalize_text(raw_error if isinstance(raw_error, str) else None)
+                            or _normalize_text(raw_error_type if isinstance(raw_error_type, str) else None)
+                            or f"async job status={status}"
+                        )
+                    raise LongTermRemoteUnavailableError(
+                        f"Accepted async remote snapshot write job {job_id!r} failed before readback: {detail}"
+                    )
+                document_id = _extract_store_document_id(result_mapping)
+                if document_id is None:
+                    document_id = _extract_store_document_id(payload)
+                if document_id is not None:
+                    return document_id
+                if status in {"succeeded", "done"}:
+                    return None
+            if attempt + 1 >= attempts:
+                break
+            if poll_interval_s > 0.0:
+                time.sleep(poll_interval_s)
+        return None
 
     def _attest_saved_snapshot_readback(
         self,
@@ -2045,6 +2115,38 @@ class LongTermRemoteStateStore:
             default=_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
             minimum=_DEFAULT_ASYNC_ATTESTATION_POLL_S,
             maximum=_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
+        )
+
+    def _remote_flush_timeout_s(self) -> float:
+        """Return the bounded end-to-end remote flush budget for one snapshot write."""
+
+        return _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_flush_timeout_s", _DEFAULT_REMOTE_FLUSH_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_FLUSH_TIMEOUT_S,
+        )
+
+    def _async_job_visibility_timeout_s(self) -> float:
+        """Return the bounded window for async job completion plus exact-id exposure."""
+
+        read_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+        )
+        flush_timeout_s = self._remote_flush_timeout_s()
+        candidate = max(
+            _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S,
+            self._status_probe_timeout_s(),
+            flush_timeout_s,
+            min(
+                flush_timeout_s + read_timeout_s,
+                _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S,
+            ),
+        )
+        return _coerce_float(
+            candidate,
+            default=_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S,
+            minimum=_DEFAULT_ASYNC_ATTESTATION_POLL_S,
+            maximum=_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S,
         )
 
     def _status_probe_client(self, client: ChonkyDBClient) -> ChonkyDBClient:

@@ -64,6 +64,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - reconnect the edge voice websocket after transient server or network closures and replay the last known runtime state so hands-free wake detection does not stay dead until the Pi service restarts
 - keep the live voice gateway server-only after wake: once the Pi has opened a voice turn on thh1986, the same remote stream must stay authoritative for wake, transcript commit, continuation, and follow-up closure instead of pausing capture and reopening a second Pi-local listen phase
 - keep answer-time interruption server-owned whenever the live voice gateway is active; do not reopen a second local Pi STT watcher while the remote thh1986 stream already owns barge-in
+- keep the Pi-owned household voice identity source local: sync only bounded read-only speaker embeddings to the live gateway for wake-time familiar-speaker bias, and keep any passive profile updates on the Pi runtime side
 - replay the runtime-owned temporary voice-quiet window into the live voice orchestrator and suppress automatic follow-up reopening while that bounded quiet window is active
 - fail closed on the Pi as well when a late or stale server-side wake confirmation arrives during that runtime-owned voice-quiet window, and immediately re-attest `waiting` plus the active quiet deadline back into the live gateway
 - re-check remote follow-up eligibility after streamed tool side effects such as temporary voice quiet mode, so the streaming voice path never re-arms `follow_up_open` from a stale pre-turn snapshot once the runtime has decided to stay quiet
@@ -86,6 +87,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
 | [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
+| [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
 | [remote_transcript_commit.py](./remote_transcript_commit.py) | Bounded wait coordinator for same-stream server transcript commits during live remote listening |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
 | [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions |

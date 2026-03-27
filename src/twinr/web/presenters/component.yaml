@@ -13,6 +13,7 @@ owned_concerns:
   - Build and validate the `/integrations/email` guided mailbox setup wizard, including provider selection, mailbox login storage, transport defaults, bounded connection-test state, and final guardrails
   - Build and validate the `/integrations` social-history learning consent panel, including bounded source/window choices and operator-facing import status
   - Build the WhatsApp self-chat wizard page context, including bounded pairing-state rows, persisted onboarding snapshots, and live portal QR rendering, without moving route orchestration or subprocess calls into templates
+  - Build the grouped primary shell navigation plus flatter Home, Settings shortcut, and `/advanced` hub card content so the top-level control surface stays short and consistent
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
   - Build self-coding operator telemetry rows from persisted self-coding state without moving policy into web routes
   - Build the tabbed `/ops/debug` operator context from authoritative runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
@@ -49,6 +50,9 @@ files:
       - _format_log_rows
       - _format_usage_rows
       - _health_card_detail
+      - build_advanced_hub_page_context
+      - build_home_destination_cards
+      - build_settings_shortcut_cards
       - _integration_overview_rows
       - _memory_sections
       - _nav_items
@@ -67,14 +71,20 @@ files:
       - _voice_profile_page_context
       - _voice_snapshot_label
   - path: common.py
-    role: Shared navigation, reminder, provider-status, and safe file-link helpers
+    role: Shared reminder, provider-status, and safe file-link helpers
     exports:
       - _default_reminder_due_at
-      - _nav_items
       - _provider_status
       - _recent_named_files
       - _reminder_rows
       - _resolve_named_file
+  - path: shell.py
+    role: Grouped primary navigation plus flatter Home, Settings shortcut, and Advanced hub card builders
+    exports:
+      - _nav_items
+      - build_advanced_hub_page_context
+      - build_home_destination_cards
+      - build_settings_shortcut_cards
   - path: connect.py
     role: Provider-routing and credential presenter sections for `/connect`
     exports:
@@ -172,6 +182,9 @@ public_api:
     - _format_log_rows
     - _format_usage_rows
     - _health_card_detail
+    - build_advanced_hub_page_context
+    - build_home_destination_cards
+    - build_settings_shortcut_cards
     - build_ops_debug_page_context
     - coerce_ops_debug_tab
     - _integration_overview_rows

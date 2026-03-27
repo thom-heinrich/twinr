@@ -96,8 +96,13 @@ The current resolution order is:
 4. `full_frame_hand_roi`
 5. `mediapipe_pose_fallback`
 
-The current freeze point includes the extra whole-frame rescue when a visible
-person ROI exists but yields `0` hand detections.
+The current freeze point still includes the extra whole-frame rescue when a
+visible person ROI exists but yields `0` hand detections, but that rescue and
+the broader `person_roi` path now fail closed only when fresh live results
+already confirm `no hand` and there is no fresh recent live hand box left to
+reuse. One narrow exception remains for `peace_sign`: a valid person-ROI
+`Victory` recovery can still pass through that gate so the accepted Pi visual
+wake path does not disappear when the live hand callbacks briefly drop to zero.
 
 ### HDMI Ack Lane Floors
 

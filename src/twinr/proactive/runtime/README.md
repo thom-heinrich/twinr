@@ -138,11 +138,21 @@ and presence-session state used to arm voice-activation listening and proactive 
 | `sensitive_behavior_gate.py` | Conservative gate that blocks sensitive proactive behavior on ambiguous multi-person or low-confidence audio context |
 | `governor_inputs.py` | Focused governor-facing packaging of current ReSpeaker presence/audio facts |
 | `presence.py` | Presence-session state machine |
+| `service_impl/README.md` | Internal map of the refactored `service.py` implementation package; wrapper path stays stable and no migration is required |
+| `service_impl/coordinator_core.py` | Dependency wiring plus the main proactive tick/orchestration path extracted from the legacy `service.py` monolith |
+| `service_impl/coordinator_display.py` | Dedicated HDMI attention and gesture refresh workflows extracted from the legacy `service.py` monolith |
+| `service_impl/coordinator_observation.py` | Stable observation-mixin facade that composes the focused observation helper modules behind the historic path |
+| `service_impl/coordinator_observation_display.py` | Automation-dispatch, HDMI display, gesture, and camera-surface helper bridges extracted from the legacy observation mixin |
+| `service_impl/coordinator_observation_facts.py` | Automation fact payload assembly and rising-edge sensor-event derivation extracted from the legacy observation mixin |
+| `service_impl/monitor.py` | Background worker lifecycle wrapper for the proactive coordinator |
+| `service_impl/builder.py` | Default production assembly path, with wrapper-supplied dependencies to preserve legacy monkeypatch points |
 | `service_attention_helpers.py` | Focused HDMI attention-follow, live-context export, servo-trace, and attention-debug helper surface used by `service.py` so the monitor loop stays orchestration-first |
 | `service_gesture_helpers.py` | Focused HDMI gesture acknowledgement, wakeup dispatch, and gesture-trace helper surface used by `service.py` so gesture policy stays out of the main monitor loop |
-| `service.py` | Thin monitor orchestration, unreadable-capture blocking, lifecycle, streaming-voice activation capture pause/resume around accepted hands-free turns, and assembly of the shared attention/gesture helper surfaces into the active runtime |
+| `service.py` | Compatibility shim that preserves the historic import path and helper surface while delegating the real implementation to `service_impl/` |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
+
+No migration is required for callers that already import `twinr.proactive.runtime.service`.
 
 ## Usage
 

@@ -26,9 +26,37 @@ files:
       - load_personality_instructions
       - merge_instructions
   - path: config.py
-    role: Canonical environment-backed runtime configuration, including smart-home background-worker tuning
+    role: Stable compatibility facade for the canonical environment-backed runtime configuration
     exports:
       - TwinrConfig
+  - path: _config/__init__.py
+    role: Internal runtime-config package boundary
+  - path: _config/schema.py
+    role: Immutable TwinrConfig dataclass shape plus delegated helper properties
+  - path: _config/loading.py
+    role: Canonical dotenv and process-environment loading flow for TwinrConfig
+  - path: _config/context.py
+    role: Shared dotenv/process-env context and derived config-loading values
+  - path: _config/load_providers.py
+    role: Provider and model-specific env loading
+  - path: _config/load_turn_streaming.py
+    role: Turn-control, streaming, audio, and search env loading
+  - path: _config/load_channels.py
+    role: Orchestrator, voice-gateway, and WhatsApp env loading
+  - path: _config/load_vision_proactive.py
+    role: Camera, proactive-sensing, portrait, and drone env loading
+  - path: _config/load_runtime_memory.py
+    role: Runtime-state, memory, automation, and smart-home env loading
+  - path: _config/load_hardware_display.py
+    role: GPIO, display, printer, and attention-servo env loading
+  - path: _config/normalization.py
+    role: Post-init normalization and validation orchestration for bounded config values
+  - path: _config/normalization_updates.py
+    role: Grouped frozen-dataclass update helpers for normalized config values
+  - path: _config/parsing.py
+    role: Primitive config parsing helpers kept independent from env loading and the dataclass
+  - path: _config/constants.py
+    role: Shared config constants and default value anchors
   - path: contracts.py
     role: Provider/runtime protocols and composite provider glue
     exports:
@@ -43,6 +71,8 @@ files:
       - CompositeSpeechAgentProvider
       - CombinedSpeechAgentProvider
 subpackages:
+  - path: _config
+    role: Internal runtime-config package split by schema, parsing, loading, and normalization domains
   - path: conversation
     role: Conversation micro-policies and turn-boundary helpers
   - path: prompting
@@ -66,6 +96,7 @@ reexports_from_other_packages:
       - ReminderStore
 tests:
   - path: test/test_config.py
+  - path: test/test_config_refactor_parity.py
   - path: test/test_personality.py
   - path: test/test_adaptive_timing.py
   - path: test/test_turn_controller.py

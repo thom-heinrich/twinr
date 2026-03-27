@@ -69,7 +69,6 @@ from twinr.web.conversation_lab import (
 )
 from twinr.web.context import WebAppContext
 from twinr.web.support.channel_onboarding import InProcessChannelPairingRegistry
-from twinr.web.support.contracts import DashboardCard
 from twinr.web.support.forms import _collect_standard_updates
 from twinr.web.support.auth import (
     WebAuthState,
@@ -102,7 +101,10 @@ from twinr.web.presenters import (
     _build_social_history_learning_record,
     _build_smart_home_integration_record,
     _calendar_integration_sections,
+    build_advanced_hub_page_context,
+    build_home_destination_cards,
     build_ops_debug_page_context,
+    build_settings_shortcut_cards,
     _capture_voice_profile_sample,
     _connect_sections,
     coerce_ops_debug_tab,
@@ -110,10 +112,8 @@ from twinr.web.presenters import (
     _email_integration_context,
     _format_log_rows,
     _format_usage_rows,
-    _health_card_detail,
     _integration_overview_rows,
     _memory_sections,
-    _provider_status,
     _recent_named_files,
     _reminder_rows,
     _resolve_named_file,
@@ -927,7 +927,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
     async def dashboard(request: Request) -> HTMLResponse:
         """Render the dashboard overview page."""
 
-        config, env_values = await _call_sync(ctx.load_state)
+        config, _env_values = await _call_sync(ctx.load_state)
         snapshot = await _call_sync(ctx.load_snapshot, config)
         reminders = await _call_sync(ctx.reminder_store(config).load_entries)
         # AUDIT-FIX(#10): Sort pending reminders before selecting the next one so the dashboard reflects the true earliest due item.
@@ -947,85 +947,61 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             for entry in recent_event_rows
             if str(entry.get("level", "")).lower() == "error"
         ][-3:]
-        cards: tuple[DashboardCard, ...] = (
-            DashboardCard(
-                title="Conversation",
-                value=snapshot.status.title(),
-                detail=f"{env_values.get('TWINR_PROVIDER_REALTIME', 'openai').upper()} realtime · LLM {config.default_model}",
-                href="/memory",
-            ),
-            DashboardCard(
-                title="Personality",
-                value="Loaded",
-                detail=f"SYSTEM/PERSONALITY/USER from {config.personality_dir}/",
-                href="/personality",
-            ),
-            DashboardCard(
-                title="Memory",
-                value=f"{snapshot.memory_count} live turns",
-                detail=f"Keep recent {config.memory_keep_recent} · cap {config.memory_max_turns}",
-                href="/memory",
-            ),
-            DashboardCard(
-                title="Reminders",
-                value=f"{len(pending_reminders)} pending",
-                detail=(
-                    f"Next due {format_due_label(next_due_entry.due_at, timezone_name=config.local_timezone_name)}"
-                    if next_due_entry is not None
-                    else f"{len(delivered_reminders)} delivered"
-                ),
-                href="/memory",
-            ),
-            DashboardCard(
-                title="Printer",
-                value=config.printer_queue,
-                detail=f"Header {config.printer_header_text} · width {config.printer_line_width}",
-                href="/settings",
-            ),
-            DashboardCard(
-                title="Ops",
-                value=f"{checks_summary.get('fail', 0)} fail · {checks_summary.get('warn', 0)} warn",
-                detail="Self-tests, config checks, usage, health, support",
-                href="/ops/config",
-            ),
-            DashboardCard(
-                title="LLM usage",
-                value=f"{usage_summary.requests_total} req · {usage_summary.total_tokens} tok",
-                detail=usage_summary.latest_model or "No usage records yet",
-                href="/ops/usage",
-            ),
-            DashboardCard(
-                title="System",
-                value=health_snapshot.status.upper(),
-                detail=_health_card_detail(health_snapshot),
-                href="/ops/health",
-            ),
+        next_reminder_label = (
+            f"Next due {format_due_label(next_due_entry.due_at, timezone_name=config.local_timezone_name)}"
+            if next_due_entry is not None
+            else None
         )
-        if self_coding_status.has_activity:
-            cards = (
-                *cards,
-                DashboardCard(
-                    title="Self-coding",
-                    value=self_coding_status.card_value(),
-                    detail=self_coding_status.card_detail(),
-                    href="/ops/self-coding",
-                ),
-            )
+        cards = build_home_destination_cards(
+            snapshot=snapshot,
+            pending_reminders_count=len(pending_reminders),
+            delivered_reminders_count=len(delivered_reminders),
+            next_reminder_label=next_reminder_label,
+            health_snapshot=health_snapshot,
+            checks_summary=checks_summary,
+        )
         return ctx.render(
             request,
             "dashboard.html",
-            page_title="Dashboard",
+            page_title="Home",
             active_page="dashboard",
             config=config,
-            env_values=env_values,
             cards=cards,
-            provider_status=_provider_status(env_values),
             snapshot=snapshot,
             check_summary=checks_summary,
             recent_errors=_format_log_rows(recent_errors),
             usage_summary=usage_summary,
             health_snapshot=health_snapshot,
             voice_snapshot_label=_voice_snapshot_label(snapshot),
+            next_reminder_label=next_reminder_label,
+            self_coding_status=self_coding_status,
+        )
+
+    @app.get("/advanced", response_class=HTMLResponse)
+    async def advanced(request: Request) -> HTMLResponse:
+        """Render the grouped operator hub page."""
+
+        config, _env_values = await _call_sync(ctx.load_state)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
+        ops_event_store = ctx.event_store()
+        checks = await _call_sync(run_config_checks, config)
+        checks_summary = check_summary(checks)
+        usage_summary = await _call_sync(ctx.usage_store().summary, within_hours=24)
+        health_snapshot = await _call_sync(collect_system_health, config, snapshot=snapshot, event_store=ops_event_store)
+        self_coding_status = await _call_sync(build_self_coding_operator_status, ctx.self_coding_store())
+        page_context = build_advanced_hub_page_context(
+            checks_summary=checks_summary,
+            usage_summary=usage_summary,
+            health_snapshot=health_snapshot,
+            self_coding_status=self_coding_status,
+        )
+        return ctx.render(
+            request,
+            "advanced_page.html",
+            page_title="Advanced",
+            active_page="advanced",
+            intro="Technical checks, operator tools, and support pages live here so the main shell stays simpler.",
+            **page_context,
         )
 
     @app.get("/ops/self-test", response_class=HTMLResponse)
@@ -2135,9 +2111,10 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             "settings_page.html",
             page_title="Settings",
             active_page="settings",
-            intro="All main device and runtime tuning lives here. Hover the small (?) labels for a quick explanation of each field.",
+            intro="Start here for device setup, voice tuning, and everyday runtime behavior. The linked setup areas below open the deeper pages when you need them.",
             form_action="/settings",
             sections=sections,
+            shortcut_cards=build_settings_shortcut_cards(),
             adaptive_timing=_adaptive_timing_view(config),
         )
 
@@ -2179,9 +2156,9 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         return ctx.render(
             request,
             "memory_page.html",
-            page_title="Memory",
+            page_title="Activity & Memory",
             active_page="memory",
-            intro="Tune on-device memory and print summarization bounds. Twinr also uses the configured long-term memory path for graph recall and background episodic persistence.",
+            intro="Review recent conversation context, reminders, and the memory bounds Twinr uses to stay concise and grounded.",
             form_action="/memory",
             sections=sections,
             snapshot=snapshot,

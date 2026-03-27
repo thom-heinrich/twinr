@@ -1,6 +1,82 @@
 {% extends "base.html" %}
 
 {% block content %}
+<section class="panel two-column">
+  <div>
+    <div class="section-header">
+      <div>
+        <h2>Twinr now</h2>
+        <p class="section-description">Start here for the current device state without opening the deeper operator pages.</p>
+      </div>
+    </div>
+    <div class="stats-grid compact-grid">
+      <div class="stat-tile">
+        <span class="stat-label">Status</span>
+        <span class="stat-value">{{ snapshot.status }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Voice check</span>
+        <span class="stat-value stat-value-small">{{ voice_snapshot_label }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Next reminder</span>
+        <span class="stat-value stat-value-small">{{ next_reminder_label or "No pending reminder" }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">System health</span>
+        <span class="stat-value">{{ health_snapshot.status }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Context turns</span>
+        <span class="stat-value">{{ snapshot.memory_count }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Last update</span>
+        <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-header">
+      <div>
+        <h2>What you can do next</h2>
+        <p class="section-description">Open the next likely area instead of scanning the full operator surface.</p>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <article class="detail-card">
+        <span class="detail-label">Review activity</span>
+        <div class="detail-body detail-body-copy">See recent conversation context, reminders, and memory bounds.</div>
+        <div class="link-row">
+          <a class="inline-link" href="/memory">Open Activity</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Adjust routines</span>
+        <div class="detail-body detail-body-copy">Manage schedules, triggers, and bounded automation actions.</div>
+        <div class="link-row">
+          <a class="inline-link" href="/automations">Open Automations</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Tune setup</span>
+        <div class="detail-body detail-body-copy">Change voice, devices, and everyday runtime behavior.</div>
+        <div class="link-row">
+          <a class="inline-link" href="/settings">Open Settings</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Check technical details</span>
+        <div class="detail-body detail-body-copy">Health, support, self-tests, logs, usage, and self-coding live in one place now.</div>
+        <div class="link-row">
+          <a class="inline-link" href="/advanced">Open Advanced</a>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
 <section class="card-grid">
   {% for card in cards %}
   <a class="card" href="{{ card.href }}">
@@ -8,205 +84,97 @@
     <div class="card-value">{{ card.value }}</div>
     <div class="card-detail">{{ card.detail }}</div>
   </a>
-{% endfor %}
+  {% endfor %}
+</section>
+
+<section class="panel two-column">
+  <div>
+    <div class="section-header">
+      <div>
+        <h2>Recent conversation</h2>
+        <p class="section-description">A short live snapshot from the active Twinr runtime.</p>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <article class="detail-card">
+        <span class="detail-label">Last transcript</span>
+        <div class="detail-body detail-body-copy">{{ snapshot.last_transcript or "No transcript recorded yet." }}</div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Last response</span>
+        <div class="detail-body detail-body-copy">{{ snapshot.last_response or "No response recorded yet." }}</div>
+      </article>
+    </div>
+  </div>
+
+  <div>
+    <div class="section-header">
+      <div>
+        <h2>Needs attention</h2>
+        <p class="section-description">Only the small set of checks that usually needs operator action.</p>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <article class="detail-card">
+        <span class="detail-label">Config checks</span>
+        <div class="detail-body">{{ check_summary.fail }} fail · {{ check_summary.warn }} warn</div>
+        <div class="link-row">
+          <a class="inline-link" href="/ops/config">Open config checks</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Usage</span>
+        <div class="detail-body">{{ usage_summary.requests_total }} req · {{ usage_summary.total_tokens }} tok</div>
+        <div class="link-row">
+          <a class="inline-link" href="/ops/usage">Open detailed usage</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Hardware checks</span>
+        <div class="detail-body detail-body-copy">Run bounded local tests only when you need to verify peripherals.</div>
+        <div class="link-row">
+          <a class="inline-link" href="/ops/self-test">Run self-tests</a>
+        </div>
+      </article>
+      <article class="detail-card">
+        <span class="detail-label">Self-coding</span>
+        <div class="detail-body detail-body-copy">
+          {% if self_coding_status.has_activity %}
+          {{ self_coding_status.card_value() }} · {{ self_coding_status.card_detail() }}
+          {% else %}
+          No live rollout activity right now.
+          {% endif %}
+        </div>
+        <div class="link-row">
+          <a class="inline-link" href="/ops/self-coding">Open self-coding</a>
+        </div>
+      </article>
+    </div>
+  </div>
 </section>
 
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>Live runtime</h2>
-      <p class="section-description">Read from the active Twinr process snapshot.</p>
+      <h2>Recent errors</h2>
+      <p class="section-description">Only recent local error events, kept separate from the main home flow.</p>
     </div>
   </div>
-  <div class="stats-grid">
-    <div class="stat-tile">
-      <span class="stat-label">Status</span>
-      <span class="stat-value">{{ snapshot.status }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Memory turns</span>
-      <span class="stat-value">{{ snapshot.memory_count }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Last transcript</span>
-      <span class="stat-value stat-value-small">{{ snapshot.last_transcript or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Last update</span>
-      <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Voice check</span>
-      <span class="stat-value stat-value-small">{{ voice_snapshot_label }}</span>
-    </div>
-  </div>
-</section>
-
-<section class="panel">
-  <div class="section-header">
-    <div>
-      <h2>Provider status</h2>
-    </div>
-  </div>
-  <div class="key-value-grid">
-    {% for label, value in provider_status %}
-    <div class="key-value">
-      <span class="key">{{ label }}</span>
-      <span class="value">{{ value }}</span>
-    </div>
+  {% if recent_errors %}
+  <div class="log-list compact-log-list">
+    {% for entry in recent_errors %}
+    <article class="log-entry">
+      <div class="log-entry-header">
+        <span class="log-level is-error">{{ entry.level }}</span>
+        <span class="log-event">{{ entry.event }}</span>
+        <span class="log-time">{{ entry.created_at }}</span>
+      </div>
+      <div class="log-message">{{ entry.message }}</div>
+    </article>
     {% endfor %}
   </div>
-</section>
-
-<section class="panel two-column">
-  <div>
-    <h2>LLM usage</h2>
-    <div class="stats-grid compact-grid">
-      <div class="stat-tile">
-        <span class="stat-label">Requests 24h</span>
-        <span class="stat-value">{{ usage_summary.requests_total }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Tokens 24h</span>
-        <span class="stat-value">{{ usage_summary.total_tokens }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Latest model</span>
-        <span class="stat-value stat-value-small">{{ usage_summary.latest_model or "—" }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Latest kind</span>
-        <span class="stat-value stat-value-small">{{ usage_summary.latest_request_kind or "—" }}</span>
-      </div>
-    </div>
-    <div class="link-row">
-      <a class="inline-link" href="/ops/usage">Open detailed usage</a>
-    </div>
-  </div>
-  <div>
-    <h2>System health</h2>
-    <div class="stats-grid compact-grid">
-      <div class="stat-tile">
-        <span class="stat-label">Health</span>
-        <span class="stat-value">{{ health_snapshot.status }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">CPU temp</span>
-        <span class="stat-value">{{ "%.1fC"|format(health_snapshot.cpu_temperature_c) if health_snapshot.cpu_temperature_c is not none else "—" }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Memory used</span>
-        <span class="stat-value">{{ "%.1f%%"|format(health_snapshot.memory_used_percent) if health_snapshot.memory_used_percent is not none else "—" }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Disk used</span>
-        <span class="stat-value">{{ "%.1f%%"|format(health_snapshot.disk_used_percent) if health_snapshot.disk_used_percent is not none else "—" }}</span>
-      </div>
-    </div>
-    <div class="link-row">
-      <a class="inline-link" href="/ops/health">Open system health</a>
-    </div>
-  </div>
-</section>
-
-<section class="panel">
-  <div class="section-header">
-    <div>
-      <h2>Status and failures</h2>
-      <p class="section-description">This is the small operations view that matters most for local support.</p>
-    </div>
-  </div>
-  <div class="detail-grid">
-    <article class="detail-card">
-      <span class="detail-label">Current status</span>
-      <div class="detail-body">{{ snapshot.status }}</div>
-    </article>
-    <article class="detail-card">
-      <span class="detail-label">Updated at</span>
-      <div class="detail-body">{{ snapshot.updated_at or "—" }}</div>
-    </article>
-    <article class="detail-card">
-      <span class="detail-label">Last transcript</span>
-      <div class="detail-body detail-body-copy">{{ snapshot.last_transcript or "—" }}</div>
-    </article>
-    <article class="detail-card">
-      <span class="detail-label">Last response</span>
-      <div class="detail-body detail-body-copy">{{ snapshot.last_response or "—" }}</div>
-    </article>
-    <article class="detail-card">
-      <span class="detail-label">Voice check</span>
-      <div class="detail-body">{{ voice_snapshot_label }}</div>
-    </article>
-    <article class="detail-card detail-card-wide">
-      <span class="detail-label">Last error</span>
-      <div class="detail-body detail-body-copy">{{ snapshot.error_message or "No current runtime error." }}</div>
-    </article>
-  </div>
-</section>
-
-<section class="panel two-column">
-  <div>
-    <h2>Ops summary</h2>
-    <div class="stats-grid compact-grid">
-      <div class="stat-tile">
-        <span class="stat-label">Checks OK</span>
-        <span class="stat-value">{{ check_summary.ok }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Warnings</span>
-        <span class="stat-value">{{ check_summary.warn }}</span>
-      </div>
-      <div class="stat-tile">
-        <span class="stat-label">Failures</span>
-        <span class="stat-value">{{ check_summary.fail }}</span>
-      </div>
-    </div>
-    <div class="link-row">
-      <a class="inline-link" href="/ops/self-test">Run hardware self-tests</a>
-      <a class="inline-link" href="/ops/config">Open config checks</a>
-      <a class="inline-link" href="/ops/support">Build support bundle</a>
-    </div>
-  </div>
-  <div>
-    <h2>Recent errors</h2>
-    {% if recent_errors %}
-    <div class="log-list compact-log-list">
-      {% for entry in recent_errors %}
-      <article class="log-entry">
-        <div class="log-entry-header">
-          <span class="log-level is-error">{{ entry.level }}</span>
-          <span class="log-event">{{ entry.event }}</span>
-          <span class="log-time">{{ entry.created_at }}</span>
-        </div>
-        <div class="log-message">{{ entry.message }}</div>
-      </article>
-      {% endfor %}
-    </div>
-    {% else %}
-    <div class="empty-state">No recent errors are recorded in the local ops log.</div>
-    {% endif %}
-  </div>
-</section>
-
-<section class="panel two-column">
-  <div>
-    <h2>Current config</h2>
-    <ul class="plain-list">
-      <li><strong>Host</strong> {{ config.web_host }}</li>
-      <li><strong>Port</strong> {{ config.web_port }}</li>
-      <li><strong>LLM</strong> {{ config.default_model }}</li>
-      <li><strong>Realtime</strong> {{ config.openai_realtime_model }}</li>
-      <li><strong>Printer</strong> {{ config.printer_queue }}</li>
-    </ul>
-  </div>
-  <div>
-    <h2>Configuration files</h2>
-    <ul class="plain-list">
-      <li><strong>.env</strong> {{ env_path }}</li>
-      <li><strong>SYSTEM</strong> personality/SYSTEM.md</li>
-      <li><strong>PERSONALITY</strong> personality/PERSONALITY.md</li>
-      <li><strong>USER</strong> personality/USER.md</li>
-    </ul>
-  </div>
+  {% else %}
+  <div class="empty-state">No recent local errors are recorded.</div>
+  {% endif %}
 </section>
 {% endblock %}

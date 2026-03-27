@@ -78,7 +78,8 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | `__init__.py` | Package marker and summary |
 | `store.py` | Object/conflict/archive store |
 | `midterm_store.py` | Midterm packet store |
-| `remote_catalog.py` | Fine-grained remote object/conflict/archive catalog adapter |
+| `remote_catalog.py` | Public compatibility wrapper for the fine-grained remote object/conflict/archive catalog adapter |
+| `_remote_catalog/` | Internal split implementation modules for remote catalog caching, search, hydration, and write attestation |
 | `remote_read_diagnostics.py` | Structured ops-event diagnostics for remote long-term I/O failures and fallbacks |
 | `remote_read_observability.py` | Persisted retrieve/top-k histogram + alert helper for remote read spikes |
 | `remote_state.py` | Small remote snapshot/catalog adapter plus shared remote-read exception types |

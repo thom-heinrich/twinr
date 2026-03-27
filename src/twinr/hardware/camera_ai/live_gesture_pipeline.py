@@ -89,6 +89,11 @@ _LIVE_FINE_GESTURE_ALLOWLIST = frozenset(
         AICameraFineHandGesture.PEACE_SIGN,
     }
 )
+_LIVE_NO_HAND_PERSON_ROI_ALLOWLIST = frozenset(
+    {
+        AICameraFineHandGesture.PEACE_SIGN,
+    }
+)
 _LIVE_BUILTIN_FINE_GESTURE_MAP = {
     label: gesture
     for label, gesture in BUILTIN_FINE_GESTURE_MAP.items()
@@ -411,6 +416,7 @@ class LiveGesturePipeline:
             live_hand_box_count=len(current_hand_boxes),
         )
         if fine_hand_gesture == AICameraFineHandGesture.NONE:
+            rescue_blocked_by_live_no_hand = fresh_live_results_confirm_no_hand and not effective_hand_boxes
             debug_snapshot: dict[str, object] = {
                 "resolved_source": "none",
                 "live_builtin_gesture": builtin_choice[0].value,
@@ -435,6 +441,14 @@ class LiveGesturePipeline:
                 "visible_person_box_count": len(live_visible_person_boxes),
                 "effective_visible_person_box_count": len(effective_visible_person_boxes),
                 "visible_person_box_source": visible_person_box_source,
+                "person_roi_candidate_count": len(effective_visible_person_boxes),
+                "person_roi_detection_count": 0,
+                "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
+                "person_roi_combined_confidence": None,
+                "person_roi_short_circuit_used": False,
+                "person_roi_short_circuit_reason": None,
+                "person_roi_block_reason": None,
+                "full_frame_hand_attempt_reason": None,
             }
             person_roi_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
             if effective_visible_person_boxes:
@@ -447,7 +461,11 @@ class LiveGesturePipeline:
                     sparse_keypoints=sparse_keypoints,
                 )
                 debug_snapshot.update(person_roi_debug)
-                if person_roi_choice[0] != AICameraFineHandGesture.NONE:
+                if rescue_blocked_by_live_no_hand and not _allow_person_roi_rescue_despite_live_no_hand(
+                    person_roi_choice[0]
+                ):
+                    debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
+                elif person_roi_choice[0] != AICameraFineHandGesture.NONE:
                     fine_hand_gesture, fine_hand_confidence = person_roi_choice
                     if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
                         debug_snapshot["resolved_source"] = (
@@ -459,6 +477,8 @@ class LiveGesturePipeline:
                         debug_snapshot["resolved_source"] = (
                             "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
                         )
+            elif rescue_blocked_by_live_no_hand:
+                debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
             if fine_hand_gesture == AICameraFineHandGesture.NONE:
                 rescue_choice, live_roi_debug = self._recognize_from_live_hand_rois(
                     runtime=runtime,
@@ -472,36 +492,39 @@ class LiveGesturePipeline:
                     debug_snapshot["resolved_source"] = (
                         "live_hand_roi" if hand_box_source == "live" else "recent_live_hand_roi"
                     )
-            full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
-                fine_hand_gesture=fine_hand_gesture,
-                effective_visible_person_boxes=effective_visible_person_boxes,
-                effective_hand_boxes=effective_hand_boxes,
-                person_roi_detection_count=_coerce_nonnegative_int(
-                    debug_snapshot.get("person_roi_detection_count")
-                ),
-                live_roi_hand_box_count=_coerce_nonnegative_int(
-                    debug_snapshot.get("live_roi_hand_box_count")
-                ),
-                live_roi_combined_gesture=str(
-                    debug_snapshot.get("live_roi_combined_gesture", AICameraFineHandGesture.NONE.value)
-                    or AICameraFineHandGesture.NONE.value
-                ),
-            )
-            if full_frame_rescue_reason is not None:
-                full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
-                    runtime=runtime,
-                    frame_rgb=frame_rgb,
-                    timestamp_ms=timestamp_ms,
+            if rescue_blocked_by_live_no_hand and fine_hand_gesture == AICameraFineHandGesture.NONE:
+                debug_snapshot["full_frame_hand_attempt_reason"] = "fresh_live_results_confirm_no_hand"
+            else:
+                full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
+                    fine_hand_gesture=fine_hand_gesture,
+                    effective_visible_person_boxes=effective_visible_person_boxes,
+                    effective_hand_boxes=effective_hand_boxes,
+                    person_roi_detection_count=_coerce_nonnegative_int(
+                        debug_snapshot.get("person_roi_detection_count")
+                    ),
+                    live_roi_hand_box_count=_coerce_nonnegative_int(
+                        debug_snapshot.get("live_roi_hand_box_count")
+                    ),
+                    live_roi_combined_gesture=str(
+                        debug_snapshot.get("live_roi_combined_gesture", AICameraFineHandGesture.NONE.value)
+                        or AICameraFineHandGesture.NONE.value
+                    ),
                 )
-                debug_snapshot.update(full_frame_debug)
-                debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
-                hand_count = max(
-                    hand_count,
-                    _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
-                )
-                if full_frame_choice[0] != AICameraFineHandGesture.NONE:
-                    fine_hand_gesture, fine_hand_confidence = full_frame_choice
-                    debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+                if full_frame_rescue_reason is not None:
+                    full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                        runtime=runtime,
+                        frame_rgb=frame_rgb,
+                        timestamp_ms=timestamp_ms,
+                    )
+                    debug_snapshot.update(full_frame_debug)
+                    debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
+                    hand_count = max(
+                        hand_count,
+                        _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
+                    )
+                    if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                        fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                        debug_snapshot["resolved_source"] = "full_frame_hand_roi"
         else:
             debug_snapshot = {
                 "resolved_source": "live_stream",
@@ -1608,6 +1631,20 @@ def _fresh_live_results_confirm_no_hand(
     if custom_ready is not True:
         return False
     return hand_count <= 0 and live_hand_box_count <= 0
+
+
+def _allow_person_roi_rescue_despite_live_no_hand(
+    gesture: AICameraFineHandGesture,
+) -> bool:
+    """Return whether one person-ROI symbol may override the live no-hand veto.
+
+    Fresh live no-hand evidence should still block the noisy thumb rescue path.
+    Keep one narrow exception for peace_sign, because accepted Pi baseline runs
+    regularly recovered deliberate Victory gestures from person-ROI scans even
+    when the live hand callbacks briefly dropped to zero boxes.
+    """
+
+    return gesture in _LIVE_NO_HAND_PERSON_ROI_ALLOWLIST
 
 
 def _summarize_gesture_categories(

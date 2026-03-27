@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from twinr.web.presenters.common import (
     _default_reminder_due_at,
-    _nav_items,
     _provider_status,
     _recent_named_files,
     _reminder_rows,
@@ -40,6 +39,12 @@ from twinr.web.presenters.integrations import (
 )
 from twinr.web.presenters.memory import _memory_sections
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _health_card_detail
+from twinr.web.presenters.shell import (
+    _nav_items,
+    build_advanced_hub_page_context,
+    build_home_destination_cards,
+    build_settings_shortcut_cards,
+)
 from twinr.web.presenters.self_coding import build_self_coding_ops_page_context
 from twinr.web.presenters.social_history import (
     _build_social_history_learning_record,
@@ -89,6 +94,9 @@ __all__ = [
     "_social_history_learning_panel",
     "_social_history_learning_sections",
     "_whatsapp_integration_context",
+    "build_advanced_hub_page_context",
+    "build_home_destination_cards",
+    "build_settings_shortcut_cards",
     "build_ops_debug_page_context",
     "build_self_coding_ops_page_context",
     "build_whatsapp_wizard_page_context",

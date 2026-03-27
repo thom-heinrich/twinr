@@ -359,11 +359,39 @@ files:
       - PresenceSessionController
       - PresenceSessionSnapshot
   - path: service.py
-    role: Thin proactive monitor orchestration, lifecycle, and assembly of the extracted attention/gesture helper surfaces into the active runtime
+    role: Compatibility shim that preserves the historic import path and helper surface while delegating the real implementation to service_impl/
     exports:
       - ProactiveCoordinator
       - ProactiveMonitorService
       - ProactiveTickResult
+      - build_default_proactive_monitor
+  - path: service_impl/README.md
+    role: Internal map of the refactored proactive service implementation package; no caller migration required
+  - path: service_impl/coordinator_core.py
+    role: Dependency wiring plus the main proactive tick/orchestration path extracted from the legacy service monolith
+    exports:
+      - ProactiveTickResult
+  - path: service_impl/coordinator_display.py
+    role: Dedicated HDMI attention and gesture refresh workflows extracted from the legacy service monolith
+  - path: service_impl/coordinator_observation.py
+    role: Stable observation-mixin facade that composes the focused observation helper modules behind the historic path
+  - path: service_impl/coordinator_observation_display.py
+    role: Automation-dispatch, HDMI display, gesture, and camera-surface helper bridges extracted from the legacy observation mixin
+  - path: service_impl/coordinator_observation_facts.py
+    role: Automation fact payload assembly and rising-edge sensor-event derivation extracted from the legacy observation mixin
+  - path: service_impl/coordinator.py
+    role: Final ProactiveCoordinator composition built from focused mixins
+    exports:
+      - ProactiveCoordinator
+      - ProactiveTickResult
+  - path: service_impl/monitor.py
+    role: Bounded background worker lifecycle wrapper around the proactive coordinator
+    exports:
+      - ProactiveMonitorService
+  - path: service_impl/builder.py
+    role: Default production monitor assembly path that keeps the legacy wrapper monkeypatch surface stable
+    exports:
+      - BuildDefaultProactiveMonitorDependencies
       - build_default_proactive_monitor
   - path: service_attention_helpers.py
     role: Focused HDMI attention-follow live-context export, servo follow, changed-only tracing, and attention-debug packaging used by the proactive coordinator

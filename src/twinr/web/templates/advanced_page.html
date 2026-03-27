@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card-grid">
+  {% for card in featured_cards %}
+  <a class="card" href="{{ card.href }}">
+    <div class="card-title">{{ card.title }}</div>
+    <div class="card-value">{{ card.value }}</div>
+    <div class="card-detail">{{ card.detail }}</div>
+  </a>
+  {% endfor %}
+</section>
+
+{% for section in sections %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>{{ section.title }}</h2>
+      <p class="section-description">{{ section.description }}</p>
+    </div>
+  </div>
+  <section class="card-grid">
+    {% for card in section.cards %}
+    <a class="card" href="{{ card.href }}">
+      <div class="card-title">{{ card.title }}</div>
+      <div class="card-value">{{ card.value }}</div>
+      <div class="card-detail">{{ card.detail }}</div>
+    </a>
+    {% endfor %}
+  </section>
+</section>
+{% endfor %}
+{% endblock %}

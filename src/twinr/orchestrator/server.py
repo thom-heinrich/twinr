@@ -34,6 +34,7 @@ from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceRuntimeStateEvent,
 )
 from twinr.orchestrator.voice_gateway_guardrails import (
@@ -300,8 +301,19 @@ class EdgeOrchestratorServer:
                                 emit_event(event_payload)
                             continue
                         if message_type == "voice_runtime_state":
-                            event = OrchestratorVoiceRuntimeStateEvent.from_payload(payload)
-                            for event_payload in await asyncio.to_thread(voice_session.handle_runtime_state, event):
+                            runtime_event = OrchestratorVoiceRuntimeStateEvent.from_payload(payload)
+                            for event_payload in await asyncio.to_thread(
+                                voice_session.handle_runtime_state,
+                                runtime_event,
+                            ):
+                                emit_event(event_payload)
+                            continue
+                        if message_type == "voice_identity_profiles":
+                            identity_event = OrchestratorVoiceIdentityProfilesEvent.from_payload(payload)
+                            for event_payload in await asyncio.to_thread(
+                                voice_session.handle_identity_profiles,
+                                identity_event,
+                            ):
                                 emit_event(event_payload)
                             continue
                         if message_type == "voice_audio_frame":

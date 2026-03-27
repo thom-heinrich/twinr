@@ -116,6 +116,10 @@ python3 hardware/ops/check_pi_openai_env_contract.py --env-file /twinr/.env
 python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
 ```
 
+The `twinr-web.service` unit keeps the portal alive, but remote browser access
+still stays fail-closed until `/twinr/.env` enables `TWINR_WEB_ALLOW_REMOTE=1`,
+`TWINR_WEB_REQUIRE_AUTH=1`, and a matching `TWINR_WEB_ALLOWED_HOSTS` allowlist.
+
 Install the development-host orchestrator endpoint plus LAN bridge only on
 the machine that owns the leading repo checkout:
 

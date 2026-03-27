@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig
 from twinr.memory.context_store import PersistentMemoryMarkdownStore
 from twinr.memory.longterm.storage.remote_state import (
@@ -2304,11 +2304,27 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             write_opener.queue_json(
                 {
                     "success": True,
+                    "job_id": "job-snapshot",
+                    "status": "succeeded",
+                    "result": {"success": True, "items": []},
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
                     "job_id": "job-pointer",
                     "status": "pending",
                     "items": 1,
                     "operation": "store_payload",
                     "execution_mode": "async",
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-pointer",
+                    "status": "succeeded",
+                    "result": {"success": True, "items": []},
                 }
             )
             state = LongTermRemoteStateStore(
@@ -2327,13 +2343,126 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
         self.assertEqual(state._document_id_hints["objects"], "doc-async")
         self.assertEqual(len(read_opener.calls), 4)
-        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(write_opener.calls), 4)
         first_body = json.loads(write_opener.calls[0]["body"])
-        second_body = json.loads(write_opener.calls[1]["body"])
+        second_body = json.loads(write_opener.calls[2]["body"])
         self.assertEqual(first_body["execution_mode"], "async")
         self.assertEqual(second_body["execution_mode"], "async")
         self.assertEqual(first_body["items"][0]["payload"]["snapshot_kind"], "objects")
         self.assertEqual(second_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
+        self.assertTrue(write_opener.calls[1]["full_url"].endswith("/v1/external/jobs/job-snapshot"))
+        self.assertTrue(write_opener.calls[3]["full_url"].endswith("/v1/external/jobs/job-pointer"))
+
+    def test_remote_snapshot_save_resolves_async_job_document_id_before_snapshot_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            payload = {"schema": "archive_store", "items": []}
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "archive-doc-123",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "archive",
+                            "updated_at": "2026-03-27T10:10:00+00:00",
+                            "body": payload,
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "ptr-archive-123",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:archive",
+                            "updated_at": "2026-03-27T10:10:01+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "archive",
+                                "document_id": "archive-doc-123",
+                            },
+                        }
+                    ),
+                }
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-archive",
+                    "status": "pending",
+                    "items": 1,
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-archive",
+                    "status": "succeeded",
+                    "result": {
+                        "success": True,
+                        "items": [
+                            {
+                                "success": True,
+                                "document_id": "archive-doc-123",
+                                "payload_id": "archive-doc-123",
+                            }
+                        ],
+                    },
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "items": [
+                        {
+                            "success": True,
+                            "document_id": "ptr-archive-123",
+                            "payload_id": "ptr-archive-123",
+                        }
+                    ],
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            state.save_snapshot(snapshot_kind="archive", payload=payload)
+
+        self.assertEqual(state._document_id_hints["archive"], "archive-doc-123")
+        self.assertEqual(len(read_opener.calls), 2)
+        self.assertEqual(len(write_opener.calls), 3)
+        first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
+        second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
+        self.assertEqual(first_query["document_id"], ["archive-doc-123"])
+        self.assertEqual(second_query["document_id"], ["ptr-archive-123"])
+        self.assertNotIn("origin_uri", first_query)
+        self.assertNotIn("origin_uri", second_query)
+        self.assertTrue(write_opener.calls[1]["full_url"].endswith("/v1/external/jobs/job-archive"))
 
     def test_remote_snapshot_save_retries_stale_async_origin_attestation_without_rewriting_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2435,6 +2564,14 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             write_opener.queue_json(
                 {
                     "success": True,
+                    "job_id": "job-snapshot",
+                    "status": "succeeded",
+                    "result": {"success": True, "items": []},
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
                     "items": [
                         {
                             "success": True,
@@ -2461,13 +2598,14 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             state.save_snapshot(snapshot_kind="objects", payload=payload)
 
         self.assertEqual(state._document_id_hints["objects"], "new-doc")
-        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(write_opener.calls), 3)
         self.assertEqual(len(read_opener.calls), 3)
         first_body = json.loads(write_opener.calls[0]["body"])
-        second_body = json.loads(write_opener.calls[1]["body"])
+        second_body = json.loads(write_opener.calls[2]["body"])
         self.assertEqual(first_body["items"][0]["payload"]["snapshot_kind"], "objects")
         self.assertEqual(second_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
         self.assertEqual(second_body["items"][0]["payload"]["body"]["document_id"], "new-doc")
+        self.assertTrue(write_opener.calls[1]["full_url"].endswith("/v1/external/jobs/job-snapshot"))
 
     def test_remote_snapshot_save_waits_through_multiple_stale_async_origin_reads_without_rewriting_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2570,6 +2708,14 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             write_opener.queue_json(
                 {
                     "success": True,
+                    "job_id": "job-snapshot",
+                    "status": "succeeded",
+                    "result": {"success": True, "items": []},
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
                     "items": [
                         {
                             "success": True,
@@ -2596,8 +2742,9 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             state.save_snapshot(snapshot_kind="objects", payload=payload)
 
         self.assertEqual(state._document_id_hints["objects"], "new-doc")
-        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(write_opener.calls), 3)
         self.assertEqual(len(read_opener.calls), 5)
+        self.assertTrue(write_opener.calls[1]["full_url"].endswith("/v1/external/jobs/job-snapshot"))
 
     def test_remote_snapshot_save_waits_for_exact_document_visibility_before_rewriting_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2929,6 +3076,14 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                     "execution_mode": "async",
                 }
             )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-pointer",
+                    "status": "succeeded",
+                    "result": {"success": True, "items": []},
+                }
+            )
             state = LongTermRemoteStateStore(
                 config=config,
                 read_client=ChonkyDBClient(
@@ -2944,12 +3099,13 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             state.save_snapshot(snapshot_kind="objects", payload=payload)
 
         self.assertEqual(state._document_id_hints["objects"], "new-doc")
-        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(write_opener.calls), 3)
         self.assertEqual(len(read_opener.calls), 3)
         pointer_body = json.loads(write_opener.calls[1]["body"])
         self.assertEqual(pointer_body["execution_mode"], "async")
         self.assertEqual(pointer_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
         self.assertEqual(pointer_body["items"][0]["payload"]["body"]["document_id"], "new-doc")
+        self.assertTrue(write_opener.calls[2]["full_url"].endswith("/v1/external/jobs/job-pointer"))
 
     def test_remote_snapshot_save_rejects_item_level_store_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

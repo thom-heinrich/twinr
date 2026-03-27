@@ -28,7 +28,7 @@ def build_self_coding_ops_page_context(store: SelfCodingStore) -> dict[str, Any]
     for activation in activations:
         try:
             health = store.load_skill_health(activation.skill_id, version=activation.version)
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError):
             health = None
         metadata = dict(getattr(activation, "metadata", {}) or {})
         artifact_kind = _activation_artifact_kind(store, activation=activation, metadata=metadata)

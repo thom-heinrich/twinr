@@ -9,6 +9,9 @@ from twinr.agent.workflows.remote_transcript_commit import (
     RemoteTranscriptCommit,
     RemoteTranscriptWaitHandle,
 )
+from twinr.agent.workflows.voice_identity_runtime import (
+    sync_voice_orchestrator_identity_profiles,
+)
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 
 
@@ -76,6 +79,7 @@ def notify_voice_orchestrator_state(
                 voice_quiet_until_utc=quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
+        sync_voice_orchestrator_identity_profiles(loop)
     except Exception as exc:
         loop.emit(f"voice_orchestrator_notify_failed={type(exc).__name__}")
 
@@ -121,6 +125,7 @@ def prime_voice_orchestrator_waiting_state(loop: Any) -> None:
                 voice_quiet_until_utc=loop._last_voice_orchestrator_quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
+        sync_voice_orchestrator_identity_profiles(loop, force=True)
 
 
 def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
@@ -152,6 +157,7 @@ def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
                 voice_quiet_until_utc=quiet_until_utc,
                 **intent_context.to_event_fields(),
             )
+        sync_voice_orchestrator_identity_profiles(loop)
     except Exception as exc:
         loop.emit(f"voice_orchestrator_context_refresh_failed={type(exc).__name__}")
 

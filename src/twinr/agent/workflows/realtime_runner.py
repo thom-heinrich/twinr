@@ -33,7 +33,11 @@ from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureEvaluator,
 )
 from twinr.agent.workflows.follow_up_steering import FollowUpSteeringRuntime
-from twinr.agent.workflows import realtime_follow_up, voice_orchestrator_runtime
+from twinr.agent.workflows import (
+    realtime_follow_up,
+    voice_identity_runtime,
+    voice_orchestrator_runtime,
+)
 from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.agent.tools import RealtimeToolExecutor
 from twinr.agent.tools.runtime.availability import (
@@ -224,6 +228,8 @@ class TwinrRealtimeHardwareLoop(
         self._last_voice_orchestrator_runtime_state: tuple[str, str | None, bool] | None = None
         self._last_voice_orchestrator_intent_context: VoiceRuntimeIntentContext | None = None
         self._last_voice_orchestrator_quiet_until_utc: str | None = None
+        self._last_voice_identity_profile_revision: str | None = None
+        self._last_voice_identity_profile_count: int = 0
         self._last_print_request_at: float | None = None
         self._next_reminder_check_at: float = 0.0
         self._next_automation_check_at: float = 0.0
@@ -263,6 +269,13 @@ class TwinrRealtimeHardwareLoop(
                 on_transcript_committed=self.handle_remote_transcript_committed,
                 on_follow_up_closed=self.handle_remote_follow_up_closed,
                 on_barge_in_interrupt=lambda: self._request_answer_interrupt("voice_orchestrator"),
+                on_recent_remote_audio=(
+                    lambda pcm_bytes, source: voice_identity_runtime.update_household_voice_assessment_from_pcm(
+                        self,
+                        pcm_bytes,
+                        source=source,
+                    )
+                ),
                 forensics=self.workflow_forensics,
             )
             if bool(getattr(config, "voice_orchestrator_enabled", False))
