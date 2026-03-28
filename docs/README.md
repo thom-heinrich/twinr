@@ -339,10 +339,10 @@ Recommended runtime env knobs:
 - `TWINR_ATTENTION_SERVO_GPIO=18`
 - `TWINR_ATTENTION_SERVO_INVERT_DIRECTION=false`
 
-When the physical Pololu Maestro lives on a helper Pi instead of the main Pi,
-configure `TWINR_ATTENTION_SERVO_DRIVER=peer_pololu_maestro` and point
-`TWINR_ATTENTION_SERVO_PEER_BASE_URL` at the helper's direct-link proxy, for
-example `http://10.42.0.2:8768`.
+Twinr's productive servo path is now single-Pi only: the attention-servo
+output must live on the main Pi. The active config loader rejects the retired
+helper-Pi `peer_pololu_maestro` / `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
+topology instead of letting it silently revive.
 
 Optional tuning knobs:
 
@@ -386,11 +386,9 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_PERIOD_S`
 - `TWINR_ATTENTION_SERVO_ESTIMATED_ZERO_MOVE_DUTY_CYCLE`
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_RETURN_TO_ZERO_AFTER_S`
-- `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
-- `TWINR_ATTENTION_SERVO_PEER_TIMEOUT_S`
 
 Supported driver values are `auto`, `twinr_kernel`, `sysfs_pwm`, `pigpio`,
-`lgpio_pwm`, `lgpio`, `pololu_maestro`, and `peer_pololu_maestro`.
+`lgpio_pwm`, `lgpio`, and `pololu_maestro`.
 
 When `TWINR_ATTENTION_SERVO_DRIVER=auto`, Twinr first probes for the custom
 `/sys/class/twinr_servo/servo0` kernel-module contract, then a usable
@@ -400,9 +398,7 @@ falls back to `lgpio_pwm` before the older `lgpio` servo helper. The
 Twinr kernel servo module is built and loaded on the Pi.
 
 `pololu_maestro` expects the Maestro command port to exist locally on the same
-host as the Twinr runtime. `peer_pololu_maestro` keeps the follow logic on the
-main Pi but sends bounded channel commands over HTTP to a helper Pi that owns
-the physical Maestro USB connection.
+host as the Twinr runtime.
 
 For calm physical behavior, do not think only in terms of "smaller pulse
 steps". Many hobby servos have a pulse dead band, so tiny frequent pulse
@@ -601,14 +597,14 @@ Recommended `.env` additions:
 
 ```dotenv
 OPENAI_REASONING_EFFORT=medium
-OPENAI_STT_MODEL=whisper-1
+OPENAI_STT_MODEL=gpt-4o-mini-transcribe
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=marin
 OPENAI_TTS_FORMAT=wav
 OPENAI_TTS_INSTRUCTIONS="Speak in clear, warm, natural standard German with native German pronunciation. No English accent."
-OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
+OPENAI_REALTIME_MODEL=gpt-realtime-1.5
 OPENAI_REALTIME_VOICE=sage
-OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1
+OPENAI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 OPENAI_REALTIME_LANGUAGE=de
 OPENAI_REALTIME_INPUT_SAMPLE_RATE=24000
 OPENAI_REALTIME_INSTRUCTIONS="Speak in clear, warm, natural standard German with native German pronunciation. No English accent."
@@ -658,6 +654,7 @@ TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=12.0
 TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.2
 TWINR_VOICE_ORCHESTRATOR_ENABLED=true
 TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator/voice
+TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true
 TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://192.168.1.154:8797
 TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET=twinr-voice-gateway-20260322
 ```
@@ -683,6 +680,7 @@ The active realtime and streaming loops can also trigger the camera automaticall
 With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
 With `TWINR_VOICE_ORCHESTRATOR_ENABLED=true`, the Pi keeps one live websocket stream open to the transcript-first voice gateway and leaves wake detection there. The same remote stream stays authoritative for wake, transcript commit, continuation, and follow-up closure. Twinr has no separate local wake or STT path in the live product flow.
+When the current development-host `:8797` bridge is used, that websocket is still plain `ws://` transport without TLS termination. Set `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` explicitly for that attested LAN bridge; prefer `wss://` whenever a TLS terminator is available.
 Remove any retired local voice-selector env from current deployments. The live runtime contract is remote-only and fails closed on legacy local-selector config.
 
 The active runtime loops keep the same green/yellow button UX. They can inspect the camera for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".

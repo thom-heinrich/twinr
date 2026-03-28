@@ -19,18 +19,44 @@ class OpsHealthTests(unittest.TestCase):
         entries = (
             health_mod._ProcessEntry(
                 pid="123",
+                ppid="1",
                 command="python -u -m twinr --run-streaming-loop",
             ),
         )
 
         with mock.patch.object(health_mod, "_list_process_entries", return_value=entries):
-            services, probe_ok = health_mod._collect_service_health()
+            services, probe_ok = health_mod._collect_service_health(TwinrConfig())
 
         self.assertTrue(probe_ok)
         conversation = next(service for service in services if service.key == "conversation_loop")
         self.assertTrue(conversation.running)
         self.assertEqual(conversation.count, 1)
         self.assertIn("--run-streaming-loop", conversation.detail)
+
+    def test_collect_service_health_ignores_streaming_worker_with_inherited_parent_argv(self) -> None:
+        entries = (
+            health_mod._ProcessEntry(
+                pid="123",
+                ppid="1",
+                command="python -u -m twinr --run-streaming-loop",
+            ),
+            health_mod._ProcessEntry(
+                pid="456",
+                ppid="123",
+                command="python -u -m twinr --run-streaming-loop",
+            ),
+        )
+
+        with mock.patch.object(health_mod, "_list_process_entries", return_value=entries):
+            with mock.patch.object(health_mod, "loop_lock_owner", return_value=123):
+                services, probe_ok = health_mod._collect_service_health(TwinrConfig())
+
+        self.assertTrue(probe_ok)
+        conversation = next(service for service in services if service.key == "conversation_loop")
+        self.assertTrue(conversation.running)
+        self.assertEqual(conversation.count, 1)
+        self.assertIn("pid=123", conversation.detail)
+        self.assertNotIn("pid=456", conversation.detail)
 
     def test_collect_system_health_treats_display_companion_lock_owner_as_running_display(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -107,6 +133,8 @@ class OpsHealthTests(unittest.TestCase):
                     pid=123,
                     updated_at=stale_time,
                     last_render_started_at=stale_time,
+                    updated_monotonic_ns=0,
+                    last_render_started_monotonic_ns=0,
                 )
             )
             services = (

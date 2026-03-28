@@ -183,6 +183,31 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["issues"], [])
 
+    def test_scan_staged_allows_sensitive_name_references_and_non_secret_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                (
+                    'ssl_keyfile_password=args.ssl_keyfile_password\n'
+                    '_SECRET_NAME_FRAGMENT = r"(?:api[_-]?key|token|password)"\n'
+                    '_PROCESS_TOKEN = f"{pid}:{clock}"\n'
+                    'token = "".join(normalized).strip("_")\n'
+                    'target_tokens = target.tokens\n'
+                    'token_usage=turn.token_usage\n'
+                    'api_key_header=config.chonkydb_api_key_header\n'
+                    'password_path = "/auth/password"\n'
+                ),
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
     def test_scan_staged_allows_blocked_term_policy_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -235,6 +260,45 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_ignores_dates_math_and_resolution_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "notes.md").write_text(
+                (
+                    "schema version is 2026-03-27.1\n"
+                    "timeout uses max(100, ceil(value * 100)) / 1000.0\n"
+                    "center pulse is clamp(2500) + 1500\n"
+                    "supported sizes: 420/640/720\n"
+                    "normalized gain is 2.000000 and floor is 0.500000\n"
+                ),
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "notes.md")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_still_blocks_real_phone_number_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "notes.md").write_text(
+                "Call me at +49 30 12345678\n",
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "notes.md")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            issues = cast(list[dict[str, Any]], payload["issues"])
+            self.assertEqual(issues[0]["rule_id"], "phone-number")
 
     def test_scan_staged_ignores_binary_patch_content_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

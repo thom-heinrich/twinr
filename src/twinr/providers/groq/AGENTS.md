@@ -22,6 +22,7 @@ Out of scope:
 ## Invariants
 
 - `GroqAgentTextProvider` and `GroqToolCallingAgentProvider` remain the only public exports from this package.
+- `__init__.py` stays a thin lazy re-export surface; do not import the adapter stack there at package import time.
 - `client.py` must validate API key, timeout, and base URL policy before constructing the SDK client.
 - `allow_web_search=True` stays a delegated support-provider path; do not silently pretend native Groq live search exists here.
 - Tool continuations must stay bounded by TTL and item count, and continuation reuse must continue to enforce exact expected call IDs.

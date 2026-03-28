@@ -1,8 +1,10 @@
 # api
 
-`api` owns Twinr's public OpenAI API-layer surfaces. It exports the canonical
-backend class, wraps that backend in contract-specific adapters, and assembles
-the provider bundle consumed by runtime loops and factories.
+`api` owns Twinr's public OpenAI API-layer surfaces. Its package root exports
+the canonical backend class and adapter types lazily so import probes do not
+pull the full adapter/backend stack until a caller needs a concrete export.
+The package wraps that backend in contract-specific adapters and assembles the
+provider bundle consumed by runtime loops and factories.
 
 ## Responsibility
 
@@ -21,7 +23,7 @@ the provider bundle consumed by runtime loops and factories.
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Public package exports |
+| [__init__.py](./__init__.py) | Lazy public package exports |
 | [backend.py](./backend.py) | Canonical backend composition |
 | [adapters.py](./adapters.py) | Contract adapters and bundle assembly |
 | [component.yaml](./component.yaml) | Structured package metadata |

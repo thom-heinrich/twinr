@@ -142,9 +142,11 @@ files:
       - VoiceTranscriptDebugStream
       - VoiceTranscriptDebugStreamConfig
   - path: voice_session.py
-    role: Server-side activation, follow-up, and barge-in decision session for streaming edge audio
+    role: Stable compatibility wrapper for the server-side streaming voice-session import surface
     exports:
       - EdgeOrchestratorVoiceSession
+  - path: voice_session_impl/
+    role: Internal voice-session package split across runtime-state handling, observability, backend requests, and utterance scanning
 public_api:
   module: twinr.orchestrator
   exports:

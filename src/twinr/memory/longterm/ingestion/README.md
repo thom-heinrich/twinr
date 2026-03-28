@@ -26,7 +26,8 @@ candidate long-term memory inputs.
 | `extract.py` | Turn extraction entrypoint |
 | `propositions.py` | Structured proposition compiler |
 | `multimodal.py` | Multimodal event extractor |
-| `environment_profile.py` | Room-agnostic smart-home day-profile, baseline, quality, and drift compiler |
+| `environment_profile.py` | Public compatibility wrapper for room-agnostic smart-home environment profiling |
+| `environment_profile_impl/` | Decomposed implementation package for helpers, models, baselines, deviations, and regime analysis |
 | `environment_stats.py` | Shared robust statistics and divergence helpers for environment profiling |
 | `respeaker_audio.py` | Structured ReSpeaker audio routine-seed extraction |
 | `respeaker_contract.py` | ReSpeaker claim-contract parsing and memory-attribute helpers |

@@ -1,0 +1,15 @@
+# Pi-only runtime supplements for direct optional imports used by Twinr.
+# The core project dependencies stay in pyproject.toml; this manifest covers
+# Pi acceptance packages that improve runtime behavior or unlock optional
+# capabilities without forcing every local environment to install them.
+# Keep this list byte-for-byte aligned with project.optional-dependencies.pi-runtime
+# in pyproject.toml; the deploy tests assert that contract.
+RapidFuzz>=3.14,<4
+wcwidth>=0.6,<1
+onnx>=1.17,<2
+msgspec>=0.20,<1
+orjson>=3.11,<4
+portalocker>=3.2,<4
+zstandard>=0.25,<1
+h2>=4.3,<5
+opentelemetry-api>=1.40,<2

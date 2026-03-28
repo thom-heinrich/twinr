@@ -37,6 +37,15 @@ def load_channels_config(context: ConfigLoadContext) -> dict[str, object]:
             get_value("TWINR_VOICE_ORCHESTRATOR_WS_URL")
         )
         or "",
+        "voice_orchestrator_allow_insecure_ws": _parse_bool(
+            (
+                get_value("TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS")
+                if get_value("TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS")
+                not in (None, "")
+                else get_value("TWINR_ALLOW_INSECURE_VOICE_WS")
+            ),
+            False,
+        ),
         "voice_orchestrator_shared_secret": get_value(
             "TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET"
         )

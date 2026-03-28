@@ -29,7 +29,11 @@ class _FakeCameraCapture:
     def __init__(self) -> None:
         self.source_device = "/dev/video0"
         self.input_format = "mjpeg"
-        self.data = b"\x89PNG\r\n\x1a\ncamera"
+        self.data = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc`h\xf8\x0f"
+            b"\x00\x02\x03\x01\x80$a\xf5\x97\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
         self.content_type = "image/png"
         self.filename = "camera-capture.png"
 

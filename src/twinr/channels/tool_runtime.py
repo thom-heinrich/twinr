@@ -405,6 +405,7 @@ class TwinrToolTextChannelTurnService:
                 tool_schemas=self._build_tool_schemas(tool_names),
                 allow_web_search=self.allow_web_search,
                 execute_tool=tool_executor.handle_send_whatsapp_message,
+                max_rounds=self.max_rounds,
             )
 
     def _complete_local_pending_follow_up(
@@ -442,8 +443,8 @@ class TwinrToolTextChannelTurnService:
         )
         metadata = {
             "provider_model": result.provider_model or "pending_whatsapp_follow_up",
-            "provider_used_web_search": "false",
-            "tool_rounds": "0",
+            "provider_used_web_search": str(bool(result.used_web_search)).lower(),
+            "tool_rounds": str(max(0, int(result.tool_rounds))),
             "tool_calls": str(len(result.tool_results)),
         }
         if result.provider_response_id:

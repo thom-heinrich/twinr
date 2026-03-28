@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Replaced fixed-offset framebuffer ioctl parsing with native-ABI ctypes structs; fixes broken line_length parsing on 32-bit Raspberry Pi OS.
+# BUG-2: Honour framebuffer xoffset/yoffset and virtual-memory layout; fixes writes landing in the wrong visible page on panned or double-buffered fbdev setups.
+# BUG-3: Handle short writes explicitly instead of assuming one write syscall copies a full frame.
+# SEC-1: Harden framebuffer opening with O_NOFOLLOW/CLOEXEC and character-device validation by default; prevents arbitrary file corruption if the configured path is compromised.
+# IMP-1: Added zero-copy mmap output, unchanged-frame suppression, and dirty-row writes to cut CPU, memory bandwidth, and visible tearing on Raspberry Pi 4 deployments.
+# IMP-2: Added modern fast pixel packers (Pillow raw modes for common 24/32bpp, optional NumPy vector path, resilient generic fallback), 24bpp support, trusted fontconfig probing, and reopen/reprobe recovery.
+
 """Render Twinr status screens on an HDMI framebuffer.
 
 This backend targets the Raspberry Pi HDMI path exposed via ``/dev/fb0``. It
@@ -8,15 +16,19 @@ rendering a calmer, larger, full-color screen for the HDMI panel.
 from __future__ import annotations
 
 from collections.abc import Callable
+import ctypes
 from dataclasses import dataclass, field
 from datetime import datetime
+import errno
 import fcntl
 import math
+import mmap
 import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
 from threading import RLock
-from typing import Any
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
@@ -43,6 +55,72 @@ _FBIOGET_VSCREENINFO = 0x4600
 _FBIOGET_FSCREENINFO = 0x4602
 _SUPPORTED_ROTATIONS = (0, 90, 180, 270)
 _STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
+_FB_TYPE_FOURCC = 5
+_FB_VISUAL_FOURCC = 6
+_TRUSTED_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+_SUPPORTED_PILLOW_RAW_MODES = frozenset({"RGB", "BGR", "RGBX", "BGRX", "XRGB", "XBGR", "RGBA", "BGRA", "ABGR"})
+
+
+class _CFbBitfield(ctypes.Structure):
+    _fields_ = (
+        ("offset", ctypes.c_uint32),
+        ("length", ctypes.c_uint32),
+        ("msb_right", ctypes.c_uint32),
+    )
+
+
+class _CFbFixScreeninfo(ctypes.Structure):
+    _fields_ = (
+        ("id", ctypes.c_char * 16),
+        ("smem_start", ctypes.c_ulong),
+        ("smem_len", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("type_aux", ctypes.c_uint32),
+        ("visual", ctypes.c_uint32),
+        ("xpanstep", ctypes.c_uint16),
+        ("ypanstep", ctypes.c_uint16),
+        ("ywrapstep", ctypes.c_uint16),
+        ("line_length", ctypes.c_uint32),
+        ("mmio_start", ctypes.c_ulong),
+        ("mmio_len", ctypes.c_uint32),
+        ("accel", ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16 * 2),
+    )
+
+
+class _CFbVarScreeninfo(ctypes.Structure):
+    _fields_ = (
+        ("xres", ctypes.c_uint32),
+        ("yres", ctypes.c_uint32),
+        ("xres_virtual", ctypes.c_uint32),
+        ("yres_virtual", ctypes.c_uint32),
+        ("xoffset", ctypes.c_uint32),
+        ("yoffset", ctypes.c_uint32),
+        ("bits_per_pixel", ctypes.c_uint32),
+        ("grayscale", ctypes.c_uint32),
+        ("red", _CFbBitfield),
+        ("green", _CFbBitfield),
+        ("blue", _CFbBitfield),
+        ("transp", _CFbBitfield),
+        ("nonstd", ctypes.c_uint32),
+        ("activate", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("accel_flags", ctypes.c_uint32),
+        ("pixclock", ctypes.c_uint32),
+        ("left_margin", ctypes.c_uint32),
+        ("right_margin", ctypes.c_uint32),
+        ("upper_margin", ctypes.c_uint32),
+        ("lower_margin", ctypes.c_uint32),
+        ("hsync_len", ctypes.c_uint32),
+        ("vsync_len", ctypes.c_uint32),
+        ("sync", ctypes.c_uint32),
+        ("vmode", ctypes.c_uint32),
+        ("rotate", ctypes.c_uint32),
+        ("colorspace", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 4),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,20 +138,75 @@ class FramebufferGeometry:
 
     width: int
     height: int
-    bits_per_pixel: int
-    line_length: int
-    red: FramebufferBitfield
-    green: FramebufferBitfield
-    blue: FramebufferBitfield
-    transp: FramebufferBitfield
+    virtual_width: int = 0
+    virtual_height: int = 0
+    xoffset: int = 0
+    yoffset: int = 0
+    bits_per_pixel: int = 0
+    line_length: int = 0
+    memory_length: int = 0
+    framebuffer_type: int = 0
+    visual: int = 0
+    capabilities: int = 0
+    grayscale: int = 0
+    red: FramebufferBitfield = field(default_factory=lambda: FramebufferBitfield(offset=0, length=0, msb_right=0))
+    green: FramebufferBitfield = field(default_factory=lambda: FramebufferBitfield(offset=0, length=0, msb_right=0))
+    blue: FramebufferBitfield = field(default_factory=lambda: FramebufferBitfield(offset=0, length=0, msb_right=0))
+    transp: FramebufferBitfield = field(default_factory=lambda: FramebufferBitfield(offset=0, length=0, msb_right=0))
+
+    def __post_init__(self) -> None:
+        """Preserve the historical minimal constructor contract.
+
+        Older callers only supplied the visible geometry plus channel bitfields.
+        Fill the newer low-level framebuffer metadata from those visible values
+        when it was not provided explicitly.
+        """
+
+        width = max(1, int(self.width))
+        height = max(1, int(self.height))
+        object.__setattr__(self, "width", width)
+        object.__setattr__(self, "height", height)
+
+        bytes_per_pixel = max(1, (int(self.bits_per_pixel) + 7) // 8) if int(self.bits_per_pixel) > 0 else 0
+        virtual_width = int(self.virtual_width) if int(self.virtual_width) > 0 else width
+        virtual_height = int(self.virtual_height) if int(self.virtual_height) > 0 else height
+        line_length = int(self.line_length) if int(self.line_length) > 0 else (width * bytes_per_pixel)
+        memory_length = int(self.memory_length) if int(self.memory_length) > 0 else (line_length * virtual_height)
+
+        object.__setattr__(self, "virtual_width", virtual_width)
+        object.__setattr__(self, "virtual_height", virtual_height)
+        object.__setattr__(self, "line_length", line_length)
+        object.__setattr__(self, "memory_length", memory_length)
 
     @property
     def bytes_per_pixel(self) -> int:
-        return max(1, self.bits_per_pixel // 8)
+        return max(1, (self.bits_per_pixel + 7) // 8)
+
+    @property
+    def xoffset_bytes(self) -> int:
+        return self.xoffset * self.bytes_per_pixel
+
+    @property
+    def visible_offset_bytes(self) -> int:
+        return self.yoffset * self.line_length
+
+    @property
+    def row_pixel_bytes(self) -> int:
+        return self.width * self.bytes_per_pixel
 
     @property
     def frame_size_bytes(self) -> int:
         return self.line_length * self.height
+
+    @property
+    def required_memory_bytes(self) -> int:
+        return self.visible_offset_bytes + self.frame_size_bytes
+
+    @property
+    def mapping_size_bytes(self) -> int:
+        if self.memory_length > 0:
+            return max(self.memory_length, self.required_memory_bytes)
+        return self.required_memory_bytes
 
 
 @dataclass(slots=True)
@@ -88,21 +221,30 @@ class HdmiFramebufferDisplay:
     layout_mode: str = "default"
     emit: Callable[[str], None] | None = None
     _geometry: FramebufferGeometry | None = field(default=None, init=False, repr=False)
-    _framebuffer: Any | None = field(default=None, init=False, repr=False)
+    _framebuffer_fd: int | None = field(default=None, init=False, repr=False)
+    _framebuffer_map: mmap.mmap | None = field(default=None, init=False, repr=False)
+    _framebuffer_map_length: int = field(default=0, init=False, repr=False)
     _font_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _font_path_cache: dict[str, Path | None] = field(default_factory=dict, init=False, repr=False)
     _emoji_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _emoji_font_path_cache: Path | None = field(default=None, init=False, repr=False)
     _emoji_font_path_resolved: bool = field(default=False, init=False, repr=False)
     _emoji_font_missing_reported: bool = field(default=False, init=False, repr=False)
+    _non_device_override_reported: bool = field(default=False, init=False, repr=False)
     _lock: object = field(default_factory=RLock, init=False, repr=False)
     _last_rendered_status: str | None = field(default=None, init=False, repr=False)
     _default_scene_renderer: HdmiDefaultSceneRenderer | None = field(default=None, init=False, repr=False)
+    _last_payload: bytes | None = field(default=None, init=False, repr=False)
+    _reported_io_backend: str | None = field(default=None, init=False, repr=False)
+    _reported_pack_backend: str | None = field(default=None, init=False, repr=False)
+    _legacy_open_framebuffer_func: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.framebuffer_path = self.framebuffer_path.expanduser()
         self.rotation_degrees = self.rotation_degrees % 360
         self.layout_mode = self._normalise_layout_mode(self.layout_mode)
         self._default_scene_renderer = HdmiDefaultSceneRenderer(self)
+        self._legacy_open_framebuffer_func = getattr(self._open_framebuffer, "__func__", self._open_framebuffer)
         if self.driver != "hdmi_fbdev":
             raise RuntimeError(f"HdmiFramebufferDisplay does not support driver `{self.driver}`.")
         if self.rotation_degrees not in _SUPPORTED_ROTATIONS:
@@ -139,6 +281,8 @@ class HdmiFramebufferDisplay:
                         "display_framebuffer=ready",
                         f"path={self.framebuffer_path}",
                         f"size={self._geometry.width}x{self._geometry.height}",
+                        f"virtual={self._geometry.virtual_width}x{self._geometry.virtual_height}",
+                        f"offset={self._geometry.xoffset},{self._geometry.yoffset}",
                         f"bpp={self._geometry.bits_per_pixel}",
                     )
                 )
@@ -160,6 +304,13 @@ class HdmiFramebufferDisplay:
         if self.rotation_degrees in (90, 270):
             return (height, width)
         return (width, height)
+
+    def refresh_geometry(self) -> FramebufferGeometry:
+        """Re-probe framebuffer geometry after a modeset, hotplug, or recovery."""
+
+        with self._lock:
+            self._reset_framebuffer_state(clear_geometry=True)
+            return self.geometry
 
     def show_test_pattern(self) -> None:
         """Render and display the HDMI smoke-test card."""
@@ -216,10 +367,29 @@ class HdmiFramebufferDisplay:
             prepared = self._prepare_image(image)
             geometry = self.geometry
             payload = self._pack_framebuffer_bytes(prepared, geometry)
-            framebuffer = self._open_framebuffer()
-            framebuffer.seek(0)
-            framebuffer.write(payload)
-            framebuffer.flush()
+            if self._last_payload is not None and payload == self._last_payload:
+                return
+            compatibility_open = self._open_framebuffer
+            compatibility_open_func = getattr(compatibility_open, "__func__", compatibility_open)
+            if compatibility_open_func is not self._legacy_open_framebuffer_func:
+                framebuffer = self._open_framebuffer()
+                framebuffer.seek(0)
+                framebuffer.write(payload)
+                flush = getattr(framebuffer, "flush", None)
+                if callable(flush):
+                    flush()
+                self._last_payload = payload
+                return
+            try:
+                self._write_framebuffer_payload(payload, geometry)
+            except OSError as exc:
+                self._safe_emit(f"display_framebuffer=retry reason={exc.__class__.__name__}")
+                self._reset_framebuffer_state(clear_geometry=True)
+                geometry = self.geometry
+                prepared = self._prepare_image(image)
+                payload = self._pack_framebuffer_bytes(prepared, geometry)
+                self._write_framebuffer_payload(payload, geometry)
+            self._last_payload = payload
 
     def render_test_image(self):
         """Build a full-screen HDMI validation card."""
@@ -336,14 +506,8 @@ class HdmiFramebufferDisplay:
     def close(self) -> None:
         """Release the open framebuffer handle."""
 
-        framebuffer = self._framebuffer
-        self._framebuffer = None
-        if framebuffer is None:
-            return
-        try:
-            framebuffer.close()
-        except Exception:
-            return
+        with self._lock:
+            self._reset_framebuffer_state(clear_geometry=False)
 
     def _scene_renderer(self) -> HdmiDefaultSceneRenderer:
         renderer = self._default_scene_renderer
@@ -584,23 +748,10 @@ class HdmiFramebufferDisplay:
             from PIL import ImageFont
         except ImportError as exc:  # pragma: no cover - environment issue
             raise RuntimeError("Pillow is required for Twinr HDMI font rendering.") from exc
-        font_candidates = (
-            (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            )
-            if bold
-            else (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            )
-        )
         font = None
-        for candidate in font_candidates:
+        for candidate in self._font_candidates(bold=bold):
             try:
-                font = ImageFont.truetype(candidate, size=max(8, int(size)))
+                font = ImageFont.truetype(str(candidate), size=max(8, int(size)))
                 break
             except OSError:
                 continue
@@ -609,13 +760,84 @@ class HdmiFramebufferDisplay:
         self._font_cache[cache_key] = font
         return font
 
+    def _font_candidates(self, *, bold: bool) -> tuple[Path, ...]:
+        cache_key = "bold" if bold else "regular"
+        cached = self._font_path_cache.get(cache_key)
+        if cache_key in self._font_path_cache:
+            return tuple(path for path in (cached,) if path is not None)
+        candidates: list[Path] = []
+        if bold:
+            candidates.extend(
+                (
+                    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                    Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+                    Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+                    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                )
+            )
+        else:
+            candidates.extend(
+                (
+                    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                    Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+                    Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+                    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                )
+            )
+        query = "DejaVu Sans:style=Bold" if bold else "DejaVu Sans:style=Book"
+        fontconfig_match = self._font_path_from_fontconfig(query)
+        if fontconfig_match is not None:
+            candidates.append(fontconfig_match)
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                deduped.append(candidate)
+        self._font_path_cache[cache_key] = deduped[0] if deduped else None
+        return tuple(deduped)
+
+    def _font_path_from_fontconfig(self, query: str) -> Path | None:
+        executable = self._fc_match_executable()
+        if executable is None:
+            return None
+        try:
+            result = subprocess.run(
+                (executable, "--format=%{file}\n", query),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": _TRUSTED_SYSTEM_PATH},
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        path = Path(lines[0]).expanduser()
+        return path if path.is_file() else None
+
+    def _fc_match_executable(self) -> str | None:
+        for candidate in ("/usr/bin/fc-match", "/bin/fc-match", "/usr/local/bin/fc-match"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        discovered = shutil.which("fc-match", path=_TRUSTED_SYSTEM_PATH)
+        return discovered if discovered else None
+
     def _text_width(self, draw: object, text: str, *, font: object | None = None) -> int:
         if not text:
             return 0
-        return draw.textbbox((0, 0), text, font=font)[2]
+        left, _top, right, _bottom = draw.textbbox((0, 0), text, font=font)
+        return max(0, right - left)
 
     def _text_height(self, draw: object, *, font: object | None = None) -> int:
-        return draw.textbbox((0, 0), "Hg", font=font)[3]
+        left, top, right, bottom = draw.textbbox((0, 0), "Hg", font=font)
+        del left, right
+        return max(0, bottom - top)
 
     def _truncate_text(self, draw: object, text: str, *, max_width: int, font: object | None = None) -> str:
         compact = self._normalise_text(text, fallback="")
@@ -655,7 +877,8 @@ class HdmiFramebufferDisplay:
         if bbox is None:
             return None
         glyph = canvas.crop(bbox)
-        fitted = glyph.resize((target_size, target_size), resample=Image.Resampling.LANCZOS)
+        resampling = self._pil_resampling()
+        fitted = glyph.resize((target_size, target_size), resample=resampling.LANCZOS)
         self._emoji_cache[cache_key] = fitted
         return fitted.copy()
 
@@ -705,13 +928,17 @@ class HdmiFramebufferDisplay:
     def _emoji_font_path_from_fontconfig(self) -> Path | None:
         """Ask fontconfig for a likely emoji font path when common paths are absent."""
 
+        executable = self._fc_match_executable()
+        if executable is None:
+            return None
         try:
             result = subprocess.run(
-                ("fc-match", "--format=%{file}\n", "Noto Color Emoji"),
+                (executable, "--format=%{file}\n", "Noto Color Emoji"),
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=1.0,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": _TRUSTED_SYSTEM_PATH},
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -721,7 +948,7 @@ class HdmiFramebufferDisplay:
         path = Path(lines[0]).expanduser()
         if "emoji" not in str(path).lower():
             return None
-        return path
+        return path if path.is_file() else None
 
     def _emit_missing_emoji_font_once(self, line: str) -> None:
         """Emit one bounded HDMI telemetry line for missing or unreadable emoji fonts."""
@@ -776,72 +1003,236 @@ class HdmiFramebufferDisplay:
             raise RuntimeError("Pillow is required for Twinr HDMI rendering.") from exc
         if not isinstance(image, Image.Image):
             raise RuntimeError("HDMI display expected a Pillow image.")
+        resampling = self._pil_resampling()
         prepared = image.convert("RGBA")
         if prepared.size != self.canvas_size:
-            prepared = prepared.resize(self.canvas_size)
+            prepared = prepared.resize(self.canvas_size, resample=resampling.LANCZOS)
         if self.rotation_degrees:
             prepared = prepared.rotate(self.rotation_degrees, expand=True)
         if prepared.size != self.framebuffer_size:
-            prepared = prepared.resize(self.framebuffer_size)
+            prepared = prepared.resize(self.framebuffer_size, resample=resampling.LANCZOS)
         return prepared
 
-    def _open_framebuffer(self):
-        framebuffer = self._framebuffer
-        if framebuffer is not None:
-            return framebuffer
+    def _pil_resampling(self):
         try:
-            framebuffer = self.framebuffer_path.open("r+b", buffering=0)
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - environment issue
+            raise RuntimeError("Pillow is required for Twinr HDMI rendering.") from exc
+        return getattr(Image, "Resampling", Image)
+
+    def _open_framebuffer_fd(self) -> int:
+        framebuffer_fd = self._framebuffer_fd
+        if framebuffer_fd is not None:
+            return framebuffer_fd
+        framebuffer_fd = self._open_checked_path(os.O_RDWR)
+        self._framebuffer_fd = framebuffer_fd
+        return framebuffer_fd
+
+    def _open_framebuffer(self):
+        """Open one legacy file-like framebuffer handle for compatibility callers."""
+
+        return os.fdopen(os.dup(self._open_framebuffer_fd()), "r+b", buffering=0)
+
+    def _open_checked_path(self, base_flags: int) -> int:
+        flags = base_flags
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.framebuffer_path, flags)
         except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise RuntimeError(f"Refusing to follow symlink for framebuffer `{self.framebuffer_path}`.") from exc
+            if exc.errno == errno.ENOENT and Path("/dev/dri/card0").exists():
+                raise RuntimeError(
+                    f"Unable to open framebuffer `{self.framebuffer_path}`. "
+                    "This system appears to expose DRM/KMS (`/dev/dri/card0`) but not a fbdev node. "
+                    "Use a DRM/KMS backend or enable fbdev emulation for compatibility."
+                ) from exc
             raise RuntimeError(f"Unable to open framebuffer `{self.framebuffer_path}`.") from exc
-        self._framebuffer = framebuffer
-        return framebuffer
+        try:
+            self._validate_framebuffer_fd(fd)
+            return fd
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    def _validate_framebuffer_fd(self, fd: int) -> None:
+        stats = os.fstat(fd)
+        if stat.S_ISCHR(stats.st_mode):
+            return
+        if self._allow_non_device_framebuffer():
+            if not self._non_device_override_reported:
+                self._non_device_override_reported = True
+                self._safe_emit(f"display_framebuffer=non_device_override path={self.framebuffer_path}")
+            return
+        # BREAKING: Non-device framebuffer targets (for example a regular file used as a fake framebuffer in tests)
+        # are now refused by default. Set TWINR_DISPLAY_ALLOW_NON_DEVICE_FB=1 to opt back into the old behaviour.
+        raise RuntimeError(
+            f"Refusing non-device framebuffer path `{self.framebuffer_path}`. "
+            "Expected a character device such as /dev/fb0."
+        )
+
+    def _allow_non_device_framebuffer(self) -> bool:
+        return str(os.environ.get("TWINR_DISPLAY_ALLOW_NON_DEVICE_FB", "")).strip().lower() in {"1", "true", "yes", "on"}
 
     def _read_framebuffer_geometry(self) -> FramebufferGeometry:
         try:
-            with self.framebuffer_path.open("rb", buffering=0) as framebuffer:
-                vinfo = bytearray(160)
-                finfo = bytearray(80)
-                fcntl.ioctl(framebuffer, _FBIOGET_VSCREENINFO, vinfo, True)
-                fcntl.ioctl(framebuffer, _FBIOGET_FSCREENINFO, finfo, True)
+            fd = self._open_checked_path(os.O_RDONLY)
+        except RuntimeError:
+            raise
+        try:
+            vinfo_buffer = bytearray(ctypes.sizeof(_CFbVarScreeninfo))
+            finfo_buffer = bytearray(ctypes.sizeof(_CFbFixScreeninfo))
+            fcntl.ioctl(fd, _FBIOGET_VSCREENINFO, vinfo_buffer, True)
+            fcntl.ioctl(fd, _FBIOGET_FSCREENINFO, finfo_buffer, True)
         except OSError as exc:
             raise RuntimeError(f"Unable to read framebuffer info from `{self.framebuffer_path}`.") from exc
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
-        import struct
-
-        width, height, _xvirt, _yvirt, _xoff, _yoff, bits_per_pixel, _gray = struct.unpack_from("8I", vinfo, 0)
-        line_length = struct.unpack_from("I", finfo, 48)[0]
-        red = FramebufferBitfield(*struct.unpack_from("3I", vinfo, 32))
-        green = FramebufferBitfield(*struct.unpack_from("3I", vinfo, 44))
-        blue = FramebufferBitfield(*struct.unpack_from("3I", vinfo, 56))
-        transp = FramebufferBitfield(*struct.unpack_from("3I", vinfo, 68))
+        vinfo = _CFbVarScreeninfo.from_buffer_copy(vinfo_buffer)
+        finfo = _CFbFixScreeninfo.from_buffer_copy(finfo_buffer)
 
         geometry = FramebufferGeometry(
-            width=int(width),
-            height=int(height),
-            bits_per_pixel=int(bits_per_pixel),
-            line_length=int(line_length),
-            red=red,
-            green=green,
-            blue=blue,
-            transp=transp,
+            width=int(vinfo.xres),
+            height=int(vinfo.yres),
+            virtual_width=int(vinfo.xres_virtual),
+            virtual_height=int(vinfo.yres_virtual),
+            xoffset=int(vinfo.xoffset),
+            yoffset=int(vinfo.yoffset),
+            bits_per_pixel=int(vinfo.bits_per_pixel),
+            line_length=int(finfo.line_length),
+            memory_length=int(finfo.smem_len),
+            framebuffer_type=int(finfo.type),
+            visual=int(finfo.visual),
+            capabilities=int(finfo.capabilities),
+            grayscale=int(vinfo.grayscale),
+            red=FramebufferBitfield(int(vinfo.red.offset), int(vinfo.red.length), int(vinfo.red.msb_right)),
+            green=FramebufferBitfield(int(vinfo.green.offset), int(vinfo.green.length), int(vinfo.green.msb_right)),
+            blue=FramebufferBitfield(int(vinfo.blue.offset), int(vinfo.blue.length), int(vinfo.blue.msb_right)),
+            transp=FramebufferBitfield(int(vinfo.transp.offset), int(vinfo.transp.length), int(vinfo.transp.msb_right)),
         )
+        self._validate_geometry(geometry)
+        return geometry
+
+    def _validate_geometry(self, geometry: FramebufferGeometry) -> None:
         if geometry.width <= 0 or geometry.height <= 0:
             raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned an invalid resolution.")
-        if geometry.bits_per_pixel not in {16, 32}:
+        if geometry.bits_per_pixel not in {16, 24, 32}:
             raise RuntimeError(
-                f"Framebuffer `{self.framebuffer_path}` uses unsupported {geometry.bits_per_pixel} bpp; expected 16 or 32."
+                f"Framebuffer `{self.framebuffer_path}` uses unsupported {geometry.bits_per_pixel} bpp; expected 16, 24, or 32."
+            )
+        if geometry.framebuffer_type == _FB_TYPE_FOURCC or geometry.visual == _FB_VISUAL_FOURCC:
+            fourcc = geometry.grayscale.to_bytes(4, "little", signed=False).decode("latin1", errors="replace")
+            raise RuntimeError(
+                f"Framebuffer `{self.framebuffer_path}` exposes a FOURCC pixel format `{fourcc}`; "
+                "this fbdev compatibility backend currently supports only RGB bitfield framebuffers."
             )
         for color_field in (geometry.red, geometry.green, geometry.blue, geometry.transp):
             if color_field.msb_right != 0:
                 raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` exposes an unsupported channel layout.")
-        return geometry
+        if geometry.line_length <= 0:
+            raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned an invalid line_length.")
+        if geometry.virtual_width <= 0:
+            raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned an invalid virtual width.")
+        if geometry.virtual_height <= 0:
+            raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned an invalid virtual height.")
+        if geometry.xoffset < 0 or geometry.yoffset < 0:
+            raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned negative offsets.")
+        if geometry.xoffset > geometry.virtual_width or geometry.yoffset > geometry.virtual_height:
+            raise RuntimeError(f"Framebuffer `{self.framebuffer_path}` returned offsets outside the virtual framebuffer.")
+        if geometry.row_pixel_bytes + geometry.xoffset_bytes > geometry.line_length:
+            raise RuntimeError(
+                f"Framebuffer `{self.framebuffer_path}` returned a visible row wider than line_length permits."
+            )
+        if geometry.memory_length > 0 and geometry.required_memory_bytes > geometry.memory_length:
+            raise RuntimeError(
+                f"Framebuffer `{self.framebuffer_path}` returned insufficient memory for the visible page "
+                f"({geometry.required_memory_bytes}>{geometry.memory_length})."
+            )
 
     def _pack_framebuffer_bytes(self, image: object, geometry: FramebufferGeometry) -> bytes:
+        packers = (
+            self._pack_framebuffer_bytes_pillow,
+            self._pack_framebuffer_bytes_numpy,
+            self._pack_framebuffer_bytes_generic,
+        )
+        last_error: Exception | None = None
+        for packer in packers:
+            try:
+                payload, backend = packer(image, geometry)
+                self._report_pack_backend_once(backend, geometry)
+                return payload
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"Unable to pack framebuffer pixels for `{self.framebuffer_path}`.") from last_error
+
+    def _pack_framebuffer_bytes_pillow(self, image: object, geometry: FramebufferGeometry) -> tuple[bytes, str]:
+        raw_mode_info = self._pillow_raw_mode_for_geometry(geometry)
+        if raw_mode_info is None:
+            raise ValueError("no compatible Pillow raw mode")
+        source_mode, raw_mode = raw_mode_info
+        source = image.convert(source_mode)
+        packed = source.tobytes("raw", raw_mode)
+        if geometry.line_length == geometry.row_pixel_bytes and geometry.xoffset_bytes == 0:
+            return packed, f"pillow:{raw_mode.lower()}"
+        output = bytearray(geometry.frame_size_bytes)
+        source_row_bytes = geometry.row_pixel_bytes
+        for row in range(geometry.height):
+            src_start = row * source_row_bytes
+            dst_start = (row * geometry.line_length) + geometry.xoffset_bytes
+            output[dst_start : dst_start + source_row_bytes] = packed[src_start : src_start + source_row_bytes]
+        return bytes(output), f"pillow:{raw_mode.lower()}"
+
+    def _pack_framebuffer_bytes_numpy(self, image: object, geometry: FramebufferGeometry) -> tuple[bytes, str]:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise ValueError("numpy unavailable") from exc
+
+        rgba_image = image.convert("RGBA")
+        rgba = np.asarray(rgba_image, dtype=np.uint8)
+        packed = np.zeros((geometry.height, geometry.width), dtype=np.uint32)
+        for channel_index, color_field in enumerate((geometry.red, geometry.green, geometry.blue, geometry.transp)):
+            if color_field.length <= 0:
+                continue
+            channel = rgba[:, :, channel_index].astype(np.uint32, copy=False)
+            max_value = (1 << color_field.length) - 1
+            scaled = ((channel * max_value) + 127) // 255
+            packed |= scaled << color_field.offset
+
+        if geometry.bytes_per_pixel == 2:
+            pixel_rows = packed.astype("<u2", copy=False).view(np.uint8).reshape(geometry.height, geometry.width * 2)
+        elif geometry.bytes_per_pixel == 3:
+            pixel_rows = packed.astype("<u4", copy=False).view(np.uint8).reshape(geometry.height, geometry.width, 4)
+            pixel_rows = pixel_rows[:, :, :3].reshape(geometry.height, geometry.width * 3)
+        elif geometry.bytes_per_pixel == 4:
+            pixel_rows = packed.astype("<u4", copy=False).view(np.uint8).reshape(geometry.height, geometry.width * 4)
+        else:
+            raise ValueError("unsupported bytes_per_pixel")
+
+        if geometry.line_length == geometry.row_pixel_bytes and geometry.xoffset_bytes == 0:
+            return pixel_rows.tobytes(order="C"), "numpy"
+
+        output = np.zeros((geometry.height, geometry.line_length), dtype=np.uint8)
+        output[:, geometry.xoffset_bytes : geometry.xoffset_bytes + geometry.row_pixel_bytes] = pixel_rows
+        return output.tobytes(order="C"), "numpy"
+
+    def _pack_framebuffer_bytes_generic(self, image: object, geometry: FramebufferGeometry) -> tuple[bytes, str]:
         rgba_image = image.convert("RGBA")
         pixels = rgba_image.load()
         output = bytearray(geometry.frame_size_bytes)
         for row in range(geometry.height):
-            target_start = row * geometry.line_length
+            row_start = (row * geometry.line_length) + geometry.xoffset_bytes
             for column in range(geometry.width):
                 red, green, blue, alpha = pixels[column, row]
                 packed = 0
@@ -855,12 +1246,209 @@ class HdmiFramebufferDisplay:
                         continue
                     scaled = ((int(value) * ((1 << color_field.length) - 1)) + 127) // 255
                     packed |= scaled << color_field.offset
-                byte_offset = target_start + (column * geometry.bytes_per_pixel)
+                byte_offset = row_start + (column * geometry.bytes_per_pixel)
                 output[byte_offset : byte_offset + geometry.bytes_per_pixel] = packed.to_bytes(
                     geometry.bytes_per_pixel,
                     "little",
                 )
-        return bytes(output)
+        return bytes(output), "generic"
+
+    def _pillow_raw_mode_for_geometry(self, geometry: FramebufferGeometry) -> tuple[str, str] | None:
+        bytes_per_pixel = geometry.bytes_per_pixel
+        if bytes_per_pixel not in {3, 4}:
+            return None
+        positions = ["X"] * bytes_per_pixel
+        for letter, color_field in (("R", geometry.red), ("G", geometry.green), ("B", geometry.blue), ("A", geometry.transp)):
+            if color_field.length <= 0:
+                continue
+            if color_field.length != 8 or color_field.offset % 8 != 0:
+                return None
+            byte_index = color_field.offset // 8
+            if byte_index < 0 or byte_index >= bytes_per_pixel:
+                return None
+            if positions[byte_index] != "X" and positions[byte_index] != letter:
+                return None
+            positions[byte_index] = letter
+        raw_mode = "".join(positions)
+        if raw_mode not in _SUPPORTED_PILLOW_RAW_MODES:
+            return None
+        if bytes_per_pixel == 3:
+            return ("RGB", raw_mode)
+        if "A" in raw_mode:
+            return ("RGBA", raw_mode)
+        return ("RGB", raw_mode)
+
+    def _report_pack_backend_once(self, backend: str, geometry: FramebufferGeometry) -> None:
+        if self._reported_pack_backend == backend:
+            return
+        self._reported_pack_backend = backend
+        self._safe_emit(
+            " ".join(
+                (
+                    f"display_framebuffer_pack={backend}",
+                    f"bpp={geometry.bits_per_pixel}",
+                    f"stride={geometry.line_length}",
+                )
+            )
+        )
+
+    def _write_framebuffer_payload(self, payload: bytes, geometry: FramebufferGeometry) -> None:
+        spans = self._changed_row_spans(payload, self._last_payload, geometry)
+        if spans == ():
+            return
+        framebuffer_map = self._framebuffer_mapping(geometry)
+        if framebuffer_map is not None:
+            self._report_io_backend_once("mmap", geometry)
+            self._write_payload_to_mmap(framebuffer_map, payload, geometry, spans)
+            return
+        self._report_io_backend_once("write", geometry)
+        fd = self._open_framebuffer_fd()
+        self._write_payload_to_fd(fd, payload, geometry, spans)
+
+    def _framebuffer_mapping(self, geometry: FramebufferGeometry) -> mmap.mmap | None:
+        if not self._prefer_mmap():
+            return None
+        existing = self._framebuffer_map
+        if existing is not None:
+            if self._framebuffer_map_length >= geometry.mapping_size_bytes:
+                return existing
+            self._close_framebuffer_mapping()
+        fd = self._open_framebuffer_fd()
+        try:
+            framebuffer_map = mmap.mmap(fd, geometry.mapping_size_bytes, access=mmap.ACCESS_WRITE)
+        except (BufferError, OSError, ValueError):
+            return None
+        self._framebuffer_map = framebuffer_map
+        self._framebuffer_map_length = geometry.mapping_size_bytes
+        return framebuffer_map
+
+    def _prefer_mmap(self) -> bool:
+        return str(os.environ.get("TWINR_DISPLAY_DISABLE_MMAP", "")).strip().lower() not in {"1", "true", "yes", "on"}
+
+    def _write_payload_to_mmap(
+        self,
+        framebuffer_map: mmap.mmap,
+        payload: bytes,
+        geometry: FramebufferGeometry,
+        spans: tuple[tuple[int, int], ...] | None,
+    ) -> None:
+        base_offset = geometry.visible_offset_bytes
+        if spans is None:
+            framebuffer_map[base_offset : base_offset + len(payload)] = payload
+            return
+        payload_view = memoryview(payload)
+        for start_row, end_row in spans:
+            source_start = start_row * geometry.line_length
+            source_end = end_row * geometry.line_length
+            target_start = base_offset + source_start
+            framebuffer_map[target_start : target_start + (source_end - source_start)] = payload_view[source_start:source_end]
+
+    def _write_payload_to_fd(
+        self,
+        fd: int,
+        payload: bytes,
+        geometry: FramebufferGeometry,
+        spans: tuple[tuple[int, int], ...] | None,
+    ) -> None:
+        base_offset = geometry.visible_offset_bytes
+        payload_view = memoryview(payload)
+        if spans is None:
+            os.lseek(fd, base_offset, os.SEEK_SET)
+            self._write_all(fd, payload_view)
+            return
+        for start_row, end_row in spans:
+            source_start = start_row * geometry.line_length
+            source_end = end_row * geometry.line_length
+            os.lseek(fd, base_offset + source_start, os.SEEK_SET)
+            self._write_all(fd, payload_view[source_start:source_end])
+
+    def _changed_row_spans(
+        self,
+        payload: bytes,
+        previous_payload: bytes | None,
+        geometry: FramebufferGeometry,
+    ) -> tuple[tuple[int, int], ...] | None:
+        if self._force_full_refresh():
+            return None
+        if previous_payload is None or len(previous_payload) != len(payload):
+            return None
+        if payload == previous_payload:
+            return ()
+        stride = geometry.line_length
+        current_view = memoryview(payload)
+        previous_view = memoryview(previous_payload)
+        spans: list[tuple[int, int]] = []
+        start_row: int | None = None
+        changed_rows = 0
+        for row in range(geometry.height):
+            row_start = row * stride
+            row_end = row_start + stride
+            if current_view[row_start:row_end] != previous_view[row_start:row_end]:
+                changed_rows += 1
+                if start_row is None:
+                    start_row = row
+                continue
+            if start_row is not None:
+                spans.append((start_row, row))
+                start_row = None
+        if start_row is not None:
+            spans.append((start_row, geometry.height))
+        if not spans:
+            return ()
+        if changed_rows * 4 >= geometry.height * 3:
+            return None
+        return tuple(spans)
+
+    def _force_full_refresh(self) -> bool:
+        return str(os.environ.get("TWINR_DISPLAY_FORCE_FULL_REFRESH", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _report_io_backend_once(self, backend: str, geometry: FramebufferGeometry) -> None:
+        if self._reported_io_backend == backend:
+            return
+        self._reported_io_backend = backend
+        self._safe_emit(
+            " ".join(
+                (
+                    f"display_framebuffer_io={backend}",
+                    f"offset={geometry.visible_offset_bytes}",
+                    f"stride={geometry.line_length}",
+                )
+            )
+        )
+
+    def _write_all(self, fd: int, payload: memoryview) -> None:
+        written_total = 0
+        while written_total < len(payload):
+            written = os.write(fd, payload[written_total:])
+            if written <= 0:
+                raise OSError("short framebuffer write")
+            written_total += written
+
+    def _reset_framebuffer_state(self, *, clear_geometry: bool) -> None:
+        self._close_framebuffer_mapping()
+        framebuffer_fd = self._framebuffer_fd
+        self._framebuffer_fd = None
+        self._last_payload = None
+        self._reported_io_backend = None
+        if clear_geometry:
+            self._geometry = None
+        if framebuffer_fd is None:
+            return
+        try:
+            os.close(framebuffer_fd)
+        except OSError:
+            return
+
+    def _close_framebuffer_mapping(self) -> None:
+        framebuffer_map = self._framebuffer_map
+        self._framebuffer_map = None
+        self._framebuffer_map_length = 0
+        if framebuffer_map is None:
+            return
+        try:
+            framebuffer_map.close()
+        except Exception:
+            return
 
     def _safe_emit(self, line: str) -> None:
         compact = self._normalise_text(line, fallback="")

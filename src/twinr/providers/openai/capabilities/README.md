@@ -1,8 +1,10 @@
 # capabilities
 
 `capabilities` owns the reusable behavior mixins that make up Twinr's OpenAI
-backend. Each module keeps one capability-specific slice of runtime behavior:
-responses, live search, speech, reminder phrasing, or printing.
+backend. Its package root re-exports those mixins lazily so import probes do
+not pull every sibling capability module at once. Each module keeps one
+capability-specific slice of runtime behavior: responses, live search, speech,
+reminder phrasing, or printing.
 
 ## Responsibility
 
@@ -37,7 +39,7 @@ unverified results and decide whether to ask for a deeper website check.
 
 | File | Purpose |
 |---|---|
-| [`__init__.py`](./__init__.py) | Public mixin exports |
+| [`__init__.py`](./__init__.py) | Lazy public mixin exports |
 | [`responses.py`](./responses.py) | Text, vision, and streaming helpers |
 | [`search.py`](./search.py) | Live-search orchestration |
 | [`speech.py`](./speech.py) | STT and TTS helpers |

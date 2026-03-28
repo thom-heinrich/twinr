@@ -34,6 +34,34 @@ class _FakeHardwareLoop:
         return 0
 
 
+class _FakeTurnRuntime:
+    def __init__(self) -> None:
+        self.status = SimpleNamespace(value="waiting")
+        self.failed_message = None
+        self.submitted_transcript = None
+
+    def press_green_button(self) -> None:
+        self.status.value = "listening"
+
+    def submit_transcript(self, transcript: str) -> None:
+        self.submitted_transcript = transcript
+        self.status.value = "processing"
+
+    def conversation_context(self) -> list[object]:
+        return []
+
+    def complete_agent_turn(self, answer: str) -> str:
+        self.status.value = "speaking"
+        return answer
+
+    def finish_speaking(self) -> None:
+        self.status.value = "waiting"
+
+    def fail(self, message: str) -> None:
+        self.failed_message = message
+        self.status.value = "error"
+
+
 class _FakeRemoteMemoryWatchdog:
     def __init__(self) -> None:
         self.duration_s = None
@@ -97,6 +125,40 @@ def _fake_lock(_config, _name: str):
 
 
 class MainCliTests(unittest.TestCase):
+    def test_resolve_runtime_config_scopes_direct_cli_turns_without_restore(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            config = main_mod.TwinrConfig(
+                project_root="/tmp/twinr-project",
+                runtime_state_path="state/runtime-state.json",
+                restore_runtime_state_on_startup=True,
+            )
+
+            openai_args = SimpleNamespace(
+                run_whatsapp_channel=False,
+                demo_transcript=None,
+                openai_prompt="Hallo",
+                vision_prompt=None,
+                orchestrator_probe_turn=None,
+            )
+            openai_runtime_config = main_mod._resolve_runtime_config(config, openai_args)
+
+            demo_args = SimpleNamespace(
+                run_whatsapp_channel=False,
+                demo_transcript="Hallo",
+                openai_prompt=None,
+                vision_prompt=None,
+                orchestrator_probe_turn=None,
+            )
+            demo_runtime_config = main_mod._resolve_runtime_config(config, demo_args)
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+        self.assertIn("runtime-scopes/openai-prompt/runtime-state.json", openai_runtime_config.runtime_state_path)
+        self.assertFalse(openai_runtime_config.restore_runtime_state_on_startup)
+        self.assertIn("runtime-scopes/demo-transcript/runtime-state.json", demo_runtime_config.runtime_state_path)
+        self.assertFalse(demo_runtime_config.restore_runtime_state_on_startup)
+
     def test_uses_pi_runtime_root_detects_twinr_env(self) -> None:
         main_mod = importlib.import_module("twinr.__main__")
         try:
@@ -314,10 +376,11 @@ class MainCliTests(unittest.TestCase):
                 sys.modules.pop("twinr.__main__", None)
 
             payload = json.loads(runtime_state_path.read_text(encoding="utf-8"))
+            snapshot_payload = payload["payload"]
 
         self.assertEqual(exit_code, 1)
-        self.assertEqual(payload["status"], "waiting")
-        self.assertIsNone(payload["error_message"])
+        self.assertEqual(snapshot_payload["status"], "waiting")
+        self.assertIsNone(snapshot_payload["error_message"])
 
     def test_run_web_skips_runtime_bootstrap_before_uvicorn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -562,6 +625,62 @@ class MainCliTests(unittest.TestCase):
         self.assertIsNotNone(_FakeWhatsAppLoop.last_instance)
         self.assertIs(_FakeWhatsAppLoop.last_instance.tool_agent_provider, fake_tool_agent)
         self.assertIs(_FakeWhatsAppLoop.last_instance.print_backend, fake_print_backend)
+
+    def test_openai_prompt_uses_scoped_runtime_snapshot_without_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                        "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_runtime = _FakeTurnRuntime()
+            fake_backend = SimpleNamespace(
+                respond_with_metadata=lambda *_args, **_kwargs: SimpleNamespace(
+                    text="ok",
+                    response_id=None,
+                    request_id=None,
+                    used_web_search=False,
+                )
+            )
+            built_runtime_config = None
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+
+                def _build_runtime(config):
+                    nonlocal built_runtime_config
+                    built_runtime_config = config
+                    return fake_runtime
+
+                with patch.object(main_mod, "_build_runtime", side_effect=_build_runtime):
+                    with patch("twinr.providers.openai.OpenAIBackend", return_value=fake_backend):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--openai-prompt",
+                            "Sag nur: ok.",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(built_runtime_config)
+        self.assertIn("runtime-scopes/openai-prompt", str(built_runtime_config.runtime_state_path))
+        self.assertFalse(built_runtime_config.restore_runtime_state_on_startup)
+        self.assertEqual(fake_runtime.submitted_transcript, "Sag nur: ok.")
 
     def test_run_whatsapp_channel_ensures_remote_watchdog_before_runtime_boot_on_pi(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

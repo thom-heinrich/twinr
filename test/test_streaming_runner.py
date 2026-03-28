@@ -655,12 +655,33 @@ class TimedPlayer(FakePlayer):
         self.playback_delay_s = playback_delay_s
         self.playback_started_at: float | None = None
         self.playback_finished_at: float | None = None
+        self.playback_started = Event()
+        self.playback_finished = Event()
 
     def play_wav_chunks(self, chunks, *, should_stop=None) -> None:
+        self.playback_finished.clear()
         self.playback_started_at = time.monotonic()
+        self.playback_started.set()
         super().play_wav_chunks(chunks, should_stop=should_stop)
         time.sleep(self.playback_delay_s)
         self.playback_finished_at = time.monotonic()
+        self.playback_finished.set()
+
+
+class BlockingFirstPlaybackPlayer(FakePlayer):
+    def __init__(self, *, release_first_playback: Event) -> None:
+        super().__init__()
+        self.release_first_playback = release_first_playback
+        self.first_playback_started = Event()
+        self.play_calls = 0
+
+    def play_wav_chunks(self, chunks, *, should_stop=None) -> None:
+        self.play_calls += 1
+        super().play_wav_chunks(chunks, should_stop=should_stop)
+        if self.play_calls != 1:
+            return
+        self.first_playback_started.set()
+        self.release_first_playback.wait(timeout=1.0)
 
 
 class FakePrinter:
@@ -947,6 +968,28 @@ class InterruptingConversationClosureEvaluator:
 
 
 class StreamingRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._workflow_trace_env = {
+            key: os.environ.get(key)
+            for key in (
+                "TWINR_WORKFLOW_TRACE_ENABLED",
+                "TWINR_WORKFLOW_TRACE_MODE",
+                "TWINR_WORKFLOW_TRACE_DIR",
+            )
+        }
+        os.environ["TWINR_WORKFLOW_TRACE_ENABLED"] = "0"
+        os.environ.pop("TWINR_WORKFLOW_TRACE_MODE", None)
+        os.environ.pop("TWINR_WORKFLOW_TRACE_DIR", None)
+
+    def tearDown(self) -> None:
+        for key, value in self._workflow_trace_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        super().tearDown()
+
     def test_streaming_tool_surface_omits_smart_home_tools_when_integration_is_unavailable(self) -> None:
         with TemporaryDirectory() as temp_dir, mock.patch(
             "twinr.agent.tools.runtime.availability.build_smart_home_hub_adapter",
@@ -3326,6 +3369,109 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(tts_provider.stream_calls, ["Heute wird es sonnig."])
         self.assertIn("conversation_closure_fallback=closure_eval_timeout", lines)
 
+    def test_tool_history_recording_does_not_delay_turn_completion_after_playback(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            player = TimedPlayer(playback_delay_s=0.02)
+            tool_history_started = Event()
+            tool_history_finished = Event()
+            tool_history_errors: list[str] = []
+            runtime_status = SimpleNamespace(value="processing")
+
+            def delayed_record_personality_tool_history(*, tool_calls, tool_results) -> None:
+                del tool_calls, tool_results
+                tool_history_started.set()
+                try:
+                    if not player.playback_finished.wait(timeout=1.0):
+                        tool_history_errors.append("playback did not finish before tool-history recording")
+                        return
+                    time.sleep(0.25)
+                finally:
+                    tool_history_finished.set()
+
+            runtime = SimpleNamespace(
+                status=runtime_status,
+                submit_transcript=lambda transcript: None,
+                begin_answering=lambda: setattr(runtime_status, "value", "answering"),
+                resume_processing=lambda: setattr(runtime_status, "value", "processing"),
+                resume_answering_after_print=lambda: setattr(runtime_status, "value", "answering"),
+                finalize_agent_turn=lambda response_text: response_text,
+                finish_speaking=lambda: setattr(runtime_status, "value", "waiting"),
+                rearm_follow_up=lambda request_source="follow_up": setattr(runtime_status, "value", "listening"),
+                refresh_snapshot_activity=lambda: None,
+                record_personality_tool_history=delayed_record_personality_tool_history,
+            )
+            coordinator = StreamingTurnCoordinator(
+                config=config,
+                runtime=runtime,
+                request=StreamingTurnRequest(
+                    transcript="Wie wird das Wetter?",
+                    listen_source="button",
+                    proactive_trigger=None,
+                    turn_started=time.monotonic(),
+                    capture_ms=0,
+                    stt_ms=0,
+                ),
+                lane_plan_factory=lambda: StreamingTurnLanePlan(
+                    turn_instructions=None,
+                    run_single_lane=lambda on_text_delta: (
+                        on_text_delta("Es wird kuehler auf zwei bis sechs Grad.")
+                        or SimpleNamespace(
+                            text="Es wird kuehler auf zwei bis sechs Grad.",
+                            tool_calls=(SimpleNamespace(name="search_weather"),),
+                            tool_results=(SimpleNamespace(name="search_weather"),),
+                            response_id="resp_weather",
+                            request_id="req_weather",
+                            rounds=1,
+                            used_web_search=True,
+                            model="gpt-4o-mini",
+                            token_usage=None,
+                        )
+                    ),
+                ),
+                speech_services=StreamingTurnSpeechServices(
+                    tts_provider=FakeTextToSpeechProvider(config),
+                    player=player,
+                    playback_coordinator=None,
+                    segment_boundary=lambda text: len(text) if text.strip() else None,
+                ),
+                hooks=StreamingTurnCoordinatorHooks(
+                    emit=lambda _line: None,
+                    emit_status=lambda: None,
+                    trace_event=lambda *args, **kwargs: None,
+                    trace_decision=lambda *args, **kwargs: None,
+                    start_processing_feedback_loop=lambda _kind: (lambda: None),
+                    is_search_feedback_active=lambda: False,
+                    stop_search_feedback=lambda: None,
+                    should_stop=lambda: False,
+                    request_turn_stop=lambda _reason: None,
+                    cancel_interrupted_turn=lambda: None,
+                    record_usage=lambda **kwargs: None,
+                    evaluate_follow_up_closure=lambda **kwargs: SimpleNamespace(
+                        error_type=None,
+                        decision=None,
+                    ),
+                    apply_follow_up_closure_evaluation=lambda **kwargs: False,
+                    follow_up_rearm_allowed_now=lambda _source: False,
+                ),
+            )
+
+            started = time.monotonic()
+            outcome = coordinator.execute()
+            elapsed_s = time.monotonic() - started
+
+        self.assertTrue(outcome.keep_listening)
+        self.assertLess(elapsed_s, 0.2)
+        self.assertTrue(tool_history_started.wait(timeout=1.0))
+        self.assertTrue(tool_history_finished.wait(timeout=1.0))
+        self.assertEqual(tool_history_errors, [])
+        self.assertEqual(runtime.status.value, "waiting")
+
     def test_required_remote_interrupt_during_closure_eval_preserves_error_state(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -3343,6 +3489,8 @@ class StreamingRunnerTests(unittest.TestCase):
             runtime = TwinrRuntime(config=config)
             tts_provider = FakeTextToSpeechProvider(config)
             player = TimedPlayer(playback_delay_s=0.02)
+            interrupt_errors: list[str] = []
+            interrupt_completed = Event()
             lines: list[str] = []
             loop = TwinrStreamingHardwareLoop(
                 config=config,
@@ -3380,11 +3528,13 @@ class StreamingRunnerTests(unittest.TestCase):
             )
 
             def _trigger_required_remote() -> None:
-                deadline = time.monotonic() + 1.0
-                while player.playback_finished_at is None and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                time.sleep(0.02)
-                loop._handle_error(LongTermRemoteUnavailableError("remote unavailable during closure"))
+                try:
+                    if not player.playback_finished.wait(timeout=1.0):
+                        interrupt_errors.append("playback did not finish before required-remote interrupt")
+                        return
+                    loop._handle_error(LongTermRemoteUnavailableError("remote unavailable during closure"))
+                finally:
+                    interrupt_completed.set()
 
             loop.conversation_closure_evaluator = InterruptingConversationClosureEvaluator(
                 delay_s=1.5,
@@ -3401,12 +3551,54 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertFalse(keep_listening)
         self.assertLess(elapsed_s, 1.0)
+        self.assertTrue(interrupt_completed.wait(timeout=1.0))
+        self.assertEqual(interrupt_errors, [])
         self.assertEqual(runtime.status.value, "error")
         self.assertIn("status=error", lines)
         self.assertIn("required_remote_dependency=false", lines)
         self.assertNotIn("conversation_closure_fallback=closure_eval_timeout", lines)
         self.assertNotIn("turn_interrupted=true", lines)
         self.assertFalse(any("Cannot apply tts_finished while in error" in line for line in lines))
+
+    def test_required_remote_repeat_error_emits_dependency_false_when_already_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            lines: list[str] = []
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+            runtime.reset_error()
+
+            loop._handle_error(LongTermRemoteUnavailableError("initial remote unavailable"))
+            lines.clear()
+            loop._handle_error(LongTermRemoteUnavailableError("remote unavailable again"))
+
+        self.assertEqual(runtime.status.value, "error")
+        self.assertIn("required_remote_dependency=false", lines)
+        self.assertNotIn("runtime_reset_error=", lines)
 
     def test_final_lane_waits_for_first_audio_gate(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -3939,6 +4131,8 @@ class StreamingRunnerTests(unittest.TestCase):
             runtime = TwinrRuntime(config=config)
             dual_lane = CapturingDualLaneLoop()
             tts_provider = FakeTextToSpeechProvider(config)
+            release_first_playback = Event()
+            player = BlockingFirstPlaybackPlayer(release_first_playback=release_first_playback)
             lines: list[str] = []
             loop = TwinrStreamingHardwareLoop(
                 config=config,
@@ -3949,7 +4143,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 stt_provider=FakeSpeechToTextProvider(config),
                 agent_provider=FakePrintBackend(config),
                 tts_provider=tts_provider,
-                player=FakePlayer(),
+                player=player,
                 printer=FakePrinter(),
                 voice_profile_monitor=FakeVoiceProfileMonitor(),
                 usage_store=FakeUsageStore(),
@@ -3965,7 +4159,9 @@ class StreamingRunnerTests(unittest.TestCase):
 
             def fake_final_response(transcript: str, *, turn_instructions: str | None, prefetched_decision=None):
                 del transcript, turn_instructions, prefetched_decision
-                time.sleep(0.06)
+                if not player.first_playback_started.wait(timeout=1.0):
+                    raise AssertionError("bridge playback never started")
+                release_first_playback.set()
                 return SimpleNamespace(
                     text="Hier sind die heutigen Nachrichten.",
                     response_id="resp_final",

@@ -43,9 +43,25 @@ files:
       - TwinrRealtimeHardwareLoop
       - TwinrStreamingHardwareLoop
   - path: realtime_runner.py
-    role: Realtime session loop with voice activation, configured visual gesture-wakeup, print-lane, and smart-home sensor-worker orchestration that delegates focused follow-up, voice-bridge, guidance, and transcript-verification helpers
+    role: Compatibility wrapper that preserves the public realtime-loop import path plus legacy module patch points for startup boot sound and smart-home adapter injection
     exports:
       - TwinrRealtimeHardwareLoop
+  - path: realtime_runner_impl/__init__.py
+    role: Internal export surface for the refactored realtime-loop implementation package
+    exports:
+      - TwinrRealtimeHardwareLoopImpl
+  - path: realtime_runner_impl/main.py
+    role: Compose the internal realtime-loop implementation from focused mixins
+    exports:
+      - TwinrRealtimeHardwareLoopImpl
+  - path: realtime_runner_impl/bootstrap.py
+    role: Realtime-loop bootstrap, collaborator wiring, tool-surface refresh, and managed smart-home worker setup
+  - path: realtime_runner_impl/session.py
+    role: Run-loop orchestration, wake triggers, conversation-session lifecycle, and remote voice-orchestrator coordination
+  - path: realtime_runner_impl/turn_capture.py
+    role: Turn-controller streaming capture, transcript recovery, and early-snapshot coercion
+  - path: realtime_runner_impl/turn_execution.py
+    role: Single-turn execution, streamed playback/interrupt handling, voice-activation ack caching, and print-lane enqueue helpers
   - path: realtime_follow_up.py
     role: Focused follow-up reopening and closure-decision helper for the realtime loop
     exports:

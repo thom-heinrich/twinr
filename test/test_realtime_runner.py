@@ -1,8 +1,10 @@
 from array import array
 from dataclasses import replace
 from datetime import datetime, timedelta
+from hashlib import sha1, sha256
 import io
 import json
+import os
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from typing import cast
 import wave
 from zoneinfo import ZoneInfo
 
@@ -27,8 +30,8 @@ from twinr.agent.base_agent.contracts import (
 )
 from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
-from twinr.hardware import VoiceAssessment
 from twinr.hardware.buttons import ButtonAction, ButtonEvent
+from twinr.hardware.voice_profile import VoiceAssessment
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
@@ -79,6 +82,11 @@ from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
 
 _TEST_CORINNA_GRAPH_PHONE = "5551234"
 _TEST_CORINNA_NEIGHBOR_PHONE = "5559988"
+_TEST_VALID_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc`h\xf8\x0f"
+    b"\x00\x02\x03\x01\x80$a\xf5\x97\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
 def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
@@ -100,11 +108,18 @@ def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
 def _pcm_to_test_wav_bytes(pcm_bytes: bytes, *, sample_rate: int = 24000, channels: int = 1) -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as writer:
-        writer.setnchannels(channels)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate)
-        writer.writeframes(pcm_bytes)
+        writer = cast(wave.Wave_write, writer)
+        writer.setnchannels(channels)  # pylint: disable=no-member
+        writer.setsampwidth(2)  # pylint: disable=no-member
+        writer.setframerate(sample_rate)  # pylint: disable=no-member
+        writer.writeframes(pcm_bytes)  # pylint: disable=no-member
     return buffer.getvalue()
+
+
+def _wav_frames(wav_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+        reader = cast(wave.Wave_read, reader)
+        return reader.readframes(reader.getnframes())
 
 
 def _longterm_source(event_id: str) -> LongTermSourceRefV1:
@@ -118,6 +133,10 @@ def _longterm_source(event_id: str) -> LongTermSourceRefV1:
 
 def _fresh_checked_at() -> str:
     return datetime.now(ZoneInfo("UTC")).replace(microsecond=0).isoformat()
+
+
+def _fresh_observed_at() -> float:
+    return time.monotonic()
 
 
 class FakeRealtimeSession:
@@ -749,7 +768,9 @@ class FakeVoiceOrchestrator:
         interaction_ready: bool | None = None,
         targeted_inference_blocked: bool | None = None,
         recommended_channel: str | None = None,
+        speaker_associated: bool | None = None,
         voice_quiet_until_utc: str | None = None,
+        **_kwargs,
     ) -> None:
         self.states.append((state, detail, follow_up_allowed))
         payload = {
@@ -761,6 +782,8 @@ class FakeVoiceOrchestrator:
             "targeted_inference_blocked": targeted_inference_blocked,
             "recommended_channel": recommended_channel,
         }
+        if speaker_associated is not None:
+            payload["speaker_associated"] = speaker_associated
         if voice_quiet_until_utc is not None:
             payload["voice_quiet_until_utc"] = voice_quiet_until_utc
         self.intent_contexts.append(payload)
@@ -819,7 +842,7 @@ class FakeCamera:
     def capture_photo(self, *, output_path=None, filename: str = "camera-capture.png"):
         self.capture_calls += 1
         return SimpleNamespace(
-            data=b"\x89PNG\r\n\x1a\ncamera",
+            data=_TEST_VALID_PNG_BYTES,
             content_type="image/png",
             filename=filename,
             source_device="/dev/video0",
@@ -922,6 +945,13 @@ class FakeProactiveMonitor:
 class RealtimeHardwareLoopTests(unittest.TestCase):
     _LANGUAGE_CONTRACT = "All user-facing spoken and written replies for this turn must be in German."
 
+    @staticmethod
+    def _cleanup_loop(loop: TwinrRealtimeHardwareLoop) -> None:
+        try:
+            loop.close(timeout_s=0.2)
+        except Exception:
+            pass
+
     def make_loop(
         self,
         *,
@@ -939,6 +969,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         conversation_closure_evaluator=None,
         voice_profile_monitor=None,
         proactive_monitor=None,
+        enable_working_feedback: bool = False,
     ) -> tuple[TwinrRealtimeHardwareLoop, list[str], FakeRealtimeSession, FakePrintBackend, FakeRecorder, FakePlayer, FakePrinter]:
         temp_dir_handle = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir_handle.cleanup)
@@ -1026,29 +1057,43 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         recorder = recorder or FakeRecorder()
         player = FakePlayer()
         printer = FakePrinter()
-        loop = TwinrRealtimeHardwareLoop(
-            config=config,
-            runtime=TwinrRuntime(config=config),
-            realtime_session=realtime_session,
-            print_backend=resolved_print_backend,
-            stt_provider=stt_provider,
-            agent_provider=agent_provider,
-            tts_provider=tts_provider,
-            turn_stt_provider=turn_stt_provider,
-            turn_tool_agent_provider=turn_tool_agent_provider,
-            button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
-            recorder=recorder,
-            player=player,
-            printer=printer,
-            camera=camera or FakeCamera(),
-            voice_profile_monitor=voice_profile_monitor,
-            ambient_audio_sampler=ambient_audio_sampler,
-            conversation_closure_evaluator=conversation_closure_evaluator,
-            proactive_monitor=proactive_monitor,
-            emit=lines.append,
-            sleep=lambda _seconds: None,
-            error_reset_seconds=0.0,
-        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TWINR_WORKFLOW_TRACE_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            loop = TwinrRealtimeHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                realtime_session=realtime_session,
+                print_backend=resolved_print_backend,
+                stt_provider=stt_provider,
+                agent_provider=agent_provider,
+                tts_provider=tts_provider,
+                turn_stt_provider=turn_stt_provider,
+                turn_tool_agent_provider=turn_tool_agent_provider,
+                button_monitor=button_monitor
+                or SimpleNamespace(
+                    __enter__=lambda self: self,
+                    __exit__=lambda self, exc_type, exc, tb: None,
+                ),
+                recorder=recorder,
+                player=player,
+                printer=printer,
+                camera=camera or FakeCamera(),
+                voice_profile_monitor=voice_profile_monitor,
+                ambient_audio_sampler=ambient_audio_sampler,
+                conversation_closure_evaluator=conversation_closure_evaluator,
+                proactive_monitor=proactive_monitor,
+                emit=lines.append,
+                sleep=lambda _seconds: None,
+                error_reset_seconds=0.0,
+            )
+        if not enable_working_feedback:
+            loop._start_working_feedback_loop = lambda _kind: (lambda: None)  # type: ignore[method-assign]
+        self.addCleanup(self._cleanup_loop, loop)
         loop._test_temp_dir = temp_dir_handle
         return loop, lines, realtime_session, resolved_print_backend, recorder, player, printer
 
@@ -1080,12 +1125,18 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     __exit__=lambda self, exc_type, exc, tb: None,
                 ),
             )
+            self.addCleanup(self._cleanup_loop, loop)
 
         self.assertNotIn("list_smart_home_entities", loop._tool_handlers)
         self.assertNotIn("read_smart_home_sensor_stream", loop._tool_handlers)
-        self.assertIn("inspect_camera", loop._tool_handlers)
+        self.assertNotIn("inspect_camera", loop._tool_handlers)
         self.assertNotIn("list_smart_home_entities", loop.realtime_session._tool_handlers)
         self.assertNotIn("read_smart_home_sensor_stream", loop.realtime_session._tool_handlers)
+        self.assertNotIn("inspect_camera", loop.realtime_session._tool_handlers)
+
+        loop.authorize_realtime_sensitive_tools("test")
+
+        self.assertIn("inspect_camera", loop._tool_handlers)
         self.assertIn("inspect_camera", loop.realtime_session._tool_handlers)
 
     @staticmethod
@@ -1110,6 +1161,33 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(conversation), 1)
         self.assertEqual(conversation[0][0], "system")
         self.assertIn(self._LANGUAGE_CONTRACT, conversation[0][1])
+
+    def _assert_redacted_text_observation(
+        self,
+        lines: list[str],
+        *,
+        key: str,
+        raw_text: str,
+    ) -> None:
+        digest = sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+        self.assertIn(
+            f"{key}=[redacted len={len(raw_text)} sha256={digest}]",
+            lines,
+        )
+
+    def _assert_redacted_partial_observation(
+        self,
+        lines: list[str],
+        *,
+        raw_text: str,
+    ) -> None:
+        cleaned = " ".join(raw_text.replace("\r", " ").replace("\n", " ").split()).strip()
+        self.assertIn("stt_partial=[redacted]", lines)
+        self.assertIn(
+            f"stt_partial_sha12={sha1(cleaned.encode('utf-8')).hexdigest()[:12]}",
+            lines,
+        )
+        self.assertIn(f"stt_partial_len={len(cleaned)}", lines)
 
     def test_make_loop_registers_tempdir_cleanup(self) -> None:
         class _FakeTempDir:
@@ -1149,7 +1227,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"PCM"])
         self.assertEqual(loop.runtime.last_transcript, "")
         self.assertEqual(loop.runtime.last_response, "Guten Tag")
-        self.assertIn("transcript=Hallo Twinr", lines)
+        self._assert_redacted_text_observation(lines, key="transcript", raw_text="Hallo Twinr")
         self.assertIn("status=listening", lines)
         self.assertIn("status=processing", lines)
         self.assertIn("status=answering", lines)
@@ -1182,7 +1260,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("turn_controller_decision=end_turn", lines)
         self.assertIn("turn_controller_label=complete", lines)
         self.assertIn("turn_controller_selected_label=complete", lines)
-        self.assertIn("stt_partial=ich bin immernoch", lines)
+        self._assert_redacted_partial_observation(lines, raw_text="ich bin immernoch")
         self.assertIn("timing_stt_ms=", "\n".join(lines))
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
 
@@ -1260,7 +1338,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertNotIn("follow_up_timeout=true", lines)
         self.assertEqual(realtime_session.calls, [b"PCM-APCM-B"])
         self.assertEqual(loop.runtime.last_transcript, "")
-        self.assertIn("transcript=Hallo Twinr", lines)
+        self._assert_redacted_text_observation(lines, key="transcript", raw_text="Hallo Twinr")
 
     def test_backchannel_turn_adds_short_reply_guidance(self) -> None:
         config = TwinrConfig(
@@ -1585,7 +1663,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertIn("user_interrupt_detected=true", lines)
         self.assertIn("assistant_interrupted=true", lines)
-        self.assertIn("interrupt_transcript=warte mal", lines)
+        self._assert_redacted_text_observation(lines, key="interrupt_transcript", raw_text="warte mal")
         self.assertEqual(len(loop.realtime_session.calls), 2)
         self.assertEqual(recorder.start_timeouts, [8.0, 3.5])
 
@@ -1682,7 +1760,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(realtime_session.text_calls, ["wie spaet ist es"])
         self.assertEqual(realtime_session.calls, [])
         self.assertEqual(recorder.pause_values, [])
-        self.assertGreaterEqual(len(player.tones), 1)
+        self.assertEqual(player.tones, [])
         self.assertIn("voice_activation_mode=direct_text", lines)
         self.assertIn("realtime_turn_provider_complete=true", lines)
         self.assertIn("realtime_turn_provider_audio_received=true", lines)
@@ -1691,10 +1769,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("realtime_turn_finalize_done=true", lines)
         self.assertNotIn("realtime_turn_tts_fallback_start=true", lines)
         self.assertEqual(loop.runtime.last_transcript, "")
-        self.assertIn("transcript=Hallo Twinr", lines)
+        self._assert_redacted_text_observation(lines, key="transcript", raw_text="Hallo Twinr")
 
     def test_voice_activation_without_remaining_text_opens_listening_window(self) -> None:
-        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+        loop, lines, realtime_session, print_backend, recorder, player, _printer = self.make_loop()
+        print_backend.synthesize_result = _pcm_to_test_wav_bytes((b"\x08\x00" + b"\xf8\xff") * 800)
 
         handled = loop.handle_voice_activation(
             VoiceActivationMatch(
@@ -1715,7 +1794,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.ignore_initial_ms, [loop.config.audio_follow_up_ignore_ms])
         self.assertEqual(recorder.pause_grace_values, [loop.config.adaptive_timing_pause_grace_ms])
         self.assertGreaterEqual(len(player.tones), 1)
-        self.assertEqual(player.played, [b"WAVPCM", b"PCM"])
+        self.assertEqual(
+            player.played,
+            [_wav_frames(normalize_wav_playback_level(print_backend.synthesize_result)), b"PCM"],
+        )
         self.assertIn("voice_activation_mode=listen", lines)
         self.assertIn("voice_activation_ack=Ja?", lines)
 
@@ -2166,12 +2248,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
     def test_voice_activation_ack_uses_cached_audio_when_prefetched(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
+        ack_wav = _pcm_to_test_wav_bytes((b"\x08\x00" + b"\xf8\xff") * 800)
+        print_backend.synthesize_result = ack_wav
 
         loop._prime_voice_activation_ack_cache()
         loop._acknowledge_voice_activation()
 
         self.assertEqual(print_backend.synthesize_calls, ["Ja?"])
-        self.assertEqual(player.played, [b"WAVPCM"])
+        self.assertEqual(player.played, [_wav_frames(normalize_wav_playback_level(ack_wav))])
         self.assertIn("voice_activation_ack=Ja?", lines)
         self.assertIn("voice_activation_ack_cached=true", lines)
 
@@ -2182,7 +2266,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         loop._acknowledge_voice_activation()
 
-        self.assertEqual(player.played, [normalize_wav_playback_level(quiet_wav)])
+        self.assertEqual(player.played, [_wav_frames(normalize_wav_playback_level(quiet_wav))])
 
     def test_voice_orchestrator_activation_ack_uses_earcon_only(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
@@ -2247,6 +2331,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
             config=TwinrConfig(conversation_follow_up_enabled=True)
         )
+        loop.voice_orchestrator = FakeVoiceOrchestrator()
+        loop._last_voice_orchestrator_runtime_state = ("follow_up_open", "follow_up", True)
         captured_kwargs: dict[str, object] = {}
 
         def fake_run_conversation_session(**kwargs):
@@ -2551,9 +2637,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertIn("listen_timeout=true", lines)
         self.assertIn("listen_timeout_capture_device=default", lines)
-        self.assertIn("listen_timeout_speech_threshold=700", lines)
+        self.assertIn("listen_timeout_speech_threshold=700.0", lines)
         self.assertIn("listen_timeout_chunk_count=12", lines)
-        self.assertIn("listen_timeout_peak_rms=412", lines)
+        self.assertIn("listen_timeout_peak_rms=412.0", lines)
         self.assertIn("listen_timeout_active_ratio=0.08", lines)
 
     def test_resumed_pause_adapts_next_pause_threshold(self) -> None:
@@ -2750,7 +2836,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             recorder=FakeRecorder(recordings=[b"TURN1", b"TURN2"]),
             conversation_closure_evaluator=closure_evaluator,
         )
-        loop.follow_up_steering_runtime.load_turn_steering_cues = lambda: (  # type: ignore[method-assign]
+        loop.follow_up_steering_runtime.load_turn_steering_cues = lambda **_kwargs: (  # type: ignore[method-assign]
             ConversationTurnSteeringCue(
                 title="local politics",
                 salience=0.74,
@@ -2834,6 +2920,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(result["status"], "printed")
         self.assertEqual(result["text"], "GUTEN TAG")
         self.assertIn("status=printing", lines)
+        self.assertIn("active_statuses=processing,printing", lines)
         self.assertIn("print_tool_call=true", lines)
 
     def test_self_coding_tool_calls_create_and_advance_dialogue(self) -> None:
@@ -2896,7 +2983,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(final["skill_spec"]["scope"]["contacts"], ["family"])
         self.assertIn("ask_first", final["skill_spec"]["constraints"])
         self.assertIn("user_visible", final["skill_spec"]["trigger"]["conditions"])
-        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "queued")
+        store = loop.runtime._self_coding_store()
+        self.assertEqual(store.load_job(final["compile_job_id"]).status.value, "queued")
         self.assertIn("self_coding_tool_call=true", lines)
 
     def test_tool_provider_context_includes_active_self_coding_guidance(self) -> None:
@@ -2978,8 +3066,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 )
 
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        store = loop.runtime._self_coding_store()
+        setattr(loop, "_self_coding_store", store)
         loop._self_coding_compile_worker = SelfCodingCompileWorker(
-            store=loop._self_coding_store,
+            store=store,
             driver=FakeCompileDriver(),
         )
 
@@ -3044,8 +3134,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         driver = FakeCompileDriver()
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        store = loop.runtime._self_coding_store()
+        setattr(loop, "_self_coding_store", store)
         loop._self_coding_compile_worker = SelfCodingCompileWorker(
-            store=loop._self_coding_store,
+            store=store,
             driver=driver,
         )
 
@@ -3064,7 +3156,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "constraints": ["ask_first"]})
         final = loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "confirmed": True})
 
-        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "queued")
+        self.assertEqual(store.load_job(final["compile_job_id"]).status.value, "queued")
 
         activated = loop._handle_confirm_skill_activation_tool_call(
             {
@@ -3076,7 +3168,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(driver.run_calls, ["run"])
         self.assertEqual(activated["status"], "active")
         self.assertEqual(activated["skill_id"], "announce_family_updates")
-        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "soft_launch_ready")
+        self.assertEqual(store.load_job(final["compile_job_id"]).status.value, "soft_launch_ready")
 
     def test_remember_memory_tool_call_writes_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3297,10 +3389,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 automation_poll_interval_s=0.0,
             )
             loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            due_now = now_in_timezone(config.local_timezone_name) - timedelta(minutes=2)
             entry = loop.runtime.create_time_automation(
                 name="Daily weather",
                 schedule="daily",
-                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                time_of_day=due_now.strftime("%H:%M"),
                 actions=(
                     AutomationAction(
                         kind="llm_prompt",
@@ -3316,11 +3409,15 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             stored = loop.runtime.automation_store.get(entry.automation_id)
 
         self.assertTrue(executed)
-        self.assertEqual(print_backend.automation_calls, [("Give the morning weather report.", True, "spoken")])
+        self.assertEqual(print_backend.automation_calls, [("Give the morning weather report.", False, "spoken")])
         self.assertEqual(print_backend.synthesize_calls, ["Die Wettervorhersage ist trocken und mild."])
-        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn(b"PCM", player.played)
         assert stored is not None
         self.assertIsNotNone(stored.last_triggered_at)
+        self.assertIsNotNone(stored.last_scheduled_at)
+        assert stored.last_scheduled_at is not None
+        assert stored.last_triggered_at is not None
+        self.assertLess(stored.last_scheduled_at, stored.last_triggered_at)
         self.assertIn("automation_executed=true", lines)
 
     def test_due_spoken_automation_is_released_when_idle_window_turns_stale(self) -> None:
@@ -3397,7 +3494,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     trigger_id="attention_window",
                     prompt="Soll ich dir helfen?",
                     reason="User seems attentive and quiet.",
-                    observed_at=12.0,
+                    observed_at=_fresh_observed_at(),
                     priority=SocialTriggerPriority.ATTENTION_WINDOW,
                     score=0.92,
                     threshold=0.86,
@@ -3479,7 +3576,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
             executed = loop._maybe_run_due_automation()
         self.assertTrue(executed)
-        self.assertEqual(print_backend.automation_calls, [("Print the main headlines of the day.", True, "printed")])
+        self.assertEqual(print_backend.automation_calls, [("Print the main headlines of the day.", False, "printed")])
         self.assertEqual(printer.printed, ["GUTEN TAG"])
 
     def test_idle_loop_executes_allowed_tool_call_automation(self) -> None:
@@ -3491,6 +3588,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 automation_poll_interval_s=0.0,
             )
             loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop(config=config)
+            loop._config_value = lambda name, default: (  # type: ignore[method-assign]
+                ("print_receipt",)
+                if name == "automation_tool_allowlist"
+                else getattr(config, name, default)
+            )
             entry = loop.runtime.create_time_automation(
                 name="Tool print",
                 schedule="daily",
@@ -3546,7 +3648,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertFalse(executed)
         assert stored is not None
         self.assertIsNone(stored.last_triggered_at)
-        self.assertTrue(any("Automation tool_call is not allowed" in line for line in lines))
+        self.assertTrue(
+            any(
+                "Automation tool_call denied for tool 'update_simple_setting'" in line
+                for line in lines
+            )
+        )
 
     def test_idle_loop_printed_automation_uses_processing_and_printing_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3737,6 +3844,18 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 print_backend=backend,
                 agent_provider=backend,
             )
+            loop._config_value = lambda name, default: (  # type: ignore[method-assign]
+                True
+                if name == "background_automation_allow_web_search"
+                else (
+                    (
+                        "run_self_coding_skill_scheduled",
+                        "run_self_coding_skill_sensor",
+                    )
+                    if name == "automation_tool_allowlist"
+                    else getattr(config, name, default)
+                )
+            )
             store = SelfCodingStore.from_project_root(config.project_root)
             worker = SelfCodingCompileWorker(store=store, driver=_SkillPackageCompileDriver())
             activation = SelfCodingActivationService(
@@ -3828,7 +3947,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertTrue(delivered)
         self.assertEqual(len(print_backend.reminder_calls), 1)
-        self.assertEqual(print_backend.synthesize_calls, ["Erinnerung: Medikament nehmen"])
+        self.assertEqual(print_backend.synthesize_calls, ["Erinnerung: Medikament nehmen."])
         self.assertEqual(player.played, [b"PCM"])
         self.assertIn("reminder_delivered=true", lines)
         self.assertTrue(stored_entries[0].delivered)
@@ -3892,7 +4011,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     trigger_id="attention_window",
                     prompt="Soll ich dir helfen?",
                     reason="User seems attentive and quiet.",
-                    observed_at=12.0,
+                    observed_at=_fresh_observed_at(),
                     priority=SocialTriggerPriority.ATTENTION_WINDOW,
                     score=0.92,
                     threshold=0.86,
@@ -4241,10 +4360,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [])
         self.assertIn("status=error", lines)
         self.assertIn("required_remote_dependency=false", lines)
-        self.assertIn(
-            "error=LongTermRemoteUnavailableError: remote unavailable during proactive preview",
-            lines,
-        )
+        self.assertIn("error=Required remote long-term memory is unavailable.", lines)
         self.assertNotIn(
             "longterm_proactive_error=remote unavailable during proactive preview",
             lines,
@@ -4279,7 +4395,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(delivered)
         self.assertEqual(len(print_backend.reminder_calls), 0)
         self.assertEqual(len(print_backend.generic_reminder_calls), 1)
-        self.assertIn("Speak the reminder now.", print_backend.generic_reminder_calls[0][0])
+        prompt, instructions, allow_web_search = print_backend.generic_reminder_calls[0]
+        prompt_payload = json.loads(prompt)
+        self.assertEqual(prompt_payload["task"], "Create a short spoken reminder for a reminder that is due now.")
+        self.assertTrue(prompt_payload["output_contract"]["json_only"])
+        self.assertIsNotNone(instructions)
+        assert instructions is not None
+        self.assertIn("Return only JSON with one key: text.", instructions)
+        self.assertFalse(allow_web_search)
         self.assertEqual(player.played, [b"PCM"])
         self.assertIn("reminder_backend_fallback=generic", lines)
         self.assertIn("reminder_delivered=true", lines)
@@ -4420,6 +4543,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             chat_jid="15555552233@s.whatsapp.net",
             text="Ich komme spaeter.",
             recipient_label="Anna Schulz",
+            reply_to_message_id=None,
         )
         self.assertIn("whatsapp_send_tool_call=true", lines)
         self.assertIn("whatsapp_send_status=sent", lines)
@@ -4517,6 +4641,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             chat_jid="15555554444@s.whatsapp.net",
             text="Bitte melde dich kurz.",
             recipient_label="Anna Schulz",
+            reply_to_message_id=None,
         )
 
     def test_memory_conflict_tool_calls_list_and_resolve_open_conflicts(self) -> None:
@@ -4803,14 +4928,23 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             service = loop.runtime.long_term_memory.personality_learning.world_intelligence
             service.remote_state = remote_state
             loop.runtime.long_term_memory.personality_learning.background_loop.remote_state = remote_state
-            service.page_loader = lambda url: SimpleNamespace(
-                url=url,
-                content_type="text/html; charset=utf-8",
-                text=(
-                    '<html><head><link rel="alternate" '
-                    'type="application/rss+xml" href="/feeds/local.xml"></head></html>'
-                ),
-            )
+            def _page_loader(url: str) -> SimpleNamespace:
+                if url.endswith("/feeds/local.xml"):
+                    return SimpleNamespace(
+                        url=url,
+                        content_type="application/rss+xml",
+                        text="<?xml version='1.0'?><rss><channel><title>Hamburg News</title></channel></rss>",
+                    )
+                return SimpleNamespace(
+                    url=url,
+                    content_type="text/html; charset=utf-8",
+                    text=(
+                        '<html><head><link rel="alternate" '
+                        'type="application/rss+xml" href="/feeds/local.xml"></head></html>'
+                    ),
+                )
+
+            service.page_loader = _page_loader
             service.feed_reader = lambda feed_url, *, max_items, timeout_s: (
                 WorldFeedItem(
                     feed_url=feed_url,
@@ -5114,8 +5248,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
     def test_inspect_camera_tool_uses_backend_and_reference_image(self) -> None:
         camera = FakeCamera()
         with tempfile.TemporaryDirectory() as temp_dir:
-            reference_path = Path(temp_dir) / "user-reference.jpg"
-            reference_path.write_bytes(b"\xff\xd8\xffreference")
+            reference_path = Path(temp_dir) / "user-reference.png"
+            reference_path.write_bytes(_TEST_VALID_PNG_BYTES)
             config = TwinrConfig(vision_reference_image_path=str(reference_path))
             loop, lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(
                 config=config,
@@ -5417,7 +5551,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="person_returned",
                 prompt="Hey Thom, schön dich zu sehen. Wie geht's dir?",
                 reason="Person returned after a long absence.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.PERSON_RETURNED,
             )
         )
@@ -5427,7 +5561,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(print_backend.proactive_calls), 1)
         self.assertEqual(loop.runtime.last_transcript, "")
         self.assertEqual(loop.runtime.last_response, "Guten Tag")
-        self.assertIn("transcript=Hallo Twinr", lines)
+        self._assert_redacted_text_observation(lines, key="transcript", raw_text="Hallo Twinr")
         proactive_call = print_backend.proactive_calls[0]
         self.assertEqual(
             proactive_call[:5],
@@ -5441,7 +5575,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
         self.assertIsInstance(proactive_call[5], tuple)
         self.assertIsInstance(proactive_call[6], tuple)
-        self.assertEqual(print_backend.synthesize_calls, ["Proaktiv: person_returned"])
+        self.assertEqual(print_backend.synthesize_calls, ["Proaktiv: person_returned."])
         self.assertGreaterEqual(len(player.tones), 1)
         self.assertEqual(player.played, [b"PCM", b"PCM"])
         self.assertIn("social_trigger=person_returned", lines)
@@ -5457,7 +5591,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             and entry.get("data", {}).get("trigger") == "person_returned"
         ]
         self.assertTrue(social_events)
-        self.assertEqual(social_events[-1]["data"]["prompt"], "Proaktiv: person_returned")
+        self.assertEqual(social_events[-1]["data"]["prompt"], "Proaktiv: person_returned.")
         self.assertEqual(
             social_events[-1]["data"]["default_prompt"],
             "Hey Thom, schön dich zu sehen. Wie geht's dir?",
@@ -5488,7 +5622,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="person_returned",
                 prompt="Hey Thom, schön dich zu sehen. Wie geht's dir?",
                 reason="Person returned after a long absence.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.PERSON_RETURNED,
             )
         )
@@ -5517,7 +5651,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="attention_window",
                 prompt="Kann ich dir bei etwas helfen?",
                 reason="Person was visible and quiet.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.ATTENTION_WINDOW,
             )
         )
@@ -5542,7 +5676,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="possible_fall",
                 prompt="Brauchst du Hilfe?",
                 reason="Person disappeared after a fall-like transition.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.POSSIBLE_FALL,
             )
         )
@@ -5566,7 +5700,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         proactive_monitor = SimpleNamespace(
             coordinator=SimpleNamespace(
                 latest_audio_policy_snapshot=ReSpeakerAudioPolicySnapshot(
-                    observed_at=42.0,
+                    observed_at=_fresh_observed_at(),
                     speech_delivery_defer_reason="background_media_active",
                     background_media_likely=True,
                 ),
@@ -5582,7 +5716,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="attention_window",
                 prompt="Soll ich dir helfen?",
                 reason="User seems attentive and quiet.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.ATTENTION_WINDOW,
             )
         )
@@ -5626,7 +5760,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="attention_window",
                 prompt="Soll ich dir helfen?",
                 reason="User seems attentive and quiet.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.ATTENTION_WINDOW,
             )
         )
@@ -5663,7 +5797,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="positive_contact",
                 prompt="Schön, dich zu sehen. Was möchtest du machen?",
                 reason="Visible smile.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.POSITIVE_CONTACT,
             )
         )
@@ -5684,7 +5818,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="showing_intent",
                 prompt="Möchtest du mir etwas zeigen?",
                 reason="Object near the camera.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.SHOWING_INTENT,
             )
         )
@@ -5714,7 +5848,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 trigger_id="person_returned",
                 prompt="Hey Thom, schön dich zu sehen. Wie geht's dir?",
                 reason="Person returned after a long absence.",
-                observed_at=42.0,
+                observed_at=_fresh_observed_at(),
                 priority=SocialTriggerPriority.PERSON_RETURNED,
             )
         )
@@ -5980,7 +6114,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertNotIn("status=waiting", lines)
 
     def test_run_polls_buttons_while_required_remote_watch_blocks(self) -> None:
-        button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")
+        button_monitor = FakeScheduledButtonMonitor(event_after_s=0.05, name="yellow")
         loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
             config=TwinrConfig(
                 long_term_memory_enabled=True,
@@ -6006,6 +6140,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
         loop.runtime.long_term_memory = _SlowReadyRemote()
+        self.assertTrue(loop._refresh_required_remote_dependency(force=True, force_sync=True))
 
         result = loop.run(duration_s=0.12, poll_timeout=0.001)
 
@@ -6054,6 +6189,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         remote = _ShouldNotBeCalledRemote()
         loop.runtime.long_term_memory = remote
+        loop.runtime.reset_error()
+        loop._required_remote_dependency_checked_once = True
+        loop._required_remote_dependency_cached_ready = True
 
         with mock.patch(
             "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
@@ -6382,6 +6520,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         dispatcher = ButtonPressDispatcher(
             handle_press=handle_press,
             interrupt_current=lambda source: interrupted.append(source) or allow_first_turn_to_finish.set() or True,
+            debounce_s=None,
         )
         dispatcher.submit("green")
         time.sleep(0.02)
@@ -6393,7 +6532,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(handled, ["green", "green"])
 
     def test_run_interrupts_busy_turn_on_second_green_press(self) -> None:
-        button_monitor = FakeBurstButtonMonitor(events=[(0.0, "green"), (0.02, "green")])
+        button_monitor = FakeBurstButtonMonitor(events=[(0.0, "green"), (0.05, "green")])
         loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
             button_monitor=button_monitor,
         )
@@ -6425,6 +6564,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
     def test_interrupt_requests_stop_active_player(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
+        loop.playback_coordinator = SimpleNamespace(stop_playback=player.stop_playback)
         stop_event = Event()
         loop._set_active_turn_stop_event(stop_event)
 

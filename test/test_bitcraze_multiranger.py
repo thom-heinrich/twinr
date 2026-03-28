@@ -15,6 +15,16 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
+_EMPTY_LINK_STATS = _MODULE.LinkStatisticsSnapshot(
+    latency_p95_ms=None,
+    link_quality=None,
+    uplink_rssi=None,
+    uplink_rate_packets_s=None,
+    downlink_rate_packets_s=None,
+    uplink_congestion=None,
+    downlink_congestion=None,
+)
+
 
 class BitcrazeMultirangerProbeTests(unittest.TestCase):
     def test_normalize_required_deck_name_accepts_common_aliases(self) -> None:
@@ -48,6 +58,7 @@ class BitcrazeMultirangerProbeTests(unittest.TestCase):
                 direction: _MODULE.RangeSummary(None, None, None, 0, 10)
                 for direction in _MODULE.RANGE_DIRECTIONS
             },
+            link_stats=_EMPTY_LINK_STATS,
             recommendations=(),
         )
 
@@ -75,13 +86,17 @@ class BitcrazeMultirangerProbeTests(unittest.TestCase):
                 "up": _MODULE.RangeSummary(1.0, 0.9, 1.1, 10, 0),
                 "down": _MODULE.RangeSummary(None, None, None, 0, 10),
             },
+            link_stats=_EMPTY_LINK_STATS,
             recommendations=(),
         )
 
         recommendations = _MODULE.recommendations_for_report(report)
 
-        self.assertIn("Pair the Multi-ranger deck with the Flow deck for stable ground/down sensing.", recommendations)
         self.assertIn(
-            "Downward z-range is unavailable; expect `down` to stay empty without a Z-ranger/Flow deck.",
+            "Flow deck not detected; lateral optical-flow stabilization will be unavailable during close-range experiments.",
+            recommendations,
+        )
+        self.assertIn(
+            "Downward z-range is unavailable; expect `down` to stay empty without a Flow or Z-ranger deck.",
             recommendations,
         )

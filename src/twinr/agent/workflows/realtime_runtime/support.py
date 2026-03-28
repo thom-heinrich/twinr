@@ -1,16 +1,37 @@
+# CHANGELOG: 2026-03-27
+# BUG-1: Fix lazy lock creation race that could return different lock instances to concurrent callers.
+# BUG-2: Fix feedback-loop generation races that could start overlapping working/search tones.
+# BUG-3: Fix playback coordinator lazy init race and ensure a shared audio lock is always attached.
+# BUG-4: Make workflow forensics best-effort so telemetry failures cannot abort active interactions.
+# SEC-1: Harden emitted error redaction to avoid leaking API keys, bearer tokens, signed URLs, or passwords.
+# IMP-1: Add cooperative TTS stream cancellation hooks and Python 3.13+ Queue.shutdown support for deterministic teardown.
+# IMP-2: Add dedicated playback sample-rate selection and an optional structured logger bridge for OTel-style log/trace correlation.
 """Provide shared support helpers for realtime-style workflow loops."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import nullcontext
+import inspect
+import json
+import logging
+import re
 import time
 import uuid
 from pathlib import Path
 from queue import Empty, Full, Queue
-from threading import Event, RLock, Thread, current_thread
-from typing import Callable
+from threading import Event, Lock, RLock, Thread, current_thread
+from typing import TYPE_CHECKING, Any, Callable
+
+try:
+    from queue import ShutDown as QueueShutDown
+except ImportError:  # pragma: no cover - Python < 3.13 fallback.
+    class QueueShutDown(Exception):
+        """Compatibility shim for Queue.shutdown() support on older Pythons."""
+
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.contracts import TextToSpeechProvider
 from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureEvaluator,
     StructuredConversationClosureEvaluator,
@@ -37,6 +58,11 @@ from twinr.providers.openai import (
     OpenAIToolCallingAgentProvider,
 )
 
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
+    from twinr.hardware.voice_profile import VoiceProfileMonitor
+    from twinr.ops.usage import TwinrUsageStore
+
 _SEARCH_FEEDBACK_TONE_PATTERNS: tuple[tuple[tuple[int, int], ...], ...] = (
     (
         (698, 55),
@@ -58,6 +84,7 @@ _DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_SECONDS = 20.0
 _DEFAULT_TTS_STREAM_CHUNK_TIMEOUT_SECONDS = 15.0
 _DEFAULT_STOP_JOIN_TIMEOUT_SECONDS = 2.0
 _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS = 5.0
+_DEFAULT_PLAYBACK_SAMPLE_RATE_HZ = 24000
 _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "no speech detected before timeout",
     "no speech detected",
@@ -66,10 +93,113 @@ _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "timeout waiting for user speech",
     "no input audio received",
 )
+_TTS_STOP_CALLBACK_PARAM_NAMES: tuple[str, ...] = (
+    "should_stop",
+    "is_cancelled",
+    "cancelled",
+    "should_abort",
+)
+_TTS_STOP_EVENT_PARAM_NAMES: tuple[str, ...] = (
+    "stop_event",
+    "cancel_event",
+    "abort_event",
+)
+_LOCK_CREATION_GUARD = Lock()
+_WHITESPACE_RE = re.compile(r"\s+")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?P<key>x-?api-?key|api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|signature|sig)\b\s*[:=]\s*(?P<value>[^\s,;]+)"
+)
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)\bauthorization\b\s*[:=]\s*(?P<scheme>bearer\s+)?(?P<value>[^\s,;]+)"
+)
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?i)(?P<prefix>[?&](?:x-?api-?key|api[_-]?key|access_token|refresh_token|token|password|secret|sig|signature)=)(?P<value>[^&\s]+)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})\b")
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+
+
+def _as_void_callback(value: object) -> Callable[[], None] | None:
+    """Return one zero-arg callback when the runtime attribute is callable."""
+
+    if callable(value):
+        return value
+    return None
+_UNSAFE_SECRET_RE = re.compile(
+    r"(?i)\b(?:authorization|x-?api-?key|api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|signature|sig)\b\s*[:=]\s*\S{6,}"
+)
+
 
 def _default_emit(line: str) -> None:
     """Print one workflow telemetry line to stdout."""
     print(line, flush=True)
+
+
+def _is_lock_like(candidate: object) -> bool:
+    return all(hasattr(candidate, attr) for attr in ("acquire", "release", "__enter__", "__exit__"))
+
+
+def _redact_secret_text(message: str) -> str:
+    def _redact_authorization(match: re.Match[str]) -> str:
+        scheme = (match.group("scheme") or "").strip()
+        if scheme:
+            return f"authorization: {scheme} <redacted>"
+        return "authorization=<redacted>"
+
+    redacted = _AUTHORIZATION_RE.sub(_redact_authorization, message)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('key')}=<redacted>",
+        redacted,
+    )
+    redacted = _SECRET_QUERY_PARAM_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>",
+        redacted,
+    )
+    redacted = _BEARER_TOKEN_RE.sub("Bearer <redacted>", redacted)
+    redacted = _OPENAI_KEY_RE.sub("sk-<redacted>", redacted)
+    redacted = _JWT_RE.sub("<jwt-redacted>", redacted)
+    if _UNSAFE_SECRET_RE.search(redacted) or _OPENAI_KEY_RE.search(redacted) or _JWT_RE.search(redacted):
+        return "internal error"
+    return redacted
+
+
+class _BestEffortSpanContext:
+    """Keep tracing failures from breaking the active workflow."""
+
+    def __init__(
+        self,
+        context: object,
+        *,
+        on_error: Callable[[str, BaseException], None],
+    ) -> None:
+        self._context = context
+        self._on_error = on_error
+
+    def __enter__(self) -> object | None:
+        if self._context is None:
+            return None
+        enter = getattr(self._context, "__enter__", None)
+        if not callable(enter):
+            return self._context
+        try:
+            return enter()
+        except Exception as exc:  # pragma: no cover - depends on tracer implementation.
+            self._on_error("enter", exc)
+            self._context = None
+            return None
+
+    def __exit__(self, exc_type, exc, exc_tb) -> bool:
+        if self._context is None:
+            return False
+        exit_method = getattr(self._context, "__exit__", None)
+        if not callable(exit_method):
+            return False
+        try:
+            return bool(exit_method(exc_type, exc, exc_tb))
+        except Exception as span_exc:  # pragma: no cover - depends on tracer implementation.
+            self._on_error("exit", span_exc)
+            return False
 
 
 class TwinrRealtimeSupportMixin:
@@ -79,26 +209,114 @@ class TwinrRealtimeSupportMixin:
     the session classes can stay focused on orchestration.
     """
 
-    # AUDIT-FIX(#4,#5,#10): Lazily create missing locks so mixin methods stay safe under concurrent use.
+    config: TwinrConfig
+    emit: Callable[[str], None]
+    player: Any
+    runtime: TwinrRuntime
+    sleep: Callable[[float], None]
+    usage_store: TwinrUsageStore
+    voice_profile_monitor: VoiceProfileMonitor
+    tts_provider: TextToSpeechProvider
+    _working_feedback_stop: Callable[[], None] | None = None
+    _search_feedback_stop: Callable[[], None] | None = None
+
     def _get_lock(self, name: str) -> RLock:
         lock = getattr(self, name, None)
-        if lock is None:
+        if _is_lock_like(lock):
+            return lock
+        with _LOCK_CREATION_GUARD:
+            lock = getattr(self, name, None)
+            if _is_lock_like(lock):
+                return lock
             lock = RLock()
             setattr(self, name, lock)
-        return lock
+            return lock
 
     def _get_playback_coordinator(self) -> PlaybackCoordinator:
         """Return the workflow-wide speaker coordinator, creating it lazily."""
 
         coordinator = getattr(self, "playback_coordinator", None)
-        if coordinator is None:
+        if isinstance(coordinator, PlaybackCoordinator):
+            return coordinator
+        coordinator_lock = self._get_lock("_playback_coordinator_lock")
+        with coordinator_lock:
+            coordinator = getattr(self, "playback_coordinator", None)
+            if isinstance(coordinator, PlaybackCoordinator):
+                return coordinator
             coordinator = PlaybackCoordinator(
                 self.player,
                 emit=getattr(self, "emit", None),
-                io_lock=getattr(self, "_audio_lock", None),
+                io_lock=self._get_lock("_audio_lock"),
             )
             setattr(self, "playback_coordinator", coordinator)
-        return coordinator
+            return coordinator
+
+    def _playback_sample_rate_hz(self, config: TwinrConfig | None = None) -> int:
+        config = self.config if config is None else config
+        for attr_name in (
+            "audio_output_sample_rate_hz",
+            "audio_output_sample_rate",
+            "audio_playback_sample_rate_hz",
+            "audio_playback_sample_rate",
+            "playback_sample_rate_hz",
+            "tts_output_sample_rate_hz",
+            "tts_output_sample_rate",
+        ):
+            raw_value = getattr(config, attr_name, None)
+            try:
+                sample_rate = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if sample_rate >= 8000:
+                return sample_rate
+        try:
+            fallback = int(getattr(config, "openai_realtime_input_sample_rate", _DEFAULT_PLAYBACK_SAMPLE_RATE_HZ))
+        except (TypeError, ValueError):
+            fallback = _DEFAULT_PLAYBACK_SAMPLE_RATE_HZ
+        return max(8000, fallback)
+
+    def _resolve_workflow_logger(self) -> logging.Logger | None:
+        for candidate in (
+            getattr(self, "workflow_logger", None),
+            getattr(getattr(self, "runtime", None), "workflow_logger", None),
+        ):
+            if isinstance(candidate, logging.Logger):
+                return candidate
+        return None
+
+    def _structured_workflow_log(
+        self,
+        *,
+        record_type: str,
+        msg: str,
+        level: str = "INFO",
+        trace_id: str | None = None,
+        span_id: str | None = None,
+        **payload: object,
+    ) -> None:
+        logger = self._resolve_workflow_logger()
+        if logger is None:
+            return
+        body = {
+            "record_type": record_type,
+            "msg": msg,
+            "trace_id": trace_id,
+            "span_id": span_id,
+            **payload,
+        }
+        level_name = str(level).upper()
+        level_no = getattr(logging, level_name, logging.INFO)
+        try:
+            logger.log(
+                level_no,
+                json.dumps(body, default=str, ensure_ascii=False, separators=(",", ":")),
+                extra={
+                    "twinr_trace_id": trace_id or "",
+                    "twinr_span_id": span_id or "",
+                },
+            )
+        except Exception:
+            return
 
     def _new_workflow_trace_id(self) -> str:
         """Return one stable trace id for a workflow session."""
@@ -123,20 +341,35 @@ class TwinrRealtimeSupportMixin:
         trace_id: str | None = None,
         span_id: str | None = None,
     ) -> None:
-        tracer = getattr(self, "workflow_forensics", None)
-        if not isinstance(tracer, WorkflowForensics):
-            return
-        tracer.event(
-            kind=kind,
+        active_trace_id = trace_id or self._workflow_trace_active_id()
+        self._structured_workflow_log(
+            record_type="workflow_event",
             msg=msg,
+            level=level,
+            trace_id=active_trace_id,
+            span_id=span_id,
+            kind=kind,
             details=details,
             reason=reason,
             kpi=kpi,
-            level=level,
-            trace_id=trace_id or self._workflow_trace_active_id(),
-            span_id=span_id,
-            loc_skip=3,
         )
+        tracer = getattr(self, "workflow_forensics", None)
+        if not isinstance(tracer, WorkflowForensics):
+            return
+        try:
+            tracer.event(
+                kind=kind,
+                msg=msg,
+                details=details,
+                reason=reason,
+                kpi=kpi,
+                level=level,
+                trace_id=active_trace_id,
+                span_id=span_id,
+                loc_skip=3,
+            )
+        except Exception as exc:
+            self._try_emit(f"workflow_forensics_event_error={self._safe_error_text(exc)}")
 
     def _trace_decision(
         self,
@@ -152,11 +385,13 @@ class TwinrRealtimeSupportMixin:
         trace_id: str | None = None,
         span_id: str | None = None,
     ) -> None:
-        tracer = getattr(self, "workflow_forensics", None)
-        if not isinstance(tracer, WorkflowForensics):
-            return
-        tracer.decision(
+        active_trace_id = trace_id or self._workflow_trace_active_id()
+        self._structured_workflow_log(
+            record_type="workflow_decision",
             msg=msg,
+            level="INFO",
+            trace_id=active_trace_id,
+            span_id=span_id,
             question=question,
             selected=selected,
             options=options,
@@ -164,9 +399,25 @@ class TwinrRealtimeSupportMixin:
             confidence=confidence,
             guardrails=guardrails,
             kpi_impact_estimate=kpi_impact_estimate,
-            trace_id=trace_id or self._workflow_trace_active_id(),
-            span_id=span_id,
         )
+        tracer = getattr(self, "workflow_forensics", None)
+        if not isinstance(tracer, WorkflowForensics):
+            return
+        try:
+            tracer.decision(
+                msg=msg,
+                question=question,
+                selected=selected,
+                options=options,
+                context=context,
+                confidence=confidence,
+                guardrails=guardrails,
+                kpi_impact_estimate=kpi_impact_estimate,
+                trace_id=active_trace_id,
+                span_id=span_id,
+            )
+        except Exception as exc:
+            self._try_emit(f"workflow_forensics_decision_error={self._safe_error_text(exc)}")
 
     def _trace_span(
         self,
@@ -177,28 +428,42 @@ class TwinrRealtimeSupportMixin:
         trace_id: str | None = None,
         parent_span_id: str | None = None,
     ):
+        active_trace_id = trace_id or self._workflow_trace_active_id()
+        self._structured_workflow_log(
+            record_type="workflow_span",
+            msg=name,
+            level="DEBUG",
+            trace_id=active_trace_id,
+            span_id=parent_span_id,
+            kind=kind,
+            details=details,
+        )
         tracer = getattr(self, "workflow_forensics", None)
         if not isinstance(tracer, WorkflowForensics):
             return nullcontext()
-        return tracer.span(
-            name=name,
-            kind=kind,
-            details=details,
-            trace_id=trace_id or self._workflow_trace_active_id(),
-            parent_span_id=parent_span_id,
+        try:
+            span_context = tracer.span(
+                name=name,
+                kind=kind,
+                details=details,
+                trace_id=active_trace_id,
+                parent_span_id=parent_span_id,
+            )
+        except Exception as exc:
+            self._try_emit(f"workflow_forensics_span_error={self._safe_error_text(exc)}")
+            return nullcontext()
+        return _BestEffortSpanContext(
+            span_context,
+            on_error=lambda phase, exc: self._try_emit(
+                f"workflow_forensics_span_{phase}_error={self._safe_error_text(exc)}"
+            ),
         )
 
-    # AUDIT-FIX(#4): Sanitize exception text before emitting it outside the process boundary.
     def _safe_error_text(self, exc: BaseException) -> str:
-        message = " ".join(str(exc).split()).strip()
+        message = _WHITESPACE_RE.sub(" ", str(exc)).strip()
         if not message:
             message = exc.__class__.__name__
-        lower_message = message.casefold()
-        if any(
-            marker in lower_message
-            for marker in ("api_key", "authorization", "bearer ", "token=", "password=", "secret=")
-        ):
-            message = "internal error"
+        message = _redact_secret_text(message)
         if len(message) > 240:
             message = f"{message[:237]}..."
         if message == exc.__class__.__name__:
@@ -254,30 +519,29 @@ class TwinrRealtimeSupportMixin:
             default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
         )
 
-    # AUDIT-FIX(#4): Error reporting must not throw while handling another failure.
     def _try_emit(self, line: str) -> None:
         try:
             self.emit(line)
+            return
         except Exception:
+            pass
+        try:
             _default_emit(line)
+        except Exception:
+            return
 
-    # AUDIT-FIX(#2): Resolve the parent directory strictly while deferring the final component to O_NOFOLLOW open().
     def _normalize_reference_image_path(self, raw_path: str) -> Path:
         return vision_support.normalize_reference_image_path(raw_path)
 
-    # AUDIT-FIX(#2): Optional base-dir enforcement keeps reference media inside an explicit safe area when configured.
     def _validate_reference_image_base_dir(self, path: Path) -> bool:
         return vision_support.validate_reference_image_base_dir(self, path)
 
-    # AUDIT-FIX(#2): Open reference images without following symlinks and reject oversized/non-regular files.
     def _safe_read_reference_image_bytes(self, path: Path, *, max_bytes: int) -> bytes:
         return vision_support.safe_read_reference_image_bytes(path, max_bytes=max_bytes)
 
-    # AUDIT-FIX(#2,#7): Guess a safe content type and keep only a basename when passing files downstream.
     def _build_image_input(self, data: bytes, *, path: Path, label: str) -> OpenAIImageInput:
         return vision_support.build_image_input(data, path=path, label=label)
 
-    # AUDIT-FIX(#1): Support both legacy and renamed cooldown config fields with a safe default.
     def _print_button_cooldown_seconds(self) -> float:
         raw_value = getattr(
             self.config,
@@ -289,7 +553,6 @@ class TwinrRealtimeSupportMixin:
         except (TypeError, ValueError):
             return 0.0
 
-    # AUDIT-FIX(#6): Bound stream buffering on the Raspberry Pi and validate provider output before playback.
     def _coerce_audio_chunk(self, chunk: object) -> bytes:
         if isinstance(chunk, bytes):
             return chunk
@@ -299,7 +562,6 @@ class TwinrRealtimeSupportMixin:
             return chunk.tobytes()
         raise TypeError(f"TTS stream yielded unsupported chunk type: {type(chunk).__name__}")
 
-    # AUDIT-FIX(#3): Centralize the provider list so config updates and rollbacks stay consistent.
     def _iter_config_targets(self) -> tuple[object, ...]:
         seen: set[int] = set()
         targets: list[object] = []
@@ -322,7 +584,6 @@ class TwinrRealtimeSupportMixin:
             targets.append(provider)
         return tuple(targets)
 
-    # AUDIT-FIX(#3): Apply config only to targets that actually accept a config attribute.
     def _apply_config_to_targets(self, config: TwinrConfig) -> None:
         for provider in self._iter_config_targets():
             if hasattr(provider, "config"):
@@ -331,7 +592,6 @@ class TwinrRealtimeSupportMixin:
         if session is not None and hasattr(session, "config"):
             session.config = config
 
-    # AUDIT-FIX(#3): Build the turn evaluator from the new config without leaving stale state behind.
     def _build_turn_decision_evaluator(self, config: TwinrConfig) -> ToolCallingTurnDecisionEvaluator | None:
         turn_tool_agent_provider = getattr(self, "turn_tool_agent_provider", None)
         if turn_tool_agent_provider is None or not config.turn_controller_enabled:
@@ -362,11 +622,8 @@ class TwinrRealtimeSupportMixin:
     def _handle_error(self, exc: Exception) -> None:
         if isinstance(exc, LongTermRemoteUnavailableError) and self._enter_required_remote_error(exc):
             return
-        safe_error = self._safe_error_text(exc)  # AUDIT-FIX(#4): Never emit unsanitized exception text.
+        safe_error = self._safe_error_text(exc)
         if getattr(self, "_required_remote_dependency_error_active", False):
-            # A new non-remote blocker must not inherit stale remote-recovery state,
-            # otherwise the next healthy remote probe can incorrectly reset an
-            # unrelated runtime error back to waiting.
             self._required_remote_dependency_error_active = False
             self._required_remote_dependency_error_message = None
             self._required_remote_dependency_recovery_started_at = None
@@ -383,10 +640,10 @@ class TwinrRealtimeSupportMixin:
         )
         try:
             self.runtime.fail(safe_error)
-        except Exception as runtime_exc:  # AUDIT-FIX(#4): Preserve the original failure even if error-state persistence fails.
+        except Exception as runtime_exc:
             _default_emit(f"runtime_fail_error={self._safe_error_text(runtime_exc)}")
         self._emit_status(force=True)
-        self._try_emit(f"error={safe_error}")  # AUDIT-FIX(#4): Emission is best-effort only.
+        self._try_emit(f"error={safe_error}")
         if isinstance(exc, ReSpeakerRuntimeContractError):
             self._trace_event(
                 "workflow_error_handler_hold",
@@ -402,11 +659,11 @@ class TwinrRealtimeSupportMixin:
         if sleep_seconds > 0:
             try:
                 self.sleep(sleep_seconds)
-            except Exception as sleep_exc:  # AUDIT-FIX(#4): A broken sleep implementation must not trap the device in error handling.
+            except Exception as sleep_exc:
                 _default_emit(f"error_reset_sleep_error={self._safe_error_text(sleep_exc)}")
         try:
             self.runtime.reset_error()
-        except Exception as runtime_exc:  # AUDIT-FIX(#4): Failing to clear the error state should not raise a second exception here.
+        except Exception as runtime_exc:
             _default_emit(f"runtime_reset_error={self._safe_error_text(runtime_exc)}")
         self._emit_status(force=True)
         self._trace_event(
@@ -419,18 +676,33 @@ class TwinrRealtimeSupportMixin:
         return required_remote_support.current_runtime_error_matches_required_remote(self)
 
     def _emit_status(self, *, force: bool = False) -> None:
-        status = getattr(getattr(self.runtime, "status", None), "value", "unknown")  # AUDIT-FIX(#9): Guard the first emit when _last_status is unset or runtime is partially initialised.
+        runtime = getattr(self, "runtime", None)
+        status = getattr(getattr(runtime, "status", None), "value", "unknown")
         if force or status != getattr(self, "_last_status", None):
-            self._try_emit(f"status={status}")  # AUDIT-FIX(#4): Status reporting must not crash the main flow.
+            self._try_emit(f"status={status}")
             self._trace_event(
                 "runtime_status_emitted",
                 kind="metric",
                 details={"status": status, "force": force},
             )
             self._last_status = status
+        active_statuses = tuple(
+            str(getattr(item, "value", item) or "").strip().lower()
+            for item in getattr(getattr(runtime, "state_machine", None), "active_statuses", ())
+            if str(getattr(item, "value", item) or "").strip()
+        )
+        active_statuses_label = ",".join(active_statuses) if active_statuses else status
+        if force or active_statuses_label != getattr(self, "_last_active_statuses", None):
+            self._try_emit(f"active_statuses={active_statuses_label}")
+            self._trace_event(
+                "runtime_active_statuses_emitted",
+                kind="metric",
+                details={"active_statuses": active_statuses_label, "force": force},
+            )
+            self._last_active_statuses = active_statuses_label
 
     def _reload_live_config_from_env(self, env_path: Path) -> None:
-        config_lock = self._get_lock("_config_lock")  # AUDIT-FIX(#3): Serialise live config reloads and rollbacks.
+        config_lock = self._get_lock("_config_lock")
         with config_lock:
             previous_config = getattr(self, "config", None)
             previous_evaluator = getattr(self, "turn_decision_evaluator", None)
@@ -466,7 +738,7 @@ class TwinrRealtimeSupportMixin:
     def _record_event(self, event: str, message: str, *, level: str = "info", **data: object) -> None:
         try:
             self.runtime.ops_events.append(event=event, message=message, level=level, data=data)
-        except Exception as exc:  # AUDIT-FIX(#8): Ops-event persistence failures must not break the active interaction.
+        except Exception as exc:
             self._try_emit(f"ops_event_error={self._safe_error_text(exc)}")
 
     def _record_usage(
@@ -492,11 +764,11 @@ class TwinrRealtimeSupportMixin:
                 token_usage=token_usage,
                 metadata=metadata,
             )
-        except Exception as exc:  # AUDIT-FIX(#8): Usage-accounting write failures must degrade gracefully on flaky storage.
+        except Exception as exc:
             self._try_emit(f"usage_store_error={self._safe_error_text(exc)}")
 
     def _update_voice_assessment_from_pcm(self, audio_pcm: bytes) -> None:
-        config = self.config  # AUDIT-FIX(#3): Snapshot config during assessment to avoid mixed live-reload reads.
+        config = self.config
         household_assessment = update_household_voice_assessment_from_pcm(
             self,
             audio_pcm,
@@ -514,7 +786,7 @@ class TwinrRealtimeSupportMixin:
                 channels=config.audio_channels,
             )
         except Exception as exc:
-            self._try_emit(f"voice_profile_error={self._safe_error_text(exc)}")  # AUDIT-FIX(#4): Sanitise provider errors.
+            self._try_emit(f"voice_profile_error={self._safe_error_text(exc)}")
             return
         if not assessment.should_persist:
             return
@@ -527,7 +799,7 @@ class TwinrRealtimeSupportMixin:
                 user_display_name=None,
                 match_source="legacy_voice_profile",
             )
-        except Exception as exc:  # AUDIT-FIX(#8): State persistence is best-effort here.
+        except Exception as exc:
             self._try_emit(f"voice_profile_persist_error={self._safe_error_text(exc)}")
             return
         self._try_emit(f"voice_profile_status={assessment.status}")
@@ -535,7 +807,7 @@ class TwinrRealtimeSupportMixin:
             self._try_emit(f"voice_profile_confidence={assessment.confidence:.2f}")
 
     def _play_listen_beep(self) -> None:
-        config = self.config  # AUDIT-FIX(#3): Use one config snapshot per tone.
+        config = self.config
         started = time.monotonic()
         self._trace_event(
             "listen_beep_started",
@@ -553,7 +825,7 @@ class TwinrRealtimeSupportMixin:
                 frequency_hz=config.audio_beep_frequency_hz,
                 duration_ms=config.audio_beep_duration_ms,
                 volume=config.audio_beep_volume,
-                sample_rate=config.openai_realtime_input_sample_rate,
+                sample_rate=self._playback_sample_rate_hz(config),
             )
         except Exception as exc:
             self._try_emit(f"beep_error={self._safe_error_text(exc)}")
@@ -573,7 +845,7 @@ class TwinrRealtimeSupportMixin:
         if config.audio_beep_settle_ms > 0:
             try:
                 self.sleep(config.audio_beep_settle_ms / 1000.0)
-            except Exception as exc:  # AUDIT-FIX(#4): Post-tone settling must not crash the interaction loop.
+            except Exception as exc:
                 self._try_emit(f"beep_settle_error={self._safe_error_text(exc)}")
                 self._trace_event(
                     "listen_beep_settle_failed",
@@ -589,14 +861,16 @@ class TwinrRealtimeSupportMixin:
         )
 
     def _start_working_feedback_loop(self, kind: WorkingFeedbackKind) -> Callable[[], None]:
-        feedback_lock = self._get_lock("_feedback_lock")  # AUDIT-FIX(#10): Coordinate stop/start mutations across threads.
+        feedback_lock = self._get_lock("_feedback_lock")
         with feedback_lock:
-            previous_stop = getattr(self, "_working_feedback_stop", None)
-            previous_generation = int(getattr(self, "_working_feedback_generation", 0) or 0)
-        if callable(previous_stop):
+            previous_stop = _as_void_callback(getattr(self, "_working_feedback_stop", None))
+            generation = int(getattr(self, "_working_feedback_generation", 0) or 0) + 1
+            self._working_feedback_generation = generation
+            self._working_feedback_stop = None
+        if previous_stop is not None:
             try:
                 previous_stop()
-            except Exception as exc:  # AUDIT-FIX(#10): A broken previous stop callback must not block the new loop.
+            except Exception as exc:
                 self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
                 self._trace_event(
                     "working_feedback_stop_failed",
@@ -604,12 +878,12 @@ class TwinrRealtimeSupportMixin:
                     level="WARN",
                     details={"kind": kind, "error": self._safe_error_text(exc)},
                 )
-        config = self.config  # AUDIT-FIX(#3): Snapshot delay-related config for the new loop.
+        config = self.config
         try:
             stop = start_working_feedback_loop(
                 self.player,
                 kind=kind,
-                sample_rate=config.openai_realtime_input_sample_rate,
+                sample_rate=self._playback_sample_rate_hz(config),
                 config=config,
                 emit=self._try_emit,
                 delay_override_ms=(
@@ -619,7 +893,7 @@ class TwinrRealtimeSupportMixin:
                 ),
                 playback_coordinator=self._get_playback_coordinator(),
             )
-        except Exception as exc:  # AUDIT-FIX(#10): Feedback audio is optional and must not take down the turn.
+        except Exception as exc:
             self._try_emit(f"working_feedback_error={self._safe_error_text(exc)}")
             self._trace_event(
                 "working_feedback_start_failed",
@@ -628,10 +902,25 @@ class TwinrRealtimeSupportMixin:
                 details={"kind": kind, "error": self._safe_error_text(exc)},
             )
             return lambda: None
-        generation = previous_generation + 1
+
+        stale_generation = False
         with feedback_lock:
-            self._working_feedback_generation = generation
-            self._working_feedback_stop = stop
+            if getattr(self, "_working_feedback_generation", None) != generation:
+                stale_generation = True
+            else:
+                self._working_feedback_stop = stop
+        if stale_generation:
+            try:
+                stop()
+            except Exception as exc:
+                self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
+            self._trace_event(
+                "working_feedback_discarded_stale_start",
+                kind="branch",
+                details={"kind": kind, "generation": generation},
+            )
+            return lambda: None
+
         self._trace_event(
             "working_feedback_started",
             kind="io",
@@ -647,12 +936,12 @@ class TwinrRealtimeSupportMixin:
                         details={"kind": kind, "generation": generation},
                     )
                     return
-                active_stop = getattr(self, "_working_feedback_stop", None)
+                active_stop = _as_void_callback(getattr(self, "_working_feedback_stop", None))
                 self._working_feedback_stop = None
-            if callable(active_stop):
+            if active_stop is not None:
                 try:
                     active_stop()
-                except Exception as exc:  # AUDIT-FIX(#10): Feedback stop callbacks are best-effort.
+                except Exception as exc:
                     self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
                     self._trace_event(
                         "working_feedback_stop_failed",
@@ -670,34 +959,33 @@ class TwinrRealtimeSupportMixin:
         return stop_current
 
     def _stop_working_feedback(self) -> None:
-        feedback_lock = self._get_lock("_feedback_lock")  # AUDIT-FIX(#10): Prevent concurrent stop/start races.
+        feedback_lock = self._get_lock("_feedback_lock")
         with feedback_lock:
-            active_stop = getattr(self, "_working_feedback_stop", None)
+            active_stop = _as_void_callback(getattr(self, "_working_feedback_stop", None))
             self._working_feedback_stop = None
-        if callable(active_stop):
+        if active_stop is not None:
             try:
                 active_stop()
-            except Exception as exc:  # AUDIT-FIX(#10): Feedback stop callbacks are best-effort.
+            except Exception as exc:
                 self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
 
     def _start_search_feedback_loop(self) -> Callable[[], None]:
-        config = self.config  # AUDIT-FIX(#3): Freeze timing/volume values for the lifetime of this loop.
+        config = self.config
         if not config.search_feedback_tones_enabled:
             return lambda: None
 
-        feedback_lock = self._get_lock("_feedback_lock")  # AUDIT-FIX(#10): Ensure only one search-tone loop is active at once.
+        feedback_lock = self._get_lock("_feedback_lock")
         with feedback_lock:
-            previous_stop = getattr(self, "_search_feedback_stop", None)
-            previous_generation = int(getattr(self, "_search_feedback_generation", 0) or 0)
-        if callable(previous_stop):
-            previous_stop_call = getattr(previous_stop, "__call__", None)
+            previous_stop = _as_void_callback(getattr(self, "_search_feedback_stop", None))
+            generation = int(getattr(self, "_search_feedback_generation", 0) or 0) + 1
+            self._search_feedback_generation = generation
+            self._search_feedback_stop = None
+        if previous_stop is not None:
             try:
-                if callable(previous_stop_call):
-                    previous_stop_call()  # pylint: disable=not-callable
+                previous_stop()
             except Exception as exc:
                 self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
 
-        generation = previous_generation + 1
         stop_event = Event()
         delay_seconds = max(0.0, config.search_feedback_delay_ms / 1000.0)
         pause_seconds = max(0.12, config.search_feedback_pause_ms / 1000.0)
@@ -706,6 +994,7 @@ class TwinrRealtimeSupportMixin:
             float(getattr(config, "search_feedback_stop_join_timeout_seconds", _DEFAULT_STOP_JOIN_TIMEOUT_SECONDS)),
         )
         owner = "search_feedback"
+        playback_sample_rate = self._playback_sample_rate_hz(config)
 
         def worker() -> None:
             if stop_event.wait(delay_seconds):
@@ -719,12 +1008,12 @@ class TwinrRealtimeSupportMixin:
                         if stop_event.is_set():
                             return
                         self._get_playback_coordinator().play_tone(
-                            owner="search_feedback",
+                            owner=owner,
                             priority=PlaybackPriority.FEEDBACK,
                             frequency_hz=frequency_hz,
                             duration_ms=duration_ms,
                             volume=config.search_feedback_volume,
-                            sample_rate=config.openai_realtime_input_sample_rate,
+                            sample_rate=playback_sample_rate,
                             should_stop=stop_event.is_set,
                         )
                         if stop_event.wait(0.05):
@@ -735,7 +1024,7 @@ class TwinrRealtimeSupportMixin:
                 if stop_event.wait(pause_seconds):
                     return
 
-        thread = Thread(target=worker, daemon=True)
+        thread = Thread(target=worker, name="twinr-search-feedback", daemon=True)
         thread.start()
 
         def stop() -> None:
@@ -743,16 +1032,30 @@ class TwinrRealtimeSupportMixin:
             self._get_playback_coordinator().stop_owner(owner)
             if thread is current_thread():
                 return
-            thread.join(timeout=join_timeout_seconds)  # AUDIT-FIX(#5): Avoid indefinite hangs during stop/shutdown.
+            thread.join(timeout=join_timeout_seconds)
             if thread.is_alive():
                 self._try_emit("search_feedback_warning=stop_timeout")
             with feedback_lock:
                 if getattr(self, "_search_feedback_generation", None) == generation:
                     self._search_feedback_stop = None
 
+        stale_generation = False
         with feedback_lock:
-            self._search_feedback_generation = generation
-            self._search_feedback_stop = stop
+            if getattr(self, "_search_feedback_generation", None) != generation:
+                stale_generation = True
+            else:
+                self._search_feedback_stop = stop
+        if stale_generation:
+            try:
+                stop()
+            except Exception as exc:
+                self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
+            self._trace_event(
+                "search_feedback_discarded_stale_start",
+                kind="branch",
+                details={"generation": generation},
+            )
+            return lambda: None
 
         return stop
 
@@ -761,15 +1064,77 @@ class TwinrRealtimeSupportMixin:
 
         feedback_lock = self._get_lock("_feedback_lock")
         with feedback_lock:
-            active_stop = getattr(self, "_search_feedback_stop", None)
+            active_stop = _as_void_callback(getattr(self, "_search_feedback_stop", None))
             self._search_feedback_stop = None
-        if callable(active_stop):
-            active_stop_call = getattr(active_stop, "__call__", None)
+        if active_stop is not None:
             try:
-                if callable(active_stop_call):
-                    active_stop_call()  # pylint: disable=not-callable
+                active_stop()
             except Exception as exc:
                 self._try_emit(f"search_feedback_stop_error={self._safe_error_text(exc)}")
+
+    def _build_tts_stream_iterator(
+        self,
+        text: str,
+        *,
+        producer_stop: Event,
+        should_stop: Callable[[], bool] | None,
+    ) -> Iterator[object]:
+        synthesize_stream = self.tts_provider.synthesize_stream
+
+        def combined_should_stop() -> bool:
+            return producer_stop.is_set() or (should_stop is not None and should_stop())
+
+        kwargs: dict[str, object] = {}
+        try:
+            signature = inspect.signature(synthesize_stream)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None:
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            parameter_names = {
+                parameter.name
+                for parameter in signature.parameters.values()
+                if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            }
+            if accepts_kwargs or any(name in parameter_names for name in _TTS_STOP_CALLBACK_PARAM_NAMES):
+                for name in _TTS_STOP_CALLBACK_PARAM_NAMES:
+                    if accepts_kwargs or name in parameter_names:
+                        kwargs[name] = combined_should_stop
+                        break
+            if accepts_kwargs or any(name in parameter_names for name in _TTS_STOP_EVENT_PARAM_NAMES):
+                for name in _TTS_STOP_EVENT_PARAM_NAMES:
+                    if accepts_kwargs or name in parameter_names:
+                        kwargs[name] = producer_stop
+                        break
+        return synthesize_stream(text, **kwargs) if kwargs else synthesize_stream(text)
+
+    def _cancel_tts_provider_stream(self, producer_stop: Event) -> None:
+        for method_name in ("cancel_current_stream", "cancel_stream"):
+            cancel = getattr(self.tts_provider, method_name, None)
+            if not callable(cancel):
+                continue
+            try:
+                cancel()
+            except TypeError:
+                try:
+                    cancel(producer_stop)
+                except Exception as exc:
+                    self._try_emit(f"tts_cancel_error={self._safe_error_text(exc)}")
+            except Exception as exc:
+                self._try_emit(f"tts_cancel_error={self._safe_error_text(exc)}")
+            break
+
+    def _shutdown_tts_queue(self, chunk_queue: Queue[object]) -> None:
+        shutdown = getattr(chunk_queue, "shutdown", None)
+        if not callable(shutdown):
+            return
+        try:
+            shutdown(immediate=True)
+        except Exception as exc:
+            self._try_emit(f"tts_queue_shutdown_error={self._safe_error_text(exc)}")
 
     def _play_streaming_tts_with_feedback(
         self,
@@ -778,7 +1143,7 @@ class TwinrRealtimeSupportMixin:
         turn_started: float,
         should_stop: Callable[[], bool] | None = None,
     ) -> tuple[int, int | None]:
-        config = self.config  # AUDIT-FIX(#3): Keep timing and queue limits consistent for this TTS turn.
+        config = self.config
         tts_started = time.monotonic()
         first_audio_at: list[float | None] = [None]
         queue_max_chunks = max(
@@ -805,7 +1170,7 @@ class TwinrRealtimeSupportMixin:
                 )
             ),
         )
-        chunk_queue: Queue[bytes | Exception | object] = Queue(maxsize=queue_max_chunks)  # AUDIT-FIX(#6): Bound memory growth under slow playback.
+        chunk_queue: Queue[bytes | Exception | object] = Queue(maxsize=queue_max_chunks)
         sentinel = object()
         producer_stop = Event()
         feedback_started = False
@@ -822,11 +1187,17 @@ class TwinrRealtimeSupportMixin:
                     return True
                 except Full:
                     continue
+                except QueueShutDown:
+                    return False
             return False
 
         def synth_worker() -> None:
             try:
-                for chunk in self.tts_provider.synthesize_stream(text):
+                for chunk in self._build_tts_stream_iterator(
+                    text,
+                    producer_stop=producer_stop,
+                    should_stop=should_stop,
+                ):
                     if producer_stop.is_set():
                         return
                     chunk_bytes = self._coerce_audio_chunk(chunk)
@@ -841,7 +1212,7 @@ class TwinrRealtimeSupportMixin:
                 if not producer_stop.is_set():
                     queue_put(sentinel)
 
-        synth_thread = Thread(target=synth_worker, daemon=True)
+        synth_thread = Thread(target=synth_worker, name="twinr-tts-synth", daemon=True)
         synth_thread.start()
         first_chunk: bytes | None = None
         first_chunk_deadline = tts_started + first_chunk_timeout_seconds
@@ -859,17 +1230,19 @@ class TwinrRealtimeSupportMixin:
                         feedback_started = True
                         stop_answering_feedback = self._start_working_feedback_loop("answering")
                     continue
+                except QueueShutDown:
+                    break
                 if item is sentinel:
                     break
                 if isinstance(item, Exception):
                     raise item
-                first_chunk = item
+                first_chunk = self._coerce_audio_chunk(item)
             stop_answering_feedback()
             if first_chunk is None:
                 raise RuntimeError("TTS stream ended without audio")
             self._try_emit("realtime_tts_first_chunk_received=true")
 
-            def playback_chunks():
+            def playback_chunks() -> Iterator[bytes]:
                 if first_audio_at[0] is None:
                     first_audio_at[0] = time.monotonic()
                 yield first_chunk
@@ -880,11 +1253,13 @@ class TwinrRealtimeSupportMixin:
                         item = chunk_queue.get(timeout=chunk_timeout_seconds)
                     except Empty:
                         raise TimeoutError("TTS stream stalled while waiting for audio chunk")
+                    except QueueShutDown:
+                        return
                     if item is sentinel:
                         return
                     if isinstance(item, Exception):
                         raise item
-                    yield item
+                    yield self._coerce_audio_chunk(item)
 
             self._try_emit("realtime_tts_playback_started=true")
             self._get_playback_coordinator().play_wav_chunks(
@@ -895,8 +1270,10 @@ class TwinrRealtimeSupportMixin:
             )
             self._try_emit("realtime_tts_playback_completed=true")
         finally:
-            producer_stop.set()  # AUDIT-FIX(#6): Let the worker thread exit if the consumer aborts early.
+            producer_stop.set()
             stop_answering_feedback()
+            self._cancel_tts_provider_stream(producer_stop)
+            self._shutdown_tts_queue(chunk_queue)
             synth_thread.join(timeout=_DEFAULT_STOP_JOIN_TIMEOUT_SECONDS)
             if synth_thread.is_alive():
                 self._try_emit("tts_warning=synth_thread_still_running")
@@ -924,8 +1301,15 @@ class TwinrRealtimeSupportMixin:
         return vision_support.build_vision_prompt(question, include_reference=include_reference)
 
     def _is_no_speech_timeout(self, exc: Exception) -> bool:
-        message = str(exc).casefold()  # AUDIT-FIX(#11): Provider errors drift over time; avoid brittle exact-match classification.
-        return any(marker in message for marker in _NO_SPEECH_TIMEOUT_MARKERS)
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            message = str(current).casefold()
+            if any(marker in message for marker in _NO_SPEECH_TIMEOUT_MARKERS):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     def _is_print_cooldown_active(self) -> bool:
         last_print_request_at = getattr(self, "_last_print_request_at", None)
@@ -933,6 +1317,6 @@ class TwinrRealtimeSupportMixin:
             return False
         try:
             elapsed_seconds = time.monotonic() - float(last_print_request_at)
-        except (TypeError, ValueError):  # AUDIT-FIX(#1): Corrupt in-memory state should fail open, not crash the print path.
+        except (TypeError, ValueError):
             return False
         return elapsed_seconds < self._print_button_cooldown_seconds()

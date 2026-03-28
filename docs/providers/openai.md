@@ -12,14 +12,14 @@ Twinr currently starts with an OpenAI-first backend slice for:
 ```dotenv
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_REASONING_EFFORT=medium
-OPENAI_STT_MODEL=whisper-1
+OPENAI_STT_MODEL=gpt-4o-mini-transcribe
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=marin
 OPENAI_TTS_FORMAT=wav
 OPENAI_TTS_INSTRUCTIONS="Speak in clear, warm, natural standard German with native German pronunciation. No English accent."
-OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
+OPENAI_REALTIME_MODEL=gpt-realtime-1.5
 OPENAI_REALTIME_VOICE=sage
-OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1
+OPENAI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 OPENAI_REALTIME_LANGUAGE=de
 OPENAI_REALTIME_INPUT_SAMPLE_RATE=24000
 OPENAI_REALTIME_INSTRUCTIONS="Speak in clear, warm, natural standard German with native German pronunciation. No English accent."

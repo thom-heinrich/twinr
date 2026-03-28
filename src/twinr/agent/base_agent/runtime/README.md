@@ -19,6 +19,8 @@ and runtime snapshot durability.
 - keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
 - keep runtime-local tool turns on a bounded tiny-recent context when broader long-term memory is not needed, so status/control handoffs do not block the streaming final lane on remote retrieval
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
+- restore persisted runtime status through the state-machine snapshot contract instead of assigning to the read-only runtime `status` property, so startup restore can reinstate valid `waiting` and orthogonal `printing_active` states without false warnings while refusing to resurrect stale persisted `error` status from older process lifetimes
+- let `state.RuntimeSnapshotStore` remain the authoritative cross-process snapshot lock so Pi runtimes with `portalocker` installed do not self-deadlock by taking the same lock file twice during restore/persist
 - expose reminder-reservation release semantics so workflow races can unwind a reserved reminder before speech starts without forcing a fake failure retry delay
 - expose the runtime-side guided user-discovery flow so Twinr can persist, review, correct, and delete high-value get-to-know-you facts across managed context, graph memory, and durable memory without bloating orchestration code
 - expose active self-coding dialogue and compile-job guidance to the tool lane so follow-up answers and activation requests can reuse runtime-owned `session_id` / `job_id` state instead of asking the user for internal identifiers

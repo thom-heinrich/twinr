@@ -45,6 +45,23 @@ class SettingsSection:
 
 
 @dataclass(frozen=True, slots=True)
+class SectionGroup:
+    """Bundle related page sections under one calmer operator-facing heading.
+
+    Attributes:
+        key: Stable anchor/id token for in-page navigation.
+        title: Group heading shown above the grouped sections.
+        description: Plain-language summary of the group purpose.
+        sections: Settings-style sections rendered inside the group.
+    """
+
+    key: str
+    title: str
+    description: str
+    sections: tuple[SettingsSection, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class IntegrationOverviewRow:
     """Describe one integration status row for the overview page.
 

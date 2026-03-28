@@ -223,6 +223,7 @@ class RemoteAICameraProviderTests(unittest.TestCase):
 
         self.assertEqual(processor.gesture_calls[0]["frame_rgb"], "rgb-frame")
         self.assertFalse(processor.gesture_calls[0]["allow_pose_fallback"])
+        self.assertTrue(processor.gesture_calls[0]["gesture_fast_path"])
         self.assertEqual(snapshot.input_format, "remote-ai-frame")
         self.assertEqual(snapshot.observation.fine_hand_gesture, SocialFineHandGesture.PEACE_SIGN)
         self.assertEqual(snapshot.model, "remote-imx500-detection+local-mediapipe-live-gesture")

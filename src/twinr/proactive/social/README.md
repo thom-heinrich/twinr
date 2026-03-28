@@ -12,7 +12,7 @@ scored proactive trigger candidates and optional visual second opinions.
 - Define the social-trigger domain models and score thresholds
 - Evaluate stateful trigger candidates from normalized observation ticks
 - Wrap ambient-audio, ReSpeaker XVF3800, legacy OpenAI vision, and local-first AI-camera observations into bounded conservative snapshots
-- Keep the live AI-camera contract portable across Pis by allowing the main runtime to either fetch bounded IMX500 observations from a dedicated proxy Pi or pull a coherent helper-side detection-plus-frame bundle and run the hot attention/gesture lifting locally on the main board instead of assuming the sensor is physically attached there
+- Keep the live AI-camera contract bounded and portable inside the main-Pi runtime while treating any older helper-Pi camera transport as legacy-only code rather than a supported productive topology
 - Preserve conservative ReSpeaker facts such as `assistant_output_active`, `direction_confidence`, `speech_overlap_likely`, and `barge_in_detected`
 - Stabilize automation-facing camera snapshots, including person-count/zone anchors, coarse motion, and coarse/fine gesture event surfaces
 - Preserve bounded `looking_signal_state/source` metadata on camera snapshots so downstream HDMI/runtime debug surfaces can distinguish face-confirmed `LOOKING` from the cheap body-box proxy without inventing a second camera truth
@@ -20,11 +20,11 @@ scored proactive trigger candidates and optional visual second opinions.
 - Treat local camera health faults as `unknown` camera semantics instead of authoritative "no person" ticks, so short IMX500/runtime problems do not instantly erase the last stable person anchor
 - Smooth small primary-person center jitter before it reaches the HDMI gaze path, so box wobble does not read as nervous eye movement when the user is standing still
 - Keep that center smoothing short enough for live HDMI HCI, so person-following stays calm without adding second-scale lag
-- Keep the gesture acknowledgement surface fast enough for HDMI HCI, so changed user symbols like `🖐️` then `👍` are not blocked for several seconds by the slower proactive inspect cadence
+- Keep the gesture acknowledgement surface fast enough for HDMI HCI, so changed user symbols like `🖐️` then `👍` are not blocked for several seconds by the slower proactive inspect cadence, preferring current-frame live-hand evidence over slower person-ROI or full-frame rescues in the user-facing runtime lane
 - Preserve short explicit fine-hand symbols such as `👍`, `👎`, `👉`, `✌️`, `👌`, or `🖕` across brief motion/dropout jitter so users do not need to freeze unnaturally for the camera path
 - Keep per-symbol fine-hand acceptance configurable and bounded, because `👌` and `🖕` are materially easier to confuse than built-in `👍`, `👎`, `✌️`, or `👉`
 - Keep per-symbol acceptance bounded for live HDMI HCI: prefer a short explicit visibility window for deliberate symbols such as `👍`, `👎`, and `✌️` over brittle single-frame publishes, but do not let that grow into multi-second frozen-pose requirements
-- Let the staged custom gesture model supplement built-in MediaPipe hand symbols instead of globally overriding them, so custom-only `👌` / `🖕` support does not steal `✌️` or `👉` from the built-in recognizer
+- Let the staged custom gesture model supplement built-in MediaPipe hand symbols instead of globally overriding them, so custom-only `👌` / `🖕` support does not steal `✌️` or `👉` from the built-in recognizer; the precision-first user-facing fast lane may still disable that custom branch when Pi evidence shows it misses the current-frame deadline
 - Expose a low-latency ReSpeaker signal-only audio snapshot path for HDMI attention refresh, so local gesture/gaze HCI does not inherit the longer ambient PCM sampling window
 - Share low-risk social-contract normalization helpers across modules without regrowing duplicate coercion code in hot runtime paths
 - Route safety prompts and render bounded evidence facts for proactive prompting
@@ -42,12 +42,13 @@ scored proactive trigger candidates and optional visual second opinions.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package export surface |
-| `camera_surface.py` | Debounced camera snapshot, bounded multi-person anchor surface, coarse motion, and rising-edge coarse/fine gesture event surface |
+| `camera_surface.py` | Legacy-compatible public wrapper for the debounced camera snapshot and rising-edge event surface |
+| `camera_surface_impl/` | Internal package that splits camera surface config, models, signal trackers, presence/health resolution, and gesture stabilization into reviewable modules |
 | `gesture_calibration.py` | Bounded per-symbol fine-hand calibration profile loaded from `state/mediapipe/gesture_calibration.json` |
 | `engine.py` | Stateful social-trigger scoring engine and normalized vision contract, including visible-person anchor payloads |
 | `aideck_camera_provider.py` | Bounded continuous AI-Deck still-camera provider that feeds the OpenAI proactive vision classifier from `aideck://` captures |
-| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and coarse/fine gesture output |
-| `remote_camera_provider.py` | Fetches bounded IMX500 observations from the helper Pi over the direct-link HTTP proxy and also supports a `remote_frame` mode where the main Pi runs the hot attention/gesture lifting locally from a coherent helper-side detection-plus-frame bundle |
+| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and a current-frame fast gesture snapshot for HDMI ack/wakeup |
+| `remote_camera_provider.py` | Fetches bounded IMX500 observations from the helper Pi over the direct-link HTTP proxy and also supports a `remote_frame` mode where the main Pi runs the hot attention/gesture lifting locally from a coherent helper-side detection-plus-frame bundle, keeping the user-facing gesture lane on the same current-frame fast policy |
 | `normalization.py` | Shared low-risk enum, box, and integer coercion helpers reused by `engine.py` and `camera_surface.py` |
 | `observers.py` | Audio, ReSpeaker overlay, and vision observation providers |
 | `prompting.py` | Prompt routing and evidence rendering |
@@ -74,13 +75,9 @@ decision = engine.observe(
 )
 ```
 
-For a friendlier peer-camera setup, `TwinrConfig.from_env()` now supports the
-high-level topology env pair `TWINR_CAMERA_HOST_MODE=onboard|second_pi` plus
-`TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767`. In `second_pi` mode,
-Twinr derives the still-photo snapshot proxy and defaults proactive live
-vision to `remote_frame`, where both the fast attention lane and the gesture
-lane consume one coherent helper-side detection-plus-frame bundle while still
-allowing the older low-level camera envs to override behavior explicitly.
+The productive Twinr runtime is now single-Pi only. `TwinrConfig.from_env()`
+expects the AI camera on the main Pi and fail-closes the retired helper-Pi
+camera envs instead of deriving `second_pi` / proxy behavior implicitly.
 
 For a direct Bitcraze AI-Deck camera, set `TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000`.
 When no explicit proactive provider override is set, `TwinrConfig.from_env()`

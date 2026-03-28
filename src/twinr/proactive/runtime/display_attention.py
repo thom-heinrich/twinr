@@ -289,7 +289,7 @@ class DisplayAttentionCuePublisher:
         )
         if not decision.active:
             if active_owner == self.source:
-                self.controller.clear()
+                self.controller.clear(now=effective_now)
                 return DisplayAttentionCuePublishResult(
                     action="cleared",
                     decision=decision,

@@ -24,6 +24,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - prefer explicitly remembered remote document ids on ordinary snapshot reads right after local writes, while avoiding sticky read-learned hints that could keep a fresh reader on stale snapshot documents after another runtime updates the same namespace
 - keep cold `origin_uri` resolution on a separate bounded bootstrap timeout, so startup can still recover through large historical pointer chains without stretching the hot-path exact-document timeout
 - keep fail-closed remote health/status probes on their own bounded timeout, so startup and fresh-reader attestation do not misclassify a loaded-but-live backend as down just because `/v1/external/instance` is slower than the hot-path snapshot reads
+- when `/v1/external/instance` stalls, allow one bounded synthetic `documents/full` missing-document probe to prove transport/auth liveness before the deeper readiness pass validates the real Twinr snapshot namespace
 - keep TTL-bounded in-process read-through caches for remote snapshot heads, catalog segments, search hits, and item payloads so repeated foreground recall can reuse the last proven remote state instead of rehydrating the same objects on every turn
 - build local catalog search selectors from those cached remote entries so cache-enabled foreground recall can answer the first query-specific turn without waiting on another remote full-text roundtrip
 - expose explicit payload-cache prewarm hooks so text-channel startup can front-load the first-hit object/conflict document fetches instead of making the user's first real message pay that network cost
@@ -51,6 +52,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - reject ChonkyDB bulk responses that return item-level store failures inside an HTTP-success envelope, so Twinr never treats a fast backend rejection as a durable snapshot write
 - stamp each remote `records/bulk` failure with a bounded request correlation id, batch coordinates, and request bytes, then propagate that same context into watchdog/runtime failure surfaces for Pi incident tracing
 - persist structured retrieve-search/retrieve-batch latency histograms plus explicit timeout/slow-read alert events so `/twinr` operators can see ChonkyDB read spikes without replaying raw logs
+- serialize persisted remote-read histograms behind a dedicated cross-process lock file and unique temp writes, so runtime services and live validation prompts can update observability without `.tmp` collisions or lost increments
 - preserve separate semantics for "required remote backend unavailable" versus "specific required remote read failed", and stamp fast `topk_records(scope_ref=...)` incidents with status/detail/timeout/retry evidence for Pi forensics
 - preserve restart-recall midterm packets while reflection refreshes the rest of the midterm snapshot, so confirmed/stable durable facts can survive fresh runtime roots as explicit policy context
 - preserve a small bounded set of the newest immediate turn-continuity packets across reflection refreshes, so nightly/next-day continuity prompts do not disappear just because a slower reflection pass rewrote the midterm snapshot
@@ -76,13 +78,15 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package marker and summary |
-| `store.py` | Object/conflict/archive store |
+| `store.py` | Public compatibility wrapper for `LongTermStructuredStore` |
+| `_structured_store/` | Internal split implementation modules for structured snapshot IO, mutations, ranking, and retrieval |
 | `midterm_store.py` | Midterm packet store |
 | `remote_catalog.py` | Public compatibility wrapper for the fine-grained remote object/conflict/archive catalog adapter |
 | `_remote_catalog/` | Internal split implementation modules for remote catalog caching, search, hydration, and write attestation |
+| `_remote_state/` | Internal split implementation modules for remote snapshot reads, writes, cache state, and shared value types |
 | `remote_read_diagnostics.py` | Structured ops-event diagnostics for remote long-term I/O failures and fallbacks |
 | `remote_read_observability.py` | Persisted retrieve/top-k histogram + alert helper for remote read spikes |
-| `remote_state.py` | Small remote snapshot/catalog adapter plus shared remote-read exception types |
+| `remote_state.py` | Public compatibility wrapper exporting the split remote snapshot state store and its shared read-status/failure types |
 | `component.yaml` | Structured ownership metadata |
 | `AGENTS.md` | Local editing rules |
 

@@ -4,6 +4,10 @@
 agent lanes. It is the single source of truth for full, compact, and
 realtime-safe schema variants.
 
+The public import path stays on [`contracts.py`](./contracts.py), while the
+runtime implementation lives in [`contracts_impl`](./contracts_impl/) and is
+split by concern so no single file carries the whole tool surface.
+
 ## Responsibility
 
 `schemas` owns:
@@ -34,7 +38,11 @@ realtime-safe schema variants.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Schema export surface |
-| [contracts.py](./contracts.py) | Canonical schema builders |
+| [contracts.py](./contracts.py) | Stable compatibility wrapper for the public builder imports |
+| [contracts_impl/main.py](./contracts_impl/main.py) | Canonical builder orchestration across schema families |
+| [contracts_impl/shared.py](./contracts_impl/shared.py) | Shared schema-property helpers and validation rules |
+| [contracts_impl/memory.py](./contracts_impl/memory.py) | Memory, contact, WhatsApp, and user-discovery schema builders |
+| [contracts_impl/runtime_state.py](./contracts_impl/runtime_state.py) | World-intelligence, setting, quiet-mode, and identity schema builders |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 ## Usage

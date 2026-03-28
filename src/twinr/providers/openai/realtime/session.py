@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
 import threading
+from collections.abc import Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -163,6 +165,18 @@ def _coerce_optional_int(value: Any, *, default: int | None, minimum: int) -> in
     return coerced
 
 
+def _deep_merge_dicts(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied merge where nested mappings override recursively."""
+
+    merged = copy.deepcopy(dict(base))
+    for key, value in override.items():
+        if isinstance(merged.get(key), Mapping) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 class OpenAIRealtimeSession:
     """Manage a live OpenAI realtime websocket session for Twinr.
 
@@ -180,6 +194,7 @@ class OpenAIRealtimeSession:
         client: Any | None = None,
         client_factory: Callable[[TwinrConfig], Any] | None = None,
         base_instructions: str | None = None,
+        session_defaults: Mapping[str, Any] | None = None,
         tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
     ) -> None:
         """Initialize the realtime session wrapper.
@@ -193,6 +208,9 @@ class OpenAIRealtimeSession:
                 when ``client`` is absent.
             base_instructions: Optional instruction override that replaces the
                 personality-derived base instructions.
+            session_defaults: Optional provider session fields that should be
+                merged into Twinr's baseline realtime session update before the
+                connection is configured.
             tool_handlers: Mapping from realtime tool names to handler
                 callables. Handlers may be sync, async, or return awaitables.
         """
@@ -201,6 +219,11 @@ class OpenAIRealtimeSession:
         factory = client_factory or _default_async_client_factory
         self._client = client or factory(config)
         self._base_instructions_override = base_instructions
+        self._session_defaults = (
+            copy.deepcopy(dict(session_defaults))
+            if isinstance(session_defaults, Mapping)
+            else None
+        )
         self._tool_handlers = dict(tool_handlers or {})
         self._state_lock = threading.RLock()  # AUDIT-FIX(#1): serialize lifecycle/turn operations so the sync API is safe from concurrent callers.
         self._loop: asyncio.AbstractEventLoop | None = None  # AUDIT-FIX(#1): use a dedicated background event loop instead of asyncio.Runner in the caller thread.
@@ -374,10 +397,12 @@ class OpenAIRealtimeSession:
                 },
             },
         }
+        if self._session_defaults:
+            session = _deep_merge_dicts(session, self._session_defaults)
         tools = self._session_tools()
         if tools:
             session["tools"] = tools
-            session["tool_choice"] = "auto"
+            session.setdefault("tool_choice", "auto")
         await self._await_provider(
             self._connection.session.update(session=session),
             stage="configuring realtime session",

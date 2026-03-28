@@ -18,7 +18,6 @@ from twinr.agent.personality import (
     DEFAULT_PERSONALITY_SNAPSHOT_KIND,
     ContinuityThread,
     HumorProfile,
-    INTERACTION_SIGNAL_SNAPSHOT_KIND,
     InteractionSignal,
     PersonalityLearningService,
     PersonalityDelta,
@@ -128,6 +127,7 @@ class AgentPersonalityTests(unittest.TestCase):
     def test_builder_renders_structured_personality_layers_in_expected_order(self) -> None:
         builder = PersonalityContextBuilder()
         snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T10:00:00+00:00",
             core_traits=(
                 PersonalityTrait(
                     name="attentive companion",
@@ -201,7 +201,7 @@ class AgentPersonalityTests(unittest.TestCase):
 
         self.assertEqual(
             [title for title, _content in sections],
-            ["SYSTEM", "PERSONALITY", "USER", "MINDSHARE", "CONTINUITY", "PLACE", "WORLD", "REFLECTION"],
+            ["SYSTEM", "PERSONALITY", "USER", "CONTINUITY", "PLACE", "WORLD", "REFLECTION", "MINDSHARE"],
         )
         self.assertIn("Structured core character", dict(sections)["PERSONALITY"])
         self.assertIn("Evolving conversation style", dict(sections)["PERSONALITY"])
@@ -662,6 +662,7 @@ class AgentPersonalityTests(unittest.TestCase):
                     updated_at="2026-03-21T06:35:00+00:00",
                 ),
             ),
+            max_active_actions=2,
         )
 
         policy_by_title = {policy.title: policy for policy in policies}
@@ -1389,6 +1390,7 @@ class AgentPersonalityTests(unittest.TestCase):
             now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
         )
         snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T12:00:00+00:00",
             relationship_signals=(
                 RelationshipSignal(
                     topic="old topic",
@@ -1510,6 +1512,7 @@ class AgentPersonalityTests(unittest.TestCase):
                         "place": "Hamburg",
                         "place_ref": "place:hamburg",
                         "event_domain": "civic",
+                        "support_count": 2,
                     },
                 ),
             ),
@@ -2244,19 +2247,21 @@ class AgentPersonalityTests(unittest.TestCase):
                 graph_edges=(),
             )
 
-            result = learning.record_conversation_consolidation(
+            learning.record_conversation_consolidation(
                 turn=turn,
                 consolidation=consolidation,
             )
             history = history_store.load()
             reserve_feedback = feedback_store.load_active(now=shown_at + timedelta(minutes=4))
 
-        interaction_payload = remote_state.snapshots[INTERACTION_SIGNAL_SNAPSHOT_KIND]
-        interaction_items = interaction_payload["items"]
+        interaction_items = RemoteStatePersonalityEvolutionStore().load_interaction_signals(
+            config=config,
+            remote_state=remote_state,
+        )
         self.assertTrue(
             any(
-                item["signal_kind"] == "topic_engagement"
-                and item.get("metadata", {}).get("signal_source") == "display_reserve_card"
+                item.signal_kind == "topic_engagement"
+                and item.metadata.get("signal_source") == "display_reserve_card"
                 for item in interaction_items
             )
         )

@@ -20,6 +20,7 @@ Out of scope:
 ## Invariants
 
 - `DeepgramSpeechToTextProvider` remains the only public export from this package.
+- `__init__.py` stays a thin lazy re-export surface; do not import transport modules there at package import time.
 - Batch transcription must fail with explicit runtime errors; do not hide transport or decode failures behind empty transcripts.
 - `transcribe_path()` must keep safe file handling: regular files only, no symlink traversal, deterministic descriptor cleanup.
 - Streaming sessions must stay bounded: backpressure, finalize waits, and keepalive behavior must not become unbounded.

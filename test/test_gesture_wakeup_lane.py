@@ -18,6 +18,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
@@ -25,6 +26,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
@@ -43,6 +45,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.95,
                 ),
@@ -60,6 +63,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
@@ -67,6 +71,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             second = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
@@ -74,6 +79,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             third = lane.observe(
                 observed_at=11.4,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.91,
                 ),
@@ -94,6 +100,7 @@ class GestureWakeupLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.95,
                 ),
@@ -101,6 +108,22 @@ class GestureWakeupLaneTests(unittest.TestCase):
 
         self.assertFalse(decision.active)
         self.assertEqual(decision.reason, "gesture_wakeup_disabled")
+
+    def test_lane_rejects_trigger_without_current_hand_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureWakeupLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                    fine_hand_gesture_confidence=0.95,
+                    hand_or_object_near_camera=False,
+                ),
+            )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "no_gesture_wakeup_candidate")
 
 
 if __name__ == "__main__":

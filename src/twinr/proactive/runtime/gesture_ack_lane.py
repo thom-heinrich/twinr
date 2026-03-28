@@ -158,6 +158,8 @@ class GestureAckLane:
         self,
         observation: SocialVisionObservation,
     ) -> _GestureCandidate | None:
+        if not observation.hand_or_object_near_camera:
+            return None
         if observation.gesture_event in _SUPPORTED_COARSE_GESTURES:
             confidence = _coerce_confidence(observation.gesture_confidence)
             if confidence >= 0.68:

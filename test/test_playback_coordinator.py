@@ -66,6 +66,52 @@ class _PCMChunkPlayer:
         self.stop_calls += 1
 
 
+class _InterruptingPCMPlayer:
+    def __init__(self) -> None:
+        self.played: list[bytes] = []
+        self.feedback_started = Event()
+        self.stop_calls = 0
+        self._stop_current = Event()
+
+    def play_pcm16_chunks(self, chunks, *, sample_rate: int, channels: int = 1, should_stop=None) -> None:
+        del sample_rate, channels
+        payload = bytearray()
+        first_chunk: bytes | None = None
+        stop_current = Event()
+        self._stop_current = stop_current
+        for chunk in chunks:
+            chunk_bytes = bytes(chunk)
+            if first_chunk is None:
+                first_chunk = chunk_bytes
+                if first_chunk.startswith(b"FEED"):
+                    self.feedback_started.set()
+            payload.extend(chunk_bytes)
+            if first_chunk is not None and first_chunk.startswith(b"FEED"):
+                while not stop_current.is_set():
+                    if callable(should_stop) and should_stop():
+                        break
+                    time.sleep(0.005)
+                raise RuntimeError(
+                    "Audio playback failed: aplay: pcm_write:2127: write error: Interrupted system call"
+                )
+        self.played.append(bytes(payload))
+
+    def stop_playback(self) -> None:
+        self.stop_calls += 1
+        self._stop_current.set()
+
+
+class _CoordinatorRequestDouble:
+    def __init__(self, *, owner: str, priority: int, stop) -> None:
+        self.owner = owner
+        self.priority = priority
+        self.atomic = False
+        self.done = Event()
+        self.cancel_reason: str | None = None
+        self.cancel_event = Event()
+        self.stop = stop
+
+
 class PlaybackCoordinatorTests(unittest.TestCase):
     def test_higher_priority_request_preempts_active_feedback(self) -> None:
         player = _BlockingTonePlayer()
@@ -140,25 +186,60 @@ class PlaybackCoordinatorTests(unittest.TestCase):
         self.assertFalse(result.preempted)
         self.assertGreaterEqual(result.runtime_ms, 0.0)
 
+    def test_preempted_pcm_stop_error_returns_preempted_result(self) -> None:
+        player = _InterruptingPCMPlayer()
+        coordinator = PlaybackCoordinator(player)
+        results: list[object] = []
+
+        def run_feedback() -> None:
+            results.append(
+                coordinator.play_pcm16_chunks(
+                    owner="feedback",
+                    priority=PlaybackPriority.FEEDBACK,
+                    chunks=iter((b"FEED-1", b"FEED-2")),
+                    sample_rate=24000,
+                    channels=1,
+                )
+            )
+
+        thread = Thread(target=run_feedback, daemon=True)
+        thread.start()
+        self.assertTrue(player.feedback_started.wait(timeout=1.0))
+
+        speech_result = coordinator.play_pcm16_chunks(
+            owner="speech",
+            priority=PlaybackPriority.SPEECH,
+            chunks=iter((b"SPEAK-1",)),
+            sample_rate=24000,
+            channels=1,
+        )
+        thread.join(timeout=1.0)
+        coordinator.close(timeout_s=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(player.stop_calls, 1)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].preempted)
+        self.assertFalse(speech_result.preempted)
+        self.assertIn(b"SPEAK-1", player.played)
+
     def test_bound_preemption_callback_does_not_stop_replacement_request(self) -> None:
         player = _ChunkPlayer()
         coordinator = PlaybackCoordinator(player)
-        current = coordinator._current = type("_Req", (), {})()
-        current.owner = "feedback"
-        current.priority = int(PlaybackPriority.FEEDBACK)
-        current.atomic = False
-        current.cancel_event = Event()
-        current.stop = player.stop_playback
+        current = coordinator._current = _CoordinatorRequestDouble(
+            owner="feedback",
+            priority=int(PlaybackPriority.FEEDBACK),
+            stop=player.stop_playback,
+        )
         current.cancel_event.set()
 
         with coordinator._condition:
             stop_callback = coordinator._build_bound_stop_callback_locked(current)
-            replacement = type("_Req", (), {})()
-            replacement.owner = "speech"
-            replacement.priority = int(PlaybackPriority.SPEECH)
-            replacement.atomic = False
-            replacement.cancel_event = Event()
-            replacement.stop = player.stop_playback
+            replacement = _CoordinatorRequestDouble(
+                owner="speech",
+                priority=int(PlaybackPriority.SPEECH),
+                stop=player.stop_playback,
+            )
             coordinator._current = replacement
 
         stop_callback()
@@ -170,12 +251,11 @@ class PlaybackCoordinatorTests(unittest.TestCase):
     def test_bound_preemption_callback_stops_original_request_when_still_current(self) -> None:
         player = _ChunkPlayer()
         coordinator = PlaybackCoordinator(player)
-        current = coordinator._current = type("_Req", (), {})()
-        current.owner = "feedback"
-        current.priority = int(PlaybackPriority.FEEDBACK)
-        current.atomic = False
-        current.cancel_event = Event()
-        current.stop = player.stop_playback
+        current = coordinator._current = _CoordinatorRequestDouble(
+            owner="feedback",
+            priority=int(PlaybackPriority.FEEDBACK),
+            stop=player.stop_playback,
+        )
         current.cancel_event.set()
 
         with coordinator._condition:
@@ -190,12 +270,11 @@ class PlaybackCoordinatorTests(unittest.TestCase):
     def test_stop_owner_only_stops_matching_active_request(self) -> None:
         player = _ChunkPlayer()
         coordinator = PlaybackCoordinator(player)
-        current = coordinator._current = type("_Req", (), {})()
-        current.owner = "feedback"
-        current.priority = int(PlaybackPriority.FEEDBACK)
-        current.atomic = False
-        current.cancel_event = Event()
-        current.stop = player.stop_playback
+        coordinator._current = _CoordinatorRequestDouble(
+            owner="feedback",
+            priority=int(PlaybackPriority.FEEDBACK),
+            stop=player.stop_playback,
+        )
 
         coordinator.stop_owner("speech")
         stop_calls_after_miss = player.stop_calls

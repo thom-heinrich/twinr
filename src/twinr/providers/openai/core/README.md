@@ -1,9 +1,12 @@
 # core
 
 `core` owns the shared OpenAI provider primitives reused across Twinr's API,
-capability, and realtime layers. It centralizes client construction, request
-assembly helpers, validated instruction constants, and the canonical response
-and image dataclasses consumed by higher OpenAI packages.
+capability, and realtime layers. Its package root re-exports shared client
+helpers and value types lazily so probes can inspect the package without
+eagerly importing SDK wiring or dataclass helpers. It centralizes client
+construction, request assembly helpers, validated instruction constants, and
+the canonical response and image dataclasses consumed by higher OpenAI
+packages.
 
 ## Responsibility
 
@@ -22,7 +25,7 @@ and image dataclasses consumed by higher OpenAI packages.
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Shared package exports |
+| [__init__.py](./__init__.py) | Lazy shared package exports |
 | [base.py](./base.py) | Request-building backend base |
 | [client.py](./client.py) | SDK client factory |
 | [instructions.py](./instructions.py) | Prompt constants and fallbacks |

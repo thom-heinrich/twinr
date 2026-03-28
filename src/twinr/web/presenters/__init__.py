@@ -37,7 +37,13 @@ from twinr.web.presenters.integrations import (
     _smart_home_integration_sections,
     _whatsapp_integration_context,
 )
-from twinr.web.presenters.memory import _memory_sections
+from twinr.web.presenters.memory import (
+    _memory_sections,
+    build_activity_advanced_metrics,
+    build_activity_overview_cards,
+    build_activity_snapshot_metrics,
+    build_memory_section_groups,
+)
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _health_card_detail
 from twinr.web.presenters.shell import (
     _nav_items,
@@ -51,7 +57,12 @@ from twinr.web.presenters.social_history import (
     _social_history_learning_panel,
     _social_history_learning_sections,
 )
-from twinr.web.presenters.settings import _adaptive_timing_view, _settings_sections
+from twinr.web.presenters.settings import (
+    _adaptive_timing_view,
+    _settings_sections,
+    build_settings_overview_cards,
+    build_settings_section_groups,
+)
 from twinr.web.presenters.voice import (
     _capture_voice_profile_sample,
     _voice_action_result,
@@ -94,9 +105,15 @@ __all__ = [
     "_social_history_learning_panel",
     "_social_history_learning_sections",
     "_whatsapp_integration_context",
+    "build_activity_advanced_metrics",
+    "build_activity_overview_cards",
+    "build_activity_snapshot_metrics",
     "build_advanced_hub_page_context",
     "build_home_destination_cards",
+    "build_memory_section_groups",
     "build_settings_shortcut_cards",
+    "build_settings_overview_cards",
+    "build_settings_section_groups",
     "build_ops_debug_page_context",
     "build_self_coding_ops_page_context",
     "build_whatsapp_wizard_page_context",

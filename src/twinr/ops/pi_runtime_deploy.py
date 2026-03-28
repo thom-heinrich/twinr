@@ -24,14 +24,17 @@ from typing import Any, Protocol, Sequence
 from twinr.ops.pi_repo_mirror import PiRepoMirrorCycleResult, PiRepoMirrorWatchdog
 from twinr.ops.pi_runtime_deploy_remote import (
     PiRemoteExecutor as _PiRemoteExecutor,
+    PiPythonImportContractResult,
     PiSyncedFileResult,
     PiSystemdServiceState,
     install_browser_automation_runtime_support as _install_browser_automation_runtime_support,
     install_editable_package as _install_editable_package,
+    install_python_requirements_manifest as _install_python_requirements_manifest,
     install_service_units as _install_service_units,
     restart_services as _restart_services,
     run_env_contract_probe as _run_env_contract_probe,
     sync_authoritative_file as _sync_authoritative_file,
+    verify_python_import_contract as _verify_python_import_contract,
     wait_for_services as _wait_for_services,
 )
 from twinr.ops.self_coding_pi import load_pi_connection_settings
@@ -45,6 +48,27 @@ DEFAULT_DEPLOY_SERVICES: tuple[str, ...] = (
 )
 _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS = Path("browser_automation/runtime_requirements.txt")
 _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS = Path("browser_automation/playwright_browsers.txt")
+_PI_RUNTIME_REQUIREMENTS = Path("hardware/ops/pi_runtime_requirements.txt")
+_PI_RUNTIME_IMPORT_MODULES: tuple[str, ...] = (
+    "dateutil",
+    "markupsafe",
+    "starlette",
+    "pydantic",
+    "pydantic_core",
+    "urllib3",
+    "gpiod",
+    "lgpio",
+    "pigpio",
+    "rapidfuzz",
+    "wcwidth",
+    "onnx",
+    "msgspec",
+    "orjson",
+    "portalocker",
+    "zstandard",
+    "h2",
+    "opentelemetry.trace",
+)
 
 
 class _MirrorWatchdog(Protocol):
@@ -73,6 +97,7 @@ class PiRuntimeDeployResult:
     installed_units: tuple[str, ...]
     restarted_services: tuple[str, ...]
     service_states: tuple[PiSystemdServiceState, ...]
+    import_contract: PiPythonImportContractResult | None
     env_contract: dict[str, object] | None
     duration_s: float
 
@@ -143,6 +168,10 @@ def deploy_pi_runtime(
         subprocess_runner: Injectable subprocess runner for tests.
         mirror_watchdog: Optional prebuilt mirror watchdog for tests.
 
+        The deploy also runs a fixed remote import contract against the
+        preserved Pi venv so critical direct-import modules must remain
+        importable under ``/twinr/.venv/bin/python`` after every rollout.
+
     Returns:
         A structured deploy result for operator logging and script output.
 
@@ -172,6 +201,9 @@ def deploy_pi_runtime(
     )
     install_playwright_browsers = _has_nonempty_local_file(
         resolved_root / _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS
+    )
+    install_pi_runtime_requirements = _has_nonempty_local_file(
+        resolved_root / _PI_RUNTIME_REQUIREMENTS
     )
 
     remote = _PiRemoteExecutor(
@@ -222,6 +254,21 @@ def deploy_pi_runtime(
                 install_with_deps=install_with_deps,
             ),
         )
+        if install_pi_runtime_requirements:
+            pi_runtime_requirements_summary = _run_phase(
+                "pi_runtime_requirements",
+                lambda: _install_python_requirements_manifest(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    manifest_relpath=_PI_RUNTIME_REQUIREMENTS.as_posix(),
+                    label="pi_runtime",
+                ),
+            )
+            editable_install_summary = "\n".join(
+                part
+                for part in (editable_install_summary, pi_runtime_requirements_summary)
+                if part and part.strip()
+            )
         if install_browser_requirements or install_playwright_browsers:
             _run_phase(
                 "browser_automation_runtime",
@@ -232,6 +279,15 @@ def deploy_pi_runtime(
                     install_playwright_browsers=install_playwright_browsers,
                 ),
             )
+
+    import_contract_result = _run_phase(
+        "python_import_contract",
+        lambda: _verify_python_import_contract(
+            remote=remote,
+            remote_python=f"{resolved_remote_root}/.venv/bin/python",
+            modules=_PI_RUNTIME_IMPORT_MODULES,
+        ),
+    )
 
     if install_systemd_units:
         _run_phase(
@@ -283,6 +339,7 @@ def deploy_pi_runtime(
         installed_units=normalized_services if install_systemd_units else (),
         restarted_services=normalized_services,
         service_states=service_states,
+        import_contract=import_contract_result,
         env_contract=env_contract_result,
         duration_s=round(time.monotonic() - started, 3),
     )
@@ -532,6 +589,7 @@ def _is_enabled_unit_file_state(state: str) -> bool:
 __all__ = [
     "DEFAULT_DEPLOY_SERVICES",
     "PiRuntimeDeployError",
+    "PiPythonImportContractResult",
     "PiRuntimeDeployResult",
     "PiSyncedFileResult",
     "PiSystemdServiceState",

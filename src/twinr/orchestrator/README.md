@@ -48,7 +48,8 @@ contracts used by the Alexa-like hybrid voice path.
 | [voice_contracts.py](./voice_contracts.py) | Streaming voice websocket contracts |
 | [voice_runtime_intent.py](./voice_runtime_intent.py) | Compact person-state projection for voice-gateway bias |
 | [voice_client.py](./voice_client.py) | Blocking client for the voice websocket |
-| [voice_session.py](./voice_session.py) | Server-side wake/follow-up/barge-in session |
+| [voice_session.py](./voice_session.py) | Stable compatibility wrapper for the server-side voice-session import surface |
+| [voice_session_impl/](./voice_session_impl/) | Internal package split across runtime-state handling, observability, backend requests, and utterance scanning |
 | [acks.py](./acks.py) | Ack phrase ID map |
 | [component.yaml](./component.yaml) | Structured package metadata |
 

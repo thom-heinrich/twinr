@@ -1,8 +1,10 @@
 # groq
 
-`groq` owns Twinr's Groq-specific text and tool-calling adapters. It validates
-Groq client configuration, translates Twinr conversation state into Groq chat
-completion requests, and preserves continuation state across tool turns.
+`groq` owns Twinr's Groq-specific text and tool-calling adapters. Its package
+root re-exports the public providers lazily so import probes do not pull the
+adapter stack until a caller requests it. The package validates Groq client
+configuration, translates Twinr conversation state into Groq chat completion
+requests, and preserves continuation state across tool turns.
 
 ## Responsibility
 
@@ -20,7 +22,7 @@ completion requests, and preserves continuation state across tool turns.
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Public package exports |
+| [__init__.py](./__init__.py) | Lazy public package exports |
 | [adapters.py](./adapters.py) | Text and tool provider logic |
 | [client.py](./client.py) | Validated SDK client builder |
 | [types.py](./types.py) | Response value object |

@@ -22,9 +22,25 @@ files:
   - path: __init__.py
     role: Package marker and local summary
   - path: store.py
-    role: Durable object, conflict, and archive snapshot store
+    role: Public compatibility wrapper for the split structured object/conflict/archive store
     exports:
       - LongTermStructuredStore
+  - path: _structured_store/__init__.py
+    role: Internal package exports for the split structured store implementation
+  - path: _structured_store/base.py
+    role: Small structured-store base class that composes focused mixins
+  - path: _structured_store/shared.py
+    role: Shared constants and helper functions for structured snapshot persistence
+  - path: _structured_store/snapshots.py
+    role: Local/remote snapshot IO, validation, and remote mirroring helpers
+  - path: _structured_store/remote_select.py
+    role: Remote-first episodic/object/conflict selector helpers
+  - path: _structured_store/mutations.py
+    role: Snapshot mutation, review, and write orchestration helpers
+  - path: _structured_store/retrieval.py
+    role: Retrieval entrypoints and shared context-object selection helpers
+  - path: _structured_store/query.py
+    role: Shared payload parsing, merge, ranking, and query-overlap helpers
   - path: midterm_store.py
     role: Midterm packet snapshot store
     exports:
@@ -49,10 +65,24 @@ files:
     role: Structured ops diagnostics for remote long-term I/O failures and fallbacks
   - path: remote_read_observability.py
     role: Persisted retrieve latency histograms and explicit remote-read alert policy
+  - path: _remote_state/__init__.py
+    role: Internal package exports for the split remote-state implementation
+  - path: _remote_state/base.py
+    role: Small remote-state base class that composes focused read/write/state mixins
+  - path: _remote_state/shared.py
+    role: Shared remote-state constants, helper functions, and public value types
+  - path: _remote_state/state.py
+    role: Remote-state config, readiness, cache, hint persistence, and local-fallback helpers
+  - path: _remote_state/reads.py
+    role: Remote snapshot read, probe, pointer-resolution, and diagnostics helpers
+  - path: _remote_state/writes.py
+    role: Remote snapshot writes, async job resolution, and readback-attestation helpers
   - path: remote_state.py
-    role: Small remote snapshot/catalog adapter and status types
+    role: Public compatibility wrapper for the split remote snapshot state store
     exports:
+      - LongTermRemoteFetchAttempt
       - LongTermRemoteReadFailedError
+      - LongTermRemoteSnapshotProbe
       - LongTermRemoteStateStore
       - LongTermRemoteStatus
       - LongTermRemoteUnavailableError

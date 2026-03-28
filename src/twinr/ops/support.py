@@ -6,6 +6,7 @@ health snapshots, and recent self-test artifacts into a bounded ZIP export.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ import os
 import re
 import stat
 import tempfile
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeGuard, TypeVar
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -139,7 +140,7 @@ def build_support_bundle(
         generation_errors["env_file"] = env_error
     redacted_env = redact_env_values(env_values)
 
-    checks = _collect_or_default(
+    checks: list[object] = _collect_or_default(
         "config_checks",
         lambda: list(run_config_checks(config)),
         [],
@@ -200,7 +201,7 @@ def build_support_bundle(
             generation_errors,
         )  # AUDIT-FIX(#4): Recent usage export should not take down the whole bundle.
 
-    health_payload = _collect_or_default(
+    health_payload: object = _collect_or_default(
         "system_health",
         lambda: collect_system_health(config),
         {},
@@ -319,7 +320,18 @@ def _read_json(path: Path) -> tuple[object | None, str | None]:
 
 
 def _redact_runtime_snapshot_payload(payload: object | None) -> object | None:
-    return _redact_nested_payload(payload)  # AUDIT-FIX(#2): Recursively remove nested privacy-sensitive runtime fields instead of only stripping three top-level keys.
+    return _redact_nested_payload(
+        _unwrap_runtime_snapshot_payload(payload)
+    )  # AUDIT-FIX(#2): Redact the logical snapshot payload even when the on-disk file uses the schema-v2 integrity envelope.
+
+
+def _unwrap_runtime_snapshot_payload(payload: object | None) -> object | None:
+    if not isinstance(payload, Mapping):
+        return payload
+    nested_payload = payload.get("payload")
+    if payload.get("format") == "twinr.runtime_snapshot" and isinstance(nested_payload, Mapping):
+        return nested_payload
+    return payload
 
 
 def _latest_self_test_artifacts(root: Path, *, limit: int = 4) -> tuple[Path, ...]:
@@ -591,6 +603,12 @@ def _json_text(payload: object) -> str:
     ) + "\n"
 
 
+def _is_dataclass_instance(value: object) -> TypeGuard[Any]:
+    """Return whether ``value`` is a dataclass instance, not a dataclass type."""
+
+    return is_dataclass(value) and not isinstance(value, type)
+
+
 def _coerce_for_json(value: object) -> object:
     try:
         to_dict = getattr(value, "to_dict", None)
@@ -601,7 +619,7 @@ def _coerce_for_json(value: object) -> object:
             return _coerce_for_json(to_dict())
         except Exception:
             return str(value)
-    if is_dataclass(value):
+    if _is_dataclass_instance(value):
         try:
             return _coerce_for_json(asdict(value))
         except Exception:

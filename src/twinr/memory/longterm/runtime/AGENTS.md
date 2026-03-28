@@ -13,7 +13,18 @@ Out of scope:
 
 ## Key files
 
-- `service.py` — runtime orchestration entrypoint; keep deep business logic in owned subpackages
+- `service.py` — compatibility shim that preserves the historic import path and delegates to `service_impl/`
+- `service_impl/compat.py` — shared helper functions, limits, logger, and readiness dataclasses extracted from the old monolith
+- `service_impl/main.py` — `LongTermMemoryService` dataclass and inherited method surface
+- `service_impl/builder.py` — service assembly and bounded writer construction
+- `service_impl/readiness.py` — required-remote readiness probes and remote-state cache helpers
+- `service_impl/context.py` — provider-context assembly for normal, fast, and tool-facing retrieval
+- `service_impl/ingestion.py` — enqueue/import paths and dry-run analysis entry points
+- `service_impl/maintenance.py` — reflection, sensor-memory, backfill, and retention orchestration
+- `service_impl/proactive.py` — proactive planning and reservation state transitions
+- `service_impl/mutations.py` — conflict resolution, review, and prompt-context mutation entry points
+- `service_impl/lifecycle.py` — flush and shutdown orchestration for bounded background writers
+- `service_impl/persistence.py` — static persistence helpers and multimodal/ops payload sanitization
 - `worker.py` — bounded async persistence workers with exact drain/error tracking
 - `flush_budget.py` — deterministic total-deadline planner for multi-writer flush orchestration
 - `health.py` — remote snapshot readiness probe; no production state mutation here
@@ -22,6 +33,7 @@ Out of scope:
 ## Invariants
 
 - `service.py` stays orchestration-focused. New extraction, reasoning, storage, or policy logic belongs in the package that already owns that concern.
+- `service.py` stays a thin compatibility shim. New runtime logic belongs in the appropriate `service_impl/*.py` module instead of growing the shim again.
 - Shared `_store_lock` serialization is reserved for object/graph/midterm mutation paths that truly share those stores. Prompt-context mutations keep their own store-local locking and must not wait behind unrelated background multimodal or turn persistence.
 - Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
 - Foreground runtime turn-finalization paths must only queue tool-history learning and must not reacquire the shared long-term store lock for that queue step; any expensive remote-primary personality commit belongs to the later bounded persistence/flush path, not the answer-finalization hot path.
@@ -51,6 +63,7 @@ PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal
 ## Coupling
 
 `service.py` changes -> also check:
+- `service_impl/`
 - `src/twinr/memory/longterm/ingestion/`
 - `src/twinr/memory/longterm/reasoning/`
 - `src/twinr/memory/longterm/proactive/`

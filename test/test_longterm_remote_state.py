@@ -3683,6 +3683,48 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertTrue(status.ready)
         self.assertEqual(opener.calls[0]["timeout"], 20.0)
 
+    def test_status_uses_document_liveness_probe_when_instance_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            opener = FakeOpener()
+            opener.queue_exception(socket.timeout("instance slow"))
+            opener.queue_http_error(404, {"detail": "document_not_found"})
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+                chonkydb_base_url="https://memory.test",
+                chonkydb_api_key="secret-key",
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(
+                        base_url="https://memory.test",
+                        api_key="secret-key",
+                        timeout_s=8.0,
+                    ),
+                    opener=opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            status = state.status()
+
+        self.assertTrue(status.ready)
+        self.assertIsNone(status.detail)
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(opener.calls[0]["timeout"], 20.0)
+        self.assertEqual(opener.calls[1]["timeout"], 20.0)
+        self.assertIn("/v1/external/instance", str(opener.calls[0]["full_url"]))
+        self.assertIn("/v1/external/documents/full", str(opener.calls[1]["full_url"]))
+        self.assertIn("origin_uri=__status_probe__%3Aremote_status", str(opener.calls[1]["full_url"]))
+
     def test_attest_external_readiness_clears_local_cooldown_and_probe_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = LongTermRemoteStateStore(config=self._config(temp_dir))

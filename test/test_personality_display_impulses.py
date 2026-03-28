@@ -57,7 +57,8 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
 
         self.assertTrue(candidates)
         first = candidates[0]
-        self.assertEqual(first.topic_key, "ai companions")
+        self.assertEqual(first.semantic_topic_key, "memory_thread::ai companions")
+        self.assertTrue(first.topic_key.startswith("continuity::memory_thread::ai companions::"))
         self.assertIn(first.action, {"ask_one", "invite_follow_up"})
         self.assertEqual(first.accent, "warm")
         self.assertEqual(first.eyebrow, "")
@@ -65,7 +66,7 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
         self.assertTrue(first.body)
         self.assertIsNotNone(first.generation_context)
         assert first.generation_context is not None
-        self.assertEqual(first.generation_context.get("candidate_family"), "mindshare")
+        self.assertEqual(first.generation_context.get("candidate_family"), "memory_thread")
         self.assertEqual(
             first.generation_context.get("card_intent"),
             {

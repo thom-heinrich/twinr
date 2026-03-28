@@ -42,6 +42,7 @@ DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
     "/.venv/",
     "/.env",
     "/.env.pi",
+    "/.cache/",
     "/.codex/",
     "/.pytest_cache/",
     "/.mypy_cache/",
@@ -56,6 +57,7 @@ DEFAULT_IGNORED_PATTERNS: tuple[str, ...] = (
     "**/__pycache__/",
     "**/*.pyc",
     "**/*.pyo",
+    "**/*.egg-info/",
     "**/node_modules/",
     "**/browser_automation/artifacts/",
 )
@@ -184,7 +186,9 @@ class PiRepoMirrorWatchdog:
         """Run one drift probe and optionally heal the Pi checkout.
 
         By default this compares file contents via ``rsync --checksum`` so a
-        same-size, same-mtime drift cannot be misclassified as clean.
+        same-size, same-mtime drift cannot be misclassified as clean. When the
+        source tree changes during a healing sync, the watchdog retries one
+        extra sync+verify pass before reporting non-convergence.
         """
 
         if max_change_lines <= 0:
@@ -200,7 +204,7 @@ class PiRepoMirrorWatchdog:
         elif self.verify_with_checksum_on_sync:
             verification_changes = self._run_rsync(dry_run=True, checksum=True)
             if verification_changes:
-                verification_changes = self._recover_from_cache_only_directory_drift(
+                verification_changes = self._recover_from_post_sync_drift(
                     verification_changes,
                     checksum=checksum,
                 )
@@ -225,6 +229,29 @@ class PiRepoMirrorWatchdog:
             sampled_change_lines=tuple(change_lines[:max_change_lines]),
             duration_s=duration_s,
         )
+
+    def _recover_from_post_sync_drift(
+        self,
+        verification_changes: list[str],
+        *,
+        checksum: bool,
+    ) -> list[str]:
+        """Try bounded recovery before failing a post-sync verification.
+
+        First handle the known cache-only delete case. If drift still remains,
+        run one extra sync+verify pass so a shared-worktree source update that
+        landed between the first sync and the checksum audit can converge
+        without making operators rerun the whole deploy manually.
+        """
+
+        remaining_changes = self._recover_from_cache_only_directory_drift(
+            verification_changes,
+            checksum=checksum,
+        )
+        if not remaining_changes:
+            return remaining_changes
+        self._run_rsync(dry_run=False, checksum=checksum)
+        return self._run_rsync(dry_run=True, checksum=True)
 
     def run(
         self,

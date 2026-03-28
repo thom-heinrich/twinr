@@ -2,187 +2,113 @@
 {% from "_form_fields.html" import render_setting_field %}
 
 {% block content %}
+{% if overview_cards %}
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>Live memory snapshot</h2>
-      <p class="section-description">This is the current structured memory state from the active Twinr runtime process.</p>
+      <h2>Start here</h2>
+      <p class="section-description">The everyday path is current context first, then reminders and saved memories. Deeper runtime traces stay grouped at the end.</p>
     </div>
   </div>
-  <div class="stats-grid">
-    <div class="stat-tile">
-      <span class="stat-label">Status</span>
-      <span class="stat-value">{{ snapshot.status }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Context turns</span>
-      <span class="stat-value">{{ snapshot.memory_count }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Last transcript</span>
-      <span class="stat-value stat-value-small">{{ snapshot.last_transcript or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Updated</span>
-      <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Raw tail</span>
-      <span class="stat-value">{{ snapshot.memory_raw_tail|length }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Ledger</span>
-      <span class="stat-value">{{ snapshot.memory_ledger|length }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Search results</span>
-      <span class="stat-value">{{ snapshot.memory_search_results|length }}</span>
-    </div>
-  </div>
+  <section class="card-grid">
+    {% for card in overview_cards %}
+    <a class="card" href="{{ card.href }}">
+      <div class="card-title">{{ card.title }}</div>
+      <div class="card-value">{{ card.value }}</div>
+      <div class="card-detail">{{ card.detail }}</div>
+    </a>
+    {% endfor %}
+  </section>
+</section>
+{% endif %}
 
+<section class="panel" id="current-context">
   <div class="section-header">
     <div>
-      <h2>Memory state</h2>
-      <p class="section-description">Compact state fields drive the next turn without replaying the full conversation.</p>
+      <h2>Current conversation context</h2>
+      <p class="section-description">This is what Twinr is carrying into the next reply right now.</p>
     </div>
+    <span class="status-pill is-muted">{{ snapshot.status }}</span>
   </div>
-  <div class="stats-grid">
-    <div class="stat-tile">
-      <span class="stat-label">Active topic</span>
-      <span class="stat-value stat-value-small">{{ snapshot.memory_state.active_topic or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Last user goal</span>
-      <span class="stat-value stat-value-small">{{ snapshot.memory_state.last_user_goal or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Pending printable</span>
-      <span class="stat-value stat-value-small">{{ snapshot.memory_state.pending_printable or "—" }}</span>
-    </div>
-    <div class="stat-tile">
-      <span class="stat-label">Last search summary</span>
-      <span class="stat-value stat-value-small">{{ snapshot.memory_state.last_search_summary or "—" }}</span>
-    </div>
-  </div>
-  <div class="memory-list">
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <span class="role-badge role-system">open_loops</span>
-      </div>
-      <div class="memory-content">
-        {% if snapshot.memory_state.open_loops %}
-        {{ snapshot.memory_state.open_loops|join(" | ") }}
-        {% else %}
-        —
-        {% endif %}
-      </div>
-    </article>
-  </div>
-
-  <div class="section-header">
-    <div>
-      <h2>Context sent to the model</h2>
-      <p class="section-description">This is the compacted view Twinr currently replays into the next turn.</p>
-    </div>
-  </div>
-  {% if snapshot.memory_turns %}
-  <div class="memory-list">
-    {% for turn in snapshot.memory_turns %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
-        <span class="memory-time">{{ turn.created_at }}</span>
-      </div>
-      <div class="memory-content">{{ turn.content }}</div>
+  <div class="detail-grid">
+    {% for metric in snapshot_metrics %}
+    <article class="detail-card">
+      <div class="detail-label">{{ metric.label }}</div>
+      <div class="detail-body-copy">{{ metric.value }}</div>
+      <div class="field-help">{{ metric.detail }}</div>
     </article>
     {% endfor %}
   </div>
-  {% else %}
-  <div class="empty-state">No context turns are stored yet. Start a conversation and refresh this page.</div>
-  {% endif %}
 
-  <div class="section-header">
-    <div>
-      <h2>Raw tail</h2>
-      <p class="section-description">Most recent verbatim turns kept before compaction.</p>
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">What Twinr is carrying forward</h3>
+    <div class="detail-grid">
+      <article class="detail-card">
+        <div class="detail-label">Active topic</div>
+        <div class="detail-body-copy">{{ snapshot.memory_state.active_topic or "—" }}</div>
+        <div class="field-help">Short current topic label from the structured memory state.</div>
+      </article>
+      <article class="detail-card">
+        <div class="detail-label">Last user goal</div>
+        <div class="detail-body-copy">{{ snapshot.memory_state.last_user_goal or "—" }}</div>
+        <div class="field-help">Best current guess of what the user wanted to achieve.</div>
+      </article>
+      <article class="detail-card">
+        <div class="detail-label">Pending printable</div>
+        <div class="detail-body-copy">{{ snapshot.memory_state.pending_printable or "—" }}</div>
+        <div class="field-help">Short printable item the runtime is still carrying for later output.</div>
+      </article>
+      <article class="detail-card">
+        <div class="detail-label">Last search summary</div>
+        <div class="detail-body-copy">{{ snapshot.memory_state.last_search_summary or "—" }}</div>
+        <div class="field-help">Compact summary from the last verified web lookup kept in memory state.</div>
+      </article>
+    </div>
+    <div class="panel-subsection">
+      <h3 class="subsection-title">Open loops</h3>
+      {% if snapshot.memory_state.open_loops %}
+      <div class="memory-list">
+        <article class="memory-turn">
+          <div class="memory-turn-meta">
+            <span class="role-badge role-system">open loops</span>
+          </div>
+          <div class="memory-content">{{ snapshot.memory_state.open_loops|join(" | ") }}</div>
+        </article>
+      </div>
+      {% else %}
+      <div class="empty-state">No open loops are stored right now.</div>
+      {% endif %}
     </div>
   </div>
-  {% if snapshot.memory_raw_tail %}
-  <div class="memory-list">
-    {% for turn in snapshot.memory_raw_tail %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
-        <span class="memory-time">{{ turn.created_at }}</span>
-      </div>
-      <div class="memory-content">{{ turn.content }}</div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">No raw-tail turns are stored yet.</div>
-  {% endif %}
 
-  <div class="section-header">
-    <div>
-      <h2>Ledger</h2>
-      <p class="section-description">Compacted facts and summaries that survive tail compaction.</p>
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">Context sent to the next reply</h3>
+    <p class="section-description">This compacted view is what Twinr currently replays into the next turn.</p>
+    {% if snapshot.memory_turns %}
+    <div class="memory-list">
+      {% for turn in snapshot.memory_turns %}
+      <article class="memory-turn">
+        <div class="memory-turn-meta">
+          <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
+          <span class="memory-time">{{ turn.created_at }}</span>
+        </div>
+        <div class="memory-content">{{ turn.content }}</div>
+      </article>
+      {% endfor %}
     </div>
+    {% else %}
+    <div class="empty-state">No context turns are stored yet. Start a conversation and refresh this page.</div>
+    {% endif %}
   </div>
-  {% if snapshot.memory_ledger %}
-  <div class="memory-list">
-    {% for item in snapshot.memory_ledger %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <span class="role-badge role-system">{{ item.kind }}</span>
-        <span class="memory-time">{{ item.created_at }}</span>
-      </div>
-      <div class="memory-content">{{ item.content }}</div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">No ledger entries are stored yet.</div>
-  {% endif %}
-
-  <div class="section-header">
-    <div>
-      <h2>Recent search results</h2>
-      <p class="section-description">Typed web lookups preserved for later turns, printing, and operator inspection.</p>
-    </div>
-  </div>
-  {% if snapshot.memory_search_results %}
-  <div class="memory-list">
-    {% for item in snapshot.memory_search_results %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <span class="role-badge role-system">search</span>
-        <span class="memory-time">{{ item.created_at }}</span>
-      </div>
-      <div class="memory-content">
-        <strong>Question:</strong> {{ item.question }}<br>
-        <strong>Answer:</strong> {{ item.answer }}<br>
-        <strong>Sources:</strong>
-        {% if item.sources %}
-        {{ item.sources|join(", ") }}
-        {% else %}
-        —
-        {% endif %}
-      </div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">No search results are stored yet.</div>
-  {% endif %}
 </section>
 
-<section class="panel">
+<section class="panel" id="reminders">
   <div class="section-header">
     <div>
-      <h2>Scheduled reminders</h2>
+      <h2>Reminders to review</h2>
       <p class="section-description">Explicit reminder and timer requests live here. Twinr checks this store while idle and speaks due reminders later.</p>
     </div>
+    <span class="status-pill is-muted">{{ reminder_entries|length }} pending</span>
   </div>
   <div class="stats-grid">
     <div class="stat-tile">
@@ -203,148 +129,151 @@
     </div>
   </div>
 
-  <div class="section-header">
-    <div>
-      <h2>Pending reminders</h2>
-      <p class="section-description">These are still scheduled and can trigger later while Twinr is idle.</p>
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">Pending reminders</h3>
+    <p class="section-description">These are still scheduled and can trigger later while Twinr is idle.</p>
+    {% if reminder_entries %}
+    <div class="memory-list">
+      {% for entry in reminder_entries %}
+      <article class="memory-turn">
+        <div class="memory-turn-meta">
+          <div class="page-notes">
+            <span class="role-badge role-system">{{ entry.kind }}</span>
+            <span class="status-pill is-muted">{{ entry.status_label }}</span>
+            <span class="memory-time">Due {{ entry.due_label }}</span>
+          </div>
+          <div class="memory-turn-actions">
+            <form method="post" action="{{ form_action }}">
+              <input type="hidden" name="_action" value="mark_reminder_delivered">
+              <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+              <button type="submit" class="button-secondary">Mark delivered</button>
+            </form>
+            <form method="post" action="{{ form_action }}">
+              <input type="hidden" name="_action" value="delete_reminder">
+              <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+              <button type="submit" class="button-secondary">Delete</button>
+            </form>
+          </div>
+        </div>
+        <div class="memory-content">
+          <strong>{{ entry.summary }}</strong>
+          {% if entry.details %}
+          <br>{{ entry.details }}
+          {% endif %}
+          {% if entry.original_request %}
+          <br><strong>Original request:</strong> {{ entry.original_request }}
+          {% endif %}
+          <br><strong>Source:</strong> {{ entry.source }}
+          {% if entry.delivery_attempts %}
+          <br><strong>Attempts:</strong> {{ entry.delivery_attempts }}
+          {% endif %}
+          {% if entry.last_error %}
+          <br><strong>Last error:</strong> {{ entry.last_error }}
+          {% endif %}
+          {% if entry.next_attempt_label %}
+          <br><strong>Next retry:</strong> {{ entry.next_attempt_label }}
+          {% endif %}
+        </div>
+      </article>
+      {% endfor %}
     </div>
+    {% else %}
+    <div class="empty-state">No pending reminders are stored yet.</div>
+    {% endif %}
   </div>
-  {% if reminder_entries %}
-  <div class="memory-list">
-    {% for entry in reminder_entries %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <div class="page-notes">
-          <span class="role-badge role-system">{{ entry.kind }}</span>
-          <span class="status-pill is-muted">{{ entry.status_label }}</span>
-          <span class="memory-time">Due {{ entry.due_label }}</span>
-        </div>
-        <div class="memory-turn-actions">
-          <form method="post" action="{{ form_action }}">
-            <input type="hidden" name="_action" value="mark_reminder_delivered">
-            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
-            <button type="submit" class="button-secondary">Mark delivered</button>
-          </form>
-          <form method="post" action="{{ form_action }}">
-            <input type="hidden" name="_action" value="delete_reminder">
-            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
-            <button type="submit" class="button-secondary">Delete</button>
-          </form>
-        </div>
-      </div>
-      <div class="memory-content">
-        <strong>{{ entry.summary }}</strong>
-        {% if entry.details %}
-        <br>{{ entry.details }}
-        {% endif %}
-        {% if entry.original_request %}
-        <br><strong>Original request:</strong> {{ entry.original_request }}
-        {% endif %}
-        <br><strong>Source:</strong> {{ entry.source }}
-        {% if entry.delivery_attempts %}
-        <br><strong>Attempts:</strong> {{ entry.delivery_attempts }}
-        {% endif %}
-        {% if entry.last_error %}
-        <br><strong>Last error:</strong> {{ entry.last_error }}
-        {% endif %}
-        {% if entry.next_attempt_label %}
-        <br><strong>Next retry:</strong> {{ entry.next_attempt_label }}
-        {% endif %}
-      </div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">No pending reminders are stored yet.</div>
-  {% endif %}
 
-  <div class="section-header">
-    <div>
-      <h2>Add reminder</h2>
-      <p class="section-description">Use this for explicit reminders or timers. Twinr resolves spoken reminders itself; this form is for operator edits.</p>
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Add reminder</span>
+      <span class="panel-disclosure-copy">Use this for explicit reminders or timers when you need to edit the store directly.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      <form method="post" action="{{ form_action }}" class="stack">
+        <input type="hidden" name="_action" value="add_reminder">
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">Due at</span>
+            <input type="datetime-local" name="reminder_due_at" value="{{ reminder_default_due_at }}">
+            <span class="field-help">Local time on this Pi. Keep reminders short and specific.</span>
+          </label>
+          <label class="field">
+            <span class="field-label">Type</span>
+            <input type="text" name="reminder_kind" value="" placeholder="appointment">
+            <span class="field-help">Short category such as appointment, medication, timer, or call.</span>
+          </label>
+          <label class="field field-span-2">
+            <span class="field-label">Summary</span>
+            <textarea name="reminder_summary" rows="4" placeholder="Morgen um 12 Uhr an den Arzttermin erinnern."></textarea>
+            <span class="field-help">This becomes the main reminder sentence Twinr uses later.</span>
+          </label>
+          <label class="field field-span-2">
+            <span class="field-label">Details</span>
+            <textarea name="reminder_details" rows="4" placeholder="Dr. Meyer, Unterlagen mitnehmen."></textarea>
+            <span class="field-help">Optional extra details for the later spoken reminder.</span>
+          </label>
+          <label class="field field-span-2">
+            <span class="field-label">Original request</span>
+            <textarea name="reminder_original_request" rows="3" placeholder="Erinnere mich morgen um 12 Uhr an den Arzttermin."></textarea>
+            <span class="field-help">Optional. Useful for operator traceability.</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit">Save reminder</button>
+        </div>
+      </form>
     </div>
-  </div>
-  <form method="post" action="{{ form_action }}" class="stack">
-    <input type="hidden" name="_action" value="add_reminder">
-    <div class="form-grid">
-      <label class="field">
-        <span class="field-label">Due at</span>
-        <input type="datetime-local" name="reminder_due_at" value="{{ reminder_default_due_at }}">
-        <span class="field-help">Local time on this Pi. Keep reminders short and specific.</span>
-      </label>
-      <label class="field">
-        <span class="field-label">Type</span>
-        <input type="text" name="reminder_kind" value="" placeholder="appointment">
-        <span class="field-help">Short category such as appointment, medication, timer, or call.</span>
-      </label>
-      <label class="field field-span-2">
-        <span class="field-label">Summary</span>
-        <textarea name="reminder_summary" rows="4" placeholder="Morgen um 12 Uhr an den Arzttermin erinnern."></textarea>
-        <span class="field-help">This becomes the main reminder sentence Twinr uses later.</span>
-      </label>
-      <label class="field field-span-2">
-        <span class="field-label">Details</span>
-        <textarea name="reminder_details" rows="4" placeholder="Dr. Meyer, Unterlagen mitnehmen."></textarea>
-        <span class="field-help">Optional extra details for the later spoken reminder.</span>
-      </label>
-      <label class="field field-span-2">
-        <span class="field-label">Original request</span>
-        <textarea name="reminder_original_request" rows="3" placeholder="Erinnere mich morgen um 12 Uhr an den Arzttermin."></textarea>
-        <span class="field-help">Optional. Useful for operator traceability.</span>
-      </label>
-    </div>
-    <div class="actions">
-      <button type="submit">Save reminder</button>
-    </div>
-  </form>
+  </details>
 
-  <div class="section-header">
-    <div>
-      <h2>Delivered reminders</h2>
-      <p class="section-description">Recently completed reminders stay visible here until they are deleted or trimmed by the store limit.</p>
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Delivered reminders</span>
+      <span class="panel-disclosure-copy">Recently completed reminders stay visible here until they are deleted or trimmed by the store limit.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      {% if delivered_reminder_entries %}
+      <div class="memory-list">
+        {% for entry in delivered_reminder_entries %}
+        <article class="memory-turn">
+          <div class="memory-turn-meta">
+            <div class="page-notes">
+              <span class="role-badge role-system">{{ entry.kind }}</span>
+              <span class="status-pill is-ok">{{ entry.status_label }}</span>
+              <span class="memory-time">Due {{ entry.due_label }}</span>
+            </div>
+            <div class="memory-turn-actions">
+              <form method="post" action="{{ form_action }}">
+                <input type="hidden" name="_action" value="delete_reminder">
+                <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+                <button type="submit" class="button-secondary">Delete</button>
+              </form>
+            </div>
+          </div>
+          <div class="memory-content">
+            <strong>{{ entry.summary }}</strong>
+            {% if entry.details %}
+            <br>{{ entry.details }}
+            {% endif %}
+            {% if entry.delivered_at_label %}
+            <br><strong>Delivered:</strong> {{ entry.delivered_at_label }}
+            {% endif %}
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No delivered reminders are stored yet.</div>
+      {% endif %}
     </div>
-  </div>
-  {% if delivered_reminder_entries %}
-  <div class="memory-list">
-    {% for entry in delivered_reminder_entries %}
-    <article class="memory-turn">
-      <div class="memory-turn-meta">
-        <div class="page-notes">
-          <span class="role-badge role-system">{{ entry.kind }}</span>
-          <span class="status-pill is-ok">{{ entry.status_label }}</span>
-          <span class="memory-time">Due {{ entry.due_label }}</span>
-        </div>
-        <div class="memory-turn-actions">
-          <form method="post" action="{{ form_action }}">
-            <input type="hidden" name="_action" value="delete_reminder">
-            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
-            <button type="submit" class="button-secondary">Delete</button>
-          </form>
-        </div>
-      </div>
-      <div class="memory-content">
-        <strong>{{ entry.summary }}</strong>
-        {% if entry.details %}
-        <br>{{ entry.details }}
-        {% endif %}
-        {% if entry.delivered_at_label %}
-        <br><strong>Delivered:</strong> {{ entry.delivered_at_label }}
-        {% endif %}
-      </div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">No delivered reminders are stored yet.</div>
-  {% endif %}
+  </details>
 </section>
 
-<section class="panel">
+<section class="panel" id="saved-memories">
   <div class="section-header">
     <div>
-      <h2>Durable memories</h2>
+      <h2>Saved memories</h2>
       <p class="section-description">Only explicit “remember this” items belong here. This list is separate from the rolling conversation snapshot.</p>
     </div>
+    <span class="status-pill is-muted">{{ durable_memory_entries|length }} stored</span>
   </div>
   <div class="stats-grid">
     <div class="stat-tile">
@@ -376,59 +305,172 @@
   {% else %}
   <div class="empty-state">No durable memories are stored yet.</div>
   {% endif %}
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Add saved memory</span>
+      <span class="panel-disclosure-copy">Use this only for facts Twinr should keep for later, such as appointments, contacts, or long-lived preferences.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      <form method="post" action="{{ form_action }}" class="stack">
+        <input type="hidden" name="_action" value="add_memory">
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">Type</span>
+            <input type="text" name="memory_kind" value="" placeholder="appointment">
+            <span class="field-help">Short category such as appointment, contact, medication, or preference.</span>
+          </label>
+          <label class="field field-span-2">
+            <span class="field-label">Summary</span>
+            <textarea name="memory_summary" rows="4" placeholder="Arzttermin am Montag um 14 Uhr."></textarea>
+            <span class="field-help">Keep it short. This becomes the primary durable memory line.</span>
+          </label>
+          <label class="field field-span-2">
+            <span class="field-label">Details</span>
+            <textarea name="memory_details" rows="4" placeholder="Bei Dr. Meyer in Hamburg."></textarea>
+            <span class="field-help">Optional extra detail if the memory needs more context.</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit">Save durable memory</button>
+        </div>
+      </form>
+    </div>
+  </details>
 </section>
 
-<section class="panel">
-  <div class="section-header">
-    <div>
-      <h2>Add durable memory</h2>
-      <p class="section-description">Use this only for facts Twinr should keep for later, such as appointments, contacts, or long-lived preferences.</p>
-    </div>
-  </div>
-  <form method="post" action="{{ form_action }}" class="stack">
-    <input type="hidden" name="_action" value="add_memory">
-    <div class="form-grid">
-      <label class="field">
-        <span class="field-label">Type</span>
-        <input type="text" name="memory_kind" value="" placeholder="appointment">
-        <span class="field-help">Short category such as appointment, contact, medication, or preference.</span>
-      </label>
-      <label class="field field-span-2">
-        <span class="field-label">Summary</span>
-        <textarea name="memory_summary" rows="4" placeholder="Arzttermin am Montag um 14 Uhr."></textarea>
-        <span class="field-help">Keep it short. This becomes the primary durable memory line.</span>
-      </label>
-      <label class="field field-span-2">
-        <span class="field-label">Details</span>
-        <textarea name="memory_details" rows="4" placeholder="Bei Dr. Meyer in Hamburg."></textarea>
-        <span class="field-help">Optional extra detail if the memory needs more context.</span>
-      </label>
-    </div>
-    <div class="actions">
-      <button type="submit">Save durable memory</button>
-    </div>
-  </form>
-</section>
-
-<form method="post" action="{{ form_action }}" class="stack">
+<form method="post" action="{{ form_action }}" class="stack" id="memory-settings">
   <input type="hidden" name="_action" value="save_settings">
-  {% for section in sections %}
   <section class="panel">
     <div class="section-header">
       <div>
-        <h2>{{ section.title }}</h2>
-        <p class="section-description">{{ section.description }}</p>
+        <h2>Memory limits and storage</h2>
+        <p class="section-description">Everyday reminder and conversation review stays above. These settings define how much Twinr keeps and where it may store it.</p>
       </div>
     </div>
-    <div class="form-grid">
-      {% for field in section.fields %}
-      {{ render_setting_field(field) }}
+    {% for group in settings_groups %}
+    <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}" id="group-{{ group.key }}">
+      <h3 class="subsection-title">{{ group.title }}</h3>
+      <p class="section-description">{{ group.description }}</p>
+      {% for section in group.sections %}
+      <details class="panel-disclosure"{% if loop.first %} open{% endif %}>
+        <summary class="panel-disclosure-summary">
+          <span class="panel-disclosure-title">{{ section.title }}</span>
+          <span class="panel-disclosure-copy">{{ section.description }}</span>
+        </summary>
+        <div class="panel-disclosure-body">
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
+      </details>
       {% endfor %}
     </div>
+    {% endfor %}
   </section>
-  {% endfor %}
   <div class="actions">
     <button type="submit">Save changes</button>
   </div>
 </form>
+
+<section class="panel" id="advanced-memory">
+  <div class="section-header">
+    <div>
+      <h2>Advanced runtime traces</h2>
+      <p class="section-description">Open these only when you need to inspect how memory compaction and stored search results currently look.</p>
+    </div>
+  </div>
+  <div class="detail-grid">
+    {% for metric in advanced_metrics %}
+    <article class="detail-card">
+      <div class="detail-label">{{ metric.label }}</div>
+      <div class="detail-body">{{ metric.value }}</div>
+      <div class="field-help">{{ metric.detail }}</div>
+    </article>
+    {% endfor %}
+  </div>
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Verbatim tail before compaction</span>
+      <span class="panel-disclosure-copy">Most recent turns kept exactly as they were before older content is condensed.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      {% if snapshot.memory_raw_tail %}
+      <div class="memory-list">
+        {% for turn in snapshot.memory_raw_tail %}
+        <article class="memory-turn">
+          <div class="memory-turn-meta">
+            <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
+            <span class="memory-time">{{ turn.created_at }}</span>
+          </div>
+          <div class="memory-content">{{ turn.content }}</div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No raw-tail turns are stored yet.</div>
+      {% endif %}
+    </div>
+  </details>
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Compacted ledger</span>
+      <span class="panel-disclosure-copy">Facts and summaries that survive tail compaction.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      {% if snapshot.memory_ledger %}
+      <div class="memory-list">
+        {% for item in snapshot.memory_ledger %}
+        <article class="memory-turn">
+          <div class="memory-turn-meta">
+            <span class="role-badge role-system">{{ item.kind }}</span>
+            <span class="memory-time">{{ item.created_at }}</span>
+          </div>
+          <div class="memory-content">{{ item.content }}</div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No ledger entries are stored yet.</div>
+      {% endif %}
+    </div>
+  </details>
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Stored search answers</span>
+      <span class="panel-disclosure-copy">Typed web lookups preserved for later turns, printing, and operator inspection.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      {% if snapshot.memory_search_results %}
+      <div class="memory-list">
+        {% for item in snapshot.memory_search_results %}
+        <article class="memory-turn">
+          <div class="memory-turn-meta">
+            <span class="role-badge role-system">search</span>
+            <span class="memory-time">{{ item.created_at }}</span>
+          </div>
+          <div class="memory-content">
+            <strong>Question:</strong> {{ item.question }}<br>
+            <strong>Answer:</strong> {{ item.answer }}<br>
+            <strong>Sources:</strong>
+            {% if item.sources %}
+            {{ item.sources|join(", ") }}
+            {% else %}
+            —
+            {% endif %}
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No search results are stored yet.</div>
+      {% endif %}
+    </div>
+  </details>
+</section>
 {% endblock %}

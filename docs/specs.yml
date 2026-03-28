@@ -107,7 +107,7 @@ providers:
       - DeepInfra
       - OpenRouter
       - other pluggable providers
-    default_openai_model: whisper-1
+    default_openai_model: gpt-4o-mini-transcribe
   llm:
     role: reasoning_and_agent_control
     candidates:
@@ -130,7 +130,7 @@ providers:
   realtime_voice:
     role: low_latency_direct_audio_conversation
     provider: OpenAI
-    default_openai_model: gpt-4o-realtime-preview
+    default_openai_model: gpt-realtime-1.5
     default_openai_voice: sage
     default_speed: 1.0
     input_audio_format: pcm16_24khz_mono

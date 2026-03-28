@@ -1,3 +1,14 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Fixed async result correlation so observe() only treats exact-frame callbacks as "current"; future-frame callbacks are no longer misattributed to earlier frames.
+# BUG-2: Fixed stale hand-box rescue leakage after fresh live no-hand results; recent cached boxes can no longer bypass the current-frame no-hand veto.
+# BUG-3: Enforced monotonically increasing LIVE_STREAM timestamps before recognize_async() to avoid MediaPipe timestamp regressions and silent frame drops.
+# BUG-4: Fixed the logically dead wave path; wave tracking now consumes current-frame open-palm center evidence directly instead of requiring an allowlisted fine-hand label.
+# SEC-1: Added bounded person-ROI / hand-ROI candidate budgets and full-frame rescue rate limiting to reduce practical CPU-exhaustion and latency-collapse attacks on Raspberry Pi 4.
+# SEC-2: Added generation-guarded callbacks and fail-closed exception handling so late callbacks after close() and recognizer/runtime errors do not corrupt live state or crash the lane.
+# IMP-1: Added bounded per-timestamp snapshot history so fallback reads exact-or-older results but never "future" callbacks from later frames.
+# IMP-2: Added lightweight temporal stabilization for rescue paths plus wave cooldown/reset logic to reduce flicker and false positives in continuous user-facing HCI.
+# IMP-3: Added IoU-based hand-box deduplication and config-driven tuning knobs via getattr(config, ...) without breaking older configs.
+
 """Run a dedicated low-latency MediaPipe live-stream gesture lane.
 
 Twinr's user-facing HDMI gesture acknowledgements should not depend on the
@@ -16,7 +27,8 @@ but they are not accepted by this low-latency user-facing lane.
 
 from __future__ import annotations
 
-from collections import deque
+from collections.abc import Mapping
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from threading import Condition, RLock
 from time import monotonic
@@ -45,22 +57,42 @@ from .models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
 
 _DEFAULT_MAX_RESULT_AGE_S = 0.75
-_DEFAULT_CURRENT_RESULT_WAIT_S = 0.2
-_LIVE_CUSTOM_MIN_SCORE_FLOOR = 0.6
+_DEFAULT_CURRENT_RESULT_WAIT_S = 0.20
+_DEFAULT_RESULT_HISTORY_SIZE = 12
+_LIVE_CUSTOM_MIN_SCORE_FLOOR = 0.60
+
 _WAVE_WINDOW_S = 0.55
 _WAVE_MIN_SAMPLES = 3
 _WAVE_MIN_SPAN_X = 0.10
 _WAVE_MIN_TRAVEL_X = 0.18
 _WAVE_DIRECTION_DELTA = 0.015
+_WAVE_MAX_GAP_S = 0.16
+_WAVE_COOLDOWN_S = 0.70
+
 _RECENT_PRIMARY_PERSON_BOX_TTL_S = 0.45
 _RECENT_VISIBLE_PERSON_BOXES_TTL_S = 0.45
 _RECENT_HAND_BOXES_TTL_S = 0.45
+
 _LIVE_GESTURE_NUM_HANDS = 1
-_PRIMARY_PERSON_HINT_MIN_IOU = 0.6
+_PRIMARY_PERSON_HINT_MIN_IOU = 0.60
+
 _LIVE_HAND_CROP_PADDING = 0.14
 _LIVE_HAND_MIN_CONTEXT_RATIO = 0.18
+_HAND_BOX_DUPLICATE_IOU = 0.62
+
 _PERSON_ROI_SOURCE_PRIORITY_MARGIN = 0.12
 _PERSON_ROI_POSE_HINT_SHORT_CIRCUIT_REASON = "primary_pose_hint_confident_gesture"
+
+_DEFAULT_MAX_PERSON_ROI_CANDIDATES = 3
+_DEFAULT_MAX_HAND_ROI_CANDIDATES = 2
+_DEFAULT_FULL_FRAME_RESCUE_MIN_INTERVAL_S = 0.18
+
+_TEMPORAL_WINDOW_S = 0.35
+_TEMPORAL_WINDOW_SAMPLES = 3
+_TEMPORAL_REQUIRED_VOTES = 2
+_TEMPORAL_STRONG_CONFIDENCE = 0.84
+_TEMPORAL_HOLD_S = 0.22
+
 _PERSON_ROI_SOURCE_PRIORITY = {
     HandRoiSource.FULL_FRAME.value: 5,
     HandRoiSource.LEFT_WRIST.value: 4,
@@ -89,11 +121,7 @@ _LIVE_FINE_GESTURE_ALLOWLIST = frozenset(
         AICameraFineHandGesture.PEACE_SIGN,
     }
 )
-_LIVE_NO_HAND_PERSON_ROI_ALLOWLIST = frozenset(
-    {
-        AICameraFineHandGesture.PEACE_SIGN,
-    }
-)
+_LIVE_NO_HAND_PERSON_ROI_ALLOWLIST = frozenset({AICameraFineHandGesture.PEACE_SIGN})
 _LIVE_BUILTIN_FINE_GESTURE_MAP = {
     label: gesture
     for label, gesture in BUILTIN_FINE_GESTURE_MAP.items()
@@ -104,6 +132,7 @@ _LIVE_CUSTOM_FINE_GESTURE_MAP = {
     for label, gesture in CUSTOM_FINE_GESTURE_MAP.items()
     if gesture in _LIVE_FINE_GESTURE_ALLOWLIST
 }
+_HandBox = tuple[float, float, float, float]
 _GestureChoice = tuple[AICameraFineHandGesture, float | None]
 
 
@@ -121,15 +150,46 @@ class LiveGestureFrameObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class LiveGestureObservePolicy:
+    """Describe which recovery stages one observe call may use."""
+
+    name: str = "full"
+    enable_custom_live: bool = True
+    enable_custom_roi: bool = True
+    allow_person_roi_recovery: bool = True
+    allow_live_hand_roi_recovery: bool = True
+    allow_full_frame_hand_recovery: bool = True
+    allow_recent_person_boxes: bool = True
+    allow_recent_hand_boxes: bool = True
+
+    @classmethod
+    def full(cls) -> "LiveGestureObservePolicy":
+        return cls()
+
+    @classmethod
+    def user_facing_fast(cls) -> "LiveGestureObservePolicy":
+        return cls(
+            name="user_facing_fast",
+            enable_custom_live=True,
+            enable_custom_roi=False,
+            allow_person_roi_recovery=False,
+            allow_live_hand_roi_recovery=True,
+            allow_full_frame_hand_recovery=False,
+            allow_recent_person_boxes=False,
+            allow_recent_hand_boxes=False,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _RecognizerSnapshot:
-    """Store the newest live-stream recognizer callback payload."""
+    """Store one live-stream recognizer callback payload."""
 
     timestamp_ms: int
     gesture: AICameraFineHandGesture
     confidence: float | None
     hand_count: int
     open_palm_center_x: float | None
-    hand_boxes: tuple[tuple[float, float, float, float], ...] = ()
+    hand_boxes: tuple[_HandBox, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +201,17 @@ class _WaveSample:
 
 
 @dataclass(frozen=True, slots=True)
+class _TemporalGestureSample:
+    """Store one final-stage gesture sample for temporal stabilization."""
+
+    observed_at: float
+    gesture: AICameraFineHandGesture
+    confidence: float | None
+    resolved_source: str
+    hand_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PersonRoiGestureChoice:
     """Store one person-ROI gesture candidate with its source provenance."""
 
@@ -149,9 +220,7 @@ class _PersonRoiGestureChoice:
     roi_source: str = ""
     detection_index: int | None = None
 
-    def as_choice(self) -> tuple[AICameraFineHandGesture, float | None]:
-        """Expose the public gesture tuple used by the rest of the pipeline."""
-
+    def as_choice(self) -> _GestureChoice:
         return self.gesture, self.confidence
 
 
@@ -160,6 +229,8 @@ class _WaveGestureTracker:
 
     def __init__(self) -> None:
         self._samples: deque[_WaveSample] = deque()
+        self._last_open_palm_at: float | None = None
+        self._last_emitted_at: float | None = None
 
     def observe(
         self,
@@ -167,17 +238,22 @@ class _WaveGestureTracker:
         observed_at: float,
         open_palm_center_x: float | None,
     ) -> tuple[AICameraGestureEvent, float | None]:
-        """Update the tracker and return one optional bounded wave event."""
-
         self._prune(observed_at)
         if open_palm_center_x is None:
+            if (
+                self._last_open_palm_at is not None
+                and (observed_at - self._last_open_palm_at) > _WAVE_MAX_GAP_S
+            ):
+                self._samples.clear()
             return AICameraGestureEvent.NONE, None
-        self._samples.append(
-            _WaveSample(
-                observed_at=observed_at,
-                center_x=open_palm_center_x,
-            )
-        )
+
+        if (
+            self._last_open_palm_at is not None
+            and (observed_at - self._last_open_palm_at) > _WAVE_MAX_GAP_S
+        ):
+            self._samples.clear()
+        self._last_open_palm_at = observed_at
+        self._samples.append(_WaveSample(observed_at=observed_at, center_x=open_palm_center_x))
         self._prune(observed_at)
         if len(self._samples) < _WAVE_MIN_SAMPLES:
             return AICameraGestureEvent.NONE, None
@@ -196,8 +272,14 @@ class _WaveGestureTracker:
             if last_sign != 0 and sign != last_sign:
                 direction_changes += 1
             last_sign = sign
+
         if span_x < _WAVE_MIN_SPAN_X or total_travel_x < _WAVE_MIN_TRAVEL_X or direction_changes < 1:
             return AICameraGestureEvent.NONE, None
+        if self._last_emitted_at is not None and (observed_at - self._last_emitted_at) < _WAVE_COOLDOWN_S:
+            return AICameraGestureEvent.NONE, None
+
+        self._last_emitted_at = observed_at
+        self._samples.clear()
         confidence = min(
             0.99,
             0.55 + min(0.25, span_x * 1.2) + min(0.19, total_travel_x * 0.6),
@@ -210,39 +292,200 @@ class _WaveGestureTracker:
             self._samples.popleft()
 
 
+class _GestureStabilityTracker:
+    """Apply a tiny streaming stabilizer without adding a heavy temporal model."""
+
+    def __init__(self, *, config: MediaPipeVisionConfig) -> None:
+        self._config = config
+        self._samples: deque[_TemporalGestureSample] = deque()
+        self._last_output_gesture = AICameraFineHandGesture.NONE
+        self._last_output_confidence: float | None = None
+        self._last_output_at: float | None = None
+
+    def observe(
+        self,
+        *,
+        observed_at: float,
+        gesture: AICameraFineHandGesture,
+        confidence: float | None,
+        resolved_source: str,
+        hand_count: int,
+    ) -> tuple[AICameraFineHandGesture, float | None, dict[str, object]]:
+        if not _live_temporal_stability_enabled(self._config):
+            return gesture, confidence, {
+                "temporal_enabled": False,
+                "temporal_reason": "disabled",
+                "temporal_output_gesture": gesture.value,
+                "temporal_output_confidence": _round_optional_confidence(confidence),
+                "temporal_output_changed": False,
+                "temporal_resolved_source": resolved_source,
+            }
+
+        self._samples.append(
+            _TemporalGestureSample(
+                observed_at=observed_at,
+                gesture=gesture,
+                confidence=confidence,
+                resolved_source=resolved_source,
+                hand_count=max(0, int(hand_count)),
+            )
+        )
+        self._prune(observed_at)
+        strong_confidence = _live_temporal_strong_confidence(self._config)
+        hold_s = _live_temporal_hold_s(self._config)
+        score = _coerce_unit_interval(confidence) or 0.0
+
+        if gesture != AICameraFineHandGesture.NONE:
+            votes, mean_confidence = self._votes_for_gesture(gesture)
+            if score >= strong_confidence:
+                self._remember_output(gesture, confidence, observed_at)
+                return gesture, confidence, {
+                    "temporal_enabled": True,
+                    "temporal_reason": "strong_current",
+                    "temporal_votes": votes,
+                    "temporal_output_gesture": gesture.value,
+                    "temporal_output_confidence": _round_optional_confidence(confidence),
+                    "temporal_output_changed": False,
+                    "temporal_resolved_source": resolved_source,
+                }
+            if votes >= _live_temporal_required_votes(self._config):
+                stabilized_confidence = max(score, mean_confidence or 0.0)
+                self._remember_output(gesture, stabilized_confidence, observed_at)
+                return gesture, stabilized_confidence, {
+                    "temporal_enabled": True,
+                    "temporal_reason": "consensus",
+                    "temporal_votes": votes,
+                    "temporal_output_gesture": gesture.value,
+                    "temporal_output_confidence": _round_optional_confidence(stabilized_confidence),
+                    "temporal_output_changed": False,
+                    "temporal_resolved_source": "temporal_consensus",
+                }
+            if resolved_source != "live_stream":
+                return AICameraFineHandGesture.NONE, None, {
+                    "temporal_enabled": True,
+                    "temporal_reason": "rescue_waiting_for_consensus",
+                    "temporal_votes": votes,
+                    "temporal_output_gesture": AICameraFineHandGesture.NONE.value,
+                    "temporal_output_confidence": None,
+                    "temporal_output_changed": True,
+                    "temporal_resolved_source": "temporal_guard",
+                }
+            self._remember_output(gesture, confidence, observed_at)
+            return gesture, confidence, {
+                "temporal_enabled": True,
+                "temporal_reason": "live_passthrough",
+                "temporal_votes": votes,
+                "temporal_output_gesture": gesture.value,
+                "temporal_output_confidence": _round_optional_confidence(confidence),
+                "temporal_output_changed": False,
+                "temporal_resolved_source": resolved_source,
+            }
+
+        if (
+            self._last_output_gesture != AICameraFineHandGesture.NONE
+            and self._last_output_at is not None
+            and (observed_at - self._last_output_at) <= hold_s
+            and (hand_count > 0 or (observed_at - self._last_output_at) <= (hold_s * 0.5))
+        ):
+            return self._last_output_gesture, self._last_output_confidence, {
+                "temporal_enabled": True,
+                "temporal_reason": "hold_recent",
+                "temporal_votes": 0,
+                "temporal_output_gesture": self._last_output_gesture.value,
+                "temporal_output_confidence": _round_optional_confidence(self._last_output_confidence),
+                "temporal_output_changed": True,
+                "temporal_resolved_source": "temporal_hold",
+            }
+
+        return gesture, confidence, {
+            "temporal_enabled": True,
+            "temporal_reason": "none",
+            "temporal_votes": 0,
+            "temporal_output_gesture": gesture.value,
+            "temporal_output_confidence": _round_optional_confidence(confidence),
+            "temporal_output_changed": False,
+            "temporal_resolved_source": resolved_source,
+        }
+
+    def _votes_for_gesture(self, gesture: AICameraFineHandGesture) -> tuple[int, float | None]:
+        votes = 0
+        confidences: list[float] = []
+        for sample in list(self._samples)[-_live_temporal_window_samples(self._config):]:
+            if sample.gesture != gesture:
+                continue
+            votes += 1
+            sample_score = _coerce_unit_interval(sample.confidence)
+            if sample_score is not None:
+                confidences.append(sample_score)
+        if not confidences:
+            return votes, None
+        return votes, (sum(confidences) / len(confidences))
+
+    def _remember_output(
+        self,
+        gesture: AICameraFineHandGesture,
+        confidence: float | None,
+        observed_at: float,
+    ) -> None:
+        self._last_output_gesture = gesture
+        self._last_output_confidence = confidence
+        self._last_output_at = observed_at
+
+    def _prune(self, observed_at: float) -> None:
+        cutoff = observed_at - _live_temporal_window_s(self._config)
+        while self._samples and self._samples[0].observed_at < cutoff:
+            self._samples.popleft()
+        while len(self._samples) > _live_temporal_window_samples(self._config):
+            self._samples.popleft()
+
+
 class LiveGesturePipeline:
     """Submit RGB frames to MediaPipe LIVE_STREAM gesture recognizers."""
 
-    def __init__(
-        self,
-        *,
-        config: MediaPipeVisionConfig,
-    ) -> None:
+    def __init__(self, *, config: MediaPipeVisionConfig) -> None:
         self.config = config
         self._runtime = MediaPipeTaskRuntime(config=config)
         self._lock = RLock()
         self._result_condition = Condition(self._lock)
+
         self._latest_builtin: _RecognizerSnapshot | None = None
         self._latest_custom: _RecognizerSnapshot | None = None
+        self._builtin_history: OrderedDict[int, _RecognizerSnapshot] = OrderedDict()
+        self._custom_history: OrderedDict[int, _RecognizerSnapshot] = OrderedDict()
+
         self._wave_tracker = _WaveGestureTracker()
+        self._stability_tracker = _GestureStabilityTracker(config=config)
         self._hand_landmark_worker: MediaPipeHandLandmarkWorker | None = None
+
         self._recent_primary_person_box: AICameraBox | None = None
         self._recent_primary_person_seen_at: float | None = None
         self._recent_visible_person_boxes: tuple[AICameraBox, ...] = ()
         self._recent_visible_person_boxes_seen_at: float | None = None
-        self._recent_hand_boxes: tuple[tuple[float, float, float, float], ...] = ()
+        self._recent_hand_boxes: tuple[_HandBox, ...] = ()
         self._recent_hand_boxes_seen_at: float | None = None
+
         self._last_debug_snapshot: dict[str, object] = {}
+        self._last_submitted_live_timestamp_ms = 0
+        self._last_full_frame_rescue_at: float | None = None
+        self._callback_generation = 0
 
     def close(self) -> None:
         """Close live-stream recognizers and reset cached callback state."""
 
         with self._lock:
+            self._callback_generation += 1
             self._latest_builtin = None
             self._latest_custom = None
+            self._builtin_history.clear()
+            self._custom_history.clear()
             self._wave_tracker = _WaveGestureTracker()
+            self._stability_tracker = _GestureStabilityTracker(config=self.config)
+            self._last_submitted_live_timestamp_ms = 0
+            self._last_full_frame_rescue_at = None
+
             worker = self._hand_landmark_worker
             self._hand_landmark_worker = None
+
             self._recent_primary_person_box = None
             self._recent_primary_person_seen_at = None
             self._recent_visible_person_boxes = ()
@@ -250,13 +493,12 @@ class LiveGesturePipeline:
             self._recent_hand_boxes = ()
             self._recent_hand_boxes_seen_at = None
             self._last_debug_snapshot = {}
+
         if worker is not None:
             worker.close()
         self._runtime.close()
 
     def debug_snapshot(self) -> dict[str, object]:
-        """Return the newest bounded debug snapshot for this live gesture lane."""
-
         with self._lock:
             return dict(self._last_debug_snapshot)
 
@@ -265,6 +507,7 @@ class LiveGesturePipeline:
         *,
         frame_rgb: Any,
         observed_at: float,
+        observe_policy: LiveGestureObservePolicy | None = None,
         primary_person_box: AICameraBox | None = None,
         visible_person_boxes: tuple[AICameraBox, ...] = (),
         person_count: int = 0,
@@ -272,6 +515,7 @@ class LiveGesturePipeline:
     ) -> LiveGestureFrameObservation:
         """Submit one RGB frame and return the freshest bounded live result."""
 
+        active_policy = observe_policy or LiveGestureObservePolicy.full()
         with workflow_span(
             name="live_gesture_pipeline_observe",
             kind="io",
@@ -279,47 +523,64 @@ class LiveGesturePipeline:
                 "person_count": max(0, int(person_count)),
                 "visible_person_box_count": len(tuple(visible_person_boxes or ())),
                 "pose_hint_keypoint_count": len(dict(sparse_keypoints or {})),
+                "observe_policy": active_policy.name,
             },
         ):
-            runtime = self._runtime.load_runtime()
-            image = self._runtime.build_image(runtime, frame_rgb=frame_rgb)
-            timestamp_ms = self._runtime.timestamp_ms(observed_at)
-            live_custom_enabled = _live_custom_gesture_enabled(self.config)
-            builtin_recognizer = self._runtime.ensure_live_gesture_recognizer(
-                runtime,
-                result_callback=self._handle_builtin_result,
-                num_hands_override=_LIVE_GESTURE_NUM_HANDS,
-            )
-            builtin_recognizer.recognize_async(image, timestamp_ms)
-            if live_custom_enabled:
-                custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
-                    runtime,
-                    result_callback=self._handle_custom_result,
+            try:
+                runtime = self._runtime.load_runtime()
+                image = self._runtime.build_image(runtime, frame_rgb=frame_rgb)
+                timestamp_ms = self._next_live_timestamp_ms(observed_at)
+                frame_time_s = timestamp_ms / 1000.0
+                live_custom_enabled = (
+                    active_policy.enable_custom_live and _live_custom_gesture_enabled(self.config)
                 )
-                custom_recognizer.recognize_async(image, timestamp_ms)
-            (
-                live_result_wait_s,
-                current_live_builtin_ready,
-                current_live_custom_ready,
-            ) = self._await_current_live_results(
-                timestamp_ms=timestamp_ms,
-                expect_custom=live_custom_enabled,
-            )
-            return self._build_observation(
-                runtime=runtime,
-                frame_rgb=frame_rgb,
-                observed_at=observed_at,
-                timestamp_ms=timestamp_ms,
-                live_result_wait_s=live_result_wait_s,
-                current_live_builtin_ready=current_live_builtin_ready,
-                current_live_custom_ready=(
-                    current_live_custom_ready if live_custom_enabled else None
-                ),
-                primary_person_box=primary_person_box,
-                visible_person_boxes=visible_person_boxes,
-                person_count=person_count,
-                sparse_keypoints=dict(sparse_keypoints or {}),
-            )
+                with self._lock:
+                    generation = self._callback_generation
+
+                builtin_recognizer = self._runtime.ensure_live_gesture_recognizer(
+                    runtime,
+                    result_callback=self._make_builtin_result_handler(generation),
+                    num_hands_override=_LIVE_GESTURE_NUM_HANDS,
+                )
+                builtin_recognizer.recognize_async(image, timestamp_ms)
+
+                if live_custom_enabled:
+                    custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
+                        runtime,
+                        result_callback=self._make_custom_result_handler(generation),
+                    )
+                    custom_recognizer.recognize_async(image, timestamp_ms)
+
+                wait_s, builtin_ready, custom_ready = self._await_current_live_results(
+                    timestamp_ms=timestamp_ms,
+                    expect_custom=live_custom_enabled,
+                )
+
+                return self._build_observation(
+                    runtime=runtime,
+                    frame_rgb=frame_rgb,
+                    observed_at=observed_at,
+                    frame_time_s=frame_time_s,
+                    timestamp_ms=timestamp_ms,
+                    live_result_wait_s=wait_s,
+                    current_live_builtin_ready=builtin_ready,
+                    current_live_custom_ready=(custom_ready if live_custom_enabled else None),
+                    observe_policy=active_policy,
+                    primary_person_box=primary_person_box,
+                    visible_person_boxes=visible_person_boxes,
+                    person_count=person_count,
+                    sparse_keypoints=dict(sparse_keypoints or {}),
+                )
+            except Exception as exc:
+                return self._fail_closed_observation(
+                    observed_at=observed_at,
+                    observe_policy=active_policy,
+                    person_count=person_count,
+                    visible_person_boxes=visible_person_boxes,
+                    sparse_keypoints=dict(sparse_keypoints or {}),
+                    stage="observe",
+                    exc=exc,
+                )
 
     def _build_observation(
         self,
@@ -327,20 +588,31 @@ class LiveGesturePipeline:
         runtime: dict[str, Any],
         frame_rgb: Any,
         observed_at: float,
+        frame_time_s: float,
         timestamp_ms: int,
         live_result_wait_s: float,
         current_live_builtin_ready: bool,
         current_live_custom_ready: bool | None,
+        observe_policy: LiveGestureObservePolicy,
         primary_person_box: AICameraBox | None,
         visible_person_boxes: tuple[AICameraBox, ...],
         person_count: int,
         sparse_keypoints: dict[int, tuple[float, float, float]],
     ) -> LiveGestureFrameObservation:
-        """Materialize one bounded observation from the newest callback results."""
-
         with self._lock:
-            builtin = self._fresh_snapshot(self._latest_builtin, observed_at=observed_at)
-            custom = self._fresh_snapshot(self._latest_custom, observed_at=observed_at)
+            current_builtin = self._builtin_history.get(timestamp_ms)
+            current_custom = self._custom_history.get(timestamp_ms)
+            builtin = self._select_snapshot_from_history(
+                history=self._builtin_history,
+                max_timestamp_ms=timestamp_ms,
+                frame_time_s=frame_time_s,
+            )
+            custom = self._select_snapshot_from_history(
+                history=self._custom_history,
+                max_timestamp_ms=timestamp_ms,
+                frame_time_s=frame_time_s,
+            )
+
             builtin_choice = (
                 (AICameraFineHandGesture.NONE, None)
                 if builtin is None
@@ -361,21 +633,33 @@ class LiveGesturePipeline:
                 0 if builtin is None else builtin.hand_count,
                 0 if custom is None else custom.hand_count,
             )
-            open_palm_center_x = None
-            if builtin is not None and builtin.gesture == AICameraFineHandGesture.OPEN_PALM:
-                open_palm_center_x = builtin.open_palm_center_x
+
+            open_palm_center_x = None if current_builtin is None else current_builtin.open_palm_center_x
             gesture_event, gesture_confidence = self._wave_tracker.observe(
                 observed_at=observed_at,
                 open_palm_center_x=open_palm_center_x,
             )
+
             freshest_timestamp_ms = max(
                 0 if builtin is None else builtin.timestamp_ms,
                 0 if custom is None else custom.timestamp_ms,
             )
-            current_hand_boxes = _merge_hand_boxes(
-                () if builtin is None else builtin.hand_boxes,
-                () if custom is None else custom.hand_boxes,
+            result_age_s = (
+                None
+                if freshest_timestamp_ms <= 0
+                else max(0.0, frame_time_s - (freshest_timestamp_ms / 1000.0))
             )
+
+            current_live_hand_boxes = _merge_hand_boxes(
+                () if current_builtin is None else current_builtin.hand_boxes,
+                () if current_custom is None else current_custom.hand_boxes,
+            )
+            current_live_hand_count_exact = max(
+                0,
+                0 if current_builtin is None else current_builtin.hand_count,
+                0 if current_custom is None else current_custom.hand_count,
+            )
+
             live_visible_person_boxes = tuple(box for box in visible_person_boxes if box is not None)
             if primary_person_box is not None and person_count > 0:
                 self._recent_primary_person_box = primary_person_box
@@ -383,108 +667,155 @@ class LiveGesturePipeline:
             if live_visible_person_boxes and person_count > 0:
                 self._recent_visible_person_boxes = live_visible_person_boxes
                 self._recent_visible_person_boxes_seen_at = observed_at
+
             effective_primary_person_box = primary_person_box
             primary_person_box_source = "live" if primary_person_box is not None and person_count > 0 else "none"
-            if effective_primary_person_box is None:
+            if effective_primary_person_box is None and observe_policy.allow_recent_person_boxes:
                 effective_primary_person_box = self._fresh_recent_primary_person_box(observed_at)
                 if effective_primary_person_box is not None:
                     primary_person_box_source = "recent"
+
             effective_visible_person_boxes = live_visible_person_boxes
             visible_person_box_source = "live" if live_visible_person_boxes and person_count > 0 else "none"
-            if not effective_visible_person_boxes:
+            if not effective_visible_person_boxes and observe_policy.allow_recent_person_boxes:
                 effective_visible_person_boxes = self._fresh_recent_visible_person_boxes(observed_at)
                 if effective_visible_person_boxes:
                     visible_person_box_source = "recent"
             if not effective_visible_person_boxes and effective_primary_person_box is not None:
                 effective_visible_person_boxes = (effective_primary_person_box,)
                 visible_person_box_source = primary_person_box_source
-            if current_hand_boxes:
-                self._recent_hand_boxes = tuple(current_hand_boxes)
+
+            if current_live_hand_boxes:
+                self._recent_hand_boxes = tuple(current_live_hand_boxes)
                 self._recent_hand_boxes_seen_at = observed_at
-                effective_hand_boxes = tuple(current_hand_boxes)
+                effective_hand_boxes = tuple(current_live_hand_boxes)
                 hand_box_source = "live"
             else:
-                effective_hand_boxes = self._fresh_recent_hand_boxes(observed_at)
+                effective_hand_boxes = (
+                    self._fresh_recent_hand_boxes(observed_at)
+                    if observe_policy.allow_recent_hand_boxes
+                    else ()
+                )
                 hand_box_source = "recent" if effective_hand_boxes else "none"
-        result_age_s = None
-        if freshest_timestamp_ms > 0:
-            result_age_s = max(0.0, observed_at - (freshest_timestamp_ms / 1000.0))
+
         fresh_live_results_confirm_no_hand = _fresh_live_results_confirm_no_hand(
             builtin_ready=current_live_builtin_ready,
             custom_ready=current_live_custom_ready,
-            hand_count=hand_count,
-            live_hand_box_count=len(current_hand_boxes),
+            hand_count=current_live_hand_count_exact,
+            live_hand_box_count=len(current_live_hand_boxes),
         )
+
+        debug_snapshot: dict[str, object] = {
+            "resolved_source": "none" if fine_hand_gesture == AICameraFineHandGesture.NONE else "live_stream",
+            "live_builtin_gesture": builtin_choice[0].value,
+            "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
+            "live_custom_gesture": custom_choice[0].value,
+            "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
+            "live_custom_enabled": (
+                observe_policy.enable_custom_live and _live_custom_gesture_enabled(self.config)
+            ),
+            "live_hand_count": hand_count,
+            "live_hand_count_exact": current_live_hand_count_exact,
+            "live_hand_box_count": len(current_live_hand_boxes),
+            "effective_live_hand_box_count": len(effective_hand_boxes),
+            "live_hand_box_source": hand_box_source,
+            "live_result_age_s": _round_optional_confidence(result_age_s),
+            "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
+            "current_live_builtin_ready": current_live_builtin_ready,
+            "current_live_custom_ready": current_live_custom_ready,
+            "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
+            "input_person_count": max(0, int(person_count)),
+            "primary_person_box_available": primary_person_box is not None,
+            "effective_primary_person_box_available": effective_primary_person_box is not None,
+            "primary_person_box_source": primary_person_box_source,
+            "pose_hint_keypoint_count": len(sparse_keypoints),
+            "visible_person_box_count": len(live_visible_person_boxes),
+            "effective_visible_person_box_count": len(effective_visible_person_boxes),
+            "visible_person_box_source": visible_person_box_source,
+            "person_roi_candidate_count_total": len(effective_visible_person_boxes),
+            "person_roi_candidate_count": 0,
+            "person_roi_detection_count": 0,
+            "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
+            "person_roi_combined_confidence": None,
+            "person_roi_block_reason": None,
+            "person_roi_short_circuit_used": False,
+            "live_roi_candidate_count_total": len(effective_hand_boxes),
+            "live_roi_candidate_count": 0,
+            "live_roi_hand_box_count": 0,
+            "live_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
+            "live_roi_combined_confidence": None,
+            "live_roi_skip_reason": None,
+            "full_frame_hand_attempt_reason": None,
+            "observe_policy": observe_policy.name,
+            "observe_policy_enable_custom_live": observe_policy.enable_custom_live,
+            "observe_policy_enable_custom_roi": observe_policy.enable_custom_roi,
+            "observe_policy_allow_person_roi_recovery": observe_policy.allow_person_roi_recovery,
+            "observe_policy_allow_live_hand_roi_recovery": observe_policy.allow_live_hand_roi_recovery,
+            "observe_policy_allow_full_frame_hand_recovery": observe_policy.allow_full_frame_hand_recovery,
+            "observe_policy_allow_recent_person_boxes": observe_policy.allow_recent_person_boxes,
+            "observe_policy_allow_recent_hand_boxes": observe_policy.allow_recent_hand_boxes,
+        }
+
         if fine_hand_gesture == AICameraFineHandGesture.NONE:
-            rescue_blocked_by_live_no_hand = fresh_live_results_confirm_no_hand and not effective_hand_boxes
-            debug_snapshot: dict[str, object] = {
-                "resolved_source": "none",
-                "live_builtin_gesture": builtin_choice[0].value,
-                "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
-                "live_custom_gesture": custom_choice[0].value,
-                "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
-                "live_custom_enabled": _live_custom_gesture_enabled(self.config),
-                "live_hand_count": hand_count,
-                "live_hand_box_count": len(current_hand_boxes),
-                "effective_live_hand_box_count": len(effective_hand_boxes),
-                "live_hand_box_source": hand_box_source,
-                "live_result_age_s": _round_optional_confidence(result_age_s),
-                "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
-                "current_live_builtin_ready": current_live_builtin_ready,
-                "current_live_custom_ready": current_live_custom_ready,
-                "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
-                "input_person_count": max(0, int(person_count)),
-                "primary_person_box_available": primary_person_box is not None,
-                "effective_primary_person_box_available": effective_primary_person_box is not None,
-                "primary_person_box_source": primary_person_box_source,
-                "pose_hint_keypoint_count": len(sparse_keypoints),
-                "visible_person_box_count": len(live_visible_person_boxes),
-                "effective_visible_person_box_count": len(effective_visible_person_boxes),
-                "visible_person_box_source": visible_person_box_source,
-                "person_roi_candidate_count": len(effective_visible_person_boxes),
-                "person_roi_detection_count": 0,
-                "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
-                "person_roi_combined_confidence": None,
-                "person_roi_short_circuit_used": False,
-                "person_roi_short_circuit_reason": None,
-                "person_roi_block_reason": None,
-                "full_frame_hand_attempt_reason": None,
-            }
-            person_roi_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
-            if effective_visible_person_boxes:
+            rescue_blocked_by_live_no_hand = (
+                fresh_live_results_confirm_no_hand and not effective_hand_boxes
+            )
+
+            selected_person_boxes = _prioritize_person_boxes(
+                primary_person_box=effective_primary_person_box,
+                person_boxes=effective_visible_person_boxes,
+                limit=_live_max_person_roi_candidates(self.config),
+            )
+            debug_snapshot["person_roi_candidate_count"] = len(selected_person_boxes)
+
+            if selected_person_boxes and observe_policy.allow_person_roi_recovery:
                 person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
                     runtime=runtime,
                     frame_rgb=frame_rgb,
                     timestamp_ms=timestamp_ms,
                     primary_person_box=effective_primary_person_box,
-                    person_boxes=effective_visible_person_boxes,
+                    person_boxes=selected_person_boxes,
                     sparse_keypoints=sparse_keypoints,
+                    allow_custom=observe_policy.enable_custom_roi,
                 )
                 debug_snapshot.update(person_roi_debug)
                 if rescue_blocked_by_live_no_hand and not _allow_person_roi_rescue_despite_live_no_hand(
-                    person_roi_choice[0]
+                    person_roi_choice[0],
+                    detection_debug=person_roi_debug.get("person_roi_detection_debug", ()),
                 ):
                     debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
                 elif person_roi_choice[0] != AICameraFineHandGesture.NONE:
                     fine_hand_gesture, fine_hand_confidence = person_roi_choice
-                    if len(effective_visible_person_boxes) > 1 and visible_person_box_source in {"live", "recent"}:
-                        debug_snapshot["resolved_source"] = (
-                            "visible_person_roi"
-                            if visible_person_box_source == "live"
-                            else "recent_visible_person_roi"
-                        )
-                    else:
-                        debug_snapshot["resolved_source"] = (
-                            "person_roi" if visible_person_box_source == "live" else "recent_person_roi"
-                        )
+                    debug_snapshot["resolved_source"] = (
+                        "recent_visible_person_roi"
+                        if len(selected_person_boxes) > 1 and visible_person_box_source == "recent"
+                        else "visible_person_roi"
+                        if len(selected_person_boxes) > 1
+                        else "recent_person_roi"
+                        if visible_person_box_source == "recent"
+                        else "person_roi"
+                    )
+            elif selected_person_boxes and not observe_policy.allow_person_roi_recovery:
+                debug_snapshot["person_roi_block_reason"] = "observe_policy_disallows_person_roi_recovery"
             elif rescue_blocked_by_live_no_hand:
                 debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
-            if fine_hand_gesture == AICameraFineHandGesture.NONE:
+
+            selected_hand_boxes = _prioritize_hand_boxes(
+                hand_boxes=effective_hand_boxes,
+                limit=_live_max_hand_roi_candidates(self.config),
+            )
+            debug_snapshot["live_roi_candidate_count"] = len(selected_hand_boxes)
+            debug_snapshot["live_roi_hand_box_count"] = len(selected_hand_boxes)
+
+            if fine_hand_gesture == AICameraFineHandGesture.NONE and rescue_blocked_by_live_no_hand:
+                debug_snapshot["live_roi_skip_reason"] = "fresh_live_results_confirm_no_hand"
+            elif fine_hand_gesture == AICameraFineHandGesture.NONE and observe_policy.allow_live_hand_roi_recovery:
                 rescue_choice, live_roi_debug = self._recognize_from_live_hand_rois(
                     runtime=runtime,
                     frame_rgb=frame_rgb,
-                    hand_boxes=effective_hand_boxes,
+                    hand_boxes=selected_hand_boxes,
                     hand_box_source=hand_box_source,
+                    allow_custom=observe_policy.enable_custom_roi,
                 )
                 debug_snapshot.update(live_roi_debug)
                 if rescue_choice[0] != AICameraFineHandGesture.NONE:
@@ -492,13 +823,18 @@ class LiveGesturePipeline:
                     debug_snapshot["resolved_source"] = (
                         "live_hand_roi" if hand_box_source == "live" else "recent_live_hand_roi"
                     )
+            elif fine_hand_gesture == AICameraFineHandGesture.NONE:
+                debug_snapshot["live_roi_skip_reason"] = "observe_policy_disallows_live_hand_roi_recovery"
+
             if rescue_blocked_by_live_no_hand and fine_hand_gesture == AICameraFineHandGesture.NONE:
                 debug_snapshot["full_frame_hand_attempt_reason"] = "fresh_live_results_confirm_no_hand"
+            elif fine_hand_gesture == AICameraFineHandGesture.NONE and not observe_policy.allow_full_frame_hand_recovery:
+                debug_snapshot["full_frame_hand_attempt_reason"] = "observe_policy_disallows_full_frame_hand_recovery"
             else:
                 full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
                     fine_hand_gesture=fine_hand_gesture,
-                    effective_visible_person_boxes=effective_visible_person_boxes,
-                    effective_hand_boxes=effective_hand_boxes,
+                    effective_visible_person_boxes=selected_person_boxes,
+                    effective_hand_boxes=selected_hand_boxes,
                     person_roi_detection_count=_coerce_nonnegative_int(
                         debug_snapshot.get("person_roi_detection_count")
                     ),
@@ -506,49 +842,52 @@ class LiveGesturePipeline:
                         debug_snapshot.get("live_roi_hand_box_count")
                     ),
                     live_roi_combined_gesture=str(
-                        debug_snapshot.get("live_roi_combined_gesture", AICameraFineHandGesture.NONE.value)
+                        debug_snapshot.get(
+                            "live_roi_combined_gesture",
+                            AICameraFineHandGesture.NONE.value,
+                        )
                         or AICameraFineHandGesture.NONE.value
                     ),
                 )
                 if full_frame_rescue_reason is not None:
-                    full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
-                        runtime=runtime,
-                        frame_rgb=frame_rgb,
-                        timestamp_ms=timestamp_ms,
-                    )
-                    debug_snapshot.update(full_frame_debug)
-                    debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
-                    hand_count = max(
-                        hand_count,
-                        _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
-                    )
-                    if full_frame_choice[0] != AICameraFineHandGesture.NONE:
-                        fine_hand_gesture, fine_hand_confidence = full_frame_choice
-                        debug_snapshot["resolved_source"] = "full_frame_hand_roi"
-        else:
-            debug_snapshot = {
-                "resolved_source": "live_stream",
-                "live_builtin_gesture": builtin_choice[0].value,
-                "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
-                "live_custom_gesture": custom_choice[0].value,
-                "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
-                "live_custom_enabled": _live_custom_gesture_enabled(self.config),
-                "live_hand_count": hand_count,
-                "live_hand_box_count": len(current_hand_boxes),
-                "live_result_age_s": _round_optional_confidence(result_age_s),
-                "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
-                "current_live_builtin_ready": current_live_builtin_ready,
-                "current_live_custom_ready": current_live_custom_ready,
-                "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
-                "input_person_count": max(0, int(person_count)),
-                "primary_person_box_available": primary_person_box is not None,
-                "effective_primary_person_box_available": effective_primary_person_box is not None,
-                "primary_person_box_source": primary_person_box_source,
-                "pose_hint_keypoint_count": len(sparse_keypoints),
-                "visible_person_box_count": len(live_visible_person_boxes),
-                "effective_visible_person_box_count": len(effective_visible_person_boxes),
-                "visible_person_box_source": visible_person_box_source,
-            }
+                    if not self._reserve_full_frame_rescue(observed_at):
+                        debug_snapshot["full_frame_hand_attempt_reason"] = (
+                            f"{full_frame_rescue_reason}_rate_limited"
+                        )
+                    else:
+                        full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                            runtime=runtime,
+                            frame_rgb=frame_rgb,
+                            timestamp_ms=timestamp_ms,
+                            allow_custom=observe_policy.enable_custom_roi,
+                        )
+                        debug_snapshot.update(full_frame_debug)
+                        debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
+                        hand_count = max(
+                            hand_count,
+                            _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
+                        )
+                        if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                            fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                            debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+
+        raw_resolved_source = str(debug_snapshot.get("resolved_source", "none") or "none")
+        stabilized_gesture, stabilized_confidence, temporal_debug = self._stability_tracker.observe(
+            observed_at=observed_at,
+            gesture=fine_hand_gesture,
+            confidence=fine_hand_confidence,
+            resolved_source=raw_resolved_source,
+            hand_count=hand_count,
+        )
+        debug_snapshot.update(temporal_debug)
+        if bool(debug_snapshot.get("temporal_output_changed")):
+            debug_snapshot["resolved_source_raw"] = raw_resolved_source
+            debug_snapshot["resolved_source"] = str(
+                debug_snapshot.get("temporal_resolved_source", raw_resolved_source) or raw_resolved_source
+            )
+        fine_hand_gesture = stabilized_gesture
+        fine_hand_confidence = stabilized_confidence
+
         workflow_decision(
             msg="live_gesture_pipeline_resolution",
             question="Which bounded gesture source should the live gesture pipeline expose for this frame?",
@@ -562,6 +901,9 @@ class LiveGesturePipeline:
                 {"id": "visible_person_roi", "summary": "Use a visible-person ROI hand result."},
                 {"id": "live_hand_roi", "summary": "Use the tight live hand ROI rescue result."},
                 {"id": "full_frame_hand_roi", "summary": "Use the whole-frame hand rescue result."},
+                {"id": "temporal_consensus", "summary": "Use the small temporal consensus layer."},
+                {"id": "temporal_hold", "summary": "Briefly hold the last stable gesture across a short miss."},
+                {"id": "temporal_guard", "summary": "Suppress a weak rescue result until it repeats."},
                 {"id": "none", "summary": "Expose no concrete fine-hand gesture from this frame."},
             ],
             context={
@@ -575,6 +917,8 @@ class LiveGesturePipeline:
                 "live_roi_combined_confidence": debug_snapshot.get("live_roi_combined_confidence"),
                 "full_frame_hand_combined_gesture": debug_snapshot.get("full_frame_hand_combined_gesture"),
                 "full_frame_hand_combined_confidence": debug_snapshot.get("full_frame_hand_combined_confidence"),
+                "temporal_output_gesture": debug_snapshot.get("temporal_output_gesture"),
+                "temporal_output_confidence": debug_snapshot.get("temporal_output_confidence"),
                 "hand_count": hand_count,
             },
             confidence=_round_optional_confidence(fine_hand_confidence),
@@ -590,8 +934,10 @@ class LiveGesturePipeline:
                 "result_age_s": _round_optional_confidence(result_age_s),
             },
         )
+
         with self._lock:
             self._last_debug_snapshot = dict(debug_snapshot)
+
         return LiveGestureFrameObservation(
             observed_at=observed_at,
             fine_hand_gesture=fine_hand_gesture,
@@ -611,50 +957,46 @@ class LiveGesturePipeline:
         primary_person_box: AICameraBox | None,
         person_boxes: tuple[AICameraBox, ...],
         sparse_keypoints: dict[int, tuple[float, float, float]],
-    ) -> tuple[tuple[AICameraFineHandGesture, float | None], dict[str, object]]:
-        """Recover concrete symbols from bounded visible-person upper-body ROIs."""
+        allow_custom: bool,
+    ) -> tuple[_GestureChoice, dict[str, object]]:
+        debug: dict[str, object] = {
+            "person_roi_candidate_count": len(person_boxes),
+            "person_roi_detection_count": 0,
+            "person_roi_detection_debug": (),
+            "person_roi_match_index": None,
+            "person_roi_builtin_gesture": AICameraFineHandGesture.NONE.value,
+            "person_roi_builtin_confidence": None,
+            "person_roi_builtin_detection_index": None,
+            "person_roi_custom_gesture": AICameraFineHandGesture.NONE.value,
+            "person_roi_custom_confidence": None,
+            "person_roi_custom_detection_index": None,
+            "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
+            "person_roi_combined_confidence": None,
+            "person_roi_combined_source": None,
+            "person_roi_pose_hint_match_index": None,
+            "person_roi_short_circuit_used": False,
+            "person_roi_short_circuit_index": None,
+            "person_roi_short_circuit_confidence": None,
+            "person_roi_short_circuit_reason": None,
+        }
+        best_builtin_choice = _PersonRoiGestureChoice()
+        best_custom_choice = _PersonRoiGestureChoice()
+        best_combined_choice = _PersonRoiGestureChoice()
+        best_detection_debug: tuple[dict[str, object], ...] = ()
+        best_match_index: int | None = None
+        pose_hint_match_index: int | None = None
+        roi_options: list[dict[str, object]] = []
 
-        with workflow_span(
-            name="live_gesture_pipeline_person_roi_recovery",
-            kind="decision",
-            details={"person_roi_candidate_count": len(person_boxes)},
-        ):
-            debug = {
-                "person_roi_candidate_count": len(person_boxes),
-                "person_roi_detection_count": 0,
-                "person_roi_detection_debug": (),
-                "person_roi_match_index": None,
-                "person_roi_builtin_gesture": AICameraFineHandGesture.NONE.value,
-                "person_roi_builtin_confidence": None,
-                "person_roi_builtin_detection_index": None,
-                "person_roi_custom_gesture": AICameraFineHandGesture.NONE.value,
-                "person_roi_custom_confidence": None,
-                "person_roi_custom_detection_index": None,
-                "person_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
-                "person_roi_combined_confidence": None,
-                "person_roi_combined_source": None,
-                "person_roi_pose_hint_match_index": None,
-                "person_roi_short_circuit_used": False,
-                "person_roi_short_circuit_index": None,
-                "person_roi_short_circuit_confidence": None,
-                "person_roi_short_circuit_reason": None,
-            }
-            best_builtin_choice = _PersonRoiGestureChoice()
-            best_custom_choice = _PersonRoiGestureChoice()
-            best_combined_choice = _PersonRoiGestureChoice()
-            best_detection_debug: tuple[dict[str, object], ...] = ()
-            best_match_index: int | None = None
-            pose_hint_match_index: int | None = None
-            roi_options: list[dict[str, object]] = []
-            for index, person_box in enumerate(person_boxes):
-                candidate_sparse_keypoints = self._person_roi_sparse_keypoints(
-                    person_box=person_box,
-                    primary_person_box=primary_person_box,
-                    sparse_keypoints=sparse_keypoints,
-                )
-                pose_hint_attached = bool(candidate_sparse_keypoints)
-                if candidate_sparse_keypoints and pose_hint_match_index is None:
-                    pose_hint_match_index = index
+        for index, person_box in enumerate(person_boxes):
+            candidate_sparse_keypoints = self._person_roi_sparse_keypoints(
+                person_box=person_box,
+                primary_person_box=primary_person_box,
+                sparse_keypoints=sparse_keypoints,
+            )
+            pose_hint_attached = bool(candidate_sparse_keypoints)
+            if candidate_sparse_keypoints and pose_hint_match_index is None:
+                pose_hint_match_index = index
+            try:
                 hand_landmark_result = self._ensure_hand_landmark_worker().analyze(
                     runtime=runtime,
                     frame_rgb=frame_rgb,
@@ -662,103 +1004,111 @@ class LiveGesturePipeline:
                     primary_person_box=person_box,
                     sparse_keypoints=candidate_sparse_keypoints,
                 )
-                detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
-                debug["person_roi_detection_count"] = (
-                    _coerce_nonnegative_int(debug.get("person_roi_detection_count")) + len(detections)
-                )
-                (
-                    builtin_choice,
-                    custom_choice,
-                    detection_debug,
-                ) = self._recognize_from_hand_landmark_result(
-                    runtime=runtime,
-                    hand_landmark_result=hand_landmark_result,
-                )
-                combined = _combine_person_roi_gesture_choices(
-                    builtin=builtin_choice,
-                    custom=custom_choice,
-                )
+            except Exception as exc:
                 roi_options.append(
                     {
                         "id": f"person_roi_{index}",
-                        "summary": f"ROI {index} produced {combined.gesture.value}.",
+                        "summary": f"ROI {index} hand-landmark stage failed.",
                         "score_components": {
-                            "detection_count": len(detections),
-                            "builtin_gesture": builtin_choice.gesture.value,
-                            "builtin_confidence": _round_optional_confidence(builtin_choice.confidence),
-                            "builtin_source": builtin_choice.roi_source or None,
-                            "custom_gesture": custom_choice.gesture.value,
-                            "custom_confidence": _round_optional_confidence(custom_choice.confidence),
-                            "custom_source": custom_choice.roi_source or None,
-                            "combined_gesture": combined.gesture.value,
-                            "combined_confidence": _round_optional_confidence(combined.confidence),
-                            "combined_source": combined.roi_source or None,
                             "pose_hint_attached": pose_hint_attached,
+                            "error": _short_exception(exc),
                         },
-                        "constraints_violated": (
-                            []
-                            if combined.gesture != AICameraFineHandGesture.NONE
-                            else ["no_symbol_or_source_guard"]
-                        ),
+                        "constraints_violated": ["hand_landmark_error"],
                     }
                 )
-                if not best_detection_debug and detection_debug:
-                    best_detection_debug = detection_debug
-                if _prefer_person_roi_gesture_choice(best_combined_choice, combined) != best_combined_choice:
-                    best_builtin_choice = builtin_choice
-                    best_custom_choice = custom_choice
-                    best_combined_choice = combined
-                    best_detection_debug = detection_debug
-                    best_match_index = index
-                if _should_short_circuit_person_roi_scan(
-                    config=self.config,
-                    pose_hint_attached=pose_hint_attached,
-                    candidate=combined,
-                ):
-                    debug["person_roi_short_circuit_used"] = True
-                    debug["person_roi_short_circuit_index"] = index
-                    debug["person_roi_short_circuit_confidence"] = _round_optional_confidence(
-                        combined.confidence
-                    )
-                    debug["person_roi_short_circuit_reason"] = (
-                        _PERSON_ROI_POSE_HINT_SHORT_CIRCUIT_REASON
-                    )
-                    break
-            debug.update(
+                continue
+
+            detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
+            debug["person_roi_detection_count"] = (
+                _coerce_nonnegative_int(debug.get("person_roi_detection_count")) + len(detections)
+            )
+
+            builtin_choice, custom_choice, detection_debug = self._recognize_from_hand_landmark_result(
+                runtime=runtime,
+                hand_landmark_result=hand_landmark_result,
+                allow_custom=allow_custom,
+            )
+            combined = _combine_person_roi_gesture_choices(
+                builtin=builtin_choice,
+                custom=custom_choice,
+            )
+
+            roi_options.append(
                 {
-                    "person_roi_detection_debug": best_detection_debug,
-                    "person_roi_match_index": best_match_index,
-                    "person_roi_builtin_gesture": best_builtin_choice.gesture.value,
-                    "person_roi_builtin_confidence": _round_optional_confidence(best_builtin_choice.confidence),
-                    "person_roi_builtin_detection_index": best_builtin_choice.detection_index,
-                    "person_roi_custom_gesture": best_custom_choice.gesture.value,
-                    "person_roi_custom_confidence": _round_optional_confidence(best_custom_choice.confidence),
-                    "person_roi_custom_detection_index": best_custom_choice.detection_index,
-                    "person_roi_combined_gesture": best_combined_choice.gesture.value,
-                    "person_roi_combined_confidence": _round_optional_confidence(best_combined_choice.confidence),
-                    "person_roi_combined_source": best_combined_choice.roi_source or None,
-                    "person_roi_pose_hint_match_index": pose_hint_match_index,
+                    "id": f"person_roi_{index}",
+                    "summary": f"ROI {index} produced {combined.gesture.value}.",
+                    "score_components": {
+                        "detection_count": len(detections),
+                        "builtin_gesture": builtin_choice.gesture.value,
+                        "builtin_confidence": _round_optional_confidence(builtin_choice.confidence),
+                        "custom_gesture": custom_choice.gesture.value,
+                        "custom_confidence": _round_optional_confidence(custom_choice.confidence),
+                        "combined_gesture": combined.gesture.value,
+                        "combined_confidence": _round_optional_confidence(combined.confidence),
+                        "pose_hint_attached": pose_hint_attached,
+                    },
+                    "constraints_violated": (
+                        [] if combined.gesture != AICameraFineHandGesture.NONE else ["no_symbol_or_source_guard"]
+                    ),
                 }
             )
-            workflow_decision(
-                msg="live_gesture_pipeline_person_roi_selection",
-                question="Which visible-person ROI should win the person-conditioned gesture recovery stage?",
-                selected={
-                    "id": "none" if best_match_index is None else f"person_roi_{best_match_index}",
-                    "summary": "Use the strongest person ROI gesture candidate for this frame.",
-                },
-                options=roi_options or [{"id": "none", "summary": "No person ROI candidates were available."}],
-                context={
-                    "person_roi_candidate_count": len(person_boxes),
-                    "person_roi_detection_count": debug["person_roi_detection_count"],
-                    "pose_hint_match_index": pose_hint_match_index,
-                    "combined_source": best_combined_choice.roi_source or None,
-                },
-                confidence=_round_optional_confidence(best_combined_choice.confidence),
-                guardrails=["person_roi_priority_order", "person_roi_source_confidence_guard"],
-                kpi_impact_estimate={"latency": "medium", "gesture_accuracy": "high"},
-            )
-            return best_combined_choice.as_choice(), debug
+
+            if not best_detection_debug and detection_debug:
+                best_detection_debug = detection_debug
+            if _prefer_person_roi_gesture_choice(best_combined_choice, combined) != best_combined_choice:
+                best_builtin_choice = builtin_choice
+                best_custom_choice = custom_choice
+                best_combined_choice = combined
+                best_detection_debug = detection_debug
+                best_match_index = index
+
+            if _should_short_circuit_person_roi_scan(
+                config=self.config,
+                pose_hint_attached=pose_hint_attached,
+                candidate=combined,
+            ):
+                debug["person_roi_short_circuit_used"] = True
+                debug["person_roi_short_circuit_index"] = index
+                debug["person_roi_short_circuit_confidence"] = _round_optional_confidence(combined.confidence)
+                debug["person_roi_short_circuit_reason"] = _PERSON_ROI_POSE_HINT_SHORT_CIRCUIT_REASON
+                break
+
+        debug.update(
+            {
+                "person_roi_detection_debug": best_detection_debug,
+                "person_roi_match_index": best_match_index,
+                "person_roi_builtin_gesture": best_builtin_choice.gesture.value,
+                "person_roi_builtin_confidence": _round_optional_confidence(best_builtin_choice.confidence),
+                "person_roi_builtin_detection_index": best_builtin_choice.detection_index,
+                "person_roi_custom_gesture": best_custom_choice.gesture.value,
+                "person_roi_custom_confidence": _round_optional_confidence(best_custom_choice.confidence),
+                "person_roi_custom_detection_index": best_custom_choice.detection_index,
+                "person_roi_combined_gesture": best_combined_choice.gesture.value,
+                "person_roi_combined_confidence": _round_optional_confidence(best_combined_choice.confidence),
+                "person_roi_combined_source": best_combined_choice.roi_source or None,
+                "person_roi_pose_hint_match_index": pose_hint_match_index,
+            }
+        )
+
+        workflow_decision(
+            msg="live_gesture_pipeline_person_roi_selection",
+            question="Which visible-person ROI should win the person-conditioned gesture recovery stage?",
+            selected={
+                "id": "none" if best_match_index is None else f"person_roi_{best_match_index}",
+                "summary": "Use the strongest person ROI gesture candidate for this frame.",
+            },
+            options=roi_options or [{"id": "none", "summary": "No person ROI candidates were available."}],
+            context={
+                "person_roi_candidate_count": len(person_boxes),
+                "person_roi_detection_count": debug["person_roi_detection_count"],
+                "pose_hint_match_index": pose_hint_match_index,
+                "combined_source": best_combined_choice.roi_source or None,
+            },
+            confidence=_round_optional_confidence(best_combined_choice.confidence),
+            guardrails=["person_roi_priority_order", "person_roi_source_confidence_guard"],
+            kpi_impact_estimate={"latency": "medium", "gesture_accuracy": "high"},
+        )
+        return best_combined_choice.as_choice(), debug
 
     def _person_roi_sparse_keypoints(
         self,
@@ -767,8 +1117,6 @@ class LiveGesturePipeline:
         primary_person_box: AICameraBox | None,
         sparse_keypoints: dict[int, tuple[float, float, float]],
     ) -> dict[int, tuple[float, float, float]]:
-        """Attach pose hints only to the ROI that still matches the tracked primary person."""
-
         if not sparse_keypoints or primary_person_box is None:
             return {}
         if person_box == primary_person_box:
@@ -785,27 +1133,19 @@ class LiveGesturePipeline:
         *,
         runtime: dict[str, Any],
         hand_landmark_result: object,
-    ) -> tuple[
-        _PersonRoiGestureChoice,
-        _PersonRoiGestureChoice,
-        tuple[dict[str, object], ...],
-    ]:
-        """Run bounded image-mode gesture recognition on hand-ROI landmark crops."""
-
+        allow_custom: bool,
+    ) -> tuple[_PersonRoiGestureChoice, _PersonRoiGestureChoice, tuple[dict[str, object], ...]]:
         detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
         if not detections:
-            return (
-                _PersonRoiGestureChoice(),
-                _PersonRoiGestureChoice(),
-                (),
-            )
+            return _PersonRoiGestureChoice(), _PersonRoiGestureChoice(), ()
 
         builtin_choice = _PersonRoiGestureChoice()
         custom_choice = _PersonRoiGestureChoice()
         detection_debug: list[dict[str, object]] = []
+
         builtin_recognizer = self._runtime.ensure_roi_gesture_recognizer(runtime)
         custom_recognizer = None
-        if _live_custom_gesture_enabled(self.config):
+        if allow_custom and _live_custom_gesture_enabled(self.config):
             custom_recognizer = self._runtime.ensure_custom_roi_gesture_recognizer(runtime)
 
         for index, detection in enumerate(detections):
@@ -818,6 +1158,7 @@ class LiveGesturePipeline:
                 primary_frame=gesture_frame,
                 context_frame=getattr(detection, "gesture_context_frame_rgb", None),
             )
+
             (
                 builtin_raw_candidate,
                 builtin_result,
@@ -839,62 +1180,42 @@ class LiveGesturePipeline:
                 gesture_frame_source=gesture_frame_source,
                 detection_index=index,
             )
-            next_builtin_choice = _prefer_person_roi_gesture_choice(
-                builtin_choice,
-                builtin_candidate,
-            )
-            builtin_choice = next_builtin_choice
-            custom_result = None
+            builtin_choice = _prefer_person_roi_gesture_choice(builtin_choice, builtin_candidate)
+
+            custom_result: object | None = None
             custom_raw_candidate: _GestureChoice = (AICameraFineHandGesture.NONE, None)
+            custom_context_retry_used = False
+            custom_context_candidate: _GestureChoice = (AICameraFineHandGesture.NONE, None)
+            custom_context_result: object | None = None
             custom_candidate = _PersonRoiGestureChoice(
                 roi_source=roi_source,
                 detection_index=index,
             )
-            if custom_recognizer is None:
-                detection_debug.append(
-                    _summarize_roi_gesture_debug(
-                        detection=detection,
-                        builtin_raw_candidate=builtin_raw_candidate,
-                        builtin_candidate=builtin_candidate,
-                        builtin_result=builtin_result,
-                        builtin_context_retry_used=builtin_context_retry_used,
-                        builtin_context_candidate=builtin_context_candidate,
-                        builtin_context_result=builtin_context_result,
-                        custom_raw_candidate=custom_raw_candidate,
-                        custom_candidate=custom_candidate,
-                        custom_result=custom_result,
-                        custom_context_retry_used=False,
-                        custom_context_candidate=(AICameraFineHandGesture.NONE, None),
-                        custom_context_result=None,
-                    )
+
+            if custom_recognizer is not None:
+                (
+                    custom_raw_candidate,
+                    custom_result,
+                    custom_context_retry_used,
+                    custom_context_candidate,
+                    custom_context_result,
+                ) = _recognize_roi_gesture_candidate_with_context_retry(
+                    runtime_interface=self._runtime,
+                    runtime=runtime,
+                    recognizer=custom_recognizer,
+                    frame_rgb=gesture_frame,
+                    context_frame_rgb=gesture_context_frame,
+                    category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
+                    min_score=_live_custom_min_score(self.config),
                 )
-                continue
-            (
-                custom_raw_candidate,
-                custom_result,
-                custom_context_retry_used,
-                custom_context_candidate,
-                custom_context_result,
-            ) = _recognize_roi_gesture_candidate_with_context_retry(
-                runtime_interface=self._runtime,
-                runtime=runtime,
-                recognizer=custom_recognizer,
-                frame_rgb=gesture_frame,
-                context_frame_rgb=gesture_context_frame,
-                category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-                min_score=_live_custom_min_score(self.config),
-            )
-            custom_candidate = _guard_person_roi_gesture_choice(
-                candidate=custom_raw_candidate,
-                roi_source=roi_source,
-                gesture_frame_source=gesture_frame_source,
-                detection_index=index,
-            )
-            next_custom_choice = _prefer_person_roi_gesture_choice(
-                custom_choice,
-                custom_candidate,
-            )
-            custom_choice = next_custom_choice
+                custom_candidate = _guard_person_roi_gesture_choice(
+                    candidate=custom_raw_candidate,
+                    roi_source=roi_source,
+                    gesture_frame_source=gesture_frame_source,
+                    detection_index=index,
+                )
+                custom_choice = _prefer_person_roi_gesture_choice(custom_choice, custom_candidate)
+
             detection_debug.append(
                 _summarize_roi_gesture_debug(
                     detection=detection,
@@ -912,20 +1233,37 @@ class LiveGesturePipeline:
                     custom_context_result=custom_context_result,
                 )
             )
-        return (
-            builtin_choice,
-            custom_choice,
-            tuple(detection_debug),
-        )
+
+        return builtin_choice, custom_choice, tuple(detection_debug)
+
+    def _make_builtin_result_handler(self, generation: int):
+        def _callback(result: object, output_image: object, timestamp_ms: int) -> None:
+            self._handle_builtin_result(
+                result=result,
+                _output_image=output_image,
+                timestamp_ms=timestamp_ms,
+                generation=generation,
+            )
+        return _callback
+
+    def _make_custom_result_handler(self, generation: int):
+        def _callback(result: object, output_image: object, timestamp_ms: int) -> None:
+            self._handle_custom_result(
+                result=result,
+                _output_image=output_image,
+                timestamp_ms=timestamp_ms,
+                generation=generation,
+            )
+        return _callback
 
     def _handle_builtin_result(
         self,
+        *,
         result: object,
         _output_image: object,
         timestamp_ms: int,
+        generation: int,
     ) -> None:
-        """Store one built-in live-stream recognizer callback result."""
-
         gesture, confidence = resolve_fine_hand_gesture(
             result=result,
             category_map=_LIVE_BUILTIN_FINE_GESTURE_MAP,
@@ -943,18 +1281,25 @@ class LiveGesturePipeline:
             hand_boxes=_extract_hand_boxes(result),
         )
         with self._result_condition:
+            if generation != self._callback_generation:
+                return
+            _remember_snapshot(
+                self._builtin_history,
+                snapshot,
+                max_items=_live_result_history_size(self.config),
+            )
             if self._latest_builtin is None or snapshot.timestamp_ms >= self._latest_builtin.timestamp_ms:
                 self._latest_builtin = snapshot
             self._result_condition.notify_all()
 
     def _handle_custom_result(
         self,
+        *,
         result: object,
         _output_image: object,
         timestamp_ms: int,
+        generation: int,
     ) -> None:
-        """Store one custom live-stream recognizer callback result."""
-
         gesture, confidence = resolve_fine_hand_gesture(
             result=result,
             category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
@@ -969,6 +1314,13 @@ class LiveGesturePipeline:
             hand_boxes=_extract_hand_boxes(result),
         )
         with self._result_condition:
+            if generation != self._callback_generation:
+                return
+            _remember_snapshot(
+                self._custom_history,
+                snapshot,
+                max_items=_live_result_history_size(self.config),
+            )
             if self._latest_custom is None or snapshot.timestamp_ms >= self._latest_custom.timestamp_ms:
                 self._latest_custom = snapshot
             self._result_condition.notify_all()
@@ -978,20 +1330,12 @@ class LiveGesturePipeline:
         *,
         runtime: dict[str, Any],
         frame_rgb: Any,
-        hand_boxes: tuple[tuple[float, float, float, float], ...],
+        hand_boxes: tuple[_HandBox, ...],
         hand_box_source: str,
-    ) -> tuple[tuple[AICameraFineHandGesture, float | None], dict[str, object]]:
-        """Recover concrete symbols from tight hand crops when live labels stay empty.
-
-        The full-frame live recognizer is the fastest path, but on the Pi it can
-        already localize a hand while still labeling the frame as `none`.
-        Reusing those live hand landmarks for tight IMAGE-mode ROI gesture
-        recognition recovers explicit symbols without pulling the hot path back
-        through the heavier social-vision pipeline.
-        """
-
-        debug = {
-            "live_roi_hand_box_count": 0,
+        allow_custom: bool,
+    ) -> tuple[_GestureChoice, dict[str, object]]:
+        debug: dict[str, object] = {
+            "live_roi_hand_box_count": len(hand_boxes),
             "live_roi_hand_box_source": hand_box_source,
             "live_roi_detection_debug": (),
             "live_roi_builtin_gesture": AICameraFineHandGesture.NONE.value,
@@ -1001,69 +1345,75 @@ class LiveGesturePipeline:
             "live_roi_combined_gesture": AICameraFineHandGesture.NONE.value,
             "live_roi_combined_confidence": None,
         }
-        debug["live_roi_hand_box_count"] = len(hand_boxes)
         if not hand_boxes:
             return (AICameraFineHandGesture.NONE, None), debug
 
         builtin_recognizer = self._runtime.ensure_roi_gesture_recognizer(runtime)
         custom_recognizer = None
-        if _live_custom_gesture_enabled(self.config):
+        if allow_custom and _live_custom_gesture_enabled(self.config):
             custom_recognizer = self._runtime.ensure_custom_roi_gesture_recognizer(runtime)
 
         builtin_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
         custom_choice: _GestureChoice = (AICameraFineHandGesture.NONE, None)
         hand_box_options: list[dict[str, object]] = []
         hand_box_debug: list[dict[str, object]] = []
+
         for index, hand_box in enumerate(hand_boxes):
             crop = _crop_hand_box(frame_rgb, hand_box)
             if crop is None:
+                hand_box_options.append(
+                    {
+                        "id": f"live_hand_roi_{index}",
+                        "summary": f"Hand ROI {index} crop failed.",
+                        "score_components": {"hand_box_index": index},
+                        "constraints_violated": ["crop_failed"],
+                    }
+                )
                 continue
-            image = self._runtime.build_image(runtime, frame_rgb=crop)
-            builtin_result = builtin_recognizer.recognize(image)
+            try:
+                image = self._runtime.build_image(runtime, frame_rgb=crop)
+                builtin_result = builtin_recognizer.recognize(image)
+            except Exception as exc:
+                hand_box_debug.append({"hand_box_index": index, "error": _short_exception(exc)})
+                hand_box_options.append(
+                    {
+                        "id": f"live_hand_roi_{index}",
+                        "summary": f"Hand ROI {index} recognizer failed.",
+                        "score_components": {"error": _short_exception(exc)},
+                        "constraints_violated": ["recognize_error"],
+                    }
+                )
+                continue
+
             builtin_candidate = resolve_fine_hand_gesture(
                 result=builtin_result,
                 category_map=_LIVE_BUILTIN_FINE_GESTURE_MAP,
                 min_score=self.config.builtin_gesture_min_score,
             )
-            builtin_choice = prefer_gesture_choice(
-                builtin_choice,
-                builtin_candidate,
-            )
+            builtin_choice = prefer_gesture_choice(builtin_choice, builtin_candidate)
+
             custom_result = None
             custom_candidate: _GestureChoice = (AICameraFineHandGesture.NONE, None)
-            if custom_recognizer is None:
-                hand_box_debug.append(
-                    {
-                        "hand_box_index": index,
-                        "builtin_gesture": builtin_candidate[0].value,
-                        "builtin_confidence": _round_optional_confidence(builtin_candidate[1]),
-                        "builtin_categories": _summarize_gesture_categories(builtin_result),
-                    }
-                )
-                hand_box_options.append(
-                    {
-                        "id": f"live_hand_roi_{index}",
-                        "summary": f"Hand ROI {index} produced {builtin_candidate[0].value}.",
-                        "score_components": {
+            if custom_recognizer is not None:
+                try:
+                    custom_result = custom_recognizer.recognize(image)
+                    custom_candidate = resolve_fine_hand_gesture(
+                        result=custom_result,
+                        category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
+                        min_score=_live_custom_min_score(self.config),
+                    )
+                    custom_choice = prefer_gesture_choice(custom_choice, custom_candidate)
+                except Exception as exc:
+                    hand_box_debug.append(
+                        {
+                            "hand_box_index": index,
+                            "custom_error": _short_exception(exc),
                             "builtin_gesture": builtin_candidate[0].value,
                             "builtin_confidence": _round_optional_confidence(builtin_candidate[1]),
-                        },
-                        "constraints_violated": (
-                            [] if builtin_candidate[0] != AICameraFineHandGesture.NONE else ["no_symbol"]
-                        ),
-                    }
-                )
-                continue
-            custom_result = custom_recognizer.recognize(image)
-            custom_candidate = resolve_fine_hand_gesture(
-                result=custom_result,
-                category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-                min_score=_live_custom_min_score(self.config),
-            )
-            custom_choice = prefer_gesture_choice(
-                custom_choice,
-                custom_candidate,
-            )
+                        }
+                    )
+                    custom_result = None
+
             combined_candidate = combine_task_specific_custom_gesture_choice(
                 builtin_candidate,
                 custom_candidate,
@@ -1099,6 +1449,7 @@ class LiveGesturePipeline:
                     ),
                 }
             )
+
         combined = combine_task_specific_custom_gesture_choice(
             builtin_choice,
             custom_choice,
@@ -1115,6 +1466,7 @@ class LiveGesturePipeline:
                 "live_roi_combined_confidence": _round_optional_confidence(combined[1]),
             }
         )
+
         workflow_decision(
             msg="live_gesture_pipeline_live_hand_roi_selection",
             question="Which tight live hand ROI should win the hand-box rescue stage?",
@@ -1139,10 +1491,9 @@ class LiveGesturePipeline:
         runtime: dict[str, Any],
         frame_rgb: Any,
         timestamp_ms: int,
-    ) -> tuple[tuple[AICameraFineHandGesture, float | None], dict[str, object]]:
-        """Recover one symbol from a final bounded whole-frame hand pass."""
-
-        debug = {
+        allow_custom: bool,
+    ) -> tuple[_GestureChoice, dict[str, object]]:
+        debug: dict[str, object] = {
             "full_frame_hand_detection_count": 0,
             "full_frame_hand_detection_debug": (),
             "full_frame_hand_builtin_gesture": AICameraFineHandGesture.NONE.value,
@@ -1152,16 +1503,25 @@ class LiveGesturePipeline:
             "full_frame_hand_combined_gesture": AICameraFineHandGesture.NONE.value,
             "full_frame_hand_combined_confidence": None,
         }
-        hand_landmark_result = self._ensure_hand_landmark_worker().analyze_full_frame(
-            runtime=runtime,
-            frame_rgb=frame_rgb,
-            timestamp_ms=timestamp_ms,
-        )
+        try:
+            hand_landmark_result = self._ensure_hand_landmark_worker().analyze_full_frame(
+                runtime=runtime,
+                frame_rgb=frame_rgb,
+                timestamp_ms=timestamp_ms,
+            )
+        except Exception as exc:
+            debug["full_frame_hand_detection_debug"] = (
+                {"error": _short_exception(exc)},
+            )
+            return (AICameraFineHandGesture.NONE, None), debug
+
         detections = tuple(getattr(hand_landmark_result, "detections", ()) or ())
         debug["full_frame_hand_detection_count"] = len(detections)
+
         builtin_choice, custom_choice, detection_debug = self._recognize_from_hand_landmark_result(
             runtime=runtime,
             hand_landmark_result=hand_landmark_result,
+            allow_custom=allow_custom,
         )
         combined = combine_task_specific_custom_gesture_choice(
             builtin_choice.as_choice(),
@@ -1203,36 +1563,21 @@ class LiveGesturePipeline:
         )
         return combined, debug
 
-    def _fresh_recent_primary_person_box(
-        self,
-        observed_at: float,
-    ) -> AICameraBox | None:
-        """Reuse the newest primary-person ROI hint for short detection flickers only."""
-
+    def _fresh_recent_primary_person_box(self, observed_at: float) -> AICameraBox | None:
         if self._recent_primary_person_box is None or self._recent_primary_person_seen_at is None:
             return None
         if (observed_at - self._recent_primary_person_seen_at) > _RECENT_PRIMARY_PERSON_BOX_TTL_S:
             return None
         return self._recent_primary_person_box
 
-    def _fresh_recent_visible_person_boxes(
-        self,
-        observed_at: float,
-    ) -> tuple[AICameraBox, ...]:
-        """Reuse newest visible-person ROI hints for short detection flickers only."""
-
+    def _fresh_recent_visible_person_boxes(self, observed_at: float) -> tuple[AICameraBox, ...]:
         if not self._recent_visible_person_boxes or self._recent_visible_person_boxes_seen_at is None:
             return ()
         if (observed_at - self._recent_visible_person_boxes_seen_at) > _RECENT_VISIBLE_PERSON_BOXES_TTL_S:
             return ()
         return tuple(self._recent_visible_person_boxes)
 
-    def _fresh_recent_hand_boxes(
-        self,
-        observed_at: float,
-    ) -> tuple[tuple[float, float, float, float], ...]:
-        """Reuse the newest live hand boxes for brief live-stream misses only."""
-
+    def _fresh_recent_hand_boxes(self, observed_at: float) -> tuple[_HandBox, ...]:
         if not self._recent_hand_boxes or self._recent_hand_boxes_seen_at is None:
             return ()
         if (observed_at - self._recent_hand_boxes_seen_at) > _RECENT_HAND_BOXES_TTL_S:
@@ -1240,8 +1585,6 @@ class LiveGesturePipeline:
         return tuple(self._recent_hand_boxes)
 
     def _ensure_hand_landmark_worker(self) -> MediaPipeHandLandmarkWorker:
-        """Reuse or create the bounded person-ROI hand-landmark worker."""
-
         with self._lock:
             if self._hand_landmark_worker is not None:
                 return self._hand_landmark_worker
@@ -1250,20 +1593,38 @@ class LiveGesturePipeline:
             )
             return self._hand_landmark_worker
 
-    def _fresh_snapshot(
+    def _select_snapshot_from_history(
         self,
-        snapshot: _RecognizerSnapshot | None,
         *,
-        observed_at: float,
+        history: OrderedDict[int, _RecognizerSnapshot],
+        max_timestamp_ms: int,
+        frame_time_s: float,
     ) -> _RecognizerSnapshot | None:
-        """Return one recognizer snapshot only while it is still fresh."""
+        for ts, snapshot in reversed(tuple(history.items())):
+            if ts > max_timestamp_ms:
+                continue
+            if _fresh_snapshot(snapshot, frame_time_s=frame_time_s) is not None:
+                return snapshot
+        return None
 
-        if snapshot is None:
-            return None
-        age_s = observed_at - (snapshot.timestamp_ms / 1000.0)
-        if not math.isfinite(age_s) or age_s < 0.0 or age_s > _DEFAULT_MAX_RESULT_AGE_S:
-            return None
-        return snapshot
+    def _reserve_full_frame_rescue(self, observed_at: float) -> bool:
+        min_interval_s = _live_full_frame_rescue_min_interval_s(self.config)
+        with self._lock:
+            if (
+                self._last_full_frame_rescue_at is not None
+                and (observed_at - self._last_full_frame_rescue_at) < min_interval_s
+            ):
+                return False
+            self._last_full_frame_rescue_at = observed_at
+            return True
+
+    def _next_live_timestamp_ms(self, observed_at: float) -> int:
+        proposed = max(1, int(self._runtime.timestamp_ms(observed_at)))
+        with self._lock:
+            if proposed <= self._last_submitted_live_timestamp_ms:
+                proposed = self._last_submitted_live_timestamp_ms + 1
+            self._last_submitted_live_timestamp_ms = proposed
+            return proposed
 
     def _await_current_live_results(
         self,
@@ -1271,48 +1632,79 @@ class LiveGesturePipeline:
         timestamp_ms: int,
         expect_custom: bool,
     ) -> tuple[float, bool, bool]:
-        """Wait briefly for the current frame's async live callbacks to land."""
-
         wait_started_at = monotonic()
         with self._result_condition:
-            builtin_ready = _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
-            custom_ready = (
-                not expect_custom
-                or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
-            )
+            builtin_ready = timestamp_ms in self._builtin_history
+            custom_ready = (not expect_custom) or (timestamp_ms in self._custom_history)
             if not (builtin_ready and custom_ready):
                 self._result_condition.wait_for(
                     lambda: (
-                        _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
-                        and (
-                            not expect_custom
-                            or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
-                        )
+                        timestamp_ms in self._builtin_history
+                        and ((not expect_custom) or (timestamp_ms in self._custom_history))
                     ),
                     timeout=_DEFAULT_CURRENT_RESULT_WAIT_S,
                 )
-                builtin_ready = _snapshot_matches_timestamp(self._latest_builtin, timestamp_ms)
-                custom_ready = (
-                    not expect_custom
-                    or _snapshot_matches_timestamp(self._latest_custom, timestamp_ms)
-                )
+                builtin_ready = timestamp_ms in self._builtin_history
+                custom_ready = (not expect_custom) or (timestamp_ms in self._custom_history)
         return monotonic() - wait_started_at, builtin_ready, custom_ready
 
+    def _fail_closed_observation(
+        self,
+        *,
+        observed_at: float,
+        observe_policy: LiveGestureObservePolicy,
+        person_count: int,
+        visible_person_boxes: tuple[AICameraBox, ...],
+        sparse_keypoints: dict[int, tuple[float, float, float]],
+        stage: str,
+        exc: Exception,
+    ) -> LiveGestureFrameObservation:
+        debug_snapshot = {
+            "resolved_source": "none",
+            "observe_policy": observe_policy.name,
+            "input_person_count": max(0, int(person_count)),
+            "visible_person_box_count": len(tuple(visible_person_boxes or ())),
+            "pose_hint_keypoint_count": len(sparse_keypoints),
+            "error_stage": stage,
+            "error_type": type(exc).__name__,
+            "error": _short_exception(exc),
+            "fail_closed": True,
+        }
+        workflow_event(
+            kind="error",
+            msg="live_gesture_pipeline_error",
+            details=dict(debug_snapshot),
+        )
+        with self._lock:
+            self._last_debug_snapshot = dict(debug_snapshot)
+        return LiveGestureFrameObservation(observed_at=observed_at)
 
-def _snapshot_matches_timestamp(
+
+def _fresh_snapshot(
     snapshot: _RecognizerSnapshot | None,
-    timestamp_ms: int,
-) -> bool:
-    """Report whether one live snapshot belongs to the requested frame or newer."""
-
+    *,
+    frame_time_s: float,
+) -> _RecognizerSnapshot | None:
     if snapshot is None:
-        return False
-    return snapshot.timestamp_ms >= max(1, int(timestamp_ms))
+        return None
+    age_s = frame_time_s - (snapshot.timestamp_ms / 1000.0)
+    if not math.isfinite(age_s) or age_s < 0.0 or age_s > _DEFAULT_MAX_RESULT_AGE_S:
+        return None
+    return snapshot
+
+
+def _remember_snapshot(
+    history: OrderedDict[int, _RecognizerSnapshot],
+    snapshot: _RecognizerSnapshot,
+    *,
+    max_items: int,
+) -> None:
+    history[snapshot.timestamp_ms] = snapshot
+    while len(history) > max_items:
+        history.popitem(last=False)
 
 
 def _count_hand_landmarks(result: object) -> int:
-    """Count recognized hands from one MediaPipe gesture result."""
-
     hand_landmarks = getattr(result, "hand_landmarks", None)
     if hand_landmarks is None:
         return 0
@@ -1327,8 +1719,6 @@ def _extract_open_palm_center_x(
     *,
     min_score: float,
 ) -> float | None:
-    """Return the center-x of the strongest open-palm hand when present."""
-
     gestures = getattr(result, "gestures", None)
     hand_landmarks = getattr(result, "hand_landmarks", None)
     if gestures is None or hand_landmarks is None:
@@ -1338,6 +1728,7 @@ def _extract_open_palm_center_x(
         landmark_sets = list(hand_landmarks)
     except TypeError:
         return None
+
     best_score = 0.0
     best_center_x = None
     for index, categories in enumerate(gesture_sets):
@@ -1354,11 +1745,7 @@ def _extract_open_palm_center_x(
     return best_center_x
 
 
-def _extract_hand_boxes(
-    result: object,
-) -> tuple[tuple[float, float, float, float], ...]:
-    """Return bounded normalized hand boxes from MediaPipe live landmarks."""
-
+def _extract_hand_boxes(result: object) -> tuple[_HandBox, ...]:
     hand_landmarks = getattr(result, "hand_landmarks", None)
     if hand_landmarks is None:
         return ()
@@ -1366,14 +1753,16 @@ def _extract_hand_boxes(
         landmark_sets = list(hand_landmarks)
     except TypeError:
         return ()
-    boxes: list[tuple[float, float, float, float]] = []
+
+    boxes: list[_HandBox] = []
     for landmarks in landmark_sets:
-        xs: list[float] = []
-        ys: list[float] = []
         try:
             points = list(landmarks)
         except TypeError:
             continue
+
+        xs: list[float] = []
+        ys: list[float] = []
         for point in points:
             x = _coerce_unit_interval(getattr(point, "x", None))
             y = _coerce_unit_interval(getattr(point, "y", None))
@@ -1395,10 +1784,8 @@ def _extract_hand_boxes(
 
 def _crop_hand_box(
     frame_rgb: Any,
-    hand_box: tuple[float, float, float, float],
+    hand_box: _HandBox,
 ) -> Any | None:
-    """Crop one normalized hand box from the current frame when possible."""
-
     if getattr(frame_rgb, "shape", None) is None:
         return frame_rgb
     try:
@@ -1408,11 +1795,13 @@ def _crop_hand_box(
         return None
     if frame_height <= 1 or frame_width <= 1:
         return None
+
     top, left, bottom, right = hand_box
     crop_width = max(0.0, right - left)
     crop_height = max(0.0, bottom - top)
     if crop_width <= 0.0 or crop_height <= 0.0:
         return None
+
     center_x = (left + right) / 2.0
     center_y = (top + bottom) / 2.0
     side = max(
@@ -1425,6 +1814,7 @@ def _crop_hand_box(
     right = center_x + half_side
     top = center_y - half_side
     bottom = center_y + half_side
+
     if left < 0.0:
         right = min(1.0, right - left)
         left = 0.0
@@ -1437,6 +1827,7 @@ def _crop_hand_box(
     if bottom > 1.0:
         top = max(0.0, top - (bottom - 1.0))
         bottom = 1.0
+
     y0 = max(0, min(frame_height - 1, int(math.floor(top * frame_height))))
     x0 = max(0, min(frame_width - 1, int(math.floor(left * frame_width))))
     y1 = max(y0 + 1, min(frame_height, int(math.ceil(bottom * frame_height))))
@@ -1452,8 +1843,6 @@ def _resolve_gesture_context_retry_frame(
     primary_frame: Any,
     context_frame: Any,
 ) -> Any | None:
-    """Return one looser retry crop only when it actually adds hand context."""
-
     if context_frame is None or context_frame is primary_frame:
         return None
     primary_shape = getattr(primary_frame, "shape", None)
@@ -1483,23 +1872,13 @@ def _recognize_roi_gesture_candidate_with_context_retry(
     context_frame_rgb: Any | None,
     category_map: dict[str, AICameraFineHandGesture],
     min_score: float,
-) -> tuple[
-    tuple[AICameraFineHandGesture, float | None],
-    object,
-    bool,
-    tuple[AICameraFineHandGesture, float | None],
-    object | None,
-]:
-    """Retry one hand-centered ROI gesture read with a looser local context crop.
+) -> tuple[_GestureChoice, object | None, bool, _GestureChoice, object | None]:
+    try:
+        image = runtime_interface.build_image(runtime, frame_rgb=frame_rgb)
+        primary_result = recognizer.recognize(image)
+    except Exception:
+        return (AICameraFineHandGesture.NONE, None), None, False, (AICameraFineHandGesture.NONE, None), None
 
-    Pi forensic runs showed person-ROI hand detections that were real enough for
-    MediaPipe Hand Landmarker but still yielded `none` or empty categories in
-    the gesture classifier. Keep the first pass on the tighter crop, then do one
-    bounded retry on a slightly wider hand-centered crop before giving up.
-    """
-
-    image = runtime_interface.build_image(runtime, frame_rgb=frame_rgb)
-    primary_result = recognizer.recognize(image)
     primary_candidate = resolve_fine_hand_gesture(
         result=primary_result,
         category_map=category_map,
@@ -1507,8 +1886,13 @@ def _recognize_roi_gesture_candidate_with_context_retry(
     )
     if primary_candidate[0] != AICameraFineHandGesture.NONE or context_frame_rgb is None:
         return primary_candidate, primary_result, False, (AICameraFineHandGesture.NONE, None), None
-    context_image = runtime_interface.build_image(runtime, frame_rgb=context_frame_rgb)
-    context_result = recognizer.recognize(context_image)
+
+    try:
+        context_image = runtime_interface.build_image(runtime, frame_rgb=context_frame_rgb)
+        context_result = recognizer.recognize(context_image)
+    except Exception:
+        return primary_candidate, primary_result, True, (AICameraFineHandGesture.NONE, None), None
+
     context_candidate = resolve_fine_hand_gesture(
         result=context_result,
         category_map=category_map,
@@ -1522,21 +1906,19 @@ def _recognize_roi_gesture_candidate_with_context_retry(
 def _summarize_roi_gesture_debug(
     *,
     detection: object,
-    builtin_raw_candidate: tuple[AICameraFineHandGesture, float | None],
+    builtin_raw_candidate: _GestureChoice,
     builtin_candidate: _PersonRoiGestureChoice,
-    builtin_result: object,
+    builtin_result: object | None,
     builtin_context_retry_used: bool,
-    builtin_context_candidate: tuple[AICameraFineHandGesture, float | None],
+    builtin_context_candidate: _GestureChoice,
     builtin_context_result: object | None,
-    custom_raw_candidate: tuple[AICameraFineHandGesture, float | None],
+    custom_raw_candidate: _GestureChoice,
     custom_candidate: _PersonRoiGestureChoice,
     custom_result: object | None,
     custom_context_retry_used: bool,
-    custom_context_candidate: tuple[AICameraFineHandGesture, float | None],
+    custom_context_candidate: _GestureChoice,
     custom_context_result: object | None,
 ) -> dict[str, object]:
-    """Return one bounded per-hand gesture debug summary."""
-
     roi_source_value = _coerce_roi_source_value(getattr(detection, "roi_source", None))
     gesture_frame_source = _resolve_detection_gesture_frame_source(detection)
     source_min_confidence = _effective_person_roi_source_min_confidence(
@@ -1582,8 +1964,6 @@ def _summarize_roi_gesture_debug(
 
 
 def _resolve_detection_gesture_frame(detection: object) -> object | None:
-    """Prefer the full-frame landmark crop without relying on array truthiness."""
-
     gesture_frame = getattr(detection, "gesture_frame_rgb", None)
     if gesture_frame is not None:
         return gesture_frame
@@ -1591,22 +1971,16 @@ def _resolve_detection_gesture_frame(detection: object) -> object | None:
 
 
 def _resolve_detection_gesture_frame_source(detection: object) -> str:
-    """Report whether gesture classification used a hand-localized full-frame crop."""
-
     if getattr(detection, "gesture_frame_rgb", None) is not None:
         return "full_frame_landmark_crop"
     return "roi_local_crop"
 
 
 def _live_custom_gesture_enabled(config: MediaPipeVisionConfig) -> bool:
-    """Return whether the live lane should load the custom recognizer at all."""
-
     return bool(getattr(config, "custom_gesture_model_path", None)) and bool(_LIVE_CUSTOM_FINE_GESTURE_MAP)
 
 
 def _live_custom_min_score(config: MediaPipeVisionConfig) -> float:
-    """Clamp live custom-gesture acceptance to a stricter HCI-specific floor."""
-
     configured = _coerce_unit_interval(getattr(config, "custom_gesture_min_score", None))
     return max(_LIVE_CUSTOM_MIN_SCORE_FLOOR, configured or 0.0)
 
@@ -1618,33 +1992,35 @@ def _fresh_live_results_confirm_no_hand(
     hand_count: int,
     live_hand_box_count: int,
 ) -> bool:
-    """Report when fresh live callbacks explicitly found no hand evidence.
-
-    When the dedicated live-stream recognizers are current for this frame and
-    still produce zero hands/boxes, broader person/full-frame rescues become
-    much more likely to hallucinate than to help. The low-latency HCI lane
-    should trust that fresh `no hand` signal and fail closed.
-    """
-
     if not builtin_ready:
         return False
-    if custom_ready is not True:
+    if custom_ready is None:
         return False
     return hand_count <= 0 and live_hand_box_count <= 0
 
 
 def _allow_person_roi_rescue_despite_live_no_hand(
     gesture: AICameraFineHandGesture,
+    *,
+    detection_debug: object = (),
 ) -> bool:
-    """Return whether one person-ROI symbol may override the live no-hand veto.
-
-    Fresh live no-hand evidence should still block the noisy thumb rescue path.
-    Keep one narrow exception for peace_sign, because accepted Pi baseline runs
-    regularly recovered deliberate Victory gestures from person-ROI scans even
-    when the live hand callbacks briefly dropped to zero boxes.
-    """
-
-    return gesture in _LIVE_NO_HAND_PERSON_ROI_ALLOWLIST
+    if gesture in _LIVE_NO_HAND_PERSON_ROI_ALLOWLIST:
+        return True
+    if gesture == AICameraFineHandGesture.NONE:
+        return False
+    try:
+        detections = tuple(cast(Any, detection_debug) or ())
+    except TypeError:
+        return False
+    return any(
+        isinstance(entry, Mapping)
+        and entry.get("gesture_frame_source") == "full_frame_landmark_crop"
+        and (
+            bool(entry.get("builtin_source_accepted"))
+            or bool(entry.get("custom_source_accepted"))
+        )
+        for entry in detections
+    )
 
 
 def _summarize_gesture_categories(
@@ -1652,8 +2028,6 @@ def _summarize_gesture_categories(
     *,
     limit: int = 3,
 ) -> tuple[dict[str, object], ...]:
-    """Return the top raw gesture categories for bounded debug snapshots."""
-
     if result is None or limit <= 0:
         return ()
     try:
@@ -1676,8 +2050,6 @@ def _summarize_gesture_categories(
 
 
 def _summarize_frame_shape(frame_rgb: object | None) -> tuple[int, ...] | None:
-    """Return one normalized frame shape for bounded debug output."""
-
     if frame_rgb is None:
         return None
     shape = getattr(frame_rgb, "shape", None)
@@ -1693,13 +2065,11 @@ def _resolve_full_frame_rescue_reason(
     *,
     fine_hand_gesture: AICameraFineHandGesture,
     effective_visible_person_boxes: tuple[AICameraBox, ...],
-    effective_hand_boxes: tuple[tuple[float, float, float, float], ...],
+    effective_hand_boxes: tuple[_HandBox, ...],
     person_roi_detection_count: int,
     live_roi_hand_box_count: int,
     live_roi_combined_gesture: str,
 ) -> str | None:
-    """Explain when the bounded whole-frame hand rescue is still justified."""
-
     if fine_hand_gesture != AICameraFineHandGesture.NONE:
         return None
     if not effective_visible_person_boxes:
@@ -1722,21 +2092,15 @@ def _resolve_full_frame_rescue_reason(
 
 
 def _coerce_roi_source_value(value: object) -> str:
-    """Normalize one ROI source enum/string into a compact comparable token."""
-
     raw = getattr(value, "value", None) or str(value or "")
     return str(raw).strip()
 
 
 def _person_roi_source_priority(roi_source: str) -> int:
-    """Return the relative trust rank for one ROI source."""
-
     return int(_PERSON_ROI_SOURCE_PRIORITY.get(roi_source, 0))
 
 
 def _person_roi_source_min_confidence(roi_source: str) -> float | None:
-    """Return the extra gesture floor for one known person-ROI source."""
-
     value = _PERSON_ROI_SOURCE_MIN_CONFIDENCE.get(roi_source)
     return _coerce_unit_interval(value) if value is not None else None
 
@@ -1746,29 +2110,12 @@ def _effective_person_roi_source_min_confidence(
     roi_source: str,
     gesture_frame_source: str,
 ) -> float | None:
-    """Return one extra person-ROI floor only while the classifier still sees the ROI crop.
-
-    The broader person-ROI floors were added to block torso-wide false positives.
-    Once the hand-landmark worker already re-cropped the gesture classifier onto
-    a hand-localized full-frame crop, that body-ROI floor becomes over-aggressive
-    and suppresses valid thumb gestures on the real Pi.
-    """
-
     if gesture_frame_source == "full_frame_landmark_crop":
         return None
     return _person_roi_source_min_confidence(roi_source)
 
 
 def _person_roi_short_circuit_min_confidence(config: MediaPipeVisionConfig) -> float:
-    """Return the minimum score that justifies skipping later visible-person ROIs.
-
-    MediaPipe's live-stream lane already uses tracking to keep the hot path
-    low-latency. Once Twinr falls back into IMAGE-mode person-ROI rescans, the
-    main latency driver becomes per-person serial hand reclassification. If the
-    pose-hinted primary ROI already produced a supported gesture above the
-    active model floors, later ROI rescans only add delay for the HDMI HCI path.
-    """
-
     builtin_min_score = _coerce_unit_interval(getattr(config, "builtin_gesture_min_score", None)) or 0.0
     custom_min_score = _live_custom_min_score(config) if _live_custom_gesture_enabled(config) else 0.0
     return max(builtin_min_score, custom_min_score, _LIVE_CUSTOM_MIN_SCORE_FLOOR)
@@ -1780,14 +2127,6 @@ def _should_short_circuit_person_roi_scan(
     pose_hint_attached: bool,
     candidate: _PersonRoiGestureChoice,
 ) -> bool:
-    """Return whether the primary pose-hinted ROI is strong enough to stop scanning.
-
-    Only the ROI that still matches the tracked primary person receives sparse
-    pose hints. When that ROI already resolves one supported gesture above the
-    active model floors, continuing through every additional visible person adds
-    substantial Pi latency while rarely changing the outcome.
-    """
-
     if not pose_hint_attached or candidate.gesture == AICameraFineHandGesture.NONE:
         return False
     confidence = _coerce_unit_interval(candidate.confidence)
@@ -1798,20 +2137,11 @@ def _should_short_circuit_person_roi_scan(
 
 def _guard_person_roi_gesture_choice(
     *,
-    candidate: tuple[AICameraFineHandGesture, float | None],
+    candidate: _GestureChoice,
     roi_source: str,
     gesture_frame_source: str,
     detection_index: int,
 ) -> _PersonRoiGestureChoice:
-    """Reject weak person-ROI symbols from broad crops before arbitration.
-
-    Pi forensic captures showed broad torso ROIs resolving concrete thumb
-    gestures on frames that did not contain a reliable hand pose. Keep that
-    source-aware guard for raw ROI-local crops, but do not keep applying it
-    after the hand-landmark worker already emitted a hand-localized full-frame
-    gesture crop.
-    """
-
     gesture, confidence = candidate
     score = _coerce_unit_interval(confidence)
     required_score = _effective_person_roi_source_min_confidence(
@@ -1840,8 +2170,6 @@ def _prefer_person_roi_gesture_choice(
     current: _PersonRoiGestureChoice,
     challenger: _PersonRoiGestureChoice,
 ) -> _PersonRoiGestureChoice:
-    """Prefer tighter ROI sources when scores are close enough to be ambiguous."""
-
     if challenger.gesture == AICameraFineHandGesture.NONE:
         return current
     if current.gesture == AICameraFineHandGesture.NONE:
@@ -1850,6 +2178,7 @@ def _prefer_person_roi_gesture_choice(
     challenger_score = _coerce_unit_interval(challenger.confidence) or 0.0
     current_priority = _person_roi_source_priority(current.roi_source)
     challenger_priority = _person_roi_source_priority(challenger.roi_source)
+
     if challenger_priority > current_priority and challenger_score >= (current_score - _PERSON_ROI_SOURCE_PRIORITY_MARGIN):
         return challenger
     if current_priority > challenger_priority and current_score >= (challenger_score - _PERSON_ROI_SOURCE_PRIORITY_MARGIN):
@@ -1868,8 +2197,6 @@ def _combine_person_roi_gesture_choices(
     builtin: _PersonRoiGestureChoice,
     custom: _PersonRoiGestureChoice,
 ) -> _PersonRoiGestureChoice:
-    """Merge guarded built-in/custom choices while keeping the winning source."""
-
     combined = combine_task_specific_custom_gesture_choice(
         builtin.as_choice(),
         custom.as_choice(),
@@ -1883,12 +2210,11 @@ def _combine_person_roi_gesture_choices(
 
 
 def _open_palm_score(categories: object) -> float | None:
-    """Return the bounded score for one open-palm category candidate."""
-
     try:
         candidates = list(cast(Any, categories))
     except TypeError:
         return None
+
     best_score = None
     for category in candidates:
         label = str(getattr(category, "category_name", "") or "").strip().lower()
@@ -1907,8 +2233,6 @@ def _open_palm_score(categories: object) -> float | None:
 
 
 def _hand_center_x(landmarks: object) -> float | None:
-    """Return one normalized hand center from MediaPipe landmarks."""
-
     try:
         points = list(cast(Any, landmarks))
     except TypeError:
@@ -1927,8 +2251,6 @@ def _hand_center_x(landmarks: object) -> float | None:
 
 
 def _coerce_unit_interval(value: object) -> float | None:
-    """Return one finite normalized coordinate or ``None`` when malformed."""
-
     try:
         numeric = float(cast(Any, value))
     except (TypeError, ValueError):
@@ -1939,38 +2261,125 @@ def _coerce_unit_interval(value: object) -> float | None:
 
 
 def _round_optional_confidence(value: float | None) -> float | None:
-    """Round one optional gesture/debug ratio into a compact bounded float."""
-
     if value is None or not math.isfinite(value):
         return None
     return round(max(0.0, min(1.0, float(value))), 3)
 
 
-def _merge_hand_boxes(
-    builtin_boxes: tuple[tuple[float, float, float, float], ...],
-    custom_boxes: tuple[tuple[float, float, float, float], ...],
-) -> tuple[tuple[float, float, float, float], ...]:
-    """Merge built-in/custom hand boxes while collapsing exact duplicates."""
+def _normalize_hand_box(box: _HandBox) -> _HandBox | None:
+    try:
+        top = float(box[0])
+        left = float(box[1])
+        bottom = float(box[2])
+        right = float(box[3])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not all(math.isfinite(value) for value in (top, left, bottom, right)):
+        return None
+    top = max(0.0, min(1.0, top))
+    left = max(0.0, min(1.0, left))
+    bottom = max(0.0, min(1.0, bottom))
+    right = max(0.0, min(1.0, right))
+    if bottom <= top or right <= left:
+        return None
+    return (top, left, bottom, right)
 
-    merged: list[tuple[float, float, float, float]] = []
-    seen: set[tuple[float, float, float, float]] = set()
-    for box in tuple(builtin_boxes or ()) + tuple(custom_boxes or ()):
-        normalized = (
-            round(float(box[0]), 4),
-            round(float(box[1]), 4),
-            round(float(box[2]), 4),
-            round(float(box[3]), 4),
-        )
-        if normalized in seen:
+
+def _hand_box_iou(a: _HandBox, b: _HandBox) -> float:
+    inter_top = max(a[0], b[0])
+    inter_left = max(a[1], b[1])
+    inter_bottom = min(a[2], b[2])
+    inter_right = min(a[3], b[3])
+    inter_h = max(0.0, inter_bottom - inter_top)
+    inter_w = max(0.0, inter_right - inter_left)
+    inter_area = inter_h * inter_w
+    if inter_area <= 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+    return inter_area / union
+
+
+def _merge_hand_boxes(
+    builtin_boxes: tuple[_HandBox, ...],
+    custom_boxes: tuple[_HandBox, ...],
+) -> tuple[_HandBox, ...]:
+    merged: list[_HandBox] = []
+    for raw_box in tuple(builtin_boxes or ()) + tuple(custom_boxes or ()):
+        normalized = _normalize_hand_box(raw_box)
+        if normalized is None:
             continue
-        seen.add(normalized)
-        merged.append(box)
+        duplicate = False
+        for existing in merged:
+            if _hand_box_iou(existing, normalized) >= _HAND_BOX_DUPLICATE_IOU:
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(normalized)
     return tuple(merged)
 
 
-def _coerce_nonnegative_int(value: object, *, default: int = 0) -> int:
-    """Return one bounded non-negative integer from loose debug payloads."""
+def _box_area(box: Any) -> float:
+    try:
+        top = float(getattr(box, "top", box[0]))
+        left = float(getattr(box, "left", box[1]))
+        bottom = float(getattr(box, "bottom", box[2]))
+        right = float(getattr(box, "right", box[3]))
+    except Exception:
+        return 0.0
+    return max(0.0, bottom - top) * max(0.0, right - left)
 
+
+def _hand_box_area(box: _HandBox) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _hand_box_center_distance(box: _HandBox) -> float:
+    center_y = (box[0] + box[2]) / 2.0
+    center_x = (box[1] + box[3]) / 2.0
+    return math.hypot(center_x - 0.5, center_y - 0.5)
+
+
+def _prioritize_person_boxes(
+    *,
+    primary_person_box: AICameraBox | None,
+    person_boxes: tuple[AICameraBox, ...],
+    limit: int,
+) -> tuple[AICameraBox, ...]:
+    if limit <= 0 or not person_boxes:
+        return ()
+    ranked: list[tuple[int, float, float, int, AICameraBox]] = []
+    for index, box in enumerate(person_boxes):
+        exact = 1 if (primary_person_box is not None and box == primary_person_box) else 0
+        overlap = 0.0
+        if primary_person_box is not None:
+            try:
+                overlap = max(0.0, min(1.0, float(iou(box, primary_person_box))))
+            except Exception:
+                overlap = 0.0
+        ranked.append((exact, overlap, _box_area(box), -index, box))
+    ranked.sort(reverse=True)
+    return tuple(item[-1] for item in ranked[:limit])
+
+
+def _prioritize_hand_boxes(
+    *,
+    hand_boxes: tuple[_HandBox, ...],
+    limit: int,
+) -> tuple[_HandBox, ...]:
+    if limit <= 0 or not hand_boxes:
+        return ()
+    ranked = sorted(
+        hand_boxes,
+        key=lambda box: (-_hand_box_area(box), _hand_box_center_distance(box)),
+    )
+    return tuple(ranked[:limit])
+
+
+def _coerce_nonnegative_int(value: object, *, default: int = 0) -> int:
     try:
         numeric = int(cast(Any, value))
     except (TypeError, ValueError):
@@ -1978,7 +2387,149 @@ def _coerce_nonnegative_int(value: object, *, default: int = 0) -> int:
     return max(0, numeric)
 
 
+def _coerce_bool(value: object, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    try:
+        normalized = str(value).strip().lower()
+    except Exception:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _coerce_bounded_float(
+    value: object,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        numeric = float(cast(Any, value))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(numeric):
+        return default
+    return max(minimum, min(maximum, numeric))
+
+
+def _coerce_bounded_int(
+    value: object,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        numeric = int(cast(Any, value))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, numeric))
+
+
+def _live_result_history_size(config: MediaPipeVisionConfig) -> int:
+    return _coerce_bounded_int(
+        getattr(config, "live_result_history_size", None),
+        default=_DEFAULT_RESULT_HISTORY_SIZE,
+        minimum=4,
+        maximum=64,
+    )
+
+
+def _live_max_person_roi_candidates(config: MediaPipeVisionConfig) -> int:
+    return _coerce_bounded_int(
+        getattr(config, "live_max_person_roi_candidates", None),
+        default=_DEFAULT_MAX_PERSON_ROI_CANDIDATES,
+        minimum=1,
+        maximum=8,
+    )
+
+
+def _live_max_hand_roi_candidates(config: MediaPipeVisionConfig) -> int:
+    return _coerce_bounded_int(
+        getattr(config, "live_max_hand_roi_candidates", None),
+        default=_DEFAULT_MAX_HAND_ROI_CANDIDATES,
+        minimum=1,
+        maximum=6,
+    )
+
+
+def _live_full_frame_rescue_min_interval_s(config: MediaPipeVisionConfig) -> float:
+    return _coerce_bounded_float(
+        getattr(config, "live_full_frame_rescue_min_interval_s", None),
+        default=_DEFAULT_FULL_FRAME_RESCUE_MIN_INTERVAL_S,
+        minimum=0.0,
+        maximum=2.0,
+    )
+
+
+def _live_temporal_stability_enabled(config: MediaPipeVisionConfig) -> bool:
+    return _coerce_bool(
+        getattr(config, "live_temporal_stability_enabled", None),
+        default=False,
+    )
+
+
+def _live_temporal_window_s(config: MediaPipeVisionConfig) -> float:
+    return _coerce_bounded_float(
+        getattr(config, "live_temporal_window_s", None),
+        default=_TEMPORAL_WINDOW_S,
+        minimum=0.10,
+        maximum=2.0,
+    )
+
+
+def _live_temporal_window_samples(config: MediaPipeVisionConfig) -> int:
+    return _coerce_bounded_int(
+        getattr(config, "live_temporal_window_samples", None),
+        default=_TEMPORAL_WINDOW_SAMPLES,
+        minimum=2,
+        maximum=8,
+    )
+
+
+def _live_temporal_required_votes(config: MediaPipeVisionConfig) -> int:
+    requested = _coerce_bounded_int(
+        getattr(config, "live_temporal_required_votes", None),
+        default=_TEMPORAL_REQUIRED_VOTES,
+        minimum=1,
+        maximum=8,
+    )
+    return min(requested, _live_temporal_window_samples(config))
+
+
+def _live_temporal_strong_confidence(config: MediaPipeVisionConfig) -> float:
+    return _coerce_bounded_float(
+        getattr(config, "live_temporal_strong_confidence", None),
+        default=_TEMPORAL_STRONG_CONFIDENCE,
+        minimum=0.50,
+        maximum=0.99,
+    )
+
+
+def _live_temporal_hold_s(config: MediaPipeVisionConfig) -> float:
+    return _coerce_bounded_float(
+        getattr(config, "live_temporal_hold_s", None),
+        default=_TEMPORAL_HOLD_S,
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+
+def _short_exception(exc: Exception, *, limit: int = 160) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    text = " ".join(text.split())
+    return text[:limit]
+
+
 __all__ = [
     "LiveGestureFrameObservation",
+    "LiveGestureObservePolicy",
     "LiveGesturePipeline",
 ]

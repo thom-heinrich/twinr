@@ -3,11 +3,12 @@ import sys
 import tempfile
 import unittest
 import json
+import stat
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveTimingStore
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 
 
 class AdaptiveTimingStoreTests(unittest.TestCase):
@@ -152,6 +153,18 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
         self.assertEqual(profile.pause_grace_ms, 650)
         self.assertEqual(profile.button_start_timeout_s, 14.0)
         self.assertEqual(profile.follow_up_start_timeout_s, 8.0)
+
+    def test_ensure_saved_writes_group_readable_state_for_cross_service_runtime_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adaptive-timing.json"
+            store = AdaptiveTimingStore(
+                path,
+                config=TwinrConfig(adaptive_timing_store_path=str(path)),
+            )
+
+            store.ensure_saved()
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
 
 
 if __name__ == "__main__":

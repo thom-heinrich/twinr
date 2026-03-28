@@ -26,6 +26,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     first = lane.observe(
                         observed_at=10.0,
                         observation=SocialVisionObservation(
+                            hand_or_object_near_camera=True,
                             fine_hand_gesture=gesture,
                             fine_hand_gesture_confidence=confidence,
                         ),
@@ -35,6 +36,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     decision = lane.observe(
                         observed_at=11.0,
                         observation=SocialVisionObservation(
+                            hand_or_object_near_camera=True,
                             fine_hand_gesture=gesture,
                             fine_hand_gesture_confidence=confidence,
                         ),
@@ -58,6 +60,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     decision = lane.observe(
                         observed_at=10.0,
                         observation=SocialVisionObservation(
+                            hand_or_object_near_camera=True,
                             fine_hand_gesture=gesture,
                             fine_hand_gesture_confidence=confidence,
                         ),
@@ -73,6 +76,7 @@ class GestureAckLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -80,6 +84,7 @@ class GestureAckLaneTests(unittest.TestCase):
             second = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -96,6 +101,7 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.OPEN_PALM,
                     fine_hand_gesture_confidence=0.98,
                 ),
@@ -111,6 +117,7 @@ class GestureAckLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -118,6 +125,7 @@ class GestureAckLaneTests(unittest.TestCase):
             second = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -125,6 +133,7 @@ class GestureAckLaneTests(unittest.TestCase):
             third = lane.observe(
                 observed_at=11.2,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -132,6 +141,7 @@ class GestureAckLaneTests(unittest.TestCase):
             fourth = lane.observe(
                 observed_at=11.5,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.94,
                 ),
@@ -151,6 +161,7 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     gesture_event=SocialGestureEvent.WAVE,
                     gesture_confidence=0.86,
                 ),
@@ -166,6 +177,7 @@ class GestureAckLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.661,
                 ),
@@ -173,6 +185,7 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
                     fine_hand_gesture_confidence=0.661,
                 ),
@@ -190,6 +203,7 @@ class GestureAckLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_DOWN,
                     fine_hand_gesture_confidence=0.393,
                 ),
@@ -197,6 +211,7 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_DOWN,
                     fine_hand_gesture_confidence=0.393,
                 ),
@@ -214,6 +229,7 @@ class GestureAckLaneTests(unittest.TestCase):
             first = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.48,
                 ),
@@ -221,6 +237,7 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=11.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
                     fine_hand_gesture_confidence=0.48,
                 ),
@@ -268,8 +285,25 @@ class GestureAckLaneTests(unittest.TestCase):
             decision = lane.observe(
                 observed_at=10.0,
                 observation=SocialVisionObservation(
+                    hand_or_object_near_camera=True,
                     fine_hand_gesture=SocialFineHandGesture.POINTING,
                     fine_hand_gesture_confidence=0.92,
+                ),
+            )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "no_supported_live_gesture")
+
+    def test_lane_rejects_supported_symbol_without_current_hand_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=SocialVisionObservation(
+                    fine_hand_gesture=SocialFineHandGesture.THUMBS_DOWN,
+                    fine_hand_gesture_confidence=0.95,
+                    hand_or_object_near_camera=False,
                 ),
             )
 

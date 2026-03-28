@@ -51,12 +51,27 @@ bounded background writers into the APIs used by agent runtime loops.
 
 | File | Purpose |
 |---|---|
-| `service.py` | Runtime orchestration service |
+| `service.py` | Compatibility shim that preserves the historic import surface while delegating to `service_impl/` |
+| `service_impl/README.md` | Internal map of the refactored service implementation package |
+| `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface |
+| `service_impl/builder.py` | Runtime service assembly and background-writer construction |
+| `service_impl/readiness.py` | Required-remote readiness probes and cache helpers |
+| `service_impl/context.py` | Provider-context assembly for normal, fast, and tool-facing paths |
+| `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points |
+| `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration |
+| `service_impl/proactive.py` | Proactive planning and reservation state transitions |
+| `service_impl/mutations.py` | Conflict resolution, review, and prompt-context mutation entry points |
+| `service_impl/lifecycle.py` | Flush/shutdown orchestration for bounded background writers |
+| `service_impl/persistence.py` | Static persistence pipeline helpers and multimodal payload sanitization |
+| `service_impl/compat.py` | Shared limits, logger, helper functions, and remote-readiness dataclasses |
 | `worker.py` | Bounded async persistence |
 | `flush_budget.py` | Total-deadline planner for multi-writer flush budgeting |
 | `health.py` | Remote readiness probe with per-snapshot pointer/origin evidence |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
+
+No migration is required for callers that already import
+`twinr.memory.longterm.runtime.service`.
 
 ## Usage
 

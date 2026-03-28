@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent import TwinrConfig
 from twinr.memory import ConversationTurn, OnDeviceMemory
 from twinr.memory.reminders import now_in_timezone
+from twinr.agent.base_agent import RuntimeSnapshotStore
 from twinr.agent.base_agent import TwinrRuntime
 from twinr.agent.base_agent import TwinrEvent, TwinrStatus
 
@@ -168,9 +169,33 @@ class TwinrRuntimeTests(unittest.TestCase):
         runtime.begin_tool_print()
 
         self.assertEqual(runtime.status, TwinrStatus.PRINTING)
+        self.assertEqual(runtime.state_machine.status, TwinrStatus.PROCESSING)
+        self.assertTrue(runtime.state_machine.printing_active)
+        self.assertEqual(
+            runtime.state_machine.active_statuses,
+            (TwinrStatus.PROCESSING, TwinrStatus.PRINTING),
+        )
 
         runtime.resume_answering_after_print()
         self.assertEqual(runtime.status, TwinrStatus.ANSWERING)
+        self.assertTrue(runtime.state_machine.printing_active)
+
+        runtime.finish_printing()
+        self.assertFalse(runtime.state_machine.printing_active)
+
+    def test_runtime_snapshot_persists_orthogonal_printing_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+
+            runtime.press_green_button()
+            runtime.submit_transcript("Bitte drucke das")
+            runtime.begin_tool_print()
+
+            snapshot = RuntimeSnapshotStore(snapshot_path).load()
+
+            self.assertEqual(snapshot.status, "printing")
+            self.assertTrue(snapshot.printing_active)
 
     def test_proactive_prompt_can_speak_without_user_turn(self) -> None:
         runtime = TwinrRuntime(config=TwinrConfig())

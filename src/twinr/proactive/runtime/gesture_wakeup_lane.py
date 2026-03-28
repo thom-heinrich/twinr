@@ -101,6 +101,20 @@ class GestureWakeupLane:
             fallback_hold_s=0.40,
             fallback_min_visible_s=1.0,
         )
+        if not observation.hand_or_object_near_camera:
+            self._reset_pending_if_stale(observed_at)
+            decision = GestureWakeupDecision(
+                reason="no_gesture_wakeup_candidate",
+                trigger_gesture=self.trigger_gesture,
+                observed_gesture=observed_gesture,
+                confidence=confidence,
+            )
+            self._trace_wakeup_decision(
+                observed_at=observed_at,
+                observation=observation,
+                decision=decision,
+            )
+            return decision
         if observed_gesture != self.trigger_gesture:
             self._reset_pending_if_stale(observed_at)
             decision = GestureWakeupDecision(

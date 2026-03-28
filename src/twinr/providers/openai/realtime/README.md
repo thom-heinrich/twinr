@@ -1,9 +1,11 @@
 # realtime
 
 `realtime` owns Twinr's OpenAI realtime session wrapper and the completed-turn
-value object returned to the runtime. It packages websocket session setup,
-event consumption, tool-call bridging, and bounded timeout handling behind a
-small synchronous surface.
+value object returned to the runtime. Its package root re-exports that surface
+lazily so probes can inspect the package without opening the full realtime
+implementation stack. The package wraps websocket session setup, event
+consumption, tool-call bridging, and bounded timeout handling behind a small
+synchronous surface.
 
 ## Responsibility
 
@@ -21,7 +23,7 @@ small synchronous surface.
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Public package exports |
+| [__init__.py](./__init__.py) | Lazy public package exports |
 | [session.py](./session.py) | Session lifecycle and turn handling |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [AGENTS.md](./AGENTS.md) | Local editing invariants |

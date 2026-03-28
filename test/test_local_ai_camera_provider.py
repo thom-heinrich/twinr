@@ -27,11 +27,16 @@ from twinr.proactive.social.local_camera_provider import LocalAICameraObservatio
 class _FakeAdapter:
     def __init__(self, observation):
         self.observation = observation
+        self.last_gesture_kwargs = None
 
     def observe(self):
         if isinstance(self.observation, Exception):
             raise self.observation
         return self.observation
+
+    def observe_gesture(self, **kwargs):
+        self.last_gesture_kwargs = dict(kwargs)
+        return self.observe()
 
 
 class LocalAICameraProviderTests(unittest.TestCase):
@@ -111,6 +116,25 @@ class LocalAICameraProviderTests(unittest.TestCase):
         self.assertFalse(snapshot.observation.camera_ready)
         self.assertFalse(snapshot.observation.camera_ai_ready)
         self.assertEqual(snapshot.observation.camera_error, "local_ai_camera_provider_failed")
+
+    def test_provider_uses_current_frame_fast_path_for_gesture_snapshots(self) -> None:
+        adapter = _FakeAdapter(
+            AICameraObservation(
+                observed_at=10.0,
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                fine_hand_gesture=AICameraFineHandGesture.PEACE_SIGN,
+                fine_hand_gesture_confidence=0.84,
+                hand_or_object_near_camera=True,
+            )
+        )
+        provider = LocalAICameraObservationProvider(adapter=adapter)
+
+        snapshot = provider.observe_gesture()
+
+        self.assertEqual(snapshot.observation.fine_hand_gesture, SocialFineHandGesture.PEACE_SIGN)
+        self.assertEqual(adapter.last_gesture_kwargs, {"gesture_fast_path": True})
 
 
 if __name__ == "__main__":

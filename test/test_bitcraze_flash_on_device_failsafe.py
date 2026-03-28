@@ -61,17 +61,22 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
             observed_commands.append(list(args[0]))
             return subprocess.CompletedProcess(args[0], 0, stdout="flash ok\n", stderr="")
 
-        original_probe = _MODULE._probe_loaded_failsafe
+        original_run_probe = _MODULE._run_probe_with_timeout
         try:
-            _MODULE._probe_loaded_failsafe = lambda **_kwargs: _MODULE.OnDeviceFailsafeAvailability(
-                loaded=True,
-                protocol_version=1,
-                enabled=1,
-                state_code=1,
-                state_name="monitoring",
-                reason_code=0,
-                reason_name="none",
-                failures=(),
+            _MODULE._run_probe_with_timeout = lambda **_kwargs: (
+                {
+                    "loaded": True,
+                    "protocol_version": 1,
+                    "enabled": 1,
+                    "state_code": 1,
+                    "state_name": "monitoring",
+                    "reason_code": 0,
+                    "reason_name": "none",
+                    "failures": (),
+                },
+                {},
+                None,
+                (),
             )
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_root = Path(temp_dir)
@@ -79,6 +84,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                 cfloader = temp_root / "cfloader"
                 binary.write_bytes(b"fw")
                 cfloader.write_text("#!/bin/sh\n")
+                cfloader.chmod(0o755)
                 report = _MODULE.flash_on_device_failsafe(
                     uri="radio://0/80/2M",
                     workspace=temp_root,
@@ -87,7 +93,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                     runner=_runner,
                 )
         finally:
-            _MODULE._probe_loaded_failsafe = original_probe
+            _MODULE._run_probe_with_timeout = original_run_probe
 
         self.assertTrue(report.flashed)
         self.assertTrue(report.probe_attempted)
@@ -103,17 +109,22 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
         def _runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args[0], 0, stdout="flash ok\n", stderr="")
 
-        original_probe = _MODULE._probe_loaded_failsafe
+        original_run_probe = _MODULE._run_probe_with_timeout
         try:
-            _MODULE._probe_loaded_failsafe = lambda **_kwargs: _MODULE.OnDeviceFailsafeAvailability(
-                loaded=False,
-                protocol_version=None,
-                enabled=None,
-                state_code=None,
-                state_name=None,
-                reason_code=None,
-                reason_name=None,
-                failures=("twinrFs.protocolVersion:missing",),
+            _MODULE._run_probe_with_timeout = lambda **_kwargs: (
+                {
+                    "loaded": False,
+                    "protocol_version": None,
+                    "enabled": None,
+                    "state_code": None,
+                    "state_name": None,
+                    "reason_code": None,
+                    "reason_name": None,
+                    "failures": ("twinrFs.protocolVersion:missing",),
+                },
+                {},
+                None,
+                (),
             )
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_root = Path(temp_dir)
@@ -121,6 +132,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                 cfloader = temp_root / "cfloader"
                 binary.write_bytes(b"fw")
                 cfloader.write_text("#!/bin/sh\n")
+                cfloader.chmod(0o755)
                 report = _MODULE.flash_on_device_failsafe(
                     workspace=temp_root,
                     binary_path=binary,
@@ -128,7 +140,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                     runner=_runner,
                 )
         finally:
-            _MODULE._probe_loaded_failsafe = original_probe
+            _MODULE._run_probe_with_timeout = original_run_probe
 
         self.assertTrue(report.flashed)
         self.assertTrue(any("protocolVersion" in failure for failure in report.failures))
@@ -137,7 +149,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
     def test_probe_loaded_failsafe_reconnects_and_uses_probe_module(self) -> None:
         class _FakeCRTP:
             @staticmethod
-            def init_drivers() -> None:
+            def init_drivers(*, enable_debug_driver: bool = False) -> None:
                 return None
 
         class _FakeCrazyflie:
@@ -171,10 +183,11 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                 failures=(str(sync_cf.cf.rw_cache),),
             )
             with tempfile.TemporaryDirectory() as temp_dir:
-                availability = _MODULE._probe_loaded_failsafe(
+                availability, link_stats = _MODULE._probe_loaded_failsafe(
                     uri="radio://0/80/2M",
                     workspace=Path(temp_dir),
                     settle_s=0.0,
+                    link_stats_sample_s=0.0,
                     sleep=lambda _seconds: None,
                 )
         finally:
@@ -183,6 +196,7 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
 
         self.assertTrue(availability.loaded)
         self.assertTrue(any(".cache" in failure for failure in availability.failures))
+        self.assertEqual(link_stats, {})
 
 
 if __name__ == "__main__":

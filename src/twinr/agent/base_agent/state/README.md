@@ -10,9 +10,11 @@ persistence for runtime, display, web, and ops consumers.
 - Define the canonical runtime statuses and events
 - Validate deterministic state transitions and recovery paths
 - Persist and restore runtime snapshots as normalized JSON
-- Normalize snapshot timestamps, memory fields, and voice-status fields
+- Normalize snapshot timestamps, memory fields, voice-status fields, and the orthogonal `printing_active` flag
+- Reapply persisted `status` plus orthogonal `printing_active` through `TwinrStateMachine.restore_snapshot_state()` so runtime bootstrap restores state without bypassing state-machine invariants, while runtime startup can deliberately refuse stale persisted `error` status
 - Preserve local household voice-match metadata alongside the current voice-status snapshot
 - Keep runtime snapshot files cross-service readable (`0644`) so the external remote-memory watchdog can inspect them without weakening runtime ownership
+- Keep the runtime snapshot lock file on one canonical hidden path and make it cross-service writable (`0666`) so root-owned services and `thh`-run validation tools coordinate on the same snapshot guard
 
 `state` does **not** own:
 - Runtime orchestration or business flow decisions

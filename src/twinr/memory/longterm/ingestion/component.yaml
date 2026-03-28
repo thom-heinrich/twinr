@@ -39,9 +39,11 @@ files:
     exports:
       - LongTermMultimodalExtractor
   - path: environment_profile.py
-    role: Room-agnostic smart-home environment-profile compilation
+    role: Compatibility wrapper and public import surface for room-agnostic smart-home environment-profile compilation
     exports:
       - LongTermEnvironmentProfileCompiler
+  - path: environment_profile_impl/
+    role: Decomposed implementation package for environment-profile helpers, models, baselines, deviations, and regime analysis
   - path: environment_stats.py
     role: Shared robust statistics and divergence helpers for environment profiling
   - path: respeaker_audio.py
@@ -78,3 +80,4 @@ tests:
   - path: test/test_sensor_memory.py
   - path: test/test_proactive_monitor.py
   - path: test/test_longterm_memory.py
+  - path: test/test_environment_profile_refactor_parity.py

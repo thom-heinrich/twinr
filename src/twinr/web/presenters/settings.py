@@ -7,13 +7,15 @@ breaking the dashboard.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
-from twinr.web.support.contracts import AdaptiveTimingView, DetailMetric, SettingsSection
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveTimingStore
+from twinr.web.support.contracts import AdaptiveTimingView, DashboardCard, DetailMetric, SectionGroup, SettingsSection
 from twinr.web.support.forms import _select_field, _text_field, _textarea_field
 from twinr.web.presenters.common import (
     _BOOL_OPTIONS,
@@ -568,6 +570,14 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
                     config.voice_orchestrator_ws_url,
                     placeholder="wss://voice.example/ws/orchestrator/voice",
                     tooltip_text="Authoritative websocket endpoint the Pi streams to for live voice turns.",
+                ),
+                _select_field(
+                    "TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS",
+                    "Allow insecure gateway ws://",
+                    env_values,
+                    _BOOL_OPTIONS,
+                    "true" if config.voice_orchestrator_allow_insecure_ws else "false",
+                    tooltip_text="Explicitly allow the current plain ws:// LAN bridge when no TLS terminator exists yet. Leave this off for normal wss:// deployments.",
                 ),
                 _text_field(
                     "TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET",
@@ -1345,3 +1355,79 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
             ),
         ),
     )
+
+
+def _group_sections(sections: Sequence[SettingsSection], *titles: str) -> tuple[SettingsSection, ...]:
+    """Return sections in the requested stable display order when present."""
+
+    section_by_title = {section.title: section for section in sections}
+    return tuple(section_by_title[title] for title in titles if title in section_by_title)
+
+
+def build_settings_section_groups(sections: Sequence[SettingsSection]) -> tuple[SectionGroup, ...]:
+    """Group settings sections into calmer setup buckets for the main page."""
+
+    groups = (
+        SectionGroup(
+            key="voice-and-replies",
+            title="Voice and replies",
+            description="Start here for models, spoken voice, web answers, and short-turn timing.",
+            sections=_group_sections(
+                sections,
+                "Models and voices",
+                "Search",
+                "Conversation flow",
+                "Audio feedback",
+            ),
+        ),
+        SectionGroup(
+            key="listening-and-devices",
+            title="Listening and devices",
+            description="Microphones, remote voice gateway, buttons, camera, display, and printer live here.",
+            sections=_group_sections(
+                sections,
+                "Voice gateway and audio capture",
+                "Buttons and motion sensor",
+                "Camera and vision",
+                "Display and printer",
+            ),
+        ),
+        SectionGroup(
+            key="daily-behavior",
+            title="Daily behavior",
+            description="Tune how proactive Twinr should be, when it should wait, and how sensitive it should stay.",
+            sections=_group_sections(
+                sections,
+                "Proactive behavior",
+                "Proactive timing",
+                "Proactive sensitivity",
+            ),
+        ),
+        SectionGroup(
+            key="advanced-and-recovery",
+            title="Advanced and recovery",
+            description="Web reachability, file-heavy runtime controls, and learned timing reset stay at the end.",
+            sections=_group_sections(
+                sections,
+                "Web UI and files",
+            ),
+        ),
+    )
+    return tuple(group for group in groups if group.sections)
+
+
+def build_settings_overview_cards(section_groups: Sequence[SectionGroup]) -> tuple[DashboardCard, ...]:
+    """Build in-page shortcut cards for grouped settings areas."""
+
+    cards: list[DashboardCard] = []
+    for group in section_groups:
+        area_count = len(group.sections) + (1 if group.key == "advanced-and-recovery" else 0)
+        cards.append(
+            DashboardCard(
+                title=group.title,
+                value=f"{area_count} areas",
+                detail=group.description,
+                href=f"#group-{group.key}",
+            )
+        )
+    return tuple(cards)

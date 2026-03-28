@@ -79,12 +79,24 @@ files:
       - SocialTriggerThresholds
       - SocialVisionObservation
   - path: camera_surface.py
-    role: Debounced camera snapshot plus visible-person, coarse-motion, and coarse/fine gesture event stabilization
+    role: Legacy-compatible public wrapper for camera snapshot and event stabilization
     exports:
       - ProactiveCameraSnapshot
       - ProactiveCameraSurface
       - ProactiveCameraSurfaceConfig
       - ProactiveCameraSurfaceUpdate
+  - path: camera_surface_impl/config.py
+    role: Camera-surface config defaults plus validation for cadence and smoothing bounds
+  - path: camera_surface_impl/models.py
+    role: Snapshot and update dataclasses rendered by the camera surface
+  - path: camera_surface_impl/signals.py
+    role: Debounced boolean and stable-object trackers reused by the camera surface
+  - path: camera_surface_impl/presence.py
+    role: Presence, health, motion, and secondary-field stabilization helpers for the camera surface
+  - path: camera_surface_impl/gestures.py
+    role: Coarse/fine gesture stabilization helpers for the camera surface
+  - path: camera_surface_impl/surface.py
+    role: Main camera-surface orchestration implementation behind the public wrapper
   - path: gesture_calibration.py
     role: Load bounded per-symbol fine-hand calibration for the live social camera surface
     exports:

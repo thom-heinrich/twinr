@@ -60,6 +60,11 @@ _DEFAULT_MAX_SNAPSHOT_AGE_S = 45.0
 _DEFAULT_RESTART_BACKOFF_S = 5.0
 _DEFAULT_STOP_TIMEOUT_S = 10.0
 _STREAMING_HEALTH_FAILURE_THRESHOLD = 2
+_REQUIRED_REMOTE_PUBLIC_ERROR_MESSAGE = "Required remote long-term memory is unavailable."
+_REQUIRED_REMOTE_RECOVERY_ERROR_FRAGMENTS = (
+    "remote long-term memory is temporarily cooling down after recent failures.",
+    "remote memory watchdog snapshot",
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -732,10 +737,32 @@ class TwinrRuntimeSupervisor:
             return None
         if runtime_status == "error" and not assessment.ready:
             return None
+        if runtime_status == "error" and self._snapshot_error_is_required_remote(snapshot):
+            # Required-remote failures can strand the child inside the top-level
+            # runtime error hold, which never self-recovers. Once the watchdog
+            # is healthy again, recycle the child promptly instead of waiting
+            # for generic snapshot staleness.
+            return "required_remote_recovered"
         age_s = max(0.0, (self._utcnow() - updated_at).total_seconds())
         if age_s > self.max_snapshot_age_s:
             return "runtime_snapshot_stale"
         return None
+
+    def _snapshot_error_is_required_remote(self, snapshot: RuntimeSnapshot) -> bool:
+        error_text = " ".join(str(getattr(snapshot, "error_message", "") or "").split()).strip().lower()
+        if not error_text:
+            return False
+        configured_public = str(
+            getattr(
+                self.config,
+                "long_term_memory_remote_required_public_error_message",
+                _REQUIRED_REMOTE_PUBLIC_ERROR_MESSAGE,
+            )
+            or _REQUIRED_REMOTE_PUBLIC_ERROR_MESSAGE
+        ).strip()
+        if configured_public and configured_public.lower() in error_text:
+            return True
+        return any(fragment in error_text for fragment in _REQUIRED_REMOTE_RECOVERY_ERROR_FRAGMENTS)
 
     def _streaming_health_issue(self, health: TwinrSystemHealth) -> str | None:
         conversation = self._service(health, "conversation_loop")

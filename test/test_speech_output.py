@@ -138,6 +138,41 @@ class BlockingCloseTTSProvider:
         return self.iterator
 
 
+class HeaderThenDelayedAudioTTSProvider:
+    def __init__(self, *, delay_s: float = 0.06) -> None:
+        self.delay_s = delay_s
+
+    def synthesize_stream(self, text: str, **kwargs):
+        del text, kwargs
+        pcm_frames = b"\x01\x00" * 400
+        sample_rate = 24000
+        channels = 1
+        bits_per_sample = 16
+        block_align = channels * (bits_per_sample // 8)
+        byte_rate = sample_rate * block_align
+        data_size = len(pcm_frames)
+        riff_size = 36 + data_size
+        wav_bytes = (
+            b"RIFF"
+            + riff_size.to_bytes(4, "little")
+            + b"WAVE"
+            + b"fmt "
+            + (16).to_bytes(4, "little")
+            + (1).to_bytes(2, "little")
+            + channels.to_bytes(2, "little")
+            + sample_rate.to_bytes(4, "little")
+            + byte_rate.to_bytes(4, "little")
+            + block_align.to_bytes(2, "little")
+            + bits_per_sample.to_bytes(2, "little")
+            + b"data"
+            + data_size.to_bytes(4, "little")
+            + pcm_frames
+        )
+        yield wav_bytes[:44]
+        sleep(self.delay_s)
+        yield wav_bytes[44:]
+
+
 class InterruptiblePlayer:
     def __init__(self) -> None:
         self.played: list[bytes] = []
@@ -522,6 +557,29 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
 
         self.assertEqual(join_mock.call_count, 1)
         self.assertLessEqual(join_mock.call_args.kwargs["timeout"], 0.25)
+
+    def test_header_only_wav_prefix_waits_for_real_audio_before_first_audio(self) -> None:
+        tts_provider = HeaderThenDelayedAudioTTSProvider(delay_s=0.06)
+        player = InterruptiblePlayer()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            first_chunk_timeout_s=0.2,
+            chunk_stall_timeout_s=0.05,
+        )
+
+        output.submit_text_delta("Hallo zusammen.")
+        self.assertFalse(output.wait_for_first_audio(timeout_s=0.03))
+        self.assertTrue(output.wait_for_first_audio(timeout_s=0.2))
+        output.close(timeout_s=1.0)
+        output.raise_if_error()
+
+        self.assertTrue(player.played)
+        self.assertTrue(player.played[0].startswith(b"RIFF"))
+        self.assertGreater(len(player.played[0]), 44)
 
     def test_interrupt_path_uses_short_pump_join_timeout_with_playback_coordinator(self) -> None:
         tts_provider = GatedFirstChunkTTSProvider()

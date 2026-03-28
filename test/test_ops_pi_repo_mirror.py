@@ -84,8 +84,10 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--exclude=**/__pycache__/", commands[0])
         self.assertIn("--exclude=**/*.pyc", commands[0])
         self.assertIn("--exclude=**/*.pyo", commands[0])
+        self.assertIn("--exclude=**/*.egg-info/", commands[0])
         self.assertIn("--exclude=**/node_modules/", commands[0])
         self.assertIn("--exclude=**/browser_automation/artifacts/", commands[0])
+        self.assertIn("--filter=-p /.cache/", joined)
         self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])
         env = envs[0]
@@ -251,6 +253,49 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--dry-run", commands[1])
         self.assertNotIn("--dry-run", commands[3])
         self.assertIn("--dry-run", commands[4])
+
+    def test_probe_once_retries_sync_when_post_sync_verification_still_sees_drift(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            responses = iter(
+                (
+                    _completed(["rsync"], stdout="<fcst...... src/app.py\n"),
+                    _completed(["rsync"], stdout="<fcst...... src/app.py\n"),
+                    _completed(["rsync"], stdout="<fcst...... src/app.py\n"),
+                    _completed(["rsync"], stdout=""),
+                )
+            )
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                return next(responses)
+
+            watchdog = PiRepoMirrorWatchdog(
+                project_root=root,
+                connection_settings=PiConnectionSettings(
+                    host=_TEST_PI_HOST,
+                    user=_TEST_PI_SSH_USER,
+                    password=_TEST_PI_SSH_PASSWORD,
+                ),
+                subprocess_runner=_runner,
+            )
+
+            result = watchdog.probe_once()
+
+        self.assertTrue(result.drift_detected)
+        self.assertTrue(result.sync_applied)
+        self.assertTrue(result.verified_clean)
+        self.assertEqual(result.change_count, 1)
+        self.assertEqual(result.sampled_change_lines, ("<fcst...... src/app.py",))
+        self.assertEqual(len(commands), 4)
+        self.assertNotIn("--dry-run", commands[0])
+        self.assertIn("--dry-run", commands[1])
+        self.assertNotIn("--dry-run", commands[2])
+        self.assertIn("--dry-run", commands[3])
 
     def test_run_continues_after_transient_failure(self) -> None:
         commands: list[list[str]] = []

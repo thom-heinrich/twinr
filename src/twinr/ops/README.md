@@ -36,7 +36,7 @@ tools.
 - tolerate bounded display-render inflight windows when evaluating companion health, so long Waveshare refreshes are not misclassified as dead threads
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
-- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
+- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, `artifacts/`, and `.cache/`, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
 - deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, restart the productive Pi service set, and verify post-restart health
 - bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
 - expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
@@ -143,10 +143,19 @@ PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptan
 The repo mirror uses `rsync --checksum` on every cycle by default. Only opt
 into `--metadata-only` when you explicitly accept the weaker quick-check plus
 periodic checksum-audit model.
+After a healing sync, the watchdog also retries one extra sync+verify pass if
+the checksum audit still sees source-managed drift, which absorbs brief
+shared-worktree churn without hiding persistent Pi-side divergence.
 Its Pi-local preserve rules are perishable, which keeps root runtime state
 protected while still allowing accidental nested repo copies to be deleted.
+That preserved scope intentionally includes `/twinr/.cache/`, because runtime
+helpers such as the startup boot-sound renderer can create root-owned cache
+artifacts there and those must not block later repo deploys.
 Python bytecode caches are intentionally excluded from the mirror because they
 are runtime artefacts and productive root-owned imports on the Pi can otherwise
+Installer-generated `*.egg-info/` trees are excluded for the same reason: the
+Pi-side editable install rewrites them locally and they are not authoritative
+repo content.
 block later sync cycles.
 Nested `node_modules/` trees are intentionally excluded from the mirror for the
 same reason: SDK and channel dependency installs are local build artefacts, not
@@ -155,22 +164,31 @@ Captured `browser_automation/artifacts/` output is intentionally excluded from
 the mirror as well, so gitignored screenshots/HTML traces on either host do not
 block official Pi deploy convergence while the small mirrored browser-runtime
 manifests remain available for install.
+The Pi deploy also attests `/twinr/.venv/bin` after the editable refresh and
+normalizes stale copied Python-wrapper shebangs back to `/twinr/.venv/bin/python`,
+so direct console scripts under the preserved Pi venv do not stay pinned to an
+old `/home/thh/twinr/.venv/...` path after historical checkout moves.
 When a deleted remote tree survives only because it still contains ignored
 Python caches, the mirror prunes those cache-only stale directories and reruns
 the sync once so the acceptance checkout can still converge cleanly.
 The deploy helper builds on that mirror contract and adds the explicit pieces
 the mirror intentionally does not own: authoritative `.env` sync, a no-deps
-editable refresh by default, optional mirrored browser-automation runtime
-installs via `browser_automation/runtime_requirements.txt` plus
+editable refresh by default, selective backfill of mirrored project runtime
+dependencies that are still missing or out of spec on the Pi, optional
+Pi-only runtime supplement installs via `hardware/ops/pi_runtime_requirements.txt`,
+which mirrors `project.optional-dependencies.pi-runtime` in `pyproject.toml`,
+optional mirrored browser-automation runtime installs via
+`browser_automation/runtime_requirements.txt` plus
 `browser_automation/playwright_browsers.txt`, productive unit
-installation/restart, and bounded post-restart verification. By default it
+installation/restart, a fixed `/twinr/.venv/bin/python` import contract for
+critical direct-import modules, and bounded post-restart verification. By default it
 always manages the base runtime units and also picks up any repo-backed Pi unit
 that is already enabled on the acceptance host, which keeps optional services
 such as WhatsApp inside the same restart proof once they are live there. The
 same default path also repairs an optional Pi unit whose install symlink still
 exists but whose installed unit file became masked or otherwise corrupted on the
 host. Opt into a dependency-refreshing install only when you deliberately want
-the Pi to re-resolve runtime packages. For first rollout of an optional Pi unit
+the Pi to re-resolve the full runtime package graph. For first rollout of an optional Pi unit
 that is present in the repo but not enabled on the host yet, add
 `--rollout-service <unit>` so the deploy includes, enables, restarts, and
 verifies that unit without replacing the default base service set.

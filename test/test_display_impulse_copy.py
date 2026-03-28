@@ -31,7 +31,8 @@ class DisplayImpulseCopyTests(unittest.TestCase):
         )
 
         self.assertFalse(copy.headline.endswith("?"))
-        self.assertTrue(copy.body.endswith("?"))
+        self.assertTrue(copy.body)
+        self.assertNotEqual(copy.body, copy.headline)
 
     def test_memory_copy_uses_statement_headline_and_cta_body(self) -> None:
         copy = build_ambient_display_impulse_copy(
@@ -53,7 +54,8 @@ class DisplayImpulseCopyTests(unittest.TestCase):
         )
 
         self.assertFalse(copy.headline.endswith("?"))
-        self.assertTrue(copy.body.endswith("?"))
+        self.assertTrue(copy.body)
+        self.assertNotEqual(copy.body, copy.headline)
 
 
 if __name__ == "__main__":

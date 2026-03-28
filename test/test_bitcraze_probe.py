@@ -30,15 +30,36 @@ class BitcrazeProbeTests(unittest.TestCase):
         )
 
     def test_classify_pa_emulation(self) -> None:
-        mode = _MODULE.classify_usb_mode("1915", "7777", info_uf2_present=False)
+        mode = _MODULE.classify_usb_mode(
+            "1915",
+            "7777",
+            info_uf2_present=False,
+            filesystem_label=None,
+            manufacturer=None,
+            product=None,
+        )
         self.assertEqual(mode, "pa_emulation")
 
     def test_classify_bootloader_when_uf2_volume_is_present(self) -> None:
-        mode = _MODULE.classify_usb_mode("35f0", "bad2", info_uf2_present=True)
+        mode = _MODULE.classify_usb_mode(
+            "35f0",
+            "bad2",
+            info_uf2_present=True,
+            filesystem_label=None,
+            manufacturer=None,
+            product=None,
+        )
         self.assertEqual(mode, "uf2_bootloader")
 
     def test_classify_native_crazyradio2_without_uf2_volume(self) -> None:
-        mode = _MODULE.classify_usb_mode("35f0", "bad2", info_uf2_present=False)
+        mode = _MODULE.classify_usb_mode(
+            "35f0",
+            "bad2",
+            info_uf2_present=False,
+            filesystem_label=None,
+            manufacturer=None,
+            product=None,
+        )
         self.assertEqual(mode, "crazyradio2_native")
 
     def test_probe_workspace_reports_missing_venv_cleanly(self) -> None:
@@ -55,14 +76,17 @@ class BitcrazeProbeTests(unittest.TestCase):
             sysfs_path="/sys/bus/usb/devices/1-9",
             vendor_id="35f0",
             product_id="bad2",
+            bcd_device=None,
             manufacturer="Bitcraze AB",
             product="Crazyradio 2.0",
             serial="049867FCE657E611",
             tty_nodes=("/dev/ttyACM0",),
             block_devices=("/dev/sda",),
             mountpoints=("/media/thh/Crazyradio2",),
+            filesystem_label="Crazyradio2",
             info_uf2_present=True,
             mode="uf2_bootloader",
+            cflib_probe_compatible=False,
             recommendation="flash the pinned PA emulation UF2 for cflib compatibility",
         )
         workspace = _MODULE.WorkspaceProbe(
@@ -71,7 +95,9 @@ class BitcrazeProbeTests(unittest.TestCase):
             venv_python="/twinr/bitcraze/.venv/bin/python",
             cflib_version="0.1.31",
             cfclient_version="2025.12.1",
+            workspace_probe_error=None,
             radio_access_attempted=False,
+            radio_access_scope="not_attempted",
             radio_access_ok=False,
             radio_access_error=None,
             detected_radio_serials=(),

@@ -244,6 +244,43 @@ class AICameraTests(unittest.TestCase):
         self.assertTrue(debug["pose_fallback_disabled_by_caller"])
         self.assertFalse(debug["pose_fallback_used"])
 
+    def test_adapter_gesture_observe_tolerates_missing_debug_confidence_keys(self) -> None:
+        adapter = LocalAICameraAdapter()
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=0,
+            primary_person_box=None,
+            primary_person_zone=AICameraZone.UNKNOWN,
+            visible_persons=(),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: "frame"
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=lambda **_: SimpleNamespace(
+                hand_count=1,
+                fine_hand_gesture=AICameraFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.84,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            ),
+            debug_snapshot=lambda: {
+                "resolved_source": "live_stream",
+                "live_fine_hand_gesture": AICameraFineHandGesture.THUMBS_UP.value,
+            },
+        )
+
+        observation = adapter.observe_gesture(gesture_fast_path=True)
+
+        self.assertTrue(observation.camera_ready)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertIsNone(observation.camera_error)
+        debug = adapter.get_last_gesture_debug_details()
+        self.assertEqual(debug["final_resolved_source"], "live_stream")
+        self.assertAlmostEqual(debug["live_fine_hand_gesture_confidence"] or 0.0, 0.84, places=3)
+
     def test_adapter_attention_observe_records_fast_path_gate_reasons(self) -> None:
         adapter = LocalAICameraAdapter(
             config=AICameraAdapterConfig(

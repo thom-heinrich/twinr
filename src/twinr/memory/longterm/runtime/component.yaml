@@ -25,9 +25,40 @@ files:
   - path: __init__.py
     role: Package marker and local summary
   - path: service.py
-    role: Runtime-facing long-term memory orchestration service
+    role: Compatibility shim that preserves the historic runtime service import surface while delegating the implementation to service_impl/
     exports:
       - LongTermMemoryService
+      - LongTermRemoteReadinessResult
+      - LongTermRemoteReadinessStep
+  - path: service_impl/README.md
+    role: Internal map of the refactored service implementation package
+  - path: service_impl/main.py
+    role: LongTermMemoryService dataclass and inherited runtime method surface
+    exports:
+      - LongTermMemoryService
+  - path: service_impl/compat.py
+    role: Shared limits, helper functions, logger, and remote-readiness dataclasses extracted from the old monolith
+    exports:
+      - LongTermRemoteReadinessResult
+      - LongTermRemoteReadinessStep
+  - path: service_impl/builder.py
+    role: Runtime service assembly and bounded background-writer construction
+  - path: service_impl/readiness.py
+    role: Required-remote readiness probes and remote-state cache helpers
+  - path: service_impl/context.py
+    role: Provider-context assembly for normal, fast, and tool-facing runtime retrieval
+  - path: service_impl/ingestion.py
+    role: Conversation/multimodal enqueue paths and dry-run analysis entry points
+  - path: service_impl/maintenance.py
+    role: Reflection, sensor-memory, ops backfill, and retention orchestration
+  - path: service_impl/proactive.py
+    role: Proactive planning, reservation, and delivery/skip state transitions
+  - path: service_impl/mutations.py
+    role: Conflict resolution, review, and prompt-context mutation entry points
+  - path: service_impl/lifecycle.py
+    role: Flush and shutdown orchestration for bounded background writers
+  - path: service_impl/persistence.py
+    role: Static persistence pipeline helpers and multimodal/ops payload sanitization
   - path: worker.py
     role: Bounded background persistence workers
     exports:

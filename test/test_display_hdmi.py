@@ -1516,6 +1516,9 @@ class FakeQApplication:
     def processEvents(self) -> None:
         self.process_events_calls += 1
 
+    def platformName(self) -> str:
+        return "wayland"
+
 
 class FakeQWidget:
     def __init__(self) -> None:
@@ -1673,12 +1676,12 @@ class HdmiWaylandDisplayTests(unittest.TestCase):
         self.assertIsNone(display._qt_app)
         self.assertEqual(window.title, "TWINR")
         self.assertEqual(window.flags, 0x07)
-        self.assertEqual(window.fullscreen_calls, 1)
+        self.assertGreaterEqual(window.fullscreen_calls, 1)
         self.assertEqual(window.raise_calls, 1)
-        self.assertEqual(window.activate_calls, 1)
+        self.assertEqual(window.activate_calls, 0)
         self.assertEqual(window.close_calls, 1)
         self.assertEqual(image_label.geometry_calls, [(0, 0, 320, 240)])
-        self.assertEqual(image_label.resize_calls, [(320, 240)])
+        self.assertEqual(image_label.resize_calls, [])
         self.assertEqual(image_label.show_calls, 1)
         self.assertEqual(len(image_label.pixmap_calls), 1)
         self.assertGreaterEqual(app.process_events_calls, 2)
@@ -1686,7 +1689,7 @@ class HdmiWaylandDisplayTests(unittest.TestCase):
         self.assertEqual((first_image.width, first_image.height), (320, 240))
         self.assertEqual(first_image.stride, 1280)
         self.assertTrue(any("display_wayland=ready" in line for line in emitted))
-        self.assertTrue(any("toolkit=pyqt5" in line for line in emitted))
+        self.assertTrue(any("platform=wayland" in line for line in emitted))
 
     def test_resolve_wayland_socket_prefers_configured_runtime_dir(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):

@@ -141,7 +141,7 @@ class LocalAICameraObservationProvider:
         """Capture one low-latency gesture-only snapshot for HDMI emoji ack."""
 
         try:
-            observation = self.adapter.observe_gesture()
+            observation = self.adapter.observe_gesture(gesture_fast_path=True)
         except Exception:  # pragma: no cover - adapter already degrades conservatively.
             logger.exception("Local AI camera gesture provider failed unexpectedly; returning a conservative health snapshot.")
             observation = AICameraObservation(

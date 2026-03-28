@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
-from twinr.agent.base_agent import TwinrConfig
-from twinr.web.support.contracts import SettingsSection
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.web.support.contracts import DashboardCard, DetailMetric, SectionGroup, SettingsSection
 from twinr.web.support.forms import _select_field, _text_field
 from twinr.web.presenters.common import _BOOL_OPTIONS
 
@@ -42,6 +43,13 @@ def _bool_default(config: TwinrConfig, attr_name: str, fallback: bool) -> str:
             return "false"
         return "true" if fallback else "false"
     return "true" if bool(value) else "false"
+
+
+def _count_label(count: int, singular: str, plural: str | None = None) -> str:
+    """Render one compact count label with stable pluralization."""
+
+    suffix = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {suffix}"
 
 
 def _memory_sections(config: TwinrConfig, env_values: Mapping[str, str]) -> tuple[SettingsSection, ...]:
@@ -141,3 +149,123 @@ def _memory_sections(config: TwinrConfig, env_values: Mapping[str, str]) -> tupl
             ),
         ),
     )
+
+
+def build_activity_overview_cards(
+    snapshot: RuntimeSnapshot,
+    reminder_entries: Sequence[object],
+    delivered_reminder_entries: Sequence[object],
+    durable_memory_entries: Sequence[object],
+) -> tuple[DashboardCard, ...]:
+    """Build the top overview cards for the Activity & Memory page."""
+
+    trace_count = len(snapshot.memory_raw_tail) + len(snapshot.memory_ledger) + len(snapshot.memory_search_results)
+    return (
+        DashboardCard(
+            title="Conversation now",
+            value=_count_label(len(snapshot.memory_turns), "context turn"),
+            detail=f"{snapshot.status.title()} right now. These turns shape the next reply first.",
+            href="#current-context",
+        ),
+        DashboardCard(
+            title="Reminders",
+            value=f"{len(reminder_entries)} pending",
+            detail=f"{len(delivered_reminder_entries)} delivered reminders stay visible for review.",
+            href="#reminders",
+        ),
+        DashboardCard(
+            title="Saved memories",
+            value=_count_label(len(durable_memory_entries), "saved item"),
+            detail="Only explicit remember-this items belong here.",
+            href="#saved-memories",
+        ),
+        DashboardCard(
+            title="Advanced traces",
+            value=_count_label(trace_count, "trace item"),
+            detail="Raw tail, compact ledger, and stored web answers stay grouped at the end.",
+            href="#advanced-memory",
+        ),
+    )
+
+
+def build_activity_snapshot_metrics(snapshot: RuntimeSnapshot) -> tuple[DetailMetric, ...]:
+    """Describe the current runtime memory snapshot in plain operator language."""
+
+    return (
+        DetailMetric(
+            label="Status",
+            value=snapshot.status.title(),
+            detail="Current runtime state for the active memory snapshot.",
+        ),
+        DetailMetric(
+            label="Last heard",
+            value=snapshot.last_transcript or "—",
+            detail="Most recent transcript kept in runtime state.",
+        ),
+        DetailMetric(
+            label="Last answer",
+            value=snapshot.last_response or "—",
+            detail="Most recent spoken or generated Twinr reply.",
+        ),
+        DetailMetric(
+            label="Updated",
+            value=snapshot.updated_at or "—",
+            detail="Last time the runtime snapshot file changed.",
+        ),
+    )
+
+
+def build_activity_advanced_metrics(snapshot: RuntimeSnapshot) -> tuple[DetailMetric, ...]:
+    """Summarize the deeper runtime traces shown later on the page."""
+
+    return (
+        DetailMetric(
+            label="Open loops",
+            value=str(len(snapshot.memory_state.open_loops)),
+            detail="Outstanding follow-ups the runtime still carries forward.",
+        ),
+        DetailMetric(
+            label="Verbatim tail",
+            value=str(len(snapshot.memory_raw_tail)),
+            detail="Newest uncondensed turns kept before compaction.",
+        ),
+        DetailMetric(
+            label="Compacted ledger",
+            value=str(len(snapshot.memory_ledger)),
+            detail="Facts and summaries preserved after compaction.",
+        ),
+        DetailMetric(
+            label="Stored search answers",
+            value=str(len(snapshot.memory_search_results)),
+            detail="Verified web lookups carried into later turns and printing.",
+        ),
+    )
+
+
+def build_memory_section_groups(sections: Sequence[SettingsSection]) -> tuple[SectionGroup, ...]:
+    """Group memory-related settings into calmer operator-facing buckets."""
+
+    section_by_title = {section.title: section for section in sections}
+    groups = (
+        SectionGroup(
+            key="memory-bounds",
+            title="Conversation and print limits",
+            description="Keep the active conversation concise and printed output predictable.",
+            sections=tuple(
+                section_by_title[title]
+                for title in ("On-device memory", "Print memory")
+                if title in section_by_title
+            ),
+        ),
+        SectionGroup(
+            key="long-term-memory",
+            title="Long-term storage",
+            description="Use long-term storage only when the backend and path are intentionally configured.",
+            sections=tuple(
+                section_by_title[title]
+                for title in ("Long-term memory",)
+                if title in section_by_title
+            ),
+        ),
+    )
+    return tuple(group for group in groups if group.sections)

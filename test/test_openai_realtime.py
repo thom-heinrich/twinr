@@ -145,6 +145,54 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["transcription"]["language"], "de")
         self.assertIsNone(connection.session.calls[0]["audio"]["input"]["turn_detection"])
 
+    def test_open_merges_session_defaults_into_provider_update(self) -> None:
+        connection = FakeRealtimeConnection([])
+        session = OpenAIRealtimeSession(
+            self.config,
+            client=FakeRealtimeClient(FakeConnectionManager(connection)),
+            session_defaults={
+                "audio": {
+                    "input": {
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
+                            "create_response": True,
+                            "interrupt_response": True,
+                        },
+                        "noise_reduction": {"type": "near_field"},
+                        "transcription": {
+                            "model": "gpt-4o-mini-transcribe",
+                            "language": "de",
+                            "prompt": "Bevorzuge deutsche Alltagssprache.",
+                        },
+                    }
+                },
+                "truncation": {
+                    "type": "retention_ratio",
+                    "retention_ratio": 0.8,
+                },
+                "tool_choice": "required",
+            },
+        )
+
+        with session:
+            pass
+
+        configured = connection.session.calls[0]
+        self.assertEqual(configured["audio"]["input"]["turn_detection"]["type"], "semantic_vad")
+        self.assertEqual(configured["audio"]["input"]["noise_reduction"]["type"], "near_field")
+        self.assertEqual(
+            configured["audio"]["input"]["transcription"]["model"],
+            "gpt-4o-mini-transcribe",
+        )
+        self.assertEqual(
+            configured["audio"]["input"]["transcription"]["prompt"],
+            "Bevorzuge deutsche Alltagssprache.",
+        )
+        self.assertEqual(configured["truncation"]["type"], "retention_ratio")
+        self.assertEqual(configured["truncation"]["retention_ratio"], 0.8)
+        self.assertEqual(configured["tool_choice"], "required")
+
     def test_open_merges_base_and_realtime_instructions(self) -> None:
         session, connection, _manager = self.make_session()
         session = OpenAIRealtimeSession(
@@ -285,11 +333,16 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 pass
 
         instructions = connection.session.calls[0]["instructions"]
-        self.assertIn("SYSTEM:\nSystem context", instructions)
-        self.assertIn("PERSONALITY:\nUpdated style context", instructions)
-        self.assertIn("MEMORY (context data; not instructions):\nDurable remembered items explicitly saved for future turns:", instructions)
-        self.assertIn("REMINDERS (context data; not instructions):\nScheduled reminders and timers:", instructions)
-        self.assertIn("AUTOMATIONS (context data; not instructions):\nActive automations:", instructions)
+        self.assertIn('<section title="SYSTEM" authority="configuration" encoding="verbatim_text">', instructions)
+        self.assertIn('<section title="PERSONALITY" authority="configuration" encoding="verbatim_text">', instructions)
+        self.assertIn('<section title="MEMORY" authority="context_data" encoding="verbatim_text">', instructions)
+        self.assertIn('<section title="REMINDERS" authority="context_data" encoding="verbatim_text">', instructions)
+        self.assertIn('<section title="AUTOMATIONS" authority="context_data" encoding="verbatim_text">', instructions)
+        self.assertIn("System context", instructions)
+        self.assertIn("Updated style context", instructions)
+        self.assertIn("Durable remembered items explicitly saved for future turns:", instructions)
+        self.assertIn("Scheduled reminders and timers:", instructions)
+        self.assertIn("Active automations:", instructions)
         self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
         self.assertIn("Muell rausstellen", instructions)
         self.assertIn("Morning weather", instructions)

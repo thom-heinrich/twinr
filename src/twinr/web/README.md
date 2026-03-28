@@ -26,6 +26,8 @@ templates and CSS that power the operator dashboard.
 - persist per-channel onboarding snapshots so web-driven channel setup can show live QR-needed, paired, reconnect, and repair-needed status without moving runtime state into templates
 - compose presenters, support helpers, templates, and static assets into operator pages
 - keep the primary shell flatter by grouping deeper technical pages behind `/advanced` while exposing calmer Home, Activity, Automations, and Settings entry points
+- keep `/settings` and `/memory` internally flatter as well, with grouped overview cards, calmer buckets, and progressive disclosure for technical runtime detail
+- keep `/automations`, `/connect`, `/integrations`, `/voice-profile`, and the guided setup wizards internally flatter as well, with a clear `start here -> guided action -> advanced details` flow instead of one long flat operator surface
 - persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context, including Hue-backed smart-home settings on `/integrations`
 
 `web` does **not** own:
@@ -39,7 +41,8 @@ templates and CSS that power the operator dashboard.
 | File | Purpose |
 |---|---|
 | [`__init__.py`](./__init__.py) | Export `create_app` |
-| [`app.py`](./app.py) | FastAPI factory and route handlers |
+| [`app.py`](./app.py) | Stable compatibility shim for `twinr.web.app` plus legacy helper exports |
+| [`app_impl`](./app_impl/README.md) | Internal FastAPI implementation package split across auth, ops, integrations, automations, and preference routes |
 | [`conversation_lab.py`](./conversation_lab.py) | Portal conversation-lab session store and real text-turn execution helper |
 | [`conversation_lab_vision.py`](./conversation_lab_vision.py) | Camera and vision helpers used by Conversation Lab tool owners |
 | [`context.py`](./context.py) | Shared loaders and template rendering |

@@ -1,8 +1,10 @@
 # deepgram
 
-`deepgram` owns Twinr's Deepgram speech-to-text integration. It exposes the
-provider that handles batch transcription and bounded live-stream sessions
-against Deepgram's REST and websocket endpoints.
+`deepgram` owns Twinr's Deepgram speech-to-text integration. Its package root
+re-exports the public provider lazily so import probes do not pull transport
+dependencies until the provider is actually used. The provider itself handles
+batch transcription and bounded live-stream sessions against Deepgram's REST
+and websocket endpoints.
 
 ## Responsibility
 
@@ -24,7 +26,7 @@ Streaming note:
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Public package export |
+| [__init__.py](./__init__.py) | Lazy public package export |
 | [speech.py](./speech.py) | REST and websocket STT implementation |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [AGENTS.md](./AGENTS.md) | Local editing invariants |

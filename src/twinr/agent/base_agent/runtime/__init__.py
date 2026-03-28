@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 
 __all__ = ["TwinrRuntime"]
 

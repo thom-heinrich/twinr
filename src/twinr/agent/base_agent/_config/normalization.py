@@ -28,6 +28,10 @@ from .normalization_updates import (
     apply_display_updates,
     apply_general_updates,
 )
+from .topology_validation import (
+    validate_supported_attention_servo_topology,
+    validate_supported_camera_topology,
+)
 
 if TYPE_CHECKING:
     from .schema import TwinrConfig
@@ -823,6 +827,16 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
             "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL; "
             "Twinr must not fall back to an implicit voice gateway endpoint."
         )
+    validate_supported_camera_topology(
+        camera_host_mode=normalized_camera_host_mode,
+        camera_second_pi_base_url=normalized_camera_second_pi_base_url,
+        camera_proxy_snapshot_url=normalized_camera_proxy_snapshot_url,
+        proactive_remote_camera_base_url=normalized_proactive_remote_camera_base_url,
+    )
+    validate_supported_attention_servo_topology(
+        attention_servo_driver=normalized_attention_servo_driver,
+        attention_servo_peer_base_url=normalized_attention_servo_peer_base_url,
+    )
     normalized_values = locals().copy()
     apply_general_updates(config, normalized_values)
     apply_display_updates(config, normalized_values)

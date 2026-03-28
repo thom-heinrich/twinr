@@ -1000,6 +1000,94 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
 
+    def test_required_remote_error_restarts_streaming_once_watchdog_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+
+            snapshot_store = _RuntimeSnapshotStore(
+                lambda: RuntimeSnapshot(
+                    status="error",
+                    updated_at=clock.utcnow().isoformat(),
+                    error_message="LongTermRemoteUnavailableError: Remote long-term memory is temporarily cooling down after recent failures.",
+                )
+            )
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=snapshot_store,
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: (
+                    next(
+                        (
+                            process.pid
+                            for process in reversed(factory.processes)
+                            if process.key == "streaming"
+                        ),
+                        None,
+                    )
+                    if name == "streaming-loop"
+                    else None
+                ),
+                streaming_health_grace_s=0.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=1.5)
+
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 2)
+
+    def test_foreign_error_does_not_restart_streaming_while_watchdog_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+
+            snapshot_store = _RuntimeSnapshotStore(
+                lambda: RuntimeSnapshot(
+                    status="error",
+                    updated_at=clock.utcnow().isoformat(),
+                    error_message="ReSpeaker XVF3800 is not visible to the Pi.",
+                )
+            )
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=snapshot_store,
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: (
+                    next(
+                        (
+                            process.pid
+                            for process in reversed(factory.processes)
+                            if process.key == "streaming"
+                        ),
+                        None,
+                    )
+                    if name == "streaming-loop"
+                    else None
+                ),
+                streaming_health_grace_s=0.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=2.0)
+
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
+
     def test_base_agent_runtime_import_stays_free_of_workflow_init_cycles(self) -> None:
         result = subprocess.run(
             [

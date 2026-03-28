@@ -1,3 +1,4 @@
+# mypy: disable-error-code="arg-type,assignment,attr-defined,method-assign,index"
 import os
 from pathlib import Path
 from threading import Event
@@ -57,7 +58,7 @@ _TEST_CONTACT_PHONE_ALT_2 = "+15555550002"
 
 
 def _test_twinr_whatsapp_config(root: Path, *, runtime_state_path: str | None = None) -> TwinrConfig:
-    values: dict[str, object] = {
+    values: dict[str, str] = {
         "project_root": str(root),
         "whatsapp_allow_from": _TEST_ALLOW_FROM,
         "whatsapp_auth_dir": "state/channels/whatsapp/auth",
@@ -274,6 +275,27 @@ class _FakeToolAgentProvider:
         )
 
 
+def _fake_whatsapp_reply_text(result_output: dict[str, object]) -> str:
+    question = str(result_output.get("question", "") or "").strip()
+    if question:
+        return question
+    message = str(result_output.get("message", "") or "").strip()
+    if message:
+        return message
+    status = str(result_output.get("status", "") or "").strip()
+    recipient_label = (
+        str(result_output.get("recipient_label", "") or "").strip()
+        or str(result_output.get("name", "") or "").strip()
+    )
+    if status == "sent" and recipient_label:
+        return f"Ich habe {recipient_label} geschrieben."
+    if status == "delivery_failed":
+        return "Die WhatsApp konnte gerade nicht gesendet werden."
+    if status == "not_found":
+        return "Ich konnte diesen Kontakt gerade nicht finden."
+    return ""
+
+
 class _FakeWhatsAppPendingProvider:
     def __init__(self, config: TwinrConfig) -> None:
         self.config = config
@@ -292,7 +314,7 @@ class _FakeWhatsAppPendingProvider:
     ) -> ToolCallingTurnResponse:
         del instructions, tool_schemas, allow_web_search, on_text_delta
         call_index = len(self.start_calls)
-        call = {
+        call: dict[str, object] = {
             "prompt": prompt,
             "conversation": tuple(conversation or ()),
         }
@@ -328,6 +350,7 @@ class _FakeWhatsAppPendingProvider:
                 response_id="resp_msg_pending",
                 request_id="req_msg_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_msg_pending",
             )
         if call_index == 2:
             return ToolCallingTurnResponse(
@@ -346,6 +369,7 @@ class _FakeWhatsAppPendingProvider:
                 response_id="resp_confirm_pending",
                 request_id="req_confirm_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_confirm_pending",
             )
         raise AssertionError("unexpected extra start_turn_streaming call")
 
@@ -369,11 +393,21 @@ class _FakeWhatsAppPendingProvider:
         )
         result_output = normalized_results[0].output
         assert isinstance(result_output, dict)
-        if continuation_token == "cont_msg":
+        if continuation_token in {"cont_msg", "cont_msg_pending", "cont_confirm_pending"}:
+            response_id = {
+                "cont_msg": "resp_msg_final",
+                "cont_msg_pending": "resp_msg_pending_final",
+                "cont_confirm_pending": "resp_confirm_pending_final",
+            }[continuation_token]
+            request_id = {
+                "cont_msg": "req_msg_final",
+                "cont_msg_pending": "req_msg_pending_final",
+                "cont_confirm_pending": "req_confirm_pending_final",
+            }[continuation_token]
             return ToolCallingTurnResponse(
-                text=str(result_output["question"]),
-                response_id="resp_msg_final",
-                request_id="req_msg_final",
+                text=_fake_whatsapp_reply_text(result_output),
+                response_id=response_id,
+                request_id=request_id,
                 model="gpt-tool-test",
             )
         raise AssertionError(f"unexpected continuation token {continuation_token!r}")
@@ -397,7 +431,7 @@ class _FakeWhatsAppClarificationProvider:
     ) -> ToolCallingTurnResponse:
         del instructions, tool_schemas, allow_web_search, on_text_delta
         call_index = len(self.start_calls)
-        call = {
+        call: dict[str, object] = {
             "prompt": prompt,
             "conversation": tuple(conversation or ()),
         }
@@ -438,6 +472,7 @@ class _FakeWhatsAppClarificationProvider:
                 response_id="resp_clarify_pending",
                 request_id="req_clarify_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_clarify_pending",
             )
         if call_index == 2:
             return ToolCallingTurnResponse(
@@ -458,6 +493,7 @@ class _FakeWhatsAppClarificationProvider:
                 response_id="resp_confirm_pending",
                 request_id="req_confirm_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_clarify_confirm_pending",
             )
         raise AssertionError("unexpected extra start_turn_streaming call")
 
@@ -481,11 +517,25 @@ class _FakeWhatsAppClarificationProvider:
         )
         result_output = normalized_results[0].output
         assert isinstance(result_output, dict)
-        if continuation_token == "cont_clarify":
+        if continuation_token in {
+            "cont_clarify",
+            "cont_clarify_pending",
+            "cont_clarify_confirm_pending",
+        }:
+            response_id = {
+                "cont_clarify": "resp_clarify_final",
+                "cont_clarify_pending": "resp_clarify_pending_final",
+                "cont_clarify_confirm_pending": "resp_confirm_pending_final",
+            }[continuation_token]
+            request_id = {
+                "cont_clarify": "req_clarify_final",
+                "cont_clarify_pending": "req_clarify_pending_final",
+                "cont_clarify_confirm_pending": "req_confirm_pending_final",
+            }[continuation_token]
             return ToolCallingTurnResponse(
-                text=str(result_output["question"]),
-                response_id="resp_clarify_final",
-                request_id="req_clarify_final",
+                text=_fake_whatsapp_reply_text(result_output),
+                response_id=response_id,
+                request_id=request_id,
                 model="gpt-tool-test",
             )
         raise AssertionError(f"unexpected continuation token {continuation_token!r}")
@@ -509,7 +559,7 @@ class _FakeWhatsAppNameClarificationProvider:
     ) -> ToolCallingTurnResponse:
         del instructions, tool_schemas, allow_web_search, on_text_delta
         call_index = len(self.start_calls)
-        call = {
+        call: dict[str, object] = {
             "prompt": prompt,
             "conversation": tuple(conversation or ()),
         }
@@ -546,6 +596,7 @@ class _FakeWhatsAppNameClarificationProvider:
                 response_id="resp_name_pending",
                 request_id="req_name_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_name_pending",
             )
         if call_index == 2:
             return ToolCallingTurnResponse(
@@ -565,6 +616,7 @@ class _FakeWhatsAppNameClarificationProvider:
                 response_id="resp_name_message_pending",
                 request_id="req_name_message_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_name_message_pending",
             )
         if call_index == 3:
             return ToolCallingTurnResponse(
@@ -585,6 +637,7 @@ class _FakeWhatsAppNameClarificationProvider:
                 response_id="resp_name_confirm_pending",
                 request_id="req_name_confirm_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_name_confirm_pending",
             )
         raise AssertionError("unexpected extra start_turn_streaming call")
 
@@ -608,13 +661,30 @@ class _FakeWhatsAppNameClarificationProvider:
         )
         result_output = normalized_results[0].output
         assert isinstance(result_output, dict)
-        if continuation_token == "cont_name_clarify":
+        if continuation_token in {
+            "cont_name_clarify",
+            "cont_name_pending",
+            "cont_name_message_pending",
+            "cont_name_confirm_pending",
+        }:
+            response_id = {
+                "cont_name_clarify": "resp_name_clarify_final",
+                "cont_name_pending": "resp_name_pending_final",
+                "cont_name_message_pending": "resp_name_message_pending_final",
+                "cont_name_confirm_pending": "resp_name_confirm_pending_final",
+            }[continuation_token]
+            request_id = {
+                "cont_name_clarify": "req_name_clarify_final",
+                "cont_name_pending": "req_name_pending_final",
+                "cont_name_message_pending": "req_name_message_pending_final",
+                "cont_name_confirm_pending": "req_name_confirm_pending_final",
+            }[continuation_token]
             return ToolCallingTurnResponse(
-                text=str(result_output["question"]),
-                response_id="resp_name_clarify_final",
-                request_id="req_name_clarify_final",
+                text=_fake_whatsapp_reply_text(result_output),
+                response_id=response_id,
+                request_id=request_id,
                 model="gpt-tool-test",
-        )
+            )
         raise AssertionError(f"unexpected continuation token {continuation_token!r}")
 
 
@@ -636,7 +706,7 @@ class _FakeWhatsAppExactLabelClarificationProvider:
     ) -> ToolCallingTurnResponse:
         del instructions, tool_schemas, allow_web_search, on_text_delta
         call_index = len(self.start_calls)
-        call = {
+        call: dict[str, object] = {
             "prompt": prompt,
             "conversation": tuple(conversation or ()),
         }
@@ -672,6 +742,7 @@ class _FakeWhatsAppExactLabelClarificationProvider:
                 response_id="resp_exact_label_pending",
                 request_id="req_exact_label_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_exact_label_pending",
             )
         if call_index == 2:
             return ToolCallingTurnResponse(
@@ -690,6 +761,7 @@ class _FakeWhatsAppExactLabelClarificationProvider:
                 response_id="resp_exact_label_message_pending",
                 request_id="req_exact_label_message_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_exact_label_message_pending",
             )
         if call_index == 3:
             return ToolCallingTurnResponse(
@@ -709,6 +781,7 @@ class _FakeWhatsAppExactLabelClarificationProvider:
                 response_id="resp_exact_label_confirm_pending",
                 request_id="req_exact_label_confirm_pending",
                 model="gpt-tool-test",
+                continuation_token="cont_exact_label_confirm_pending",
             )
         raise AssertionError("unexpected extra start_turn_streaming call")
 
@@ -732,11 +805,28 @@ class _FakeWhatsAppExactLabelClarificationProvider:
         )
         result_output = normalized_results[0].output
         assert isinstance(result_output, dict)
-        if continuation_token == "cont_exact_label":
+        if continuation_token in {
+            "cont_exact_label",
+            "cont_exact_label_pending",
+            "cont_exact_label_message_pending",
+            "cont_exact_label_confirm_pending",
+        }:
+            response_id = {
+                "cont_exact_label": "resp_exact_label_final",
+                "cont_exact_label_pending": "resp_exact_label_pending_final",
+                "cont_exact_label_message_pending": "resp_exact_label_message_pending_final",
+                "cont_exact_label_confirm_pending": "resp_exact_label_confirm_pending_final",
+            }[continuation_token]
+            request_id = {
+                "cont_exact_label": "req_exact_label_final",
+                "cont_exact_label_pending": "req_exact_label_pending_final",
+                "cont_exact_label_message_pending": "req_exact_label_message_pending_final",
+                "cont_exact_label_confirm_pending": "req_exact_label_confirm_pending_final",
+            }[continuation_token]
             return ToolCallingTurnResponse(
-                text=str(result_output["question"]),
-                response_id="resp_exact_label_final",
-                request_id="req_exact_label_final",
+                text=_fake_whatsapp_reply_text(result_output),
+                response_id=response_id,
+                request_id=request_id,
                 model="gpt-tool-test",
             )
         raise AssertionError(f"unexpected continuation token {continuation_token!r}")
@@ -772,6 +862,7 @@ class _FakeSingleToolCallProvider:
             response_id="resp_single",
             request_id="req_single",
             model="gpt-tool-test",
+            continuation_token="cont_single",
         )
 
     def continue_turn_streaming(
@@ -784,8 +875,24 @@ class _FakeSingleToolCallProvider:
         allow_web_search=None,
         on_text_delta=None,
     ) -> ToolCallingTurnResponse:
-        del continuation_token, tool_results, instructions, tool_schemas, allow_web_search, on_text_delta
-        raise AssertionError("_FakeSingleToolCallProvider should not continue tool turns")
+        del instructions, tool_schemas, allow_web_search, on_text_delta
+        if continuation_token != "cont_single":
+            raise AssertionError(f"unexpected continuation token {continuation_token!r}")
+        normalized_results = tuple(tool_results)
+        self.continue_calls.append(
+            {
+                "continuation_token": continuation_token,
+                "tool_results": normalized_results,
+            }
+        )
+        result_output = normalized_results[0].output
+        assert isinstance(result_output, dict)
+        return ToolCallingTurnResponse(
+            text=_fake_whatsapp_reply_text(result_output),
+            response_id="resp_single_final",
+            request_id="req_single_final",
+            model="gpt-tool-test",
+        )
 
 
 class _SequencedWorkerBridge:
@@ -1450,10 +1557,12 @@ class WhatsAppChannelTests(unittest.TestCase):
         self.assertEqual(second.text, "Should I send this WhatsApp to Anna: Bring bitte den Schlüssel mit.")
         self.assertEqual(third.text, "Ich habe Anna geschrieben.")
         self.assertEqual(len(provider.start_calls), 3)
-        self.assertEqual(len(provider.continue_calls), 1)
+        self.assertEqual(len(provider.continue_calls), 3)
         self.assertEqual(second.metadata["provider_model"], "gpt-tool-test")
+        self.assertEqual(second.metadata["provider_response_id"], "resp_msg_pending_final")
         self.assertEqual(second.metadata["tool_calls"], "1")
         self.assertEqual(third.metadata["provider_model"], "gpt-tool-test")
+        self.assertEqual(third.metadata["provider_response_id"], "resp_confirm_pending_final")
         self.assertEqual(third.metadata["tool_calls"], "1")
         dispatch_mock.assert_called_once()
 
@@ -1761,7 +1870,7 @@ class WhatsAppChannelTests(unittest.TestCase):
         )
         self.assertEqual(third.text, "Ich habe Janina Weber geschrieben.")
         self.assertEqual(len(provider.start_calls), 3)
-        self.assertEqual(len(provider.continue_calls), 1)
+        self.assertEqual(len(provider.continue_calls), 3)
         self.assertEqual(second.metadata["provider_model"], "gpt-tool-test")
         self.assertEqual(third.metadata["provider_model"], "gpt-tool-test")
         runtime.lookup_contact.assert_has_calls(  # type: ignore[union-attr]
@@ -1878,7 +1987,7 @@ class WhatsAppChannelTests(unittest.TestCase):
         )
         self.assertEqual(fourth.text, "Ich habe Janina Werner privat geschrieben.")
         self.assertEqual(len(provider.start_calls), 4)
-        self.assertEqual(len(provider.continue_calls), 1)
+        self.assertEqual(len(provider.continue_calls), 4)
         self.assertEqual(second.metadata["provider_model"], "gpt-tool-test")
         self.assertEqual(third.metadata["provider_model"], "gpt-tool-test")
         self.assertEqual(fourth.metadata["provider_model"], "gpt-tool-test")

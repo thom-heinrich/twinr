@@ -18,6 +18,8 @@ import time
 from typing import Any, Sequence
 
 from twinr.ops.self_coding_pi import PiConnectionSettings
+from twinr.ops.venv_system_site_bridge import PiVenvSystemSiteBridgeResult
+from twinr.ops.venv_wrapper_repair import PiVenvScriptRepairResult, repair_venv_python_shebangs
 
 
 _SubprocessRunner = Any
@@ -45,6 +47,16 @@ class PiSystemdServiceState:
     main_pid: int | None
     exec_main_status: int | None
     healthy: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PiPythonImportContractResult:
+    """Summarize one remote Python import attestation."""
+
+    python_path: str
+    checked_modules: tuple[str, ...]
+    imported_modules: tuple[str, ...]
+    elapsed_s: float
 
 
 class PiRemoteExecutor:
@@ -188,7 +200,15 @@ def install_editable_package(
     remote_root: str,
     install_with_deps: bool,
 ) -> str:
-    """Ensure the Pi venv exists and refresh the editable Twinr install."""
+    """Ensure the Pi venv exists and refresh the editable Twinr install.
+
+    The default deploy path keeps ``pip install -e`` in ``--no-deps`` mode so
+    stable Pi-host packages such as ``PyQt5`` are not rebuilt on every rollout.
+    To keep that fast path integration-safe when the project adds new runtime
+    dependencies, the deploy also compares the mirrored ``pyproject.toml``
+    dependency list against the Pi venv and installs only missing or
+    out-of-spec requirements individually.
+    """
 
     remote_python = f"{remote_root}/.venv/bin/python"
     pip_args = "-e \"$remote_root\"" if install_with_deps else "--no-deps -e \"$remote_root\""
@@ -202,7 +222,363 @@ def install_editable_package(
             )
         )
     )
+    dependency_sync_summary = ""
+    if not install_with_deps:
+        dependency_sync_summary = sync_project_runtime_dependencies(
+            remote=remote,
+            remote_root=remote_root,
+            remote_python=remote_python,
+        )
+    repair_result = _repair_remote_venv_python_shebangs(
+        remote=remote,
+        remote_root=remote_root,
+        remote_python=remote_python,
+    )
+    site_bridge_result = _bridge_remote_venv_system_site_packages(
+        remote=remote,
+        remote_root=remote_root,
+        remote_python=remote_python,
+    )
+    summary_parts = [summarize_output(completed), dependency_sync_summary]
+    if repair_result.rewritten_files:
+        repaired = ", ".join(repair_result.sample_paths) or "stale wrappers"
+        summary_parts.append(
+            "normalized "
+            f"{repair_result.rewritten_files} stale venv wrapper shebang(s): {repaired}"
+        )
+    elif repair_result.checked_files:
+        summary_parts.append(
+            "verified "
+            f"{repair_result.checked_files} venv wrapper shebang(s); no stale paths found"
+        )
+    if site_bridge_result.active_paths:
+        path_count = len(site_bridge_result.active_paths)
+        noun = "path" if path_count == 1 else "paths"
+        if site_bridge_result.changed:
+            summary_parts.append(
+                "bridged "
+                f"{path_count} Pi system site-package {noun} into the venv"
+            )
+        else:
+            summary_parts.append(
+                "verified Pi system site-package bridge for "
+                f"{path_count} {noun}"
+            )
+    return summarize_text("\n".join(part for part in summary_parts if part))
+
+
+def sync_project_runtime_dependencies(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    remote_python: str,
+) -> str:
+    """Install only mirrored project requirements that the Pi venv still needs."""
+
+    pending_requirements = load_pending_project_runtime_requirements(
+        remote=remote,
+        remote_root=remote_root,
+        remote_python=remote_python,
+    )
+    if not pending_requirements:
+        return "verified mirrored project dependencies; no changes needed"
+
+    requirement_args = " ".join(shlex.quote(requirement) for requirement in pending_requirements)
+    completed = remote.run_ssh(
+        "\n".join(
+            (
+                f"remote_python={shlex.quote(remote_python)}",
+                f"\"$remote_python\" -m pip install {requirement_args}",
+            )
+        )
+    )
+    dependency_count = len(pending_requirements)
+    noun = "dependency" if dependency_count == 1 else "dependencies"
+    installed = ", ".join(pending_requirements)
+    prefix = f"installed {dependency_count} mirrored project {noun}: {installed}"
+    details = summarize_output(completed)
+    return prefix if not details else f"{prefix}\n{details}"
+
+
+def load_pending_project_runtime_requirements(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    remote_python: str,
+) -> tuple[str, ...]:
+    """Return mirrored project requirements missing or out of spec on the Pi."""
+
+    project_pyproject = f"{remote_root}/pyproject.toml"
+    script = "\n".join(
+        (
+            f"{shlex.quote(remote_python)} - <<'PY'",
+            "from __future__ import annotations",
+            "import importlib.metadata as importlib_metadata",
+            "import json",
+            "from pathlib import Path",
+            "import tomllib",
+            "try:",
+            "    from packaging.markers import default_environment",
+            "    from packaging.requirements import Requirement",
+            "except Exception:",
+            "    from pip._vendor.packaging.markers import default_environment",
+            "    from pip._vendor.packaging.requirements import Requirement",
+            f"project_pyproject = Path({json.dumps(project_pyproject)})",
+            "project_payload = tomllib.loads(project_pyproject.read_text(encoding='utf-8'))",
+            "dependencies = project_payload.get('project', {}).get('dependencies', [])",
+            "environment = default_environment()",
+            "pending_requirements = []",
+            "for raw_dependency in dependencies:",
+            "    requirement = Requirement(raw_dependency)",
+            "    if requirement.marker is not None and not requirement.marker.evaluate(environment):",
+            "        continue",
+            "    try:",
+            "        installed_version = importlib_metadata.version(requirement.name)",
+            "    except importlib_metadata.PackageNotFoundError:",
+            "        pending_requirements.append(raw_dependency)",
+            "        continue",
+            "    try:",
+            "        if requirement.specifier and not requirement.specifier.contains(installed_version, prereleases=True):",
+            "            pending_requirements.append(raw_dependency)",
+            "    except Exception:",
+            "        pending_requirements.append(raw_dependency)",
+            "print(json.dumps({'requirements': pending_requirements}, ensure_ascii=False))",
+            "PY",
+        )
+    )
+    completed = remote.run_ssh(script)
+    payload = json.loads((completed.stdout or "{}").strip() or "{}")
+    raw_requirements = payload.get("requirements", ())
+    if not isinstance(raw_requirements, list):
+        return ()
+    pending_requirements = tuple(
+        str(requirement).strip()
+        for requirement in raw_requirements
+        if str(requirement).strip()
+    )
+    return pending_requirements
+
+
+def _repair_remote_venv_python_shebangs(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    remote_python: str,
+) -> PiVenvScriptRepairResult:
+    """Run the venv wrapper-shebang repair in the Pi runtime environment."""
+
+    remote_bin_dir = f"{remote_root}/.venv/bin"
+    helper_path = f"{remote_root}/src/twinr/ops/venv_wrapper_repair.py"
+    script = "\n".join(
+        (
+            f"{shlex.quote(remote_python)} - <<'PY'",
+            "import importlib.util",
+            "import sys",
+            "from pathlib import Path",
+            "import json",
+            f"helper_path = Path({json.dumps(helper_path)})",
+            "spec = importlib.util.spec_from_file_location('twinr_ops_venv_wrapper_repair', helper_path)",
+            "if spec is None or spec.loader is None:",
+            "    raise RuntimeError(f'Could not load venv repair helper from {helper_path}')",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules[spec.name] = module",
+            "spec.loader.exec_module(module)",
+            (
+                "result = module.repair_venv_python_shebangs("
+                f"bin_dir=Path({json.dumps(remote_bin_dir)}), "
+                f"expected_interpreter={json.dumps(remote_python)}"
+                ")"
+            ),
+            "print(json.dumps({",
+            "    'checked_files': result.checked_files,",
+            "    'rewritten_files': result.rewritten_files,",
+            "    'sample_paths': list(result.sample_paths),",
+            "}, ensure_ascii=False))",
+            "PY",
+        )
+    )
+    completed = remote.run_ssh(script)
+    payload = json.loads((completed.stdout or "{}").strip() or "{}")
+    sample_paths_raw = payload.get("sample_paths", ())
+    sample_paths = (
+        tuple(str(item).strip() for item in sample_paths_raw if str(item).strip())
+        if isinstance(sample_paths_raw, list)
+        else ()
+    )
+    return PiVenvScriptRepairResult(
+        checked_files=max(0, int(payload.get("checked_files", 0) or 0)),
+        rewritten_files=max(0, int(payload.get("rewritten_files", 0) or 0)),
+        sample_paths=sample_paths,
+    )
+
+
+def _bridge_remote_venv_system_site_packages(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    remote_python: str,
+) -> PiVenvSystemSiteBridgeResult:
+    """Expose Pi OS-managed `dist-packages` inside the preserved venv."""
+
+    helper_path = f"{remote_root}/src/twinr/ops/venv_system_site_bridge.py"
+    script = "\n".join(
+        (
+            f"{shlex.quote(remote_python)} - <<'PY'",
+            "import importlib.util",
+            "import json",
+            "import sys",
+            "import sysconfig",
+            "from pathlib import Path",
+            f"helper_path = Path({json.dumps(helper_path)})",
+            "spec = importlib.util.spec_from_file_location('twinr_ops_venv_system_site_bridge', helper_path)",
+            "if spec is None or spec.loader is None:",
+            "    raise RuntimeError(f'Could not load venv bridge helper from {helper_path}')",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules[spec.name] = module",
+            "spec.loader.exec_module(module)",
+            (
+                "result = module.ensure_pi_system_site_packages_bridge("
+                "site_packages_dir=Path(sysconfig.get_path('purelib'))"
+                ")"
+            ),
+            "print(json.dumps({",
+            "    'bridge_path': result.bridge_path,",
+            "    'active_paths': list(result.active_paths),",
+            "    'changed': result.changed,",
+            "}, ensure_ascii=False))",
+            "PY",
+        )
+    )
+    completed = remote.run_ssh(script)
+    payload = json.loads((completed.stdout or "{}").strip() or "{}")
+    active_paths_raw = payload.get("active_paths", ())
+    active_paths = (
+        tuple(str(item).strip() for item in active_paths_raw if str(item).strip())
+        if isinstance(active_paths_raw, list)
+        else ()
+    )
+    return PiVenvSystemSiteBridgeResult(
+        bridge_path=str(payload.get("bridge_path", "")).strip(),
+        active_paths=active_paths,
+        changed=bool(payload.get("changed", False)),
+    )
+
+
+def install_python_requirements_manifest(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    manifest_relpath: str,
+    label: str,
+) -> str:
+    """Install one mirrored Python requirements manifest into the Pi venv."""
+
+    remote_python = f"{remote_root}/.venv/bin/python"
+    requirements_path = f"{remote_root}/{manifest_relpath.lstrip('/')}"
+    completed = remote.run_ssh(
+        "\n".join(
+            (
+                f"remote_root={shlex.quote(remote_root)}",
+                f"remote_python={shlex.quote(remote_python)}",
+                f"requirements_path={shlex.quote(requirements_path)}",
+                "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
+                'test -s "$requirements_path"',
+                f'echo "[{label}] installing python requirements"',
+                '"$remote_python" -m pip install -r "$requirements_path"',
+            )
+        )
+    )
     return summarize_output(completed)
+
+
+def verify_python_import_contract(
+    *,
+    remote: PiRemoteExecutor,
+    remote_python: str,
+    modules: Sequence[str],
+) -> PiPythonImportContractResult:
+    """Import a fixed module set inside the remote Pi venv and fail on drift."""
+
+    normalized_modules = tuple(str(module).strip() for module in modules if str(module).strip())
+    if not normalized_modules:
+        return PiPythonImportContractResult(
+            python_path=remote_python,
+            checked_modules=(),
+            imported_modules=(),
+            elapsed_s=0.0,
+        )
+
+    script = "\n".join(
+        (
+            f"{shlex.quote(remote_python)} - <<'PY'",
+            "import importlib",
+            "import json",
+            "import time",
+            f"modules = {json.dumps(list(normalized_modules), ensure_ascii=False)}",
+            "started = time.perf_counter()",
+            "imported = []",
+            "failed = {}",
+            "for name in modules:",
+            "    try:",
+            "        importlib.import_module(name)",
+            "    except Exception as exc:",
+            "        failed[name] = f'{type(exc).__name__}: {exc}'",
+            "    else:",
+            "        imported.append(name)",
+            "payload = {",
+            "    'python_path': " + json.dumps(remote_python) + ",",
+            "    'checked_modules': modules,",
+            "    'imported_modules': imported,",
+            "    'failed_imports': failed,",
+            "    'elapsed_s': round(time.perf_counter() - started, 3),",
+            "}",
+            "print(json.dumps(payload, ensure_ascii=False))",
+            "PY",
+        )
+    )
+    completed = remote.run_ssh(script)
+    payload = json.loads((completed.stdout or "{}").strip() or "{}")
+
+    checked_modules_raw = payload.get("checked_modules", ())
+    imported_modules_raw = payload.get("imported_modules", ())
+    failed_imports_raw = payload.get("failed_imports", {})
+
+    checked_modules = (
+        tuple(str(item).strip() for item in checked_modules_raw if str(item).strip())
+        if isinstance(checked_modules_raw, list)
+        else normalized_modules
+    )
+    imported_modules = (
+        tuple(str(item).strip() for item in imported_modules_raw if str(item).strip())
+        if isinstance(imported_modules_raw, list)
+        else ()
+    )
+    failed_imports = (
+        {
+            str(module).strip(): str(error).strip()
+            for module, error in failed_imports_raw.items()
+            if str(module).strip()
+        }
+        if isinstance(failed_imports_raw, dict)
+        else {}
+    )
+    if failed_imports:
+        details = "; ".join(f"{module} -> {error}" for module, error in sorted(failed_imports.items()))
+        raise RuntimeError(f"remote python import contract failed for {remote_python}: {details}")
+    missing_modules = tuple(module for module in checked_modules if module not in set(imported_modules))
+    if missing_modules:
+        missing_list = ", ".join(missing_modules)
+        raise RuntimeError(
+            "remote python import contract returned an incomplete result for "
+            f"{remote_python}: missing {missing_list}"
+        )
+
+    return PiPythonImportContractResult(
+        python_path=str(payload.get("python_path", remote_python)).strip() or remote_python,
+        checked_modules=checked_modules,
+        imported_modules=imported_modules,
+        elapsed_s=max(0.0, float(payload.get("elapsed_s", 0.0) or 0.0)),
+    )
 
 
 def install_browser_automation_runtime_support(
@@ -227,23 +603,23 @@ def install_browser_automation_runtime_support(
     """
 
     remote_python = f"{remote_root}/.venv/bin/python"
-    requirements_path = f"{remote_root}/browser_automation/runtime_requirements.txt"
     browsers_path = f"{remote_root}/browser_automation/playwright_browsers.txt"
+    summary_parts: list[str] = []
+    if install_python_requirements:
+        summary_parts.append(
+            install_python_requirements_manifest(
+                remote=remote,
+                remote_root=remote_root,
+                manifest_relpath="browser_automation/runtime_requirements.txt",
+                label="browser_automation",
+            )
+        )
     lines = [
         f"remote_root={shlex.quote(remote_root)}",
         f"remote_python={shlex.quote(remote_python)}",
-        f"requirements_path={shlex.quote(requirements_path)}",
         f"browsers_path={shlex.quote(browsers_path)}",
         "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
     ]
-    if install_python_requirements:
-        lines.extend(
-            (
-                'test -s "$requirements_path"',
-                'echo "[browser_automation] installing python requirements"',
-                '"$remote_python" -m pip install -r "$requirements_path"',
-            )
-        )
     if install_playwright_browsers:
         lines.extend(
             (
@@ -265,8 +641,10 @@ def install_browser_automation_runtime_support(
                 '"$remote_python" -m playwright install "${browser_names[@]}"',
             )
         )
-    completed = remote.run_ssh("\n".join(lines))
-    return summarize_output(completed)
+    if install_playwright_browsers:
+        completed = remote.run_ssh("\n".join(lines))
+        summary_parts.append(summarize_output(completed))
+    return summarize_text("\n".join(part for part in summary_parts if part))
 
 
 def install_service_units(
@@ -481,11 +859,15 @@ def sshpass_env(password: str) -> dict[str, str]:
 
 
 __all__ = [
+    "PiPythonImportContractResult",
     "PiRemoteExecutor",
     "PiSyncedFileResult",
     "PiSystemdServiceState",
+    "PiVenvSystemSiteBridgeResult",
+    "PiVenvScriptRepairResult",
     "install_browser_automation_runtime_support",
     "install_editable_package",
+    "install_python_requirements_manifest",
     "install_service_units",
     "load_journal_excerpt",
     "load_service_states",
@@ -493,9 +875,11 @@ __all__ = [
     "read_remote_sha256",
     "restart_services",
     "run_env_contract_probe",
+    "repair_venv_python_shebangs",
     "sshpass_env",
     "summarize_output",
     "summarize_text",
     "sync_authoritative_file",
+    "verify_python_import_contract",
     "wait_for_services",
 ]

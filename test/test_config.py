@@ -110,7 +110,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.browser_automation_workspace_path, "browser_automation")
         self.assertEqual(config.browser_automation_entry_module, "adapter.py")
 
-    def test_from_env_second_pi_mode_derives_remote_frame_defaults(self) -> None:
+    def test_from_env_rejects_legacy_second_pi_camera_topology(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -124,15 +124,15 @@ class TwinrConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config = TwinrConfig.from_env(env_path)
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi camera topology is no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.camera_host_mode, "second_pi")
-        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
-        self.assertEqual(config.proactive_remote_camera_base_url, "http://10.42.0.2:8767")
-        self.assertEqual(config.proactive_vision_provider, "remote_frame")
-        self.assertEqual(config.camera_proxy_snapshot_url, "http://10.42.0.2:8767/snapshot.png")
-
-    def test_from_env_explicit_onboard_mode_does_not_derive_remote_defaults(self) -> None:
+    def test_from_env_rejects_legacy_remote_camera_envs_even_when_onboard_mode_is_explicit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -146,14 +146,13 @@ class TwinrConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config = TwinrConfig.from_env(env_path)
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi camera topology is no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.camera_host_mode, "onboard")
-        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
-        self.assertEqual(config.proactive_vision_provider, "local_first")
-        self.assertIsNone(config.camera_proxy_snapshot_url)
-
-    def test_from_env_legacy_remote_camera_settings_derive_second_pi_mode(self) -> None:
+    def test_from_env_rejects_legacy_remote_camera_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -161,12 +160,11 @@ class TwinrConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.camera_host_mode, "second_pi")
-        self.assertEqual(config.camera_second_pi_base_url, "http://10.42.0.2:8767")
-        self.assertEqual(config.proactive_vision_provider, "remote_frame")
-        self.assertEqual(config.camera_proxy_snapshot_url, "http://10.42.0.2:8767/snapshot.png")
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi camera topology is no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
 
     def test_from_env_aideck_camera_defaults_to_aideck_openai_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -502,7 +500,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_continuous_min_speed_pulse_delta_us, 72)
         self.assertEqual(config.attention_servo_continuous_max_speed_pulse_delta_us, 165)
 
-    def test_from_env_reads_peer_pololu_maestro_attention_servo_driver(self) -> None:
+    def test_from_env_rejects_legacy_peer_pololu_maestro_attention_servo_driver(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -527,21 +527,31 @@ class TwinrConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config = TwinrConfig.from_env(env_path)
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi attention-servo topology is no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.attention_servo_driver, "peer_pololu_maestro")
-        self.assertEqual(config.attention_servo_control_mode, "continuous_rotation")
-        self.assertEqual(config.attention_servo_peer_base_url, "http://10.42.0.2:8768")
-        self.assertEqual(config.attention_servo_peer_timeout_s, 2.25)
-        self.assertEqual(config.attention_servo_maestro_channel, 1)
-        self.assertEqual(config.attention_servo_state_path, "/tmp/custom-attention-servo-state.json")
-        self.assertEqual(config.attention_servo_estimated_zero_max_uncertainty_degrees, 9.0)
-        self.assertEqual(config.attention_servo_estimated_zero_settle_tolerance_degrees, 0.8)
-        self.assertEqual(config.attention_servo_estimated_zero_speed_scale, 0.45)
-        self.assertEqual(config.attention_servo_estimated_zero_move_pulse_delta_us, 71)
-        self.assertEqual(config.attention_servo_estimated_zero_move_period_s, 0.9)
-        self.assertEqual(config.attention_servo_estimated_zero_move_duty_cycle, 0.22)
-        self.assertEqual(config.attention_servo_continuous_return_to_zero_after_s, 45.0)
+    def test_from_env_rejects_stale_peer_servo_url_without_peer_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_ATTENTION_SERVO_DRIVER=auto",
+                        "TWINR_ATTENTION_SERVO_PEER_BASE_URL=http://10.42.0.2:8768/",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi attention-servo topology is no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
 
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1734,6 +1744,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
                         "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
                         "TWINR_VOICE_ORCHESTRATOR_WS_URL=wss://voice.example/ws/orchestrator/voice",
+                        "TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=1",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=2400",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_MIN_ACTIVE_RATIO=0.12",
                         "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://10.10.0.2:18090",
@@ -1761,6 +1772,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestrator_shared_secret, "secret-token")
         self.assertTrue(config.voice_orchestrator_enabled)
         self.assertEqual(config.voice_orchestrator_ws_url, "wss://voice.example/ws/orchestrator/voice")
+        self.assertTrue(config.voice_orchestrator_allow_insecure_ws)
         self.assertEqual(config.voice_orchestrator_shared_secret, "secret-token")
         self.assertEqual(config.voice_orchestrator_wake_candidate_window_ms, 2400)
         self.assertEqual(config.voice_orchestrator_wake_candidate_min_active_ratio, 0.12)
@@ -1779,6 +1791,24 @@ class TwinrConfigTests(unittest.TestCase):
             "artifacts/stores/ops/voice_gateway_audio_live",
         )
         self.assertEqual(config.voice_orchestrator_audio_debug_max_files, 12)
+
+    def test_legacy_insecure_voice_ws_flag_still_populates_new_config_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_ALLOW_INSECURE_VOICE_WS=1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.voice_orchestrator_allow_insecure_ws)
 
     def test_voice_orchestrator_enabled_requires_explicit_ws_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

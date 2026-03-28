@@ -44,7 +44,7 @@ class TwinrConfig:
     openai_reasoning_effort: str = "medium"
     openai_prompt_cache_enabled: bool = True
     openai_prompt_cache_retention: str | None = None
-    openai_stt_model: str = "whisper-1"
+    openai_stt_model: str = "gpt-4o-mini-transcribe"
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "marin"
     openai_tts_speed: float = 1.0
@@ -65,11 +65,11 @@ class TwinrConfig:
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_s: float = 45.0
-    openai_realtime_model: str = "gpt-4o-realtime-preview"
+    openai_realtime_model: str = "gpt-realtime-1.5"
     openai_realtime_voice: str = "sage"
     openai_realtime_speed: float = 1.0
     openai_realtime_instructions: str | None = None
-    openai_realtime_transcription_model: str = "whisper-1"
+    openai_realtime_transcription_model: str = "gpt-4o-mini-transcribe"
     openai_realtime_language: str | None = "de"
     openai_realtime_input_sample_rate: int = 24000
     turn_controller_enabled: bool = True
@@ -194,6 +194,7 @@ class TwinrConfig:
     orchestrator_shared_secret: str | None = None
     voice_orchestrator_enabled: bool = False
     voice_orchestrator_ws_url: str = ""
+    voice_orchestrator_allow_insecure_ws: bool = False
     voice_orchestrator_shared_secret: str | None = None
     voice_orchestrator_audio_device: str | None = None
     voice_activation_phrases: tuple[str, ...] = DEFAULT_VOICE_ACTIVATION_PHRASES

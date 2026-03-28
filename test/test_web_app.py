@@ -824,6 +824,8 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/connect")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("Start here", response.text)
+        self.assertIn("Provider and credential settings", response.text)
         self.assertIn("Open WhatsApp wizard", response.text)
         self.assertIn("field-tooltip", response.text)
         self.assertIn("The main OpenAI secret used for chat, speech, vision, and realtime requests.", response.text)
@@ -838,6 +840,8 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("WhatsApp self-chat wizard", response.text)
+        self.assertIn("What to do now", response.text)
+        self.assertIn("Other steps", response.text)
         self.assertIn("Choose your own WhatsApp chat", response.text)
         self.assertIn("Prepare the worker runtime", response.text)
         self.assertIn("Pair WhatsApp once", response.text)
@@ -1008,6 +1012,8 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Email setup wizard", response.text)
+        self.assertIn("What to do now", response.text)
+        self.assertIn("Other steps", response.text)
         self.assertIn("Choose the mail provider", response.text)
         self.assertIn("Save the mailbox login", response.text)
         self.assertIn("Review the server settings", response.text)
@@ -1300,7 +1306,9 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/integrations")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Integration overview", response.text)
+        self.assertIn("Start here", response.text)
+        self.assertIn("Guided setup pages", response.text)
+        self.assertIn("Direct forms and optional setup", response.text)
         self.assertIn("Email mailbox", response.text)
         self.assertIn("Open email wizard", response.text)
         self.assertIn("/integrations/email", response.text)
@@ -1538,7 +1546,9 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/voice-profile")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Live voice status", response.text)
+        self.assertIn("Start here", response.text)
+        self.assertIn("Voice actions", response.text)
+        self.assertIn("Safety and decision policy", response.text)
         self.assertIn("Capture and enroll sample", response.text)
         self.assertIn("Verify now", response.text)
         self.assertIn("Reset profile", response.text)
@@ -1600,6 +1610,10 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/automations")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("Start here", response.text)
+        self.assertIn("Saved rules by family", response.text)
+        self.assertIn("Scheduled automation editor", response.text)
+        self.assertIn("Sensor automation editor", response.text)
         self.assertIn("Automation families", response.text)
         self.assertIn("Scheduled", response.text)
         self.assertIn("Sensor-triggered", response.text)
@@ -1779,9 +1793,14 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/settings")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Open a setup area", response.text)
+        self.assertIn("Choose a setup area", response.text)
+        self.assertIn("Special setup pages", response.text)
         self.assertIn("/voice-profile", response.text)
         self.assertIn("/integrations", response.text)
+        self.assertIn("Voice and replies", response.text)
+        self.assertIn("Listening and devices", response.text)
+        self.assertIn("Daily behavior", response.text)
+        self.assertIn("Advanced and recovery", response.text)
         self.assertIn("Models and voices", response.text)
         self.assertIn("Search", response.text)
         self.assertIn("Camera and vision", response.text)
@@ -1791,6 +1810,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Voice gateway and audio capture", response.text)
         self.assertIn("Remote voice gateway", response.text)
         self.assertIn("Voice gateway websocket", response.text)
+        self.assertIn("Allow insecure gateway ws://", response.text)
         self.assertIn("Remote ASR URL", response.text)
         self.assertIn("Remote ASR timeout (s)", response.text)
         self.assertIn("Buttons and motion sensor", response.text)
@@ -1806,6 +1826,10 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Realtime speed", response.text)
         self.assertIn(
             "Keep the live transcript-first remote voice gateway enabled for hands-free speech. Twinr uses only this remote path for live voice turns.",
+            response.text,
+        )
+        self.assertIn(
+            "Explicitly allow the current plain ws:// LAN bridge when no TLS terminator exists yet. Leave this off for normal wss:// deployments.",
             response.text,
         )
         self.assertIn("After this many quiet seconds without motion, the scene is treated as idle / low-motion.", response.text)
@@ -1880,6 +1904,7 @@ class WebAppTests(unittest.TestCase):
                 "TWINR_PROACTIVE_AUDIO_SAMPLE_MS": "900",
                 "TWINR_VOICE_ORCHESTRATOR_ENABLED": "true",
                 "TWINR_VOICE_ORCHESTRATOR_WS_URL": "ws://voice-gateway.example/ws/orchestrator/voice",
+                "TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS": "true",
                 "TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET": "voice-secret",
                 "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS": "1700",
                 "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL": "http://asr.example:18090",
@@ -1938,6 +1963,7 @@ class WebAppTests(unittest.TestCase):
             "TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://voice-gateway.example/ws/orchestrator/voice",
             env_text,
         )
+        self.assertIn("TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true", env_text)
         self.assertIn("TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=1700", env_text)
         self.assertIn("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://asr.example:18090", env_text)
         self.assertIn("TWINR_PROACTIVE_ATTENTION_WINDOW_S=8.5", env_text)
@@ -2061,12 +2087,15 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/memory")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Live memory snapshot", response.text)
-        self.assertIn("Durable memories", response.text)
-        self.assertIn("Memory state", response.text)
-        self.assertIn("Raw tail", response.text)
-        self.assertIn("Recent search results", response.text)
-        self.assertIn("Scheduled reminders", response.text)
+        self.assertIn("Start here", response.text)
+        self.assertIn("Current conversation context", response.text)
+        self.assertIn("What Twinr is carrying forward", response.text)
+        self.assertIn("Saved memories", response.text)
+        self.assertIn("Memory limits and storage", response.text)
+        self.assertIn("Advanced runtime traces", response.text)
+        self.assertIn("Verbatim tail before compaction", response.text)
+        self.assertIn("Stored search answers", response.text)
+        self.assertIn("Reminders to review", response.text)
         self.assertIn("Pending reminders", response.text)
         self.assertIn("Delivered reminders", response.text)
         self.assertIn("An die Tabletten erinnern.", response.text)

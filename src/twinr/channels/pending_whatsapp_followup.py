@@ -1,23 +1,23 @@
-"""Resolve bounded WhatsApp draft follow-ups with a dedicated model step.
+"""Resolve bounded WhatsApp draft follow-ups with the shared tool loop.
 
 Open WhatsApp send flows should stay structured across turns without relying on
-free-form chat history alone. This helper asks the tool-capable model for the
-next ``send_whatsapp_message`` call inside a tightly bounded context, then
-executes that tool call locally and returns the resulting structured reply.
+free-form chat history alone. This helper narrows the provider to one
+``send_whatsapp_message`` lane, runs the same continuation-aware tool loop used
+by normal channel turns, and returns the resulting structured reply plus the
+final provider metadata.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from twinr.agent.base_agent.contracts import (
-    AgentToolCall,
     AgentToolResult,
     ConversationLike,
     ToolCallingAgentProvider,
 )
+from twinr.agent.tools.runtime.streaming_loop import ToolCallingStreamingLoop
 
 from .pending_actions import PendingTextChannelAction
 
@@ -32,6 +32,8 @@ class PendingWhatsAppFollowUpResult:
     provider_response_id: str | None = None
     provider_request_id: str | None = None
     provider_model: str | None = None
+    tool_rounds: int = 0
+    used_web_search: bool = False
 
 
 def resolve_pending_whatsapp_follow_up(
@@ -44,6 +46,7 @@ def resolve_pending_whatsapp_follow_up(
     tool_schemas: tuple[dict[str, object], ...],
     allow_web_search: bool | None,
     execute_tool,
+    max_rounds: int = 6,
 ) -> PendingWhatsAppFollowUpResult | None:
     """Continue one active ``send_whatsapp_message`` draft with a bounded model call.
 
@@ -62,28 +65,34 @@ def resolve_pending_whatsapp_follow_up(
     }:
         return None
 
-    response = provider.start_turn_streaming(
+    loop = ToolCallingStreamingLoop(
+        provider,
+        tool_handlers={"send_whatsapp_message": execute_tool},
+        tool_schemas=tool_schemas,
+        max_rounds=max_rounds,
+        stream_final_only=False,
+    )
+    loop_result = loop.run(
         _pending_follow_up_prompt(pending_action, user_text),
         conversation=conversation,
         instructions=instructions,
-        tool_schemas=tool_schemas,
         allow_web_search=allow_web_search,
         on_text_delta=None,
     )
-    tool_call = _extract_single_send_whatsapp_tool_call(response.tool_calls)
-    output = execute_tool(dict(tool_call.arguments))
-    tool_result = AgentToolResult(
-        call_id=tool_call.call_id,
-        name=tool_call.name,
-        output=output,
-        serialized_output=json.dumps(output, ensure_ascii=False, sort_keys=True),
-    )
+    reply_text = str(loop_result.text or "").strip()
+    if not reply_text:
+        reply_text = _reply_text_from_tool_results(
+            loop_result.tool_results,
+            pending_action=pending_action,
+        )
     return PendingWhatsAppFollowUpResult(
-        reply_text=_reply_text_from_tool_output(output, pending_action=pending_action),
-        tool_results=(tool_result,),
-        provider_response_id=_optional_text(getattr(response, "response_id", None)),
-        provider_request_id=_optional_text(getattr(response, "request_id", None)),
-        provider_model=_optional_text(getattr(response, "model", None)),
+        reply_text=reply_text,
+        tool_results=tuple(loop_result.tool_results),
+        provider_response_id=_optional_text(loop_result.response_id),
+        provider_request_id=_optional_text(loop_result.request_id),
+        provider_model=_optional_text(loop_result.model),
+        tool_rounds=max(0, int(loop_result.rounds)),
+        used_web_search=bool(loop_result.used_web_search),
     )
 
 
@@ -149,28 +158,25 @@ def _stored_recipient_fields_text(pending_action: PendingTextChannelAction) -> s
     return ", ".join(fields)
 
 
-def _extract_single_send_whatsapp_tool_call(tool_calls: object) -> AgentToolCall:
-    if tool_calls is None:
-        normalized: tuple[object, ...] = ()
-    else:
-        normalized = tuple(cast(list[object] | tuple[object, ...], tool_calls))
-    if len(normalized) != 1:
-        raise RuntimeError("pending WhatsApp follow-up requires exactly one tool call")
-    tool_call = normalized[0]
-    if not isinstance(tool_call, AgentToolCall):
-        raise RuntimeError("pending WhatsApp follow-up returned a malformed tool call")
-    if tool_call.name != "send_whatsapp_message":
-        raise RuntimeError("pending WhatsApp follow-up must call send_whatsapp_message")
-    if not isinstance(tool_call.arguments, dict):
-        raise RuntimeError("pending WhatsApp follow-up tool arguments must be a JSON object")
-    return tool_call
-
-
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _reply_text_from_tool_results(
+    tool_results: tuple[AgentToolResult, ...],
+    *,
+    pending_action: PendingTextChannelAction,
+) -> str:
+    for tool_result in reversed(tool_results):
+        if str(getattr(tool_result, "name", "") or "").strip() != "send_whatsapp_message":
+            continue
+        output = getattr(tool_result, "output", None)
+        if isinstance(output, dict):
+            return _reply_text_from_tool_output(output, pending_action=pending_action)
+    return "Ich konnte die WhatsApp gerade nicht weiterführen."
 
 
 def _reply_text_from_tool_output(

@@ -87,7 +87,14 @@ files:
       - AICameraZone
       - LocalAICameraAdapter
   - path: camera_ai/
-    role: Internal SoC package for AI-camera contracts, IMX500 runtime, MediaPipe runtime, supplemental face anchors, pose, motion, and gesture modules
+    role: Internal SoC package for AI-camera contracts, IMX500 runtime, MediaPipe runtime, supplemental face anchors, pose, motion, gesture modules, and the decomposed local adapter internals
+  - path: camera_ai/adapter.py
+    role: Stable compatibility facade for the internal local AI-camera adapter surface; preserves the legacy module path while runtime logic lives under camera_ai/adapter_impl/
+    exports:
+      - LocalAICameraAdapter
+      - PoseResult
+  - path: camera_ai/adapter_impl/
+    role: Internal AI-camera adapter package split across observation entrypoints, pose resolution, gesture targeting, runtime lifecycle, and cache/error helpers
   - path: ai_camera_diagnostics.py
     role: Bounded diagnostics for IMX500 pose candidate selection and keypoint support on the Pi
     exports:
@@ -143,12 +150,14 @@ files:
       - edge_name
       - edge_to_action
   - path: servo_follow.py
-    role: Bounded servo pulse adapter for normalized body-orientation follow, with calibrated soft limits, calm idle release, continuous-rotation control-mode selection, and driver selection across Pi GPIO and focused external writers
+    role: Stable compatibility facade for the public attention-servo import surface; preserves the legacy module path while runtime logic lives under servo_follow_impl/
     exports:
       - AttentionServoConfig
       - AttentionServoController
       - AttentionServoDecision
       - LGPIOServoPulseWriter
+  - path: servo_follow_impl/
+    role: Internal attention-servo package split across config normalization, writer selection, motion shaping, target resolution, exit-only behavior, and controller state
   - path: servo_continuous.py
     role: Focused virtual-heading planner for continuous-rotation servos so open-loop speed control stays separate from the higher follow-state machine
   - path: servo_maestro.py
@@ -343,6 +352,7 @@ primary_callers:
   - path: src/twinr/ops/self_test.py
 tests:
   - path: test/test_ai_camera.py
+  - path: test/test_ai_camera_adapter_refactor_parity.py
   - path: test/test_audio.py
   - path: test/test_button_helpers.py
   - path: test/test_camera.py

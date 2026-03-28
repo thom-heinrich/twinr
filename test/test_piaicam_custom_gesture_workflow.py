@@ -1,9 +1,12 @@
+import io
 from pathlib import Path
 import importlib.util
 import sys
 import tempfile
 import unittest
 import zipfile
+
+from PIL import Image
 
 
 PIAICAM_DIR = Path(__file__).resolve().parents[1] / "hardware" / "piaicam"
@@ -47,7 +50,7 @@ class _FakeCamera:
 
     def capture_file(self, path: str) -> None:
         self.files.append(path)
-        Path(path).write_bytes(b"jpeg")
+        Path(path).write_bytes(_jpeg_bytes(color=(255, 0, 0)))
 
     def stop(self) -> None:
         self.stopped = True
@@ -56,21 +59,12 @@ class _FakeCamera:
         self.closed = True
 
 
-class _StubSplit:
-    def __init__(self, size: int) -> None:
-        self.size = size
-
-
 class _StubDataset:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.label_names = ["none", "peace_sign", "thumbs_down", "thumbs_up"]
         self.num_classes = 4
-        self.fraction = None
-
-    def split(self, fraction: float):
-        self.fraction = fraction
-        return _StubSplit(8), _StubSplit(2)
+        self.size = sum(1 for _ in root.rglob("*") if _.is_file())
 
 
 class _StubRecognizer:
@@ -93,20 +87,31 @@ class _StubRecognizer:
 
 class _StubGestureRecognizerAPI:
     last_dataset = None
+    loaded_datasets: list[_StubDataset] = []
 
     class HParams:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
+    class ModelOptions:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
     class GestureRecognizerOptions:
-        def __init__(self, *, hparams=None) -> None:
+        def __init__(self, *, hparams=None, model_options=None) -> None:
             self.hparams = hparams
+            self.model_options = model_options
+
+    class HandDataPreprocessingParams:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
 
     class Dataset:
         @staticmethod
-        def from_folder(dirname: str):
+        def from_folder(dirname: str, **kwargs):
             dataset = _StubDataset(Path(dirname))
             _StubGestureRecognizerAPI.last_dataset = dataset
+            _StubGestureRecognizerAPI.loaded_datasets.append(dataset)
             return dataset
 
     class GestureRecognizer:
@@ -124,14 +129,38 @@ class _StubGestureRecognizerAPIRejectingHands:
             raise ValueError("No valid hand is detected.")
 
 
+def _jpeg_bytes(*, color: tuple[int, int, int]) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _write_test_jpeg(path: Path, *, color: tuple[int, int, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_jpeg_bytes(color=color))
+
+
+def _color_for(label: str, index: int) -> tuple[int, int, int]:
+    base = sum(ord(ch) for ch in label) % 200
+    return (
+        (base + 31 * (index + 1)) % 256,
+        (base + 67 * (index + 1)) % 256,
+        (base + 103 * (index + 1)) % 256,
+    )
+
+
 class PIAICustomGestureWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _StubGestureRecognizerAPI.last_dataset = None
+        _StubGestureRecognizerAPI.loaded_datasets = []
+
     def test_stage_required_label_dataset_excludes_extra_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_root = Path(temp_dir) / "dataset"
             for label in ("none", "thumbs_up", "thumbs_down", "peace_sign", "ok_sign"):
                 label_dir = dataset_root / label
                 label_dir.mkdir(parents=True)
-                (label_dir / "sample.jpg").write_bytes(b"jpeg")
+                _write_test_jpeg(label_dir / "sample.jpg", color=_color_for(label, 0))
             manifest = workflow.collect_dataset_manifest(
                 dataset_root,
                 required_labels=("none", "thumbs_up", "thumbs_down", "peace_sign"),
@@ -143,16 +172,16 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
                 output_root=Path(temp_dir) / "staged",
             )
 
-        self.assertEqual(staged_manifest.label_names, ("none", "peace_sign", "thumbs_down", "thumbs_up"))
+        self.assertEqual(staged_manifest.label_names, ("none", "thumbs_up", "thumbs_down", "peace_sign"))
         self.assertFalse((Path(temp_dir) / "staged" / "ok_sign").exists())
 
     def test_collect_dataset_manifest_requires_none_label(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_root = Path(temp_dir)
             (dataset_root / "thumbs_up").mkdir()
-            (dataset_root / "thumbs_up" / "sample.jpg").write_bytes(b"jpeg")
+            _write_test_jpeg(dataset_root / "thumbs_up" / "sample.jpg", color=_color_for("thumbs_up", 0))
             (dataset_root / "thumbs_down").mkdir()
-            (dataset_root / "thumbs_down" / "sample.jpg").write_bytes(b"jpeg")
+            _write_test_jpeg(dataset_root / "thumbs_down" / "sample.jpg", color=_color_for("thumbs_down", 0))
 
             with self.assertRaises(ValueError) as context:
                 workflow.collect_dataset_manifest(dataset_root)
@@ -212,8 +241,8 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
                 for label in ("like", "dislike", "peace", "no_gesture", "ok"):
                     for index in range(3):
                         archive.writestr(
-                            f"hagrid-classification-512p-no-gesture-150k/{label}/{label}-{index}.jpeg",
-                            b"jpeg",
+                            f"hagrid-classification-512p-no-gesture-150k/{label}/{label}-{index}.jpg",
+                            _jpeg_bytes(color=_color_for(label, index)),
                         )
 
             summary = public_seed_script.import_public_seed_dataset(
@@ -231,10 +260,10 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["imported_counts"]["peace_sign"], 2)
             self.assertEqual(summary["imported_counts"]["none"], 2)
             self.assertFalse((dataset_root / "ok").exists())
-            self.assertEqual(len(list((dataset_root / "thumbs_up").glob("*.jpeg"))), 2)
-            self.assertEqual(len(list((dataset_root / "thumbs_down").glob("*.jpeg"))), 2)
-            self.assertEqual(len(list((dataset_root / "peace_sign").glob("*.jpeg"))), 2)
-            self.assertEqual(len(list((dataset_root / "none").glob("*.jpeg"))), 2)
+            self.assertEqual(len(list((dataset_root / "thumbs_up").glob("*.jpg"))), 2)
+            self.assertEqual(len(list((dataset_root / "thumbs_down").glob("*.jpg"))), 2)
+            self.assertEqual(len(list((dataset_root / "peace_sign").glob("*.jpg"))), 2)
+            self.assertEqual(len(list((dataset_root / "none").glob("*.jpg"))), 2)
 
     def test_import_public_seed_dataset_dry_run_avoids_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -244,8 +273,8 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
                 for label in ("like", "dislike", "peace", "no_gesture"):
                     for index in range(2):
                         archive.writestr(
-                            f"hagrid-classification-512p-no-gesture-150k/{label}/{label}-{index}.jpeg",
-                            b"jpeg",
+                            f"hagrid-classification-512p-no-gesture-150k/{label}/{label}-{index}.jpg",
+                            _jpeg_bytes(color=_color_for(label, index)),
                         )
 
             summary = public_seed_script.import_public_seed_dataset(
@@ -267,7 +296,8 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
             for label in ("none", "thumbs_up", "thumbs_down", "peace_sign"):
                 label_dir = dataset_root / label
                 label_dir.mkdir(parents=True)
-                (label_dir / "sample.jpg").write_bytes(b"jpeg")
+                for index in range(3):
+                    _write_test_jpeg(label_dir / f"sample-{index}.jpg", color=_color_for(label, index))
             output_dir = Path(temp_dir) / "runs" / "20260319T100000Z"
             runtime_dir = Path(temp_dir) / "runtime"
 
@@ -290,7 +320,7 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["status"], "dry_run")
-        self.assertEqual(summary["dataset"]["total_images"], 4)
+        self.assertEqual(sum(summary["dataset"]["accepted_counts"].values()), 12)
         self.assertTrue(summary["training"]["training_dataset_root"].endswith("/training_dataset"))
         self.assertEqual(
             summary["runtime_env_hint"],
@@ -304,7 +334,8 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
             for label in ("none", "thumbs_up", "thumbs_down", "peace_sign"):
                 label_dir = dataset_root / label
                 label_dir.mkdir(parents=True)
-                (label_dir / "sample.jpg").write_bytes(b"jpeg")
+                for index in range(3):
+                    _write_test_jpeg(label_dir / f"sample-{index}.jpg", color=_color_for(label, index))
             output_dir = Path(temp_dir) / "runs" / "20260319T100000Z"
             runtime_dir = Path(temp_dir) / "runtime"
 
@@ -327,13 +358,14 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
 
             self.assertEqual(summary["status"], "trained")
             self.assertEqual(summary["dataset"]["training_size"], 8)
-            self.assertEqual(summary["dataset"]["validation_size"], 2)
-            self.assertEqual(summary["evaluation"]["accuracy"], 0.91)
-            self.assertAlmostEqual(_StubGestureRecognizerAPI.last_dataset.fraction or 0.0, 0.8, places=3)
+            self.assertEqual(summary["dataset"]["validation_size"], 4)
+            self.assertIsNone(summary["dataset"]["test_size"])
+            self.assertEqual(summary["evaluation"]["validation"]["accuracy"], 0.91)
             self.assertEqual(
-                sorted(path.name for path in _StubGestureRecognizerAPI.last_dataset.root.iterdir()),
+                sorted(path.name for path in _StubGestureRecognizerAPI.loaded_datasets[0].root.iterdir()),
                 ["none", "peace_sign", "thumbs_down", "thumbs_up"],
             )
+            self.assertEqual(_StubGestureRecognizerAPI.loaded_datasets[0].root.name, "train")
             self.assertTrue((output_dir / "custom_gesture.task").exists())
             self.assertTrue((runtime_dir / "custom_gesture.task").exists())
             self.assertTrue((output_dir / "labels.txt").exists())
@@ -344,7 +376,8 @@ class PIAICustomGestureWorkflowTests(unittest.TestCase):
             for label in ("none", "thumbs_up", "thumbs_down", "peace_sign"):
                 label_dir = dataset_root / label
                 label_dir.mkdir(parents=True)
-                (label_dir / "sample.jpg").write_bytes(b"jpeg")
+                for index in range(3):
+                    _write_test_jpeg(label_dir / f"sample-{index}.jpg", color=_color_for(label, index))
             output_dir = Path(temp_dir) / "runs" / "20260319T100000Z"
             runtime_dir = Path(temp_dir) / "runtime"
 

@@ -20,6 +20,8 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - build the compact email and WhatsApp setup summaries for `/integrations`, while keeping the stateful WhatsApp QR pairing flow in the dedicated wizard
 - build the social-history learning consent/status panel for `/integrations`, including source selection, bounded lookback windows, and import-status copy
 - own the flatter primary shell grouping, home destination cards, and grouped `/advanced` operator hub context so top-level navigation stays short and consistent
+- own the calmer in-page grouping and overview-card composition for `/settings` and `/memory`, keeping everyday operator work ahead of deeper runtime detail
+- feed templates that keep `/automations` and the specialized setup surfaces focused on overview first, guided work second, and advanced detail last
 - expose the presenter import surface through [`__init__.py`](./__init__.py)
 
 `presenters` does **not** own:
@@ -35,7 +37,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`__init__.py`](./__init__.py) | Curated presenter export surface |
 | [`common.py`](./common.py) | Shared reminder, provider-status, and safe file-link helpers |
 | [`shell.py`](./shell.py) | Grouped primary shell navigation plus flatter Home, Settings shortcut, and Advanced hub card builders |
-| [`settings.py`](./settings.py) | Global settings page builders |
+| [`settings.py`](./settings.py) | Grouped settings page builders |
 | [`integrations.py`](./integrations.py) | Integration overview rows, compact email/WhatsApp setup summaries, and validated email/calendar/smart-home form builders |
 | [`email_wizard.py`](./email_wizard.py) | Guided email mailbox setup wizard page context, bounded connection-test state, and stepwise record validation |
 | [`social_history.py`](./social_history.py) | Presenter shaping and form validation for the `/integrations` social-history learning panel |
@@ -46,7 +48,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`memory_search.py`](./memory_search.py) | Presenter shaping for the read-only `/ops/debug` memory-search tab |
 | [`connect.py`](./connect.py) | Provider-routing section builders |
 | [`whatsapp_wizard.py`](./whatsapp_wizard.py) | WhatsApp self-chat wizard page context with bounded pairing, live QR rendering, and live status rows |
-| [`memory.py`](./memory.py) | Memory-related section builders |
+| [`memory.py`](./memory.py) | Activity & Memory overview cards, runtime metrics, and grouped memory section builders |
 | [`self_coding.py`](./self_coding.py) | Self-coding operator page context builder |
 
 ## Usage

@@ -35,9 +35,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from twinr.agent.base_agent.config import TwinrConfig
-from twinr.ops.openai_env_contract import check_openai_env_contract
-from twinr.providers.openai.api.backend import OpenAIBackend
+from twinr.agent.base_agent.config import TwinrConfig  # noqa: E402
+from twinr.ops.openai_env_contract import check_openai_env_contract  # noqa: E402
+from twinr.providers.openai.core.client import _default_client_factory  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,30 +111,39 @@ def _run_live_probe(
 
     started = time.perf_counter()
     config = TwinrConfig.from_env(env_file)
-    backend = OpenAIBackend(config=config)
+    client = _default_client_factory(config)
 
     try:
         if live_search is not None:
-            result = backend.search_live_info_with_metadata(live_search)
-            answer = str(result.answer or "")
+            response = client.responses.create(
+                model=config.openai_search_model,
+                input=live_search,
+                tools=[{"type": "web_search_preview"}],
+                max_output_tokens=160,
+            )
+            answer = _response_output_text(response)
             return LiveProbeResult(
                 kind="search",
                 ok=bool(answer.strip()),
                 elapsed_s=round(time.perf_counter() - started, 3),
                 requested_model=_clean_text(config.openai_search_model),
-                actual_model=_clean_text(result.model),
+                actual_model=_clean_text(getattr(response, "model", None)),
                 answer_head=_answer_head(answer),
             )
 
         text_prompt = str(live_text or "").strip()
-        response = backend.respond_with_metadata(text_prompt, allow_web_search=False)
-        answer = str(response.text or "")
+        response = client.responses.create(
+            model=config.default_model,
+            input=text_prompt,
+            max_output_tokens=80,
+        )
+        answer = _response_output_text(response)
         return LiveProbeResult(
             kind="text",
             ok=bool(answer.strip()),
             elapsed_s=round(time.perf_counter() - started, 3),
             requested_model=_clean_text(config.default_model),
-            actual_model=_clean_text(response.model),
+            actual_model=_clean_text(getattr(response, "model", None)),
             answer_head=_answer_head(answer),
         )
     except Exception as exc:
@@ -160,6 +169,31 @@ def _clean_text(value: object) -> str | None:
 
     text = str(value or "").strip()
     return text or None
+
+
+def _response_output_text(response: object) -> str:
+    """Return the SDK convenience text or best-effort output-text fallback."""
+
+    direct_text = str(getattr(response, "output_text", "") or "").strip()
+    if direct_text:
+        return direct_text
+
+    output_items = getattr(response, "output", None)
+    if not isinstance(output_items, list):
+        return ""
+
+    chunks: list[str] = []
+    for item in output_items:
+        content_items = getattr(item, "content", None)
+        if not isinstance(content_items, list):
+            continue
+        for content in content_items:
+            if getattr(content, "type", None) != "output_text":
+                continue
+            text = str(getattr(content, "text", "") or "").strip()
+            if text:
+                chunks.append(text)
+    return "\n".join(chunks).strip()
 
 
 if __name__ == "__main__":

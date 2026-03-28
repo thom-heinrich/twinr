@@ -30,7 +30,7 @@ Twinr currently uses:
 
 Today the expensive part is the always-audio-native OpenAI Realtime path configured via:
 
-- `.env` → `OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview`
+- `.env` → `OPENAI_REALTIME_MODEL=gpt-realtime-1.5`
 
 This path is fast and convenient, but it couples:
 

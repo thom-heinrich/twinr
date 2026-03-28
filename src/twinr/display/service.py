@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Detect stale active runtime snapshots and stop silently presenting old listening/processing/answering states as current truth.
+# BUG-2: Force a repaint after display reopen/tick recovery; the previous loop could reopen a fresh backend and then skip rendering forever.
+# BUG-3: Let debug-log layouts repaint immediately on semantic changes while still allowing periodic refreshes for identical content.
+# SEC-1: Sanitize emitted presentation telemetry tokens so file-backed cue payloads cannot forge key=value operator logs.
+# IMP-1: Move internet and health sampling off the hot render path with bounded async workers and cached fallback values.
+# IMP-2: Add adaptive idle polling, optional systemd sd_notify status/watchdog integration, and periodic maintenance refresh for unchanged Waveshare frames.
+
 """Drive the Twinr status display loop from runtime snapshots.
 
 This module polls the runtime snapshot store, samples bounded health and
@@ -9,6 +17,7 @@ distinguish an alive companion from a hung one.
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
@@ -58,6 +67,12 @@ _STATUS_TEXT_MAX_LEN = 32
 _EMIT_LINE_MAX_LEN = 160
 _ERROR_LOG_THROTTLE_S = 30.0
 _HEARTBEAT_IDLE_REFRESH_S = 5.0
+_BACKGROUND_WORKERS = 2
+_IDLE_POLL_MULTIPLIER = 4.0
+_IDLE_POLL_MAX_S = 1.0
+_ACTIVE_STATUS_SNAPSHOT_STALE_AFTER_S = 20.0
+_WAVESHARE_MAINTENANCE_REFRESH_S = 23 * 60 * 60
+_TELEMETRY_TOKEN_MAX_LEN = 48
 
 _LOGGER = logging.getLogger(__name__)
 _VOICE_QUIET_FACE_CUE = DisplayFaceCue(
@@ -67,6 +82,7 @@ _VOICE_QUIET_FACE_CUE = DisplayFaceCue(
     brows="soft",
     blink=True,
 )
+_ACTIVE_RUNTIME_STATES = frozenset({"listening", "processing", "answering", "printing"})
 
 
 def _default_emit(line: str) -> None:
@@ -76,13 +92,11 @@ def _default_emit(line: str) -> None:
 
 def _default_clock() -> datetime:
     """Return the current local wall clock as an aware datetime."""
-    # AUDIT-FIX(#7): Use an aware local datetime to avoid ambiguous naive-time semantics around DST and injected clocks.
     return datetime.now().astimezone()
 
 
 def _default_internet_probe() -> bool:
     """Probe internet reachability with bounded numeric endpoints."""
-    # AUDIT-FIX(#4): Use numeric endpoints only so the probe remains bounded even when DNS resolution is unhealthy.
     endpoints = (
         ("1.1.1.1", 443),
         ("8.8.8.8", 53),
@@ -99,37 +113,16 @@ def _default_internet_probe() -> bool:
 
 def _never_stop() -> bool:
     """Return the default stop signal for standalone display loops."""
-
     return False
 
 
 @dataclass(slots=True)
 class TwinrStatusDisplayLoop:
-    """Drive the status panel from runtime snapshots and health signals.
-
-    The loop keeps the rendered state bounded and resilient: snapshot, health,
-    or display faults degrade to last-known-good or unknown labels instead of
-    terminating the loop.
-
-    Attributes:
-        config: Runtime configuration including display timings and API-key
-            state.
-        display: Display adapter that renders and uploads status images.
-        snapshot_store: File-backed runtime snapshot source.
-        emit: Best-effort telemetry sink for bounded status/error lines.
-        sleep: Sleep primitive used between polling cycles.
-        health_collector: Callable that samples system health for footer
-            labels.
-        clock: Callable that returns the current local time.
-        internet_probe: Callable that samples outbound connectivity.
-        heartbeat_store: File-backed display-progress heartbeat sink for
-            supervisor and ops health consumers.
-    """
+    """Drive the status panel from runtime snapshots and health signals."""
 
     config: TwinrConfig
     display: TwinrDisplayAdapter
     snapshot_store: RuntimeSnapshotStore
-    # AUDIT-FIX(#8): Replace invalid `callable` annotations with explicit callable signatures for Python 3.11 type safety.
     emit: Callable[[str], None] = _default_emit
     sleep: Callable[[float], None] = time.sleep
     stop_requested: Callable[[], bool] = _never_stop
@@ -162,26 +155,30 @@ class TwinrStatusDisplayLoop:
     _last_render_status: str | None = field(default=None, init=False, repr=False)
     _last_render_monotonic_s: float = field(default=0.0, init=False, repr=False)
     _last_display_telemetry_signature: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _background_pool: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
+    _pending_health_future: Future[TwinrSystemHealth] | None = field(default=None, init=False, repr=False)
+    _pending_health_error: str | None = field(default=None, init=False, repr=False)
+    _pending_health_status: str | None = field(default=None, init=False, repr=False)
+    _pending_internet_future: Future[bool] | None = field(default=None, init=False, repr=False)
+    _force_render_next_cycle: bool = field(default=False, init=False, repr=False)
+    _systemd_notify_socket: str | None = field(default=None, init=False, repr=False)
+    _systemd_watchdog_interval_s: float | None = field(default=None, init=False, repr=False)
+    _last_systemd_watchdog_at: float = field(default=0.0, init=False, repr=False)
+    _systemd_ready_sent: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._systemd_notify_socket = self._resolve_systemd_notify_socket()
+        self._systemd_watchdog_interval_s = self._resolve_systemd_watchdog_interval_s()
 
     @classmethod
     def from_config(
         cls,
         config: TwinrConfig,
         *,
-        # AUDIT-FIX(#8): Keep constructor injection but annotate optional emit correctly for 3.11 tooling and readability.
         emit: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> "TwinrStatusDisplayLoop":
-        """Build a display loop from Twinr configuration.
-
-        Args:
-            config: Runtime configuration with display and snapshot settings.
-            emit: Optional telemetry sink for bounded status/error lines.
-            sleep: Sleep primitive used between polling cycles.
-
-        Returns:
-            A configured ``TwinrStatusDisplayLoop`` instance.
-        """
+        """Build a display loop from Twinr configuration."""
         return cls(
             config=config,
             display=create_display_adapter(config, emit=emit or _default_emit),
@@ -201,18 +198,11 @@ class TwinrStatusDisplayLoop:
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
-        """Run the display loop until a duration or cycle limit is reached.
-
-        Args:
-            duration_s: Optional maximum runtime in seconds.
-            max_cycles: Optional maximum number of polling cycles.
-
-        Returns:
-            ``0`` when the loop exits cleanly.
-        """
+        """Run the display loop until a duration or cycle limit is reached."""
         started_at = time.monotonic()
         last_signature: tuple[object, ...] | None = None
         cycles = 0
+        self._systemd_notify_status("starting", phase="starting", detail="display_loop_starting")
         try:
             while True:
                 if self.stop_requested():
@@ -222,12 +212,11 @@ class TwinrStatusDisplayLoop:
                 if max_cycles is not None and cycles >= max_cycles:
                     return 0
 
-                # AUDIT-FIX(#1): Never let snapshot read/build/display failures terminate the status loop; degrade to last-known-good state.
                 snapshot, snapshot_stale = self._load_snapshot()
-                headline, details = self._build_status_content(snapshot, stale=snapshot_stale)
-                state_fields = self._build_state_fields(snapshot, stale=snapshot_stale)
-                log_sections = self._build_log_sections(snapshot, stale=snapshot_stale)
-                status = self._snapshot_status(snapshot)
+                status = self._effective_runtime_status(snapshot, stale=snapshot_stale)
+                headline, details = self._build_status_content(snapshot, status=status, stale=snapshot_stale)
+                state_fields = self._build_state_fields(snapshot, status=status, stale=snapshot_stale)
+                log_sections = self._build_log_sections(snapshot, status=status, stale=snapshot_stale)
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue(snapshot=snapshot)
                 emoji_cue = self._active_emoji_cue()
@@ -251,6 +240,7 @@ class TwinrStatusDisplayLoop:
                     presentation_cue=presentation_cue,
                     debug_signals=debug_signals,
                 )
+
                 if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
                     self._last_render_started_at = datetime.now(timezone.utc)
                     self._write_heartbeat(status, phase="rendering", force=True)
@@ -274,35 +264,45 @@ class TwinrStatusDisplayLoop:
                         self._last_render_completed_at = datetime.now(timezone.utc)
                         self._last_render_status = status
                         self._last_render_monotonic_s = time.monotonic()
+                        self._force_render_next_cycle = False
                         self._write_heartbeat(status, phase="idle", force=True)
+                        if not self._systemd_ready_sent:
+                            self._systemd_notify("READY=1")
+                            self._systemd_ready_sent = True
                     else:
                         self._write_heartbeat(status, phase="error", detail="display_show_failed", force=True)
                 else:
                     self._write_heartbeat(status, phase="idle")
+
                 self._tick_display()
+                self._maybe_systemd_watchdog(status=status, phase="idle")
                 cycles += 1
-                self._sleep_once()
+                self._sleep_once(
+                    status=status,
+                    ticker_text=ticker_text,
+                    presentation_cue=presentation_cue,
+                )
         finally:
-            status = self._snapshot_status(self._last_snapshot)
+            status = self._effective_runtime_status(
+                self._last_snapshot,
+                stale=self._snapshot_is_stale(self._last_snapshot),
+            )
             self._write_heartbeat(status, phase="stopping", detail="display_loop_stopping", force=True)
-            # AUDIT-FIX(#10): Cleanup must never mask the real failure path.
+            self._systemd_notify("STOPPING=1", f"STATUS={self._systemd_status_text(status, 'stopping', 'display_loop_stopping')}")
+            self._shutdown_background_pool()
             self._close_display()
 
     def _build_status_content(
         self,
         snapshot: RuntimeSnapshot | None,
         *,
+        status: str | None = None,
         stale: bool = False,
     ) -> tuple[str, tuple[str, ...]]:
-        # AUDIT-FIX(#1): Normalize snapshot access so corrupt/missing state cannot trigger AttributeError/None crashes.
-        status = self._snapshot_status(snapshot)
-
-        # AUDIT-FIX(#2): Make stale state explicit instead of silently presenting an old snapshot as current truth.
-        note = "Status wird aktualisiert" if stale else None
+        status = status or self._snapshot_status(snapshot)
+        note = "Status veraltet" if stale else None
         if snapshot is None and not stale:
             note = "Status nicht verfügbar"
-
-        # AUDIT-FIX(#5): Build short, line-oriented footer details instead of one oversized string that overflows the eInk panel.
         details = self._detail_lines(
             note,
             *self._health_detail_values(snapshot),
@@ -319,7 +319,6 @@ class TwinrStatusDisplayLoop:
             return "Printing", details
         if status == "error":
             return "Error", details
-        # AUDIT-FIX(#9): Sanitize unexpected status values before they reach the display surface.
         return status.replace("_", " ").title(), details
 
     def _detail_lines(self, *values: str | None) -> tuple[str, ...]:
@@ -331,8 +330,13 @@ class TwinrStatusDisplayLoop:
             if not compact:
                 continue
             while compact and len(lines) < 4:
-                lines.append(compact[:32])
-                compact = compact[32:].lstrip()
+                chunk = compact[:32]
+                if len(compact) > 32:
+                    split_at = chunk.rfind(" ")
+                    if split_at >= 12:
+                        chunk = chunk[:split_at]
+                lines.append(chunk.rstrip())
+                compact = compact[len(chunk):].lstrip()
         return tuple(lines[:4])
 
     def _animation_frame(self, status: str) -> int:
@@ -345,7 +349,6 @@ class TwinrStatusDisplayLoop:
         return _STATUS_ANIMATION_SPECS.get(self._compact_text(status).lower(), (1, 60.0))
 
     def _health_detail_values(self, snapshot: RuntimeSnapshot | None) -> tuple[str, str, str, str]:
-        # AUDIT-FIX(#1): Footer generation must survive collector/probe/clock failures and fall back to cached/unknown values.
         health = self._current_health(snapshot)
         internet_ok = self._internet_ok()
         return (
@@ -359,15 +362,17 @@ class TwinrStatusDisplayLoop:
         self,
         snapshot: RuntimeSnapshot | None,
         *,
+        status: str | None = None,
         stale: bool = False,
     ) -> tuple[tuple[str, str], ...]:
-        note = "Status wird aktualisiert" if stale else None
+        status = status or self._snapshot_status(snapshot)
+        note = "Status veraltet" if stale else None
         if snapshot is None and not stale:
             note = "Status nicht verfügbar"
         health = self._current_health(snapshot)
         internet_ok = self._internet_ok()
         state_fields = [
-            ("Status", self._runtime_state_value(snapshot)),
+            ("Status", self._runtime_state_value(snapshot, status=status, stale=stale)),
             ("Internet", self._internet_state_value(internet_ok)),
             ("AI", self._ai_state_value(snapshot, health, internet_ok)),
             ("System", self._system_state_value(snapshot, health)),
@@ -380,7 +385,6 @@ class TwinrStatusDisplayLoop:
 
     def _respeaker_state_fields(self) -> list[tuple[str, str]]:
         """Return calm operator-visible ReSpeaker HCI fields when relevant."""
-
         store = self.respeaker_hci_store
         if store is None:
             return []
@@ -397,6 +401,7 @@ class TwinrStatusDisplayLoop:
         self,
         snapshot: RuntimeSnapshot | None,
         *,
+        status: str,
         stale: bool = False,
     ) -> LogSections:
         if self._display_layout() != "debug_log":
@@ -405,7 +410,7 @@ class TwinrStatusDisplayLoop:
         internet_ok = self._internet_ok()
         return self._debug_log_builder().build_sections(
             snapshot=snapshot,
-            runtime_status=self._runtime_state_value(snapshot),
+            runtime_status=self._runtime_state_value(snapshot, status=status, stale=stale),
             internet_state=self._internet_state_value(internet_ok),
             ai_state=self._ai_state_value(snapshot, health, internet_ok),
             system_state=self._system_state_value(snapshot, health),
@@ -418,6 +423,7 @@ class TwinrStatusDisplayLoop:
         now = time.monotonic()
         snapshot_error = self._snapshot_error_message(snapshot)
         snapshot_status = self._snapshot_status(snapshot)
+        self._drain_health_future()
 
         if (
             (now - self._cached_health_at) < _HEALTH_FOOTER_REFRESH_S
@@ -432,35 +438,113 @@ class TwinrStatusDisplayLoop:
             self._cached_health_at = now
             return self._cached_health
 
-        try:
-            # AUDIT-FIX(#1): Guard the external health collector; reuse the last cached health on transient failures.
-            health = self.health_collector(self.config, snapshot=snapshot)
-        except Exception as exc:
-            self._emit_error("health_collect_failed", exc)
+        if self._cached_health is None:
+            try:
+                health = self.health_collector(self.config, snapshot=snapshot)
+            except Exception as exc:
+                self._emit_error("health_collect_failed", exc)
+                self._cached_health_error = snapshot_error
+                self._cached_health_status = snapshot_status
+                self._cached_health_at = now
+                return self._cached_health
+            self._cached_health = health
             self._cached_health_error = snapshot_error
             self._cached_health_status = snapshot_status
             self._cached_health_at = now
-            return self._cached_health
+            return health
 
+        if self._pending_health_future is None:
+            try:
+                self._pending_health_future = self._background_executor().submit(
+                    self.health_collector,
+                    self.config,
+                    snapshot=snapshot,
+                )
+                self._pending_health_error = snapshot_error
+                self._pending_health_status = snapshot_status
+            except Exception as exc:
+                self._emit_error("health_collect_submit_failed", exc)
+                self._cached_health_error = snapshot_error
+                self._cached_health_status = snapshot_status
+                self._cached_health_at = now
+        return self._cached_health
+
+    def _drain_health_future(self) -> None:
+        future = self._pending_health_future
+        if future is None or not future.done():
+            return
+        self._pending_health_future = None
+        pending_error = self._pending_health_error
+        pending_status = self._pending_health_status
+        self._pending_health_error = None
+        self._pending_health_status = None
+        try:
+            health = future.result()
+        except Exception as exc:
+            self._emit_error("health_collect_async_failed", exc)
+            self._cached_health_error = pending_error
+            self._cached_health_status = pending_status
+            self._cached_health_at = time.monotonic()
+            return
         self._cached_health = health
-        self._cached_health_error = snapshot_error
-        self._cached_health_status = snapshot_status
-        self._cached_health_at = now
-        return health
+        self._cached_health_error = pending_error
+        self._cached_health_status = pending_status
+        self._cached_health_at = time.monotonic()
 
     def _internet_ok(self) -> bool | None:
         now = time.monotonic()
+        self._drain_internet_future()
         refresh_s = _INTERNET_FOOTER_REFRESH_S if self._cached_internet_ok is True else _DEGRADED_INTERNET_FOOTER_REFRESH_S
         if (now - self._cached_internet_at) < refresh_s:
             return self._cached_internet_ok
+
+        if self._cached_internet_at <= 0.0:
+            try:
+                self._cached_internet_ok = bool(self.internet_probe())
+            except Exception as exc:
+                self._emit_error("internet_probe_failed", exc)
+                self._cached_internet_ok = None
+            self._cached_internet_at = now
+            return self._cached_internet_ok
+
+        if self._pending_internet_future is None:
+            try:
+                self._pending_internet_future = self._background_executor().submit(self.internet_probe)
+            except Exception as exc:
+                self._emit_error("internet_probe_submit_failed", exc)
+                self._cached_internet_ok = None
+                self._cached_internet_at = now
+        return self._cached_internet_ok
+
+    def _drain_internet_future(self) -> None:
+        future = self._pending_internet_future
+        if future is None or not future.done():
+            return
+        self._pending_internet_future = None
         try:
-            # AUDIT-FIX(#4): Treat probe failure as an unknown/down state instead of letting it abort the footer path.
-            self._cached_internet_ok = bool(self.internet_probe())
+            self._cached_internet_ok = bool(future.result())
         except Exception as exc:
             self._emit_error("internet_probe_failed", exc)
             self._cached_internet_ok = None
-        self._cached_internet_at = now
-        return self._cached_internet_ok
+        self._cached_internet_at = time.monotonic()
+
+    def _background_executor(self) -> ThreadPoolExecutor:
+        if self._background_pool is None:
+            self._background_pool = ThreadPoolExecutor(
+                max_workers=_BACKGROUND_WORKERS,
+                thread_name_prefix="twinr-display",
+            )
+        return self._background_pool
+
+    def _shutdown_background_pool(self) -> None:
+        pool = self._background_pool
+        if pool is None:
+            return
+        self._background_pool = None
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            self._emit_error("display_background_pool_shutdown_failed", exc)
 
     def _ai_footer_label(
         self,
@@ -478,7 +562,6 @@ class TwinrStatusDisplayLoop:
     ) -> str:
         if not self.config.openai_api_key:
             return "fehlt"
-        # AUDIT-FIX(#6): Do not claim "AI ok" while the network is down or unknown.
         if internet_ok is False:
             return "wartet"
         if internet_ok is None:
@@ -489,7 +572,6 @@ class TwinrStatusDisplayLoop:
             for part in (self._snapshot_error_message(snapshot), health_error)
             if part
         ).lower()
-        # AUDIT-FIX(#6): Tighten keyword matching to avoid false positives from the overly broad `api` substring.
         if any(
             token in error_text
             for token in (
@@ -543,21 +625,32 @@ class TwinrStatusDisplayLoop:
             return "fehlt"
         return "?"
 
-    def _runtime_state_value(self, snapshot: RuntimeSnapshot | None) -> str:
-        status = self._snapshot_status(snapshot)
-        if status == "waiting":
-            return "Waiting"
-        if status == "listening":
-            return "Listening"
-        if status == "processing":
-            return "Processing"
-        if status == "answering":
-            return "Answering"
-        if status == "printing":
-            return "Printing"
-        if status == "error":
-            return "Error"
-        return status.replace("_", " ").title()
+    def _runtime_state_value(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        *,
+        status: str | None = None,
+        stale: bool = False,
+    ) -> str:
+        effective_status = status or self._effective_runtime_status(snapshot, stale=stale)
+        if effective_status == "waiting":
+            base = "Waiting"
+        elif effective_status == "listening":
+            base = "Listening"
+        elif effective_status == "processing":
+            base = "Processing"
+        elif effective_status == "answering":
+            base = "Answering"
+        elif effective_status == "printing":
+            base = "Printing"
+        elif effective_status == "error":
+            base = "Error"
+        else:
+            base = effective_status.replace("_", " ").title()
+        raw_status = self._snapshot_status(snapshot)
+        if stale and raw_status in _ACTIVE_RUNTIME_STATES:
+            return f"{raw_status.title()} (stale)"
+        return base
 
     def _service_running(self, health: TwinrSystemHealth | None, key: str) -> bool:
         if health is None:
@@ -573,16 +666,14 @@ class TwinrStatusDisplayLoop:
             snapshot = self.snapshot_store.load()
         except Exception as exc:
             self._emit_error("snapshot_load_failed", exc)
-            # AUDIT-FIX(#2): Retry once after a very short pause to ride out partial file writes in the file-backed store.
-            time.sleep(_SNAPSHOT_RETRY_DELAY_S)
+            self._pause(_SNAPSHOT_RETRY_DELAY_S)
             try:
                 snapshot = self.snapshot_store.load()
             except Exception as retry_exc:
                 self._emit_error("snapshot_load_retry_failed", retry_exc)
                 return self._last_snapshot, self._last_snapshot is not None
-
         self._last_snapshot = snapshot
-        return snapshot, False
+        return snapshot, self._snapshot_is_stale(snapshot)
 
     def _show_status(
         self,
@@ -621,7 +712,6 @@ class TwinrStatusDisplayLoop:
         except Exception as exc:
             self._emit_error("display_show_failed", exc)
 
-        # AUDIT-FIX(#1): Attempt one display re-open before giving up on the frame update.
         if self._reopen_display():
             try:
                 self.display.show_status(
@@ -639,6 +729,7 @@ class TwinrStatusDisplayLoop:
                     presentation_cue=presentation_cue,
                     debug_signals=debug_signals,
                 )
+                self._force_render_next_cycle = False
                 return True
             except Exception as retry_exc:
                 self._emit_error("display_show_retry_failed", retry_exc)
@@ -653,28 +744,32 @@ class TwinrStatusDisplayLoop:
         force: bool = False,
     ) -> None:
         store = self.heartbeat_store
-        if store is None:
-            return
         now_monotonic = time.monotonic()
         if not force and (now_monotonic - self._last_heartbeat_at) < _HEARTBEAT_IDLE_REFRESH_S:
+            self._maybe_systemd_watchdog(status=runtime_status, phase=phase, detail=detail)
             return
         self._heartbeat_seq += 1
-        try:
-            save_display_heartbeat(
-                store,
-                runtime_status=runtime_status,
-                phase=phase,
-                seq=self._heartbeat_seq,
-                detail=self._compact_text(detail, max_len=_STATUS_TEXT_MAX_LEN) or None,
-                pid=os.getpid(),
-                updated_at=datetime.now(timezone.utc),
-                last_render_started_at=self._last_render_started_at,
-                last_render_completed_at=self._last_render_completed_at,
-            )
-        except Exception as exc:
-            self._emit_error("display_heartbeat_save_failed", exc)
-            return
-        self._last_heartbeat_at = now_monotonic
+        if store is not None:
+            try:
+                save_display_heartbeat(
+                    store,
+                    runtime_status=runtime_status,
+                    phase=phase,
+                    seq=self._heartbeat_seq,
+                    detail=self._compact_text(detail, max_len=_STATUS_TEXT_MAX_LEN) or None,
+                    pid=os.getpid(),
+                    updated_at=datetime.now(timezone.utc),
+                    last_render_started_at=self._last_render_started_at,
+                    last_render_completed_at=self._last_render_completed_at,
+                )
+            except Exception as exc:
+                self._emit_error("display_heartbeat_save_failed", exc)
+            else:
+                self._last_heartbeat_at = now_monotonic
+        else:
+            self._last_heartbeat_at = now_monotonic
+        self._systemd_notify_status(runtime_status, phase=phase, detail=detail)
+        self._maybe_systemd_watchdog(status=runtime_status, phase=phase, detail=detail)
 
     def _reopen_display(self) -> bool:
         last_rendered_status = getattr(self.display, "_last_rendered_status", None)
@@ -693,6 +788,7 @@ class TwinrStatusDisplayLoop:
                     setattr(reopened, "_last_rendered_status", last_rendered_status)
                 self.display = reopened
                 self._last_display_telemetry_signature = None
+                self._force_render_next_cycle = True
                 return True
             except Exception as exc:
                 self._emit_error("display_reopen_failed", exc)
@@ -737,14 +833,48 @@ class TwinrStatusDisplayLoop:
             self._emit_error("display_tick_failed", exc)
             self._reopen_display()
 
-    def _sleep_once(self) -> None:
-        poll_interval_s = self._poll_interval_s()
+    def _sleep_once(
+        self,
+        *,
+        status: str,
+        ticker_text: str | None,
+        presentation_cue: DisplayPresentationCue | None,
+    ) -> None:
+        poll_interval_s = self._effective_poll_interval_s(
+            status=status,
+            ticker_text=ticker_text,
+            presentation_cue=presentation_cue,
+        )
+        self._pause(poll_interval_s)
+
+    def _pause(self, duration_s: float) -> None:
         try:
-            self.sleep(poll_interval_s)
+            self.sleep(duration_s)
         except Exception as exc:
-            # AUDIT-FIX(#1): A broken injected sleeper must not terminate the loop.
             self._emit_error("display_sleep_failed", exc)
-            time.sleep(poll_interval_s)
+            time.sleep(duration_s)
+
+    def _effective_poll_interval_s(
+        self,
+        *,
+        status: str,
+        ticker_text: str | None,
+        presentation_cue: DisplayPresentationCue | None,
+    ) -> float:
+        base_interval = self._poll_interval_s()
+        if self._display_layout() != "default":
+            return max(base_interval, 0.25)
+        normalized_status = self._compact_text(status).lower()
+        if normalized_status in _ACTIVE_RUNTIME_STATES:
+            return base_interval
+        if presentation_cue is not None:
+            return base_interval
+        if ticker_text:
+            return base_interval
+        if normalized_status == "waiting" and self._supports_idle_waiting_animation():
+            return base_interval
+        idle_interval = min(max(base_interval * _IDLE_POLL_MULTIPLIER, 0.25), _IDLE_POLL_MAX_S)
+        return max(base_interval, idle_interval)
 
     def _poll_interval_s(self) -> float:
         raw_interval = getattr(self.config, "display_poll_interval_s", _MIN_DISPLAY_POLL_INTERVAL_S)
@@ -753,7 +883,6 @@ class TwinrStatusDisplayLoop:
         except (TypeError, ValueError):
             self._emit_error("display_poll_interval_invalid")
             return _MIN_DISPLAY_POLL_INTERVAL_S
-        # AUDIT-FIX(#3): Clamp invalid/degenerate intervals so config mistakes do not crash or spin the process.
         if not math.isfinite(interval_s) or interval_s < _MIN_DISPLAY_POLL_INTERVAL_S:
             self._emit_error("display_poll_interval_clamped")
             return _MIN_DISPLAY_POLL_INTERVAL_S
@@ -847,13 +976,38 @@ class TwinrStatusDisplayLoop:
         signature: tuple[object, ...],
         last_signature: tuple[object, ...] | None,
     ) -> bool:
+        if self._force_render_next_cycle:
+            return True
         if signature == last_signature:
-            return False
+            return self._maintenance_refresh_due()
         if self._display_layout() != "debug_log":
             return True
         if last_signature is None or status != self._last_render_status:
             return True
+        if self._maintenance_refresh_due():
+            return True
         return (time.monotonic() - self._last_render_monotonic_s) >= _DEBUG_LOG_MIN_REFRESH_S
+
+    def _maintenance_refresh_due(self) -> bool:
+        interval_s = self._maintenance_refresh_interval_s()
+        if interval_s <= 0 or self._last_render_monotonic_s <= 0:
+            return False
+        return (time.monotonic() - self._last_render_monotonic_s) >= interval_s
+
+    def _maintenance_refresh_interval_s(self) -> float:
+        configured = getattr(self.config, "display_maintenance_refresh_s", None)
+        if configured is not None:
+            try:
+                interval_s = float(configured)
+            except (TypeError, ValueError):
+                self._emit_error("display_maintenance_refresh_invalid")
+                interval_s = 0.0
+            if math.isfinite(interval_s) and interval_s > 0:
+                return interval_s
+        driver = self._compact_text(getattr(self.config, "display_driver", None)).lower()
+        if driver.startswith("waveshare"):
+            return float(_WAVESHARE_MAINTENANCE_REFRESH_S)
+        return 0.0
 
     def _display_layout(self) -> str:
         return self._compact_text(getattr(self.config, "display_layout", "default")).lower() or "default"
@@ -864,26 +1018,49 @@ class TwinrStatusDisplayLoop:
         status: str,
         presentation_cue: DisplayPresentationCue | None,
     ) -> None:
-        """Emit one bounded semantic display-status line without render spam."""
-
         signature = self._display_telemetry_signature(status=status, presentation_cue=presentation_cue)
         if signature == self._last_display_telemetry_signature:
             return
         self._last_display_telemetry_signature = signature
-        parts = [f"display_status={status}"]
+        safe_status = self._telemetry_token(status, fallback="error")
+        parts = [f"display_status={safe_status}"]
         layout_mode = self._display_layout()
         if layout_mode != "default":
-            parts.append(f"layout={layout_mode}")
+            parts.append(f"layout={self._telemetry_token(layout_mode, fallback='default')}")
         if presentation_cue is not None:
             presentation_signature = presentation_cue.telemetry_signature()
             active_card = presentation_cue.active_card()
             if presentation_signature is not None and active_card is not None:
-                parts.append(f"presentation={active_card.kind}:{presentation_cue.transition_stage()}")
-                parts.append(f"presentation_key={active_card.key}")
+                parts.append(
+                    "presentation="
+                    f"{self._telemetry_token(active_card.kind, fallback='card')}:"
+                    f"{self._telemetry_token(presentation_cue.transition_stage(), fallback='idle')}"
+                )
+                parts.append(
+                    "presentation_key="
+                    f"{self._telemetry_token(active_card.key, fallback='unknown')}"
+                )
                 queued_count = len(presentation_cue.queued_cards())
                 if queued_count > 0:
                     parts.append(f"presentation_queue={queued_count}")
         self._safe_emit(" ".join(parts))
+
+    def _telemetry_token(
+        self,
+        value: object | None,
+        *,
+        max_len: int = _TELEMETRY_TOKEN_MAX_LEN,
+        fallback: str | None = None,
+    ) -> str | None:
+        text = self._compact_text(value, max_len=max_len * 2)
+        if not text:
+            return fallback
+        token = "".join(
+            char if char.isalnum() or char in "-_.:/" else "_"
+            for char in text
+        )
+        token = token[:max_len].strip("_.")
+        return token or fallback
 
     def _display_telemetry_signature(
         self,
@@ -891,8 +1068,6 @@ class TwinrStatusDisplayLoop:
         status: str,
         presentation_cue: DisplayPresentationCue | None,
     ) -> tuple[object, ...]:
-        """Return one semantic signature for low-noise display telemetry."""
-
         layout_mode = self._display_layout()
         presentation_signature = presentation_cue.telemetry_signature() if presentation_cue is not None else None
         return (layout_mode, status, presentation_signature)
@@ -960,8 +1135,6 @@ class TwinrStatusDisplayLoop:
             return None
 
     def _active_debug_signals(self) -> tuple[DisplayDebugSignal, ...]:
-        """Return the current bounded HDMI debug-signal pills."""
-
         if self._display_layout() != "default":
             return ()
         store = self.debug_signal_store
@@ -984,14 +1157,58 @@ class TwinrStatusDisplayLoop:
     def _snapshot_status(self, snapshot: RuntimeSnapshot | None) -> str:
         if snapshot is None:
             return "error"
-        # AUDIT-FIX(#9): Normalize status values from the file-backed store before they reach logs/UI logic.
         compact = self._compact_text(getattr(snapshot, "status", None), max_len=_STATUS_TEXT_MAX_LEN).lower()
         return compact or "error"
+
+    def _effective_runtime_status(self, snapshot: RuntimeSnapshot | None, *, stale: bool) -> str:
+        status = self._snapshot_status(snapshot)
+        if stale and status in _ACTIVE_RUNTIME_STATES:
+            return "error"
+        return status
 
     def _snapshot_error_message(self, snapshot: RuntimeSnapshot | None) -> str:
         if snapshot is None:
             return ""
         return self._compact_text(getattr(snapshot, "error_message", None), max_len=_EMIT_LINE_MAX_LEN)
+
+    def _snapshot_updated_at_utc(self, snapshot: RuntimeSnapshot | None) -> datetime | None:
+        if snapshot is None:
+            return None
+        raw_updated_at = self._compact_text(getattr(snapshot, "updated_at", None), max_len=64)
+        if not raw_updated_at:
+            return None
+        normalized = raw_updated_at[:-1] + "+00:00" if raw_updated_at.endswith("Z") else raw_updated_at
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _snapshot_is_stale(self, snapshot: RuntimeSnapshot | None) -> bool:
+        if snapshot is None:
+            return False
+        status = self._snapshot_status(snapshot)
+        if status not in _ACTIVE_RUNTIME_STATES:
+            return False
+        updated_at = self._snapshot_updated_at_utc(snapshot)
+        if updated_at is None:
+            return True
+        age_s = max(0.0, (self._current_time_utc() - updated_at).total_seconds())
+        return age_s > self._active_snapshot_stale_after_s()
+
+    def _active_snapshot_stale_after_s(self) -> float:
+        configured = getattr(self.config, "display_active_snapshot_stale_after_s", None)
+        if configured is not None:
+            try:
+                interval_s = float(configured)
+            except (TypeError, ValueError):
+                self._emit_error("display_active_snapshot_stale_after_invalid")
+            else:
+                if math.isfinite(interval_s) and interval_s > 0:
+                    return interval_s
+        return max(_ACTIVE_STATUS_SNAPSHOT_STALE_AFTER_S, self._poll_interval_s() * 20.0)
 
     def _snapshot_voice_quiet_active(self, snapshot: RuntimeSnapshot | None) -> bool:
         if self._snapshot_status(snapshot) != "waiting":
@@ -1026,6 +1243,64 @@ class TwinrStatusDisplayLoop:
         if current.tzinfo is None:
             return current.replace(tzinfo=timezone.utc)
         return current.astimezone(timezone.utc)
+
+    def _resolve_systemd_notify_socket(self) -> str | None:
+        return self._compact_text(os.environ.get("NOTIFY_SOCKET"), max_len=256) or None
+
+    def _resolve_systemd_watchdog_interval_s(self) -> float | None:
+        if self._systemd_notify_socket is None:
+            return None
+        raw_value = self._compact_text(os.environ.get("WATCHDOG_USEC"), max_len=32)
+        if not raw_value or not raw_value.isdigit():
+            return None
+        watchdog_usec = int(raw_value)
+        if watchdog_usec <= 0:
+            return None
+        return max(1.0, watchdog_usec / 2_000_000.0)
+
+    def _systemd_notify(self, *fields: str) -> None:
+        notify_socket = self._systemd_notify_socket
+        if not notify_socket:
+            return
+        payload = "\n".join(field for field in fields if field).encode("utf-8", errors="replace")
+        if not payload:
+            return
+        address: str | bytes = notify_socket
+        if notify_socket.startswith("@"):
+            address = b"\0" + notify_socket[1:].encode("utf-8", errors="replace")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_sock:
+                notify_sock.connect(address)
+                notify_sock.sendall(payload)
+        except Exception as exc:
+            self._emit_error("systemd_notify_failed", exc)
+
+    def _systemd_status_text(self, status: str, phase: str, detail: str | None = None) -> str:
+        parts = [
+            "display-loop",
+            f"phase={self._telemetry_token(phase, fallback='idle')}",
+            f"status={self._telemetry_token(status, fallback='error')}",
+        ]
+        safe_detail = self._telemetry_token(detail, max_len=64)
+        if safe_detail:
+            parts.append(f"detail={safe_detail}")
+        return self._compact_text(" ".join(parts), max_len=_EMIT_LINE_MAX_LEN)
+
+    def _systemd_notify_status(self, status: str, *, phase: str, detail: str | None = None) -> None:
+        self._systemd_notify(f"STATUS={self._systemd_status_text(status, phase, detail)}")
+
+    def _maybe_systemd_watchdog(self, *, status: str, phase: str, detail: str | None = None) -> None:
+        interval_s = self._systemd_watchdog_interval_s
+        if interval_s is None:
+            return
+        now = time.monotonic()
+        if self._last_systemd_watchdog_at and (now - self._last_systemd_watchdog_at) < interval_s:
+            return
+        self._last_systemd_watchdog_at = now
+        self._systemd_notify(
+            "WATCHDOG=1",
+            f"STATUS={self._systemd_status_text(status, phase, detail)}",
+        )
 
     def _compact_text(self, value: object | None, *, max_len: int | None = None) -> str:
         if value is None:

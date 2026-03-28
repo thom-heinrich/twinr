@@ -6,6 +6,7 @@ visibility: internal
 summary: Build canonical, compact, and realtime-safe tool schemas for Twinr agent tool calls.
 owned_concerns:
   - Define the canonical tool schema surface and shared schema-property helpers
+  - Keep the public contracts.py import path stable while the implementation stays modular under contracts_impl/
   - Normalize requested tool names before schema selection
   - Derive compact schema variants for token-constrained callers
   - Derive realtime-safe schema variants for provider APIs with stricter top-level limits
@@ -27,11 +28,19 @@ files:
       - build_compact_agent_tool_schemas
       - build_realtime_tool_schemas
   - path: contracts.py
-    role: Canonical schema definitions and schema adapters
+    role: Stable compatibility wrapper that preserves the public builder import path
     exports:
       - build_agent_tool_schemas
       - build_compact_agent_tool_schemas
       - build_realtime_tool_schemas
+  - path: contracts_impl/main.py
+    role: Canonical schema builder orchestration across family modules
+  - path: contracts_impl/shared.py
+    role: Shared schema helper primitives and validation rule builders
+  - path: contracts_impl/memory.py
+    role: Memory, contact, WhatsApp, conflict, and user-discovery schema families
+  - path: contracts_impl/runtime_state.py
+    role: World-intelligence, setting, quiet-mode, and identity schema families
 public_api:
   module: twinr.agent.tools.schemas.contracts
   callables:

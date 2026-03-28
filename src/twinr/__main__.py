@@ -311,6 +311,43 @@ def _build_runtime(config: TwinrConfig) -> Any:
     return runtime_factory(config=config)
 
 
+def _resolve_direct_runtime_scope_name(args: argparse.Namespace) -> str | None:
+    """Return the isolated runtime scope for one-shot CLI turn commands."""
+
+    if args.demo_transcript:
+        return "demo-transcript"
+    if args.openai_prompt:
+        return "openai-prompt"
+    if args.vision_prompt:
+        return "vision-prompt"
+    if args.orchestrator_probe_turn:
+        return "orchestrator-probe-turn"
+    return None
+
+
+def _resolve_runtime_config(config: TwinrConfig, args: argparse.Namespace) -> TwinrConfig:
+    """Select the correct runtime snapshot scope for the requested CLI command."""
+
+    from twinr.ops.runtime_scope import build_scoped_runtime_config
+
+    if args.run_whatsapp_channel:
+        return build_scoped_runtime_config(
+            config,
+            scope_name="whatsapp-channel",
+            restore_runtime_state_on_startup=True,
+        )
+    scope_name = _resolve_direct_runtime_scope_name(args)
+    if scope_name is None:
+        return config
+    # One-shot operator turns must not restore stale transient state from a
+    # previous direct CLI invocation.
+    return build_scoped_runtime_config(
+        config,
+        scope_name=scope_name,
+        restore_runtime_state_on_startup=False,
+    )
+
+
 def _print_runtime_banner(runtime: Any, config: TwinrConfig, env_path: Path) -> None:
     """Emit the standard runtime bootstrap facts once the runtime exists."""
 
@@ -632,7 +669,7 @@ def main() -> int:
     uses_camera = bool(args.vision_camera_capture or args.camera_capture_output or args.proactive_observe_once)
 
     runtime = None
-    runtime_config = config
+    runtime_config = _resolve_runtime_config(config, args)
     try:
         if args.run_streaming_loop:
             _assert_pi_runtime_root(args.env_file, command_name="run-streaming-loop")
@@ -677,15 +714,6 @@ def main() -> int:
                                 error=exc,
                                 duration_s=args.loop_duration,
                             )
-
-        if args.run_whatsapp_channel:
-            from twinr.ops.runtime_scope import build_scoped_runtime_config
-
-            runtime_config = build_scoped_runtime_config(
-                config,
-                scope_name="whatsapp-channel",
-                restore_runtime_state_on_startup=True,
-            )
 
         _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
         runtime = _build_runtime(runtime_config)

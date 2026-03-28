@@ -10,9 +10,12 @@ readme = "docs/README.md"
 requires-python = ">=3.11"
 dependencies = [
     "dateparser>=1.3,<2",
+    "defusedxml>=0.7.1,<1",
     "fastapi>=0.115,<1",
+    "feedparser>=6.0.12,<7",
     "httpx>=0.28,<1",
     "jinja2>=3.1,<4",
+    "MarkupSafe>=3,<4",
     "mediapipe>=0.10.18,<0.11; platform_machine == 'aarch64'",
     "munkres>=1.1,<2; platform_machine == 'aarch64'",
     "numpy>=1.26,<2",
@@ -20,7 +23,10 @@ dependencies = [
     "opencv-contrib-python>=4.10,<5; platform_machine == 'aarch64'",
     "openwakeword>=0.6,<0.7",
     "openai>=2.26.0,<3",
+    "pydantic>=2.12,<3",
+    "pydantic-core>=2.41,<3",
     "pillow>=10,<12",
+    "python-dateutil>=2.9,<3",
     "pypinyin>=0.53,<1",
     "PyYAML>=6,<7",
     "PyQt5>=5.15,<6",
@@ -28,9 +34,31 @@ dependencies = [
     "sentencepiece>=0.2,<1",
     "sherpa-onnx>=1.12,<2",
     "sherpa-onnx-bin>=1.12,<2",
+    "starlette>=0.46,<1",
     "tokenizers>=0.20,<1",
+    "urllib3>=2,<3",
     "uvicorn>=0.32,<1",
     "websockets>=13,<16",
+]
+
+[project.optional-dependencies]
+pi-runtime = [
+    "RapidFuzz>=3.14,<4",
+    "wcwidth>=0.6,<1",
+    "onnx>=1.17,<2",
+    "msgspec>=0.20,<1",
+    "orjson>=3.11,<4",
+    "portalocker>=3.2,<4",
+    "zstandard>=0.25,<1",
+    "h2>=4.3,<5",
+    "opentelemetry-api>=1.40,<2",
+]
+router-training = [
+    "scikit-learn>=1.8,<2",
+    "scipy>=1.17,<2",
+]
+piaicam-import = [
+    "huggingface-hub>=1.7,<2",
 ]
 
 [project.scripts]
@@ -50,3 +78,19 @@ twinr = [
     "web/static/*.css",
     "web/templates/*.html",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_errors = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "test.test_channels_whatsapp",
+    "twinr.channels.pending_whatsapp_followup",
+    "twinr.channels.tool_runtime",
+    "twinr.orchestrator.voice_session_impl.scanner",
+    "twinr.orchestrator.voice_session_impl.transcription",
+    "twinr.providers.groq.adapters",
+]
+ignore_errors = false

@@ -118,7 +118,7 @@ class ReminderDeliveryHelpersTests(unittest.TestCase):
         )
 
         self.assertIsInstance(response, LocalMetadataResponse)
-        self.assertEqual(response.text, "Reminder. Take your medicine")
+        self.assertEqual(response.text, "Reminder. Take your medicine.")
         self.assertIn("reminder_backend_primary_error=primary down", loop.emitted)
         self.assertIn("reminder_backend_fallback=generic", loop.emitted)
         self.assertIn("reminder_backend_fallback=local", loop.emitted)

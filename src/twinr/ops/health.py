@@ -75,6 +75,7 @@ class TwinrSystemHealth:
 @dataclass(frozen=True, slots=True)
 class _ProcessEntry:
     pid: str
+    ppid: str
     command: str
 
 
@@ -107,7 +108,9 @@ def collect_system_health(
     load_1m, load_5m, load_15m = _read_loadavg()
     memory_total_mb, memory_available_mb, memory_used_percent = _read_memory()
     disk_total_gb, disk_free_gb, disk_used_percent = _read_disk(project_root)
-    services, service_probe_ok = _collect_service_health()  # AUDIT-FIX(#4): Probe processes once with bounded latency.
+    services, service_probe_ok = _collect_service_health(
+        config,
+    )  # AUDIT-FIX(#4): Probe processes once with bounded latency.
     if service_probe_ok:
         services = _apply_display_companion_health(
             config,
@@ -284,7 +287,7 @@ def _read_cpu_temperature_c() -> float | None:
         return None
 
 
-def _collect_service_health() -> tuple[tuple[ServiceHealth, ...], bool]:
+def _collect_service_health(config: TwinrConfig | None = None) -> tuple[tuple[ServiceHealth, ...], bool]:
     service_specs = (
         ("web", "Web UI", ("--run-web",)),
         (
@@ -298,12 +301,20 @@ def _collect_service_health() -> tuple[tuple[ServiceHealth, ...], bool]:
     rows: list[ServiceHealth] = []
 
     if process_entries is not None:
+        parent_by_pid = {entry.pid: entry.ppid for entry in process_entries}
         for key, label, alternatives in service_specs:
-            matches = tuple(
-                _format_process_detail(entry.pid, entry.command)
-                for entry in process_entries
-                if _command_matches(entry.command, alternatives)
+            matching_entries = tuple(
+                entry for entry in process_entries if _command_matches(entry.command, alternatives)
             )  # AUDIT-FIX(#10): Match exact argv tokens to avoid substring false positives.
+            if key == "conversation_loop":
+                matching_entries = _filter_conversation_loop_entries(
+                    config,
+                    matching_entries,
+                    parent_by_pid=parent_by_pid,
+                )  # AUDIT-FIX(#13): Ignore multiprocessing workers that inherit the parent's streaming-loop argv.
+            matches = tuple(
+                _format_process_detail(entry.pid, entry.command) for entry in matching_entries
+            )
             rows.append(
                 ServiceHealth(
                     key=key,
@@ -378,13 +389,61 @@ def _find_processes(alternatives: tuple[str, ...]) -> tuple[str, ...] | None:
     return tuple(matches)
 
 
+def _filter_conversation_loop_entries(
+    config: TwinrConfig | None,
+    entries: tuple[_ProcessEntry, ...],
+    *,
+    parent_by_pid: dict[str, str],
+) -> tuple[_ProcessEntry, ...]:
+    if not entries or config is None:
+        return entries
+    owner_pid = _resolve_streaming_loop_owner_pid(config, entries)
+    if owner_pid is None:
+        return entries
+
+    filtered = tuple(
+        entry
+        for entry in entries
+        if entry.pid == owner_pid or not _pid_descends_from(entry.pid, owner_pid, parent_by_pid)
+    )
+    return filtered or entries
+
+
+def _resolve_streaming_loop_owner_pid(
+    config: TwinrConfig,
+    entries: tuple[_ProcessEntry, ...],
+) -> str | None:
+    owner_pid = loop_lock_owner(config, "streaming-loop")
+    owner_text = str(owner_pid).strip() if owner_pid is not None else ""
+    if not owner_text.isdigit():
+        return None
+    for entry in entries:
+        if entry.pid == owner_text:
+            return owner_text
+    return None
+
+
+def _pid_descends_from(pid: str, ancestor_pid: str, parent_by_pid: dict[str, str]) -> bool:
+    current_pid = pid
+    visited: set[str] = set()
+    while current_pid and current_pid not in visited:
+        visited.add(current_pid)
+        parent_pid = parent_by_pid.get(current_pid)
+        if not parent_pid:
+            return False
+        if parent_pid == ancestor_pid:
+            return True
+        current_pid = parent_pid
+    return False
+
+
 def _list_process_entries() -> tuple[_ProcessEntry, ...] | None:
     ps_binary = _resolve_binary("ps")  # AUDIT-FIX(#9): Use the resolved absolute binary path instead of PATH lookup at execution time.
     if ps_binary is None:
         return None
     try:
         result = subprocess.run(
-            [ps_binary, "-eo", "pid=,args="],
+            [ps_binary, "-eo", "pid=,ppid=,args="],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -405,18 +464,19 @@ def _list_process_entries() -> tuple[_ProcessEntry, ...] | None:
         pid, command = _split_process_line(stripped)
         if pid is None or command is None:
             continue
-        entries.append(_ProcessEntry(pid=pid, command=command))
+        pid_value, ppid_value = pid
+        entries.append(_ProcessEntry(pid=pid_value, ppid=ppid_value, command=command))
     return tuple(entries)
 
 
-def _split_process_line(line: str) -> tuple[str | None, str | None]:
-    parts = line.split(maxsplit=1)
-    if len(parts) != 2:
+def _split_process_line(line: str) -> tuple[tuple[str, str] | None, str | None]:
+    parts = line.split(maxsplit=2)
+    if len(parts) != 3:
         return (None, None)
-    pid, command = parts[0], parts[1].strip()
-    if not pid.isdigit() or not command:
+    pid, ppid, command = parts[0], parts[1], parts[2].strip()
+    if not pid.isdigit() or not ppid.isdigit() or not command:
         return (None, None)
-    return (pid, command)
+    return ((pid, ppid), command)
 
 
 def _command_matches(command: str, alternatives: tuple[str, ...]) -> bool:

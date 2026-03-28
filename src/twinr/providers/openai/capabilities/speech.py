@@ -30,7 +30,9 @@ _MAX_TTS_INPUT_CHARS = 4096
 _JSON_ONLY_TRANSCRIPTION_MODELS = frozenset(
     {
         "gpt-4o-transcribe",
+        "gpt-4o-transcribe-latest",
         "gpt-4o-mini-transcribe",
+        "gpt-4o-mini-transcribe-2025-03-20",
         "gpt-4o-mini-transcribe-2025-12-15",
     }
 )
@@ -284,9 +286,9 @@ class OpenAISpeechMixin:
             stop_requested.set()
             with response_lock:
                 response = response_holder["response"]
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
+            close_method = getattr(response, "close", None)
+            if callable(close_method):
+                close_method()  # pylint: disable=not-callable
 
         def iterator() -> Iterator[bytes]:
             attempted_models: list[str] = []

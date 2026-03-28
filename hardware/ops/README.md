@@ -4,6 +4,11 @@ Pi-side operating-system service definitions plus leading-repo mirror helpers,
 plus the development-host units that expose the remote-only voice gateway
 contract to the Pi.
 
+Legacy note: the helper-Pi camera and servo proxies in this folder are retained
+only as historical reference artifacts. Current Twinr runtime wiring is
+single-Pi; the canonical config loader rejects the retired helper-Pi camera and
+servo envs instead of treating them as supported operating modes.
+
 ## Responsibility
 
 `hardware/ops` owns:
@@ -39,12 +44,12 @@ contract to the Pi.
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
 | [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: mirror the repo, sync the authoritative runtime `.env`, reinstall Twinr into the Pi venv, restart the base services plus any already-enabled repo-backed Pi runtime units, optionally first-rollout a disabled Pi unit, and verify post-restart health |
-| [peer_ai_camera_observation_proxy.py](./peer_ai_camera_observation_proxy.py) | Transport-only peer-Pi HTTP service that exposes bounded live IMX500 observation payloads plus a coherent detection-plus-frame bundle from the dedicated AI-camera proxy Pi on `10.42.0.2:8767` |
-| [peer_camera_snapshot_proxy.py](./peer_camera_snapshot_proxy.py) | Transport-only peer-Pi HTTP snapshot service that exposes bounded `rpicam-still` captures from the dedicated AI-camera proxy Pi on `10.42.0.2:8766` |
-| [peer_servo_proxy.py](./peer_servo_proxy.py) | Transport-only peer-Pi HTTP service that exposes one local helper-Pi servo writer on `10.42.0.2:8768`, either a Pololu Maestro command port or a direct GPIO servo output such as GPIO18 via `lgpio_pwm` |
-| [twinr-peer-ai-camera-proxy.service](./twinr-peer-ai-camera-proxy.service) | Proxy-Pi unit: keep the peer AI-camera observation service alive on the dedicated direct-link address |
-| [twinr-peer-camera-proxy.service](./twinr-peer-camera-proxy.service) | Proxy-Pi unit: keep the peer camera snapshot service alive on the dedicated direct-link address |
-| [twinr-peer-servo-proxy.service](./twinr-peer-servo-proxy.service) | Proxy-Pi unit: keep the peer Pololu Maestro service alive on the dedicated direct-link address |
+| [peer_ai_camera_observation_proxy.py](./peer_ai_camera_observation_proxy.py) | Legacy transport-only helper-Pi HTTP service retained for historical migrations; not part of the current productive runtime |
+| [peer_camera_snapshot_proxy.py](./peer_camera_snapshot_proxy.py) | Legacy helper-Pi still-snapshot proxy retained for historical migrations; not part of the current productive runtime |
+| [peer_servo_proxy.py](./peer_servo_proxy.py) | Legacy helper-Pi servo proxy retained for historical migrations; not part of the current productive runtime |
+| [twinr-peer-ai-camera-proxy.service](./twinr-peer-ai-camera-proxy.service) | Legacy helper-Pi unit retained for historical migrations; not part of the current productive runtime |
+| [twinr-peer-camera-proxy.service](./twinr-peer-camera-proxy.service) | Legacy helper-Pi unit retained for historical migrations; not part of the current productive runtime |
+| [twinr-peer-servo-proxy.service](./twinr-peer-servo-proxy.service) | Legacy helper-Pi unit retained for historical migrations; not part of the current productive runtime |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
 
@@ -75,7 +80,10 @@ must not grow main-runtime orchestration, HDMI policy, or gesture/UI decisions
 into the helper service. Its busy-cache path is intentionally short-lived only:
 the helper may reuse one just-captured payload to bridge immediate lock
 overlap, but stale helper frames must time out explicitly instead of being
-replayed indefinitely as if they were fresh.
+replayed indefinitely as if they were fresh. Even in that legacy recovery mode,
+the helper `/observe_gesture` route must stay on the adapter's current-frame
+fast path; slow ROI or full-frame rescues are not allowed to masquerade as
+fresh HDMI gestures over the transport.
 
 The drone daemon is intentionally mission-bounded as well. Twinr may only queue
 high-level inspect missions, read state, cancel work, or request local manual
@@ -191,7 +199,14 @@ The post-flash probe is important: it reconnects over the normal radio URI and
 only passes when the Crazyflie exposes the `twinrFs.*` param surface that
 proves the firmware app is live.
 
-Install the peer camera snapshot proxy only on the dedicated camera proxy Pi:
+## Legacy helper-Pi proxies
+
+The commands below are retained only for historical recovery or migration work.
+Do not use them for the productive Twinr runtime; the supported topology is now
+single-Pi and the active config loader rejects the old helper-Pi envs.
+
+Install the peer camera snapshot proxy only on the dedicated camera proxy Pi
+when recovering a historical setup:
 
 ```bash
 sudo install -d -m 0755 /opt/twinr-peer-camera-proxy
@@ -274,6 +289,11 @@ By default the deploy command:
 - mirrors `/home/thh/twinr` into `/twinr`
 - treats the local `.env` as authoritative and overwrites `/twinr/.env` with a backup
 - refreshes `/twinr/.venv` via `pip install --no-deps -e /twinr`
+- compares the mirrored `pyproject.toml` runtime dependencies against the Pi venv and installs only missing or out-of-spec packages, so new lightweight dependencies can roll out without a full resolver pass
+- installs mirrored Pi-only runtime supplement packages from `hardware/ops/pi_runtime_requirements.txt` when that manifest exists locally, so optional direct-import extras such as `RapidFuzz`, `wcwidth`, `onnx`, `msgspec`, `orjson`, `portalocker`, `zstandard`, `h2`, and `opentelemetry-api` stay present on the acceptance Pi without forcing every local environment to carry them
+- treats `hardware/ops/pi_runtime_requirements.txt` as the Pi copy of `project.optional-dependencies.pi-runtime` from `pyproject.toml`; the repo tests fail if those two lists drift apart
+- attests `/twinr/.venv/bin` after that refresh and normalizes stale copied Python-wrapper shebangs back to `/twinr/.venv/bin/python` so direct console scripts such as `pytest` keep working on the Pi
+- runs a fixed `/twinr/.venv/bin/python` import contract before restart, so critical direct-import modules must still import successfully after the deploy instead of failing only later in live runtime
 - installs mirrored browser-automation runtime requirements from `browser_automation/runtime_requirements.txt` and Playwright browsers listed in `browser_automation/playwright_browsers.txt` when those manifests exist locally
 - installs the mirrored productive systemd unit files into `/etc/systemd/system/`
 - restarts `twinr-remote-memory-watchdog.service`, `twinr-runtime-supervisor.service`, and `twinr-web.service`
@@ -298,43 +318,15 @@ the first time and it is not enabled on the target host yet. Use explicit
 `--service ...` flags only when you intentionally want to replace the automatic
 deploy target set with a narrower or different one.
 Use `--install-with-deps` only when you intentionally want the Pi deploy to
-re-resolve runtime dependencies; the default no-deps editable refresh avoids
-rebuilding Pi-host packages such as `PyQt5` on every deploy.
+re-resolve the full runtime dependency graph; the default no-deps editable
+refresh now still backfills only missing or out-of-spec mirrored project
+dependencies and avoids rebuilding Pi-host packages such as `PyQt5` on every
+deploy.
 
-## Peer camera flow
+## Current camera flow
 
-Use the dedicated proxy Pi when the main Twinr Pi has no local still camera but
-needs the usual still-photo contract. When live HDMI attention/gesture is also
-enabled, use the combined AI-camera proxy service so one process owns the
-IMX500:
-
-```bash
-export TWINR_CAMERA_PROXY_SNAPSHOT_URL=http://10.42.0.2:8767/snapshot.png
-PYTHONPATH=src ./.venv/bin/python -m twinr --env-file .env --camera-capture-output /tmp/peer-proxy.png
-```
-
-`src/twinr/hardware/camera.py` keeps the upstream `CapturedPhoto` contract
-unchanged, but fetches the PNG bytes over the direct Ethernet link instead of
-opening a local `/dev/video*` node.
-
-For live HDMI attention and gesture behavior, point the main Pi's proactive
-vision provider at the helper Pi:
-
-```bash
-export TWINR_PROACTIVE_VISION_PROVIDER=remote_proxy
-export TWINR_PROACTIVE_REMOTE_CAMERA_BASE_URL=http://10.42.0.2:8767
-```
-
-For open-source-friendly wiring, prefer the high-level topology env instead of
-remembering the lower-level camera flags:
-
-```bash
-export TWINR_CAMERA_HOST_MODE=second_pi
-export TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767
-```
-
-That high-level mode keeps still capture on the helper Pi via
-`/snapshot.png` and defaults the proactive camera path to `remote_frame`, so
-the helper Pi holds the physical camera while the main Pi can do the hot
-gesture/attention lifting locally from one coherent helper detection-plus-frame
-bundle instead of separate live detection and snapshot fetches.
+The productive Twinr runtime now expects the camera on the main Pi. Use the
+local camera path and the main runtime services for bounded still capture,
+proactive observation, HDMI attention, and gesture behavior. The older helper-
+Pi proxy flow above is legacy-only and should not be reintroduced into active
+`.env` files.

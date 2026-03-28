@@ -10,10 +10,13 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.respeaker_duplex_keepalive import respeaker_duplex_keepalive_supported
 from twinr.agent.workflows.voice_orchestrator import EdgeVoiceOrchestrator
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceFollowUpClosedEvent,
+    OrchestratorVoiceIdentityProfile,
+    OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
 )
@@ -26,6 +29,7 @@ class _FakeVoiceClient:
         self.hello_requests: list[Any] = []
         self.runtime_states: list[Any] = []
         self.audio_frames: list[Any] = []
+        self.identity_profiles: list[Any] = []
         self.fail_audio_sends = 0
         self.fail_open_calls = 0
 
@@ -50,6 +54,9 @@ class _FakeVoiceClient:
             self.fail_audio_sends -= 1
             raise ConnectionError("closed")
         self.audio_frames.append(frame)
+
+    def send_identity_profiles(self, event) -> None:
+        self.identity_profiles.append(event)
 
 
 class _FakeCaptureProcess:
@@ -95,7 +102,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         orchestrator._client = fake_client
         return orchestrator, fake_client, lines, committed
 
-    def test_explicit_voice_device_alias_is_respected(self) -> None:
+    def test_generic_voice_device_alias_resolves_to_specific_capture_device(self) -> None:
         orchestrator = EdgeVoiceOrchestrator(
             TwinrConfig(
                 voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
@@ -108,7 +115,22 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             on_barge_in_interrupt=lambda: True,
         )
 
-        self.assertEqual(orchestrator._device, "default")
+        self.assertEqual(orchestrator._device, "sysdefault:CARD=Array")
+
+    def test_specific_voice_device_is_still_respected(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="hw:CARD=Array,DEV=0",
+                audio_input_device="sysdefault:CARD=Array",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        self.assertEqual(orchestrator._device, "hw:CARD=Array,DEV=0")
 
     def test_missing_voice_device_still_falls_back_to_specific_input_device(self) -> None:
         orchestrator = EdgeVoiceOrchestrator(
@@ -124,6 +146,54 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         )
 
         self.assertEqual(orchestrator._device, "sysdefault:CARD=Array")
+
+    def test_respeaker_duplex_keepalive_supports_twinr_owned_playback_pcm(self) -> None:
+        self.assertTrue(
+            respeaker_duplex_keepalive_supported(
+                capture_device="plughw:CARD=Array,DEV=0",
+                playback_device="twinr_playback_softvol",
+            )
+        )
+
+    def test_respeaker_duplex_keepalive_skips_non_respeaker_capture(self) -> None:
+        self.assertFalse(
+            respeaker_duplex_keepalive_supported(
+                capture_device="default",
+                playback_device="twinr_playback_softvol",
+            )
+        )
+
+    def test_non_loopback_ws_requires_explicit_opt_in(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Insecure ws:// voice orchestrator endpoint rejected",
+        ):
+            EdgeVoiceOrchestrator(
+                TwinrConfig(
+                    voice_orchestrator_ws_url="ws://192.168.1.154:8797/ws/orchestrator/voice",
+                ),
+                emit=lambda _msg: None,
+                on_voice_activation=lambda match: True,
+                on_transcript_committed=lambda transcript, source: True,
+                on_barge_in_interrupt=lambda: True,
+            )
+
+    def test_explicit_opt_in_allows_non_loopback_ws_bridge(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://192.168.1.154:8797/ws/orchestrator/voice",
+                voice_orchestrator_allow_insecure_ws=True,
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        self.assertEqual(
+            orchestrator._client.url,
+            "ws://192.168.1.154:8797/ws/orchestrator/voice",
+        )
 
     def test_reconnects_and_replays_runtime_state_after_remote_close(self) -> None:
         orchestrator, fake_client, lines, _committed = self._make_orchestrator()
@@ -297,6 +367,32 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(fake_client.open_calls, 1)
         self.assertIn("voice_orchestrator_unavailable=ConnectionError", lines)
 
+    def test_open_and_close_manage_respeaker_duplex_keepalive(self) -> None:
+        lines: list[str] = []
+        keepalive = mock.Mock()
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            ),
+            emit=lines.append,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+        fake_client = _FakeVoiceClient()
+        orchestrator._client = fake_client
+        orchestrator._duplex_keepalive = keepalive
+
+        with (
+            mock.patch.object(orchestrator, "_capture_loop"),
+            mock.patch.object(orchestrator, "_sender_loop"),
+        ):
+            orchestrator.open()
+            orchestrator.close()
+
+        keepalive.open.assert_called_once_with()
+        keepalive.close.assert_called_once_with()
+
     def test_next_frame_reconnects_after_send_failure(self) -> None:
         orchestrator, fake_client, lines, _committed = self._make_orchestrator()
         orchestrator._connect_client()
@@ -323,6 +419,36 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(orchestrator.ready_backend, "remote_asr")
         self.assertTrue(orchestrator.supports_remote_follow_up())
+
+    def test_unsupported_identity_profiles_disable_optional_sync_without_disconnect(self) -> None:
+        orchestrator, fake_client, lines, _committed = self._make_orchestrator()
+        orchestrator._connect_client()
+
+        event = OrchestratorVoiceIdentityProfilesEvent(
+            revision="rev-1",
+            profiles=(
+                OrchestratorVoiceIdentityProfile(
+                    user_id="main_user",
+                    embedding=(0.1, 0.2, 0.3),
+                    primary_user=True,
+                ),
+            ),
+        )
+
+        orchestrator.notify_identity_profiles(event)
+        self.assertEqual(len(fake_client.identity_profiles), 1)
+        self.assertTrue(orchestrator._connected)
+
+        orchestrator._handle_server_event(
+            OrchestratorVoiceErrorEvent(error="Unsupported message type.")
+        )
+
+        self.assertTrue(orchestrator._connected)
+        self.assertFalse(orchestrator._identity_profiles_supported)
+        self.assertIn("voice_orchestrator_identity_profiles_unsupported=true", lines)
+
+        orchestrator.notify_identity_profiles(event)
+        self.assertEqual(len(fake_client.identity_profiles), 1)
 
     def test_transcript_committed_event_dispatches_same_stream_transcript(self) -> None:
         orchestrator, _fake_client, lines, committed = self._make_orchestrator()
@@ -374,7 +500,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 return [], [], []
             return [read_fds[0]], [], []
 
-        def fake_send_frame(frame: bytes) -> None:
+        def fake_enqueue_frame(frame: bytes) -> None:
             sent_frames.append(frame)
             orchestrator._stop_event.set()
 
@@ -394,7 +520,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 return_value=b"\x01\x00" * (orchestrator._frame_bytes // 2),
             ),
             mock.patch.object(orchestrator, "_drain_stderr"),
-            mock.patch.object(orchestrator, "_send_frame", side_effect=fake_send_frame),
+            mock.patch.object(orchestrator, "_enqueue_frame", side_effect=fake_enqueue_frame),
         ):
             orchestrator._capture_loop()
 

@@ -8,13 +8,16 @@ embedding histogram bookkeeping or alert policy in their main read paths.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import json
 import logging
 import os
 from pathlib import Path
 import threading
-from typing import TYPE_CHECKING
+import tempfile
+from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     from twinr.memory.longterm.storage.remote_read_diagnostics import LongTermRemoteReadContext
@@ -25,6 +28,8 @@ _PROJECT_ROOT_OVERRIDE_ENV = "TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT"
 _HISTOGRAM_SCHEMA = "twinr_longterm_remote_read_histograms_v1"
 _ALERT_TIMEOUT_CLASS = "timeout"
 _SLOW_ALERT_LATENCY_MS = 2_000.0
+_ARTIFACT_FILE_MODE = 0o644
+_LOCK_FILE_MODE = 0o666
 _HISTOGRAM_BUCKETS_MS: tuple[tuple[float, str], ...] = (
     (50.0, "lt_50_ms"),
     (100.0, "50_100_ms"),
@@ -89,9 +94,10 @@ def record_remote_read_observation(
     histogram_path = project_root / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
     try:
         with _STATE_LOCK:
-            payload = _load_histogram_payload(histogram_path)
-            _update_histogram_payload(payload, data)
-            _write_json_atomic(histogram_path, payload)
+            with _histogram_file_lock(histogram_path):
+                payload = _load_histogram_payload(histogram_path)
+                _update_histogram_payload(payload, data)
+                _write_json_atomic(histogram_path, payload)
     except Exception:
         _LOG.warning("Failed to persist remote-read histogram artifact.", exc_info=True)
         return
@@ -140,6 +146,21 @@ def _ops_event_store(remote_state: object | None) -> object | None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _refresh_fd_mode_best_effort(fd: int, mode: int) -> None:
+    """Best-effort chmod for shared lock files that may already be foreign-owned."""
+
+    try:
+        current_mode = os.fstat(fd).st_mode & 0o777
+    except OSError:
+        return
+    if current_mode == mode:
+        return
+    try:
+        os.fchmod(fd, mode)
+    except PermissionError:
+        return
 
 
 def _normalize_text(value: object | None) -> str | None:
@@ -257,9 +278,58 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(f"{path.suffix}.tmp")
-    temp_path.write_text(json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temp_path, path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), _ARTIFACT_FILE_MODE)
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+        os.chmod(path, _ARTIFACT_FILE_MODE)
+        temp_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(path, directory_flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@contextmanager
+def _histogram_file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    lock_handle = None
+    try:
+        lock_fd = os.open(lock_path, lock_flags, _LOCK_FILE_MODE)
+        _refresh_fd_mode_best_effort(lock_fd, _LOCK_FILE_MODE)
+        lock_handle = os.fdopen(lock_fd, "a+", encoding="utf-8")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_handle is not None:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_handle.close()
 
 
 __all__ = ["record_remote_read_observation"]

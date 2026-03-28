@@ -170,6 +170,18 @@ class FakePigpioModule:
 
 
 class LGPIOServoPulseWriterTests(unittest.TestCase):
+    def test_probe_primes_pi_system_paths_before_importing_lgpio(self) -> None:
+        fake_module = FakeLGPIOModule()
+        writer = LGPIOServoPulseWriter()
+
+        with (
+            mock.patch("twinr.hardware.servo_follow_impl.writers.prime_raspberry_pi_system_site_packages") as prime,
+            mock.patch.dict(sys.modules, {"lgpio": fake_module}),
+        ):
+            writer.probe(18)
+
+        prime.assert_called_once_with()
+
     def test_explicit_pololu_maestro_driver_builds_maestro_writer(self) -> None:
         config = AttentionServoConfig(
             enabled=True,
@@ -342,6 +354,17 @@ class LGPIOPWMServoPulseWriterTests(unittest.TestCase):
 
 
 class PigpioServoPulseWriterTests(unittest.TestCase):
+    def test_probe_primes_pi_system_paths_before_importing_pigpio(self) -> None:
+        writer = PigpioServoPulseWriter()
+
+        with (
+            mock.patch("twinr.hardware.servo_follow_impl.writers.prime_raspberry_pi_system_site_packages") as prime,
+            mock.patch.dict(sys.modules, {"pigpio": FakePigpioModule(FakePigpioConnection())}),
+        ):
+            writer.probe(18)
+
+        prime.assert_called_once_with()
+
     def test_write_sets_output_once_and_updates_servo_pulsewidth(self) -> None:
         connection = FakePigpioConnection()
         writer = PigpioServoPulseWriter()
@@ -1170,22 +1193,38 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(servo_config.maestro_device, "/dev/serial/by-id/maestro-if00")
         self.assertEqual(servo_config.gpio, 0)
 
-    def test_from_config_uses_dedicated_maestro_channel_for_peer_pololu_driver(self) -> None:
+    def test_from_config_uses_dedicated_maestro_channel_for_nonzero_pololu_driver(
+        self,
+    ) -> None:
         config = TwinrConfig(
             attention_servo_enabled=True,
-            attention_servo_driver="peer_pololu_maestro",
-            attention_servo_peer_base_url="http://10.42.0.2:8768/",
-            attention_servo_peer_timeout_s=2.0,
-            attention_servo_maestro_channel=1,
+            attention_servo_driver="pololu_maestro",
+            attention_servo_maestro_device="/dev/serial/by-id/maestro-if00",
             attention_servo_gpio=18,
+            attention_servo_control_mode="position",
+            attention_servo_maestro_channel=1,
         )
 
         servo_config = AttentionServoConfig.from_config(cast(TwinrConfig, config))
 
-        self.assertEqual(servo_config.driver, "peer_pololu_maestro")
-        self.assertEqual(servo_config.peer_base_url, "http://10.42.0.2:8768")
-        self.assertEqual(servo_config.peer_timeout_s, 2.0)
+        self.assertEqual(servo_config.driver, "pololu_maestro")
+        self.assertEqual(servo_config.maestro_device, "/dev/serial/by-id/maestro-if00")
         self.assertEqual(servo_config.gpio, 1)
+        self.assertIsNone(servo_config.peer_base_url)
+
+    def test_from_config_rejects_legacy_peer_pololu_driver(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Legacy helper-Pi attention-servo topology is no longer supported",
+        ):
+            TwinrConfig(
+                attention_servo_enabled=True,
+                attention_servo_driver="peer_pololu_maestro",
+                attention_servo_peer_base_url="http://10.42.0.2:8768/",
+                attention_servo_peer_timeout_s=2.0,
+                attention_servo_maestro_channel=1,
+                attention_servo_gpio=18,
+            )
 
     def test_from_config_reads_continuous_rotation_servo_tuning(self) -> None:
         config = TwinrConfig(

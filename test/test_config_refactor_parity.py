@@ -25,8 +25,8 @@ _FEATURE_ENV_TEXT = (
             "TWINR_BROWSER_AUTOMATION_ENABLED=true",
             "TWINR_BROWSER_AUTOMATION_WORKSPACE_PATH=browser_automation",
             "TWINR_BROWSER_AUTOMATION_ENTRY_MODULE=adapter.py",
-            "TWINR_CAMERA_HOST_MODE=second_pi",
-            "TWINR_CAMERA_SECOND_PI_BASE_URL=http://10.42.0.2:8767/",
+            "TWINR_CAMERA_HOST_MODE=onboard",
+            "TWINR_CAMERA_DEVICE=/dev/video1",
             "TWINR_DISPLAY_LAYOUT=DEBUG_FACE",
             "TWINR_DISPLAY_BUSY_TIMEOUT_S=12.5",
             "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_MIN_WAKE_DURATION_MS=450",
@@ -51,7 +51,7 @@ _NORMALIZED_ROOT_KEYS = (
 )
 _EXPECTED_GOLDEN_DIGESTS = {
     "empty": "fdf9370023466f4bf916e07b3c9dde1ac188de3ad07d0b63cb7ef7bc95ef1bca",
-    "feature_env": "5d78459773ec0b8ba1318ff47a390dbe00ddeafc0ca75cb3e065922b66d65149",
+    "feature_env": "9790e3c584477eac8768caaee4f00ed8213cbffb7b87f2c58048e9fbf501022e",
     "env_override": "1a7bc448ac4fc10d0b94b8099a705e209ece826b19ee030fec2171069c8e38ef",
 }
 

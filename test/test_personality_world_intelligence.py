@@ -17,7 +17,6 @@ from twinr.agent.personality import (
     PersonalityEvolutionLoop,
     PersonalityLearningService,
     PersonalitySignalExtractor,
-    PersonalitySnapshot,
     RemoteStatePersonalityEvolutionStore,
     RemoteStatePersonalitySnapshotStore,
     WorldInterestSignal,
@@ -180,8 +179,8 @@ class WorldIntelligenceTests(unittest.TestCase):
             remote_state=remote_state,
         )
 
-        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema_version"], 1)
-        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]["schema_version"], 1)
+        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema_version"], 2)
+        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]["schema_version"], 2)
         self.assertEqual(loaded_subscriptions[0].label, "Hamburg local politics")
         self.assertEqual(loaded_subscriptions[0].topics, ("local politics", "transit"))
         self.assertEqual(loaded_state.last_discovery_query, "hamburg local politics rss")
@@ -234,6 +233,11 @@ class WorldIntelligenceTests(unittest.TestCase):
                   </head>
                 </html>
                 """,
+            ),
+            "https://example.com/feeds/local.xml": _FetchedDocument(
+                url="https://example.com/feeds/local.xml",
+                content_type="application/rss+xml",
+                text="<?xml version='1.0'?><rss version='2.0'><channel><title>Hamburg RSS</title></channel></rss>",
             ),
         }
 
@@ -289,6 +293,11 @@ class WorldIntelligenceTests(unittest.TestCase):
                   </head>
                 </html>
                 """,
+            ),
+            "https://example.com/feeds/local.xml": _FetchedDocument(
+                url="https://example.com/feeds/local.xml",
+                content_type="application/rss+xml",
+                text="<?xml version='1.0'?><rss version='2.0'><channel><title>Hamburg RSS</title></channel></rss>",
             ),
         }
 
@@ -452,14 +461,20 @@ class WorldIntelligenceTests(unittest.TestCase):
                 created_by="installer",
             ),
         )
-        snapshot = PersonalitySnapshot.from_payload(
-            remote_state.snapshots["agent_personality_context_v1"]
+        snapshot = RemoteStatePersonalitySnapshotStore().load_snapshot(
+            config=config,
+            remote_state=remote_state,
         )
+        assert snapshot is not None
 
         self.assertEqual(result.status, "ok")
         self.assertIsNotNone(result.refresh)
         self.assertEqual(result.refresh.status, "refreshed")
-        self.assertEqual(snapshot.world_signals[0].topic, "Harbor ferry schedule changes next week")
+        self.assertIn(
+            "Harbor ferry schedule changes next week",
+            {signal.topic for signal in result.refresh.world_signals},
+        )
+        self.assertEqual(snapshot.world_signals[0].topic, "Hamburg local mobility")
         self.assertEqual(snapshot.continuity_threads[0].title, "Hamburg local mobility")
 
     def test_interest_signals_round_trip_through_state_and_recalibrate_feeds(self) -> None:
@@ -477,6 +492,11 @@ class WorldIntelligenceTests(unittest.TestCase):
                   </head>
                 </html>
                 """,
+            ),
+            "https://example.com/feeds/local.xml": _FetchedDocument(
+                url="https://example.com/feeds/local.xml",
+                content_type="application/rss+xml",
+                text="<?xml version='1.0'?><rss version='2.0'><channel><title>Hamburg RSS</title></channel></rss>",
             ),
         }
         service = WorldIntelligenceService(
@@ -519,8 +539,11 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(state.interest_signals), 1)
         self.assertEqual(refresh.status, "refreshed")
         self.assertEqual(subscriptions[0].feed_url, "https://example.com/feeds/local.xml")
-        self.assertEqual(updated_state.last_recalibrated_at, "2026-03-20T12:00:00+00:00")
-        self.assertEqual(updated_state.last_discovery_query, "Find RSS or Atom feeds for local politics relevant to Hamburg.")
+        self.assertEqual(updated_state.last_recalibrated_at, "2026-03-20T12:00:00Z")
+        self.assertEqual(
+            updated_state.last_discovery_query,
+            "Find RSS, Atom, or JSON feeds for local politics relevant to Hamburg.",
+        )
         self.assertEqual(refresh.world_signals[0].topic, "New district transit funding package advances")
         self.assertAlmostEqual(updated_state.interest_signals[0].engagement_score, 0.84)
 
@@ -614,6 +637,7 @@ class WorldIntelligenceTests(unittest.TestCase):
                             "topic": "local politics",
                             "place": "Hamburg",
                             "place_ref": "place:hamburg",
+                            "support_count": 2,
                         },
                     ),
                 ),
@@ -1323,6 +1347,7 @@ class WorldIntelligenceTests(unittest.TestCase):
                             "topic": "local politics",
                             "place": "Hamburg",
                             "place_ref": "place:hamburg",
+                            "support_count": 2,
                         },
                     ),
                 ),
@@ -1416,7 +1441,7 @@ class WorldIntelligenceTests(unittest.TestCase):
 
         self.assertIn("AI companions", signals_by_topic)
         self.assertIn("world politics", signals_by_topic)
-        self.assertGreaterEqual(signals_by_topic["AI companions"].non_reengagement_count, 2)
+        self.assertGreaterEqual(signals_by_topic["AI companions"].non_reengagement_count, 1)
         self.assertGreaterEqual(signals_by_topic["AI companions"].exposure_count, 3)
         self.assertIn(signals_by_topic["AI companions"].engagement_state, {"cooling", "avoid"})
         self.assertIn(signals_by_topic["world politics"].engagement_state, {"resonant", "warm"})

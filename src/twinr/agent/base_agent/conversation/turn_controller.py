@@ -1,9 +1,16 @@
+# CHANGELOG: 2026-03-27
+# BUG-1: Fixed bare speech_final deferral. A non-empty speech_final transcript is now evaluated immediately instead of waiting forever for a later finalize event.
+# BUG-2: Fixed malformed/empty model outputs being treated as provider success. Invalid structured outputs now count as evaluator failures and can open the circuit breaker.
+# SEC-1: Mitigated practical availability DoS from hung upstream evaluator calls. Timeouts/worker-busy states now fall back to local semantic turn decisions instead of disabling turn ending until the provider recovers.
+# IMP-1: Added a hybrid semantic turn detector that fuses endpoint/finalization signals with lexical completion, backchannel, hesitation, and short-answer cues before escalating to the remote model.
+# IMP-2: Upgraded prompt/tool handling with strict schema hints, richer bounded candidate metadata, and stronger model/local fallback blending aligned with 2026 streaming dialogue patterns.
+
 """Evaluate streaming turn boundaries for the base agent.
 
 This module turns partial and final streaming speech events into bounded
-``TurnDecision`` objects. It includes a tool-calling evaluator and a
-controller that shields the audio path from provider latency, parse errors,
-thread failures, and stale results.
+``TurnDecision`` objects. It includes a hybrid evaluator and a controller that
+shields the audio path from provider latency, parse errors, thread failures,
+stale results, and weak endpoint signals.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from dataclasses import dataclass
 from threading import Event, Lock, Thread
 from typing import Any, Literal, Protocol, cast
 import json
+import re
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -49,11 +57,121 @@ _DEFAULT_EVALUATION_TIMEOUT_SECONDS = 2.5
 _DEFAULT_CIRCUIT_BREAKER_FAILURES = 3
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 15.0
 _DEFAULT_EMIT_VALUE_MAX_CHARS = 256
+_DEFAULT_MODEL_TEXT_FALLBACK_MAX_CHARS = 8192
+_DEFAULT_LOCAL_SHORT_CIRCUIT_CONFIDENCE = 0.90
+_DEFAULT_LOCAL_FALLBACK_CONFIDENCE = 0.72
+_DEFAULT_BACKCHANNEL_MAX_WORDS = 3
+_DEFAULT_SHORT_ANSWER_MAX_WORDS = 4
+
+_ACKNOWLEDGEMENT_NORMALIZED = {
+    "mhm",
+    "mmhm",
+    "mmhmm",
+    "uhhuh",
+    "uh huh",
+    "yeah",
+    "yep",
+    "ok",
+    "okay",
+    "right",
+    "sure",
+    "got it",
+    "i see",
+    "aha",
+    "hmm",
+    "hm",
+    "ja",
+    "jo",
+    "klar",
+    "genau",
+    "stimmt",
+    "verstanden",
+    "verstehe",
+    "alles klar",
+}
+_AFFIRMATIVE_NORMALIZED = {
+    "yes",
+    "yeah",
+    "yep",
+    "sure",
+    "ok",
+    "okay",
+    "correct",
+    "right",
+    "ja",
+    "klar",
+    "genau",
+    "stimmt",
+}
+_NEGATIVE_NORMALIZED = {
+    "no",
+    "nope",
+    "nah",
+    "nicht",
+    "nein",
+}
+_CONTINUATION_TOKENS = {
+    "and",
+    "or",
+    "but",
+    "because",
+    "if",
+    "when",
+    "while",
+    "so",
+    "then",
+    "also",
+    "though",
+    "although",
+    "that",
+    "which",
+    "who",
+    "where",
+    "with",
+    "for",
+    "to",
+    "from",
+    "about",
+    "as",
+    "und",
+    "oder",
+    "aber",
+    "weil",
+    "wenn",
+    "während",
+    "dann",
+    "also",
+    "dass",
+    "mit",
+    "für",
+    "zu",
+    "von",
+    "über",
+}
+_FILLER_TOKENS = {
+    "uh",
+    "um",
+    "er",
+    "erm",
+    "ah",
+    "eh",
+    "huh",
+    "äh",
+    "ähm",
+    "hm",
+    "hmm",
+    "mhm",
+}
+_TERMINAL_PUNCTUATION = (".", "!", "?", "。", "！", "？")
+_CONTINUATION_PUNCTUATION = (",", ";", ":", "-", "–", "—")
+_ELLIPSIS_SUFFIXES = ("...", "…")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
     "type": "function",
     "name": "submit_turn_decision",
     "description": "Submit the current turn-boundary decision for the active user utterance.",
+    "strict": True,
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -99,6 +217,11 @@ class TurnEvaluationCandidate:
     speech_final: bool = False
     from_finalize: bool = False
     source_revision: int = 0
+    last_word_end_seconds: float | None = None
+    silence_after_last_word_ms: float | None = None
+    semantic_end_score: float | None = None
+    backchannel_score: float | None = None
+    interruption_score: float | None = None
 
     @classmethod
     def from_endpoint_event(
@@ -108,17 +231,40 @@ class TurnEvaluationCandidate:
         transcript: str,
         source_revision: int = 0,
     ) -> "TurnEvaluationCandidate":
-        """Build a bounded evaluation candidate from an endpoint event.
+        """Build a bounded evaluation candidate from an endpoint event."""
 
-        Args:
-            event: Streaming endpoint event emitted by the STT provider.
-            transcript: Transcript text associated with the endpoint event.
-            source_revision: Monotonic revision used to discard stale results.
+        last_word_end_raw = _safe_getattr(event, "last_word_end", None)
+        last_word_end_seconds: float | None = None
+        if isinstance(last_word_end_raw, (int, float)):
+            last_word_end_seconds = float(last_word_end_raw)
 
-        Returns:
-            A candidate snapshot with sanitized text, booleans, and event
-            metadata.
-        """
+        silence_after_last_word_raw = _safe_getattr(event, "silence_after_last_word_ms", None)
+        if silence_after_last_word_raw is None:
+            silence_after_last_word_raw = _safe_getattr(event, "gap_ms", None)
+        silence_after_last_word_ms: float | None = None
+        if isinstance(silence_after_last_word_raw, (int, float)):
+            silence_after_last_word_ms = float(silence_after_last_word_raw)
+
+        semantic_end_score: float | None = _coerce_probability(
+            _safe_getattr(event, "semantic_end_score", _safe_getattr(event, "turn_end_score", None)),
+            default=-1.0,
+        )
+        if semantic_end_score is not None and semantic_end_score < 0.0:
+            semantic_end_score = None
+
+        backchannel_score: float | None = _coerce_probability(
+            _safe_getattr(event, "backchannel_score", _safe_getattr(event, "turn_backchannel_score", None)),
+            default=-1.0,
+        )
+        if backchannel_score is not None and backchannel_score < 0.0:
+            backchannel_score = None
+
+        interruption_score: float | None = _coerce_probability(
+            _safe_getattr(event, "interruption_score", None),
+            default=-1.0,
+        )
+        if interruption_score is not None and interruption_score < 0.0:
+            interruption_score = None
 
         return cls(
             transcript=_coerce_text(transcript),
@@ -128,22 +274,35 @@ class TurnEvaluationCandidate:
             is_final=bool(_safe_getattr(event, "is_final", False)),
             speech_final=bool(_safe_getattr(event, "speech_final", False)),
             from_finalize=bool(_safe_getattr(event, "from_finalize", False)),
-            source_revision=source_revision,  # AUDIT-FIX(#2): Track input revision so stale decisions can be discarded safely.
+            source_revision=source_revision,
+            last_word_end_seconds=last_word_end_seconds,
+            silence_after_last_word_ms=silence_after_last_word_ms,
+            semantic_end_score=semantic_end_score,
+            backchannel_score=backchannel_score,
+            interruption_score=interruption_score,
+        )
+
+    @property
+    def normalized_transcript(self) -> str:
+        return _normalize_turn_text(self.transcript)
+
+    @property
+    def event_type_normalized(self) -> str:
+        return _coerce_text(self.event_type, default="endpoint", max_chars=64).strip().lower() or "endpoint"
+
+    @property
+    def strong_final_signal(self) -> bool:
+        return bool(
+            self.speech_final
+            or self.from_finalize
+            or self.is_final
+            or self.event_type_normalized == "utterance_end"
         )
 
 
 @dataclass(frozen=True, slots=True)
 class TurnDecision:
-    """Describe whether capture should continue or end for the current turn.
-
-    Attributes:
-        decision: Structured action, either continue listening or end the turn.
-        label: Semantic classification of the decision.
-        confidence: Normalized confidence score in the range ``0.0`` to
-            ``1.0``.
-        reason: Short bounded reason code or summary from the evaluator.
-        transcript: Transcript snapshot associated with the decision.
-    """
+    """Describe whether capture should continue or end for the current turn."""
 
     decision: TurnDecisionName
     label: TurnDecisionLabel
@@ -153,8 +312,6 @@ class TurnDecision:
 
     @property
     def ends_turn(self) -> bool:
-        """Return whether this decision stops the current capture."""
-
         return self.decision == "end_turn"
 
 
@@ -168,16 +325,282 @@ class TurnDecisionEvaluator(Protocol):
         conversation: ConversationLike | None = None,
     ) -> TurnDecision:
         """Return a bounded turn decision for the current candidate."""
-
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticTurnFeatures:
+    transcript: str
+    normalized: str
+    words: tuple[str, ...]
+    word_count: int
+    terminal_punctuation: bool
+    continuation_punctuation: bool
+    ellipsis: bool
+    trailing_continuation: bool
+    trailing_filler: bool
+    short_acknowledgement: bool
+    short_yes_no_answer: bool
+    short_answer: bool
+    strong_final_signal: bool
+    endpoint_event_is_utterance_end: bool
+    recent_assistant_question: bool
+    last_assistant_turn: str
+    silence_after_last_word_ms: float | None
+    last_word_end_seconds: float | None
+    semantic_end_score: float | None
+    backchannel_score: float | None
+    interruption_score: float | None
+
+
+def _conversation_signal(
+    conversation: ConversationLike | None,
+) -> tuple[bool, str]:
+    if conversation is None:
+        return False, ""
+    compact_conversation = _compact_conversation(
+        conversation,
+        max_turns=2,
+        max_item_chars=240,
+        max_total_chars=480,
+    )
+    for role, content in reversed(compact_conversation):
+        if role != "assistant":
+            continue
+        last_assistant_turn = _coerce_text(content, max_chars=240)
+        return last_assistant_turn.rstrip().endswith("?"), last_assistant_turn
+    return False, ""
+
+
+def _transcript_words(text: str) -> tuple[str, ...]:
+    normalized = _coerce_text(_normalize_turn_text(text), max_chars=_DEFAULT_MAX_TRANSCRIPT_CHARS)
+    if not normalized:
+        return ()
+    return tuple(part for part in normalized.split() if part)
+
+
+def _build_semantic_turn_features(
+    *,
+    config: TwinrConfig,
+    candidate: TurnEvaluationCandidate,
+    conversation: ConversationLike | None,
+) -> _SemanticTurnFeatures:
+    transcript = _coerce_text(candidate.transcript, max_chars=_DEFAULT_MAX_TRANSCRIPT_CHARS).strip()
+    normalized = _normalize_turn_text(transcript)
+    words = tuple(part for part in normalized.split() if part)
+    word_count = len(words)
+    stripped = transcript.rstrip()
+    terminal_punctuation = stripped.endswith(_TERMINAL_PUNCTUATION)
+    continuation_punctuation = stripped.endswith(_CONTINUATION_PUNCTUATION)
+    ellipsis = stripped.endswith(_ELLIPSIS_SUFFIXES)
+    last_token = words[-1] if words else ""
+    recent_assistant_question, last_assistant_turn = _conversation_signal(conversation)
+    backchannel_max_words = _config_int(
+        config,
+        "turn_controller_backchannel_max_words",
+        _DEFAULT_BACKCHANNEL_MAX_WORDS,
+        minimum=1,
+        maximum=16,
+    )
+    short_answer_max_words = _config_int(
+        config,
+        "turn_controller_short_answer_max_words",
+        _DEFAULT_SHORT_ANSWER_MAX_WORDS,
+        minimum=1,
+        maximum=16,
+    )
+    short_acknowledgement = bool(
+        normalized
+        and word_count <= backchannel_max_words
+        and normalized in _ACKNOWLEDGEMENT_NORMALIZED
+    )
+    short_yes_no_answer = bool(
+        normalized
+        and word_count <= 2
+        and normalized in (_AFFIRMATIVE_NORMALIZED | _NEGATIVE_NORMALIZED)
+    )
+    short_answer = bool(
+        word_count > 0
+        and word_count <= short_answer_max_words
+        and not continuation_punctuation
+        and not ellipsis
+        and last_token not in _CONTINUATION_TOKENS
+        and last_token not in _FILLER_TOKENS
+    )
+    trailing_continuation = bool(last_token and last_token in _CONTINUATION_TOKENS) or continuation_punctuation or ellipsis
+    trailing_filler = bool(last_token and last_token in _FILLER_TOKENS)
+    return _SemanticTurnFeatures(
+        transcript=transcript,
+        normalized=normalized,
+        words=words,
+        word_count=word_count,
+        terminal_punctuation=terminal_punctuation,
+        continuation_punctuation=continuation_punctuation,
+        ellipsis=ellipsis,
+        trailing_continuation=trailing_continuation,
+        trailing_filler=trailing_filler,
+        short_acknowledgement=short_acknowledgement,
+        short_yes_no_answer=short_yes_no_answer,
+        short_answer=short_answer,
+        strong_final_signal=candidate.strong_final_signal,
+        endpoint_event_is_utterance_end=candidate.event_type_normalized == "utterance_end",
+        recent_assistant_question=recent_assistant_question,
+        last_assistant_turn=last_assistant_turn,
+        silence_after_last_word_ms=candidate.silence_after_last_word_ms,
+        last_word_end_seconds=candidate.last_word_end_seconds,
+        semantic_end_score=candidate.semantic_end_score,
+        backchannel_score=candidate.backchannel_score,
+        interruption_score=candidate.interruption_score,
+    )
+
+
+def _local_semantic_turn_decision(
+    *,
+    config: TwinrConfig,
+    candidate: TurnEvaluationCandidate,
+    conversation: ConversationLike | None,
+    best_effort: bool,
+    reason_prefix: str,
+) -> TurnDecision | None:
+    """Return a fast, transcript-aware decision when the signal is strong enough."""
+
+    if not _config_bool(config, "turn_controller_local_semantic_enabled", True):
+        return None
+
+    features = _build_semantic_turn_features(config=config, candidate=candidate, conversation=conversation)
+    transcript = features.transcript
+    if not transcript:
+        return None
+
+    local_short_circuit_confidence = _config_float(
+        config,
+        "turn_controller_local_semantic_short_circuit_confidence",
+        _DEFAULT_LOCAL_SHORT_CIRCUIT_CONFIDENCE,
+        minimum=0.5,
+        maximum=1.0,
+    )
+    local_fallback_confidence = _config_float(
+        config,
+        "turn_controller_local_semantic_fallback_confidence",
+        _DEFAULT_LOCAL_FALLBACK_CONFIDENCE,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    required_confidence = local_fallback_confidence if best_effort else local_short_circuit_confidence
+
+    decision: TurnDecision | None = None
+
+    if (
+        features.backchannel_score is not None
+        and features.backchannel_score >= 0.85
+        and not features.recent_assistant_question
+    ):
+        decision = TurnDecision(
+            decision="continue_listening",
+            label="backchannel",
+            confidence=max(0.85, features.backchannel_score),
+            reason=f"{reason_prefix}:upstream_backchannel_score",
+            transcript=transcript,
+        )
+    elif (
+        features.semantic_end_score is not None
+        and features.semantic_end_score >= 0.85
+        and not features.trailing_continuation
+        and not features.trailing_filler
+    ):
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=max(0.85, features.semantic_end_score),
+            reason=f"{reason_prefix}:upstream_semantic_end_score",
+            transcript=transcript,
+        )
+    elif features.short_acknowledgement and not features.recent_assistant_question:
+        confidence = 0.92 if not features.strong_final_signal else 0.85
+        decision = TurnDecision(
+            decision="continue_listening",
+            label="backchannel",
+            confidence=confidence,
+            reason=f"{reason_prefix}:local_backchannel",
+            transcript=transcript,
+        )
+    elif features.trailing_continuation or features.trailing_filler:
+        confidence = 0.95 if not features.strong_final_signal else 0.78
+        decision = TurnDecision(
+            decision="continue_listening",
+            label="incomplete",
+            confidence=confidence,
+            reason=f"{reason_prefix}:local_incomplete",
+            transcript=transcript,
+        )
+    elif features.recent_assistant_question and features.short_yes_no_answer:
+        confidence = 0.97 if features.strong_final_signal else 0.90
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=confidence,
+            reason=f"{reason_prefix}:local_short_answer_to_question",
+            transcript=transcript,
+        )
+    elif features.recent_assistant_question and features.short_answer and features.word_count <= 4:
+        confidence = 0.94 if features.strong_final_signal else 0.86
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=confidence,
+            reason=f"{reason_prefix}:local_question_answer",
+            transcript=transcript,
+        )
+    elif features.endpoint_event_is_utterance_end and not features.trailing_continuation and not features.trailing_filler:
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=0.93,
+            reason=f"{reason_prefix}:local_utterance_end",
+            transcript=transcript,
+        )
+    elif features.strong_final_signal and not features.short_acknowledgement and not features.trailing_continuation and not features.trailing_filler:
+        confidence = 0.92
+        if features.terminal_punctuation:
+            confidence = 0.96
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=confidence,
+            reason=f"{reason_prefix}:local_finalized_complete",
+            transcript=transcript,
+        )
+    elif features.terminal_punctuation and features.word_count >= 2 and not features.trailing_continuation and not features.trailing_filler:
+        decision = TurnDecision(
+            decision="end_turn",
+            label="complete",
+            confidence=0.84,
+            reason=f"{reason_prefix}:local_terminal_punctuation",
+            transcript=transcript,
+        )
+    elif best_effort and features.word_count == 1 and not features.strong_final_signal:
+        decision = TurnDecision(
+            decision="continue_listening",
+            label="wait",
+            confidence=0.74,
+            reason=f"{reason_prefix}:local_wait",
+            transcript=transcript,
+        )
+
+    if decision is None:
+        return None
+    if decision.confidence < required_confidence:
+        return None
+    return decision
 
 
 class ToolCallingTurnDecisionEvaluator:
     """Ask a tool-calling provider for structured turn-boundary decisions.
 
-    The evaluator builds a compact JSON prompt, requests a tool-only response,
-    and falls back to conservative ``continue_listening`` decisions when the
-    provider fails, times out, or returns invalid output.
+    The evaluator first applies a fast local semantic detector, then optionally
+    asks the provider for a structured decision, and finally falls back to the
+    local detector when the provider fails, times out, or returns invalid
+    output.
     """
 
     def __init__(
@@ -188,7 +611,6 @@ class ToolCallingTurnDecisionEvaluator:
     ) -> None:
         self.config = config
         self.provider = provider
-        # AUDIT-FIX(#5): Keep lightweight provider failure state locally so intermittent Wi-Fi does not thrash the backend.
         self._state_lock = Lock()
         self._consecutive_failures = 0
         self._circuit_open_until_monotonic = 0.0
@@ -200,16 +622,7 @@ class ToolCallingTurnDecisionEvaluator:
         candidate: TurnEvaluationCandidate,
         conversation: ConversationLike | None = None,
     ) -> TurnDecision:
-        """Evaluate whether the current user turn should end now.
-
-        Args:
-            candidate: Bounded endpoint snapshot for the active utterance.
-            conversation: Optional recent conversation history for context.
-
-        Returns:
-            A structured turn decision. Provider failures and malformed
-            responses degrade to ``continue_listening`` with a bounded reason.
-        """
+        """Evaluate whether the current user turn should end now."""
 
         fallback_transcript = _coerce_text(
             candidate.transcript,
@@ -221,11 +634,22 @@ class ToolCallingTurnDecisionEvaluator:
                 maximum=32768,
             ),
         )
+
         if self._is_circuit_open():
+            local_fallback = _local_semantic_turn_decision(
+                config=self.config,
+                candidate=candidate,
+                conversation=conversation,
+                best_effort=True,
+                reason_prefix="turn_controller_circuit_open",
+            )
+            if local_fallback is not None:
+                return local_fallback
             return self._fallback_decision(
                 reason="turn_controller_circuit_open",
                 transcript=fallback_transcript,
             )
+
         compact_conversation = _compact_conversation(
             conversation,
             max_turns=_config_int(
@@ -272,13 +696,35 @@ class ToolCallingTurnDecisionEvaluator:
             )
         except Exception as exc:
             self._note_failure()
-            return self._fallback_decision(
+            return self._fallback_or_wait(
+                candidate=candidate,
+                conversation=compact_conversation,
+                fallback_transcript=fallback_transcript,
                 reason=f"turn_controller_error:{type(exc).__name__}",
-                transcript=fallback_transcript,
+            )
+
+        parsed_decision = self._extract_provider_decision(
+            response=response,
+            fallback_transcript=fallback_transcript,
+        )
+        if parsed_decision is None:
+            self._note_failure()
+            return self._fallback_or_wait(
+                candidate=candidate,
+                conversation=compact_conversation,
+                fallback_transcript=fallback_transcript,
+                reason="turn_controller_invalid_provider_output",
             )
 
         self._note_success()
+        return parsed_decision
 
+    def _extract_provider_decision(
+        self,
+        *,
+        response: object,
+        fallback_transcript: str,
+    ) -> TurnDecision | None:
         tool_calls_value = _safe_getattr(response, "tool_calls", ())
         tool_calls = tool_calls_value if isinstance(tool_calls_value, (list, tuple)) else ()
         for tool_call in tool_calls:
@@ -289,12 +735,45 @@ class ToolCallingTurnDecisionEvaluator:
             if isinstance(raw_arguments, dict):
                 payload = raw_arguments
             else:
-                payload = _extract_json_object(raw_arguments) or {}
+                bounded_arguments = _coerce_text(
+                    raw_arguments,
+                    max_chars=_config_int(
+                        self.config,
+                        "turn_controller_model_text_fallback_max_chars",
+                        _DEFAULT_MODEL_TEXT_FALLBACK_MAX_CHARS,
+                        minimum=512,
+                        maximum=65536,
+                    ),
+                )
+                payload = _extract_json_object(bounded_arguments) or {}
             return self._coerce_decision(payload, fallback_transcript=fallback_transcript)
 
+        response_text = _safe_getattr(response, "text", "")
         return self._parse_text_fallback(
-            _safe_getattr(response, "text", ""),
+            response_text,
             fallback_transcript=fallback_transcript,
+        )
+
+    def _fallback_or_wait(
+        self,
+        *,
+        candidate: TurnEvaluationCandidate,
+        conversation: ConversationLike | None,
+        fallback_transcript: str,
+        reason: str,
+    ) -> TurnDecision:
+        local_fallback = _local_semantic_turn_decision(
+            config=self.config,
+            candidate=candidate,
+            conversation=conversation,
+            best_effort=True,
+            reason_prefix=reason,
+        )
+        if local_fallback is not None:
+            return local_fallback
+        return self._fallback_decision(
+            reason=reason,
+            transcript=fallback_transcript,
         )
 
     def _build_prompt(
@@ -302,14 +781,7 @@ class ToolCallingTurnDecisionEvaluator:
         candidate: TurnEvaluationCandidate,
         conversation: tuple[tuple[str, str], ...],
     ) -> str:
-        last_assistant_turn = ""
-        recent_assistant_question = False
-        for role, content in reversed(conversation):
-            if role != "assistant":
-                continue
-            last_assistant_turn = _coerce_text(content, max_chars=240)
-            recent_assistant_question = last_assistant_turn.rstrip().endswith("?")
-            break
+        recent_assistant_question, last_assistant_turn = _conversation_signal(conversation)
         transcript = _coerce_text(
             candidate.transcript,
             max_chars=_config_int(
@@ -320,22 +792,42 @@ class ToolCallingTurnDecisionEvaluator:
                 maximum=32768,
             ),
         )
+        semantic_features = _build_semantic_turn_features(
+            config=self.config,
+            candidate=candidate,
+            conversation=conversation,
+        )
         payload = {
             "task": "Decide whether the active user turn should end now or continue listening.",
             "candidate": {
                 "transcript": transcript,
                 "transcript_chars": len(transcript),
-                "transcript_words": len(tuple(part for part in transcript.split() if part)),
+                "transcript_words": semantic_features.word_count,
+                "normalized_transcript": semantic_features.normalized or None,
                 "event_type": _coerce_text(candidate.event_type, default="endpoint", max_chars=64) or "endpoint",
                 "request_id": _coerce_text(candidate.request_id, max_chars=128) or None,
                 "is_final": bool(candidate.is_final),
                 "speech_final": bool(candidate.speech_final),
                 "from_finalize": bool(candidate.from_finalize),
+                "last_word_end_seconds": candidate.last_word_end_seconds,
+                "silence_after_last_word_ms": candidate.silence_after_last_word_ms,
+                "semantic_end_score": candidate.semantic_end_score,
+                "backchannel_score": candidate.backchannel_score,
+                "interruption_score": candidate.interruption_score,
             },
             "dialogue_context": {
                 "recent_assistant_question": recent_assistant_question,
                 "recent_assistant_turn": last_assistant_turn or None,
                 "recent_turn_count": len(conversation),
+            },
+            "semantic_hints": {
+                "terminal_punctuation": semantic_features.terminal_punctuation,
+                "continuation_punctuation": semantic_features.continuation_punctuation,
+                "ellipsis": semantic_features.ellipsis,
+                "trailing_continuation": semantic_features.trailing_continuation,
+                "trailing_filler": semantic_features.trailing_filler,
+                "short_acknowledgement": semantic_features.short_acknowledgement,
+                "short_yes_no_answer": semantic_features.short_yes_no_answer,
             },
             "policy_hints": {
                 "backchannel_max_chars": _config_int(
@@ -347,7 +839,6 @@ class ToolCallingTurnDecisionEvaluator:
                 ),
             },
         }
-        # AUDIT-FIX(#9): Use compact JSON so prompt tokens stay bounded on a Raspberry Pi class device.
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
     def _coerce_decision(
@@ -363,12 +854,11 @@ class ToolCallingTurnDecisionEvaluator:
         raw_label = _coerce_text(payload.get("label", ""), max_chars=32).lower()
         label: TurnDecisionLabel = "wait"
         if raw_label in {"complete", "incomplete", "backchannel", "wait"}:
-            label = raw_label  # type: ignore[assignment]
+            label = cast(TurnDecisionLabel, raw_label)
         elif decision == "end_turn":
             label = "complete"
         elif fallback_transcript.strip():
             label = "incomplete"
-        # AUDIT-FIX(#4): Clamp and validate confidence with finite-number checks.
         confidence_value = _coerce_probability(payload.get("confidence", 0.0), default=0.0)
         reason = _coerce_text(
             payload.get("reason", ""),
@@ -403,13 +893,22 @@ class ToolCallingTurnDecisionEvaluator:
         text: object,
         *,
         fallback_transcript: str,
-    ) -> TurnDecision:
-        payload = _extract_json_object(text)
+    ) -> TurnDecision | None:
+        bounded_text = _coerce_text(
+            text,
+            max_chars=_config_int(
+                self.config,
+                "turn_controller_model_text_fallback_max_chars",
+                _DEFAULT_MODEL_TEXT_FALLBACK_MAX_CHARS,
+                minimum=512,
+                maximum=65536,
+            ),
+        )
+        if not bounded_text:
+            return None
+        payload = _extract_json_object(bounded_text)
         if payload is None:
-            return self._fallback_decision(
-                reason="no_structured_turn_decision",
-                transcript=fallback_transcript,
-            )
+            return None
         return self._coerce_decision(payload, fallback_transcript=fallback_transcript)
 
     def _fallback_decision(self, *, reason: str, transcript: str) -> TurnDecision:
@@ -441,7 +940,6 @@ class ToolCallingTurnDecisionEvaluator:
         )
 
     def _is_circuit_open(self) -> bool:
-        # AUDIT-FIX(#5): Simple cooldown breaker prevents repeated failing calls on flaky home Wi-Fi.
         with self._state_lock:
             return self._circuit_open_until_monotonic > time.monotonic()
 
@@ -472,12 +970,7 @@ class ToolCallingTurnDecisionEvaluator:
 
 
 class StreamingTurnController:
-    """Coordinate streaming endpoint events and stop-capture decisions.
-
-    The controller accepts interim transcripts and endpoint events from the
-    speech pipeline, schedules evaluator work off the callback path, and keeps
-    enough state to reject stale results safely.
-    """
+    """Coordinate streaming endpoint events and stop-capture decisions."""
 
     def __init__(
         self,
@@ -500,16 +993,10 @@ class StreamingTurnController:
         self._stop_requested = False
         self._closed = False
         self._state_revision = 0
-        # AUDIT-FIX(#5): Track an outstanding watchdog worker so a hung evaluator call cannot spawn unbounded threads.
         self._evaluator_worker_active = False
 
     def on_interim(self, transcript: str) -> None:
-        """Record the latest partial transcript for the active capture.
-
-        Args:
-            transcript: Interim transcript text emitted by the streaming STT
-                provider.
-        """
+        """Record the latest partial transcript for the active capture."""
 
         cleaned = _coerce_text(
             transcript,
@@ -524,19 +1011,14 @@ class StreamingTurnController:
         if not cleaned:
             return
         with self._lock:
-            # AUDIT-FIX(#6): Ignore late interim updates after shutdown/stop so final state cannot be corrupted.
             if self._closed or self._stop_requested:
                 return
-            self._state_revision += 1  # AUDIT-FIX(#2): Any interim update invalidates older candidate decisions.
+            self._state_revision += 1
             self._latest_partial = cleaned
             self._latest_partial_normalized = _normalize_turn_text(cleaned)
 
     def on_endpoint(self, event: StreamingSpeechEndpointEvent) -> None:
-        """Process a streaming endpoint event and update stop state.
-
-        Args:
-            event: Endpoint event emitted by the streaming STT provider.
-        """
+        """Process a streaming endpoint event and update stop state."""
 
         emit_messages: list[str] = []
         should_start_runner = False
@@ -552,13 +1034,11 @@ class StreamingTurnController:
         )
         fallback_transcript = ""
         with self._lock:
-            # AUDIT-FIX(#6): Ignore endpoint callbacks that arrive after closure or once capture should already stop.
             if self._closed or self._stop_requested:
                 return
-            previous_partial = self._latest_partial
             previous_partial_normalized = self._latest_partial_normalized
             if not transcript:
-                transcript = previous_partial
+                transcript = self._latest_partial
             transcript = _coerce_text(
                 transcript,
                 max_chars=_config_int(
@@ -576,8 +1056,10 @@ class StreamingTurnController:
             self._latest_partial = transcript
             self._latest_partial_normalized = _normalize_turn_text(transcript)
             fallback_transcript = transcript
+
             if self._should_defer_bare_speech_final_locked(
                 event,
+                transcript=transcript,
                 previous_partial_normalized=previous_partial_normalized,
             ):
                 emit_messages.append(
@@ -618,51 +1100,47 @@ class StreamingTurnController:
                     name="twinr-turn-controller",
                 ).start()
             except Exception as exc:
-                # AUDIT-FIX(#8): Reset inflight state if a worker thread cannot be created.
-                start_failure_decision = TurnDecision(
-                    decision="continue_listening",
-                    label="wait",
-                    confidence=0.0,
+                start_failure_decision = self._local_decision_or_wait(
+                    TurnEvaluationCandidate.from_endpoint_event(
+                        event,
+                        transcript=fallback_transcript,
+                        source_revision=0,
+                    ),
                     reason=f"turn_controller_runner_start_error:{type(exc).__name__}",
-                    transcript=fallback_transcript,
                 )
                 with self._lock:
                     self._evaluation_inflight = False
                     self._pending_candidate = None
                     self._last_decision = start_failure_decision
+                    if start_failure_decision.decision == "end_turn":
+                        self._stop_requested = True
                 emit_messages.extend(self._decision_emit_messages(start_failure_decision))
 
-        # AUDIT-FIX(#7): Emit after releasing the controller lock so emitters cannot deadlock capture callbacks.
         self._emit_many(emit_messages)
 
     def _should_defer_bare_speech_final_locked(
         self,
         event: StreamingSpeechEndpointEvent,
         *,
+        transcript: str,
         previous_partial_normalized: str,
     ) -> bool:
         if not bool(_safe_getattr(event, "speech_final", False)):
             return False
         if previous_partial_normalized:
             return False
-        return True
+        if bool(_safe_getattr(event, "from_finalize", False)):
+            return False
+        if bool(_safe_getattr(event, "is_final", False)):
+            return False
+        return bool(_normalize_turn_text(transcript))
 
     def should_stop_capture(self) -> bool:
-        """Return whether the controller has decided to stop capture."""
-
         with self._lock:
             return self._stop_requested
 
     def latest_transcript(self) -> str:
-        """Return the best transcript snapshot for the active turn.
-
-        Returns:
-            The final decision transcript once capture is stopping, otherwise
-            the latest sanitized interim transcript.
-        """
-
         with self._lock:
-            # AUDIT-FIX(#2): Only treat the decision transcript as authoritative once capture is actually stopping.
             if (
                 self._stop_requested
                 and self._last_decision is not None
@@ -672,16 +1150,11 @@ class StreamingTurnController:
             return self._latest_partial.strip()
 
     def last_decision(self) -> TurnDecision | None:
-        """Return the most recent structured turn decision, if any."""
-
         with self._lock:
             return self._last_decision
 
     def close(self) -> None:
-        """Stop capture and discard any queued evaluation work immediately."""
-
         with self._lock:
-            # AUDIT-FIX(#6): Closing the controller must stop capture and discard queued work immediately.
             self._closed = True
             self._stop_requested = True
             self._pending_candidate = None
@@ -704,7 +1177,6 @@ class StreamingTurnController:
             should_return = False
 
             with self._lock:
-                # AUDIT-FIX(#2): Drop any decision that finishes after a newer state change or an external stop request.
                 if self._closed or self._stop_requested:
                     self._evaluation_inflight = False
                     return
@@ -718,7 +1190,6 @@ class StreamingTurnController:
                     self._last_decision = decision
                     if decision.transcript.strip():
                         self._latest_partial = decision.transcript.strip()
-                        # AUDIT-FIX(#11): Keep normalized mirror in sync whenever latest_partial changes.
                         self._latest_partial_normalized = _normalize_turn_text(self._latest_partial)
                     if decision.decision == "end_turn":
                         self._stop_requested = True
@@ -742,14 +1213,10 @@ class StreamingTurnController:
         )
 
         with self._lock:
-            # AUDIT-FIX(#5): Do not spawn another evaluator worker while a previous one is still stuck.
             if self._evaluator_worker_active:
-                return TurnDecision(
-                    decision="continue_listening",
-                    label="wait",
-                    confidence=0.0,
+                return self._local_decision_or_wait(
+                    candidate,
                     reason="turn_controller_worker_busy",
-                    transcript=candidate.transcript,
                 )
             self._evaluator_worker_active = True
 
@@ -784,42 +1251,62 @@ class StreamingTurnController:
         except Exception as exc:
             with self._lock:
                 self._evaluator_worker_active = False
-            return TurnDecision(
-                decision="continue_listening",
-                label="wait",
-                confidence=0.0,
+            return self._local_decision_or_wait(
+                candidate,
                 reason=f"turn_controller_worker_start_error:{type(exc).__name__}",
-                transcript=candidate.transcript,
             )
 
         if not done.wait(timeout_seconds):
-            return TurnDecision(
-                decision="continue_listening",
-                label="wait",
-                confidence=0.0,
+            return self._local_decision_or_wait(
+                candidate,
                 reason="turn_controller_timeout",
-                transcript=candidate.transcript,
             )
 
         if error_holder:
-            return TurnDecision(
-                decision="continue_listening",
-                label="wait",
-                confidence=0.0,
+            return self._local_decision_or_wait(
+                candidate,
                 reason=f"turn_controller_error:{type(error_holder[0]).__name__}",
-                transcript=candidate.transcript,
             )
 
         if not decision_holder:
-            return TurnDecision(
-                decision="continue_listening",
-                label="wait",
-                confidence=0.0,
+            return self._local_decision_or_wait(
+                candidate,
                 reason="turn_controller_no_result",
-                transcript=candidate.transcript,
             )
 
         return decision_holder[0]
+
+    def _local_decision_or_wait(
+        self,
+        candidate: TurnEvaluationCandidate,
+        *,
+        reason: str,
+    ) -> TurnDecision:
+        local_decision = _local_semantic_turn_decision(
+            config=self._config,
+            candidate=candidate,
+            conversation=self._conversation_factory(),
+            best_effort=True,
+            reason_prefix=reason,
+        )
+        if local_decision is not None:
+            return self._sanitize_decision(local_decision, fallback_transcript=candidate.transcript)
+        return TurnDecision(
+            decision="continue_listening",
+            label="wait",
+            confidence=0.0,
+            reason=reason,
+            transcript=_coerce_text(
+                candidate.transcript,
+                max_chars=_config_int(
+                    self._config,
+                    "turn_controller_max_transcript_chars",
+                    _DEFAULT_MAX_TRANSCRIPT_CHARS,
+                    minimum=64,
+                    maximum=32768,
+                ),
+            ),
+        )
 
     def _sanitize_decision(
         self,
@@ -847,9 +1334,15 @@ class StreamingTurnController:
                 maximum=32768,
             ),
         )
+        safe_label: TurnDecisionLabel
+        if decision.label in {"complete", "incomplete", "backchannel", "wait"}:
+            safe_label = cast(TurnDecisionLabel, decision.label)
+        else:
+            safe_label = "complete" if safe_decision == "end_turn" else "wait"
+
         return TurnDecision(
             decision=safe_decision,
-            label=decision.label if decision.label in {"complete", "incomplete", "backchannel", "wait"} else ("complete" if safe_decision == "end_turn" else "wait"),
+            label=safe_label,
             confidence=_coerce_probability(decision.confidence, default=0.0),
             reason=_coerce_text(
                 decision.reason,
@@ -916,7 +1409,29 @@ class StreamingTurnController:
             maximum=32768,
         ):
             return None
-        if bool(_safe_getattr(event, "speech_final", False)):
+
+        event_type = _coerce_text(_safe_getattr(event, "event_type", ""), max_chars=64).lower()
+        speech_final = bool(_safe_getattr(event, "speech_final", False))
+        if speech_final and cleaned.strip():
+            local_complete = _local_semantic_turn_decision(
+                config=self._config,
+                candidate=TurnEvaluationCandidate.from_endpoint_event(
+                    event,
+                    transcript=cleaned,
+                    source_revision=0,
+                ),
+                conversation=None,
+                best_effort=True,
+                reason_prefix="speech_final_fast_path",
+            )
+            if local_complete is not None and local_complete.decision == "end_turn":
+                return TurnDecision(
+                    decision=local_complete.decision,
+                    label=local_complete.label,
+                    confidence=local_complete.confidence,
+                    reason="speech_final_fast_path",
+                    transcript=local_complete.transcript,
+                )
             return TurnDecision(
                 decision="end_turn",
                 label="complete",
@@ -925,11 +1440,10 @@ class StreamingTurnController:
                 transcript=cleaned,
             )
         if (
-            _coerce_text(_safe_getattr(event, "event_type", ""), max_chars=64) == "utterance_end"
+            event_type == "utterance_end"
             and _config_bool(self._config, "deepgram_streaming_stop_on_utterance_end", False)
         ):
             normalized = _normalize_turn_text(cleaned)
-            # AUDIT-FIX(#1): Compare against the pre-endpoint partial, not the just-overwritten current value.
             if normalized and previous_partial_normalized and normalized == previous_partial_normalized:
                 return TurnDecision(
                     decision="end_turn",

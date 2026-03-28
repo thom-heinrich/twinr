@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Fixed real cross-process lost-update races in the JSON store by adding an advisory file lock
+# BUG-2: Fixed missed daily/weekly runs after downtime/restart by tracking scheduled fire times and computing pending occurrences
+# BUG-3: Fixed backup recovery when the primary store file is missing but the backup still exists
+# SEC-1: Added bounded store-file reads/writes to avoid practical memory/disk exhaustion on Raspberry Pi deployments
+# SEC-2: Hardened lock/store file creation to private permissions and safe lock-file path validation
+# IMP-1: Added APScheduler-style time semantics: misfire_grace_seconds, coalesce_policy, scheduled-for tracking, and due match metadata
+# IMP-2: Added optional msgspec read fast-path plus cache invalidation/signatures for lower-overhead Pi 4 operation
 """Define Twinr automation models, scheduling logic, and file-backed storage.
 
 This module owns the canonical automation data model used across the runtime,
@@ -7,26 +15,42 @@ time and fact-based triggers, and persists them to a bounded JSON store.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Iterator, Literal
 from uuid import uuid4
 import json
 import math
 import os
 import tempfile
 
+try:  # Linux/Raspberry Pi path for real inter-process locking.
+    import fcntl  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - non-Unix fallback
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Optional frontier fast-path; keep the module drop-in without extra deps.
+    import msgspec  # type: ignore[import-not-found]  # pylint: disable=import-error
+except Exception:  # pragma: no cover - optional dependency
+    msgspec = None  # type: ignore[assignment]
+
 from twinr.memory.reminders import now_in_timezone, parse_due_at, resolve_timezone
 
 ConditionOperator = Literal["eq", "ne", "contains", "gt", "gte", "lt", "lte", "truthy", "falsy"]
 TimeSchedule = Literal["once", "daily", "weekly"]
 ActionKind = Literal["say", "print", "tool_call", "llm_prompt"]
+CoalescePolicy = Literal["latest", "earliest", "all"]
 
 _SUPPORTED_OPERATORS = {"eq", "ne", "contains", "gt", "gte", "lt", "lte", "truthy", "falsy"}
 _SUPPORTED_ACTIONS = {"say", "print", "tool_call", "llm_prompt"}
 _SUPPORTED_SCHEDULES = {"once", "daily", "weekly"}
+_SUPPORTED_COALESCE_POLICIES = {"latest", "earliest", "all"}
+_DEFAULT_MAX_STORE_BYTES = 2 * 1024 * 1024
+_MAX_PENDING_OCCURRENCES = 512
+_PAYLOAD_SCHEMA_VERSION = 2
 _UTC = timezone.utc
 
 
@@ -46,10 +70,6 @@ def _slugify(value: Any, *, fallback: str) -> str:
 
 
 def _normalize_event_name(value: Any) -> str | None:
-    # AUDIT-FIX(#10): Normalize event identifiers to a stable canonical form while preserving
-    # semantic separators like dots that are part of Twinr event ids (for example
-    # `camera.person_visible`). Collapsing everything into underscores breaks sensor-trigger
-    # round-trips and tool-based updates.
     text = _normalize_text(value, limit=120)
     if not text:
         return None
@@ -89,7 +109,6 @@ def _coerce_scalar(value: Any) -> Any:
 
 
 def _coerce_bool(value: Any, *, default: bool) -> bool:
-    # AUDIT-FIX(#8): Parse persisted/config booleans explicitly so strings like "false" do not become True.
     if isinstance(value, bool):
         return value
     if value is None:
@@ -109,7 +128,6 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
 
 
 def _coerce_int(value: Any, *, default: int) -> int:
-    # AUDIT-FIX(#4): Keep .env/config parsing resilient instead of crashing on malformed numeric values.
     try:
         return int(str(value).strip())
     except (AttributeError, TypeError, ValueError):
@@ -126,9 +144,13 @@ def _parse_non_negative_float(value: Any, *, field_name: str) -> float:
     return number
 
 
+def _parse_optional_non_negative_float(value: Any, *, field_name: str) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return _parse_non_negative_float(value, field_name=field_name)
+
+
 def _canonical_timezone_name(timezone_name: str | None, *, fallback: str) -> str:
-    # AUDIT-FIX(#4): Validate and canonicalize timezone names at construction time so bad config/state
-    # cannot survive until runtime and crash schedule evaluation.
     candidate = str(timezone_name or "").strip() or fallback
     try:
         zone = resolve_timezone(candidate)
@@ -139,7 +161,6 @@ def _canonical_timezone_name(timezone_name: str | None, *, fallback: str) -> str
 
 
 def _ensure_aware_datetime(value: datetime, *, timezone_name: str) -> datetime:
-    # AUDIT-FIX(#6): Normalize all datetimes to timezone-aware values before comparisons/astimezone calls.
     zone = resolve_timezone(_canonical_timezone_name(timezone_name, fallback="UTC"))
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=zone)
@@ -147,7 +168,6 @@ def _ensure_aware_datetime(value: datetime, *, timezone_name: str) -> datetime:
 
 
 def _to_utc_datetime(value: datetime, *, timezone_name: str) -> datetime:
-    # AUDIT-FIX(#6): Canonicalize persisted timestamps to UTC so sorting and comparisons remain stable.
     return _ensure_aware_datetime(value, timezone_name=timezone_name).astimezone(_UTC)
 
 
@@ -193,8 +213,14 @@ def _normalize_weekdays(values: tuple[int, ...] | list[int] | None) -> tuple[int
     return normalized
 
 
+def _normalize_coalesce_policy(value: Any, *, default: str = "latest") -> CoalescePolicy:
+    text = str(value or default).strip().lower() or default
+    if text not in _SUPPORTED_COALESCE_POLICIES:
+        raise ValueError(f"Unsupported coalesce policy: {value}")
+    return text  # type: ignore[return-value]
+
+
 def _json_safe_value(value: Any, *, depth: int = 0) -> Any:
-    # AUDIT-FIX(#9): Sanitize action payloads into JSON-safe primitives before persisting file-backed state.
     if depth > 8:
         return _normalize_text(repr(value), limit=240)
     if value is None or isinstance(value, (bool, int, str)):
@@ -213,9 +239,15 @@ def _json_safe_value(value: Any, *, depth: int = 0) -> Any:
 
 
 def _normalize_store_path(path: str | Path) -> Path:
-    # AUDIT-FIX(#1): Normalize the configured store path without resolving symlinks so safety checks can
-    # detect symlink tricks while still supporting relative paths from config.
     return Path(os.path.abspath(str(Path(path).expanduser())))
+
+
+def _path_signature(path: Path) -> tuple[bool, int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (False, 0, 0)
+    return (True, int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def _valid_local_candidates(local_naive: datetime, *, zone: Any) -> tuple[datetime, ...]:
@@ -236,8 +268,6 @@ def _valid_local_candidates(local_naive: datetime, *, zone: Any) -> tuple[dateti
 
 
 def _resolve_local_schedule_datetime(schedule_date: date, run_time: time, *, zone: Any) -> datetime:
-    # AUDIT-FIX(#7): Resolve daily/weekly wall-clock schedule times through DST gaps/ambiguities instead of
-    # using naive datetime.replace(), which produces wrong or impossible local instants.
     local_naive = datetime.combine(schedule_date, run_time)
     candidates = _valid_local_candidates(local_naive, zone=zone)
     if candidates:
@@ -295,7 +325,6 @@ def _values_match(*, operator: str, actual: Any, expected: Any) -> bool:
 
 
 def _safe_describe_sensor_trigger(trigger: AutomationTrigger) -> Any | None:
-    # AUDIT-FIX(#12): Optional sensor helpers must not be able to take down tooling/context generation.
     try:
         from twinr.automations.sensors import describe_sensor_trigger
     except Exception:
@@ -307,7 +336,6 @@ def _safe_describe_sensor_trigger(trigger: AutomationTrigger) -> Any | None:
 
 
 def _safe_describe_sensor_trigger_text(trigger: AutomationTrigger) -> str | None:
-    # AUDIT-FIX(#12): Optional sensor-text formatting failures should degrade gracefully.
     try:
         from twinr.automations.sensors import describe_sensor_trigger_text
     except Exception:
@@ -321,14 +349,6 @@ def _safe_describe_sensor_trigger_text(trigger: AutomationTrigger) -> str | None
 
 @dataclass(frozen=True, slots=True)
 class AutomationCondition:
-    """Represent one fact comparison inside an if/then trigger.
-
-    Attributes:
-        key: Dot-separated fact path to read from runtime facts.
-        operator: Comparison operator to apply to the fact value.
-        value: Optional comparison value. ``truthy`` and ``falsy`` ignore it.
-    """
-
     key: str
     operator: ConditionOperator
     value: str | int | float | bool | None = None
@@ -346,42 +366,24 @@ class AutomationCondition:
             object.__setattr__(self, "value", None)
 
     def matches(self, facts: dict[str, Any]) -> bool:
-        """Return whether the provided facts satisfy this condition."""
-
-        return _values_match(
-            operator=self.operator,
-            actual=_fact_value(facts, self.key),
-            expected=self.value,
-        )
+        return _values_match(operator=self.operator, actual=_fact_value(facts, self.key), expected=self.value)
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the condition into the persisted JSON shape."""
-
-        return {
-            "key": self.key,
-            "operator": self.operator,
-            "value": self.value,
-        }
+        return {"key": self.key, "operator": self.operator, "value": self.value}
 
 
 @dataclass(frozen=True, slots=True)
 class TimeAutomationTrigger:
-    """Describe a scheduled automation trigger.
-
-    ``once`` triggers persist a concrete ``due_at`` timestamp. ``daily`` and
-    ``weekly`` triggers persist a local wall-clock ``time_of_day`` plus the
-    timezone used to resolve that schedule.
-    """
-
     kind: Literal["time"] = "time"
     schedule: TimeSchedule = "once"
     due_at: str | None = None
     time_of_day: str | None = None
     weekdays: tuple[int, ...] = ()
     timezone_name: str | None = None
+    misfire_grace_seconds: float | None = None
+    coalesce_policy: CoalescePolicy = "latest"
 
     def __post_init__(self) -> None:
-        # AUDIT-FIX(#11): Validate trigger shape eagerly so malformed objects do not survive until runtime.
         clean_kind = str(self.kind).strip().lower()
         if clean_kind != "time":
             raise ValueError("TimeAutomationTrigger.kind must be 'time'")
@@ -390,15 +392,20 @@ class TimeAutomationTrigger:
             raise ValueError(f"Unsupported time schedule: {self.schedule}")
         normalized_weekdays = _normalize_weekdays(self.weekdays)
         timezone_name = _canonical_timezone_name(self.timezone_name, fallback="UTC")
+        misfire_grace_seconds = _parse_optional_non_negative_float(
+            self.misfire_grace_seconds,
+            field_name="misfire_grace_seconds",
+        )
+        coalesce_policy = _normalize_coalesce_policy(self.coalesce_policy)
         object.__setattr__(self, "kind", "time")
         object.__setattr__(self, "schedule", clean_schedule)
         object.__setattr__(self, "weekdays", normalized_weekdays)
         object.__setattr__(self, "timezone_name", timezone_name)
+        object.__setattr__(self, "misfire_grace_seconds", misfire_grace_seconds)
+        object.__setattr__(self, "coalesce_policy", coalesce_policy)
         if clean_schedule == "once":
             if not str(self.due_at or "").strip():
                 raise ValueError("due_at is required for once schedules")
-            # AUDIT-FIX(#5): Persist one-shot triggers as absolute ISO timestamps so relative input like
-            # "tomorrow 8am" cannot drift after reload.
             parsed_due_at = _parse_due_at_absolute(self.due_at, timezone_name=timezone_name)
             object.__setattr__(self, "due_at", parsed_due_at.isoformat())
             object.__setattr__(self, "time_of_day", None)
@@ -414,8 +421,6 @@ class TimeAutomationTrigger:
             raise ValueError("weekdays are required for weekly schedules")
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the trigger into the persisted JSON shape."""
-
         return {
             "kind": self.kind,
             "schedule": self.schedule,
@@ -423,21 +428,13 @@ class TimeAutomationTrigger:
             "time_of_day": self.time_of_day,
             "weekdays": list(self.weekdays),
             "timezone_name": self.timezone_name,
+            "misfire_grace_seconds": self.misfire_grace_seconds,
+            "coalesce_policy": self.coalesce_policy,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class IfThenAutomationTrigger:
-    """Describe an event- and fact-driven automation trigger.
-
-    Attributes:
-        kind: Trigger discriminator for persisted payloads.
-        event_name: Optional event gate that must match before conditions run.
-        all_conditions: Conditions that must all evaluate to true.
-        any_conditions: Conditions where at least one must evaluate to true.
-        cooldown_seconds: Minimum time between repeated matches.
-    """
-
     kind: Literal["if_then"] = "if_then"
     event_name: str | None = None
     all_conditions: tuple[AutomationCondition, ...] = ()
@@ -445,7 +442,6 @@ class IfThenAutomationTrigger:
     cooldown_seconds: float = 0.0
 
     def __post_init__(self) -> None:
-        # AUDIT-FIX(#11): Validate condition collections and trigger kind eagerly so malformed payloads fail fast.
         clean_kind = str(self.kind).strip().lower()
         if clean_kind != "if_then":
             raise ValueError("IfThenAutomationTrigger.kind must be 'if_then'")
@@ -466,8 +462,6 @@ class IfThenAutomationTrigger:
         object.__setattr__(self, "cooldown_seconds", cooldown_seconds)
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the trigger into the persisted JSON shape."""
-
         return {
             "kind": self.kind,
             "event_name": self.event_name,
@@ -482,16 +476,6 @@ AutomationTrigger = TimeAutomationTrigger | IfThenAutomationTrigger
 
 @dataclass(frozen=True, slots=True)
 class AutomationAction:
-    """Describe the work Twinr performs when an automation fires.
-
-    Attributes:
-        kind: Action type executed by the runtime.
-        text: Spoken, printed, or prompt text for text-based actions.
-        tool_name: Tool identifier for ``tool_call`` actions.
-        payload: JSON-safe action metadata passed to the runtime.
-        enabled: Whether this action participates when the automation fires.
-    """
-
     kind: ActionKind
     text: str | None = None
     tool_name: str | None = None
@@ -505,13 +489,11 @@ class AutomationAction:
         object.__setattr__(self, "kind", clean_kind)
         object.__setattr__(self, "text", _normalize_text(self.text, limit=420) or None)
         object.__setattr__(self, "tool_name", _normalize_text(self.tool_name, limit=120) or None)
-        # AUDIT-FIX(#9): Deep-sanitize payloads now so store writes never choke on datetime/Path/custom objects.
         try:
             raw_payload = dict(self.payload or {})
         except (TypeError, ValueError) as exc:
             raise ValueError("payload must be a mapping") from exc
         object.__setattr__(self, "payload", _json_safe_value(raw_payload))
-        # AUDIT-FIX(#8): Normalize enabled flags explicitly for both direct construction and payload reloads.
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled, default=True))
         if clean_kind in {"say", "print", "llm_prompt"} and not self.text:
             raise ValueError(f"text is required for action kind: {self.kind}")
@@ -519,8 +501,6 @@ class AutomationAction:
             raise ValueError("tool_name is required for action kind: tool_call")
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the action into the persisted JSON shape."""
-
         return {
             "kind": self.kind,
             "text": self.text,
@@ -532,13 +512,6 @@ class AutomationAction:
 
 @dataclass(frozen=True, slots=True)
 class AutomationDefinition:
-    """Represent one stored automation entry.
-
-    Each definition combines a validated trigger with one or more actions plus
-    timestamps and metadata used for persistence, operator tooling, and runtime
-    cooldown handling.
-    """
-
     automation_id: str
     name: str
     trigger: AutomationTrigger
@@ -548,12 +521,11 @@ class AutomationDefinition:
     created_at: datetime = field(default_factory=lambda: now_in_timezone("UTC"))
     updated_at: datetime = field(default_factory=lambda: now_in_timezone("UTC"))
     last_triggered_at: datetime | None = None
+    last_scheduled_at: datetime | None = None
     source: str = "manual"
     tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        # AUDIT-FIX(#11): Enforce a structurally valid automation object up front instead of letting broken
-        # trigger/action values fail later during persistence or execution.
         clean_automation_id = _normalize_text(self.automation_id, limit=64)
         clean_name = _normalize_text(self.name, limit=120)
         actions = tuple(self.actions or ())
@@ -574,19 +546,17 @@ class AutomationDefinition:
         object.__setattr__(self, "trigger", self.trigger)
         object.__setattr__(self, "actions", actions)
         object.__setattr__(self, "description", _normalize_text(self.description, limit=220) or None)
-        # AUDIT-FIX(#8): Normalize enabled explicitly so persisted "false" does not reactivate automations.
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled, default=True))
-        # AUDIT-FIX(#6): Persist canonical UTC timestamps so mixed naive/aware values do not crash sorting.
         object.__setattr__(self, "created_at", _to_utc_datetime(self.created_at, timezone_name="UTC"))
         object.__setattr__(self, "updated_at", _to_utc_datetime(self.updated_at, timezone_name="UTC"))
         if self.last_triggered_at is not None:
             object.__setattr__(self, "last_triggered_at", _to_utc_datetime(self.last_triggered_at, timezone_name="UTC"))
+        if self.last_scheduled_at is not None:
+            object.__setattr__(self, "last_scheduled_at", _to_utc_datetime(self.last_scheduled_at, timezone_name="UTC"))
         object.__setattr__(self, "source", clean_source)
         object.__setattr__(self, "tags", clean_tags)
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the automation definition into the persisted JSON shape."""
-
         return {
             "automation_id": self.automation_id,
             "name": self.name,
@@ -597,13 +567,36 @@ class AutomationDefinition:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "last_triggered_at": self.last_triggered_at.isoformat() if self.last_triggered_at else None,
+            "last_scheduled_at": self.last_scheduled_at.isoformat() if self.last_scheduled_at else None,
             "source": self.source,
             "tags": list(self.tags),
         }
 
 
+@dataclass(frozen=True, slots=True)
+class TimeAutomationMatch:
+    entry: AutomationDefinition
+    scheduled_for_at: datetime
+    pending_run_count: int = 1
+
+
 class AutomationEngine:
     """Evaluate automation triggers without owning persistence."""
+
+    def due_time_matches(
+        self,
+        entries: tuple[AutomationDefinition, ...] | list[AutomationDefinition],
+        *,
+        now: datetime | None = None,
+    ) -> tuple[TimeAutomationMatch, ...]:
+        current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
+        matches: list[TimeAutomationMatch] = []
+        for entry in entries:
+            if not entry.enabled or not isinstance(entry.trigger, TimeAutomationTrigger):
+                continue
+            matches.extend(self._time_trigger_matches(entry, now=current_time))
+        matches.sort(key=lambda match: (match.scheduled_for_at, match.entry.name.lower(), match.entry.automation_id))
+        return tuple(matches)
 
     def due_time_automations(
         self,
@@ -611,15 +604,14 @@ class AutomationEngine:
         *,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
-        """Return enabled scheduled automations that are due at ``now``."""
-
-        current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
+        matches = self.due_time_matches(entries, now=now)
+        seen: set[str] = set()
         due: list[AutomationDefinition] = []
-        for entry in entries:
-            if not entry.enabled or not isinstance(entry.trigger, TimeAutomationTrigger):
+        for match in matches:
+            if match.entry.automation_id in seen:
                 continue
-            if self._time_trigger_due(entry, now=current_time):
-                due.append(entry)
+            seen.add(match.entry.automation_id)
+            due.append(match.entry)
         return tuple(due)
 
     def matching_if_then_automations(
@@ -630,8 +622,6 @@ class AutomationEngine:
         event_name: str | None = None,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
-        """Return enabled if/then automations that match the current facts."""
-
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         matches: list[AutomationDefinition] = []
         for entry in entries:
@@ -647,11 +637,12 @@ class AutomationEngine:
         *,
         now: datetime | None = None,
     ) -> datetime | None:
-        """Return the next scheduled run time for a time-based automation."""
-
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         if isinstance(entry.trigger, TimeAutomationTrigger):
-            return self._next_time_run(entry.trigger, last_triggered_at=entry.last_triggered_at, now=current_time)
+            matches = self._time_trigger_matches(entry, now=current_time)
+            if matches:
+                return matches[0].scheduled_for_at
+            return self._next_future_time_run(entry, now=current_time)
         return None
 
     def tool_record(
@@ -660,19 +651,30 @@ class AutomationEngine:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Build a tooling-friendly record for inspection and UI rendering."""
-
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         next_run = self.next_run_at(entry, now=current_time)
+        pending_times: tuple[datetime, ...] = ()
+        time_matches: tuple[TimeAutomationMatch, ...] = ()
         due_now = False
         if isinstance(entry.trigger, TimeAutomationTrigger):
-            due_now = self._time_trigger_due(entry, now=current_time)
+            pending_times = self._pending_time_occurrences(entry, now=current_time)
+            time_matches = self._time_trigger_matches(entry, now=current_time)
+            due_now = bool(pending_times)
         record = {
             **entry.to_payload(),
             "trigger_kind": entry.trigger.kind,
             "due_now": due_now,
             "next_run_at": next_run.isoformat() if next_run is not None else None,
         }
+        if isinstance(entry.trigger, TimeAutomationTrigger):
+            record.update(
+                {
+                    "pending_run_count": len(pending_times),
+                    "scheduled_for_at": time_matches[0].scheduled_for_at.isoformat() if time_matches else None,
+                    "misfire_grace_seconds": entry.trigger.misfire_grace_seconds,
+                    "coalesce_policy": entry.trigger.coalesce_policy,
+                }
+            )
         if isinstance(entry.trigger, IfThenAutomationTrigger):
             sensor_trigger = _safe_describe_sensor_trigger(entry.trigger)
             record.update(
@@ -693,78 +695,98 @@ class AutomationEngine:
                 )
         return record
 
-    def _time_trigger_due(self, entry: AutomationDefinition, *, now: datetime) -> bool:
+    def _effective_schedule_anchor(self, entry: AutomationDefinition, *, zone_name: str) -> datetime | None:
+        source = entry.last_scheduled_at or entry.last_triggered_at
+        if source is None:
+            return None
+        return _ensure_aware_datetime(source, timezone_name=zone_name)
+
+    def _occurrence_within_misfire_grace(self, trigger: TimeAutomationTrigger, occurrence_at: datetime, *, now: datetime) -> bool:
+        grace = trigger.misfire_grace_seconds
+        if grace is None:
+            return True
+        return occurrence_at + timedelta(seconds=grace) >= now
+
+    def _pending_time_occurrences(self, entry: AutomationDefinition, *, now: datetime) -> tuple[datetime, ...]:
         trigger = entry.trigger
         if not isinstance(trigger, TimeAutomationTrigger):
-            return False
+            return ()
         zone = resolve_timezone(trigger.timezone_name)
         local_now = _ensure_aware_datetime(now, timezone_name=trigger.timezone_name).astimezone(zone)
-        last_triggered_at = (
-            _ensure_aware_datetime(entry.last_triggered_at, timezone_name=trigger.timezone_name).astimezone(zone)
-            if entry.last_triggered_at
-            else None
-        )
+        acknowledged_at = self._effective_schedule_anchor(entry, zone_name=trigger.timezone_name)
+        created_at = entry.created_at.astimezone(zone)
         if trigger.schedule == "once":
-            if last_triggered_at is not None:
-                return False
+            if acknowledged_at is not None:
+                return ()
             due_at = _parse_due_at_absolute(trigger.due_at, timezone_name=trigger.timezone_name)
-            return due_at <= local_now
-        run_time = _parse_time_of_day(str(trigger.time_of_day or "00:00"))
-        scheduled_at = _resolve_local_schedule_datetime(local_now.date(), run_time, zone=zone)
-        if trigger.schedule == "daily":
-            if scheduled_at > local_now:
-                return False
-            if last_triggered_at is not None and last_triggered_at >= scheduled_at:
-                return False
-            return True
-        if local_now.weekday() not in trigger.weekdays:
-            return False
-        if scheduled_at > local_now:
-            return False
-        if last_triggered_at is not None and last_triggered_at >= scheduled_at:
-            return False
-        return True
+            if due_at > local_now:
+                return ()
+            if not self._occurrence_within_misfire_grace(trigger, due_at, now=local_now):
+                return ()
+            return (due_at,)
 
-    def _next_time_run(
-        self,
-        trigger: TimeAutomationTrigger,
-        *,
-        last_triggered_at: datetime | None,
-        now: datetime,
-    ) -> datetime | None:
+        run_time = _parse_time_of_day(str(trigger.time_of_day or "00:00"))
+        anchor = acknowledged_at.astimezone(zone) if acknowledged_at is not None else None
+        start_date = anchor.date() if anchor is not None else created_at.date()
+        end_date = local_now.date()
+        pending: list[datetime] = []
+        days = max((end_date - start_date).days, 0)
+        if days > _MAX_PENDING_OCCURRENCES:
+            start_date = end_date - timedelta(days=_MAX_PENDING_OCCURRENCES)
+        current_date = start_date
+        while current_date <= end_date:
+            if trigger.schedule == "weekly" and current_date.weekday() not in trigger.weekdays:
+                current_date += timedelta(days=1)
+                continue
+            scheduled_at = _resolve_local_schedule_datetime(current_date, run_time, zone=zone)
+            if anchor is not None and scheduled_at <= anchor:
+                current_date += timedelta(days=1)
+                continue
+            if scheduled_at > local_now:
+                break
+            if self._occurrence_within_misfire_grace(trigger, scheduled_at, now=local_now):
+                pending.append(scheduled_at)
+            current_date += timedelta(days=1)
+        return tuple(pending)
+
+    def _time_trigger_matches(self, entry: AutomationDefinition, *, now: datetime) -> tuple[TimeAutomationMatch, ...]:
+        trigger = entry.trigger
+        if not isinstance(trigger, TimeAutomationTrigger):
+            return ()
+        pending = self._pending_time_occurrences(entry, now=now)
+        if not pending:
+            return ()
+        if trigger.coalesce_policy == "all":
+            return tuple(TimeAutomationMatch(entry=entry, scheduled_for_at=scheduled_for, pending_run_count=1) for scheduled_for in pending)
+        if trigger.coalesce_policy == "earliest":
+            return (TimeAutomationMatch(entry=entry, scheduled_for_at=pending[0], pending_run_count=len(pending)),)
+        return (TimeAutomationMatch(entry=entry, scheduled_for_at=pending[-1], pending_run_count=len(pending)),)
+
+    def _next_future_time_run(self, entry: AutomationDefinition, *, now: datetime) -> datetime | None:
+        trigger = entry.trigger
+        if not isinstance(trigger, TimeAutomationTrigger):
+            return None
         zone = resolve_timezone(trigger.timezone_name)
         local_now = _ensure_aware_datetime(now, timezone_name=trigger.timezone_name).astimezone(zone)
-        local_last = (
-            _ensure_aware_datetime(last_triggered_at, timezone_name=trigger.timezone_name).astimezone(zone)
-            if last_triggered_at is not None
-            else None
-        )
+        acknowledged_at = self._effective_schedule_anchor(entry, zone_name=trigger.timezone_name)
+        anchor = acknowledged_at.astimezone(zone) if acknowledged_at is not None else entry.created_at.astimezone(zone)
         if trigger.schedule == "once":
             due_at = _parse_due_at_absolute(trigger.due_at, timezone_name=trigger.timezone_name)
-            if local_last is not None:
+            if acknowledged_at is not None:
+                return None
+            if due_at <= local_now and not self._occurrence_within_misfire_grace(trigger, due_at, now=local_now):
                 return None
             return due_at
+
         run_time = _parse_time_of_day(str(trigger.time_of_day or "00:00"))
-        today_at = _resolve_local_schedule_datetime(local_now.date(), run_time, zone=zone)
-        if trigger.schedule == "daily":
-            if today_at > local_now:
-                return today_at
-            if local_last is None or local_last < today_at:
-                return today_at
-            next_date = local_now.date() + timedelta(days=1)
-            return _resolve_local_schedule_datetime(next_date, run_time, zone=zone)
-        for offset in range(0, 8):
+        for offset in range(0, 370):
             candidate_date = local_now.date() + timedelta(days=offset)
-            if candidate_date.weekday() not in trigger.weekdays:
+            if trigger.schedule == "weekly" and candidate_date.weekday() not in trigger.weekdays:
                 continue
             candidate_at = _resolve_local_schedule_datetime(candidate_date, run_time, zone=zone)
-            if offset == 0:
-                if candidate_at > local_now:
-                    return candidate_at
-                if local_last is None or local_last < candidate_at:
-                    return candidate_at
+            if candidate_at <= local_now:
                 continue
-            if local_last is not None and candidate_at <= local_last:
+            if candidate_at <= anchor:
                 continue
             return candidate_at
         return None
@@ -796,11 +818,7 @@ class AutomationEngine:
 
 
 class AutomationStore:
-    """Persist and query Twinr automations in a bounded JSON file.
-
-    The store keeps one lock per path, writes updates atomically, and maintains
-    a backup file so runtime-facing automation state survives interrupted writes.
-    """
+    """Persist and query Twinr automations in a bounded JSON file."""
 
     _LOCKS: ClassVar[dict[str, RLock]] = {}
     _LOCKS_GUARD: ClassVar[RLock] = RLock()
@@ -812,16 +830,18 @@ class AutomationStore:
         timezone_name: str | None = None,
         max_entries: int = 96,
         engine: AutomationEngine | None = None,
+        max_store_bytes: int = _DEFAULT_MAX_STORE_BYTES,
     ) -> None:
-        # AUDIT-FIX(#1): Normalize the store path once so every read/write goes through the same hardened path.
         self.path = _normalize_store_path(path)
         self.backup_path = self.path.with_name(f"{self.path.name}.bak")
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         self.timezone_name = _canonical_timezone_name(timezone_name, fallback="Europe/Berlin")
         self.max_entries = max(8, _coerce_int(max_entries, default=96))
+        self.max_store_bytes = max(64 * 1024, _coerce_int(max_store_bytes, default=_DEFAULT_MAX_STORE_BYTES))
         self.engine = engine or AutomationEngine()
-        # AUDIT-FIX(#3): Share one reentrant lock per store path to prevent same-process read/modify/write races.
         self._lock = self._lock_for_path(self.path)
         self._cached_entries: tuple[AutomationDefinition, ...] = ()
+        self._cached_signature: tuple[tuple[bool, int, int], tuple[bool, int, int]] | None = None
 
     @classmethod
     def _lock_for_path(cls, path: Path) -> RLock:
@@ -833,22 +853,42 @@ class AutomationStore:
                 cls._LOCKS[key] = lock
             return lock
 
-    def load_entries(self) -> tuple[AutomationDefinition, ...]:
-        """Load and cache all valid automation entries from disk."""
-
+    @contextmanager
+    def _guarded_store_access(self) -> Iterator[None]:
         with self._lock:
+            with self._interprocess_lock():
+                yield
+
+    @contextmanager
+    def _interprocess_lock(self) -> Iterator[None]:
+        self._assert_safe_store_path(self.lock_path)
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def load_entries(self) -> tuple[AutomationDefinition, ...]:
+        with self._guarded_store_access():
             entries = self._load_entries_unlocked()
             self._cached_entries = entries
             return entries
 
     def list_tool_records(self, *, now: datetime | None = None) -> tuple[dict[str, Any], ...]:
-        """Return all stored automations as tooling-oriented inspection records."""
-
         return tuple(self.engine.tool_record(entry, now=now) for entry in self.load_entries())
 
     def render_context(self, *, limit: int = 8, now: datetime | None = None) -> str | None:
-        """Render a short natural-language summary of enabled automations."""
-
         current_time = _ensure_aware_datetime(now or now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         enabled_entries = [entry for entry in self.load_entries() if entry.enabled]
         if not enabled_entries:
@@ -862,14 +902,10 @@ class AutomationStore:
         return "\n".join(lines).strip()
 
     def get(self, automation_id: str) -> AutomationDefinition | None:
-        """Return a stored automation by id, or ``None`` if it is missing."""
-
         lookup = _normalize_text(automation_id, limit=64)
-        with self._lock:
-            for entry in self._load_entries_unlocked():
-                if entry.automation_id == lookup:
-                    return entry
-        return None
+        with self._guarded_store_access():
+            entries = self._load_entries_unlocked()
+            return self._find_entry_unlocked(entries, lookup)
 
     def create_time_automation(
         self,
@@ -883,11 +919,11 @@ class AutomationStore:
         time_of_day: str | None = None,
         weekdays: tuple[int, ...] | list[int] = (),
         timezone_name: str | None = None,
+        misfire_grace_seconds: float | None = None,
+        coalesce_policy: CoalescePolicy = "latest",
         source: str = "manual",
         tags: tuple[str, ...] | list[str] = (),
     ) -> AutomationDefinition:
-        """Create, validate, persist, and return a scheduled automation."""
-
         now = _ensure_aware_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         trigger = TimeAutomationTrigger(
             schedule=schedule,
@@ -895,10 +931,10 @@ class AutomationStore:
             time_of_day=time_of_day,
             weekdays=tuple(weekdays),
             timezone_name=timezone_name or self.timezone_name,
+            misfire_grace_seconds=misfire_grace_seconds,
+            coalesce_policy=coalesce_policy,
         )
         entry = AutomationDefinition(
-            # AUDIT-FIX(#13): Generate IDs from UTC plus a random suffix so they are collision-resistant and
-            # do not advertise a fake trailing "Z" for non-UTC local timestamps.
             automation_id=f"AUTO-{now.astimezone(_UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}",
             name=name,
             description=description,
@@ -926,8 +962,6 @@ class AutomationStore:
         source: str = "manual",
         tags: tuple[str, ...] | list[str] = (),
     ) -> AutomationDefinition:
-        """Create, validate, persist, and return an if/then automation."""
-
         now = _ensure_aware_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         trigger = IfThenAutomationTrigger(
             event_name=event_name,
@@ -936,7 +970,6 @@ class AutomationStore:
             cooldown_seconds=cooldown_seconds,
         )
         entry = AutomationDefinition(
-            # AUDIT-FIX(#13): Use the same UTC + random-suffix ID generation for if/then automations.
             automation_id=f"AUTO-{now.astimezone(_UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}",
             name=name,
             description=description,
@@ -951,9 +984,7 @@ class AutomationStore:
         return self.upsert(entry)
 
     def upsert(self, entry: AutomationDefinition) -> AutomationDefinition:
-        """Insert or replace one automation entry and persist the change."""
-
-        with self._lock:
+        with self._guarded_store_access():
             entries = list(self._load_entries_unlocked())
             normalized = replace(
                 entry,
@@ -965,7 +996,6 @@ class AutomationStore:
                 entries[index] = normalized
                 self._write_entries_unlocked(tuple(entries))
                 return normalized
-            # AUDIT-FIX(#2): Refuse to exceed the capacity instead of silently deleting arbitrary automations.
             if len(entries) >= self.max_entries:
                 raise ValueError(f"Automation store is full ({self.max_entries} entries)")
             entries.append(normalized)
@@ -984,10 +1014,10 @@ class AutomationStore:
         source: str | None = None,
         tags: tuple[str, ...] | list[str] | None = None,
     ) -> AutomationDefinition:
-        """Update selected fields on an existing automation and persist them."""
-
-        with self._lock:
-            existing = self.get(automation_id)
+        lookup = _normalize_text(automation_id, limit=64)
+        with self._guarded_store_access():
+            entries = list(self._load_entries_unlocked())
+            existing = self._find_entry_unlocked(tuple(entries), lookup)
             if existing is None:
                 raise KeyError(f"Unknown automation_id: {automation_id}")
             updated = replace(
@@ -1001,14 +1031,17 @@ class AutomationStore:
                 tags=tuple(tags) if tags is not None else existing.tags,
                 updated_at=_to_utc_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name),
             )
-            return self.upsert(updated)
+            for index, current in enumerate(entries):
+                if current.automation_id == lookup:
+                    entries[index] = updated
+                    self._write_entries_unlocked(tuple(entries))
+                    return updated
+        raise KeyError(f"Unknown automation_id: {automation_id}")
 
     def delete(self, automation_id: str) -> AutomationDefinition:
-        """Delete and return a stored automation by id."""
-
-        with self._lock:
+        lookup = _normalize_text(automation_id, limit=64)
+        with self._guarded_store_access():
             entries = list(self._load_entries_unlocked())
-            lookup = _normalize_text(automation_id, limit=64)
             for index, entry in enumerate(entries):
                 if entry.automation_id != lookup:
                     continue
@@ -1017,29 +1050,44 @@ class AutomationStore:
                 return removed
         raise KeyError(f"Unknown automation_id: {automation_id}")
 
-    def mark_triggered(self, automation_id: str, *, triggered_at: datetime | None = None) -> AutomationDefinition:
-        """Record that an automation fired and persist the trigger timestamp."""
-
-        with self._lock:
-            existing = self.get(automation_id)
+    def mark_triggered(
+        self,
+        automation_id: str,
+        *,
+        triggered_at: datetime | None = None,
+        scheduled_for_at: datetime | None = None,
+    ) -> AutomationDefinition:
+        lookup = _normalize_text(automation_id, limit=64)
+        with self._guarded_store_access():
+            entries = list(self._load_entries_unlocked())
+            existing = self._find_entry_unlocked(tuple(entries), lookup)
             if existing is None:
                 raise KeyError(f"Unknown automation_id: {automation_id}")
-            # AUDIT-FIX(#13): Capture the timestamp once so last_triggered_at and updated_at remain identical.
             effective_triggered_at = _to_utc_datetime(
                 triggered_at or now_in_timezone(self.timezone_name),
                 timezone_name=self.timezone_name,
             )
-            return self.upsert(
-                replace(
-                    existing,
-                    last_triggered_at=effective_triggered_at,
-                    updated_at=effective_triggered_at,
-                )
+            effective_scheduled_for_at = _to_utc_datetime(
+                scheduled_for_at or effective_triggered_at,
+                timezone_name=self.timezone_name,
             )
+            updated = replace(
+                existing,
+                last_triggered_at=effective_triggered_at,
+                last_scheduled_at=effective_scheduled_for_at,
+                updated_at=effective_triggered_at,
+            )
+            for index, current in enumerate(entries):
+                if current.automation_id == lookup:
+                    entries[index] = updated
+                    self._write_entries_unlocked(tuple(entries))
+                    return updated
+        raise KeyError(f"Unknown automation_id: {automation_id}")
+
+    def due_time_matches(self, *, now: datetime | None = None) -> tuple[TimeAutomationMatch, ...]:
+        return self.engine.due_time_matches(self.load_entries(), now=now)
 
     def due_time_automations(self, *, now: datetime | None = None) -> tuple[AutomationDefinition, ...]:
-        """Return stored scheduled automations that are due at ``now``."""
-
         return self.engine.due_time_automations(self.load_entries(), now=now)
 
     def matching_if_then_automations(
@@ -1049,20 +1097,22 @@ class AutomationStore:
         event_name: str | None = None,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
-        """Return stored if/then automations matching the current facts."""
-
-        return self.engine.matching_if_then_automations(
-            self.load_entries(),
-            facts=facts,
-            event_name=event_name,
-            now=now,
-        )
+        return self.engine.matching_if_then_automations(self.load_entries(), facts=facts, event_name=event_name, now=now)
 
     def _sorted_entries(self, entries: tuple[AutomationDefinition, ...] | list[AutomationDefinition]) -> tuple[AutomationDefinition, ...]:
         return tuple(sorted(entries, key=lambda entry: (entry.name.lower(), entry.created_at, entry.automation_id)))
 
+    def _find_entry_unlocked(
+        self,
+        entries: tuple[AutomationDefinition, ...] | list[AutomationDefinition],
+        automation_id: str,
+    ) -> AutomationDefinition | None:
+        for entry in entries:
+            if entry.automation_id == automation_id:
+                return entry
+        return None
+
     def _assert_safe_store_path(self, path: Path) -> None:
-        # AUDIT-FIX(#1): Refuse symlinked store paths/parents to block accidental clobbering of arbitrary files.
         normalized_path = _normalize_store_path(path)
         if normalized_path.name in {"", ".", ".."}:
             raise ValueError("Automation store path must point to a file")
@@ -1082,29 +1132,47 @@ class AutomationStore:
         finally:
             os.close(dir_fd)
 
+    def _decode_json_payload(self, raw: bytes) -> dict[str, Any] | None:
+        try:
+            if msgspec is not None:
+                payload = msgspec.json.decode(raw)
+            else:
+                payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _read_payload_file(self, path: Path) -> dict[str, Any] | None:
         if not path.exists():
             return None
         try:
             self._assert_safe_store_path(path)
-            raw = path.read_text(encoding="utf-8")
-            payload = json.loads(raw)
-        except (OSError, ValueError, json.JSONDecodeError):
+            stat = path.stat()
+            if stat.st_size > self.max_store_bytes:
+                return None
+            raw = path.read_bytes()
+        except OSError:
             return None
-        return payload if isinstance(payload, dict) else None
+        return self._decode_json_payload(raw)
+
+    def _store_signature(self) -> tuple[tuple[bool, int, int], tuple[bool, int, int]]:
+        return (_path_signature(self.path), _path_signature(self.backup_path))
 
     def _load_entries_unlocked(self) -> tuple[AutomationDefinition, ...]:
-        if not self.path.exists():
-            return ()
-        payload = self._read_payload_file(self.path)
+        signature = self._store_signature()
+        if self._cached_signature == signature:
+            return self._cached_entries
+        payload: dict[str, Any] | None = None
+        if self.path.exists():
+            payload = self._read_payload_file(self.path)
         if payload is None:
-            # AUDIT-FIX(#1): Recover from a broken primary file using the last good backup instead of
-            # pretending the store is empty and erasing reminders on the next write.
             payload = self._read_payload_file(self.backup_path)
         if payload is None:
+            self._cached_signature = signature
             return self._cached_entries
         items = payload.get("entries", [])
         if not isinstance(items, list):
+            self._cached_signature = signature
             return self._cached_entries
         entries: list[AutomationDefinition] = []
         for item in items:
@@ -1113,18 +1181,28 @@ class AutomationStore:
             entry = self._entry_from_payload(item)
             if entry is not None:
                 entries.append(entry)
-        return self._sorted_entries(entries)
+        normalized = self._sorted_entries(entries)
+        self._cached_entries = normalized
+        self._cached_signature = signature
+        return normalized
 
     def _atomic_write_json_file(self, path: Path, payload: dict[str, Any]) -> None:
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        encoded = serialized.encode("utf-8")
+        if len(encoded) > self.max_store_bytes:
+            raise ValueError(f"Automation payload exceeds {self.max_store_bytes} bytes")
         parent = path.parent
         self._assert_safe_store_path(path)
-        parent.mkdir(parents=True, exist_ok=True)
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(parent))
         temporary_path = Path(temporary_name)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(serialized)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, path)
@@ -1140,16 +1218,17 @@ class AutomationStore:
     def _write_entries_unlocked(self, entries: tuple[AutomationDefinition, ...]) -> None:
         normalized_entries = self._sorted_entries(entries)
         payload = {
+            "schema_version": _PAYLOAD_SCHEMA_VERSION,
             "updated_at": _to_utc_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name).isoformat(),
             "entries": [entry.to_payload() for entry in normalized_entries],
         }
-        # AUDIT-FIX(#1): Use atomic replace + fsync + backup write to survive power loss/interrupted writes.
         self._atomic_write_json_file(self.path, payload)
         try:
             self._atomic_write_json_file(self.backup_path, payload)
         except (OSError, ValueError):
             pass
         self._cached_entries = normalized_entries
+        self._cached_signature = self._store_signature()
 
     def _entry_from_payload(self, payload: dict[str, Any]) -> AutomationDefinition | None:
         automation_id = _normalize_text(payload.get("automation_id"), limit=64)
@@ -1167,6 +1246,7 @@ class AutomationStore:
             return None
         if not isinstance(tags_payload, (list, tuple)):
             tags_payload = ()
+        now_utc = _to_utc_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         return AutomationDefinition(
             automation_id=automation_id,
             name=name,
@@ -1174,11 +1254,10 @@ class AutomationStore:
             enabled=_coerce_bool(payload.get("enabled", True), default=True),
             trigger=trigger,
             actions=actions,
-            created_at=_parse_iso_timestamp(payload.get("created_at"), timezone_name=self.timezone_name)
-            or _to_utc_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name),
-            updated_at=_parse_iso_timestamp(payload.get("updated_at"), timezone_name=self.timezone_name)
-            or _to_utc_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name),
+            created_at=_parse_iso_timestamp(payload.get("created_at"), timezone_name=self.timezone_name) or now_utc,
+            updated_at=_parse_iso_timestamp(payload.get("updated_at"), timezone_name=self.timezone_name) or now_utc,
             last_triggered_at=_parse_iso_timestamp(payload.get("last_triggered_at"), timezone_name=self.timezone_name),
+            last_scheduled_at=_parse_iso_timestamp(payload.get("last_scheduled_at"), timezone_name=self.timezone_name),
             source=_slugify(payload.get("source"), fallback="manual"),
             tags=tuple(str(item).strip() for item in tags_payload if str(item).strip()),
         )
@@ -1196,6 +1275,8 @@ class AutomationStore:
                     time_of_day=payload.get("time_of_day"),
                     weekdays=tuple(int(item) for item in weekdays_payload if str(item).strip()),
                     timezone_name=payload.get("timezone_name") or self.timezone_name,
+                    misfire_grace_seconds=payload.get("misfire_grace_seconds"),
+                    coalesce_policy=payload.get("coalesce_policy", "latest"),
                 )
             except (TypeError, ValueError):
                 return None
@@ -1204,16 +1285,8 @@ class AutomationStore:
             any_conditions_payload = payload.get("any_conditions", [])
             if not isinstance(all_conditions_payload, (list, tuple)) or not isinstance(any_conditions_payload, (list, tuple)):
                 return None
-            all_conditions = tuple(
-                condition
-                for condition in (self._condition_from_payload(item) for item in all_conditions_payload)
-                if condition is not None
-            )
-            any_conditions = tuple(
-                condition
-                for condition in (self._condition_from_payload(item) for item in any_conditions_payload)
-                if condition is not None
-            )
+            all_conditions = tuple(condition for condition in (self._condition_from_payload(item) for item in all_conditions_payload) if condition is not None)
+            any_conditions = tuple(condition for condition in (self._condition_from_payload(item) for item in any_conditions_payload) if condition is not None)
             try:
                 return IfThenAutomationTrigger(
                     event_name=payload.get("event_name"),
@@ -1229,11 +1302,7 @@ class AutomationStore:
         if not isinstance(payload, dict):
             return None
         try:
-            return AutomationCondition(
-                key=str(payload.get("key", "")),
-                operator=str(payload.get("operator", "eq")),
-                value=payload.get("value"),
-            )
+            return AutomationCondition(key=str(payload.get("key", "")), operator=str(payload.get("operator", "eq")), value=payload.get("value"))
         except (TypeError, ValueError):
             return None
 
@@ -1262,6 +1331,9 @@ class AutomationStore:
             due_at = _parse_due_at_absolute(trigger.due_at, timezone_name=trigger.timezone_name)
             return f"once at {due_at.isoformat()}"
         if trigger.schedule == "daily":
+            next_run = self.engine.next_run_at(entry, now=now)
+            if next_run is not None:
+                return f"every day at {trigger.time_of_day}; next {next_run.isoformat()}"
             return f"every day at {trigger.time_of_day}"
         weekday_names = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
         weekdays = ", ".join(weekday_names[index] for index in trigger.weekdays)

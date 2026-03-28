@@ -5,8 +5,39 @@
 <section class="panel">
   <div class="section-header">
     <div>
+      <h2>Start here</h2>
+      <p class="section-description">Choose the kind of routine you want to work on first, then review the saved rules below. Editors and stored rules stay separated so the page is easier to scan.</p>
+    </div>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="#time-editor">
+      <div class="card-title">Scheduled routines</div>
+      <div class="card-value">{{ family_cards[0].count if family_cards else automation_entries_total }}</div>
+      <div class="card-detail">Daily or one-off jobs such as morning weather, printed headlines, or other time-based routines.</div>
+    </a>
+    <a class="card" href="#sensor-editor">
+      <div class="card-title">Sensor responses</div>
+      <div class="card-value">{{ family_cards[1].count if family_cards|length > 1 else 0 }}</div>
+      <div class="card-detail">Idle-time reactions based on motion, quiet periods, visibility, or nearby-object signals.</div>
+    </a>
+    <a class="card" href="#saved-rules">
+      <div class="card-title">Saved rules</div>
+      <div class="card-value">{{ automation_entries_total }}</div>
+      <div class="card-detail">Review, pause, edit, or delete the current local automation rules.</div>
+    </a>
+    <article class="card">
+      <div class="card-title">Available trigger types</div>
+      <div class="card-value">{{ supported_sensor_labels|length }}</div>
+      <div class="card-detail">Current sensor trigger options: {{ supported_sensor_labels|join(", ") }}.</div>
+    </article>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
       <h2>Automation families</h2>
-      <p class="section-description">Keep automation rules explicit and bounded. The page is grouped by family so future integrations can add their own blocks without changing the overall operator flow.</p>
+      <p class="section-description">Twinr keeps routines grouped by family so future integrations can add their own bounded automation blocks without changing the overall operator flow.</p>
     </div>
   </div>
   <div class="card-grid">
@@ -26,171 +57,222 @@
   </div>
 </section>
 
-<section class="panel two-column">
-  <div>
-    <h2>Storage</h2>
-    <ul class="plain-list">
-      <li><strong>Automation store</strong> {{ automation_store_path }}</li>
-      <li><strong>Total rules</strong> {{ automation_entries_total }}</li>
-    </ul>
-  </div>
-  <div>
-    <h2>Sensor triggers today</h2>
-    <ul class="plain-list">
-      {% for label in supported_sensor_labels %}
-      <li>{{ label }}</li>
-      {% endfor %}
-    </ul>
-  </div>
-</section>
-
-{% for family in family_sections %}
-<section class="panel">
+<section class="panel" id="saved-rules">
   <div class="section-header">
     <div>
-      <h2>{{ family.definition.title }}</h2>
-      <p class="section-description">{{ family.definition.detail }}</p>
+      <h2>Saved rules by family</h2>
+      <p class="section-description">Open the relevant family only when you need to review or change existing rules.</p>
     </div>
-    <span class="status-pill is-{{ family.definition.status_key or ('ok' if family.rows else 'muted') }}">
-      {{ family.definition.status_label or (family.rows|length ~ " stored") }}
-    </span>
+    <span class="status-pill is-muted">{{ automation_entries_total }} stored</span>
   </div>
-  {% if family.rows %}
-  <div class="automation-list">
-    {% for entry in family.rows %}
-    <article class="memory-turn automation-entry">
-      <div class="memory-turn-meta">
-        <div class="page-notes">
-          <span class="role-badge role-system">{{ entry.family_title }}</span>
-          <span class="status-pill is-{{ entry.status_key }}">{{ entry.status_label }}</span>
-          <span class="memory-time">{{ entry.automation_id }}</span>
-        </div>
-        <div class="memory-turn-actions">
-          {% if entry.family_key == "time" %}
-          <a class="button-secondary button-link" href="/automations?edit={{ entry.automation_id }}#time-form">Edit</a>
-          {% elif entry.family_key == "sensor" %}
-          <a class="button-secondary button-link" href="/automations?edit={{ entry.automation_id }}#sensor-form">Edit</a>
-          {% endif %}
-          <form method="post" action="/automations">
-            <input type="hidden" name="_action" value="toggle_automation">
-            <input type="hidden" name="automation_id" value="{{ entry.automation_id }}">
-            <button type="submit" class="button-secondary">{{ "Disable" if entry.enabled else "Enable" }}</button>
-          </form>
-          <form method="post" action="/automations">
-            <input type="hidden" name="_action" value="delete_automation">
-            <input type="hidden" name="automation_id" value="{{ entry.automation_id }}">
-            <button type="submit" class="button-secondary">Delete</button>
-          </form>
-        </div>
-      </div>
-      <div class="automation-entry-grid">
+  {% for family in family_sections %}
+  <details class="panel-disclosure automation-family-disclosure"{% if loop.first %} open{% endif %}>
+    <summary class="panel-disclosure-summary">
+      <div class="section-header">
         <div>
-          <div class="check-row-title">{{ entry.name }}</div>
-          {% if entry.description %}
-          <div class="check-row-detail">{{ entry.description }}</div>
-          {% endif %}
+          <span class="panel-disclosure-title">{{ family.definition.title }}</span>
+          <span class="panel-disclosure-copy">{{ family.definition.detail }}</span>
         </div>
-        <div class="automation-entry-detail">
-          <strong>Trigger</strong><br>{{ entry.trigger_summary }}
-        </div>
-        <div class="automation-entry-detail">
-          <strong>Action</strong><br>{{ entry.action_summary }}
-        </div>
-        <div class="automation-entry-detail">
-          <strong>Next run</strong><br>{{ entry.next_run_label or "Only on matching events" }}
-        </div>
-        <div class="automation-entry-detail">
-          <strong>Last triggered</strong><br>{{ entry.last_triggered_label or "Not yet" }}
-        </div>
-        <div class="automation-entry-detail">
-          <strong>Source</strong><br>{{ entry.source }}
-        </div>
-        <div class="automation-entry-detail">
-          <strong>Tags</strong><br>{{ entry.tags|join(", ") if entry.tags else "—" }}
-        </div>
+        <span class="status-pill is-{{ family.definition.status_key or ('ok' if family.rows else 'muted') }}">
+          {{ family.definition.status_label or (family.rows|length ~ " stored") }}
+        </span>
       </div>
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}
-  <div class="empty-state">
-    {{ family.definition.reserved_note or ("No " ~ family.definition.title.lower() ~ " automations are stored yet.") }}
-  </div>
-  {% endif %}
+    </summary>
+    <div class="panel-disclosure-body">
+      {% if family.rows %}
+      <div class="automation-list">
+        {% for entry in family.rows %}
+        <article class="memory-turn automation-entry">
+          <div class="memory-turn-meta">
+            <div class="page-notes">
+              <span class="role-badge role-system">{{ entry.family_title }}</span>
+              <span class="status-pill is-{{ entry.status_key }}">{{ entry.status_label }}</span>
+              <span class="memory-time">{{ entry.automation_id }}</span>
+            </div>
+            <div class="memory-turn-actions">
+              {% if entry.family_key == "time" %}
+              <a class="button-secondary button-link" href="/automations?edit={{ entry.automation_id }}#time-editor">Edit</a>
+              {% elif entry.family_key == "sensor" %}
+              <a class="button-secondary button-link" href="/automations?edit={{ entry.automation_id }}#sensor-editor">Edit</a>
+              {% endif %}
+              <form method="post" action="/automations">
+                <input type="hidden" name="_action" value="toggle_automation">
+                <input type="hidden" name="automation_id" value="{{ entry.automation_id }}">
+                <button type="submit" class="button-secondary">{{ "Disable" if entry.enabled else "Enable" }}</button>
+              </form>
+              <form method="post" action="/automations">
+                <input type="hidden" name="_action" value="delete_automation">
+                <input type="hidden" name="automation_id" value="{{ entry.automation_id }}">
+                <button type="submit" class="button-secondary">Delete</button>
+              </form>
+            </div>
+          </div>
+          <div class="automation-entry-grid">
+            <div>
+              <div class="check-row-title">{{ entry.name }}</div>
+              {% if entry.description %}
+              <div class="check-row-detail">{{ entry.description }}</div>
+              {% endif %}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Trigger</strong><br>{{ entry.trigger_summary }}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Action</strong><br>{{ entry.action_summary }}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Next run</strong><br>{{ entry.next_run_label or "Only on matching events" }}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Last triggered</strong><br>{{ entry.last_triggered_label or "Not yet" }}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Source</strong><br>{{ entry.source }}
+            </div>
+            <div class="automation-entry-detail">
+              <strong>Tags</strong><br>{{ entry.tags|join(", ") if entry.tags else "—" }}
+            </div>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">
+        {{ family.definition.reserved_note or ("No " ~ family.definition.title.lower() ~ " automations are stored yet.") }}
+      </div>
+      {% endif %}
+    </div>
+  </details>
+  {% endfor %}
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Storage and trigger coverage</span>
+      <span class="panel-disclosure-copy">Only the on-device store path and the currently supported sensor trigger labels.</span>
+    </summary>
+    <div class="panel-disclosure-body two-column">
+      <div>
+        <h3>Storage</h3>
+        <ul class="plain-list">
+          <li><strong>Automation store</strong> {{ automation_store_path }}</li>
+          <li><strong>Total rules</strong> {{ automation_entries_total }}</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Sensor triggers today</h3>
+        <ul class="plain-list">
+          {% for label in supported_sensor_labels %}
+          <li>{{ label }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </details>
 </section>
-{% endfor %}
 
-<form method="post" action="/automations" class="stack" id="time-form">
-  <input type="hidden" name="_action" value="save_time_automation">
-  <input type="hidden" name="automation_id" value="{{ editing_time_id }}">
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ time_form_title }}</h2>
-        <p class="section-description">Use this for daily weather briefings, morning news, printed headlines, or bounded one-off jobs.</p>
-      </div>
-      {% if time_form_mode == "edit" %}
-      <div class="memory-turn-actions">
+<section class="panel" id="time-editor">
+  <div class="section-header">
+    <div>
+      <h2>Scheduled automation editor</h2>
+      <p class="section-description">Use this when you want to add or change one time-based routine. The full editor stays collapsed until you need it.</p>
+    </div>
+  </div>
+  <details class="panel-disclosure"{% if time_form_mode == "edit" %} open{% endif %}>
+    <summary class="panel-disclosure-summary">
+      <div class="section-header">
+        <div>
+          <span class="panel-disclosure-title">{{ time_form_title }}</span>
+          <span class="panel-disclosure-copy">Daily weather briefings, morning news, printed headlines, or bounded one-off jobs.</span>
+        </div>
+        {% if time_form_mode == "edit" %}
         <span class="status-pill is-warn">Editing {{ editing_time_name }}</span>
-        <a class="button-secondary button-link" href="/automations#time-form">Clear</a>
+        {% else %}
+        <span class="status-pill is-ok">Ready to add</span>
+        {% endif %}
       </div>
-      {% endif %}
-    </div>
-    {% for section in time_form_sections %}
-    <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
-      <div class="section-header">
-        <div>
-          <h3>{{ section.title }}</h3>
-          <p class="section-description">{{ section.description }}</p>
+    </summary>
+    <div class="panel-disclosure-body">
+      <form method="post" action="/automations" class="stack">
+        <input type="hidden" name="_action" value="save_time_automation">
+        <input type="hidden" name="automation_id" value="{{ editing_time_id }}">
+        {% if time_form_mode == "edit" %}
+        <div class="link-row">
+          <a class="button-secondary button-link" href="/automations#time-editor">Clear edit mode</a>
         </div>
-      </div>
-      <div class="form-grid">
-        {% for field in section.fields %}
-        {{ render_setting_field(field) }}
+        {% endif %}
+        {% for section in time_form_sections %}
+        <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
+          <div class="section-header">
+            <div>
+              <h3>{{ section.title }}</h3>
+              <p class="section-description">{{ section.description }}</p>
+            </div>
+          </div>
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
         {% endfor %}
-      </div>
+        <div class="actions">
+          <button type="submit">{{ "Save scheduled automation" if time_form_mode == "edit" else "Add scheduled automation" }}</button>
+        </div>
+      </form>
     </div>
-    {% endfor %}
-    <div class="actions">
-      <button type="submit">{{ "Save scheduled automation" if time_form_mode == "edit" else "Add scheduled automation" }}</button>
-    </div>
-  </section>
-</form>
+  </details>
+</section>
 
-<form method="post" action="/automations" class="stack top-gap" id="sensor-form">
-  <input type="hidden" name="_action" value="save_sensor_automation">
-  <input type="hidden" name="automation_id" value="{{ editing_sensor_id }}">
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ sensor_form_title }}</h2>
-        <p class="section-description">Use this for PIR motion, quiet periods, person visibility, or nearby-object triggers while Twinr is idle.</p>
-      </div>
-      {% if sensor_form_mode == "edit" %}
-      <div class="memory-turn-actions">
-        <span class="status-pill is-warn">Editing {{ editing_sensor_name }}</span>
-        <a class="button-secondary button-link" href="/automations#sensor-form">Clear</a>
-      </div>
-      {% endif %}
+<section class="panel" id="sensor-editor">
+  <div class="section-header">
+    <div>
+      <h2>Sensor automation editor</h2>
+      <p class="section-description">Use this when Twinr should react while idle. The detailed editor stays folded away until you need to work on a sensor rule.</p>
     </div>
-    {% for section in sensor_form_sections %}
-    <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
+  </div>
+  <details class="panel-disclosure"{% if sensor_form_mode == "edit" %} open{% endif %}>
+    <summary class="panel-disclosure-summary">
       <div class="section-header">
         <div>
-          <h3>{{ section.title }}</h3>
-          <p class="section-description">{{ section.description }}</p>
+          <span class="panel-disclosure-title">{{ sensor_form_title }}</span>
+          <span class="panel-disclosure-copy">PIR motion, quiet periods, person visibility, or nearby-object triggers while Twinr is idle.</span>
         </div>
+        {% if sensor_form_mode == "edit" %}
+        <span class="status-pill is-warn">Editing {{ editing_sensor_name }}</span>
+        {% else %}
+        <span class="status-pill is-ok">Ready to add</span>
+        {% endif %}
       </div>
-      <div class="form-grid">
-        {% for field in section.fields %}
-        {{ render_setting_field(field) }}
+    </summary>
+    <div class="panel-disclosure-body">
+      <form method="post" action="/automations" class="stack">
+        <input type="hidden" name="_action" value="save_sensor_automation">
+        <input type="hidden" name="automation_id" value="{{ editing_sensor_id }}">
+        {% if sensor_form_mode == "edit" %}
+        <div class="link-row">
+          <a class="button-secondary button-link" href="/automations#sensor-editor">Clear edit mode</a>
+        </div>
+        {% endif %}
+        {% for section in sensor_form_sections %}
+        <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
+          <div class="section-header">
+            <div>
+              <h3>{{ section.title }}</h3>
+              <p class="section-description">{{ section.description }}</p>
+            </div>
+          </div>
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
         {% endfor %}
-      </div>
+        <div class="actions">
+          <button type="submit">{{ "Save sensor automation" if sensor_form_mode == "edit" else "Add sensor automation" }}</button>
+        </div>
+      </form>
     </div>
-    {% endfor %}
-    <div class="actions">
-      <button type="submit">{{ "Save sensor automation" if sensor_form_mode == "edit" else "Add sensor automation" }}</button>
-    </div>
-  </section>
-</form>
+  </details>
+</section>
 {% endblock %}

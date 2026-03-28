@@ -48,6 +48,7 @@ class FakeTurnToolAgentProvider:
         )
         return ToolCallingTurnResponse(
             text="",
+            continuation_token="turn-controller-test-token",
             tool_calls=(
                 AgentToolCall(
                     name="submit_turn_decision",

@@ -33,6 +33,7 @@ class _FakeAdapter:
         self._last_gesture_debug = {"resolved_source": "builtin"}
         self.attention_calls = 0
         self.gesture_calls = 0
+        self.last_gesture_kwargs = None
         self.bundle_calls = 0
 
     def observe(self):
@@ -55,8 +56,9 @@ class _FakeAdapter:
             primary_person_zone="center",
         )
 
-    def observe_gesture(self):
+    def observe_gesture(self, **kwargs):
         self.gesture_calls += 1
+        self.last_gesture_kwargs = dict(kwargs)
         return AICameraObservation(
             observed_at=12.0,
             camera_online=True,
@@ -286,6 +288,7 @@ class PeerAICameraObservationProxyTests(unittest.TestCase):
         self.assertEqual(adapter.gesture_calls, 1)
         self.assertEqual(cached_payload["observation"]["fine_hand_gesture"], "peace_sign")
         self.assertEqual(cached_payload["cache_state"], "busy_reused")
+        self.assertEqual(adapter.last_gesture_kwargs, {"gesture_fast_path": True})
 
     def test_frame_bundle_reuses_cached_payload_while_busy(self) -> None:
         adapter = _FakeAdapter()

@@ -128,7 +128,9 @@ files:
   - path: hdmi_ambient_moments.py
     role: Resolve deterministic rare idle-only HDMI ambient moments and their temporary face cues
   - path: hdmi_default_scene.py
-    role: Compose the modular senior-facing HDMI default scene, including layout, face animation, header state, and the reserved right-hand capability area
+    role: Stable public wrapper for the default HDMI scene import surface
+  - path: hdmi_default_scene_impl/
+    role: Compose the modular senior-facing HDMI default scene, including layout, face animation, header rendering, and split reserve/prompt right-hand panel responsibilities
   - path: hdmi_presentation_graph.py
     role: Resolve prioritized HDMI presentation cards into eased graph nodes and face-sync defaults
   - path: visual_qc.py

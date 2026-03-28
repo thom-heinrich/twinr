@@ -8,10 +8,11 @@ import stat
 import socket
 import sys
 import tempfile
-from threading import Event, Lock, Thread
+from threading import Barrier, Event, Lock, Thread
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -27,6 +28,7 @@ from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.storage import remote_read_observability
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteReadContext,
     _classify_remote_read_exception,
@@ -1225,6 +1227,101 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             if event.get("event") == "longterm_remote_read_failed"
         )
         self.assertEqual(failed_event["data"]["snapshot_kind"], "conflicts")
+
+    def test_remote_read_histogram_observation_creates_cross_service_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.config.project_root = temp_dir
+
+            remote_read_observability.record_remote_read_observation(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind="objects",
+                    operation="topk_search",
+                    request_method="POST",
+                    request_path="/v1/external/retrieve/topk_records",
+                    request_payload_kind="topk_scope_query",
+                ),
+                latency_ms=125.0,
+                outcome="ok",
+                classification="ok",
+            )
+
+            lock_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / ".longterm_remote_read_histograms.json.lock"
+            lock_mode = stat.S_IMODE(lock_path.stat().st_mode)
+
+        self.assertEqual(lock_mode, 0o666)
+
+    def test_remote_read_histogram_observation_tolerates_foreign_owned_lock_file_mode_refresh_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.config.project_root = temp_dir
+            lock_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / ".longterm_remote_read_histograms.json.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text("", encoding="utf-8")
+            os.chmod(lock_path, 0o600)
+            real_fchmod = remote_read_observability.os.fchmod
+            call_count = 0
+
+            def flaky_fchmod(fd: int, mode: int) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise PermissionError(1, "operation not permitted")
+                real_fchmod(fd, mode)
+
+            with patch.object(remote_read_observability.os, "fchmod", side_effect=flaky_fchmod):
+                remote_read_observability.record_remote_read_observation(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind="objects",
+                        operation="topk_search",
+                        request_method="POST",
+                        request_path="/v1/external/retrieve/topk_records",
+                        request_payload_kind="topk_scope_query",
+                    ),
+                    latency_ms=125.0,
+                    outcome="ok",
+                    classification="ok",
+                )
+
+            histogram_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
+            histogram_exists = histogram_path.exists()
+
+        self.assertGreaterEqual(call_count, 2)
+        self.assertTrue(histogram_exists)
+
+    def test_remote_read_histogram_atomic_write_uses_unique_temp_paths_for_concurrent_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            histogram_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
+            real_replace = remote_read_observability.os.replace
+            barrier = Barrier(2)
+            replace_sources: list[str] = []
+            errors: list[BaseException] = []
+
+            def gated_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                del destination
+                replace_sources.append(os.fspath(source))
+                barrier.wait(timeout=2.0)
+                real_replace(source, histogram_path)
+
+            def worker(writer_id: int) -> None:
+                try:
+                    remote_read_observability._write_json_atomic(histogram_path, {"writer": writer_id})
+                except BaseException as exc:  # pragma: no cover - assertion carries details on failure
+                    errors.append(exc)
+
+            with patch.object(remote_read_observability.os, "replace", side_effect=gated_replace):
+                first = Thread(target=worker, args=(1,))
+                second = Thread(target=worker, args=(2,))
+                first.start()
+                second.start()
+                first.join()
+                second.join()
+
+        self.assertFalse(errors)
+        self.assertEqual(len(replace_sources), 2)
+        self.assertEqual(len({Path(source).name for source in replace_sources}), 2)
 
     def test_select_open_conflicts_logs_remote_retrieve_failure_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

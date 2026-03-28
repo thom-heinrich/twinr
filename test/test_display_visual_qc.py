@@ -46,7 +46,7 @@ class DisplayVisualQcTests(unittest.TestCase):
             (40, 40, 40),
             (120, 50, 40),
             (230, 180, 80),
-            (10, 10, 10),
+            (0, 0, 0),
         ]
         capture_index = {"value": 0}
 
@@ -79,7 +79,7 @@ class DisplayVisualQcTests(unittest.TestCase):
             (40, 40, 40),
             (120, 50, 40),
             (230, 180, 80),
-            (10, 10, 10),
+            (0, 0, 0),
         ]
         capture_index = {"value": 0}
 

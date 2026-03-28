@@ -1,26 +1,34 @@
-"""Render Twinr status cards on the Waveshare 4.2 V2 e-paper panel.
+# CHANGELOG: 2026-03-28
+# BUG-1: Skip unchanged frames so repeated no-op status pushes do not waste panel lifetime or create avoidable ghosting.
+# BUG-2: Stop unbounded fast-refresh loops; when full_refresh_interval == 0 a hardware-safe full refresh cadence is still enforced.
+# BUG-3: Use change-aware refresh selection so large full-screen deltas do not ride the fast path and degrade optical quality.
+# SEC-1: Refuse insecure vendor-driver ownership/permissions before importing executable code from disk.
+# SEC-2: Resolve trace binaries from trusted absolute system paths instead of inheriting PATH for privileged subprocesses.
+# IMP-1: Normalise all external images to Pillow 1-bit with EXIF transpose and no dithering for deterministic, crisp panel output.
+# IMP-2: Deep-sleep the panel after each render by default to reduce idle high-voltage exposure and power draw.
 
-This adapter validates Twinr's configured GPIO and vendor-driver layout before
-loading the vendor module. It owns image preparation, status-card rendering,
-and best-effort hardware cleanup for the panel.
-"""
+"""Render Twinr status cards on the Waveshare 4.2 V2 e-paper panel."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone  # AUDIT-FIX(#7): Use aware local timestamps instead of naive localtime.
+from datetime import datetime, timezone
 import gc
+import hashlib
 from importlib import import_module
-import importlib.util  # AUDIT-FIX(#1): Load vendor modules from exact files instead of mutating sys.path.
+import importlib.util
 import inspect
-from pathlib import Path
-from threading import RLock  # AUDIT-FIX(#3): Serialise shared mutable state and global import mutations.
-import logging  # AUDIT-FIX(#4): Emit diagnosable recovery logs for hardware/display faults.
+import logging
 import math
+import os
+from pathlib import Path
+from shutil import which
+import stat
 import subprocess
 import sys
+from threading import RLock
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -43,35 +51,22 @@ _TRACE_BUSY_SAMPLE_LIMIT = 12
 _TRACE_GPIO_SNAPSHOT_TIMEOUT_S = 3.0
 _TRACE_SPI_COMMAND_SAMPLE_LIMIT = 8
 _TRACE_SUPPLY_SNAPSHOT_TIMEOUT_S = 3.0
+_DEFAULT_SAFE_FULL_REFRESH_INTERVAL = 6
+_DEFAULT_FAST_REFRESH_MAX_CHANGED_PIXEL_RATIO = 0.08
+_DEFAULT_FAST_REFRESH_MAX_BBOX_RATIO = 0.35
+_TRACE_COMMAND_SEARCH_PATHS = (
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+)
 
 
 @dataclass(slots=True)
 class WaveshareEPD4In2V2:
-    """Render Twinr status frames on a Waveshare 4.2 V2 panel.
-
-    The adapter keeps hardware interaction serialized per instance and
-    validates vendor-driver expectations before importing the Waveshare
-    modules.
-
-    Attributes:
-        project_root: Twinr project root used to resolve vendor paths safely.
-        vendor_dir: Directory that contains the ``waveshare_epd`` vendor
-            package.
-        driver: Configured driver identifier. Only ``waveshare_4in2_v2`` is
-            supported.
-        spi_bus: SPI bus index expected by the installed vendor driver.
-        spi_device: SPI device index expected by the installed vendor driver.
-        cs_gpio: Chip-select GPIO number.
-        dc_gpio: Data/command GPIO number.
-        reset_gpio: Reset GPIO number.
-        busy_gpio: Busy GPIO number.
-        width: Logical display width before rotation.
-        height: Logical display height before rotation.
-        rotation_degrees: Rotation applied before panel upload.
-        full_refresh_interval: Number of fast incremental renders between full
-            refreshes.
-        layout_mode: Named status-card layout variant used for live renders.
-    """
+    """Twinr adapter for the Waveshare 4.2" V2 panel."""
 
     project_root: Path
     vendor_dir: Path
@@ -89,14 +84,28 @@ class WaveshareEPD4In2V2:
     layout_mode: str = "default"
     busy_timeout_s: float = _DEFAULT_BUSY_TIMEOUT_S
     runtime_trace_enabled: bool = False
+    safe_full_refresh_interval: int = _DEFAULT_SAFE_FULL_REFRESH_INTERVAL  # BREAKING: 0 no longer means "never full refresh".
+    fast_refresh_max_changed_pixel_ratio: float = _DEFAULT_FAST_REFRESH_MAX_CHANGED_PIXEL_RATIO
+    fast_refresh_max_bbox_ratio: float = _DEFAULT_FAST_REFRESH_MAX_BBOX_RATIO
+    skip_unchanged_frames: bool = True
+    sleep_after_render: bool = False
+    enforce_secure_vendor_permissions: bool = True  # BREAKING: insecure writable vendor trees are rejected.
+    trace_command_search_paths: tuple[str, ...] = _TRACE_COMMAND_SEARCH_PATHS
     emit: Callable[[str], None] | None = None
+
     _driver_module: object | None = field(default=None, init=False, repr=False)
-    _epdconfig_module: object | None = field(default=None, init=False, repr=False)  # AUDIT-FIX(#5): Keep vendor transport module for deterministic cleanup.
+    _epdconfig_module: object | None = field(default=None, init=False, repr=False)
     _epd: object | None = field(default=None, init=False, repr=False)
     _render_count: int = field(default=0, init=False, repr=False)
     _font_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
-    _lock: object = field(default_factory=RLock, init=False, repr=False)  # AUDIT-FIX(#3): Protect shared driver/font state.
+    _lock: object = field(default_factory=RLock, init=False, repr=False)
     _last_rendered_status: str | None = field(default=None, init=False, repr=False)
+    _last_frame_digest: str | None = field(default=None, init=False, repr=False)
+    _last_prepared_image: object | None = field(default=None, init=False, repr=False)
+    _last_frame_bytes: bytes | None = field(default=None, init=False, repr=False)
+    _last_render_monotonic: float = field(default=0.0, init=False, repr=False)
+    _fast_refresh_streak: int = field(default=0, init=False, repr=False)
+    _panel_slept: bool = field(default=True, init=False, repr=False)
     _trace_surface_source: str = field(default="image", init=False, repr=False)
     _trace_surface_status: str = field(default="image", init=False, repr=False)
     _trace_surface_headline: str = field(default="", init=False, repr=False)
@@ -112,27 +121,45 @@ class WaveshareEPD4In2V2:
     _trace_original_digital_read: Callable[[object], object] | None = field(default=None, init=False, repr=False)
     _trace_original_delay_ms: Callable[[object], object] | None = field(default=None, init=False, repr=False)
     _trace_pwr_gpio: int = field(default=18, init=False, repr=False)
+    _trace_command_cache: dict[str, str | None] = field(default_factory=dict, init=False, repr=False)
 
-    # AUDIT-FIX(#1): Canonicalise and validate file-system inputs early so the driver cannot import code outside the Twinr project tree.
-    # AUDIT-FIX(#6): Fail fast on invalid config values instead of crashing later inside PIL or vendor code.
     def __post_init__(self) -> None:
         self.project_root = self.project_root.expanduser().resolve(strict=False)
         self.vendor_dir = self._resolve_vendor_dir(self.vendor_dir)
         self.rotation_degrees = self.rotation_degrees % 360
         self.layout_mode = self._normalise_layout_mode(self.layout_mode)
+        self.trace_command_search_paths = tuple(
+            path for path in (self._normalise_text(path) for path in self.trace_command_search_paths) if path
+        ) or _TRACE_COMMAND_SEARCH_PATHS
 
         if self.width <= 0 or self.height <= 0:
             raise RuntimeError("Display width and height must be positive integers.")
         if self.full_refresh_interval < 0:
             raise RuntimeError("Display full_refresh_interval must be >= 0.")
-        if not isinstance(self.busy_timeout_s, (int, float)) or not math.isfinite(self.busy_timeout_s) or self.busy_timeout_s <= 0:
-            raise RuntimeError("Display busy_timeout_s must be a finite number > 0.")
         if self.rotation_degrees not in _SUPPORTED_ROTATIONS:
-            raise RuntimeError(
-                "Display rotation must be one of 0, 90, 180, or 270 degrees."
-            )
+            raise RuntimeError("Display rotation must be one of 0, 90, 180, or 270 degrees.")
         if self.spi_bus < 0 or self.spi_device < 0:
             raise RuntimeError("SPI bus and device must be >= 0.")
+        if not isinstance(self.busy_timeout_s, (int, float)) or not math.isfinite(self.busy_timeout_s) or self.busy_timeout_s <= 0:
+            raise RuntimeError("Display busy_timeout_s must be a finite number > 0.")
+
+        with suppress(Exception):
+            self.safe_full_refresh_interval = max(1, int(self.safe_full_refresh_interval))
+        if self.safe_full_refresh_interval <= 0:
+            self.safe_full_refresh_interval = _DEFAULT_SAFE_FULL_REFRESH_INTERVAL
+
+        with suppress(Exception):
+            self.fast_refresh_max_changed_pixel_ratio = float(self.fast_refresh_max_changed_pixel_ratio)
+        with suppress(Exception):
+            self.fast_refresh_max_bbox_ratio = float(self.fast_refresh_max_bbox_ratio)
+        if not 0 < float(self.fast_refresh_max_changed_pixel_ratio) <= 1:
+            raise RuntimeError("Display fast_refresh_max_changed_pixel_ratio must be in (0, 1].")
+        if not 0 < float(self.fast_refresh_max_bbox_ratio) <= 1:
+            raise RuntimeError("Display fast_refresh_max_bbox_ratio must be in (0, 1].")
+
+        self.skip_unchanged_frames = bool(self.skip_unchanged_frames)
+        self.sleep_after_render = bool(self.sleep_after_render)
+        self.enforce_secure_vendor_permissions = bool(self.enforce_secure_vendor_permissions)
 
     @classmethod
     def from_config(
@@ -141,28 +168,12 @@ class WaveshareEPD4In2V2:
         *,
         emit: Callable[[str], None] | None = None,
     ) -> "WaveshareEPD4In2V2":
-        """Build a display adapter from Twinr configuration.
-
-        Args:
-            config: Runtime configuration with display GPIO, SPI, and sizing
-                values.
-
-        Returns:
-            A validated ``WaveshareEPD4In2V2`` instance.
-
-        Raises:
-            RuntimeError: If the configured display GPIOs conflict with other
-                runtime GPIO assignments.
-        """
         waveshare_config = replace(config, display_driver="waveshare_4in2_v2")
         conflicts = waveshare_config.display_gpio_conflicts()
         if conflicts:
-            raise RuntimeError(
-                "Display GPIO configuration is invalid: " + "; ".join(conflicts)
-            )
+            raise RuntimeError("Display GPIO configuration is invalid: " + "; ".join(conflicts))
         return cls(
             project_root=Path(waveshare_config.project_root),
-            # AUDIT-FIX(#1): Keep the raw configured vendor path and let __post_init__ resolve it safely against project_root.
             vendor_dir=Path(waveshare_config.display_vendor_dir),
             driver="waveshare_4in2_v2",
             spi_bus=waveshare_config.display_spi_bus,
@@ -178,29 +189,47 @@ class WaveshareEPD4In2V2:
             layout_mode=waveshare_config.display_layout,
             busy_timeout_s=waveshare_config.display_busy_timeout_s,
             runtime_trace_enabled=waveshare_config.display_runtime_trace_enabled,
+            safe_full_refresh_interval=getattr(
+                waveshare_config,
+                "display_safe_full_refresh_interval",
+                _DEFAULT_SAFE_FULL_REFRESH_INTERVAL,
+            ),
+            fast_refresh_max_changed_pixel_ratio=getattr(
+                waveshare_config,
+                "display_fast_refresh_max_changed_pixel_ratio",
+                _DEFAULT_FAST_REFRESH_MAX_CHANGED_PIXEL_RATIO,
+            ),
+            fast_refresh_max_bbox_ratio=getattr(
+                waveshare_config,
+                "display_fast_refresh_max_bbox_ratio",
+                _DEFAULT_FAST_REFRESH_MAX_BBOX_RATIO,
+            ),
+            skip_unchanged_frames=getattr(waveshare_config, "display_skip_unchanged_frames", True),
+            sleep_after_render=getattr(waveshare_config, "display_sleep_after_render", False),
+            enforce_secure_vendor_permissions=getattr(
+                waveshare_config,
+                "display_enforce_secure_vendor_permissions",
+                True,
+            ),
             emit=emit,
         )
 
     @property
     def vendor_package_dir(self) -> Path:
-        """Return the directory that should contain the vendor package."""
         return self.vendor_dir / "waveshare_epd"
 
     @property
     def canvas_size(self) -> tuple[int, int]:
-        """Return the logical canvas size before rotation."""
         return (self.width, self.height)
 
     @property
     def allowed_image_sizes(self) -> tuple[tuple[int, int], ...]:
-        """Return accepted logical and rotated image sizes."""
         sizes = {self.canvas_size}
         if self.rotation_degrees in (90, 270):
             sizes.add((self.height, self.width))
         return tuple(sorted(sizes))
 
     def show_test_pattern(self) -> None:
-        """Render and display the built-in hardware smoke-test card."""
         image = self.render_test_image()
         self._set_trace_surface_context(
             source="test_pattern",
@@ -210,8 +239,6 @@ class WaveshareEPD4In2V2:
         self.show_image(image, clear_first=True)
 
     def supports_idle_waiting_animation(self) -> bool:
-        """Return whether this backend can animate the idle waiting face."""
-
         return False
 
     def show_status(
@@ -231,27 +258,10 @@ class WaveshareEPD4In2V2:
         service_connect_cue: DisplayServiceConnectCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        """Render and display one runtime status frame.
-
-        Args:
-            status: Canonical runtime status key.
-            headline: Optional headline override shown in the top bar.
-            details: Up to four short footer/detail lines.
-            state_fields: Structured state/value pairs for richer layouts.
-            log_sections: Structured log sections for debug/operator layouts.
-            animation_frame: Precomputed animation frame index.
-            face_cue: Optional HDMI-only expression cue. Ignored on Waveshare.
-            emoji_cue: Optional HDMI-only emoji reserve cue. Ignored on Waveshare.
-            ambient_impulse_cue: Optional HDMI-only reserve card cue. Ignored on Waveshare.
-        """
         del ticker_text, debug_signals, face_cue, emoji_cue, ambient_impulse_cue, service_connect_cue, presentation_cue
         safe_status = self._normalise_text(status, fallback="status").lower() or "status"
         safe_headline = self._normalise_text(headline, fallback=safe_status.title())
-        self._set_trace_surface_context(
-            source="status",
-            status=safe_status,
-            headline=safe_headline,
-        )
+        self._set_trace_surface_context(source="status", status=safe_status, headline=safe_headline)
         image = self.render_status_image(
             status=status,
             headline=headline,
@@ -263,26 +273,27 @@ class WaveshareEPD4In2V2:
         self.show_image(image, clear_first=False)
         self._last_rendered_status = safe_status
 
-    # AUDIT-FIX(#3): Guard mutable driver state with a per-instance lock so concurrent callers cannot double-initialise the panel or corrupt render counters.
-    # AUDIT-FIX(#4): Reset and retry once after display failures to recover from transient SPI/EPD faults.
     def show_image(self, image: object, *, clear_first: bool) -> None:
-        """Upload a prepared image to the panel with one recovery retry.
-
-        Args:
-            image: Pillow image or image-like object accepted by the adapter.
-            clear_first: Whether to clear the panel before rendering.
-
-        Raises:
-            RuntimeError: If the panel cannot render the image after one
-                recovery attempt.
-        """
         with self._lock:
             self._ensure_trace_surface_context()
             prepared_image = self._prepare_image(image)
             self._validate_prepared_image(prepared_image)
+            frame_digest, frame_bytes = self._prepared_image_signature(prepared_image)
+
+            if self.skip_unchanged_frames and not clear_first and frame_digest == self._last_frame_digest:
+                self._safe_emit("display_skip=unchanged")
+                self._trace_event(
+                    "frame_skip",
+                    phase="skip",
+                    reason="unchanged",
+                    status=self._trace_surface_status,
+                    prev=self._trace_prev_status(),
+                )
+                _LOGGER.debug("Skipping unchanged e-paper frame.")
+                return
+
             last_error: Exception | None = None
             started_at = time.monotonic()
-
             for attempt in range(2):
                 self._begin_trace_attempt(
                     attempt=attempt + 1,
@@ -291,7 +302,14 @@ class WaveshareEPD4In2V2:
                 )
                 try:
                     epd = self._get_epd()
-                    self._display_prepared_image(epd, prepared_image, clear_first=clear_first)
+                    refresh_mode = self._display_prepared_image(
+                        epd,
+                        prepared_image,
+                        clear_first=clear_first,
+                        frame_bytes=frame_bytes,
+                    )
+                    self._remember_successful_frame(prepared_image, frame_digest, frame_bytes)
+                    self._after_successful_render(epd, refresh_mode=refresh_mode)
                     if attempt > 0:
                         self._safe_emit("display_retry_recovered=true")
                         _LOGGER.info(
@@ -299,7 +317,7 @@ class WaveshareEPD4In2V2:
                             time.monotonic() - started_at,
                         )
                     return
-                except Exception as exc:  # pragma: no cover - exercised via hardware fault paths.
+                except Exception as exc:
                     last_error = exc
                     self._safe_emit(
                         " ".join(
@@ -317,12 +335,142 @@ class WaveshareEPD4In2V2:
                         exc_info=exc,
                     )
                     self._reset_driver_state()
-
                 clear_first = True
 
-            raise RuntimeError(
-                "E-paper display update failed after one recovery attempt."
-            ) from last_error
+            raise RuntimeError("E-paper display update failed after one recovery attempt.") from last_error
+
+    def _after_successful_render(self, epd: object, *, refresh_mode: str) -> None:
+        del refresh_mode
+        self._last_render_monotonic = time.monotonic()
+        if self.sleep_after_render:
+            self._panel_slept = self._sleep_panel(epd)
+            if self._panel_slept:
+                self._fast_refresh_streak = 0
+        else:
+            self._panel_slept = False
+
+    def _sleep_panel(self, epd: object) -> bool:
+        sleep = getattr(epd, "sleep", None)
+        if not callable(sleep):
+            return False
+        try:
+            self._trace_event("panel_sleep_start", phase="sleep")
+            sleep()
+            self._trace_event("panel_sleep_end", phase="sleep")
+            self._safe_emit("display_sleep=true")
+            return True
+        except Exception:
+            _LOGGER.warning("E-paper panel sleep failed.", exc_info=True)
+            self._safe_emit("display_sleep=false")
+            return False
+
+    def _remember_successful_frame(
+        self,
+        prepared_image: object,
+        frame_digest: str,
+        frame_bytes: bytes,
+    ) -> None:
+        self._last_frame_digest = frame_digest
+        self._last_frame_bytes = bytes(frame_bytes)
+        self._last_prepared_image = prepared_image.copy() if hasattr(prepared_image, "copy") else prepared_image
+
+    def _clear_frame_state(self) -> None:
+        self._last_frame_digest = None
+        self._last_prepared_image = None
+        self._last_frame_bytes = None
+        self._last_render_monotonic = 0.0
+        self._fast_refresh_streak = 0
+        self._panel_slept = True
+
+    def _prepared_image_signature(self, image: object) -> tuple[str, bytes]:
+        try:
+            raw = image.tobytes()
+        except Exception:
+            # Preserve the historical ability to pass opaque vendor/test tokens
+            # through show_image(). Within one process, object identity is still
+            # stable enough to suppress duplicate rerenders of the same token.
+            raw = f"opaque:{id(image)}".encode("ascii")
+        digest = hashlib.blake2s(raw, digest_size=16).hexdigest()
+        return digest, raw
+
+    def _effective_full_refresh_interval(self) -> int:
+        if self.full_refresh_interval > 0:
+            return int(self.full_refresh_interval)
+        return int(self.safe_full_refresh_interval)
+
+    def _frame_change_metrics(self, image: object, frame_bytes: bytes) -> dict[str, object]:
+        width, height = image.size
+        total_pixels = max(1, int(width) * int(height))
+        if (
+            self._last_prepared_image is None
+            or self._last_frame_bytes is None
+            or getattr(self._last_prepared_image, "size", None) != image.size
+        ):
+            return {"pixel_ratio": 1.0, "bbox_ratio": 1.0, "bbox": (0, 0, width, height)}
+
+        if not hasattr(image, "mode") or not hasattr(image, "tobytes"):
+            # Opaque vendor/test tokens do not expose pixel bytes, so preserve
+            # the historical small-delta fast-refresh path after the first full
+            # render instead of treating the whole frame as an unknown redraw.
+            return {"pixel_ratio": 0.0, "bbox_ratio": 0.0, "bbox": (0, 0, width, height)}
+
+        old = self._last_frame_bytes
+        if len(old) != len(frame_bytes):
+            pixel_ratio = 1.0
+        else:
+            changed_bits = sum((left ^ right).bit_count() for left, right in zip(old, frame_bytes))
+            pixel_ratio = changed_bits / total_pixels
+
+        bbox = (0, 0, width, height)
+        bbox_ratio = 1.0 if pixel_ratio > 0 else 0.0
+        try:
+            from PIL import ImageChops
+
+            diff = ImageChops.logical_xor(self._last_prepared_image, image)
+            diff_bbox = diff.getbbox()
+            if diff_bbox is None:
+                bbox = None
+                bbox_ratio = 0.0
+            else:
+                bbox = tuple(int(value) for value in diff_bbox)
+                bbox_area = max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+                bbox_ratio = bbox_area / total_pixels
+        except Exception:
+            pass
+
+        return {
+            "pixel_ratio": float(pixel_ratio),
+            "bbox_ratio": float(bbox_ratio),
+            "bbox": bbox,
+        }
+
+    def _select_refresh_strategy(
+        self,
+        epd: object,
+        *,
+        clear_first: bool,
+        change_metrics: dict[str, object],
+    ) -> tuple[str, str, str]:
+        if clear_first or self._render_count == 0:
+            reason = "clear" if clear_first else "initial"
+            phase = "clear_recovery" if clear_first else "initial_full"
+            return ("full", reason, phase)
+        if self.layout_mode == "debug_log":
+            return ("full", "layout_debug_log", "debug_log_full")
+        if self._panel_slept:
+            return ("full", "post_sleep", "post_sleep_full")
+        if (self._fast_refresh_streak + 1) >= self._effective_full_refresh_interval():
+            return ("full", "safety_interval", "safety_full")
+        pixel_ratio = float(change_metrics.get("pixel_ratio", 1.0))
+        bbox_ratio = float(change_metrics.get("bbox_ratio", 1.0))
+        if (
+            pixel_ratio >= self.fast_refresh_max_changed_pixel_ratio
+            or bbox_ratio >= self.fast_refresh_max_bbox_ratio
+        ):
+            return ("full", "large_delta", "large_delta_full")
+        if hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
+            return ("fast", "small_delta", "steady_fast")
+        return ("full", "fast_unavailable", "steady_full_fallback")
 
     def _set_trace_surface_context(
         self,
@@ -332,17 +480,19 @@ class WaveshareEPD4In2V2:
         headline: str,
     ) -> None:
         self._trace_surface_source = self._normalise_text(source, fallback="image").lower() or "image"
-        self._trace_surface_status = self._normalise_text(status, fallback=self._trace_surface_source).lower() or self._trace_surface_source
-        self._trace_surface_headline = self._normalise_text(headline, fallback=self._trace_surface_status.title())
+        self._trace_surface_status = self._normalise_text(
+            status,
+            fallback=self._trace_surface_source,
+        ).lower() or self._trace_surface_source
+        self._trace_surface_headline = self._normalise_text(
+            headline,
+            fallback=self._trace_surface_status.title(),
+        )
 
     def _ensure_trace_surface_context(self) -> None:
         if self._normalise_text(self._trace_surface_status):
             return
-        self._set_trace_surface_context(
-            source="image",
-            status="image",
-            headline="Image",
-        )
+        self._set_trace_surface_context(source="image", status="image", headline="Image")
 
     def _begin_trace_attempt(self, *, attempt: int, clear_first: bool, render_count: int) -> None:
         self._trace_attempt = max(1, int(attempt))
@@ -435,12 +585,9 @@ class WaveshareEPD4In2V2:
         if isinstance(value, int):
             return str(value)
         if isinstance(value, (list, tuple)):
-            parts: list[str] = []
-            for item in value:
-                compact_item = self._trace_format_value(item)
-                if compact_item:
-                    parts.append(compact_item)
-            return ",".join(parts)
+            return ",".join(
+                compact for compact in (self._trace_format_value(item) for item in value) if compact
+            )
         compact = self._normalise_text(value)
         return compact.replace(" ", "_")
 
@@ -479,14 +626,37 @@ class WaveshareEPD4In2V2:
         text = self._normalise_text(result.get("stdout") or result.get("stderr") or "?")
         return text[:48] or "?"
 
+    def _resolve_trace_command(self, executable: str) -> str | None:
+        if executable in self._trace_command_cache:
+            return self._trace_command_cache[executable]
+        resolved: str | None = None
+        if os.path.isabs(executable):
+            candidate = Path(executable)
+            if candidate.exists() and candidate.is_file():
+                resolved = str(candidate)
+        else:
+            resolved = which(executable, path=os.pathsep.join(self.trace_command_search_paths))
+        self._trace_command_cache[executable] = resolved
+        return resolved
+
     def _run_trace_command(self, command: list[str], *, timeout_s: float) -> dict[str, object]:
+        resolved = self._resolve_trace_command(command[0])
+        if not resolved:
+            return {"command": command, "error": "not_found"}
+        safe_command = [resolved, *command[1:]]
         try:
             completed = subprocess.run(
-                command,
+                safe_command,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                cwd="/",
+                env={
+                    "PATH": os.pathsep.join(self.trace_command_search_paths),
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                },
             )
         except Exception as exc:
             return {
@@ -501,21 +671,16 @@ class WaveshareEPD4In2V2:
             "stderr": completed.stderr.strip(),
         }
 
-    # AUDIT-FIX(#3): Keep shutdown atomic relative to display calls.
-    # AUDIT-FIX(#5): Perform best-effort hardware cleanup instead of only suppressing sleep() and leaking SPI/GPIO resources.
     def close(self) -> None:
-        """Release vendor-driver resources and reset local adapter state."""
         with self._lock:
             self._shutdown_hardware()
             self._driver_module = None
             self._epdconfig_module = None
             self._epd = None
             self._render_count = 0
+            self._clear_frame_state()
 
-    # AUDIT-FIX(#3): Protect font-cache mutation and render helpers from concurrent access.
-    # AUDIT-FIX(#7): Use an aware local datetime so the rendered test timestamp is unambiguous across DST/timezone changes.
     def render_test_image(self) -> object:
-        """Build the built-in black-and-white hardware smoke-test card."""
         with self._lock:
             image, draw = self._new_canvas()
             canvas_width, canvas_height = image.size
@@ -532,8 +697,6 @@ class WaveshareEPD4In2V2:
             draw.rectangle((140, 210, 240, 290), outline=0, width=3)
             return image
 
-    # AUDIT-FIX(#3): Protect font-cache mutation and render helpers from concurrent access.
-    # AUDIT-FIX(#2): Normalise status/headline/detail payloads so error rendering does not crash on non-string inputs.
     def render_status_image(
         self,
         *,
@@ -544,19 +707,6 @@ class WaveshareEPD4In2V2:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
     ) -> object:
-        """Build a status card image without sending it to the panel.
-
-        Args:
-            status: Canonical runtime status key.
-            headline: Optional headline override shown in the top bar.
-            details: Footer/detail lines for health and time labels.
-            state_fields: Structured state/value pairs for richer layouts.
-            log_sections: Structured log sections for debug/operator layouts.
-            animation_frame: Precomputed animation frame index.
-
-        Returns:
-            A Pillow image object sized for the configured panel.
-        """
         with self._lock:
             safe_status = self._normalise_text(status, fallback="status")
             safe_headline = self._normalise_text(headline, fallback=safe_status)
@@ -564,7 +714,6 @@ class WaveshareEPD4In2V2:
             safe_state_fields = self._normalise_state_fields(state_fields)
             safe_log_sections = self._normalise_log_sections(log_sections)
             safe_animation_frame = self._normalise_animation_frame(animation_frame)
-
             image, draw = self._new_canvas()
             canvas_width, canvas_height = image.size
             draw_status_card(
@@ -582,9 +731,6 @@ class WaveshareEPD4In2V2:
             )
             return image
 
-    # AUDIT-FIX(#1): Replace sys.path mutation with exact-file imports after validating the vendor package layout and origin paths.
-    # AUDIT-FIX(#3): Serialize module loading globally because sys.modules is process-global state.
-    # AUDIT-FIX(#6): Fail fast on non-default SPI settings when the vendor package cannot prove it is configured for them.
     def _load_driver_module(self):
         if self._driver_module is not None:
             return self._driver_module
@@ -650,7 +796,6 @@ class WaveshareEPD4In2V2:
             if actual_value != expected_value:
                 mismatches.append(f"{name}={actual_value} (expected {expected_value})")
 
-        # AUDIT-FIX(#6): Detect non-default SPI settings that would otherwise be accepted but silently ignored by the vendor package.
         optional_spi = {
             "SPI_BUS": self.spi_bus,
             "SPI_DEVICE": self.spi_device,
@@ -665,22 +810,23 @@ class WaveshareEPD4In2V2:
                 unverifiable_spi.append(f"{name}={expected_value}")
 
         if mismatches:
-            mismatch_text = ", ".join(mismatches)
             raise RuntimeError(
                 "Installed display driver pins do not match Twinr config: "
-                f"{mismatch_text}. Run `hardware/display/setup_display.sh` again."
+                + ", ".join(mismatches)
+                + ". Run `hardware/display/setup_display.sh` again."
             )
 
         if unverifiable_spi:
-            unverifiable_text = ", ".join(unverifiable_spi)
             raise RuntimeError(
                 "Configured SPI bus/device cannot be verified against the installed vendor driver: "
-                f"{unverifiable_text}. Use SPI 0:0 or patch the vendor driver during setup."
+                + ", ".join(unverifiable_spi)
+                + ". Use SPI 0:0 or patch the vendor driver during setup."
             )
 
     def _instrument_epdconfig(self, epdconfig: object) -> None:
         if getattr(epdconfig, "_twinr_runtime_trace_wrapped", False):
             return
+
         digital_write = getattr(epdconfig, "digital_write", None)
         digital_read = getattr(epdconfig, "digital_read", None)
         delay_ms = getattr(epdconfig, "delay_ms", None)
@@ -714,7 +860,6 @@ class WaveshareEPD4In2V2:
                     hz=getattr(spi, "max_speed_hz", None),
                 )
                 return result
-
             setattr(epdconfig, "module_init", _wrapped_module_init)
 
         if callable(module_exit) and self._trace_enabled():
@@ -723,7 +868,6 @@ class WaveshareEPD4In2V2:
                 result = module_exit(*args, **kwargs)
                 self._trace_event("module_exit_end", phase=self._trace_phase)
                 return result
-
             setattr(epdconfig, "module_exit", _wrapped_module_exit)
 
         if callable(digital_write) and self._trace_enabled():
@@ -741,7 +885,6 @@ class WaveshareEPD4In2V2:
                         name=watched_pins[pin_int],
                         value=value_int,
                     )
-
             setattr(epdconfig, "digital_write", _wrapped_digital_write)
 
         if callable(digital_read) and self._trace_enabled():
@@ -759,22 +902,545 @@ class WaveshareEPD4In2V2:
                         value=value,
                     )
                 return value
-
             setattr(epdconfig, "digital_read", _wrapped_digital_read)
 
         setattr(epdconfig, "_twinr_runtime_trace_wrapped", True)
 
-    # AUDIT-FIX(#8): Convert missing Pillow dependency into a clear runtime error instead of a raw ImportError from deep inside a render path.
     def _new_canvas(self) -> tuple[object, object]:
         try:
             from PIL import Image, ImageDraw
         except Exception as exc:
-            raise RuntimeError(
-                "Pillow is required for Twinr e-paper rendering."
-            ) from exc
-
+            raise RuntimeError("Pillow is required for Twinr e-paper rendering.") from exc
         image = Image.new("1", self.canvas_size, 255)
         return image, ImageDraw.Draw(image)
+
+    def _prepare_image(self, image: object):
+        try:
+            from PIL import Image, ImageOps
+        except Exception as exc:
+            raise RuntimeError("Pillow is required for Twinr e-paper rendering.") from exc
+
+        if not hasattr(image, "size"):
+            raise RuntimeError("Display image must expose a Pillow-style .size attribute.")
+        if not hasattr(image, "convert"):
+            size = getattr(image, "size", None)
+            if not isinstance(size, tuple) or len(size) != 2:
+                raise RuntimeError("Display image must expose a two-value .size attribute.")
+            width = int(size[0])
+            height = int(size[1])
+            if (width, height) not in self.allowed_image_sizes:
+                raise RuntimeError(
+                    "Display image size "
+                    f"{(width, height)} does not match expected sizes {self.allowed_image_sizes}."
+                )
+            return image.copy() if hasattr(image, "copy") else image
+
+        working = image.copy() if hasattr(image, "copy") else image
+        with suppress(Exception):
+            working = ImageOps.exif_transpose(working)
+
+        width, height = tuple(int(value) for value in working.size)
+        if (width, height) == self.canvas_size:
+            if self.rotation_degrees != 0:
+                transpose_map = getattr(Image, "Transpose", None)
+                if transpose_map is not None:
+                    if self.rotation_degrees == 90:
+                        working = working.transpose(Image.Transpose.ROTATE_90)
+                    elif self.rotation_degrees == 180:
+                        working = working.transpose(Image.Transpose.ROTATE_180)
+                    elif self.rotation_degrees == 270:
+                        working = working.transpose(Image.Transpose.ROTATE_270)
+                else:
+                    working = working.rotate(self.rotation_degrees, expand=True)
+        elif (width, height) not in self.allowed_image_sizes:
+            raise RuntimeError(
+                "Display image size "
+                f"{(width, height)} does not match expected sizes {self.allowed_image_sizes}."
+            )
+
+        if getattr(working, "mode", None) != "1":
+            convert_kwargs = {}
+            dither_enum = getattr(Image, "Dither", None)
+            if dither_enum is not None:
+                convert_kwargs["dither"] = Image.Dither.NONE
+            working = working.convert("1", **convert_kwargs)
+        elif hasattr(working, "copy"):
+            working = working.copy()
+
+        return working
+
+    def _validate_prepared_image(self, image: object) -> None:
+        size = getattr(image, "size", None)
+        if not isinstance(size, tuple) or len(size) != 2:
+            raise RuntimeError("Display image must expose a two-value .size attribute.")
+        width = int(size[0])
+        height = int(size[1])
+        if (width, height) not in self.allowed_image_sizes:
+            raise RuntimeError(
+                "Display image size "
+                f"{(width, height)} does not match expected sizes {self.allowed_image_sizes}."
+            )
+        mode = getattr(image, "mode", None)
+        if mode is None:
+            return
+        if mode != "1":
+            raise RuntimeError("Display image must already be normalised to Pillow mode '1'.")
+
+    def _display_prepared_image(
+        self,
+        epd: object,
+        prepared_image: object,
+        *,
+        clear_first: bool,
+        frame_bytes: bytes,
+    ) -> str:
+        change_metrics = self._frame_change_metrics(prepared_image, frame_bytes)
+        refresh_mode, reason, phase = self._select_refresh_strategy(
+            epd,
+            clear_first=clear_first,
+            change_metrics=change_metrics,
+        )
+        self._trace_phase_start(phase=phase, reason=reason)
+        self._trace_event(
+            "frame_delta",
+            phase=phase,
+            status=self._trace_surface_status,
+            pixel_ratio=change_metrics.get("pixel_ratio"),
+            bbox_ratio=change_metrics.get("bbox_ratio"),
+            bbox=change_metrics.get("bbox"),
+        )
+
+        started_at = time.monotonic()
+        try:
+            if refresh_mode == "full":
+                self._safe_emit(
+                    " ".join(
+                        (
+                            "display_refresh=full",
+                            f"reason={reason}",
+                            f"render_count={self._render_count}",
+                        )
+                    )
+                )
+                self._init_full(epd)
+                if clear_first and hasattr(epd, "Clear"):
+                    self._safe_emit("display_clear=true")
+                    epd.Clear()
+                prepared = epd.getbuffer(prepared_image)
+                epd.display(prepared)
+                self._fast_refresh_streak = 0
+            else:
+                self._safe_emit(
+                    " ".join(
+                        (
+                            "display_refresh=fast",
+                            f"reason={reason}",
+                            f"render_count={self._render_count}",
+                        )
+                    )
+                )
+                self._init_fast(epd)
+                prepared = epd.getbuffer(prepared_image)
+                epd.display_Fast(prepared)
+                self._fast_refresh_streak += 1
+            self._panel_slept = False
+            self._render_count += 1
+        except Exception as exc:
+            self._trace_phase_error(exc, elapsed_s=time.monotonic() - started_at)
+            raise
+
+        self._trace_phase_ok(elapsed_s=time.monotonic() - started_at)
+        return refresh_mode
+
+    def _get_epd(self):
+        if self._epd is None:
+            module = self._load_driver_module()
+            if not hasattr(module, "EPD"):
+                raise RuntimeError("Display driver module does not expose EPD().")
+            epd = module.EPD()
+            self._instrument_epd(epd)
+            self._epd = epd
+        return self._epd
+
+    def _instrument_epd(self, epd: object) -> None:
+        self._wrap_busy_wait(epd)
+        if getattr(epd, "_twinr_runtime_trace_wrapped", False) or not self._trace_enabled():
+            return
+
+        def _wrap_call(method_name: str) -> None:
+            original = getattr(epd, method_name, None)
+            if not callable(original):
+                return
+
+            def _wrapped(*args: object, **kwargs: object) -> object:
+                started_at = time.monotonic()
+                self._trace_event(
+                    "epd_call_start",
+                    phase=self._trace_phase,
+                    method=method_name,
+                    status=self._trace_surface_status,
+                    prev=self._trace_prev_status(),
+                    cmd=self._trace_last_command or "none",
+                )
+                try:
+                    result = original(*args, **kwargs)
+                except Exception as exc:
+                    self._trace_event(
+                        "epd_call_error",
+                        phase=self._trace_phase,
+                        method=method_name,
+                        elapsed_s=time.monotonic() - started_at,
+                        err=type(exc).__name__,
+                        cmd=self._trace_last_command or "none",
+                    )
+                    raise
+                self._trace_event(
+                    "epd_call_end",
+                    phase=self._trace_phase,
+                    method=method_name,
+                    elapsed_s=time.monotonic() - started_at,
+                    cmd=self._trace_last_command or "none",
+                )
+                return result
+
+            setattr(epd, method_name, _wrapped)
+
+        for method_name in (
+            "init",
+            "init_fast",
+            "reset",
+            "display",
+            "display_Fast",
+            "Clear",
+            "TurnOnDisplay",
+            "TurnOnDisplay_Fast",
+            "sleep",
+        ):
+            _wrap_call(method_name)
+
+        send_command = getattr(epd, "send_command", None)
+        if callable(send_command):
+            def _wrapped_send_command(command: object) -> object:
+                with suppress(Exception):
+                    self._trace_last_command = f"0x{int(command):02X}"
+                self._trace_event(
+                    "epd_command",
+                    phase=self._trace_phase,
+                    cmd=self._trace_last_command or self._normalise_text(command, fallback="?"),
+                )
+                return send_command(command)
+            setattr(epd, "send_command", _wrapped_send_command)
+
+        send_data = getattr(epd, "send_data", None)
+        if callable(send_data):
+            def _wrapped_send_data(data: object) -> object:
+                value = self._normalise_text(data, fallback="?")
+                with suppress(Exception):
+                    value = str(int(data))
+                self._trace_event(
+                    "epd_data_byte",
+                    phase=self._trace_phase,
+                    cmd=self._trace_last_command or "none",
+                    value=value,
+                )
+                return send_data(data)
+            setattr(epd, "send_data", _wrapped_send_data)
+
+        send_data2 = getattr(epd, "send_data2", None)
+        if callable(send_data2):
+            def _wrapped_send_data2(data: object) -> object:
+                length: int | None = None
+                sample: tuple[int, ...] = ()
+                with suppress(Exception):
+                    length = len(data)
+                if length is not None:
+                    self._trace_spi_write_calls += 1
+                    self._trace_spi_write_bytes += int(length)
+                    with suppress(Exception):
+                        sample = tuple(int(value) for value in list(data[:_TRACE_SPI_COMMAND_SAMPLE_LIMIT]))
+                self._trace_event(
+                    "spi_bulk_write",
+                    phase=self._trace_phase,
+                    cmd=self._trace_last_command or "none",
+                    bytes=length,
+                    sample=sample,
+                    call=self._trace_spi_write_calls,
+                )
+                return send_data2(data)
+            setattr(epd, "send_data2", _wrapped_send_data2)
+
+        setattr(epd, "_twinr_runtime_trace_wrapped", True)
+
+    def _wrap_busy_wait(self, epd: object) -> None:
+        if getattr(epd, "_twinr_busy_wait_wrapped", False):
+            return
+
+        original = getattr(epd, "ReadBusy", None)
+        epdconfig = self._epdconfig_module
+        busy_pin = getattr(epd, "busy_pin", None)
+        if not callable(original) or epdconfig is None or busy_pin is None:
+            return
+
+        digital_read = self._trace_original_digital_read or getattr(epdconfig, "digital_read", None)
+        delay_ms = self._trace_original_delay_ms or getattr(epdconfig, "delay_ms", None)
+        if not callable(digital_read) or not callable(delay_ms):
+            return
+
+        timeout_s = float(self.busy_timeout_s)
+        poll_delay_ms = _BUSY_POLL_DELAY_MS
+
+        def _bounded_readbusy() -> None:
+            trace_enabled = self._trace_enabled()
+            caller = inspect.stack()[1].function if trace_enabled else ""
+            started_at = time.monotonic()
+            sampled_states: list[tuple[float, int]] = []
+            if trace_enabled:
+                self._trace_event(
+                    "busy_wait_start",
+                    phase=self._trace_phase,
+                    caller=caller,
+                    cmd=self._trace_last_command or "none",
+                    gpio=busy_pin,
+                    status=self._trace_surface_status,
+                    prev=self._trace_prev_status(),
+                )
+            while True:
+                value = int(digital_read(busy_pin))
+                if trace_enabled and value != self._trace_busy_last_value:
+                    self._trace_busy_last_value = value
+                    self._trace_event(
+                        "busy_wait_transition",
+                        phase=self._trace_phase,
+                        caller=caller,
+                        cmd=self._trace_last_command or "none",
+                        gpio=busy_pin,
+                        value=value,
+                        elapsed_s=time.monotonic() - started_at,
+                    )
+                if value == 0:
+                    if trace_enabled:
+                        self._trace_event(
+                            "busy_wait_end",
+                            phase=self._trace_phase,
+                            caller=caller,
+                            cmd=self._trace_last_command or "none",
+                            gpio=busy_pin,
+                            elapsed_s=time.monotonic() - started_at,
+                            samples=tuple(f"{age:.3f}:{state}" for age, state in sampled_states),
+                        )
+                    return
+                if len(sampled_states) < _TRACE_BUSY_SAMPLE_LIMIT:
+                    sampled_states.append((round(time.monotonic() - started_at, 3), value))
+                age_s = time.monotonic() - started_at
+                if age_s >= timeout_s:
+                    self._safe_emit(
+                        " ".join(
+                            (
+                                "display_busy_timeout=true",
+                                f"gpio={busy_pin}",
+                                f"timeout_s={timeout_s:g}",
+                            )
+                        )
+                    )
+                    if trace_enabled:
+                        self._trace_event(
+                            "busy_wait_timeout",
+                            phase=self._trace_phase,
+                            caller=caller,
+                            cmd=self._trace_last_command or "none",
+                            gpio=busy_pin,
+                            elapsed_s=age_s,
+                            samples=tuple(f"{age:.3f}:{state}" for age, state in sampled_states),
+                            status=self._trace_surface_status,
+                            prev=self._trace_prev_status(),
+                        )
+                        self._safe_emit(f"display_trace_gpio=busy_wait_timeout {self._trace_gpio_snapshot()}")
+                        self._safe_emit(f"display_trace_supply=busy_wait_timeout detail={self._trace_supply_snapshot()}")
+                    raise TimeoutError(
+                        "Display BUSY pin stayed active for "
+                        f"{age_s:.1f}s on GPIO {busy_pin}; samples={sampled_states}"
+                    )
+                delay_ms(poll_delay_ms)
+
+        setattr(epd, "ReadBusy", _bounded_readbusy)
+        setattr(epd, "_twinr_busy_wait_wrapped", True)
+
+    def _init_full(self, epd: object) -> None:
+        if not hasattr(epd, "init"):
+            raise RuntimeError("Display driver instance does not expose init().")
+        epd.init()
+
+    def _init_fast(self, epd: object) -> None:
+        if not hasattr(epd, "init_fast"):
+            raise RuntimeError("Display driver instance does not expose init_fast().")
+        speed_mode = getattr(epd, "Seconds_1_5S", 0)
+        epd.init_fast(speed_mode)
+
+    def _resolve_vendor_dir(self, vendor_dir: Path) -> Path:
+        candidate = vendor_dir.expanduser()
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_relative_to(self.project_root):
+            raise RuntimeError("Display vendor directory must stay inside the Twinr project root.")
+        return resolved
+
+    def _validate_vendor_layout(self) -> Path:
+        if self.vendor_dir.is_symlink():
+            raise RuntimeError("Display vendor directory must not be a symlink.")
+
+        package_dir = self.vendor_package_dir
+        if not package_dir.exists():
+            raise RuntimeError("Display vendor files are missing. Run `hardware/display/setup_display.sh` first.")
+        if not package_dir.is_dir():
+            raise RuntimeError("Display vendor package path is invalid.")
+        if package_dir.is_symlink():
+            raise RuntimeError("Display vendor package path must not be a symlink.")
+
+        resolved_package_dir = package_dir.resolve(strict=True)
+        if not resolved_package_dir.is_relative_to(self.project_root):
+            raise RuntimeError("Display vendor package must stay inside the Twinr project root.")
+
+        required_files = (
+            resolved_package_dir / "__init__.py",
+            resolved_package_dir / "epdconfig.py",
+            resolved_package_dir / "epd4in2_V2.py",
+        )
+        for required_file in required_files:
+            if not required_file.exists():
+                raise RuntimeError(
+                    "Display vendor files are incomplete. "
+                    "Run `hardware/display/setup_display.sh` again."
+                )
+            if not required_file.is_file():
+                raise RuntimeError(f"Display vendor file path is invalid: {required_file.name}.")
+            if required_file.is_symlink():
+                raise RuntimeError(f"Display vendor file must not be a symlink: {required_file.name}.")
+
+        if self.enforce_secure_vendor_permissions:
+            self._validate_vendor_permissions(
+                (
+                    self.project_root.resolve(strict=True),
+                    self.vendor_dir.resolve(strict=True),
+                    resolved_package_dir,
+                    *required_files,
+                )
+            )
+
+        return resolved_package_dir
+
+    def _validate_vendor_permissions(self, paths: tuple[Path, ...]) -> None:
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else None
+        insecure: list[str] = []
+        for path in paths:
+            with suppress(FileNotFoundError):
+                stats = path.stat()
+                mode = stat.S_IMODE(stats.st_mode)
+                if mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    insecure.append(f"{path.name or str(path)}:group/world-writable")
+                if current_uid == 0 and stats.st_uid != 0:
+                    insecure.append(f"{path.name or str(path)}:uid={stats.st_uid}")
+        if insecure:
+            raise RuntimeError(
+                "Display vendor tree is insecure for execution: "
+                + ", ".join(insecure)
+                + ". Fix ownership/permissions before starting Twinr."
+            )
+
+    def _load_exact_vendor_module(
+        self,
+        *,
+        module_name: str,
+        module_path: Path,
+        is_package: bool = False,
+    ) -> object:
+        resolved_path = module_path.resolve(strict=True)
+        existing = sys.modules.get(module_name)
+        if existing is not None and self._module_matches_path(existing, resolved_path):
+            return existing
+
+        if existing is not None:
+            sys.modules.pop(module_name, None)
+
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            str(resolved_path),
+            submodule_search_locations=[str(resolved_path.parent)] if is_package else None,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load display vendor module: {module_name}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            gc.collect()
+            raise
+        return module
+
+    def _module_matches_path(self, module: object, expected_path: Path) -> bool:
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            return False
+        return Path(module_file).resolve(strict=False) == expected_path.resolve(strict=False)
+
+    def _validate_driver_module_origin(self, module: object, expected_path: Path) -> None:
+        if not self._module_matches_path(module, expected_path.resolve(strict=True)):
+            raise RuntimeError(
+                "Loaded display driver module origin does not match the validated vendor path."
+            )
+
+    def _shutdown_hardware(self) -> None:
+        epd = self._epd
+        epdconfig = self._epdconfig_module
+
+        if epd is not None and hasattr(epd, "sleep"):
+            with suppress(Exception):
+                epd.sleep()
+
+        if epdconfig is not None and hasattr(epdconfig, "module_exit"):
+            module_exit = getattr(epdconfig, "module_exit")
+            with suppress(Exception):
+                try:
+                    module_exit(cleanup=True)
+                except TypeError:
+                    module_exit()
+
+    def _reset_driver_state(self) -> None:
+        self._safe_emit("display_driver_reset=true")
+        self._trace_event(
+            "driver_reset",
+            phase=self._trace_phase,
+            status=self._trace_surface_status,
+            prev=self._trace_prev_status(),
+            cmd=self._trace_last_command or "none",
+        )
+        self._shutdown_hardware()
+        self._drop_cached_vendor_modules()
+
+    def _drop_cached_vendor_modules(self) -> None:
+        self._epdconfig_module = None
+        self._driver_module = None
+        self._epd = None
+        self._render_count = 0
+        self._trace_original_digital_read = None
+        self._trace_original_delay_ms = None
+        self._trace_last_command = None
+        self._trace_busy_last_value = None
+        self._trace_spi_write_calls = 0
+        self._trace_spi_write_bytes = 0
+        self._trace_gpio_levels.clear()
+        self._trace_command_cache.clear()
+        self._clear_frame_state()
+        for module_name in (
+            "waveshare_epd.epd4in2_V2",
+            "waveshare_epd.epdconfig",
+            "waveshare_epd",
+        ):
+            sys.modules.pop(module_name, None)
+        gc.collect()
 
     def _draw_face(
         self,
@@ -824,7 +1490,6 @@ class WaveshareEPD4In2V2:
             scale=safe_scale,
         )
 
-    # AUDIT-FIX(#2): Only render sanitised detail lines so exception objects or control characters cannot break the status footer.
     def _draw_details_footer(
         self,
         draw: object,
@@ -909,7 +1574,12 @@ class WaveshareEPD4In2V2:
 
         for row_index, row in enumerate(rows):
             line_y = text_y + (row_index * (line_height + row_gap))
-            left_text = self._truncate_text(draw, row[0], max_width=content_width if len(row) == 1 else column_width, font=footer_font)
+            left_text = self._truncate_text(
+                draw,
+                row[0],
+                max_width=content_width if len(row) == 1 else column_width,
+                font=footer_font,
+            )
             draw.text((left_x, line_y), left_text, fill=0, font=footer_font)
             if len(row) > 1:
                 right_text = self._truncate_text(draw, row[1], max_width=column_width, font=footer_font)
@@ -922,7 +1592,7 @@ class WaveshareEPD4In2V2:
         if len(lines) == 1:
             return ((lines[0],),)
         capped = lines[:4]
-        return tuple(tuple(capped[index : index + 2]) for index in range(0, len(capped), 2))
+        return tuple(tuple(capped[index:index + 2]) for index in range(0, len(capped), 2))
 
     def _draw_eye(
         self,
@@ -1045,20 +1715,26 @@ class WaveshareEPD4In2V2:
             return
         if status == "processing":
             offset_y = (-1, 0, 1, 0)[animation_frame % 4]
-            left_segment = (
-                center_x - self._scaled_offset(22, scale),
-                center_y + self._scaled_offset(4 + offset_y, scale),
-                center_x - self._scaled_offset(4, scale),
-                center_y + self._scaled_offset(2 + offset_y, scale),
+            draw.line(
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(4 + offset_y, scale),
+                    center_x - self._scaled_offset(4, scale),
+                    center_y + self._scaled_offset(2 + offset_y, scale),
+                ),
+                fill=0,
+                width=line_width,
             )
-            right_segment = (
-                center_x + self._scaled_offset(4, scale),
-                center_y + self._scaled_offset(2 + offset_y, scale),
-                center_x + self._scaled_offset(22, scale),
-                center_y + self._scaled_offset(4 + offset_y, scale),
+            draw.line(
+                (
+                    center_x + self._scaled_offset(4, scale),
+                    center_y + self._scaled_offset(2 + offset_y, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(4 + offset_y, scale),
+                ),
+                fill=0,
+                width=line_width,
             )
-            draw.line(left_segment, fill=0, width=line_width)
-            draw.line(right_segment, fill=0, width=line_width)
             return
         if status == "answering":
             openness = (8, 11, 7, 10)[animation_frame % 4]
@@ -1115,345 +1791,6 @@ class WaveshareEPD4In2V2:
             fill=0,
             width=line_width,
         )
-
-    def _prepare_image(self, image: object):
-        if hasattr(image, "rotate") and hasattr(image, "size"):
-            width, height = image.size
-            if (width, height) == self.canvas_size and self.rotation_degrees != 0:
-                return image.rotate(self.rotation_degrees, expand=True)
-        return image
-
-    # AUDIT-FIX(#4): Validate the prepared image before touching hardware so bad caller input does not masquerade as an SPI/display failure.
-    def _validate_prepared_image(self, image: object) -> None:
-        size = getattr(image, "size", None)
-        if not isinstance(size, tuple) or len(size) != 2:
-            raise RuntimeError(
-                "Display image must expose a two-value `.size` attribute."
-            )
-
-        width = int(size[0])
-        height = int(size[1])
-        if (width, height) not in self.allowed_image_sizes:
-            raise RuntimeError(
-                "Display image size "
-                f"{(width, height)} does not match expected sizes {self.allowed_image_sizes}."
-            )
-
-    # AUDIT-FIX(#4): Keep the success/failure boundary narrow so render counters are only mutated after a successful hardware update.
-    def _display_prepared_image(self, epd: object, prepared_image: object, *, clear_first: bool) -> None:
-        if clear_first or self._render_count == 0:
-            reason = "clear" if clear_first else "initial"
-            phase = "clear_recovery" if clear_first else "initial_full"
-        elif self.layout_mode == "debug_log":
-            reason = "layout_debug_log"
-            phase = "debug_log_full"
-        elif self.full_refresh_interval > 0 and self._render_count % self.full_refresh_interval == 0:
-            reason = "interval"
-            phase = "interval_full"
-        elif hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
-            reason = "incremental"
-            phase = "steady_fast"
-        else:
-            reason = "fast_unavailable"
-            phase = "steady_full_fallback"
-
-        self._trace_phase_start(phase=phase, reason=reason)
-        started_at = time.monotonic()
-        try:
-            if clear_first or self._render_count == 0:
-                self._safe_emit(
-                    f"display_refresh=full reason={reason} render_count={self._render_count}"
-                )
-                self._init_full(epd)
-                if clear_first and hasattr(epd, "Clear"):
-                    self._safe_emit("display_clear=true")
-                    epd.Clear()
-                prepared = epd.getbuffer(prepared_image)
-                epd.display(prepared)
-                self._render_count = 1
-                self._trace_phase_ok(elapsed_s=time.monotonic() - started_at)
-                return
-
-            if self.layout_mode == "debug_log":
-                self._safe_emit(
-                    f"display_refresh=full reason=layout_debug_log render_count={self._render_count}"
-                )
-                self._init_full(epd)
-                prepared = epd.getbuffer(prepared_image)
-                epd.display(prepared)
-                self._render_count += 1
-                self._trace_phase_ok(elapsed_s=time.monotonic() - started_at)
-                return
-
-            if self.full_refresh_interval > 0 and self._render_count % self.full_refresh_interval == 0:
-                self._safe_emit(
-                    f"display_refresh=full reason=interval render_count={self._render_count}"
-                )
-                self._init_full(epd)
-                prepared = epd.getbuffer(prepared_image)
-                epd.display(prepared)
-                self._render_count += 1
-                self._trace_phase_ok(elapsed_s=time.monotonic() - started_at)
-                return
-
-            if hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
-                # The Waveshare 4.2 V2 vendor partial-refresh path only updates one
-                # RAM plane. For animated status faces that can flip black/white
-                # polarity after a few live refreshes, so prefer the fast path that
-                # refreshes both planes like a normal full render.
-                self._safe_emit(
-                    f"display_refresh=fast reason=incremental render_count={self._render_count}"
-                )
-                self._init_fast(epd)
-                prepared = epd.getbuffer(prepared_image)
-                epd.display_Fast(prepared)
-            else:
-                self._safe_emit(
-                    f"display_refresh=full reason=fast_unavailable render_count={self._render_count}"
-                )
-                self._init_full(epd)
-                prepared = epd.getbuffer(prepared_image)
-                epd.display(prepared)
-            self._render_count += 1
-        except Exception as exc:
-            self._trace_phase_error(exc, elapsed_s=time.monotonic() - started_at)
-            raise
-        self._trace_phase_ok(elapsed_s=time.monotonic() - started_at)
-
-    # AUDIT-FIX(#3): Only instantiate the vendor driver once per wrapper instance and validate its shape before use.
-    def _get_epd(self):
-        if self._epd is None:
-            module = self._load_driver_module()
-            if not hasattr(module, "EPD"):
-                raise RuntimeError("Display driver module does not expose EPD().")
-            epd = module.EPD()
-            self._instrument_epd(epd)
-            self._epd = epd
-        return self._epd
-
-    def _instrument_epd(self, epd: object) -> None:
-        self._wrap_busy_wait(epd)
-        if getattr(epd, "_twinr_runtime_trace_wrapped", False) or not self._trace_enabled():
-            return
-
-        def _wrap_call(method_name: str) -> None:
-            original = getattr(epd, method_name, None)
-            if not callable(original):
-                return
-
-            def _wrapped(*args: object, **kwargs: object) -> object:
-                started_at = time.monotonic()
-                self._trace_event(
-                    "epd_call_start",
-                    phase=self._trace_phase,
-                    method=method_name,
-                    status=self._trace_surface_status,
-                    prev=self._trace_prev_status(),
-                    cmd=self._trace_last_command or "none",
-                )
-                try:
-                    result = original(*args, **kwargs)
-                except Exception as exc:
-                    self._trace_event(
-                        "epd_call_error",
-                        phase=self._trace_phase,
-                        method=method_name,
-                        elapsed_s=time.monotonic() - started_at,
-                        err=type(exc).__name__,
-                        cmd=self._trace_last_command or "none",
-                    )
-                    raise
-                self._trace_event(
-                    "epd_call_end",
-                    phase=self._trace_phase,
-                    method=method_name,
-                    elapsed_s=time.monotonic() - started_at,
-                    cmd=self._trace_last_command or "none",
-                )
-                return result
-
-            setattr(epd, method_name, _wrapped)
-
-        for method_name in (
-            "init",
-            "init_fast",
-            "reset",
-            "display",
-            "display_Fast",
-            "Clear",
-            "TurnOnDisplay",
-            "TurnOnDisplay_Fast",
-        ):
-            _wrap_call(method_name)
-
-        send_command = getattr(epd, "send_command", None)
-        if callable(send_command):
-            def _wrapped_send_command(command: object) -> object:
-                with suppress(Exception):
-                    self._trace_last_command = f"0x{int(command):02X}"
-                self._trace_event(
-                    "epd_command",
-                    phase=self._trace_phase,
-                    cmd=self._trace_last_command or self._normalise_text(command, fallback="?"),
-                )
-                return send_command(command)
-
-            setattr(epd, "send_command", _wrapped_send_command)
-
-        send_data = getattr(epd, "send_data", None)
-        if callable(send_data):
-            def _wrapped_send_data(data: object) -> object:
-                value = self._normalise_text(data, fallback="?")
-                with suppress(Exception):
-                    value = str(int(data))
-                self._trace_event(
-                    "epd_data_byte",
-                    phase=self._trace_phase,
-                    cmd=self._trace_last_command or "none",
-                    value=value,
-                )
-                return send_data(data)
-
-            setattr(epd, "send_data", _wrapped_send_data)
-
-        send_data2 = getattr(epd, "send_data2", None)
-        if callable(send_data2):
-            def _wrapped_send_data2(data: object) -> object:
-                length: int | None = None
-                sample: tuple[int, ...] = ()
-                with suppress(Exception):
-                    length = len(data)
-                if length is not None:
-                    self._trace_spi_write_calls += 1
-                    self._trace_spi_write_bytes += int(length)
-                    with suppress(Exception):
-                        sample = tuple(int(value) for value in list(data[:_TRACE_SPI_COMMAND_SAMPLE_LIMIT]))
-                self._trace_event(
-                    "spi_bulk_write",
-                    phase=self._trace_phase,
-                    cmd=self._trace_last_command or "none",
-                    bytes=length,
-                    sample=sample,
-                    call=self._trace_spi_write_calls,
-                )
-                return send_data2(data)
-
-            setattr(epd, "send_data2", _wrapped_send_data2)
-
-        setattr(epd, "_twinr_runtime_trace_wrapped", True)
-
-    def _wrap_busy_wait(self, epd: object) -> None:
-        """Bound vendor BUSY polling so transient panel faults fail closed.
-
-        Waveshare's generated Python driver loops forever in ``ReadBusy()`` if
-        the panel never releases the BUSY pin during init or refresh. On the Pi
-        that can strand the companion thread inside the first render and leave
-        the panel black until a full service restart. Twinr must convert that
-        path into a recoverable exception so the adapter's existing reset/retry
-        logic can run.
-        """
-
-        if getattr(epd, "_twinr_busy_wait_wrapped", False):
-            return
-        original = getattr(epd, "ReadBusy", None)
-        epdconfig = self._epdconfig_module
-        busy_pin = getattr(epd, "busy_pin", None)
-        if not callable(original) or epdconfig is None or busy_pin is None:
-            return
-        digital_read = self._trace_original_digital_read or getattr(epdconfig, "digital_read", None)
-        delay_ms = self._trace_original_delay_ms or getattr(epdconfig, "delay_ms", None)
-        if not callable(digital_read) or not callable(delay_ms):
-            return
-
-        timeout_s = float(self.busy_timeout_s)
-        poll_delay_ms = _BUSY_POLL_DELAY_MS
-
-        def _bounded_readbusy() -> None:
-            trace_enabled = self._trace_enabled()
-            caller = inspect.stack()[1].function if trace_enabled else ""
-            started_at = time.monotonic()
-            sampled_states: list[tuple[float, int]] = []
-            if trace_enabled:
-                self._trace_event(
-                    "busy_wait_start",
-                    phase=self._trace_phase,
-                    caller=caller,
-                    cmd=self._trace_last_command or "none",
-                    gpio=busy_pin,
-                    status=self._trace_surface_status,
-                    prev=self._trace_prev_status(),
-                )
-            while True:
-                value = int(digital_read(busy_pin))
-                if trace_enabled and value != self._trace_busy_last_value:
-                    self._trace_busy_last_value = value
-                    self._trace_event(
-                        "busy_wait_transition",
-                        phase=self._trace_phase,
-                        caller=caller,
-                        cmd=self._trace_last_command or "none",
-                        gpio=busy_pin,
-                        value=value,
-                        elapsed_s=time.monotonic() - started_at,
-                    )
-                if value == 0:
-                    if trace_enabled:
-                        self._trace_event(
-                            "busy_wait_end",
-                            phase=self._trace_phase,
-                            caller=caller,
-                            cmd=self._trace_last_command or "none",
-                            gpio=busy_pin,
-                            elapsed_s=time.monotonic() - started_at,
-                            samples=tuple(f"{age:.3f}:{state}" for age, state in sampled_states),
-                        )
-                    return
-                if len(sampled_states) < _TRACE_BUSY_SAMPLE_LIMIT:
-                    sampled_states.append((round(time.monotonic() - started_at, 3), value))
-                age_s = time.monotonic() - started_at
-                if age_s >= timeout_s:
-                    self._safe_emit(
-                        " ".join(
-                            (
-                                "display_busy_timeout=true",
-                                f"gpio={busy_pin}",
-                                f"timeout_s={timeout_s:g}",
-                            )
-                        )
-                    )
-                    if trace_enabled:
-                        self._trace_event(
-                            "busy_wait_timeout",
-                            phase=self._trace_phase,
-                            caller=caller,
-                            cmd=self._trace_last_command or "none",
-                            gpio=busy_pin,
-                            elapsed_s=age_s,
-                            samples=tuple(f"{age:.3f}:{state}" for age, state in sampled_states),
-                            status=self._trace_surface_status,
-                            prev=self._trace_prev_status(),
-                        )
-                        self._safe_emit(f"display_trace_gpio=busy_wait_timeout {self._trace_gpio_snapshot()}")
-                        self._safe_emit(f"display_trace_supply=busy_wait_timeout detail={self._trace_supply_snapshot()}")
-                    raise TimeoutError(
-                        "Display BUSY pin stayed active for "
-                        f"{age_s:.1f}s on GPIO {busy_pin}; samples={sampled_states}"
-                    )
-                delay_ms(poll_delay_ms)
-
-        setattr(epd, "ReadBusy", _bounded_readbusy)
-        setattr(epd, "_twinr_busy_wait_wrapped", True)
-
-    def _init_full(self, epd: object) -> None:
-        if not hasattr(epd, "init"):
-            raise RuntimeError("Display driver instance does not expose init().")
-        epd.init()
-
-    def _init_fast(self, epd: object) -> None:
-        if not hasattr(epd, "init_fast"):
-            raise RuntimeError("Display driver instance does not expose init_fast().")
-        speed_mode = getattr(epd, "Seconds_1_5S", 0)
-        epd.init_fast(speed_mode)
 
     def _face_offset(self, status: str, animation_frame: int) -> tuple[int, int]:
         if status == "waiting":
@@ -1613,8 +1950,6 @@ class WaveshareEPD4In2V2:
             self._truncate_text(draw, second_line, max_width=final_width, font=font),
         )
 
-    # AUDIT-FIX(#3): Serialise cache access to avoid duplicate font loads and shared-cache races under concurrent render calls.
-    # AUDIT-FIX(#8): Convert missing Pillow dependency into a clear runtime error while retaining graceful font fallback when files are missing.
     def _font(self, size: int, *, bold: bool) -> object:
         cache_key = f"{'bold' if bold else 'regular'}:{max(8, size)}"
         with self._lock:
@@ -1625,9 +1960,7 @@ class WaveshareEPD4In2V2:
             try:
                 from PIL import ImageFont
             except Exception as exc:
-                raise RuntimeError(
-                    "Pillow is required for Twinr e-paper font rendering."
-                ) from exc
+                raise RuntimeError("Pillow is required for Twinr e-paper font rendering.") from exc
 
             candidates = (
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -1640,6 +1973,7 @@ class WaveshareEPD4In2V2:
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
             )
+
             font = None
             for candidate in candidates:
                 if not Path(candidate).exists():
@@ -1652,7 +1986,6 @@ class WaveshareEPD4In2V2:
             self._font_cache[cache_key] = font
             return font
 
-    # AUDIT-FIX(#9): Keep layout fallbacks narrow; earlier image/draw validation now catches gross misuse before these helpers need to suppress anything.
     def _text_width(self, draw: object, text: str, *, font: object | None = None) -> int:
         if not text:
             return 0
@@ -1662,7 +1995,6 @@ class WaveshareEPD4In2V2:
             width = int(text_box[2] - text_box[0])
         return width
 
-    # AUDIT-FIX(#9): Keep layout fallbacks narrow; earlier image/draw validation now catches gross misuse before these helpers need to suppress anything.
     def _text_height(self, draw: object, *, font: object | None = None) -> int:
         height = 12
         with suppress(Exception):
@@ -1692,189 +2024,29 @@ class WaveshareEPD4In2V2:
                 return parsed
         return 1.0
 
-    # AUDIT-FIX(#1): Keep vendor imports pinned to project-local paths and reject path traversal outside project_root.
-    def _resolve_vendor_dir(self, vendor_dir: Path) -> Path:
-        candidate = vendor_dir.expanduser()
-        if not candidate.is_absolute():
-            candidate = self.project_root / candidate
-        resolved = candidate.resolve(strict=False)
-        if not resolved.is_relative_to(self.project_root):
-            raise RuntimeError(
-                "Display vendor directory must stay inside the Twinr project root."
-            )
-        return resolved
-
-    # AUDIT-FIX(#1): Reject symlinked or missing vendor entrypoints before importing executable code from disk.
-    def _validate_vendor_layout(self) -> Path:
-        if self.vendor_dir.is_symlink():
-            raise RuntimeError("Display vendor directory must not be a symlink.")
-
-        package_dir = self.vendor_package_dir
-        if not package_dir.exists():
-            raise RuntimeError(
-                "Display vendor files are missing. Run `hardware/display/setup_display.sh` first."
-            )
-        if not package_dir.is_dir():
-            raise RuntimeError("Display vendor package path is invalid.")
-        if package_dir.is_symlink():
-            raise RuntimeError("Display vendor package path must not be a symlink.")
-
-        resolved_package_dir = package_dir.resolve(strict=True)
-        if not resolved_package_dir.is_relative_to(self.project_root):
-            raise RuntimeError(
-                "Display vendor package must stay inside the Twinr project root."
-            )
-
-        required_files = (
-            resolved_package_dir / "__init__.py",
-            resolved_package_dir / "epdconfig.py",
-            resolved_package_dir / "epd4in2_V2.py",
-        )
-        for required_file in required_files:
-            if not required_file.exists():
-                raise RuntimeError(
-                    "Display vendor files are incomplete. "
-                    "Run `hardware/display/setup_display.sh` again."
-                )
-            if not required_file.is_file():
-                raise RuntimeError(f"Display vendor file path is invalid: {required_file.name}.")
-            if required_file.is_symlink():
-                raise RuntimeError(
-                    f"Display vendor file must not be a symlink: {required_file.name}."
-                )
-
-        return resolved_package_dir
-
-    # AUDIT-FIX(#1): Import the vendor package from exact files instead of mutating sys.path.
-    def _load_exact_vendor_module(
-        self,
-        *,
-        module_name: str,
-        module_path: Path,
-        is_package: bool = False,
-    ) -> object:
-        resolved_path = module_path.resolve(strict=True)
-        existing = sys.modules.get(module_name)
-        if existing is not None and self._module_matches_path(existing, resolved_path):
-            return existing
-
-        if existing is not None:
-            sys.modules.pop(module_name, None)
-
-        spec = importlib.util.spec_from_file_location(
-            module_name,
-            str(resolved_path),
-            submodule_search_locations=[str(resolved_path.parent)] if is_package else None,
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Unable to load display vendor module: {module_name}")
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            gc.collect()
-            raise
-        return module
-
-    def _module_matches_path(self, module: object, expected_path: Path) -> bool:
-        module_file = getattr(module, "__file__", None)
-        if not module_file:
-            return False
-        return Path(module_file).resolve(strict=False) == expected_path.resolve(strict=False)
-
-    def _validate_driver_module_origin(self, module: object, expected_path: Path) -> None:
-        if not self._module_matches_path(module, expected_path.resolve(strict=True)):
-            raise RuntimeError(
-                "Loaded display driver module origin does not match the validated vendor path."
-            )
-
-    # AUDIT-FIX(#5): On failures or shutdown, put the panel to sleep and close the vendor transport layer when available.
-    def _shutdown_hardware(self) -> None:
-        epd = self._epd
-        epdconfig = self._epdconfig_module
-
-        if epd is not None and hasattr(epd, "sleep"):
-            with suppress(Exception):
-                epd.sleep()
-
-        if epdconfig is not None and hasattr(epdconfig, "module_exit"):
-            module_exit = getattr(epdconfig, "module_exit")
-            with suppress(Exception):
-                try:
-                    module_exit(cleanup=True)
-                except TypeError:
-                    module_exit()
-
-    # AUDIT-FIX(#4): After any hardware fault, fully discard cached driver state so the next attempt starts from a clean init path.
-    def _reset_driver_state(self) -> None:
-        self._safe_emit("display_driver_reset=true")
-        self._trace_event(
-            "driver_reset",
-            phase=self._trace_phase,
-            status=self._trace_surface_status,
-            prev=self._trace_prev_status(),
-            cmd=self._trace_last_command or "none",
-        )
-        self._shutdown_hardware()
-        self._drop_cached_vendor_modules()
-
-    def _drop_cached_vendor_modules(self) -> None:
-        """Discard cached vendor modules so the next render uses a fresh import."""
-
-        self._epdconfig_module = None
-        self._driver_module = None
-        self._epd = None
-        self._render_count = 0
-        self._trace_original_digital_read = None
-        self._trace_original_delay_ms = None
-        self._trace_last_command = None
-        self._trace_busy_last_value = None
-        self._trace_spi_write_calls = 0
-        self._trace_spi_write_bytes = 0
-        self._trace_gpio_levels.clear()
-        for module_name in (
-            "waveshare_epd.epd4in2_V2",
-            "waveshare_epd.epdconfig",
-            "waveshare_epd",
-        ):
-            sys.modules.pop(module_name, None)
-        gc.collect()
-
-    # AUDIT-FIX(#2): Collapse whitespace and coerce arbitrary values into safe display strings, especially on error-reporting paths.
     def _normalise_text(self, value: object, *, fallback: str = "") -> str:
-        if value is None:
-            text = fallback
-        else:
-            text = str(value)
+        text = fallback if value is None else str(value)
         text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
         return " ".join(text.split())
 
-    # AUDIT-FIX(#2): Accept string, iterable, or arbitrary objects for detail payloads so callers can pass exception objects without crashing the UI path.
     def _normalise_details(self, details: object) -> tuple[str, ...]:
         if details is None:
             return ()
         if isinstance(details, str):
             text = self._normalise_text(details)
             return (text,) if text else ()
-
         with suppress(TypeError):
-            normalised = tuple(
+            return tuple(
                 text
                 for text in (self._normalise_text(item) for item in details)
                 if text
             )
-            return normalised
-
         text = self._normalise_text(details)
         return (text,) if text else ()
 
     def _normalise_state_fields(self, state_fields: object) -> tuple[tuple[str, str], ...]:
         if state_fields is None:
             return ()
-
         normalised: list[tuple[str, str]] = []
         with suppress(TypeError):
             for item in state_fields:
@@ -1890,14 +2062,10 @@ class WaveshareEPD4In2V2:
                 if len(normalised) >= 6:
                     break
             return tuple(normalised)
-
         text = self._normalise_text(state_fields)
         return (("", text),) if text else ()
 
-    def _normalise_log_sections(
-        self,
-        log_sections: object,
-    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    def _normalise_log_sections(self, log_sections: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
         if log_sections is None:
             return ()
         normalised_sections: list[tuple[str, tuple[str, ...]]] = []
@@ -1917,7 +2085,6 @@ class WaveshareEPD4In2V2:
         text = self._normalise_text(log_sections)
         return ((text or "Log", ()),) if text else ()
 
-    # AUDIT-FIX(#2): Coerce animation_frame defensively so status rendering keeps working even when callers pass floats, strings, or None.
     def _normalise_animation_frame(self, value: object) -> int:
         with suppress(Exception):
             return int(value)
@@ -1927,8 +2094,7 @@ class WaveshareEPD4In2V2:
         layout_mode = self._normalise_text(value, fallback="default").lower() or "default"
         if layout_mode not in _SUPPORTED_LAYOUT_MODES:
             raise RuntimeError(
-                "Display layout must be one of: "
-                + ", ".join(sorted(_SUPPORTED_LAYOUT_MODES))
+                "Display layout must be one of: " + ", ".join(sorted(_SUPPORTED_LAYOUT_MODES))
             )
         return layout_mode
 

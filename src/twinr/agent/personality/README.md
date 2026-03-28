@@ -11,6 +11,7 @@ and snapshot commits through remote-primary state.
 `personality` owns:
 - define typed models for stable character, learned conversation style, humor, relationship context, continuity, place/world awareness, and reflection deltas
 - build ordered prompt layers that preserve Twinr's legacy `SYSTEM` / `PERSONALITY` / `USER` contract
+- mark authority-bearing `SYSTEM` / `PERSONALITY` prompt layers with trusted builder provenance so prompt-authority guards can distinguish them from contextual data
 - render a bounded conversational self-expression and `MINDSHARE` layer so Twinr can naturally speak from ongoing themes without pretending to have a human inner life
 - derive authoritative per-turn steering cues from shared-thread and appetite state so Twinr can decide more consistently when to briefly update, when one calm follow-up is acceptable, and when it should simply observe
 - derive explicit per-topic positive-engagement actions such as `silent`, `hint`, `brief_update`, `ask_one`, and `invite_follow_up` so Twinr can foster welcomed interaction without becoming pushy
@@ -109,6 +110,7 @@ The current signal taxonomy is intentionally structured and conservative:
 - explicit structured reactions like follow-up requests may raise topic engagement faster than passive affinity, but the signal must stay typed and auditable
 - boosted topic engagement must decay over time and let RSS tuning fall back to baseline when the user stops leaning into that topic
 - Twinr's engagement model distinguishes `resonant`, `warm`, `uncertain`, `cooling`, and `avoid`; absence alone must not count as dislike unless repeated prior exposure and non-reengagement are structurally evidenced
+- topics currently classified as `avoid` must be suppressed from surfaced `MINDSHARE`, not merely scored lower, so explicit back-off signals cannot leak into prompt context
 - `MINDSHARE` now also derives a topic-specific `conversation appetite` from those engagement states plus the learned global style profile, so each surfaced theme carries bounded cues for `depth`, `follow-up`, and `proactivity` instead of relying on hidden prompt guesswork
 - `positive_engagement.py` lifts that implicit guidance into explicit turn actions: each surfaced topic resolves generically to `silent`, `hint`, `brief_update`, `ask_one`, or `invite_follow_up`, and the policy must stay topic-generic instead of accreting hardcoded examples
 - `display_impulses.py` and `display_impulse_copy.py` reuse the same generic state for non-voice ambient display moments: reserve-card candidates must stay positive and generic, with an explanatory headline plus a separate CTA line instead of hardcoding specific places, topics, or benchmark phrases

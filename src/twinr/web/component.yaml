@@ -29,9 +29,11 @@ files:
     exports:
       - create_app
   - path: app.py
-    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp/email setup wizard routes, bounded mailbox connection-test orchestration, and managed smart-home integration persistence
+    role: Stable compatibility shim that preserves the `twinr.web.app` import path, helper exports, and monkeypatch surface while delegating the real implementation to `app_impl/`
     exports:
       - create_app
+  - path: app_impl/
+    role: Internal FastAPI implementation package split across auth, shell, ops, integrations/connect, automations, and preference routes
   - path: conversation_lab.py
     role: Portal conversation-lab session storage and real text-turn execution helper
   - path: conversation_lab_vision.py

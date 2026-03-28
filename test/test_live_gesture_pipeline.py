@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.workflows.forensics import WorkflowForensics, bind_workflow_forensics
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
-from twinr.hardware.camera_ai.live_gesture_pipeline import LiveGesturePipeline, _crop_hand_box
+from twinr.hardware.camera_ai.live_gesture_pipeline import (
+    LiveGestureObservePolicy,
+    LiveGesturePipeline,
+    _crop_hand_box,
+)
 from twinr.hardware.camera_ai.models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
 
@@ -604,6 +608,149 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
 
+    def test_observe_user_facing_fast_policy_uses_current_live_hand_roi_only(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _ImageSelectiveRoiRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.95)]],
+                    hand_landmarks=[[_Landmark(0.42, 0.42), _Landmark(0.47, 0.57)]],
+                )
+            ],
+            image_to_result={
+                "frame": _GestureResult(
+                    gestures=[[_Category("Thumb_Up", 0.83)]],
+                    hand_landmarks=[],
+                )
+            },
+        )
+        worker = _RecordingHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(SimpleNamespace(roi_frame_rgb="roi-frame"),),
+                final_timestamp_ms=7000,
+            )
+        )
+        worker._full_frame_results = [
+            SimpleNamespace(
+                detections=(SimpleNamespace(roi_frame_rgb="full-frame-hand"),),
+                final_timestamp_ms=7001,
+            )
+        ]
+        pipeline._hand_landmark_worker = worker
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.0,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            visible_person_boxes=(AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),),
+            person_count=1,
+        )
+
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertEqual(debug_snapshot["resolved_source"], "live_hand_roi")
+        self.assertEqual(debug_snapshot["observe_policy"], "user_facing_fast")
+        self.assertEqual(
+            debug_snapshot["person_roi_block_reason"],
+            "observe_policy_disallows_person_roi_recovery",
+        )
+        self.assertIsNone(debug_snapshot["full_frame_hand_attempt_reason"])
+        self.assertEqual(len(worker.calls), 0)
+        self.assertEqual(len(worker.full_frame_calls), 0)
+        self.assertIsNone(pipeline._runtime._custom)
+
+    def test_observe_user_facing_fast_policy_keeps_live_custom_peace_sign(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                custom_gesture_model_path="custom.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.97)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                )
+            ],
+            custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("peace_sign", 0.91)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                )
+            ],
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.0,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+        )
+
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.91, places=3)
+        self.assertEqual(observation.hand_count, 1)
+        self.assertEqual(debug_snapshot["resolved_source"], "live_stream")
+        self.assertTrue(debug_snapshot["live_custom_enabled"])
+        self.assertTrue(debug_snapshot["observe_policy_enable_custom_live"])
+
+    def test_observe_user_facing_fast_policy_ignores_recent_hand_box_reuse(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _ImageSelectiveRoiRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.95)]],
+                    hand_landmarks=[[_Landmark(0.41, 0.41), _Landmark(0.49, 0.59)]],
+                ),
+                _GestureResult(
+                    gestures=[[_Category("none", 0.95)]],
+                    hand_landmarks=[],
+                ),
+            ],
+            image_to_result={
+                "frame": _GestureResult(
+                    gestures=[[_Category("thumbs_down", 0.88)]],
+                    hand_landmarks=[],
+                )
+            },
+        )
+
+        pipeline.observe(frame_rgb="frame", observed_at=7.0)
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.2,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            visible_person_boxes=(AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),),
+            person_count=1,
+        )
+
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertEqual(debug_snapshot["resolved_source"], "none")
+        self.assertEqual(debug_snapshot["effective_live_hand_box_count"], 0)
+        self.assertEqual(debug_snapshot["live_hand_box_source"], "none")
+        self.assertEqual(
+            debug_snapshot["person_roi_block_reason"],
+            "observe_policy_disallows_person_roi_recovery",
+        )
+
     def test_observe_recovers_symbol_from_primary_person_roi_when_live_path_stays_none(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -698,6 +845,69 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
         self.assertIsNone(observation.fine_hand_gesture_confidence)
         debug_snapshot = pipeline.debug_snapshot()
+        self.assertTrue(debug_snapshot["fresh_live_results_confirm_no_hand"])
+        self.assertEqual(debug_snapshot["resolved_source"], "none")
+        self.assertEqual(debug_snapshot["person_roi_block_reason"], "fresh_live_results_confirm_no_hand")
+
+    def test_observe_blocks_person_roi_when_builtin_no_hand_is_current_but_custom_is_still_pending(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                custom_gesture_model_path="custom.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.98)]],
+                    hand_landmarks=[],
+                )
+            ],
+            custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.98)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.98)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("thumbs_down", 0.91)]],
+                    hand_landmarks=[],
+                )
+            ],
+            custom_async_delay_s=0.35,
+        )
+        pipeline._hand_landmark_worker = _StubHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(SimpleNamespace(roi_frame_rgb="roi-frame"),),
+                final_timestamp_ms=12000,
+            )
+        )
+
+        try:
+            observation = pipeline.observe(
+                frame_rgb="frame",
+                observed_at=12.0,
+                primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+                visible_person_boxes=(AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),),
+                person_count=1,
+            )
+            debug_snapshot = pipeline.debug_snapshot()
+        finally:
+            pipeline.close()
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertIsNone(observation.fine_hand_gesture_confidence)
+        self.assertTrue(debug_snapshot["current_live_builtin_ready"])
+        self.assertFalse(debug_snapshot["current_live_custom_ready"])
         self.assertTrue(debug_snapshot["fresh_live_results_confirm_no_hand"])
         self.assertEqual(debug_snapshot["resolved_source"], "none")
         self.assertEqual(debug_snapshot["person_roi_block_reason"], "fresh_live_results_confirm_no_hand")

@@ -37,7 +37,7 @@ Bounded smoke-test scripts for the Raspberry Pi AI Camera path used by Twinr.
 python3 hardware/piaicam/fetch_mediapipe_models.py
 python3 hardware/piaicam/import_public_seed_dataset.py --dry-run
 python3 hardware/piaicam/import_public_seed_dataset.py --count-per-label 128
-PYTHONPATH=src python3 hardware/piaicam/probe_live_gestures.py --env-file /twinr/.env --duration-s 8 --output /tmp/twinr_gesture_probe.jsonl
+PYTHONPATH=src ./.venv/bin/python hardware/piaicam/probe_live_gestures.py --env-file /twinr/.env --duration-s 8 --output /tmp/twinr_gesture_probe.jsonl
 python3 hardware/piaicam/capture_custom_gesture_dataset.py --label none --count 24
 python3 hardware/piaicam/capture_custom_gesture_dataset.py --label peace_sign --count 40 --interval-s 0.35
 python3 hardware/piaicam/smoke_piaicam.py
@@ -48,6 +48,10 @@ state/mediapipe/model_maker_venv/bin/python hardware/piaicam/train_custom_gestur
 
 Artifacts land under `state/piaicam/runs/<timestamp>/` by default, with a `latest`
 symlink when the output directory is auto-created.
+
+`probe_live_gestures.py` imports the Twinr runtime and therefore needs the
+repo-local Python 3.11 environment, not an arbitrary system `python3`. The
+training helper still belongs in the dedicated Model Maker Python 3.10 venv.
 
 For custom training, use a dedicated local venv on the leading repo. The
 current reliable combination is `mediapipe-model-maker` plus `setuptools<81`,

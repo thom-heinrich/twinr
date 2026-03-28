@@ -12,6 +12,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.agent.workflows import working_feedback as working_feedback_mod
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.rendered_audio_clip import (
     RenderedAudioClipConfigurationError,
@@ -46,6 +47,20 @@ class _FakeFeedbackPlayer:
             if should_stop is not None and should_stop():
                 return
             time.sleep(0.005)
+
+    def play_tone_sequence(self, sequence, *, volume: float, sample_rate: int, gap_ms: int = 0) -> None:
+        del sample_rate, gap_ms
+        self.tone_sequences.append(tuple(sequence))
+        self.tone_volumes.append(volume)
+
+    def stop_playback(self) -> None:
+        return
+
+
+class _ToneOnlyFeedbackPlayer:
+    def __init__(self) -> None:
+        self.tone_sequences: list[tuple[tuple[int, int], ...]] = []
+        self.tone_volumes: list[float] = []
 
     def play_tone_sequence(self, sequence, *, volume: float, sample_rate: int, gap_ms: int = 0) -> None:
         del sample_rate, gap_ms
@@ -106,12 +121,12 @@ class _ImmediateLoopingFeedbackPlayer(_FakeFeedbackPlayer):
             self.looped_twice.set()
 
 
-def _constant_pcm16_bytes(*, duration_s: int = 3, sample_rate: int = 24000, amplitude: int = 8000) -> bytes:
+def _constant_pcm16_bytes(*, duration_s: float = 3.0, sample_rate: int = 24000, amplitude: int = 8000) -> bytes:
     pcm_frame = int(amplitude).to_bytes(2, byteorder="little", signed=True)
-    return pcm_frame * sample_rate * duration_s
+    return pcm_frame * int(round(sample_rate * duration_s))
 
 
-def _constant_pcm16_wav_bytes(*, duration_s: int = 3, sample_rate: int = 24000, amplitude: int = 8000) -> bytes:
+def _constant_pcm16_wav_bytes(*, duration_s: float = 3.0, sample_rate: int = 24000, amplitude: int = 8000) -> bytes:
     buffer = io.BytesIO()
     # pylint: disable=no-member
     with cast(wave.Wave_write, wave.open(buffer, "wb")) as writer:
@@ -135,6 +150,11 @@ def _write_placeholder_processing_asset(temp_dir: str) -> None:
 
 
 class WorkingFeedbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with working_feedback_mod._RENDERED_MEDIA_CACHE_LOCK:
+            working_feedback_mod._RENDERED_MEDIA_CACHE.clear()
+            working_feedback_mod._RENDERED_MEDIA_CACHE_FINALIZERS.clear()
+
     def test_processing_feedback_renders_requested_media_clip_when_available(self) -> None:
         player = _FakeFeedbackPlayer()
 
@@ -170,7 +190,7 @@ class WorkingFeedbackTests(unittest.TestCase):
         self.assertEqual(rendered_spec.playback_speed, 0.65)
 
     def test_processing_feedback_falls_back_to_tones_when_media_render_fails(self) -> None:
-        player = _FakeFeedbackPlayer()
+        player = _ToneOnlyFeedbackPlayer()
         lines: list[str] = []
         profile = WorkingFeedbackProfile(
             delay_ms=0,
@@ -202,7 +222,6 @@ class WorkingFeedbackTests(unittest.TestCase):
             assert stop is not None
             stop()
 
-        self.assertEqual(player.wav_payloads, [])
         self.assertEqual(player.tone_sequences, [((440, 40),)])
         self.assertIn(
             "working_feedback_media_fallback=processing:RenderedAudioClipConfigurationError",
@@ -210,7 +229,7 @@ class WorkingFeedbackTests(unittest.TestCase):
         )
 
     def test_processing_feedback_falls_back_to_tones_when_processing_media_is_missing(self) -> None:
-        player = _FakeFeedbackPlayer()
+        player = _ToneOnlyFeedbackPlayer()
         lines: list[str] = []
         profile = WorkingFeedbackProfile(
             delay_ms=0,
@@ -241,12 +260,11 @@ class WorkingFeedbackTests(unittest.TestCase):
             assert stop is not None
             stop()
 
-        self.assertEqual(player.wav_payloads, [])
         self.assertEqual(player.tone_sequences, [((440, 40),)])
         self.assertIn("working_feedback_media_fallback=processing:missing_asset", lines)
 
     def test_processing_feedback_default_tone_volume_is_reduced(self) -> None:
-        player = _FakeFeedbackPlayer()
+        player = _ToneOnlyFeedbackPlayer()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             stop = None
@@ -267,7 +285,7 @@ class WorkingFeedbackTests(unittest.TestCase):
             assert stop is not None
             stop()
 
-        self.assertEqual(player.tone_volumes, [0.06])
+        self.assertEqual(player.tone_volumes, [0.065])
 
     def test_processing_feedback_stop_suppresses_expected_interrupt_error(self) -> None:
         player = _InterruptingFeedbackPlayer()
@@ -314,6 +332,31 @@ class WorkingFeedbackTests(unittest.TestCase):
                     stop()
 
         self.assertGreaterEqual(len(player.wav_payloads), 2)
+
+    def test_processing_feedback_zero_pause_pcm_path_uses_one_long_lived_playback_request(self) -> None:
+        player = _PCMFeedbackPlayer()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_placeholder_processing_asset(temp_dir)
+            with mock.patch(
+                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                return_value=_constant_pcm16_wav_bytes(duration_s=0.05),
+            ):
+                stop = start_working_feedback_loop(
+                    player,
+                    kind="processing",
+                    sample_rate=24000,
+                    config=TwinrConfig(project_root=temp_dir),
+                    delay_override_ms=0,
+                )
+                try:
+                    self.assertTrue(player.pcm_started.wait(timeout=1.0))
+                finally:
+                    stop()
+
+        self.assertEqual(player.sample_rates, [24000])
+        self.assertEqual(player.channels, [1])
+        self.assertGreaterEqual(len(player.pcm_chunks), 3)
 
     def test_processing_feedback_long_think_pcm_path_quiets_each_second(self) -> None:
         player = _PCMFeedbackPlayer()

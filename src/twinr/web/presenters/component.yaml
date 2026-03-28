@@ -14,6 +14,7 @@ owned_concerns:
   - Build and validate the `/integrations` social-history learning consent panel, including bounded source/window choices and operator-facing import status
   - Build the WhatsApp self-chat wizard page context, including bounded pairing-state rows, persisted onboarding snapshots, and live portal QR rendering, without moving route orchestration or subprocess calls into templates
   - Build the grouped primary shell navigation plus flatter Home, Settings shortcut, and `/advanced` hub card content so the top-level control surface stays short and consistent
+  - Build calmer grouped view models for the main Settings and Activity & Memory pages so everyday operator tasks stay ahead of technical runtime detail
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
   - Build self-coding operator telemetry rows from persisted self-coding state without moving policy into web routes
   - Build the tabbed `/ops/debug` operator context from authoritative runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
@@ -123,9 +124,13 @@ files:
       - _social_history_learning_panel
       - _social_history_learning_sections
   - path: memory.py
-    role: Memory, reminders, and print-related settings sections
+    role: Activity & Memory overview cards, runtime summary metrics, and grouped memory/reminder settings sections
     exports:
       - _memory_sections
+      - build_activity_advanced_metrics
+      - build_activity_overview_cards
+      - build_activity_snapshot_metrics
+      - build_memory_section_groups
   - path: self_coding.py
     role: Self-coding operator telemetry and learned-skill row builder for `/ops/self-coding`
     exports:
@@ -146,10 +151,12 @@ files:
   - path: memory_search.py
     role: Presenter shaping for the read-only `/ops/debug` memory-search tab
   - path: settings.py
-    role: Global settings form sections and adaptive timing card builder
+    role: Grouped global settings page builders and adaptive timing card builder
     exports:
       - _adaptive_timing_view
       - _settings_sections
+      - build_settings_overview_cards
+      - build_settings_section_groups
   - path: voice.py
     role: Voice-profile page context, action results, and guarded capture helpers
     exports:
@@ -198,8 +205,14 @@ public_api:
     - _social_history_learning_panel
     - _social_history_learning_sections
     - _whatsapp_integration_context
+    - build_activity_advanced_metrics
+    - build_activity_overview_cards
+    - build_activity_snapshot_metrics
     - build_email_wizard_page_context
+    - build_memory_section_groups
     - build_self_coding_ops_page_context
+    - build_settings_overview_cards
+    - build_settings_section_groups
     - build_whatsapp_wizard_page_context
     - _voice_action_result
     - _voice_profile_page_context

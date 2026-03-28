@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from git_guard_tool.policy import GuardPolicy
@@ -31,6 +32,17 @@ def _normalize_key(text: str) -> str:
 
 def _normalize_value(text: str) -> str:
     return text.strip().strip(",").strip("\"'").casefold()
+
+
+def _key_matches_sensitive_fragment(key_text: str, fragments: tuple[str, ...]) -> bool:
+    normalized_key = _normalize_key(key_text)
+    key_tokens = tuple(token for token in normalized_key.split("_") if token)
+    key_variants = {normalized_key, *key_tokens}
+    key_variants.update(
+        "_".join(key_tokens[index : index + 2])
+        for index in range(len(key_tokens) - 1)
+    )
+    return any(fragment in key_variants for fragment in fragments)
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -69,6 +81,21 @@ def _iter_token_like_fragments(text: str) -> tuple[str, ...]:
     if current:
         fragments.append("".join(current))
     return tuple(fragments)
+
+
+def _iter_digit_groups(candidate: str) -> tuple[str, ...]:
+    groups: list[str] = []
+    current: list[str] = []
+    for character in candidate:
+        if character.isdigit():
+            current.append(character)
+            continue
+        if current:
+            groups.append("".join(current))
+            current.clear()
+    if current:
+        groups.append("".join(current))
+    return tuple(groups)
 
 
 def _find_assignment(text: str) -> tuple[str, str] | None:
@@ -127,10 +154,32 @@ def _looks_like_small_version(candidate: str, digit_count: int) -> bool:
 def _looks_like_phone_shape(candidate: str) -> bool:
     if candidate and not candidate[-1].isdigit():
         return False
-    separator_count = sum(character in _PHONE_SEPARATORS for character in candidate)
-    if "+" in candidate or "(" in candidate or ")" in candidate:
+    if candidate.count("+") > 1 or ("+" in candidate and not candidate.startswith("+")):
+        return False
+    if candidate.count("/") > 1:
+        return False
+    digit_groups = _iter_digit_groups(candidate)
+    if len(digit_groups) < 2:
+        return False
+    group_lengths = tuple(len(group) for group in digit_groups)
+    if any(length == 1 for length in group_lengths[1:]):
+        return False
+    separator_chars = {
+        character
+        for character in candidate
+        if not character.isdigit() and character != "+"
+    }
+    if separator_chars == {"."} and len(group_lengths) < 3:
+        return False
+    if max(group_lengths) >= 5:
         return True
-    return separator_count >= 2
+    if len(group_lengths) >= 4 and all(length == 2 for length in group_lengths):
+        return separator_chars.issubset({"-", " "})
+    if candidate.startswith("+") and sum(group_lengths) >= 8 and len(group_lengths) >= 3:
+        return True
+    if "(" in candidate and ")" in candidate and max(group_lengths) >= 4:
+        return True
+    return False
 
 
 def _iter_phone_candidates(text: str, *, min_digits: int, max_digits: int) -> tuple[str, ...]:
@@ -172,25 +221,56 @@ def _strip_wrapping_quotes(text: str) -> str:
     return stripped
 
 
-def _looks_like_literal_value(text: str) -> bool:
-    stripped = text.strip()
+def _parse_plain_string_literal(text: str) -> str | None:
+    stripped = text.strip().strip(",")
+    if not stripped:
+        return None
+    try:
+        parsed = ast.parse(stripped, mode="eval")
+    except SyntaxError:
+        return None
+    if isinstance(parsed.body, ast.Constant):
+        if isinstance(parsed.body.value, str):
+            return parsed.body.value
+        if isinstance(parsed.body.value, bytes):
+            try:
+                return parsed.body.value.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+def _looks_like_path_literal(text: str) -> bool:
+    return text.startswith(("/", "./", "../", "~", "\\")) or text.startswith(("http://", "https://"))
+
+
+def _looks_like_regex_literal(text: str) -> bool:
+    return "(?:" in text or "(?P" in text or "\\d" in text or "\\w" in text or "[" in text or "|" in text
+
+
+def _looks_like_bare_literal_value(text: str) -> bool:
+    stripped = text.strip().strip(",")
     if not stripped:
         return False
-    if stripped.startswith(("f\"", "f'", "r\"", "r'", "b\"", "b'")):
-        stripped = stripped[1:]
-    if stripped[0] in {"'", "\""}:
-        return True
-    if any(character in stripped for character in "()[]{}"):
+    if any(character in stripped for character in "\"'`()[]{}"):
         return False
     if any(character.isspace() for character in stripped):
+        return False
+    if any(character in stripped for character in "./:\\"):
         return False
     return True
 
 
 def _looks_like_sensitive_literal_value(value_text: str, *, min_length: int) -> bool:
-    if not _looks_like_literal_value(value_text):
+    parsed_string_literal = _parse_plain_string_literal(value_text)
+    if parsed_string_literal is not None:
+        unwrapped = parsed_string_literal
+        if _looks_like_path_literal(unwrapped) or _looks_like_regex_literal(unwrapped):
+            return False
+    elif _looks_like_bare_literal_value(value_text):
+        unwrapped = _strip_wrapping_quotes(value_text)
+    else:
         return False
-    unwrapped = _strip_wrapping_quotes(value_text)
     normalized = _normalize_value(unwrapped)
     if normalized in {"true", "false", "none", "null"}:
         return False
@@ -304,9 +384,8 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
     assignment = _find_assignment(added_line.text)
     if assignment is not None and not is_test_like_path:
         key_text, value_text = assignment
-        normalized_key = _normalize_key(key_text)
         normalized_value = _normalize_value(value_text)
-        if any(fragment in normalized_key for fragment in policy.content.sensitive_key_fragments):
+        if _key_matches_sensitive_fragment(key_text, policy.content.sensitive_key_fragments):
             if normalized_value not in policy.content.placeholder_values and not _looks_like_placeholder(normalized_value):
                 if _looks_like_sensitive_literal_value(value_text, min_length=policy.content.secret_min_length):
                     issues.append(

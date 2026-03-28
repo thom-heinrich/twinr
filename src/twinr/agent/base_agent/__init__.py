@@ -8,6 +8,58 @@ helpers from this package root. The module stays lazy so importing
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.config import TwinrConfig
+    from twinr.agent.base_agent.contracts import (
+        AgentTextProvider,
+        AgentToolCall,
+        AgentToolResult,
+        CombinedSpeechAgentProvider,
+        CompositeSpeechAgentProvider,
+        ProviderBundle,
+        SpeechToTextProvider,
+        StreamingSpeechEndpointEvent,
+        StreamingSpeechToTextProvider,
+        StreamingSpeechToTextSession,
+        StreamingTranscriptionResult,
+        TextToSpeechProvider,
+        ToolCallingAgentProvider,
+        ToolCallingTurnResponse,
+    )
+    from twinr.agent.base_agent.conversation.adaptive_timing import (
+        AdaptiveListeningWindow,
+        AdaptiveTimingProfile,
+        AdaptiveTimingStore,
+    )
+    from twinr.agent.base_agent.conversation.turn_controller import (
+        StreamingTurnController,
+        ToolCallingTurnDecisionEvaluator,
+        TurnDecision,
+        TurnEvaluationCandidate,
+    )
+    from twinr.agent.base_agent.prompting.personality import (
+        load_personality_instructions,
+        merge_instructions,
+    )
+    from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
+    from twinr.agent.base_agent.state.machine import (
+        InvalidTransitionError,
+        TwinrEvent,
+        TwinrStateMachine,
+        TwinrStatus,
+    )
+    from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
+    from twinr.memory.context_store import (
+        ManagedContextEntry,
+        ManagedContextFileStore,
+        PersistentMemoryEntry,
+        PersistentMemoryMarkdownStore,
+        PromptContextStore,
+    )
+    from twinr.memory.longterm import LongTermMemoryService
+    from twinr.memory.reminders import ReminderEntry, ReminderStore
 
 __all__ = [
     "AdaptiveListeningWindow",

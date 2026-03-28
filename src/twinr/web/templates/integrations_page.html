@@ -5,8 +5,51 @@
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>Integration overview</h2>
-      <p class="section-description">Manage safe external connections here. Email drafts and sends still require explicit approval in the Twinr interaction flow.</p>
+      <h2>Start here</h2>
+      <p class="section-description">Begin with the guided setup pages for mail and WhatsApp. The direct forms for calendar, smart home, and optional learning stay grouped further down.</p>
+    </div>
+  </div>
+  <div class="card-grid">
+    <article class="card">
+      <div class="card-title">{{ email_summary.title }}</div>
+      <div class="card-value">{{ email_summary.status_label }}</div>
+      <div class="card-detail">{{ email_summary.detail }}</div>
+      <div class="link-row">
+        <a class="inline-link" href="{{ email_summary.action_href }}">{{ email_summary.action_label }}</a>
+      </div>
+    </article>
+    <article class="card">
+      <div class="card-title">{{ whatsapp_summary.title }}</div>
+      <div class="card-value">{{ whatsapp_summary.status_label }}</div>
+      <div class="card-detail">{{ whatsapp_summary.detail }}</div>
+      <div class="link-row">
+        <a class="inline-link" href="{{ whatsapp_summary.action_href }}">{{ whatsapp_summary.action_label }}</a>
+      </div>
+    </article>
+    <article class="card">
+      <div class="card-title">Calendar agenda</div>
+      <div class="card-value">{{ calendar_sections|length }} section{{ "" if calendar_sections|length == 1 else "s" }}</div>
+      <div class="card-detail">Review the local agenda feed source, timezone, and bounded event limits.</div>
+      <div class="link-row">
+        <a class="inline-link" href="#calendar-settings">Open calendar settings</a>
+      </div>
+    </article>
+    <article class="card">
+      <div class="card-title">Smart-home control</div>
+      <div class="card-value">{{ smart_home_sections|length }} section{{ "" if smart_home_sections|length == 1 else "s" }}</div>
+      <div class="card-detail">Keep low-risk Hue bridge setup and sensor stream limits grouped in one place.</div>
+      <div class="link-row">
+        <a class="inline-link" href="#smart-home-settings">Open smart-home settings</a>
+      </div>
+    </article>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Guided setup status</h2>
+      <p class="section-description">Email and WhatsApp stay as guided flows so secret handling, pairing, and connection checks remain bounded and operator-visible.</p>
     </div>
   </div>
   <div class="check-list">
@@ -25,150 +68,196 @@
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>{{ email_summary.title }}</h2>
-      <p class="section-description">{{ email_summary.detail }}</p>
+      <h2>Guided setup pages</h2>
+      <p class="section-description">Use the dedicated wizard when one setup has multiple guarded steps, otherwise edit the simpler local forms below.</p>
     </div>
-    <span class="status-pill is-{{ email_summary.status }}">{{ email_summary.status_label }}</span>
   </div>
-  <div class="check-list">
-    {% for item in email_summary.checks %}
-    <article class="check-row">
-      <div class="check-row-main">
-        <div class="check-row-title">{{ item.label }}</div>
-        <div class="check-row-detail">{{ item.detail }}</div>
+  <div class="detail-grid">
+    <article class="detail-card detail-card-wide">
+      <div class="section-header">
+        <div>
+          <h3>{{ email_summary.title }}</h3>
+          <p class="section-description">{{ email_summary.detail }}</p>
+        </div>
+        <span class="status-pill is-{{ email_summary.status }}">{{ email_summary.status_label }}</span>
       </div>
-      <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+      <div class="check-list">
+        {% for item in email_summary.checks %}
+        <article class="check-row">
+          <div class="check-row-main">
+            <div class="check-row-title">{{ item.label }}</div>
+            <div class="check-row-detail">{{ item.detail }}</div>
+          </div>
+          <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+        </article>
+        {% endfor %}
+      </div>
+      <div class="link-row">
+        <a class="link-button" href="{{ email_summary.action_href }}">{{ email_summary.action_label }}</a>
+      </div>
     </article>
-    {% endfor %}
-  </div>
-  <div class="link-row">
-    <a class="link-button" href="{{ email_summary.action_href }}">{{ email_summary.action_label }}</a>
+    <article class="detail-card detail-card-wide">
+      <div class="section-header">
+        <div>
+          <h3>{{ whatsapp_summary.title }}</h3>
+          <p class="section-description">{{ whatsapp_summary.detail }}</p>
+        </div>
+        <span class="status-pill is-{{ whatsapp_summary.status }}">{{ whatsapp_summary.status_label }}</span>
+      </div>
+      <div class="check-list">
+        {% for item in whatsapp_summary.checks %}
+        <article class="check-row">
+          <div class="check-row-main">
+            <div class="check-row-title">{{ item.label }}</div>
+            <div class="check-row-detail">{{ item.detail }}</div>
+          </div>
+          <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+        </article>
+        {% endfor %}
+      </div>
+      <div class="link-row">
+        <a class="link-button" href="{{ whatsapp_summary.action_href }}">{{ whatsapp_summary.action_label }}</a>
+      </div>
+    </article>
   </div>
 </section>
 
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>{{ whatsapp_summary.title }}</h2>
-      <p class="section-description">{{ whatsapp_summary.detail }}</p>
+      <h2>Direct forms and optional setup</h2>
+      <p class="section-description">These areas stay on one page because they are shorter and do not need a full guided wizard.</p>
     </div>
-    <span class="status-pill is-{{ whatsapp_summary.status }}">{{ whatsapp_summary.status_label }}</span>
   </div>
-  <div class="check-list">
-    {% for item in whatsapp_summary.checks %}
-    <article class="check-row">
-      <div class="check-row-main">
-        <div class="check-row-title">{{ item.label }}</div>
-        <div class="check-row-detail">{{ item.detail }}</div>
-      </div>
-      <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
-    </article>
-    {% endfor %}
-  </div>
-  <div class="link-row">
-    <a class="link-button" href="{{ whatsapp_summary.action_href }}">{{ whatsapp_summary.action_label }}</a>
-  </div>
-</section>
 
-<form method="post" action="/integrations" class="stack top-gap">
-  <input type="hidden" name="_integration_id" value="social_history_learning">
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ social_history_panel.title }}</h2>
-        <p class="section-description">{{ social_history_panel.detail }}</p>
-      </div>
-      <span class="status-pill is-{{ social_history_panel.status }}">{{ social_history_panel.status_label }}</span>
-    </div>
-    <div class="check-list">
-      {% for item in social_history_panel.checks %}
-      <article class="check-row">
-        <div class="check-row-main">
-          <div class="check-row-title">{{ item.label }}</div>
-          <div class="check-row-detail">{{ item.detail }}</div>
+  <form method="post" action="/integrations" class="stack">
+    <input type="hidden" name="_integration_id" value="social_history_learning">
+    <details class="panel-disclosure"{% if social_history_panel.status != "ok" %} open{% endif %}>
+      <summary class="panel-disclosure-summary">
+        <div class="section-header">
+          <div>
+            <span class="panel-disclosure-title">{{ social_history_panel.title }}</span>
+            <span class="panel-disclosure-copy">{{ social_history_panel.detail }}</span>
+          </div>
+          <span class="status-pill is-{{ social_history_panel.status }}">{{ social_history_panel.status_label }}</span>
         </div>
-        <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
-      </article>
-      {% endfor %}
-    </div>
-    {% for section in social_history_sections %}
-    <div class="panel-subsection panel-subsection-spaced">
-      <h3 class="subsection-title">{{ section.title }}</h3>
-      <p class="section-description">{{ section.description }}</p>
-      <div class="form-grid">
-        {% for field in section.fields %}
-        {{ render_setting_field(field) }}
+      </summary>
+      <div class="panel-disclosure-body">
+        <div class="check-list">
+          {% for item in social_history_panel.checks %}
+          <article class="check-row">
+            <div class="check-row-main">
+              <div class="check-row-title">{{ item.label }}</div>
+              <div class="check-row-detail">{{ item.detail }}</div>
+            </div>
+            <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+          </article>
+          {% endfor %}
+        </div>
+        {% for section in social_history_sections %}
+        <div class="panel-subsection panel-subsection-spaced">
+          <h3 class="subsection-title">{{ section.title }}</h3>
+          <p class="section-description">{{ section.description }}</p>
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
         {% endfor %}
+        <div class="actions actions-wrap">
+          <button type="submit" name="_integration_action" value="save_social_history" class="button-secondary">{{ social_history_panel.primary_action }}</button>
+          <button type="submit" name="_integration_action" value="save_and_import_social_history">{{ social_history_panel.secondary_action }}</button>
+        </div>
+      </div>
+    </details>
+  </form>
+
+  <form method="post" action="/integrations" class="stack top-gap" id="calendar-settings">
+    <input type="hidden" name="_integration_id" value="calendar_agenda">
+    <details class="panel-disclosure">
+      <summary class="panel-disclosure-summary">
+        <div class="section-header">
+          <div>
+            <span class="panel-disclosure-title">Calendar agenda</span>
+            <span class="panel-disclosure-copy">Set the local ICS source and the bounded agenda view defaults that Twinr may use later.</span>
+          </div>
+          <span class="status-pill is-muted">{{ calendar_sections|length }} section{{ "" if calendar_sections|length == 1 else "s" }}</span>
+        </div>
+      </summary>
+      <div class="panel-disclosure-body">
+        {% for section in calendar_sections %}
+        <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
+          <h3 class="subsection-title">{{ section.title }}</h3>
+          <p class="section-description">{{ section.description }}</p>
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <div class="actions">
+          <button type="submit">Save calendar integration</button>
+        </div>
+      </div>
+    </details>
+  </form>
+
+  <form method="post" action="/integrations" class="stack top-gap" id="smart-home-settings">
+    <input type="hidden" name="_integration_id" value="smart_home_hub">
+    <details class="panel-disclosure">
+      <summary class="panel-disclosure-summary">
+        <div class="section-header">
+          <div>
+            <span class="panel-disclosure-title">Smart Home</span>
+            <span class="panel-disclosure-copy">Keep Hue bridge credentials, timeouts, and bounded sensor streaming in one local advanced area.</span>
+          </div>
+          <span class="status-pill is-muted">{{ smart_home_sections|length }} section{{ "" if smart_home_sections|length == 1 else "s" }}</span>
+        </div>
+      </summary>
+      <div class="panel-disclosure-body">
+        {% for section in smart_home_sections %}
+        <div class="panel-subsection{% if not loop.first %} panel-subsection-spaced{% endif %}">
+          <h3 class="subsection-title">{{ section.title }}</h3>
+          <p class="section-description">{{ section.description }}</p>
+          <div class="form-grid">
+            {% for field in section.fields %}
+            {{ render_setting_field(field) }}
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <div class="actions">
+          <button type="submit">Save smart-home integration</button>
+        </div>
+      </div>
+    </details>
+  </form>
+
+  <details class="panel-disclosure panel-subsection-spaced">
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Storage and scope</span>
+      <span class="panel-disclosure-copy">Where Twinr stores integration state locally and what each managed connection is allowed to do.</span>
+    </summary>
+    <div class="panel-disclosure-body two-column">
+      <div>
+        <h3>Storage</h3>
+        <ul class="plain-list">
+          <li><strong>Integration store</strong> {{ integration_store_path }}</li>
+          <li><strong>Secrets</strong> {{ env_path }}</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Scope</h3>
+        <ul class="plain-list">
+          <li><strong>WhatsApp</strong> One guided self-chat wizard with QR pairing, one allowed number, and groups blocked</li>
+          <li><strong>Email</strong> One guided mailbox wizard with provider presets, approval-first IMAP/SMTP, and visible guardrails</li>
+          <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
+          <li><strong>Smart Home</strong> Local Hue bridge setup for low-risk device control and bounded sensor streams</li>
+        </ul>
       </div>
     </div>
-    {% endfor %}
-    <div class="actions">
-      <button type="submit" name="_integration_action" value="save_social_history" class="button-secondary">{{ social_history_panel.primary_action }}</button>
-      <button type="submit" name="_integration_action" value="save_and_import_social_history">{{ social_history_panel.secondary_action }}</button>
-    </div>
-  </section>
-</form>
-
-<section class="panel two-column">
-  <div>
-    <h2>Storage</h2>
-    <ul class="plain-list">
-      <li><strong>Integration store</strong> {{ integration_store_path }}</li>
-      <li><strong>Secrets</strong> {{ env_path }}</li>
-    </ul>
-  </div>
-  <div>
-    <h2>Scope</h2>
-    <ul class="plain-list">
-      <li><strong>WhatsApp</strong> One guided self-chat wizard with QR pairing, one allowed number, and groups blocked</li>
-      <li><strong>Email</strong> One guided mailbox wizard with provider presets, approval-first IMAP/SMTP, and visible guardrails</li>
-      <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
-      <li><strong>Smart Home</strong> Local Hue bridge setup for low-risk device control and bounded sensor streams</li>
-    </ul>
-  </div>
+  </details>
 </section>
-
-<form method="post" action="/integrations" class="stack top-gap">
-  <input type="hidden" name="_integration_id" value="calendar_agenda">
-  {% for section in calendar_sections %}
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ section.title }}</h2>
-        <p class="section-description">{{ section.description }}</p>
-      </div>
-    </div>
-    <div class="form-grid">
-      {% for field in section.fields %}
-      {{ render_setting_field(field) }}
-      {% endfor %}
-    </div>
-  </section>
-  {% endfor %}
-  <div class="actions">
-    <button type="submit">Save calendar integration</button>
-  </div>
-</form>
-
-<form method="post" action="/integrations" class="stack top-gap">
-  <input type="hidden" name="_integration_id" value="smart_home_hub">
-  {% for section in smart_home_sections %}
-  <section class="panel">
-    <div class="section-header">
-      <div>
-        <h2>{{ section.title }}</h2>
-        <p class="section-description">{{ section.description }}</p>
-      </div>
-    </div>
-    <div class="form-grid">
-      {% for field in section.fields %}
-      {{ render_setting_field(field) }}
-      {% endfor %}
-    </div>
-  </section>
-  {% endfor %}
-  <div class="actions">
-    <button type="submit">Save smart-home integration</button>
-  </div>
-</form>
 {% endblock %}

@@ -8,7 +8,7 @@ tool-calling turns after Twinr executes the requested tools locally.
 from __future__ import annotations
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 from uuid import uuid4
 import copy
 import json
@@ -23,7 +23,6 @@ from twinr.agent.base_agent.contracts import (
     ImageInputLike,
     SearchResponse,
     TextResponse,
-    ToolCallingAgentProvider,
     ToolCallingTurnResponse,
 )
 from twinr.agent.base_agent.conversation.language import user_response_language_instruction
@@ -46,12 +45,26 @@ class _ContinuationState:
     created_monotonic: float
     last_access_monotonic: float
     in_flight: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCompletionPayload:
+    """Store one normalized Groq tool-completion result before continuation exists."""
+
+    text: str
+    tool_calls: tuple[AgentToolCall, ...]
+    response_id: str | None = None
+    request_id: str | None = None
+    model: str | None = None
+    token_usage: object | None = None
+
+
 def _safe_int(value: object) -> int | None:
     """Best-effort convert a value to ``int`` without raising."""
     if value is None:
         return None
     try:
-        return int(value)
+        return int(cast(Any, value))
     except (TypeError, ValueError):
         return None
 def _non_negative_int(value: object, default: int) -> int:
@@ -65,12 +78,18 @@ def _positive_float(value: object, default: float | None) -> float | None:
     if value is None:
         return default
     try:
-        coerced = float(value)
+        coerced = float(cast(Any, value))
     except (TypeError, ValueError):
         return default
     if coerced <= 0:
         return default
     return coerced
+
+
+def _as_text_response(response: GroqTextResponse) -> TextResponse:
+    """Bridge the immutable Groq response dataclass to Twinr's text-response protocol."""
+
+    return cast(TextResponse, response)
 def _groq_request_timeout_seconds(config: TwinrConfig) -> float | None:
     """Read the per-request Groq timeout override from config."""
     # AUDIT-FIX(#1): Use a bounded request timeout with a safe default, while remaining backward compatible with configs that omit the key.
@@ -189,10 +208,10 @@ def _extract_text_fragment(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value.strip()
+        return value
     if isinstance(value, list):
         fragments = [_extract_text_fragment(item) for item in value]
-        return "\n".join(fragment for fragment in fragments if fragment).strip()
+        return "".join(fragment for fragment in fragments if fragment)
     if isinstance(value, dict):
         item_type = str(value.get("type", "")).strip().lower()
         if item_type == "text":
@@ -219,7 +238,7 @@ def _extract_text_fragment(value: object) -> str:
         return _extract_text_fragment(getattr(value, "text"))
     if hasattr(value, "value"):
         return _extract_text_fragment(getattr(value, "value"))
-    return str(value).strip()
+    return str(value)
 def _message_text(message: object) -> str:
     """Extract plain text from a Groq/OpenAI-style assistant message object."""
     # AUDIT-FIX(#7): Extract text recursively from typed SDK content blocks instead of dropping or repr()-stringifying them.
@@ -414,9 +433,11 @@ class GroqAgentTextProvider:
             logger.exception("Support provider streaming fallback failed")
             fallback_text = _text_provider_error_text(self.config)
             _safe_emit_text(on_text_delta, fallback_text)
-            return GroqTextResponse(
-                text=fallback_text,
-                model=self.config.groq_model,
+            return _as_text_response(
+                GroqTextResponse(
+                    text=fallback_text,
+                    model=self.config.groq_model,
+                )
             )
     def _fallback_with_metadata(
         self,
@@ -437,9 +458,11 @@ class GroqAgentTextProvider:
             )
         except Exception:
             logger.exception("Support provider metadata fallback failed")
-            return GroqTextResponse(
-                text=_text_provider_error_text(self.config),
-                model=self.config.groq_model,
+            return _as_text_response(
+                GroqTextResponse(
+                    text=_text_provider_error_text(self.config),
+                    model=self.config.groq_model,
+                )
             )
     def respond_streaming(
         self,
@@ -527,11 +550,13 @@ class GroqAgentTextProvider:
                     allow_web_search=allow_web_search,
                     on_text_delta=on_text_delta,
                 )
-        return GroqTextResponse(
-            text="".join(text_fragments).strip(),
-            response_id=response_id,
-            request_id=request_id,
-            model=model,
+        return _as_text_response(
+            GroqTextResponse(
+                text="".join(text_fragments),
+                response_id=response_id,
+                request_id=request_id,
+                model=model,
+            )
         )
     def respond_with_metadata(
         self,
@@ -575,12 +600,14 @@ class GroqAgentTextProvider:
                 instructions=instructions,
                 allow_web_search=allow_web_search,
             )
-        return GroqTextResponse(
-            text=_message_text(message),
-            response_id=str(getattr(completion, "id", "")).strip() or None,
-            request_id=str(getattr(completion, "_request_id", "")).strip() or None,
-            model=str(getattr(completion, "model", "")).strip() or self.config.groq_model,
-            token_usage=_chat_usage(completion),
+        return _as_text_response(
+            GroqTextResponse(
+                text=_message_text(message),
+                response_id=str(getattr(completion, "id", "")).strip() or None,
+                request_id=str(getattr(completion, "_request_id", "")).strip() or None,
+                model=str(getattr(completion, "model", "")).strip() or self.config.groq_model,
+                token_usage=_chat_usage(completion),
+            )
         )
     def respond_to_images_with_metadata(
         self,
@@ -837,7 +864,15 @@ class GroqToolCallingAgentProvider:
                 used_web_search=False,
                 continuation_token=token,
             )
-        return response
+        return ToolCallingTurnResponse(
+            text=response.text,
+            tool_calls=(),
+            response_id=response.response_id,
+            request_id=response.request_id,
+            model=response.model,
+            token_usage=response.token_usage,
+            used_web_search=False,
+        )
     def continue_turn_streaming(
         self,
         *,
@@ -925,7 +960,7 @@ class GroqToolCallingAgentProvider:
         messages: list[dict[str, Any]],
         *,
         tool_schemas: Sequence[dict[str, Any]],
-    ) -> tuple[ToolCallingTurnResponse, dict[str, Any]]:
+    ) -> tuple[_ToolCompletionPayload, dict[str, Any]]:
         """Execute one Groq tool-completion request and normalize its result."""
         request: dict[str, Any] = {
             "model": self.config.groq_model,
@@ -982,14 +1017,13 @@ class GroqToolCallingAgentProvider:
         if assistant_tool_calls:
             assistant_message["tool_calls"] = assistant_tool_calls
         return (
-            ToolCallingTurnResponse(
+            _ToolCompletionPayload(
                 text=text,
                 tool_calls=tuple(tool_calls),
                 response_id=response_id,
                 request_id=request_id,
                 model=model,
                 token_usage=_chat_usage(completion),
-                used_web_search=False,
             ),
             assistant_message,
         )

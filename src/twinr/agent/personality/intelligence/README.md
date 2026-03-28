@@ -24,6 +24,7 @@ threads.
 - derive mild cross-session cooling from repeated topic switches or non-reengagement, but only when there was prior positive exposure evidence
 - discover RSS or Atom feeds from source pages returned by the live web backend
 - skip individual broken or oversized source pages during discovery instead of aborting the entire discovery/recalibration pass
+- default outbound fetches to HTTP/1.1; only enable HTTP/2 explicitly when the optional `h2` transport dependency is installed
 - recalibrate feed coverage during reflection-style maintenance windows instead of treating discovery as a daily poll
 - refresh due feeds on a calm cadence and translate fresh items into world signals, continuity threads, and condensed awareness threads
 - only let `co-attention` grow on genuinely new shared evidence such as fresh unseen feed items or new awareness-thread updates, not on every successful stale refresh

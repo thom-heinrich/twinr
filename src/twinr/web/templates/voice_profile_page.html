@@ -11,75 +11,122 @@
 <section class="flash error">{{ action_error }}</section>
 {% endif %}
 
-<section class="panel two-column">
-  <div>
-    <h2>Live voice status</h2>
-    <ul class="plain-list">
-      <li><strong>Current runtime view</strong> {{ voice_snapshot_label }}</li>
-      <li><strong>Stored samples</strong> {{ profile_summary.sample_count if profile_summary.enrolled else 0 }}</li>
-      <li><strong>Updated at</strong> {{ profile_summary.updated_at or "—" }}</li>
-      <li><strong>Average sample</strong> {{ profile_summary.average_duration_ms if profile_summary.enrolled else 0 }} ms</li>
-    </ul>
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Start here</h2>
+      <p class="section-description">Review the live voice status first, then capture or verify only when you actually need to teach or check the local voice template.</p>
+    </div>
+    <span class="status-pill is-muted">{{ voice_snapshot_label }}</span>
   </div>
-  <div>
-    <h2>Safety</h2>
-    <ul class="plain-list">
-      <li><strong>Storage</strong> Local template only, no raw audio kept</li>
-      <li><strong>Microphone</strong> Main conversation mic only in phase 1</li>
-      <li><strong>Support bundle</strong> Live voice fields are omitted</li>
-      <li><strong>Store path</strong> {{ profile_summary.store_path }}</li>
-    </ul>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Current runtime view</span>
+      <span class="stat-value stat-value-small">{{ voice_snapshot_label }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Stored samples</span>
+      <span class="stat-value">{{ profile_summary.sample_count if profile_summary and profile_summary.enrolled else 0 }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Updated at</span>
+      <span class="stat-value stat-value-small">{{ profile_summary.updated_at if profile_summary else "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Average sample</span>
+      <span class="stat-value">{{ profile_summary.average_duration_ms if profile_summary and profile_summary.enrolled else 0 }} ms</span>
+    </div>
+  </div>
+
+  <div class="panel-subsection panel-subsection-spaced">
+    <div class="section-header">
+      <div>
+        <h3>Voice actions</h3>
+        <p class="section-description">Enrollment teaches Twinr one local user voice template. Verification records no audio and only shows a local confidence signal.</p>
+      </div>
+    </div>
+    {% if capture_block_reason %}
+    <section class="flash subtle">{{ capture_block_reason }}</section>
+    {% endif %}
+    <div class="actions actions-start">
+      <form method="post" action="/voice-profile">
+        <input type="hidden" name="_action" value="enroll">
+        <button type="submit">Capture and enroll sample</button>
+      </form>
+      <form method="post" action="/voice-profile">
+        <input type="hidden" name="_action" value="verify">
+        <button type="submit">Verify now</button>
+      </form>
+      <form method="post" action="/voice-profile">
+        <input type="hidden" name="_action" value="reset">
+        <button type="submit">Reset profile</button>
+      </form>
+    </div>
   </div>
 </section>
 
 <section class="panel">
   <div class="section-header">
     <div>
-      <h2>Actions</h2>
-      <p class="section-description">Use enrollment to teach Twinr one local user voice template. Verification records no audio and only shows a local confidence signal.</p>
+      <h2>Safety and decision policy</h2>
+      <p class="section-description">The voice profile stays a soft local signal. It should help personalization, but it must never become the only gate for sensitive actions.</p>
     </div>
   </div>
-  {% if capture_block_reason %}
-  <section class="flash subtle">{{ capture_block_reason }}</section>
-  {% endif %}
-  <div class="actions actions-start">
-    <form method="post" action="/voice-profile">
-      <input type="hidden" name="_action" value="enroll">
-      <button type="submit">Capture and enroll sample</button>
-    </form>
-    <form method="post" action="/voice-profile">
-      <input type="hidden" name="_action" value="verify">
-      <button type="submit">Verify now</button>
-    </form>
-    <form method="post" action="/voice-profile">
-      <input type="hidden" name="_action" value="reset">
-      <button type="submit">Reset profile</button>
-    </form>
-  </div>
-</section>
 
-<section class="panel">
-  <div class="section-header">
-    <div>
-      <h2>Policy</h2>
-      <p class="section-description">This is intentionally a soft signal. It should never replace help access, and it should not be the only gate for sending mail or other sensitive actions.</p>
+  <details class="panel-disclosure" open>
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Local safeguards</span>
+      <span class="panel-disclosure-copy">What Twinr stores, what it does not keep, and which microphone path this feature uses.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      <div class="detail-grid">
+        <article class="detail-card">
+          <div class="detail-label">Storage</div>
+          <div class="detail-body">Local template only</div>
+          <div class="field-help">No raw enrollment audio is stored.</div>
+        </article>
+        <article class="detail-card">
+          <div class="detail-label">Microphone</div>
+          <div class="detail-body">Conversation mic</div>
+          <div class="field-help">Phase 1 uses the normal conversation microphone only.</div>
+        </article>
+        <article class="detail-card">
+          <div class="detail-label">Support bundle</div>
+          <div class="detail-body">Omitted</div>
+          <div class="field-help">Live voice-assessment fields do not go into support bundles.</div>
+        </article>
+        <article class="detail-card">
+          <div class="detail-label">Store path</div>
+          <div class="detail-body detail-body-copy">{{ profile_summary.store_path if profile_summary else "Unavailable" }}</div>
+          <div class="field-help">Persistent local voice-profile template storage.</div>
+        </article>
+      </div>
     </div>
-  </div>
-  <div class="check-list">
-    <article class="check-row">
-      <div class="check-row-main">
-        <div class="check-row-title">Likely user</div>
-        <div class="check-row-detail">Twinr may trust personalization more, but still keeps explicit confirmation for risky actions.</div>
+  </details>
+
+  <details class="panel-disclosure panel-subsection-spaced" open>
+    <summary class="panel-disclosure-summary">
+      <span class="panel-disclosure-title">Decision policy</span>
+      <span class="panel-disclosure-copy">How Twinr should interpret a likely-user vs uncertain result.</span>
+    </summary>
+    <div class="panel-disclosure-body">
+      <div class="check-list">
+        <article class="check-row">
+          <div class="check-row-main">
+            <div class="check-row-title">Likely user</div>
+            <div class="check-row-detail">Twinr may trust personalization more, but still keeps explicit confirmation for risky actions.</div>
+          </div>
+          <span class="status-pill is-ok">Soft allow</span>
+        </article>
+        <article class="check-row">
+          <div class="check-row-main">
+            <div class="check-row-title">Uncertain or unknown</div>
+            <div class="check-row-detail">Twinr should stay polite and cautious, not harder to use.</div>
+          </div>
+          <span class="status-pill is-warn">Ask again</span>
+        </article>
       </div>
-      <span class="status-pill is-ok">Soft allow</span>
-    </article>
-    <article class="check-row">
-      <div class="check-row-main">
-        <div class="check-row-title">Uncertain or unknown</div>
-        <div class="check-row-detail">Twinr should stay polite and cautious, not harder to use.</div>
-      </div>
-      <span class="status-pill is-warn">Ask again</span>
-    </article>
-  </div>
+    </div>
+  </details>
 </section>
 {% endblock %}

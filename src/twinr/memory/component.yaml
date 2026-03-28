@@ -92,16 +92,30 @@ files:
       - parse_due_at
       - resolve_timezone
   - path: user_discovery.py
-    role: Guided onboarding, lifelong discovery state, fact review, and memory-routing service
+    role: Compatibility wrapper that preserves the stable guided-discovery import surface
     exports:
       - UserDiscoveryCommitCallbacks
       - UserDiscoveryFact
-      - UserDiscoveryInvitation
+      - UserDiscoveryInvite
       - UserDiscoveryMemoryRoute
       - UserDiscoveryResult
       - UserDiscoveryReviewItem
       - UserDiscoveryService
       - UserDiscoveryState
+      - UserDiscoveryStoredFact
+      - UserDiscoveryTopicState
+  - path: user_discovery_impl/
+    role: Internal guided-discovery package split across helpers, models, persistence, commit routing, selection, and service orchestration
+    exports:
+      - UserDiscoveryCommitCallbacks
+      - UserDiscoveryFact
+      - UserDiscoveryInvite
+      - UserDiscoveryMemoryRoute
+      - UserDiscoveryResult
+      - UserDiscoveryReviewItem
+      - UserDiscoveryService
+      - UserDiscoveryState
+      - UserDiscoveryStateStore
       - UserDiscoveryStoredFact
       - UserDiscoveryTopicDefinition
       - UserDiscoveryTopicState

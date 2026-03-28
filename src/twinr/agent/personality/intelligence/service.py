@@ -1,11 +1,21 @@
+# CHANGELOG: 2026-03-27
+# BUG-1: Fixed false JSON Feed support; discovery now accepts JSON Feed 1.1 advertised as application/feed+json or application/json and refresh parses JSON Feed items correctly.
+# BUG-2: Fixed interest-merge state loss; co_attention_score is now preserved during merges and decayed state is persisted even when refresh skips because nothing is due.
+# BUG-3: Fixed feed lifecycle bugs; permanent redirects update stored feed URLs and 410 Gone deactivates dead subscriptions instead of polling them forever.
+# SEC-1: Blocked SSRF/file-scheme/local-network fetches by default for discovery and refresh, with per-hop redirect revalidation to protect Raspberry Pi home-network deployments.
+# SEC-2: Replaced unsafe XML sniff parsing with defusedxml and bounded streamed HTTP reads to reduce XML-bomb and oversized-response risk from untrusted feeds.
+# IMP-1: Upgraded transport to pooled HTTPX with strict timeouts, resource limits, trust_env=False, HTTP/2 support, and in-process conditional GET caching.
+# IMP-2: Added bounded parallel refresh, stable item IDs from feed-native ids/guid, title/source sanitization, and URL canonicalization to cut duplicate signals and latency.
+
 """Manage RSS-backed place/world intelligence for the personality system.
 
 This service owns three bounded responsibilities:
 
 - persist and mutate the curated subscription set that Twinr uses for calm
   place/world awareness
-- discover RSS/Atom feeds from explicit source pages returned by the web-search
-  backend when the installer or a recalibration pass asks for new sources
+- discover RSS/Atom/JSON feeds from explicit source pages returned by the
+  web-search backend when the installer or a recalibration pass asks for new
+  sources
 - refresh due feeds and convert fresh items into world signals plus continuity
   threads that the background personality loop can commit
 
@@ -15,15 +25,46 @@ continuity updates that higher layers may merge through existing policy gates.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime, parsedate_to_datetime
+from html import unescape
 from html.parser import HTMLParser
 import hashlib
+import ipaddress
+import json
+import socket
+import threading
 from typing import Any
-from urllib.parse import urljoin, urlparse
-import urllib.request
-import xml.etree.ElementTree as ET
+from urllib.parse import urljoin, urlparse, urlunparse
+
+# BREAKING: This upgraded implementation depends on maintained parsing/network
+# libraries that are lightweight enough for Raspberry Pi 4 deployments.
+try:
+    import feedparser
+except ImportError as exc:  # pragma: no cover - dependency contract
+    raise RuntimeError(
+        "WorldIntelligenceService requires feedparser>=6.0.12. "
+        "Install with: pip install feedparser>=6.0.12"
+    ) from exc
+
+try:
+    import httpx
+except ImportError as exc:  # pragma: no cover - dependency contract
+    raise RuntimeError(
+        "WorldIntelligenceService requires httpx>=0.28. "
+        "Install with: pip install httpx>=0.28"
+    ) from exc
+
+try:
+    from defusedxml import ElementTree as SafeET
+except ImportError as exc:  # pragma: no cover - dependency contract
+    raise RuntimeError(
+        "WorldIntelligenceService requires defusedxml>=0.7.1. "
+        "Install with: pip install defusedxml>=0.7.1"
+    ) from exc
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.intelligence.models import (
@@ -41,17 +82,54 @@ from twinr.agent.personality.intelligence.store import (
     WorldIntelligenceStore,
 )
 from twinr.agent.personality.models import ContinuityThread, WorldSignal
-from twinr.display.news_ticker import DisplayNewsTickerFetcher
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
+
+_DEFAULT_USER_AGENT = "TwinrWorldIntelligence/2026.03"
 _SUPPORTED_FEED_MIME_TYPES = frozenset(
     {
         "application/rss+xml",
         "application/atom+xml",
         "application/feed+json",
+        "application/json",
+        "application/xml",
+        "text/xml",
+    }
+)
+_SUPPORTED_DISCOVERY_LINK_MIME_TYPES = frozenset(
+    {
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/feed+json",
+        "application/json",
+        "application/xml",
+        "text/xml",
     }
 )
 _MAX_DISCOVERY_BYTES = 512 * 1024
+_MAX_FEED_BYTES = 2 * 1024 * 1024
+_MAX_REDIRECTS = 5
+_DEFAULT_CONNECT_TIMEOUT_S = 2.0
+_DEFAULT_POOL_TIMEOUT_S = 2.0
+_DEFAULT_MAX_PARALLEL_REFRESHES = 4
+_DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 8
+_DEFAULT_KEEPALIVE_EXPIRY_S = 30.0
+_PRIVATE_HOST_LABELS = frozenset({"localhost", "localhost.localdomain"})
+
+
+def _http2_enabled(requested: bool) -> bool:
+    """Enable HTTP/2 only when the optional h2 dependency is available."""
+
+    if not requested:
+        return False
+    try:
+        import h2  # noqa: F401  # pylint: disable=import-error
+    except Exception as exc:
+        raise RuntimeError(
+            "HTTP/2 support requires the optional h2 package "
+            "(for example `pip install httpx[http2]` or `pip install h2<5,>=3`)."
+        ) from exc
+    return True
 
 
 def _utcnow() -> datetime:
@@ -72,12 +150,34 @@ def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(str(value))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _parse_http_datetime(value: str | None) -> datetime | None:
+    """Parse one RFC-2822/RFC-7231 HTTP datetime value."""
+
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_http_datetime(value: datetime | None) -> str | None:
+    """Format one datetime for HTTP conditional headers."""
+
+    if value is None:
+        return None
+    return format_datetime(value.astimezone(timezone.utc), usegmt=True)
 
 
 def _clean_text(value: object | None) -> str:
@@ -86,6 +186,53 @@ def _clean_text(value: object | None) -> str:
     if value is None:
         return ""
     return " ".join(str(value).split()).strip()
+
+
+def _truncate_text(value: object | None, *, maximum: int) -> str:
+    """Return one bounded single-line text value."""
+
+    cleaned = _clean_text(value)
+    if len(cleaned) <= maximum:
+        return cleaned
+    if maximum <= 1:
+        return cleaned[:maximum]
+    return cleaned[: maximum - 1].rstrip() + "…"
+
+
+class _PlainTextExtractor(HTMLParser):
+    """Extract readable text from small HTML fragments."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return _clean_text(" ".join(self.parts))
+
+
+def _to_plain_text(value: object | None, *, maximum: int = 280) -> str:
+    """Convert one short HTML-ish fragment into bounded plain text."""
+
+    cleaned = _clean_text(value)
+    if not cleaned:
+        return ""
+    if "<" in cleaned or "&" in cleaned:
+        parser = _PlainTextExtractor()
+        try:
+            parser.feed(cleaned)
+            parser.close()
+            extracted = parser.text()
+            if extracted:
+                cleaned = extracted
+            else:
+                cleaned = unescape(cleaned)
+        except Exception:
+            cleaned = unescape(cleaned)
+    return _truncate_text(cleaned, maximum=maximum)
 
 
 def _token_set(value: object | None) -> frozenset[str]:
@@ -103,26 +250,43 @@ def _host_label(url: str) -> str:
     host = urlparse(url).netloc.strip().casefold()
     if host.startswith("www."):
         host = host[4:]
-    return host or "Feed"
+    return _truncate_text(host or "Feed", maximum=80)
+
+
+def _canonicalize_http_url(url: str) -> str:
+    """Normalize one HTTP(S) URL into a stable canonical text form."""
+
+    cleaned = _clean_text(url)
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"}:
+        raise ValueError("world_intelligence_unsupported_url_scheme")
+    if parsed.username or parsed.password:
+        raise ValueError("world_intelligence_url_userinfo_not_allowed")
+    hostname = (parsed.hostname or "").strip().casefold()
+    if not hostname:
+        raise ValueError("world_intelligence_url_missing_host")
+    port = parsed.port
+    host_port = hostname
+    if ":" in hostname and not hostname.startswith("["):
+        host_port = f"[{hostname}]"
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        host_port = f"{host_port}:{port}"
+    path = parsed.path or "/"
+    return urlunparse((scheme, host_port, path, "", parsed.query, ""))
+
+
+def _normalize_candidate_url(url: object | None) -> str:
+    """Normalize one externally supplied URL candidate or raise."""
+
+    return _canonicalize_http_url(_clean_text(url))
 
 
 def _subscription_id(feed_url: str) -> str:
     """Return a stable subscription id for one feed URL."""
 
-    digest = hashlib.sha1(feed_url.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(feed_url.encode("utf-8")).hexdigest()[:12]
     return f"feed:{digest}"
-
-
-def _feed_item_id(item: WorldFeedItem) -> str:
-    """Return a stable item identifier for one fetched feed item."""
-
-    link = _clean_text(item.link)
-    if link:
-        return link
-    published_at = _clean_text(item.published_at)
-    if published_at:
-        return f"{item.feed_url}::{published_at}::{item.title}"
-    return f"{item.feed_url}::{item.title}"
 
 
 def _clamp(value: float, *, minimum: float, maximum: float) -> float:
@@ -135,6 +299,194 @@ def _clamp(value: float, *, minimum: float, maximum: float) -> float:
     return value
 
 
+def _signal_ongoing_interest_score(signal: WorldInterestSignal) -> float:
+    """Return one normalized ongoing-interest score for ranking math."""
+
+    return 0.0 if signal.ongoing_interest_score is None else signal.ongoing_interest_score
+
+
+def _signal_co_attention_score(signal: WorldInterestSignal) -> float:
+    """Return one normalized co-attention score for ranking math."""
+
+    return 0.0 if signal.co_attention_score is None else signal.co_attention_score
+
+
+def _subscription_base_priority(subscription: WorldFeedSubscription) -> float:
+    """Return the baseline priority Twinr should relax back toward."""
+
+    return subscription.priority if subscription.base_priority is None else subscription.base_priority
+
+
+def _subscription_base_refresh_interval_hours(subscription: WorldFeedSubscription) -> int:
+    """Return the baseline refresh cadence Twinr should relax back toward."""
+
+    if subscription.base_refresh_interval_hours is None:
+        return subscription.refresh_interval_hours
+    return subscription.base_refresh_interval_hours
+
+
+def _media_type(content_type: str | None) -> str:
+    """Return the lower-cased media type without parameters."""
+
+    raw = _clean_text(content_type)
+    if not raw:
+        return "application/octet-stream"
+    return raw.split(";", 1)[0].strip().casefold() or "application/octet-stream"
+
+
+def _extract_charset(content_type: str | None) -> str | None:
+    """Extract one charset parameter from a content-type header."""
+
+    raw = _clean_text(content_type)
+    if not raw:
+        return None
+    for part in raw.split(";")[1:]:
+        key, _, value = part.partition("=")
+        if key.strip().casefold() == "charset":
+            charset = value.strip().strip('"').strip("'")
+            return charset or None
+    return None
+
+
+def _decode_text(payload: bytes, content_type: str | None) -> str:
+    """Decode one HTTP payload into text with a conservative fallback."""
+
+    charset = _extract_charset(content_type) or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def _is_json_feed_document(text: str) -> bool:
+    """Return whether one text document looks like JSON Feed."""
+
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(document, dict):
+        return False
+    version = _clean_text(document.get("version"))
+    return version.startswith("https://jsonfeed.org/version/")
+
+
+def _looks_like_feed_document(*, text: str, content_type: str) -> bool:
+    """Return whether one fetched document is already a feed."""
+
+    media_type = _media_type(content_type)
+    if media_type in {"application/feed+json", "application/json"}:
+        return _is_json_feed_document(text)
+    if media_type in _SUPPORTED_FEED_MIME_TYPES:
+        if _is_json_feed_document(text):
+            return True
+    stripped = text.lstrip()
+    if not stripped.startswith("<"):
+        return False
+    try:
+        root = SafeET.fromstring(text)
+    except Exception:
+        return False
+    local_name = str(root.tag).rsplit("}", 1)[-1].casefold()
+    return local_name in {"rss", "feed", "rdf"}
+
+
+def _struct_time_to_datetime(value: Any) -> datetime | None:
+    """Convert one feedparser date tuple into UTC datetime."""
+
+    if not value:
+        return None
+    try:
+        return datetime(
+            int(value.tm_year),
+            int(value.tm_mon),
+            int(value.tm_mday),
+            int(value.tm_hour),
+            int(value.tm_min),
+            int(value.tm_sec),
+            tzinfo=timezone.utc,
+        )
+    except Exception:
+        return None
+
+
+def _parse_json_datetime(value: object | None) -> datetime | None:
+    """Parse one JSON Feed datetime string into UTC."""
+
+    if value is None:
+        return None
+    return _parse_iso(_clean_text(value))
+
+
+def _candidate_entry_link(entry: Any) -> str:
+    """Return one best-effort canonical entry URL."""
+
+    direct_link = _clean_text(getattr(entry, "get", lambda _key, _default=None: None)("link", None))
+    if direct_link:
+        try:
+            return _canonicalize_http_url(direct_link)
+        except ValueError:
+            return direct_link
+    links = getattr(entry, "get", lambda _key, _default=None: None)("links", None) or ()
+    for link in links:
+        href = _clean_text(getattr(link, "get", lambda _key, _default=None: None)("href", None))
+        if not href:
+            continue
+        try:
+            return _canonicalize_http_url(href)
+        except ValueError:
+            return href
+    return ""
+
+
+def _safe_item_fingerprint(
+    *,
+    feed_url: str,
+    native_id: str | None,
+    link: str | None,
+    published_at: str | None,
+    title: str | None,
+) -> str:
+    """Return one stable item identifier."""
+
+    item_id = _clean_text(native_id)
+    if item_id:
+        return item_id
+    normalized_link = _clean_text(link)
+    if normalized_link:
+        return normalized_link
+    published = _clean_text(published_at)
+    headline = _clean_text(title)
+    if published:
+        return f"{feed_url}::{published}::{headline}"
+    return f"{feed_url}::{headline}"
+
+
+def _ip_is_private_or_special(address: Any) -> bool:
+    """Return whether one IP should be blocked for outbound fetches."""
+
+    return bool(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _resolve_host_addresses(host: str, port: int) -> tuple[str, ...]:
+    """Resolve one host into a bounded tuple of IP addresses."""
+
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    addresses = []
+    for _family, _socktype, _proto, _canonname, sockaddr in infos:
+        ip_text = _clean_text(sockaddr[0])
+        if ip_text and ip_text not in addresses:
+            addresses.append(ip_text)
+    return tuple(addresses)
+
+
 @dataclass(frozen=True, slots=True)
 class _FetchedDocument:
     """Represent one fetched HTML or feed document."""
@@ -142,10 +494,65 @@ class _FetchedDocument:
     url: str
     text: str
     content_type: str
+    status_code: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchedPayload:
+    """Represent one fetched binary payload plus response metadata."""
+
+    url: str
+    payload: bytes
+    content_type: str
+    status_code: int
+    headers: Mapping[str, str]
+    not_modified: bool = False
+    gone: bool = False
+    permanently_moved_to: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedFeedItem:
+    """Represent one parsed feed item plus the stable id used for dedupe."""
+
+    stable_id: str
+    item: WorldFeedItem
+    published_dt: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedReadResult:
+    """Represent one bounded feed refresh attempt."""
+
+    items: tuple[_ParsedFeedItem, ...]
+    final_feed_url: str
+    status_code: int
+    not_modified: bool = False
+    gone: bool = False
+    permanently_moved_to: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConditionalRequestState:
+    """Persist in-process conditional request headers for one feed URL."""
+
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchedSubscriptionResult:
+    """Represent one due-subscription fetch result before thread merging."""
+
+    subscription: WorldFeedSubscription
+    unseen_items: tuple[_ParsedFeedItem, ...]
+    refreshed: bool
+    had_new_items: bool
+    error: str | None = None
 
 
 class _FeedAutodiscoveryParser(HTMLParser):
-    """Extract RSS/Atom alternate links from one HTML document."""
+    """Extract RSS/Atom/JSON Feed alternate links from one HTML document."""
 
     def __init__(self, *, base_url: str) -> None:
         super().__init__(convert_charrefs=True)
@@ -155,75 +562,59 @@ class _FeedAutodiscoveryParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         """Record one alternate feed link when the tag describes one."""
 
-        if str(tag).strip().casefold() != "link":
-            return
+        normalized_tag = str(tag).strip().casefold()
         normalized = {str(key).strip().casefold(): (value or "") for key, value in attrs if key}
-        rel_tokens = {token.strip().casefold() for token in normalized.get("rel", "").split() if token.strip()}
-        if "alternate" not in rel_tokens:
-            return
-        mime_type = normalized.get("type", "").strip().casefold()
-        if mime_type not in _SUPPORTED_FEED_MIME_TYPES:
-            return
         href = normalized.get("href", "").strip()
         if not href:
             return
+        rel_tokens = {
+            token.strip().casefold()
+            for token in normalized.get("rel", "").split()
+            if token.strip()
+        }
+        mime_type = normalized.get("type", "").strip().casefold()
+        if normalized_tag == "link":
+            if not rel_tokens.intersection({"alternate", "feed"}):
+                return
+            if mime_type and mime_type not in _SUPPORTED_DISCOVERY_LINK_MIME_TYPES:
+                return
+        elif normalized_tag == "a":
+            if mime_type and mime_type not in _SUPPORTED_DISCOVERY_LINK_MIME_TYPES:
+                return
+            lowered_href = href.casefold()
+            if not (
+                rel_tokens.intersection({"alternate", "feed"})
+                or lowered_href.endswith(
+                    (
+                        ".rss",
+                        ".atom",
+                        ".xml",
+                        ".rdf",
+                        "/feed",
+                        "/feed/",
+                        "/rss",
+                        "/rss/",
+                        "/atom",
+                        "/atom/",
+                        "/index.xml",
+                        "/feed.xml",
+                        "/rss.xml",
+                        "/atom.xml",
+                        "/feed.json",
+                        "/index.json",
+                    )
+                )
+            ):
+                return
+        else:
+            return
         resolved = urljoin(self.base_url, href)
-        title = _clean_text(normalized.get("title")) or None
+        title = _to_plain_text(normalized.get("title"), maximum=120) or None
         self.discovered.append((resolved, title))
 
 
-def _default_page_loader(url: str) -> _FetchedDocument:
-    """Fetch one HTML or XML document used for feed autodiscovery."""
-
-    request = urllib.request.Request(url, headers={"User-Agent": "TwinrWorldIntelligence/1.0"})
-    with urllib.request.urlopen(request, timeout=5.0) as response:
-        payload = response.read(_MAX_DISCOVERY_BYTES + 1)
-        content_type = str(response.headers.get("Content-Type") or "application/octet-stream")
-    if len(payload) > _MAX_DISCOVERY_BYTES:
-        raise ValueError("world_intelligence_document_too_large")
-    charset = "utf-8"
-    content_type_parts = [part.strip() for part in content_type.split(";") if part.strip()]
-    for part in content_type_parts[1:]:
-        lower = part.casefold()
-        if lower.startswith("charset="):
-            charset = part.split("=", 1)[-1].strip() or "utf-8"
-            break
-    try:
-        text = payload.decode(charset, errors="replace")
-    except LookupError:
-        text = payload.decode("utf-8", errors="replace")
-    return _FetchedDocument(url=url, text=text, content_type=content_type_parts[0] if content_type_parts else content_type)
-
-
-def _default_feed_reader(
-    feed_url: str,
-    *,
-    max_items: int,
-    timeout_s: float,
-) -> tuple[WorldFeedItem, ...]:
-    """Fetch one RSS or Atom URL through the bounded display feed parser."""
-
-    snapshot = DisplayNewsTickerFetcher(
-        feed_urls=(feed_url,),
-        timeout_s=timeout_s,
-        max_items=max_items,
-    ).fetch()
-    if snapshot.last_error and not snapshot.items:
-        raise RuntimeError(snapshot.last_error)
-    return tuple(
-        WorldFeedItem(
-            feed_url=feed_url,
-            source=item.source,
-            title=item.title,
-            link=item.link,
-            published_at=item.published_at,
-        )
-        for item in snapshot.items
-    )
-
-
 class WorldIntelligenceService:
-    """Persist RSS subscriptions and convert refreshes into personality context."""
+    """Persist feed subscriptions and convert refreshes into personality context."""
 
     def __init__(
         self,
@@ -232,10 +623,11 @@ class WorldIntelligenceService:
         remote_state: LongTermRemoteStateStore | None = None,
         store: WorldIntelligenceStore | None = None,
         now_provider: Callable[[], datetime] = _utcnow,
-        page_loader: Callable[[str], Any] = _default_page_loader,
-        feed_reader: Callable[..., tuple[WorldFeedItem, ...]] = _default_feed_reader,
+        page_loader: Callable[[str], Any] | None = None,
+        feed_reader: Callable[..., Any] | None = None,
         default_refresh_interval_hours: int = 72,
         default_freshness_hours: int = 96,
+        page_timeout_s: float = 5.0,
         feed_timeout_s: float = 4.0,
         max_items_per_refresh: int = 4,
         max_signals_per_subscription: int = 2,
@@ -250,6 +642,17 @@ class WorldIntelligenceService:
         interest_decay_engagement_step: float = 0.08,
         interest_decay_salience_step: float = 0.05,
         interest_retention_days: int = 84,
+        max_parallel_refreshes: int = _DEFAULT_MAX_PARALLEL_REFRESHES,
+        allow_private_network_hosts: bool = False,
+        max_document_bytes: int = _MAX_DISCOVERY_BYTES,
+        max_feed_bytes: int = _MAX_FEED_BYTES,
+        max_redirects: int = _MAX_REDIRECTS,
+        # HTTPX documents HTTP/2 as opt-in and notes HTTP/1.1 is the more
+        # robust default transport. Twinr prefers stable defaults and only opts
+        # in when the caller requests HTTP/2 explicitly.
+        http2: bool = False,
+        http_connect_timeout_s: float = _DEFAULT_CONNECT_TIMEOUT_S,
+        http_pool_timeout_s: float = _DEFAULT_POOL_TIMEOUT_S,
     ) -> None:
         """Store the bounded collaborators used by the intelligence loop."""
 
@@ -257,10 +660,10 @@ class WorldIntelligenceService:
         self.remote_state = remote_state
         self.store = store or RemoteStateWorldIntelligenceStore()
         self.now_provider = now_provider
-        self.page_loader = page_loader
-        self.feed_reader = feed_reader
+
         self.default_refresh_interval_hours = max(24, int(default_refresh_interval_hours))
         self.default_freshness_hours = max(24, int(default_freshness_hours))
+        self.page_timeout_s = max(0.5, float(page_timeout_s))
         self.feed_timeout_s = max(0.5, float(feed_timeout_s))
         self.max_items_per_refresh = max(1, int(max_items_per_refresh))
         self.max_signals_per_subscription = max(1, int(max_signals_per_subscription))
@@ -283,6 +686,44 @@ class WorldIntelligenceService:
             maximum=0.2,
         )
         self.interest_retention_days = max(self.interest_decay_grace_days, int(interest_retention_days))
+
+        self.max_parallel_refreshes = max(1, int(max_parallel_refreshes))
+        # BREAKING: outbound discovery/refresh now blocks private-network targets by default.
+        # Set allow_private_network_hosts=True only for intentionally trusted local feeds.
+        self.allow_private_network_hosts = bool(allow_private_network_hosts)
+        self.max_document_bytes = max(64 * 1024, int(max_document_bytes))
+        self.max_feed_bytes = max(128 * 1024, int(max_feed_bytes))
+        self.max_redirects = max(0, int(max_redirects))
+
+        max_connections = max(4, self.max_parallel_refreshes * 2)
+        keepalive_connections = max(2, min(max_connections, _DEFAULT_MAX_KEEPALIVE_CONNECTIONS))
+        self._http_client = httpx.Client(
+            http2=_http2_enabled(bool(http2)),
+            follow_redirects=False,
+            verify=True,
+            trust_env=False,
+            timeout=httpx.Timeout(
+                timeout=max(self.page_timeout_s, self.feed_timeout_s),
+                connect=max(0.25, float(http_connect_timeout_s)),
+                pool=max(0.25, float(http_pool_timeout_s)),
+            ),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=keepalive_connections,
+                keepalive_expiry=_DEFAULT_KEEPALIVE_EXPIRY_S,
+            ),
+            headers={"User-Agent": _DEFAULT_USER_AGENT},
+        )
+        self._conditional_headers_by_feed_url: dict[str, _ConditionalRequestState] = {}
+        self._conditional_headers_lock = threading.Lock()
+
+        self.page_loader = page_loader or self._default_page_loader
+        self.feed_reader = feed_reader or self._default_feed_reader
+
+    def close(self) -> None:
+        """Close the pooled HTTP client."""
+
+        self._http_client.close()
 
     def configure(
         self,
@@ -334,9 +775,7 @@ class WorldIntelligenceService:
                 request=request,
                 now_iso=now_iso,
             )
-        elif request.action == "list":
-            pass
-        elif request.action == "refresh_now":
+        elif request.action in {"list", "refresh_now"}:
             pass
 
         self.store.save_subscriptions(
@@ -352,7 +791,7 @@ class WorldIntelligenceService:
 
         refresh_result: WorldIntelligenceRefreshResult | None = None
         if request.action == "refresh_now" or request.refresh_after_change:
-            refresh_result = self.maybe_refresh(force=True)
+            refresh_result = self.maybe_refresh(force=True, search_backend=search_backend)
             subscriptions = list(refresh_result.subscriptions)
 
         return WorldIntelligenceConfigResult(
@@ -399,7 +838,7 @@ class WorldIntelligenceService:
         search_backend: object | None = None,
         allow_recalibration: bool = True,
     ) -> WorldIntelligenceRefreshResult:
-        """Recalibrate if allowed and due, then refresh feed subscriptions."""
+        """Recalibrate if allowed and due, then refresh due feed subscriptions."""
 
         subscriptions = list(
             self.store.load_subscriptions(config=self.config, remote_state=self.remote_state)
@@ -422,18 +861,36 @@ class WorldIntelligenceService:
                 force=force,
                 search_backend=search_backend,
             )
+
         due_subscriptions = [
             subscription
             for subscription in subscriptions
             if subscription.active and (force or self._is_due(subscription, now=now))
         ]
         if not due_subscriptions:
+            self.store.save_subscriptions(
+                config=self.config,
+                subscriptions=subscriptions,
+                remote_state=self.remote_state,
+            )
+            self.store.save_state(
+                config=self.config,
+                state=state,
+                remote_state=self.remote_state,
+            )
             return WorldIntelligenceRefreshResult(
                 status="skipped",
                 refreshed=False,
                 subscriptions=tuple(subscriptions),
+                awareness_threads=tuple(state.awareness_threads),
                 checked_at=now_iso,
             )
+
+        fetched_results = self._fetch_due_subscriptions(
+            due_subscriptions=due_subscriptions,
+            now_iso=now_iso,
+        )
+        fetched_by_id = {result.subscription.subscription_id: result for result in fetched_results}
 
         refreshed_ids: list[str] = []
         errors: list[str] = []
@@ -444,71 +901,54 @@ class WorldIntelligenceService:
         subscriptions_with_new_items: set[str] = set()
 
         for subscription in subscriptions:
-            if subscription.subscription_id not in {item.subscription_id for item in due_subscriptions}:
+            result = fetched_by_id.get(subscription.subscription_id)
+            if result is None:
                 updated_subscriptions.append(subscription)
                 continue
 
-            try:
-                items = tuple(
-                    self.feed_reader(
-                        subscription.feed_url,
-                        max_items=self.max_items_per_refresh,
-                        timeout_s=self.feed_timeout_s,
-                    )
+            updated_subscription = result.subscription
+            updated_subscriptions.append(updated_subscription)
+
+            if result.error:
+                errors.append(f"{subscription.subscription_id}: {result.error}")
+                continue
+
+            if result.refreshed:
+                refreshed_ids.append(updated_subscription.subscription_id)
+
+            if not result.had_new_items:
+                continue
+
+            subscriptions_with_new_items.add(updated_subscription.subscription_id)
+            world_signals.extend(
+                self._build_world_signals(
+                    subscription=updated_subscription,
+                    items=result.unseen_items[: self.max_signals_per_subscription],
+                    now=now,
                 )
-                unseen_items, retained_item_ids = self._unseen_items(subscription=subscription, items=items)
-                world_signals.extend(
-                    self._build_world_signals(
-                        subscription=subscription,
-                        items=unseen_items[: self.max_signals_per_subscription],
-                        now=now,
-                    )
+            )
+            awareness_thread = self._merge_awareness_thread(
+                existing_threads=updated_awareness_threads,
+                subscription=updated_subscription,
+                items=result.unseen_items[: self.max_signals_per_subscription],
+                now=now,
+            )
+            updated_awareness_threads = self._upsert_awareness_thread(
+                existing=updated_awareness_threads,
+                thread=awareness_thread,
+            )
+            world_signals.append(
+                self._build_awareness_world_signal(
+                    thread=awareness_thread,
+                    now=now,
                 )
-                if unseen_items:
-                    subscriptions_with_new_items.add(subscription.subscription_id)
-                    awareness_thread = self._merge_awareness_thread(
-                        existing_threads=updated_awareness_threads,
-                        subscription=subscription,
-                        items=unseen_items[: self.max_signals_per_subscription],
-                        now=now,
-                    )
-                    updated_awareness_threads = self._upsert_awareness_thread(
-                        existing=updated_awareness_threads,
-                        thread=awareness_thread,
-                    )
-                    world_signals.append(
-                        self._build_awareness_world_signal(
-                            thread=awareness_thread,
-                            now=now,
-                        )
-                    )
-                    continuity_threads.append(
-                        self._build_continuity_thread(
-                            thread=awareness_thread,
-                            now=now,
-                        )
-                    )
-                updated_subscriptions.append(
-                    replace(
-                        subscription,
-                        updated_at=now_iso,
-                        last_checked_at=now_iso,
-                        last_refreshed_at=now_iso,
-                        last_error=None,
-                        last_item_ids=retained_item_ids,
-                    )
+            )
+            continuity_threads.append(
+                self._build_continuity_thread(
+                    thread=awareness_thread,
+                    now=now,
                 )
-                refreshed_ids.append(subscription.subscription_id)
-            except Exception as exc:
-                errors.append(f"{subscription.subscription_id}: {type(exc).__name__}")
-                updated_subscriptions.append(
-                    replace(
-                        subscription,
-                        updated_at=now_iso,
-                        last_checked_at=now_iso,
-                        last_error=type(exc).__name__,
-                    )
-                )
+            )
 
         synchronized_state = self._synchronize_interest_policy_state(
             state=replace(
@@ -549,6 +989,615 @@ class WorldIntelligenceService:
             checked_at=now_iso,
         )
 
+    # ------------------------- Network / parsing -------------------------
+
+    def _validated_public_url(self, url: str) -> str:
+        """Canonicalize and validate one outbound fetch URL."""
+
+        normalized = _normalize_candidate_url(url)
+        if self.allow_private_network_hosts:
+            return normalized
+
+        parsed = urlparse(normalized)
+        host = (parsed.hostname or "").casefold()
+        if host in _PRIVATE_HOST_LABELS:
+            raise ValueError("world_intelligence_private_host_blocked")
+
+        host_ip: Any | None
+        try:
+            host_ip = ipaddress.ip_address(host)
+        except ValueError:
+            host_ip = None
+
+        if host_ip is not None:
+            if _ip_is_private_or_special(host_ip):
+                raise ValueError("world_intelligence_private_host_blocked")
+            return normalized
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            resolved_addresses = _resolve_host_addresses(host, port)
+        except socket.gaierror as exc:
+            raise ValueError("world_intelligence_host_resolution_failed") from exc
+        if not resolved_addresses:
+            raise ValueError("world_intelligence_host_resolution_failed")
+
+        for address_text in resolved_addresses:
+            address = ipaddress.ip_address(address_text)
+            if _ip_is_private_or_special(address):
+                raise ValueError("world_intelligence_private_host_blocked")
+        return normalized
+
+    def _bounded_read(self, response: httpx.Response, *, max_bytes: int) -> bytes:
+        """Read one HTTP response body with a hard byte cap."""
+
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("world_intelligence_document_too_large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _fetch_payload(
+        self,
+        url: str,
+        *,
+        accept: str,
+        timeout_s: float,
+        max_bytes: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> _FetchedPayload:
+        """Fetch one URL through the pooled HTTP client with bounded redirects."""
+
+        current_url = self._validated_public_url(url)
+        permanent_target: str | None = None
+        headers = dict(request_headers or {})
+        headers["Accept"] = accept
+
+        for _hop in range(self.max_redirects + 1):
+            with self._http_client.stream(
+                "GET",
+                current_url,
+                headers=headers,
+                timeout=httpx.Timeout(
+                    timeout=timeout_s,
+                    connect=min(timeout_s, _DEFAULT_CONNECT_TIMEOUT_S),
+                    pool=min(timeout_s, _DEFAULT_POOL_TIMEOUT_S),
+                ),
+            ) as response:
+                status_code = int(response.status_code)
+                response_headers = {key: value for key, value in response.headers.items()}
+
+                if status_code in {301, 302, 303, 307, 308}:
+                    location = _clean_text(response.headers.get("Location"))
+                    if not location:
+                        raise RuntimeError("world_intelligence_redirect_missing_location")
+                    next_url = self._validated_public_url(urljoin(current_url, location))
+                    if status_code in {301, 308}:
+                        permanent_target = next_url
+                    current_url = next_url
+                    headers = {"Accept": accept}
+                    continue
+
+                content_length = _clean_text(response.headers.get("Content-Length"))
+                if content_length.isdigit() and int(content_length) > max_bytes:
+                    raise ValueError("world_intelligence_document_too_large")
+
+                if status_code == 304:
+                    return _FetchedPayload(
+                        url=current_url,
+                        payload=b"",
+                        content_type=_clean_text(response.headers.get("Content-Type")),
+                        status_code=status_code,
+                        headers=response_headers,
+                        not_modified=True,
+                        permanently_moved_to=permanent_target,
+                    )
+                if status_code == 410:
+                    return _FetchedPayload(
+                        url=current_url,
+                        payload=b"",
+                        content_type=_clean_text(response.headers.get("Content-Type")),
+                        status_code=status_code,
+                        headers=response_headers,
+                        gone=True,
+                        permanently_moved_to=permanent_target,
+                    )
+
+                response.raise_for_status()
+                payload = self._bounded_read(response, max_bytes=max_bytes)
+                return _FetchedPayload(
+                    url=current_url,
+                    payload=payload,
+                    content_type=_clean_text(response.headers.get("Content-Type")),
+                    status_code=status_code,
+                    headers=response_headers,
+                    permanently_moved_to=permanent_target,
+                )
+
+        raise RuntimeError("world_intelligence_too_many_redirects")
+
+    def _default_page_loader(self, url: str) -> _FetchedDocument:
+        """Fetch one HTML or feed document used for autodiscovery."""
+
+        fetched = self._fetch_payload(
+            self._validated_public_url(url),
+            accept=(
+                "text/html,application/xhtml+xml,"
+                "application/feed+json,application/rss+xml,application/atom+xml,"
+                "application/json,application/xml,text/xml;q=0.9,*/*;q=0.1"
+            ),
+            timeout_s=self.page_timeout_s,
+            max_bytes=self.max_document_bytes,
+        )
+        return _FetchedDocument(
+            url=fetched.url,
+            text=_decode_text(fetched.payload, fetched.content_type),
+            content_type=fetched.content_type,
+            status_code=fetched.status_code,
+        )
+
+    def _conditional_headers_for_feed(self, feed_url: str) -> dict[str, str]:
+        """Return conditional GET headers for one feed URL."""
+
+        normalized = self._validated_public_url(feed_url)
+        with self._conditional_headers_lock:
+            cached = self._conditional_headers_by_feed_url.get(normalized)
+        if cached is None:
+            return {}
+        headers: dict[str, str] = {}
+        if cached.etag:
+            headers["If-None-Match"] = cached.etag
+        if cached.last_modified:
+            headers["If-Modified-Since"] = cached.last_modified
+        return headers
+
+    def _remember_feed_conditional_headers(
+        self,
+        *,
+        requested_feed_url: str,
+        final_feed_url: str,
+        headers: Mapping[str, str],
+    ) -> None:
+        """Persist conditional headers for one feed URL in process memory."""
+
+        etag = _clean_text(headers.get("etag"))
+        last_modified = _clean_text(headers.get("last-modified"))
+        if not etag and not last_modified:
+            return
+        state = _ConditionalRequestState(
+            etag=etag or None,
+            last_modified=last_modified or None,
+        )
+        requested = self._validated_public_url(requested_feed_url)
+        final = self._validated_public_url(final_feed_url)
+        with self._conditional_headers_lock:
+            self._conditional_headers_by_feed_url[requested] = state
+            self._conditional_headers_by_feed_url[final] = state
+
+    def _move_conditional_headers(self, *, old_url: str, new_url: str) -> None:
+        """Move any remembered conditional headers onto a new canonical URL."""
+
+        normalized_old = self._validated_public_url(old_url)
+        normalized_new = self._validated_public_url(new_url)
+        with self._conditional_headers_lock:
+            cached = self._conditional_headers_by_feed_url.pop(normalized_old, None)
+            if cached is not None:
+                self._conditional_headers_by_feed_url[normalized_new] = cached
+
+    def _parse_xml_feed_items(
+        self,
+        *,
+        feed_url: str,
+        payload: bytes,
+        content_type: str,
+    ) -> tuple[_ParsedFeedItem, ...]:
+        """Parse one RSS/Atom payload into bounded feed items."""
+
+        parsed = feedparser.parse(
+            payload,
+            response_headers={"content-type": content_type},
+            sanitize_html=True,
+            resolve_relative_uris=True,
+        )
+        if not getattr(parsed, "entries", None) and not _clean_text(parsed.get("feed", {}).get("title")):
+            raise ValueError("world_intelligence_unparseable_feed")
+
+        source_label = _to_plain_text(parsed.get("feed", {}).get("title"), maximum=120) or _host_label(feed_url)
+        entries = []
+        for raw_entry in parsed.entries:
+            published_dt = (
+                _struct_time_to_datetime(raw_entry.get("published_parsed"))
+                or _struct_time_to_datetime(raw_entry.get("updated_parsed"))
+                or _struct_time_to_datetime(raw_entry.get("created_parsed"))
+            )
+            published_at = _isoformat(published_dt) if published_dt is not None else _clean_text(
+                raw_entry.get("published")
+                or raw_entry.get("updated")
+                or raw_entry.get("created")
+            )
+            link = _candidate_entry_link(raw_entry)
+            title = (
+                _to_plain_text(raw_entry.get("title"), maximum=280)
+                or _to_plain_text(raw_entry.get("summary"), maximum=280)
+                or _to_plain_text(link, maximum=280)
+                or "Untitled"
+            )
+            stable_id = _safe_item_fingerprint(
+                feed_url=feed_url,
+                native_id=_clean_text(raw_entry.get("id") or raw_entry.get("guid")),
+                link=link,
+                published_at=published_at,
+                title=title,
+            )
+            entries.append(
+                _ParsedFeedItem(
+                    stable_id=stable_id,
+                    item=WorldFeedItem(
+                        feed_url=feed_url,
+                        source=source_label,
+                        title=title,
+                        link=link,
+                        published_at=published_at,
+                    ),
+                    published_dt=published_dt,
+                )
+            )
+
+        ranked = sorted(
+            enumerate(entries),
+            key=lambda pair: (
+                pair[1].published_dt is not None,
+                pair[1].published_dt or datetime.min.replace(tzinfo=timezone.utc),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        return tuple(item for _index, item in ranked[: self.max_items_per_refresh])
+
+    def _parse_json_feed_items(
+        self,
+        *,
+        feed_url: str,
+        text: str,
+    ) -> tuple[_ParsedFeedItem, ...]:
+        """Parse one JSON Feed document into bounded feed items."""
+
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("world_intelligence_unparseable_json_feed") from exc
+        if not isinstance(document, dict):
+            raise ValueError("world_intelligence_unparseable_json_feed")
+        version = _clean_text(document.get("version"))
+        if not version.startswith("https://jsonfeed.org/version/"):
+            raise ValueError("world_intelligence_unparseable_json_feed")
+
+        source_label = _to_plain_text(document.get("title"), maximum=120) or _host_label(feed_url)
+
+        items = []
+        raw_items = document.get("items") or []
+        if not isinstance(raw_items, list):
+            raise ValueError("world_intelligence_unparseable_json_feed")
+
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            published_dt = (
+                _parse_json_datetime(raw_item.get("date_published"))
+                or _parse_json_datetime(raw_item.get("date_modified"))
+            )
+            published_at = _isoformat(published_dt) if published_dt is not None else _clean_text(
+                raw_item.get("date_published") or raw_item.get("date_modified")
+            )
+
+            link = ""
+            for candidate in (
+                raw_item.get("url"),
+                raw_item.get("external_url"),
+            ):
+                candidate_text = _clean_text(candidate)
+                if not candidate_text:
+                    continue
+                try:
+                    link = _canonicalize_http_url(candidate_text)
+                except ValueError:
+                    link = candidate_text
+                break
+
+            title = (
+                _to_plain_text(raw_item.get("title"), maximum=280)
+                or _to_plain_text(raw_item.get("summary"), maximum=280)
+                or _to_plain_text(raw_item.get("content_text"), maximum=280)
+                or _to_plain_text(raw_item.get("content_html"), maximum=280)
+                or _to_plain_text(link, maximum=280)
+                or "Untitled"
+            )
+            stable_id = _safe_item_fingerprint(
+                feed_url=feed_url,
+                native_id=_clean_text(raw_item.get("id")),
+                link=link,
+                published_at=published_at,
+                title=title,
+            )
+            items.append(
+                _ParsedFeedItem(
+                    stable_id=stable_id,
+                    item=WorldFeedItem(
+                        feed_url=feed_url,
+                        source=source_label,
+                        title=title,
+                        link=link,
+                        published_at=published_at,
+                    ),
+                    published_dt=published_dt,
+                )
+            )
+
+        ranked = sorted(
+            enumerate(items),
+            key=lambda pair: (
+                pair[1].published_dt is not None,
+                pair[1].published_dt or datetime.min.replace(tzinfo=timezone.utc),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        return tuple(item for _index, item in ranked[: self.max_items_per_refresh])
+
+    def _default_feed_reader(
+        self,
+        feed_url: str,
+        *,
+        max_items: int,
+        timeout_s: float,
+    ) -> _FeedReadResult:
+        """Fetch one RSS/Atom/JSON Feed URL through the safe pooled client."""
+
+        normalized_feed_url = self._validated_public_url(feed_url)
+        conditional_headers = self._conditional_headers_for_feed(normalized_feed_url)
+        fetched = self._fetch_payload(
+            normalized_feed_url,
+            accept=(
+                "application/feed+json,application/rss+xml,application/atom+xml,"
+                "application/xml,text/xml,application/json;q=0.95,*/*;q=0.1"
+            ),
+            timeout_s=timeout_s,
+            max_bytes=self.max_feed_bytes,
+            request_headers=conditional_headers,
+        )
+
+        final_feed_url = fetched.permanently_moved_to or fetched.url
+
+        if fetched.not_modified:
+            if fetched.permanently_moved_to and fetched.permanently_moved_to != normalized_feed_url:
+                self._move_conditional_headers(
+                    old_url=normalized_feed_url,
+                    new_url=fetched.permanently_moved_to,
+                )
+            return _FeedReadResult(
+                items=(),
+                final_feed_url=final_feed_url,
+                status_code=fetched.status_code,
+                not_modified=True,
+                permanently_moved_to=fetched.permanently_moved_to,
+            )
+
+        if fetched.gone:
+            return _FeedReadResult(
+                items=(),
+                final_feed_url=final_feed_url,
+                status_code=fetched.status_code,
+                gone=True,
+                permanently_moved_to=fetched.permanently_moved_to,
+            )
+
+        self._remember_feed_conditional_headers(
+            requested_feed_url=normalized_feed_url,
+            final_feed_url=final_feed_url,
+            headers=fetched.headers,
+        )
+
+        media_type = _media_type(fetched.content_type)
+        text = _decode_text(fetched.payload, fetched.content_type)
+        if media_type in {"application/feed+json", "application/json"} or _is_json_feed_document(text):
+            items = self._parse_json_feed_items(feed_url=final_feed_url, text=text)
+        else:
+            items = self._parse_xml_feed_items(
+                feed_url=final_feed_url,
+                payload=fetched.payload,
+                content_type=fetched.content_type or "application/xml",
+            )
+
+        return _FeedReadResult(
+            items=tuple(items[: max(1, int(max_items))]),
+            final_feed_url=final_feed_url,
+            status_code=fetched.status_code,
+            permanently_moved_to=fetched.permanently_moved_to,
+        )
+
+    def _normalize_feed_reader_result(
+        self,
+        *,
+        subscription: WorldFeedSubscription,
+        raw_result: Any,
+    ) -> _FeedReadResult:
+        """Adapt legacy injectable feed readers to the upgraded internal format."""
+
+        if isinstance(raw_result, _FeedReadResult):
+            return raw_result
+
+        legacy_items = tuple(raw_result or ())
+        parsed_items: list[_ParsedFeedItem] = []
+        for item in legacy_items:
+            if isinstance(item, _ParsedFeedItem):
+                parsed_items.append(item)
+                continue
+            stable_id = _safe_item_fingerprint(
+                feed_url=subscription.feed_url,
+                native_id=None,
+                link=_clean_text(getattr(item, "link", None)),
+                published_at=_clean_text(getattr(item, "published_at", None)),
+                title=_clean_text(getattr(item, "title", None)),
+            )
+            parsed_items.append(
+                _ParsedFeedItem(
+                    stable_id=stable_id,
+                    item=WorldFeedItem(
+                        feed_url=_clean_text(getattr(item, "feed_url", None)) or subscription.feed_url,
+                        source=_to_plain_text(getattr(item, "source", None), maximum=120),
+                        title=_to_plain_text(getattr(item, "title", None), maximum=280),
+                        link=_clean_text(getattr(item, "link", None)),
+                        published_at=_clean_text(getattr(item, "published_at", None)),
+                    ),
+                    published_dt=_parse_iso(_clean_text(getattr(item, "published_at", None))),
+                )
+            )
+        return _FeedReadResult(
+            items=tuple(parsed_items[: self.max_items_per_refresh]),
+            final_feed_url=subscription.feed_url,
+            status_code=200,
+        )
+
+    def _fetch_one_due_subscription(
+        self,
+        *,
+        subscription: WorldFeedSubscription,
+        now_iso: str,
+    ) -> _FetchedSubscriptionResult:
+        """Fetch one due subscription and return the updated subscription record."""
+
+        try:
+            raw_result = self.feed_reader(
+                subscription.feed_url,
+                max_items=self.max_items_per_refresh,
+                timeout_s=self.feed_timeout_s,
+            )
+            feed_result = self._normalize_feed_reader_result(
+                subscription=subscription,
+                raw_result=raw_result,
+            )
+
+            updated_feed_url = subscription.feed_url
+            if feed_result.permanently_moved_to:
+                updated_feed_url = self._validated_public_url(feed_result.permanently_moved_to)
+
+            if feed_result.gone:
+                return _FetchedSubscriptionResult(
+                    subscription=replace(
+                        subscription,
+                        active=False,
+                        feed_url=updated_feed_url,
+                        updated_at=now_iso,
+                        last_checked_at=now_iso,
+                        last_refreshed_at=now_iso,
+                        last_error="410_Gone",
+                    ),
+                    unseen_items=(),
+                    refreshed=True,
+                    had_new_items=False,
+                )
+
+            if feed_result.not_modified:
+                return _FetchedSubscriptionResult(
+                    subscription=replace(
+                        subscription,
+                        feed_url=updated_feed_url,
+                        updated_at=now_iso,
+                        last_checked_at=now_iso,
+                        last_refreshed_at=now_iso,
+                        last_error=None,
+                    ),
+                    unseen_items=(),
+                    refreshed=True,
+                    had_new_items=False,
+                )
+
+            unseen_items, retained_item_ids = self._unseen_items(
+                subscription=subscription,
+                items=feed_result.items,
+            )
+            return _FetchedSubscriptionResult(
+                subscription=replace(
+                    subscription,
+                    feed_url=updated_feed_url,
+                    updated_at=now_iso,
+                    last_checked_at=now_iso,
+                    last_refreshed_at=now_iso,
+                    last_error=None,
+                    last_item_ids=retained_item_ids,
+                ),
+                unseen_items=unseen_items,
+                refreshed=True,
+                had_new_items=bool(unseen_items),
+            )
+        except Exception as exc:
+            return _FetchedSubscriptionResult(
+                subscription=replace(
+                    subscription,
+                    updated_at=now_iso,
+                    last_checked_at=now_iso,
+                    last_error=f"{type(exc).__name__}:{_truncate_text(str(exc), maximum=120)}",
+                ),
+                unseen_items=(),
+                refreshed=False,
+                had_new_items=False,
+                error=type(exc).__name__,
+            )
+
+    def _fetch_due_subscriptions(
+        self,
+        *,
+        due_subscriptions: Sequence[WorldFeedSubscription],
+        now_iso: str,
+    ) -> tuple[_FetchedSubscriptionResult, ...]:
+        """Fetch due subscriptions concurrently with a bounded worker pool."""
+
+        if len(due_subscriptions) <= 1 or self.max_parallel_refreshes <= 1:
+            return tuple(
+                self._fetch_one_due_subscription(subscription=subscription, now_iso=now_iso)
+                for subscription in due_subscriptions
+            )
+
+        results_by_id: dict[str, _FetchedSubscriptionResult] = {}
+        max_workers = min(self.max_parallel_refreshes, len(due_subscriptions))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="twinr-feed") as pool:
+            futures = {
+                pool.submit(
+                    self._fetch_one_due_subscription,
+                    subscription=subscription,
+                    now_iso=now_iso,
+                ): subscription.subscription_id
+                for subscription in due_subscriptions
+            }
+            for future in as_completed(futures):
+                subscription_id = futures[future]
+                try:
+                    results_by_id[subscription_id] = future.result()
+                except Exception as exc:  # pragma: no cover - executor safety net
+                    original = next(
+                        item for item in due_subscriptions if item.subscription_id == subscription_id
+                    )
+                    results_by_id[subscription_id] = _FetchedSubscriptionResult(
+                        subscription=replace(
+                            original,
+                            updated_at=now_iso,
+                            last_checked_at=now_iso,
+                            last_error=f"{type(exc).__name__}:{_truncate_text(str(exc), maximum=120)}",
+                        ),
+                        unseen_items=(),
+                        refreshed=False,
+                        had_new_items=False,
+                        error=type(exc).__name__,
+                    )
+        return tuple(results_by_id[subscription.subscription_id] for subscription in due_subscriptions)
+
+    # ------------------------- Discovery -------------------------
+
     def _discover_feed_urls(
         self,
         *,
@@ -569,11 +1618,16 @@ class WorldIntelligenceService:
             date_context=None,
         )
         raw_sources = getattr(result, "sources", ())
-        source_urls = tuple(
-            _clean_text(source)
-            for source in raw_sources
-            if _clean_text(source)
-        )
+        source_urls = []
+        for source in raw_sources:
+            candidate = _clean_text(source)
+            if not candidate:
+                continue
+            try:
+                source_urls.append(self._validated_public_url(candidate))
+            except ValueError:
+                continue
+
         discovered: list[str] = []
         seen: set[str] = set()
         for source_url in source_urls:
@@ -591,7 +1645,7 @@ class WorldIntelligenceService:
     def _discovery_question(self, request: WorldIntelligenceConfigRequest) -> str:
         """Build one calm discovery question for the live web backend."""
 
-        parts = ["Find RSS or Atom feeds"]
+        parts = ["Find RSS, Atom, or JSON feeds"]
         if request.topics:
             parts.append(f"for {', '.join(request.topics)}")
         if request.location_hint or request.region:
@@ -601,37 +1655,43 @@ class WorldIntelligenceService:
     def _discover_feeds_from_source(self, source_url: str) -> tuple[str, ...]:
         """Extract feed URLs from one source page or direct feed URL."""
 
-        document = self.page_loader(source_url)
-        url = _clean_text(getattr(document, "url", None)) or source_url
+        safe_source_url = self._validated_public_url(source_url)
+        document = self.page_loader(safe_source_url)
+        url = _clean_text(getattr(document, "url", None)) or safe_source_url
         content_type = _clean_text(getattr(document, "content_type", None)).casefold()
         text = str(getattr(document, "text", ""))
-        if self._looks_like_feed_document(text=text, content_type=content_type):
-            return (url,)
+        if _looks_like_feed_document(text=text, content_type=content_type):
+            return (self._validated_public_url(url),)
         parser = _FeedAutodiscoveryParser(base_url=url)
         parser.feed(text)
+        parser.close()
         ordered: list[str] = []
         seen: set[str] = set()
         for feed_url, _title in parser.discovered:
-            if feed_url in seen:
+            try:
+                normalized = self._validated_public_url(feed_url)
+            except ValueError:
                 continue
-            seen.add(feed_url)
-            ordered.append(feed_url)
+            if normalized in seen:
+                continue
+            try:
+                candidate_document = self.page_loader(normalized)
+                candidate_content_type = _clean_text(
+                    getattr(candidate_document, "content_type", None)
+                ).casefold()
+                candidate_text = str(getattr(candidate_document, "text", ""))
+                if not _looks_like_feed_document(
+                    text=candidate_text,
+                    content_type=candidate_content_type,
+                ):
+                    continue
+            except Exception:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
         return tuple(ordered)
 
-    def _looks_like_feed_document(self, *, text: str, content_type: str) -> bool:
-        """Return whether one fetched document is already a feed."""
-
-        normalized_type = content_type.casefold()
-        if normalized_type in _SUPPORTED_FEED_MIME_TYPES:
-            return True
-        if "xml" not in normalized_type and not text.lstrip().startswith("<"):
-            return False
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError:
-            return False
-        local_name = str(root.tag).rsplit("}", 1)[-1].casefold()
-        return local_name in {"rss", "feed"}
+    # ------------------------- Subscription mutation -------------------------
 
     def _upsert_subscriptions(
         self,
@@ -643,8 +1703,14 @@ class WorldIntelligenceService:
     ) -> list[WorldFeedSubscription]:
         """Create or update subscriptions for one set of feed URLs."""
 
+        normalized_feed_urls: list[str] = []
+        for url in feed_urls:
+            candidate = _clean_text(url)
+            if not candidate:
+                continue
+            normalized_feed_urls.append(self._validated_public_url(candidate))
+
         ordered: list[WorldFeedSubscription] = []
-        normalized_feed_urls = [_clean_text(url) for url in feed_urls if _clean_text(url)]
         updated_feed_urls = set(normalized_feed_urls)
 
         for subscription in existing:
@@ -703,7 +1769,16 @@ class WorldIntelligenceService:
         """Deactivate matching subscriptions by id or feed URL."""
 
         refs = {_clean_text(item) for item in request.subscription_refs if _clean_text(item)}
-        urls = {_clean_text(item) for item in request.feed_urls if _clean_text(item)}
+        urls = set()
+        for item in request.feed_urls:
+            candidate = _clean_text(item)
+            if not candidate:
+                continue
+            try:
+                urls.add(self._validated_public_url(candidate))
+            except ValueError:
+                urls.add(candidate)
+
         updated: list[WorldFeedSubscription] = []
         for subscription in existing:
             if subscription.subscription_id in refs or subscription.feed_url in urls:
@@ -727,6 +1802,8 @@ class WorldIntelligenceService:
         due_at = checked_at + timedelta(hours=max(24, int(subscription.refresh_interval_hours)))
         return now >= due_at
 
+    # ------------------------- Recalibration / interests -------------------------
+
     def _maybe_recalibrate(
         self,
         *,
@@ -736,7 +1813,7 @@ class WorldIntelligenceService:
         force: bool,
         search_backend: object | None,
     ) -> tuple[list[WorldFeedSubscription], WorldIntelligenceState]:
-        """Discover new feeds from durable interest signals when recalibration is due."""
+        """Discover new feeds from durable interest signals when due."""
 
         if not force and not self._recalibration_due(state=state, now=now):
             return list(subscriptions), state
@@ -766,9 +1843,10 @@ class WorldIntelligenceService:
                 remote_state=self.remote_state,
             )
             return current_subscriptions, updated_state
+
         for interest_signal in self._select_recalibration_candidates(
             subscriptions=current_subscriptions,
-            state=state,
+            state=updated_state,
         ):
             request = WorldIntelligenceConfigRequest(
                 action="discover",
@@ -797,7 +1875,11 @@ class WorldIntelligenceService:
                 now_iso=now_iso,
             )
             updated_state = replace(
-                updated_state,
+                self._synchronize_interest_policy_state(
+                    state=updated_state,
+                    subscriptions=current_subscriptions,
+                    shared_evidence_subscription_ids=(),
+                ),
                 last_discovered_at=now_iso,
                 last_discovery_query=request.query,
             )
@@ -814,7 +1896,7 @@ class WorldIntelligenceService:
         return current_subscriptions, updated_state
 
     def _recalibration_due(self, *, state: WorldIntelligenceState, now: datetime) -> bool:
-        """Return whether the slow RSS recalibration cadence is due."""
+        """Return whether the slow feed recalibration cadence is due."""
 
         recalibrated_at = _parse_iso(state.last_recalibrated_at)
         if recalibrated_at is None:
@@ -846,7 +1928,7 @@ class WorldIntelligenceService:
                 self._engagement_state_rank(item.engagement_state),
                 self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
-                item.ongoing_interest_score,
+                _signal_ongoing_interest_score(item),
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -858,7 +1940,11 @@ class WorldIntelligenceService:
         )
         selected: list[WorldInterestSignal] = []
         for signal in ranked:
-            if any(self._subscription_covers_interest(subscription, signal) for subscription in subscriptions if subscription.active):
+            if any(
+                self._subscription_covers_interest(subscription, signal)
+                for subscription in subscriptions
+                if subscription.active
+            ):
                 continue
             selected.append(signal)
             if len(selected) >= 2:
@@ -866,13 +1952,7 @@ class WorldIntelligenceService:
         return tuple(selected)
 
     def _signal_can_seed_feed_discovery(self, signal: WorldInterestSignal) -> bool:
-        """Return whether one learned interest should drive durable feed discovery.
-
-        Tool-origin live-search signals capture one-off situational awareness.
-        They remain useful as recent-interest evidence, but recalibration should
-        only discover durable feeds from conversation-derived or explicit
-        world-intelligence interests.
-        """
+        """Return whether one learned interest should drive durable feed discovery."""
 
         return not signal.signal_id.startswith("interest:tool:")
 
@@ -903,7 +1983,7 @@ class WorldIntelligenceService:
     def _interest_discovery_question(self, signal: WorldInterestSignal) -> str:
         """Build one calm discovery question for a learned interest."""
 
-        parts = ["Find RSS or Atom feeds"]
+        parts = ["Find RSS, Atom, or JSON feeds"]
         parts.append(f"for {signal.topic}")
         if signal.region:
             parts.append(f"relevant to {signal.region}")
@@ -916,7 +1996,8 @@ class WorldIntelligenceService:
             return _clamp(
                 max(
                     signal.salience * 0.84,
-                    (signal.engagement_score * 0.52) + (signal.ongoing_interest_score * 0.44),
+                    (signal.engagement_score * 0.52)
+                    + (_signal_ongoing_interest_score(signal) * 0.44),
                 ),
                 minimum=0.52,
                 maximum=0.98,
@@ -925,7 +2006,8 @@ class WorldIntelligenceService:
             return _clamp(
                 max(
                     signal.salience * 0.74,
-                    (signal.engagement_score * 0.46) + (signal.ongoing_interest_score * 0.34),
+                    (signal.engagement_score * 0.46)
+                    + (_signal_ongoing_interest_score(signal) * 0.34),
                 ),
                 minimum=0.4,
                 maximum=0.9,
@@ -988,17 +2070,12 @@ class WorldIntelligenceService:
         state: WorldIntelligenceState,
         now_iso: str,
     ) -> list[WorldFeedSubscription]:
-        """Tune covered subscriptions from durable engagement evidence.
-
-        This lets Twinr pay more attention to topics that visibly engage the
-        user without creating duplicate subscriptions or turning refresh into an
-        unbounded poll loop.
-        """
+        """Tune covered subscriptions from durable engagement evidence."""
 
         tuned: list[WorldFeedSubscription] = []
         for subscription in subscriptions:
-            base_priority = subscription.base_priority
-            base_refresh_interval_hours = subscription.base_refresh_interval_hours
+            base_priority = _subscription_base_priority(subscription)
+            base_refresh_interval_hours = _subscription_base_refresh_interval_hours(subscription)
             matching = [
                 signal
                 for signal in state.interest_signals
@@ -1026,7 +2103,7 @@ class WorldIntelligenceService:
                     self._ongoing_interest_rank(item.ongoing_interest),
                     item.explicit,
                     self._co_attention_state_rank(item.co_attention_state),
-                    item.ongoing_interest_score,
+                    _signal_ongoing_interest_score(item),
                     item.engagement_score,
                     item.engagement_count,
                     item.salience,
@@ -1064,10 +2141,17 @@ class WorldIntelligenceService:
             if age_days <= float(self.interest_decay_grace_days):
                 decayed.append(signal)
                 continue
-            decay_steps = int((age_days - float(self.interest_decay_grace_days)) // float(self.interest_decay_step_days)) + 1
+            decay_steps = int(
+                (age_days - float(self.interest_decay_grace_days))
+                // float(self.interest_decay_step_days)
+            ) + 1
             min_engagement = 0.42 if signal.explicit else 0.2
             min_salience = 0.38 if signal.explicit else 0.16
-            ongoing_interest_floor = 0.42 if signal.explicit and signal.engagement_state not in {"cooling", "avoid"} else 0.04
+            ongoing_interest_floor = (
+                0.42
+                if signal.explicit and signal.engagement_state not in {"cooling", "avoid"}
+                else 0.04
+            )
             co_attention_floor = 0.0
             decayed_signal = WorldInterestSignal(
                 signal_id=signal.signal_id,
@@ -1087,7 +2171,7 @@ class WorldIntelligenceService:
                     maximum=1.0,
                 ),
                 ongoing_interest_score=_clamp(
-                    signal.ongoing_interest_score
+                    _signal_ongoing_interest_score(signal)
                     - (decay_steps * max(self.interest_decay_engagement_step, 0.08))
                     - (signal.non_reengagement_count * 0.03)
                     - (signal.deflection_count * 0.06),
@@ -1095,9 +2179,15 @@ class WorldIntelligenceService:
                     maximum=1.0,
                 ),
                 co_attention_score=_clamp(
-                    signal.co_attention_score
+                    _signal_co_attention_score(signal)
                     - (decay_steps * max(self.interest_decay_engagement_step, 0.09))
-                    - (0.06 if signal.engagement_state == "cooling" else 0.12 if signal.engagement_state == "avoid" else 0.0),
+                    - (
+                        0.06
+                        if signal.engagement_state == "cooling"
+                        else 0.12
+                        if signal.engagement_state == "avoid"
+                        else 0.0
+                    ),
                     minimum=co_attention_floor,
                     maximum=1.0,
                 ),
@@ -1138,7 +2228,7 @@ class WorldIntelligenceService:
                 self._engagement_state_rank(item.engagement_state),
                 self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
-                item.ongoing_interest_score,
+                    _signal_ongoing_interest_score(item),
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -1199,14 +2289,24 @@ class WorldIntelligenceService:
                 max(
                     0,
                     current.co_attention_count
-                    - (2 if signal.deflection_count > 0 else 1 if signal.non_reengagement_count > 0 else 0),
+                    - (
+                        2
+                        if signal.deflection_count > 0
+                        else 1
+                        if signal.non_reengagement_count > 0
+                        else 0
+                    ),
                 )
                 if incoming_negative
                 else max(current.co_attention_count, signal.co_attention_count)
             )
-            merged_ongoing_interest_score = (
+            merged_co_attention_score = (
                 _clamp(
-                    min(current.ongoing_interest_score, signal.ongoing_interest_score, merged_score + 0.12)
+                    min(
+                        _signal_co_attention_score(current),
+                        _signal_co_attention_score(signal),
+                        merged_score + 0.12,
+                    )
                     - 0.12
                     - (signal.non_reengagement_count * 0.05)
                     - (signal.deflection_count * 0.08),
@@ -1215,7 +2315,35 @@ class WorldIntelligenceService:
                 )
                 if incoming_negative
                 else _clamp(
-                    max(current.ongoing_interest_score, signal.ongoing_interest_score)
+                    max(
+                        _signal_co_attention_score(current),
+                        _signal_co_attention_score(signal),
+                    )
+                    + min(0.12, incoming_positive_bonus)
+                    - (existing_negative_penalty * 0.45),
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
+            merged_ongoing_interest_score = (
+                _clamp(
+                    min(
+                        _signal_ongoing_interest_score(current),
+                        _signal_ongoing_interest_score(signal),
+                        merged_score + 0.12,
+                    )
+                    - 0.12
+                    - (signal.non_reengagement_count * 0.05)
+                    - (signal.deflection_count * 0.08),
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+                if incoming_negative
+                else _clamp(
+                    max(
+                        _signal_ongoing_interest_score(current),
+                        _signal_ongoing_interest_score(signal),
+                    )
                     + incoming_positive_bonus
                     - (existing_negative_penalty * 0.55),
                     minimum=0.0,
@@ -1236,6 +2364,7 @@ class WorldIntelligenceService:
                 confidence=_clamp(max(current.confidence, signal.confidence), minimum=0.0, maximum=1.0),
                 engagement_score=merged_score,
                 ongoing_interest_score=merged_ongoing_interest_score,
+                co_attention_score=merged_co_attention_score,
                 co_attention_count=merged_co_attention_count,
                 evidence_count=current.evidence_count + signal.evidence_count,
                 engagement_count=current.engagement_count + signal.engagement_count,
@@ -1256,7 +2385,7 @@ class WorldIntelligenceService:
                 self._engagement_state_rank(item.engagement_state),
                 self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
-                item.ongoing_interest_score,
+                _signal_ongoing_interest_score(item),
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -1369,7 +2498,13 @@ class WorldIntelligenceService:
                 co_attention_count = max(
                     0,
                     co_attention_count
-                    - (2 if signal.engagement_state == "avoid" else 1 if signal.engagement_state == "cooling" else 0),
+                    - (
+                        2
+                        if signal.engagement_state == "avoid"
+                        else 1
+                        if signal.engagement_state == "cooling"
+                        else 0
+                    ),
                 )
                 if not has_coverage:
                     co_attention_count = 0
@@ -1379,8 +2514,8 @@ class WorldIntelligenceService:
                 if has_shared_refresh:
                     co_attention_count = min(6, co_attention_count + 1)
 
-            ongoing_interest_score = signal.ongoing_interest_score
-            co_attention_score = signal.co_attention_score
+            ongoing_interest_score = _signal_ongoing_interest_score(signal)
+            co_attention_score = _signal_co_attention_score(signal)
             if signal.engagement_state not in {"cooling", "avoid"}:
                 if has_coverage:
                     ongoing_interest_score = _clamp(
@@ -1445,7 +2580,7 @@ class WorldIntelligenceService:
                 self._ongoing_interest_rank(item.ongoing_interest),
                 self._engagement_state_rank(item.engagement_state),
                 self._co_attention_state_rank(item.co_attention_state),
-                item.ongoing_interest_score,
+                _signal_ongoing_interest_score(item),
                 item.engagement_score,
                 item.salience,
                 item.updated_at or "",
@@ -1479,24 +2614,26 @@ class WorldIntelligenceService:
                 return thread
         return None
 
+    # ------------------------- Feed item / awareness handling -------------------------
+
     def _unseen_items(
         self,
         *,
         subscription: WorldFeedSubscription,
-        items: Sequence[WorldFeedItem],
-    ) -> tuple[tuple[WorldFeedItem, ...], tuple[str, ...]]:
+        items: Sequence[_ParsedFeedItem],
+    ) -> tuple[tuple[_ParsedFeedItem, ...], tuple[str, ...]]:
         """Return unseen items plus the bounded retained item-id history."""
 
         existing_ids = tuple(subscription.last_item_ids)
         seen_ids = set(existing_ids)
-        unseen: list[WorldFeedItem] = []
+        unseen: list[_ParsedFeedItem] = []
         latest_ids: list[str] = []
-        for item in items:
-            item_id = _feed_item_id(item)
+        for parsed_item in items:
+            item_id = _clean_text(parsed_item.stable_id)
             latest_ids.append(item_id)
             if item_id in seen_ids:
                 continue
-            unseen.append(item)
+            unseen.append(parsed_item)
         retained: list[str] = []
         for item_id in latest_ids + list(existing_ids):
             if item_id in retained:
@@ -1511,7 +2648,7 @@ class WorldIntelligenceService:
         *,
         existing_threads: Sequence[SituationalAwarenessThread],
         subscription: WorldFeedSubscription,
-        items: Sequence[WorldFeedItem],
+        items: Sequence[_ParsedFeedItem],
         now: datetime,
     ) -> SituationalAwarenessThread:
         """Condense refreshed feed items into one slower-moving awareness thread."""
@@ -1527,7 +2664,7 @@ class WorldIntelligenceService:
         recent_titles = tuple(
             dict.fromkeys(
                 [
-                    *(_clean_text(item.title) for item in items if _clean_text(item.title)),
+                    *(_to_plain_text(item.item.title, maximum=180) for item in items if _clean_text(item.item.title)),
                     *(existing.recent_titles if existing is not None else ()),
                 ]
             )
@@ -1536,14 +2673,14 @@ class WorldIntelligenceService:
             dict.fromkeys(
                 [
                     *(existing.source_labels if existing is not None else ()),
-                    *(item.source or _host_label(subscription.feed_url) for item in items),
+                    *(item.item.source or _host_label(subscription.feed_url) for item in items),
                 ]
             )
         )
         supporting_item_ids = tuple(
             dict.fromkeys(
                 [
-                    *(_feed_item_id(item) for item in items),
+                    *(_clean_text(item.stable_id) for item in items),
                     *(existing.supporting_item_ids if existing is not None else ()),
                 ]
             )
@@ -1556,7 +2693,7 @@ class WorldIntelligenceService:
         )
         return SituationalAwarenessThread(
             thread_id=self._awareness_thread_id(subscription),
-            title=subscription.label,
+            title=_truncate_text(subscription.label, maximum=120),
             summary=self._awareness_summary(
                 label=subscription.label,
                 region=subscription.region,
@@ -1610,7 +2747,7 @@ class WorldIntelligenceService:
                 _clean_text(",".join(subscription.topics) if subscription.topics else subscription.label).casefold(),
             )
         )
-        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
         return f"awareness:{digest}"
 
     def _awareness_summary(
@@ -1629,12 +2766,12 @@ class WorldIntelligenceService:
         if region:
             return (
                 f"Keep a calm watch on {label} around {region}; "
-                f"{update_count} relevant RSS update(s) are being tracked."
+                f"{update_count} relevant feed update(s) are being tracked."
                 f"{headline_part}"
             ).strip()
         return (
             f"Keep a calm watch on {label}; "
-            f"{update_count} relevant RSS update(s) are being tracked."
+            f"{update_count} relevant feed update(s) are being tracked."
             f"{headline_part}"
         ).strip()
 
@@ -1642,23 +2779,24 @@ class WorldIntelligenceService:
         self,
         *,
         subscription: WorldFeedSubscription,
-        items: Sequence[WorldFeedItem],
+        items: Sequence[_ParsedFeedItem],
         now: datetime,
     ) -> tuple[WorldSignal, ...]:
         """Convert unseen feed items into fresh world signals."""
 
         fresh_until = _isoformat(now + timedelta(hours=self.default_freshness_hours))
         signals: list[WorldSignal] = []
-        for item in items:
+        for parsed_item in items:
+            item = parsed_item.item
             summary = f"Relevant to {subscription.label}."
             if item.source and item.source != subscription.label:
                 summary = f"Relevant to {subscription.label}; source {item.source}."
             signals.append(
                 WorldSignal(
-                    topic=item.title,
+                    topic=_to_plain_text(item.title, maximum=280),
                     summary=summary,
                     region=subscription.region,
-                    source=item.source or _host_label(subscription.feed_url),
+                    source=_to_plain_text(item.source or _host_label(subscription.feed_url), maximum=120),
                     salience=_clamp(subscription.priority * 0.9, minimum=0.25, maximum=0.95),
                     fresh_until=fresh_until,
                     evidence_count=1,
@@ -1666,7 +2804,7 @@ class WorldIntelligenceService:
                         item_id
                         for item_id in (
                             subscription.subscription_id,
-                            _feed_item_id(item),
+                            _clean_text(parsed_item.stable_id),
                         )
                         if item_id
                     ),

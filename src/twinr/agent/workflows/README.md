@@ -18,7 +18,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, play it about `35 %` slower and `30 %` quieter than the prior setting, loop it without an added idle gap until the answer starts, and let long processing loops duck gently over time while bounded tone fallbacks stay available
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
-- forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized
+- forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized, but keep that learning work off the user-facing audio-completion path so a slow background flush cannot leave Twinr visibly `speaking` after playback ends
 - keep GPIO polling responsive while long turns are active by dispatching button presses off the poll thread and interrupting active turns on a second green press
 - keep required remote-memory checks off the GPIO polling thread by gating live loops from the external remote-memory watchdog artifact while still failing closed when remote memory becomes unavailable
 - treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
@@ -64,6 +64,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - reconnect the edge voice websocket after transient server or network closures and replay the last known runtime state so hands-free wake detection does not stay dead until the Pi service restarts
 - keep the live voice gateway server-only after wake: once the Pi has opened a voice turn on thh1986, the same remote stream must stay authoritative for wake, transcript commit, continuation, and follow-up closure instead of pausing capture and reopening a second Pi-local listen phase
 - keep answer-time interruption server-owned whenever the live voice gateway is active; do not reopen a second local Pi STT watcher while the remote thh1986 stream already owns barge-in
+- require `wss://` for non-loopback voice-gateway websockets by default, and use `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` only for the explicitly attested current LAN bridge until a TLS terminator exists
 - keep the Pi-owned household voice identity source local: sync only bounded read-only speaker embeddings to the live gateway for wake-time familiar-speaker bias, and keep any passive profile updates on the Pi runtime side
 - replay the runtime-owned temporary voice-quiet window into the live voice orchestrator and suppress automatic follow-up reopening while that bounded quiet window is active
 - fail closed on the Pi as well when a late or stale server-side wake confirmation arrives during that runtime-owned voice-quiet window, and immediately re-attest `waiting` plus the active quiet deadline back into the live gateway
@@ -83,7 +84,11 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 
 | File | Purpose |
 |---|---|
-| [realtime_runner.py](./realtime_runner.py) | Realtime session loop that orchestrates voice activation, gesture wake, print-lane control, and smart-home sensor work while delegating focused follow-up and voice-bridge helpers |
+| [realtime_runner.py](./realtime_runner.py) | Compatibility wrapper that preserves the public realtime-loop import path and legacy module patch points |
+| [realtime_runner_impl/bootstrap.py](./realtime_runner_impl/bootstrap.py) | Realtime-loop bootstrap, collaborator wiring, tool-surface refresh, and managed sensor-worker setup |
+| [realtime_runner_impl/session.py](./realtime_runner_impl/session.py) | Run-loop orchestration, wake triggers, conversation-session lifecycle, and remote voice-orchestrator coordination |
+| [realtime_runner_impl/turn_capture.py](./realtime_runner_impl/turn_capture.py) | Turn-controller streaming capture, transcript recovery, and early-snapshot coercion |
+| [realtime_runner_impl/turn_execution.py](./realtime_runner_impl/turn_execution.py) | Single-turn execution, streamed playback/interrupt handling, activation ack caching, and print-lane enqueue helpers |
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
 | [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
@@ -102,6 +107,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [streaming_turn_coordinator.py](./streaming_turn_coordinator.py) | Authoritative streaming turn state machine and completion coordinator |
 | [streaming_turn_orchestrator.py](./streaming_turn_orchestrator.py) | Low-level parallel bridge/final lane watchdog executor used by the coordinator |
 | [playback_coordinator.py](./playback_coordinator.py) | Single-owner speaker queue with priority-aware, request-bound preemption for beep, feedback, and TTS |
+| [respeaker_duplex_keepalive.py](./respeaker_duplex_keepalive.py) | ReSpeaker XVF3800 duplex-stability helper that keeps one low-priority Twinr playback stream alive so Pi-side capture does not fall into immediate `arecord` I/O errors |
 | [rendered_audio_clip.py](./rendered_audio_clip.py) | Bounded media-clip renderer/cache for reusable workflow WAV payloads |
 | [startup_boot_sound.py](./startup_boot_sound.py) | Bounded startup earcon helper that renders a faded `media/boot.mp3` clip and queues it through the shared playback coordinator |
 | [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop, including idle-transition-safe reminder/automation/proactive delivery, routing display-first proactive prompts into the reserve lane, and triggering the overnight reserve-lane maintenance hook |
@@ -125,6 +131,12 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 
 Legacy compatibility shims that no longer belong to the active package are
 archived under [`__legacy__/workflows/`](./__legacy__/workflows/).
+
+The refactored realtime loop keeps the public class at
+[`realtime_runner.py`](./realtime_runner.py), but the implementation now lives
+under [`realtime_runner_impl/`](./realtime_runner_impl/) so bootstrap, session
+orchestration, capture, and per-turn execution stay reviewable as separate
+concerns.
 
 ## Forensic tracing
 

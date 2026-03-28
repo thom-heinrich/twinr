@@ -225,7 +225,7 @@ PROACTIVE_PROMPT_INSTRUCTIONS = _validate_instruction(
 # AUDIT-FIX(#4): Allow validated .env overrides for model fallback chains while keeping existing defaults intact.
 STT_MODEL_FALLBACKS = _load_identifier_tuple(
     "TWINR_STT_MODEL_FALLBACKS",
-    ("whisper-1",),
+    ("gpt-4o-mini-transcribe", "whisper-1"),
 )
 
 # AUDIT-FIX(#4): Validate TTS fallback IDs at startup so a bad override does not break speech output mid-session.

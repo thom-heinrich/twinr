@@ -268,14 +268,16 @@ poll cadence is intentionally sub-second so local face cues and emoji
 acknowledgements do not feel delayed by a slow generic status loop.
 
 That senior-facing HDMI surface is now modeled as its own scene module instead
-of being inlined into the framebuffer adapter. `hdmi_default_scene.py` owns the
-default-scene layout, face animation, header model, and reserved right-hand
-capability area so future HDMI capabilities such as expanded cards, morph
-surfaces, and reserve-bus content owners can grow without bloating the display
-loop or the transport adapters. The reserve area itself is now resolved through
-`reserve_bus.py`: gesture emoji cues still outrank calmer ambient reserve
-cards, but that priority no longer lives as ad-hoc branching inside the scene
-renderer.
+of being inlined into the framebuffer adapter. `hdmi_default_scene.py` is the
+stable public wrapper, while `hdmi_default_scene_impl/` owns the decomposed
+default-scene layout, face animation, header rendering, and reserved right-hand
+capability area. The reserve lane is now split more explicitly into header,
+reserve-panel, and prompt-layout responsibilities so future HDMI capabilities
+such as expanded cards, morph surfaces, and reserve-bus content owners can grow
+without bloating the display loop or the transport adapters. The reserve area
+itself is now resolved through `reserve_bus.py`: gesture emoji cues still
+outrank calmer ambient reserve cards, but that priority no longer lives as
+ad-hoc branching inside the scene renderer.
 transitions, or richer per-capability panels can be added without pushing
 presentation logic back into the transport backend.
 
@@ -536,7 +538,8 @@ The current default scene set covers:
 | [face_expressions.py](./face_expressions.py) | Producer-facing combinable expression API for the HDMI face |
 | [heartbeat.py](./heartbeat.py) | Persist display forward-progress heartbeats and expose the shared companion-health contract for ops/supervision |
 | [hdmi_ambient_moments.py](./hdmi_ambient_moments.py) | Deterministically schedule rare idle-only HDMI ambient moments such as sparkles or hearts |
-| [hdmi_default_scene.py](./hdmi_default_scene.py) | Modular default HDMI scene model, face renderer, and status-card composition |
+| [hdmi_default_scene.py](./hdmi_default_scene.py) | Stable public wrapper for the default HDMI scene API |
+| [hdmi_default_scene_impl/](./hdmi_default_scene_impl) | Decomposed default HDMI scene implementation split into scene-building, header, reserve/prompt-panel, presentation, ambient, and face modules |
 | [hdmi_presentation_graph.py](./hdmi_presentation_graph.py) | Resolve prioritized HDMI presentation cards into eased morph stages and face-sync reactions |
 | [hdmi_wayland.py](./hdmi_wayland.py) | Visible fullscreen HDMI Wayland adapter |
 | [hdmi_fbdev.py](./hdmi_fbdev.py) | HDMI framebuffer fallback adapter and scene host/transport layer |

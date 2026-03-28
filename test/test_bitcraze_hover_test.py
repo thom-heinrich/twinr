@@ -18,6 +18,26 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 
+def _safe_status_snapshot() -> Any:
+    return _MODULE.HoverStatusSnapshot(
+        supervisor_info=0,
+        can_arm=True,
+        is_armed=False,
+        auto_arm=False,
+        can_fly=True,
+        is_flying=False,
+        tumbled=False,
+        locked=False,
+        crashed=False,
+        hl_flying=False,
+        hl_trajectory_finished=False,
+        hl_disabled=False,
+        radio_connected=True,
+        zrange_m=0.04,
+        motion_squal=80,
+    )
+
+
 class HoverTestWorkerTests(unittest.TestCase):
     def test_normalize_required_deck_name_accepts_known_alias(self) -> None:
         self.assertEqual(_MODULE.normalize_required_deck_name("flow2"), "bcFlow2")
@@ -28,6 +48,7 @@ class HoverTestWorkerTests(unittest.TestCase):
             deck_flags={"bcFlow2": 0, "bcZRanger2": 1},
             required_decks=("bcFlow2", "bcZRanger2"),
             power=_MODULE.HoverPowerSnapshot(vbat_v=3.55, battery_level=12, state=1),
+            status_snapshot=_safe_status_snapshot(),
             clearance_snapshot=None,
             min_vbat_v=3.8,
             min_battery_level=20,
@@ -43,6 +64,7 @@ class HoverTestWorkerTests(unittest.TestCase):
             deck_flags={"bcFlow2": 1, "bcZRanger2": 1, "bcMultiranger": 1},
             required_decks=("bcFlow2", "bcZRanger2"),
             power=_MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=70, state=0),
+            status_snapshot=_safe_status_snapshot(),
             clearance_snapshot=_MODULE.HoverClearanceSnapshot(
                 front_m=0.12,
                 back_m=None,
@@ -93,7 +115,7 @@ class HoverTestWorkerTests(unittest.TestCase):
 
         original_import = _MODULE._import_cflib
         original_read_deck_flags = _MODULE._read_deck_flags
-        original_read_power_snapshot = _MODULE._read_power_snapshot
+        original_read_preflight_snapshots = _MODULE._read_preflight_snapshots
         original_apply_pre_arm = _MODULE.apply_hover_pre_arm
         original_wait_for_estimator_settle = _MODULE.wait_for_estimator_settle
         original_probe_failsafe = _MODULE.probe_on_device_failsafe
@@ -108,8 +130,11 @@ class HoverTestWorkerTests(unittest.TestCase):
                 _UnusedSyncLogger,
             )
             _MODULE._read_deck_flags = lambda *_args, **_kwargs: {"bcFlow2": 1, "bcZRanger2": 1, "bcAI": 1}
-            _MODULE._read_power_snapshot = (
-                lambda *_args, **_kwargs: _MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=90, state=0)
+            _MODULE._read_preflight_snapshots = (
+                lambda *_args, **_kwargs: (
+                    _MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=90, state=0),
+                    _safe_status_snapshot(),
+                )
             )
             _MODULE.apply_hover_pre_arm = lambda *_args, **_kwargs: _MODULE.HoverPreArmSnapshot(
                 estimator_requested=2,
@@ -176,7 +201,7 @@ class HoverTestWorkerTests(unittest.TestCase):
         finally:
             _MODULE._import_cflib = original_import
             _MODULE._read_deck_flags = original_read_deck_flags
-            _MODULE._read_power_snapshot = original_read_power_snapshot
+            _MODULE._read_preflight_snapshots = original_read_preflight_snapshots
             _MODULE.apply_hover_pre_arm = original_apply_pre_arm
             _MODULE.wait_for_estimator_settle = original_wait_for_estimator_settle
             _MODULE.probe_on_device_failsafe = original_probe_failsafe
@@ -201,6 +226,7 @@ class HoverTestWorkerTests(unittest.TestCase):
             deck_flags={"bcFlow2": 1, "bcZRanger2": 1},
             required_decks=("bcFlow2", "bcZRanger2"),
             clearance_snapshot=None,
+            status_snapshot=None,
             pre_arm_snapshot=None,
             estimator_settle=None,
             power=_MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=70, state=0),
@@ -524,6 +550,8 @@ class HoverTestWorkerTests(unittest.TestCase):
             battery_drop_v=0.02,
             radio_rssi_latest_dbm=-60.0,
             radio_rssi_min_dbm=-65.0,
+            radio_connected_latest=True,
+            radio_disconnect_seen=False,
             latest_supervisor_info=1 << 7,
             supervisor_flags_seen=("crashed",),
             stable_supervisor=False,
@@ -573,6 +601,8 @@ class HoverTestWorkerTests(unittest.TestCase):
             battery_drop_v=0.55,
             radio_rssi_latest_dbm=35.0,
             radio_rssi_min_dbm=35.0,
+            radio_connected_latest=True,
+            radio_disconnect_seen=False,
             latest_supervisor_info=0,
             supervisor_flags_seen=(),
             stable_supervisor=True,
@@ -619,7 +649,7 @@ class HoverTestWorkerTests(unittest.TestCase):
 
         original_import = _MODULE._import_cflib
         original_read_deck_flags = _MODULE._read_deck_flags
-        original_read_power_snapshot = _MODULE._read_power_snapshot
+        original_read_preflight_snapshots = _MODULE._read_preflight_snapshots
         original_telemetry_collector = _MODULE.HoverTelemetryCollector
         original_apply_pre_arm = _MODULE.apply_hover_pre_arm
         original_wait_for_estimator_settle = _MODULE.wait_for_estimator_settle
@@ -635,8 +665,11 @@ class HoverTestWorkerTests(unittest.TestCase):
                 _UnusedSyncLogger,
             )
             _MODULE._read_deck_flags = lambda *_args, **_kwargs: {"bcFlow2": 1, "bcZRanger2": 1, "bcAI": 1}
-            _MODULE._read_power_snapshot = (
-                lambda *_args, **_kwargs: _MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=90, state=0)
+            _MODULE._read_preflight_snapshots = (
+                lambda *_args, **_kwargs: (
+                    _MODULE.HoverPowerSnapshot(vbat_v=4.0, battery_level=90, state=0),
+                    _safe_status_snapshot(),
+                )
             )
             _MODULE.apply_hover_pre_arm = lambda *_args, **_kwargs: _MODULE.HoverPreArmSnapshot(
                 estimator_requested=2,
@@ -768,7 +801,7 @@ class HoverTestWorkerTests(unittest.TestCase):
         finally:
             _MODULE._import_cflib = original_import
             _MODULE._read_deck_flags = original_read_deck_flags
-            _MODULE._read_power_snapshot = original_read_power_snapshot
+            _MODULE._read_preflight_snapshots = original_read_preflight_snapshots
             _MODULE.HoverTelemetryCollector = original_telemetry_collector
             _MODULE.apply_hover_pre_arm = original_apply_pre_arm
             _MODULE.wait_for_estimator_settle = original_wait_for_estimator_settle

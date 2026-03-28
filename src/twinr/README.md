@@ -33,6 +33,7 @@ set of shared helpers that multiple subsystems reuse.
 | [channels/README.md](./channels/README.md) | External text-channel package |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [llm_json.py](./llm_json.py) | Structured-response helper |
+| [runtime_paths.py](./runtime_paths.py) | Pi-only system-site-path bootstrap helper for OS-managed modules |
 | [temporal.py](./temporal.py) | Local-date parsing helper |
 | [text_utils.py](./text_utils.py) | Text and identifier helper |
 | [agent/README.md](./agent/README.md) | Core runtime package |

@@ -13,7 +13,6 @@ from twinr.memory.longterm.core.models import (  # noqa: E402
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
-    LongTermRetentionResultV1,
     LongTermSourceRefV1,
 )
 from twinr.memory.longterm.storage.store import LongTermStructuredStore  # noqa: E402

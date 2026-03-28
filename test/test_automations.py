@@ -1,8 +1,9 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -64,6 +65,80 @@ class AutomationStoreTests(unittest.TestCase):
 
         self.assertEqual([entry.automation_id for entry in due_before_mark], [created.automation_id])
         self.assertEqual(due_after_mark, ())
+
+    def test_weekly_due_time_matches_respect_misfire_grace_and_coalesce_policy(self) -> None:
+        zone = ZoneInfo("Europe/Berlin")
+        now = datetime(2026, 3, 25, 10, 30, tzinfo=zone)
+        previous_run_at = datetime(2026, 3, 2, 8, 0, tzinfo=zone)
+        previous_triggered_at = datetime(2026, 3, 2, 8, 1, tzinfo=zone)
+        expected_backlog = (
+            datetime(2026, 3, 23, 8, 0, tzinfo=zone),
+            datetime(2026, 3, 25, 8, 0, tzinfo=zone),
+        )
+        grace_seconds = 3 * 24 * 60 * 60
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = AutomationStore(Path(temp_dir) / "automations.json", timezone_name="Europe/Berlin")
+            entries_by_policy = {}
+            for policy in ("latest", "earliest", "all"):
+                entry = store.create_time_automation(
+                    name=f"Weekly {policy}",
+                    schedule="weekly",
+                    time_of_day="08:00",
+                    weekdays=(0, 2),
+                    misfire_grace_seconds=grace_seconds,
+                    coalesce_policy=policy,
+                    actions=(AutomationAction(kind="say", text=f"Weekly backlog {policy}."),),
+                )
+                store.mark_triggered(
+                    entry.automation_id,
+                    triggered_at=previous_triggered_at,
+                    scheduled_for_at=previous_run_at,
+                )
+                reloaded = store.get(entry.automation_id)
+                assert reloaded is not None
+                entries_by_policy[policy] = reloaded
+
+            matches = store.due_time_matches(now=now)
+            matches_by_automation_id: dict[str, list[object]] = {}
+            for match in matches:
+                matches_by_automation_id.setdefault(match.entry.automation_id, []).append(match)
+
+            latest_matches = matches_by_automation_id[entries_by_policy["latest"].automation_id]
+            earliest_matches = matches_by_automation_id[entries_by_policy["earliest"].automation_id]
+            all_matches = matches_by_automation_id[entries_by_policy["all"].automation_id]
+            tool_records = {
+                record["automation_id"]: record
+                for record in store.list_tool_records(now=now)
+            }
+
+        self.assertEqual(len(latest_matches), 1)
+        self.assertEqual(latest_matches[0].scheduled_for_at, expected_backlog[-1])
+        self.assertEqual(latest_matches[0].pending_run_count, 2)
+
+        self.assertEqual(len(earliest_matches), 1)
+        self.assertEqual(earliest_matches[0].scheduled_for_at, expected_backlog[0])
+        self.assertEqual(earliest_matches[0].pending_run_count, 2)
+
+        self.assertEqual(
+            [match.scheduled_for_at for match in all_matches],
+            list(expected_backlog),
+        )
+        self.assertEqual([match.pending_run_count for match in all_matches], [1, 1])
+
+        latest_record = tool_records[entries_by_policy["latest"].automation_id]
+        earliest_record = tool_records[entries_by_policy["earliest"].automation_id]
+        all_record = tool_records[entries_by_policy["all"].automation_id]
+        self.assertEqual(latest_record["scheduled_for_at"], expected_backlog[-1].isoformat())
+        self.assertEqual(earliest_record["scheduled_for_at"], expected_backlog[0].isoformat())
+        self.assertEqual(all_record["scheduled_for_at"], expected_backlog[0].isoformat())
+        self.assertEqual(latest_record["pending_run_count"], 2)
+        self.assertEqual(earliest_record["pending_run_count"], 2)
+        self.assertEqual(all_record["pending_run_count"], 2)
+        self.assertEqual(latest_record["coalesce_policy"], "latest")
+        self.assertEqual(earliest_record["coalesce_policy"], "earliest")
+        self.assertEqual(all_record["coalesce_policy"], "all")
+        self.assertEqual(latest_record["misfire_grace_seconds"], float(grace_seconds))
 
     def test_if_then_automation_matches_facts_and_respects_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

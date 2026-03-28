@@ -322,7 +322,7 @@ class AICameraObservationProxyService:
     def _observe_gesture_uncached(self) -> tuple[Any, dict[str, object] | None]:
         """Read one fresh gesture observation from the local adapter."""
 
-        observation = self._adapter.observe_gesture()
+        observation = self._adapter.observe_gesture(gesture_fast_path=True)
         debug_getter = getattr(self._adapter, "get_last_gesture_debug_details", None)
         debug_details = debug_getter() if callable(debug_getter) else None
         return observation, debug_details

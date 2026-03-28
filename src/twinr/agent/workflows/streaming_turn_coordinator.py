@@ -1,3 +1,25 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Move TRANSCRIPT_SUBMITTED to the actual transcript-submission point and broaden execute()
+#        error handling so lane-plan / speech-output construction failures transition to FAILED and clean up.
+# BUG-2: Preserve root-cause exceptions by deferring speech-output close errors instead of letting finally-mask them.
+# BUG-3: Fix printing->answering transitions: resume_answering_after_print() is now used whenever audio or
+#        finalize-time transitions leave the runtime in "printing", and answering heartbeat state is kept coherent.
+# BUG-4: Make record_usage() best-effort so post-playback analytics failures do not fail an already delivered turn.
+# BUG-5: Add cross-thread locking around phase, processing-feedback, and speech-lifecycle mutation to eliminate
+#        duplicate transitions and callback races under worker-thread audio callbacks.
+# BUG-6: Capture and re-raise asynchronous speech callback failures on the coordinator thread instead of silently
+#        losing them inside worker threads.
+# BUG-7: Move personality tool-history recording off the foreground turn thread so budget-triggered background
+#        flushes cannot leave Twinr visibly speaking after audio already finished.
+# SEC-1: Sanitize and length-bound emitted key=value payloads so model/user-controlled text cannot inject extra
+#        protocol/log lines via CR/LF or other control characters.
+# SEC-2: Bound concurrent deferred closure-evaluation workers to avoid practical thread/resource exhaustion on
+#        Raspberry Pi deployments when the closure provider stalls.
+# IMP-1: Serialize emit()/emit_status() calls from coordinator-owned threads and attach richer failure telemetry
+#        (error_type, elapsed_ms, phase) to interruption/failure paths.
+# IMP-2: Introduce a bounded, explicit background-task owner for deferred closure evaluation and a speech-callback
+#        error bridge, matching 2026 structured-concurrency expectations without changing the public API.
+
 """Coordinate one streaming turn under a single authoritative state machine.
 
 This module owns the full lifecycle of one streamed Twinr turn after a
@@ -14,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from threading import Event, Thread
+from threading import BoundedSemaphore, Event, RLock, Thread
 from typing import Callable, Protocol
 import time
 
@@ -32,6 +54,57 @@ from twinr.agent.workflows.streaming_turn_orchestrator import (
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 _ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S = 5.0
+_DEFAULT_EMIT_VALUE_MAX_CHARS = 32_768
+_MAX_CONCURRENT_FOLLOW_UP_CLOSURE_EVALS = 2
+_FOLLOW_UP_CLOSURE_EVAL_SLOTS = BoundedSemaphore(_MAX_CONCURRENT_FOLLOW_UP_CLOSURE_EVALS)
+
+
+def _bool_token(value: bool) -> str:
+    """Return the stable lowercase wire-format boolean token."""
+
+    return "true" if value else "false"
+
+
+def _coerce_positive_int(value: object, default: int, *, minimum: int = 1) -> int:
+    """Return a bounded positive integer from config-like values."""
+
+    try:
+        return max(minimum, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _escape_emit_value(value: object, *, max_chars: int) -> str:
+    """Encode dynamic emit values for a line-oriented key=value transport.
+
+    The coordinator emits protocol-style strings such as ``response=...`` and
+    several values are model- or user-controlled. Escaping CR/LF and other
+    control bytes prevents log / line-protocol injection, while a hard size
+    cap prevents pathological payloads from flooding small-device transports.
+    """
+
+    raw = str(value)
+    pieces: list[str] = []
+    for ch in raw:
+        code = ord(ch)
+        if ch == "\n":
+            pieces.append("\\n")
+        elif ch == "\r":
+            pieces.append("\\r")
+        elif ch == "\t":
+            pieces.append("\\t")
+        elif code == 0:
+            continue
+        elif code < 32 or code == 127:
+            pieces.append(f"\\x{code:02x}")
+        else:
+            pieces.append(ch)
+    escaped = "".join(pieces)
+    if len(escaped) <= max_chars:
+        return escaped
+    if max_chars <= 3:
+        return escaped[:max_chars]
+    return f"{escaped[: max_chars - 3]}..."
 
 
 class RuntimeStatusLike(Protocol):
@@ -214,6 +287,7 @@ class _StreamingTurnStateMachine:
     trace_event: Callable[..., None]
     phase: StreamingTurnPhase = StreamingTurnPhase.READY
     history: list[str] = field(default_factory=lambda: [StreamingTurnPhase.READY.value])
+    _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def transition(
         self,
@@ -224,23 +298,25 @@ class _StreamingTurnStateMachine:
     ) -> None:
         """Move to the next phase and emit a bounded state-transition trace."""
 
-        if new_phase == self.phase:
-            return
-        allowed = _ALLOWED_PHASE_TRANSITIONS[self.phase]
-        if new_phase not in allowed:
-            raise RuntimeError(
-                f"invalid streaming turn phase transition: {self.phase.value} -> {new_phase.value}"
-            )
-        previous = self.phase
-        self.phase = new_phase
-        self.history.append(new_phase.value)
-        payload = {
-            "from": previous.value,
-            "to": new_phase.value,
-            "reason": reason,
-        }
-        if details:
-            payload.update(details)
+        payload: dict[str, object]
+        with self._lock:
+            if new_phase == self.phase:
+                return
+            allowed = _ALLOWED_PHASE_TRANSITIONS[self.phase]
+            if new_phase not in allowed:
+                raise RuntimeError(
+                    f"invalid streaming turn phase transition: {self.phase.value} -> {new_phase.value}"
+                )
+            previous = self.phase
+            self.phase = new_phase
+            self.history.append(new_phase.value)
+            payload = {
+                "from": previous.value,
+                "to": new_phase.value,
+                "reason": reason,
+            }
+            if details:
+                payload.update(details)
         self.trace_event(
             "streaming_turn_phase_changed",
             kind="mutation",
@@ -257,14 +333,17 @@ class _ProcessingFeedbackController:
     state_machine: _StreamingTurnStateMachine
     _stop: Callable[[], None] = field(default=lambda: None)
     _started: bool = False
+    _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def ensure_started(self) -> None:
         """Start the processing feedback loop exactly once."""
 
-        if self._started:
-            return
-        self._stop = self.start_loop("processing")
-        self._started = True
+        with self._lock:
+            if self._started:
+                return
+            stop = self.start_loop("processing")
+            self._stop = stop
+            self._started = True
         self.state_machine.transition(
             StreamingTurnPhase.PROCESSING,
             reason="processing_feedback_started",
@@ -274,12 +353,21 @@ class _ProcessingFeedbackController:
     def stop(self) -> None:
         """Stop the processing feedback loop if it is active."""
 
-        if not self._started:
-            return
-        stop = self._stop
-        self._stop = lambda: None
-        self._started = False
-        stop()
+        with self._lock:
+            if not self._started:
+                return
+            stop = self._stop
+            self._stop = lambda: None
+            self._started = False
+        try:
+            stop()
+        except Exception as exc:  # pragma: no cover - defensive hook guard
+            self.trace_event(
+                "streaming_processing_feedback_stop_failed",
+                kind="warning",
+                level="WARN",
+                details={"error_type": type(exc).__name__},
+            )
 
 
 @dataclass(slots=True)
@@ -297,74 +385,98 @@ class _SpeechLifecycle:
     snapshot_refresh_interval_s: float = _ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S
     _snapshot_refresh_stop: Event = field(default_factory=Event)
     _snapshot_refresh_thread: Thread | None = None
+    _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def on_speaking_started(self) -> None:
         """Start `answering` exactly when real audio begins."""
 
-        if self.answer_started:
-            return
-        self.processing_feedback.stop()
-        if self.runtime.status.value != "answering":
-            self.runtime.begin_answering()
-            self.emit_status()
-        self.answer_started = True
-        self._start_snapshot_heartbeat()
-        self.trace_event("streaming_answering_started", kind="mutation", details={})
+        with self._lock:
+            if self.answer_started:
+                return
+            self.processing_feedback.stop()
+            self._activate_answering_locked(trace_event_name="streaming_answering_started")
 
     def on_first_audio(self) -> None:
         """Capture the first audible audio timestamp exactly once."""
 
-        if self.first_audio_at is not None:
-            return
-        self.first_audio_at = time.monotonic()
+        with self._lock:
+            if self.first_audio_at is not None:
+                return
+            self.first_audio_at = time.monotonic()
+            first_audio_at = self.first_audio_at
         self.trace_event(
             "streaming_first_audio_observed",
             kind="metric",
-            kpi={"duration_ms": round((self.first_audio_at - self.turn_started) * 1000.0, 3)},
+            kpi={"duration_ms": round((first_audio_at - self.turn_started) * 1000.0, 3)},
         )
 
     def ensure_answering_started(self) -> None:
         """Start `answering` late when speech finished before audio callback."""
 
-        if self.answer_started:
-            return
-        self.processing_feedback.stop()
-        self.runtime.begin_answering()
-        self.emit_status()
-        self.answer_started = True
-        self._start_snapshot_heartbeat()
-        self.trace_event("streaming_answering_started_late", kind="mutation", details={})
+        with self._lock:
+            if self.answer_started:
+                return
+            self.processing_feedback.stop()
+            self._activate_answering_locked(trace_event_name="streaming_answering_started_late")
 
     def resume_processing(self) -> None:
         """Return from a spoken bridge acknowledgement back to processing."""
 
-        if not self.answer_started:
-            return
+        with self._lock:
+            if not self.answer_started:
+                return
+            self.answer_started = False
         self.stop_snapshot_heartbeat()
         if self.runtime.status.value != "processing":
             self.runtime.resume_processing()
             self.emit_status()
-        self.answer_started = False
         self.trace_event("streaming_processing_resumed", kind="mutation", details={})
+
+    def resume_answering_after_print(self) -> None:
+        """Transition the runtime out of `printing` while keeping speech state coherent."""
+
+        with self._lock:
+            if self.answer_started:
+                return
+            self.processing_feedback.stop()
+            self._activate_answering_locked(trace_event_name="streaming_print_resume_answering")
 
     def stop_snapshot_heartbeat(self) -> None:
         """Stop the bounded snapshot refresh loop for an active spoken reply."""
 
-        thread = self._snapshot_refresh_thread
-        if thread is None:
-            return
-        self._snapshot_refresh_stop.set()
-        thread.join(timeout=max(0.1, min(0.5, self.snapshot_refresh_interval_s)))
+        with self._lock:
+            thread = self._snapshot_refresh_thread
+            if thread is None:
+                return
+            self._snapshot_refresh_stop.set()
+            interval_s = self.snapshot_refresh_interval_s
+        thread.join(timeout=max(0.1, min(0.5, interval_s)))
         stopped = not thread.is_alive()
         if stopped:
-            self._snapshot_refresh_thread = None
+            with self._lock:
+                if self._snapshot_refresh_thread is thread:
+                    self._snapshot_refresh_thread = None
         self.trace_event(
             "streaming_answering_snapshot_refresh_stopped",
             kind="span_end",
             details={"stopped": stopped},
         )
 
-    def _start_snapshot_heartbeat(self) -> None:
+    def _activate_answering_locked(self, *, trace_event_name: str) -> None:
+        """Enter answering from either `printing` or non-answering runtime states."""
+
+        runtime_status = getattr(getattr(self.runtime, "status", None), "value", None)
+        if runtime_status == "printing":
+            self.runtime.resume_answering_after_print()
+            self.emit_status()
+        elif runtime_status != "answering":
+            self.runtime.begin_answering()
+            self.emit_status()
+        self.answer_started = True
+        self._start_snapshot_heartbeat_locked()
+        self.trace_event(trace_event_name, kind="mutation", details={})
+
+    def _start_snapshot_heartbeat_locked(self) -> None:
         """Keep the runtime snapshot fresh while long speech is still audible."""
 
         refresh_snapshot = getattr(self.runtime, "refresh_snapshot_activity", None)
@@ -389,12 +501,13 @@ class _SpeechLifecycle:
                     )
                     return
 
-        self._snapshot_refresh_thread = Thread(
+        thread = Thread(
             target=_worker,
             daemon=True,
             name="twinr-streaming-answering-snapshot-refresh",
         )
-        self._snapshot_refresh_thread.start()
+        self._snapshot_refresh_thread = thread
+        thread.start()
         self.trace_event(
             "streaming_answering_snapshot_refresh_started",
             kind="span_start",
@@ -414,44 +527,83 @@ class _DeferredFollowUpClosureEvaluation:
     proactive_trigger: str | None
     _ready: Event = field(default_factory=Event)
     _evaluation: ConversationClosureEvaluation | None = None
+    _started: bool = False
+    _slot_acquired: bool = False
+    _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def start(self) -> None:
-        """Launch the closure evaluation on a daemon thread."""
+        """Launch the closure evaluation on a bounded daemon thread."""
 
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         self.trace_event(
             "streaming_follow_up_closure_eval_started",
             kind="span_start",
             details={"request_source": self.request_source},
         )
+        if not _FOLLOW_UP_CLOSURE_EVAL_SLOTS.acquire(blocking=False):
+            self._evaluation = ConversationClosureEvaluation(
+                error_type="closure_eval_capacity_exhausted"
+            )
+            self._ready.set()
+            self.trace_event(
+                "streaming_follow_up_closure_eval_capacity_exhausted",
+                kind="warning",
+                level="WARN",
+                details={"request_source": self.request_source},
+            )
+            return
+        self._slot_acquired = True
 
         def _worker() -> None:
             started = time.monotonic()
             try:
-                evaluation = self.evaluate(
-                    user_transcript=self.user_transcript,
-                    assistant_response=self.assistant_response,
-                    request_source=self.request_source,
-                    proactive_trigger=self.proactive_trigger,
+                try:
+                    evaluation = self.evaluate(
+                        user_transcript=self.user_transcript,
+                        assistant_response=self.assistant_response,
+                        request_source=self.request_source,
+                        proactive_trigger=self.proactive_trigger,
+                    )
+                except Exception as exc:  # pragma: no cover - guarded by realtime runner
+                    evaluation = ConversationClosureEvaluation(error_type=type(exc).__name__)
+                self._evaluation = evaluation
+                self._ready.set()
+                self.trace_event(
+                    "streaming_follow_up_closure_eval_finished",
+                    kind="span_end",
+                    details={
+                        "error_type": evaluation.error_type,
+                        "has_decision": evaluation.decision is not None,
+                    },
+                    kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
                 )
-            except Exception as exc:  # pragma: no cover - guarded by realtime runner
-                evaluation = ConversationClosureEvaluation(error_type=type(exc).__name__)
-            self._evaluation = evaluation
-            self._ready.set()
-            self.trace_event(
-                "streaming_follow_up_closure_eval_finished",
-                kind="span_end",
-                details={
-                    "error_type": evaluation.error_type,
-                    "has_decision": evaluation.decision is not None,
-                },
-                kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
-            )
+            finally:
+                if self._slot_acquired:
+                    _FOLLOW_UP_CLOSURE_EVAL_SLOTS.release()
+                    self._slot_acquired = False
 
-        Thread(
+        worker = Thread(
             target=_worker,
             daemon=True,
             name="twinr-streaming-follow-up-closure",
-        ).start()
+        )
+        try:
+            worker.start()
+        except Exception as exc:  # pragma: no cover - defensive thread-start guard
+            if self._slot_acquired:
+                _FOLLOW_UP_CLOSURE_EVAL_SLOTS.release()
+                self._slot_acquired = False
+            self._evaluation = ConversationClosureEvaluation(error_type=type(exc).__name__)
+            self._ready.set()
+            self.trace_event(
+                "streaming_follow_up_closure_eval_start_failed",
+                kind="warning",
+                level="WARN",
+                details={"error_type": type(exc).__name__},
+            )
 
     def result(
         self,
@@ -520,6 +672,7 @@ class StreamingTurnCoordinator:
         self.speech_services = speech_services
         self.hooks = hooks
         self.state_machine = _StreamingTurnStateMachine(trace_event=self.hooks.trace_event)
+        self._io_lock = RLock()
         self.processing_feedback = _ProcessingFeedbackController(
             start_loop=self.hooks.start_processing_feedback_loop,
             trace_event=self.hooks.trace_event,
@@ -527,7 +680,7 @@ class StreamingTurnCoordinator:
         )
         self.speech_lifecycle = _SpeechLifecycle(
             runtime=self.runtime,
-            emit_status=self.hooks.emit_status,
+            emit_status=self._emit_status_safe,
             trace_event=self.hooks.trace_event,
             processing_feedback=self.processing_feedback,
             state_machine=self.state_machine,
@@ -535,26 +688,33 @@ class StreamingTurnCoordinator:
         )
         self._lane_plan: StreamingTurnLanePlan | None = None
         self._speech_output: InterruptibleSpeechOutput | None = None
+        self._speech_output_close_error: BaseException | None = None
+        self._async_callback_error: BaseException | None = None
+        self._async_callback_error_source: str | None = None
+        self._async_callback_error_lock = RLock()
 
     def execute(self) -> StreamingTurnExecutionOutcome:
         """Run the full streaming turn until completion or interruption."""
 
-        self.runtime.submit_transcript(self.request.transcript)
-        self.hooks.emit_status()
-        self._lane_plan = self.lane_plan_factory()
-        self.state_machine.transition(
-            StreamingTurnPhase.TRANSCRIPT_SUBMITTED,
-            reason="runtime_submitted_transcript",
-            details={"transcript_len": len(self.request.transcript)},
-        )
-        self._speech_output = self._build_speech_output()
         response: StreamingToolLoopResult | None = None
         answer = ""
         llm_ms = 0
         first_word_reply: FirstWordReply | None = None
         first_word_source = "none"
         deferred_closure_evaluation: _DeferredFollowUpClosureEvaluation | None = None
+
         try:
+            self.runtime.submit_transcript(self.request.transcript)
+            self._emit_status_safe()
+            self.state_machine.transition(
+                StreamingTurnPhase.TRANSCRIPT_SUBMITTED,
+                reason="runtime_submitted_transcript",
+                details={"transcript_len": len(self.request.transcript)},
+            )
+            self._raise_if_interrupted(phase_reason="after_transcript_submission")
+            self._lane_plan = self.lane_plan_factory()
+            self._raise_if_interrupted(phase_reason="after_lane_plan_build")
+            self._speech_output = self._build_speech_output()
             response, llm_ms, first_word_reply, first_word_source = self._run_lane_plan()
             self.state_machine.transition(
                 StreamingTurnPhase.LLM_COMPLETED,
@@ -592,22 +752,25 @@ class StreamingTurnCoordinator:
                 response=response,
                 answer=answer,
             )
+            if self._speech_output is None:
+                raise RuntimeError("speech output is unavailable before flush")
             self._speech_output.flush()
         except InterruptedError:
             self._interrupt_turn("coordinator_interrupted")
             raise
-        except Exception:
-            self.state_machine.transition(
-                StreamingTurnPhase.FAILED,
-                reason="turn_execution_failed",
-            )
+        except Exception as exc:
+            self._mark_failed("turn_execution_failed", exc)
             raise
         finally:
             self._close_speech_output()
 
         try:
             self._raise_if_interrupted(phase_reason="after_playback")
+            self._raise_if_async_callback_error()
+            if self._speech_output is None:
+                raise RuntimeError("speech output is unavailable after playback")
             self._speech_output.raise_if_error()
+            self._raise_if_speech_output_close_error()
             self.state_machine.transition(
                 StreamingTurnPhase.PLAYBACK_DRAINING,
                 reason="speech_output_drained",
@@ -635,11 +798,8 @@ class StreamingTurnCoordinator:
         except InterruptedError:
             self._interrupt_turn("coordinator_interrupted")
             raise
-        except Exception:
-            self.state_machine.transition(
-                StreamingTurnPhase.FAILED,
-                reason="post_playback_completion_failed",
-            )
+        except Exception as exc:
+            self._mark_failed("post_playback_completion_failed", exc)
             raise
         return StreamingTurnExecutionOutcome(
             keep_listening=keep_listening,
@@ -651,6 +811,99 @@ class StreamingTurnCoordinator:
             first_word_source=first_word_source,
         )
 
+    def _emit_status_safe(self) -> None:
+        """Serialize coordinator-owned status emissions across worker threads."""
+
+        with self._io_lock:
+            self.hooks.emit_status()
+
+    def _emit_line(self, line: str) -> None:
+        """Serialize raw emit lines across coordinator-owned threads."""
+
+        with self._io_lock:
+            self.hooks.emit(line)
+
+    def _emit_kv(self, key: str, value: object, *, max_chars: int | None = None) -> None:
+        """Emit a sanitized key=value pair over the coordinator's line protocol."""
+
+        limit = self._emit_value_max_chars() if max_chars is None else max(1, int(max_chars))
+        payload = _escape_emit_value(value, max_chars=limit)
+        self._emit_line(f"{key}={payload}")
+
+    def _emit_flag(self, key: str, value: bool) -> None:
+        """Emit a stable lowercase boolean flag."""
+
+        self._emit_line(f"{key}={_bool_token(value)}")
+
+    def _emit_int(self, key: str, value: int) -> None:
+        """Emit a numeric metric without stringly-typed call sites everywhere."""
+
+        self._emit_line(f"{key}={int(value)}")
+
+    def _emit_value_max_chars(self) -> int:
+        """Return the coordinator-level max payload length for emit() values."""
+
+        return _coerce_positive_int(
+            getattr(self.config, "streaming_emit_value_max_chars", _DEFAULT_EMIT_VALUE_MAX_CHARS),
+            _DEFAULT_EMIT_VALUE_MAX_CHARS,
+        )
+
+    def _mark_failed(self, reason: str, exc: BaseException) -> None:
+        """Move the state machine into FAILED exactly once with useful evidence."""
+
+        if self.state_machine.phase in {StreamingTurnPhase.FAILED, StreamingTurnPhase.INTERRUPTED}:
+            return
+        self.state_machine.transition(
+            StreamingTurnPhase.FAILED,
+            reason=reason,
+            details={"error_type": type(exc).__name__},
+        )
+
+    def _remember_async_callback_error(self, source: str, exc: BaseException) -> None:
+        """Persist the first callback-thread failure so the owner thread can raise it."""
+
+        with self._async_callback_error_lock:
+            if self._async_callback_error is not None:
+                return
+            self._async_callback_error = exc
+            self._async_callback_error_source = source
+        self.hooks.trace_event(
+            "streaming_async_callback_failed",
+            kind="exception",
+            level="ERROR",
+            details={"source": source, "error_type": type(exc).__name__},
+        )
+
+    def _raise_if_async_callback_error(self) -> None:
+        """Surface any stored callback-thread failure on the coordinator thread."""
+
+        with self._async_callback_error_lock:
+            exc = self._async_callback_error
+            source = self._async_callback_error_source
+        if exc is None:
+            return
+        raise RuntimeError(f"streaming async callback failed in {source}") from exc
+
+    def _raise_if_speech_output_close_error(self) -> None:
+        """Raise a deferred speech-output close failure after root cause work is done."""
+
+        exc = self._speech_output_close_error
+        if exc is None:
+            return
+        raise RuntimeError("streaming speech output close failed") from exc
+
+    def _guard_callback(self, source: str, callback: Callable[..., None]) -> Callable[..., None]:
+        """Wrap worker-thread callbacks so failures are bridged back to execute()."""
+
+        def _wrapped(*args, **kwargs):
+            try:
+                return callback(*args, **kwargs)
+            except BaseException as exc:  # pragma: no cover - depends on worker timing
+                self._remember_async_callback_error(source, exc)
+                raise
+
+        return _wrapped
+
     def _build_speech_output(self) -> InterruptibleSpeechOutput:
         """Create the turn-local speech output bound to this coordinator."""
 
@@ -660,17 +913,34 @@ class StreamingTurnCoordinator:
             kind="queue",
             details={"chunk_size": chunk_size},
         )
+
+        def _speech_trace_event(message: str, details=None) -> None:
+            self.hooks.trace_event(
+                message,
+                kind="io",
+                details={} if details is None else details,
+            )
+
         return InterruptibleSpeechOutput(
             tts_provider=self.speech_services.tts_provider,
             player=self.speech_services.player,
             chunk_size=chunk_size,
             segment_boundary=self.speech_services.segment_boundary,
-            on_speaking_started=self.speech_lifecycle.on_speaking_started,
-            on_first_audio=self.speech_lifecycle.on_first_audio,
-            on_preempt=lambda: self.hooks.emit("tts_lane_preempted=true"),
+            on_speaking_started=self._guard_callback(
+                "speech_output.on_speaking_started",
+                self.speech_lifecycle.on_speaking_started,
+            ),
+            on_first_audio=self._guard_callback(
+                "speech_output.on_first_audio",
+                self.speech_lifecycle.on_first_audio,
+            ),
+            on_preempt=self._guard_callback(
+                "speech_output.on_preempt",
+                lambda: self._emit_flag("tts_lane_preempted", True),
+            ),
             playback_coordinator=self.speech_services.playback_coordinator,
             should_stop=self.hooks.should_stop,
-            trace_event=lambda msg, details=None: self.hooks.trace_event(msg, details=details),
+            trace_event=_speech_trace_event,
         )
 
     def _run_lane_plan(
@@ -684,6 +954,7 @@ class StreamingTurnCoordinator:
             reason="lane_execution_started",
             details={"dual_lane": lane_plan.is_dual_lane},
         )
+        self._raise_if_interrupted(phase_reason="before_lane_execution")
         llm_started = time.monotonic()
         if lane_plan.is_dual_lane:
             lane_outcome = self._run_dual_lane()
@@ -691,8 +962,8 @@ class StreamingTurnCoordinator:
             first_word_reply = lane_outcome.first_word_reply
             first_word_source = lane_outcome.first_word_source
             if first_word_reply is not None:
-                self.hooks.emit(f"first_word_mode={first_word_reply.mode}")
-                self.hooks.emit(f"first_word_source={first_word_source}")
+                self._emit_kv("first_word_mode", first_word_reply.mode, max_chars=256)
+                self._emit_kv("first_word_source", first_word_source, max_chars=256)
                 self.hooks.trace_event(
                     "streaming_first_word_selected",
                     kind="decision",
@@ -721,6 +992,8 @@ class StreamingTurnCoordinator:
             raise RuntimeError("dual-lane turn plan missing timeout policy")
         if lane_plan.run_final_lane is None:
             raise RuntimeError("dual-lane turn plan missing run_final_lane callback")
+        if self._speech_output is None:
+            raise RuntimeError("dual-lane turn requires an initialized speech output")
         orchestrator = StreamingTurnOrchestrator(
             timeout_policy=lane_plan.timeout_policy,
             queue_lane_delta=self._queue_lane_segments,
@@ -730,7 +1003,7 @@ class StreamingTurnCoordinator:
             ensure_processing_feedback=self.processing_feedback.ensure_started,
             resume_processing_after_bridge=self._resume_processing_after_bridge_wait,
             stop_final_lane_feedback=self.hooks.stop_search_feedback,
-            emit=self.hooks.emit,
+            emit=self._emit_line,
             trace_event=self.hooks.trace_event,
             should_stop=self.hooks.should_stop,
             request_final_lane_stop=self.hooks.request_turn_stop,
@@ -754,12 +1027,11 @@ class StreamingTurnCoordinator:
         self.processing_feedback.ensure_started()
 
     def _should_recover_final_lane_error(self, exc: BaseException) -> bool:
-        """Classify fatal required-remote errors before propagating them.
+        """Recover ordinary final-lane errors but fail closed on required-remote blockers.
 
-        The streaming final lane now fails closed for every error. This helper
-        only keeps the required-remote classification and telemetry so the
-        runtime can distinguish explicit remote blockers from ordinary turn
-        failures in the emitted evidence.
+        Ordinary final-lane failures remain eligible for the orchestrator's
+        recovery path. Required remote-memory outages are explicitly marked as
+        fatal so the turn does not silently recover behind a degraded bridge.
         """
 
         if not isinstance(exc, LongTermRemoteUnavailableError):
@@ -772,7 +1044,7 @@ class StreamingTurnCoordinator:
         )
         if not remote_required:
             return True
-        self.hooks.emit(f"final_lane_fatal={type(exc).__name__}")
+        self._emit_kv("final_lane_fatal", type(exc).__name__, max_chars=256)
         self.hooks.trace_event(
             "streaming_final_lane_fatal_remote_error",
             kind="exception",
@@ -797,6 +1069,8 @@ class StreamingTurnCoordinator:
             kind="queue",
             details={"delta_len": len(delta)},
         )
+        if self._speech_output is None:
+            raise RuntimeError("speech output is unavailable while queueing text deltas")
         self._speech_output.submit_text_delta(delta)
 
     def _queue_lane_segments(self, delta) -> None:
@@ -811,16 +1085,15 @@ class StreamingTurnCoordinator:
                 "atomic": getattr(delta, "atomic", False),
             },
         )
+        if self._speech_output is None:
+            raise RuntimeError("speech output is unavailable while queueing lane deltas")
         self._speech_output.submit_lane_delta(delta)
 
     def _finalize_answer(self, response: StreamingToolLoopResult) -> str:
         """Finalize the runtime turn once the response text is available."""
 
         if self.runtime.status.value == "printing":
-            self.runtime.resume_answering_after_print()
-            self.hooks.emit_status()
-            self.speech_lifecycle.answer_started = True
-            self.hooks.trace_event("streaming_print_resume_answering", kind="mutation", details={})
+            self.speech_lifecycle.resume_answering_after_print()
         finalize_started = time.monotonic()
         answer = self.runtime.finalize_agent_turn(response.text)
         self.hooks.trace_event(
@@ -831,22 +1104,10 @@ class StreamingTurnCoordinator:
         )
         tool_calls = tuple(getattr(response, "tool_calls", ()) or ())
         tool_results = tuple(getattr(response, "tool_results", ()) or ())
-        record_tool_history = getattr(self.runtime, "record_personality_tool_history", None)
-        if callable(record_tool_history):
-            tool_history_started = time.monotonic()
-            record_tool_history(
-                tool_calls=tool_calls,
-                tool_results=tool_results,
-            )
-            self.hooks.trace_event(
-                "streaming_runtime_tool_history_recorded",
-                kind="metric",
-                details={
-                    "tool_calls": len(tool_calls),
-                    "tool_results": len(tool_results),
-                },
-                kpi={"duration_ms": round((time.monotonic() - tool_history_started) * 1000.0, 3)},
-            )
+        self._schedule_tool_history_recording(
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+        )
         self.hooks.trace_event(
             "streaming_agent_turn_finalized",
             kind="mutation",
@@ -860,24 +1121,117 @@ class StreamingTurnCoordinator:
         )
         return answer
 
-    def _close_speech_output(self) -> None:
-        """Close or abort the speech worker and always stop processing feedback."""
+    def _schedule_tool_history_recording(
+        self,
+        *,
+        tool_calls,
+        tool_results,
+    ) -> None:
+        """Dispatch non-critical tool-history learning off the foreground turn thread.
 
-        if self._speech_output is None:
+        Personality tool-history recording can synchronously flush pending learning
+        state when internal budgets are exceeded. That persistence path touches the
+        personality/background stores and can take much longer than the audible TTS
+        drain. Scheduling it on a daemon worker keeps the user-facing turn finish
+        path bounded while preserving best-effort learning.
+        """
+
+        normalized_tool_calls = tuple(tool_calls)
+        normalized_tool_results = tuple(tool_results)
+        if not normalized_tool_calls and not normalized_tool_results:
+            return
+
+        record_tool_history = getattr(self.runtime, "record_personality_tool_history", None)
+        if not callable(record_tool_history):
+            return
+
+        def _worker() -> None:
+            started = time.monotonic()
+            try:
+                record_tool_history(
+                    tool_calls=normalized_tool_calls,
+                    tool_results=normalized_tool_results,
+                )
+            except Exception as exc:  # pragma: no cover - defensive runtime hook guard
+                self.hooks.trace_event(
+                    "streaming_runtime_tool_history_failed",
+                    kind="warning",
+                    level="WARN",
+                    details={"error_type": type(exc).__name__},
+                )
+                return
+            self.hooks.trace_event(
+                "streaming_runtime_tool_history_recorded",
+                kind="metric",
+                details={
+                    "tool_calls": len(normalized_tool_calls),
+                    "tool_results": len(normalized_tool_results),
+                },
+                kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+            )
+
+        worker = Thread(
+            target=_worker,
+            daemon=True,
+            name="twinr-streaming-tool-history",
+        )
+        try:
+            worker.start()
+        except Exception as exc:  # pragma: no cover - defensive thread-start guard
+            self.hooks.trace_event(
+                "streaming_runtime_tool_history_start_failed",
+                kind="warning",
+                level="WARN",
+                details={"error_type": type(exc).__name__},
+            )
+            return
+
+        self.hooks.trace_event(
+            "streaming_runtime_tool_history_scheduled",
+            kind="branch",
+            details={
+                "tool_calls": len(normalized_tool_calls),
+                "tool_results": len(normalized_tool_results),
+            },
+        )
+
+    def _stop_search_feedback_safe(self) -> None:
+        """Stop auxiliary search feedback without letting cleanup telemetry fail the turn."""
+
+        try:
             self.hooks.stop_search_feedback()
+        except Exception as exc:  # pragma: no cover - defensive hook guard
+            self.hooks.trace_event(
+                "streaming_search_feedback_stop_failed",
+                kind="warning",
+                level="WARN",
+                details={"error_type": type(exc).__name__},
+            )
+
+    def _close_speech_output(self) -> None:
+        """Close or abort the speech worker and always stop processing feedback.
+
+        Close failures are stored and re-raised on the owner thread after the
+        main turn flow finishes, so cleanup cannot mask the real root cause.
+        """
+
+        self._speech_output_close_error = None
+        if self._speech_output is None:
+            self._stop_search_feedback_safe()
             self.processing_feedback.stop()
+            self.speech_lifecycle.stop_snapshot_heartbeat()
             return
         close_timeout_s = self._speech_output_close_timeout()
         interrupted = self.hooks.should_stop()
         # Stop feedback owners before waiting on speech-output drain so they
         # cannot keep reacquiring the speaker while the final reply is closing.
-        self.hooks.stop_search_feedback()
+        self._stop_search_feedback_safe()
         self.processing_feedback.stop()
         try:
             if interrupted:
                 stopped = self._speech_output.abort(timeout_s=min(0.25, close_timeout_s))
                 if not stopped:
-                    self.hooks.emit("speech_output_abort_timeout=true")
+                    self._emit_flag("speech_output_abort_timeout", True)
                 self.hooks.trace_event(
                     "streaming_speech_output_abort_path",
                     kind="branch",
@@ -890,8 +1244,16 @@ class StreamingTurnCoordinator:
                     kind="branch",
                     details={"close_timeout_s": close_timeout_s},
                 )
+        except BaseException as exc:  # pragma: no cover - defensive cleanup bridge
+            self._speech_output_close_error = exc
+            self.hooks.trace_event(
+                "streaming_speech_output_close_failed",
+                kind="exception",
+                level="ERROR",
+                details={"error_type": type(exc).__name__},
+            )
         finally:
-            self.hooks.stop_search_feedback()
+            self._stop_search_feedback_safe()
             self.processing_feedback.stop()
             self.speech_lifecycle.stop_snapshot_heartbeat()
 
@@ -916,24 +1278,26 @@ class StreamingTurnCoordinator:
         """Emit user-visible response and timing telemetry for the turn."""
 
         del first_word_reply, first_word_source
-        self.hooks.emit(f"response={answer}")
+        self._emit_kv("response", answer)
         if response.response_id:
-            self.hooks.emit(f"agent_response_id={response.response_id}")
+            self._emit_kv("agent_response_id", response.response_id, max_chars=512)
         if response.request_id:
-            self.hooks.emit(f"agent_request_id={response.request_id}")
-        self.hooks.emit(f"agent_tool_rounds={response.rounds}")
-        self.hooks.emit(f"agent_tool_calls={len(response.tool_calls)}")
-        self.hooks.emit(f"agent_used_web_search={str(response.used_web_search).lower()}")
-        self.hooks.emit(f"timing_capture_ms={self.request.capture_ms}")
-        self.hooks.emit(f"timing_stt_ms={self.request.stt_ms}")
-        self.hooks.emit(f"timing_llm_ms={llm_ms}")
-        self.hooks.emit("timing_playback_ms=streamed")
+            self._emit_kv("agent_request_id", response.request_id, max_chars=512)
+        self._emit_int("agent_tool_rounds", response.rounds)
+        self._emit_int("agent_tool_calls", len(response.tool_calls))
+        self._emit_flag("agent_used_web_search", bool(response.used_web_search))
+        self._emit_int("timing_capture_ms", self.request.capture_ms)
+        self._emit_int("timing_stt_ms", self.request.stt_ms)
+        self._emit_int("timing_llm_ms", llm_ms)
+        self._emit_kv("timing_playback_ms", "streamed", max_chars=32)
         if first_audio_at is not None:
-            self.hooks.emit(
-                f"timing_first_audio_ms={int((first_audio_at - self.request.turn_started) * 1000)}"
+            self._emit_int(
+                "timing_first_audio_ms",
+                int((first_audio_at - self.request.turn_started) * 1000),
             )
-        self.hooks.emit(
-            f"timing_total_ms={int((time.monotonic() - self.request.turn_started) * 1000)}"
+        self._emit_int(
+            "timing_total_ms",
+            int((time.monotonic() - self.request.turn_started) * 1000),
         )
 
     def _start_follow_up_closure_evaluation(
@@ -992,6 +1356,37 @@ class StreamingTurnCoordinator:
             provider_timeout_s = 2.0
         return min(15.0, max(0.25, provider_timeout_s) + 0.25)
 
+    def _record_usage_best_effort(
+        self,
+        *,
+        response: StreamingToolLoopResult,
+    ) -> None:
+        """Record usage without letting analytics/storage faults fail the delivered turn."""
+
+        try:
+            self.hooks.record_usage(
+                request_kind="conversation",
+                source="streaming_loop",
+                model=response.model,
+                response_id=response.response_id,
+                request_id=response.request_id,
+                used_web_search=response.used_web_search,
+                token_usage=response.token_usage,
+                transcript=self.request.transcript,
+                request_source=self.request.listen_source,
+                proactive_trigger=self.request.proactive_trigger,
+                tool_rounds=response.rounds,
+                tool_calls=len(response.tool_calls),
+            )
+        except Exception as exc:
+            self._emit_kv("streaming_usage_record_failed", type(exc).__name__, max_chars=256)
+            self.hooks.trace_event(
+                "streaming_usage_record_failed",
+                kind="warning",
+                level="WARN",
+                details={"error_type": type(exc).__name__},
+            )
+
     def _finish_turn(
         self,
         *,
@@ -1002,20 +1397,7 @@ class StreamingTurnCoordinator:
     ) -> bool:
         """Record usage, finish runtime speaking state, and decide follow-up."""
 
-        self.hooks.record_usage(
-            request_kind="conversation",
-            source="streaming_loop",
-            model=response.model,
-            response_id=response.response_id,
-            request_id=response.request_id,
-            used_web_search=response.used_web_search,
-            token_usage=response.token_usage,
-            transcript=self.request.transcript,
-            request_source=self.request.listen_source,
-            proactive_trigger=self.request.proactive_trigger,
-            tool_rounds=response.rounds,
-            tool_calls=len(response.tool_calls),
-        )
+        self._record_usage_best_effort(response=response)
         end_conversation = any(call.name == "end_conversation" for call in response.tool_calls)
         closure_evaluation = self._resolve_follow_up_closure_evaluation(
             end_conversation=end_conversation,
@@ -1035,31 +1417,34 @@ class StreamingTurnCoordinator:
                     self.hooks.follow_up_rearm_allowed_now(self.request.listen_source)
                 )
             except Exception as exc:
-                self.hooks.emit(f"streaming_follow_up_rearm_check_failed={type(exc).__name__}")
+                self._emit_kv(
+                    "streaming_follow_up_rearm_check_failed",
+                    type(exc).__name__,
+                    max_chars=256,
+                )
         rearm_follow_up = (
             not force_close
             and self.request.allow_follow_up_rearm
             and remote_follow_up_rearm_allowed_now
         )
-        self.hooks.emit(
-            f"streaming_follow_up_rearm_snapshot={str(self.request.allow_follow_up_rearm).lower()}"
-        )
-        self.hooks.emit(
-            f"streaming_follow_up_rearm_allowed_now={str(remote_follow_up_rearm_allowed_now).lower()}"
+        self._emit_flag("streaming_follow_up_rearm_snapshot", self.request.allow_follow_up_rearm)
+        self._emit_flag(
+            "streaming_follow_up_rearm_allowed_now",
+            remote_follow_up_rearm_allowed_now,
         )
         self.speech_lifecycle.stop_snapshot_heartbeat()
         self._raise_if_interrupted(phase_reason="before_runtime_finish")
         if rearm_follow_up:
-            self.hooks.emit("streaming_turn_finish_path=rearm_follow_up")
+            self._emit_kv("streaming_turn_finish_path", "rearm_follow_up", max_chars=64)
             self.runtime.rearm_follow_up(request_source="follow_up")
         else:
-            self.hooks.emit("streaming_turn_finish_path=finish_speaking")
+            self._emit_kv("streaming_turn_finish_path", "finish_speaking", max_chars=64)
             self.runtime.finish_speaking()
-        self.hooks.emit_status()
+        self._emit_status_safe()
         if end_conversation:
-            self.hooks.emit("conversation_ended=true")
+            self._emit_flag("conversation_ended", True)
         elif force_close:
-            self.hooks.emit("conversation_follow_up_vetoed=closure")
+            self._emit_kv("conversation_follow_up_vetoed", "closure", max_chars=64)
         self.hooks.trace_decision(
             "streaming_follow_up_decision",
             question="Should the session remain open for a follow-up turn?",
@@ -1094,16 +1479,19 @@ class StreamingTurnCoordinator:
     def _raise_if_interrupted(self, *, phase_reason: str) -> None:
         """Abort the turn immediately when the active turn was interrupted."""
 
+        stop_requested = self.hooks.should_stop()
         runtime_status = getattr(getattr(self.runtime, "status", None), "value", None)
-        if not self.hooks.should_stop() and runtime_status != "error":
+        if not stop_requested and runtime_status != "error":
             return
         self.hooks.trace_event(
             f"streaming_turn_interrupted_{phase_reason}",
             kind="branch",
             details={
                 "runtime_status": runtime_status,
-                "stop_requested": self.hooks.should_stop(),
+                "stop_requested": stop_requested,
+                "phase": self.state_machine.phase.value,
             },
+            kpi={"elapsed_ms": round((time.monotonic() - self.request.turn_started) * 1000.0, 3)},
         )
         self._interrupt_turn(phase_reason)
         raise InterruptedError("streaming turn interrupted")
@@ -1115,5 +1503,12 @@ class StreamingTurnCoordinator:
             self.state_machine.transition(
                 StreamingTurnPhase.INTERRUPTED,
                 reason=reason,
+                details={
+                    "phase": self.state_machine.phase.value,
+                    "elapsed_ms": round(
+                        (time.monotonic() - self.request.turn_started) * 1000.0,
+                        3,
+                    ),
+                },
             )
         self.hooks.cancel_interrupted_turn()

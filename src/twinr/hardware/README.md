@@ -67,7 +67,9 @@ feedback on device.
 | [audio.py](./audio.py) | Bounded audio capture, readable-frame probing, and playback |
 | [audio_env.py](./audio_env.py) | Sanitize child-process env for ALSA helpers when the Pi runtime borrows a different user's Wayland session |
 | [respeaker_capture_recovery.py](./respeaker_capture_recovery.py) | Bounded transient XVF3800 capture-recovery helper shared by live listen and voice-orchestrator paths |
-| [camera_ai/](./camera_ai/) | Internal SoC package for camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, and gesture modules |
+| [camera_ai/](./camera_ai/) | Internal SoC package for camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, gesture modules, and the decomposed local adapter internals |
+| [camera_ai/adapter.py](./camera_ai/adapter.py) | Stable compatibility facade for the internal local AI-camera adapter import path while the runtime logic lives under `camera_ai/adapter_impl/` |
+| [camera_ai/adapter_impl/](./camera_ai/adapter_impl/) | Internal AI-camera adapter package split across observation entrypoints, pose resolution, gesture targeting, runtime lifecycle, and cache/error helpers |
 | [camera_ai/live_gesture_pipeline.py](./camera_ai/live_gesture_pipeline.py) | Dedicated low-latency MediaPipe live-stream gesture lane for HDMI symbol acknowledgement |
 | [camera_ai/gesture_candidate_capture.py](./camera_ai/gesture_candidate_capture.py) | Bounded JPEG + JSON capture helper for manual optical QA of suspected gesture frames |
 | [ai_camera.py](./ai_camera.py) | Stable compatibility facade for the public local AI-camera adapter surface |
@@ -78,13 +80,14 @@ feedback on device.
 | [hand_landmarks.py](./hand_landmarks.py) | Bounded MediaPipe hand-landmark ROI worker for full-frame-to-hand crop resolution |
 | [mediapipe_vision.py](./mediapipe_vision.py) | Stable compatibility facade for the public MediaPipe camera pipeline surface |
 | [buttons.py](./buttons.py) | GPIO button monitoring backends |
-| [servo_follow.py](./servo_follow.py) | Bounded body-orientation adapter for normalized attention targets, selecting among Twinr's custom kernel servo sysfs contract, kernel-PWM sysfs, hardware-timed `pigpio`, calmer `lgpio.tx_pwm`, older `lgpio` servo output, a focused local Pololu Mini Maestro USB command-port writer, or a peer-Pi Pololu Maestro HTTP writer, and layering visible-target latching, optional exit-only physical follow with loss-confirmation delay plus frame-edge-confirmed visible departure, one-way exit pursuit toward a bounded side target, coarse periodic visible-user recentering after a long off-center dwell instead of continuous in-frame tracking, a dedicated continuous-rotation mode that drives a virtual heading through bounded speed pulses for 360-degree servos, a short exit settle-hold before release, centered visible reacquire cooldown, a slower rest-position return profile after longer absence, startup seeding from the active writer's remembered pulse width so any non-center remembered pose is neutralized first, an explicit manual-hold branch that keeps a 360-degree servo electrically released until explicitly armed, live reload of the persisted hold/arm state file, an explicit return-to-estimated-zero branch that first replays the persisted movement journal through exact-duration bounded segments before falling back to the older slow planner, released idle semantics once the estimated heading is already back at `0°`, acceleration/jerk motion shaping, soft end-stop margins, output hysteresis, calm idle release, release-after-settle for quieter loaded holds, and a fail-closed startup guard against proven foreign GPIO servo overlays/processes |
+| [servo_follow.py](./servo_follow.py) | Stable compatibility facade for the public attention-servo API while the implementation lives in the decomposed `servo_follow_impl/` package |
+| [servo_follow_impl/](./servo_follow_impl/) | Internal attention-servo package split across config normalization, GPIO/Pololu writers, motion shaping, target resolution, exit-only behavior, and the top-level controller |
 | [servo_continuous.py](./servo_continuous.py) | Focused open-loop planner for continuous-rotation servos that estimates one virtual heading, converts heading error into bounded direction/speed pulses, and keeps that motion model out of the higher follow-state machine |
 | [servo_state.py](./servo_state.py) | Tiny JSON-backed runtime-state store for continuous servos, persisting the operator-confirmed virtual heading, bounded heading uncertainty, and explicit hold/arm or return-to-estimated-zero transitions outside the main follow controller |
 | [servo_segment_player.py](./servo_segment_player.py) | Exact-duration background segment player for continuous-servo reverse replay, starting one bounded pulse immediately and disabling it at the recorded deadline instead of holding it until the next runtime tick |
 | [servo_maestro.py](./servo_maestro.py) | Focused Pololu Mini Maestro command-port adapter that auto-discovers the stable `...-if00` USB serial endpoint when present, falls back to Maestro-tagged `ttyACM*` command ports when by-id links are absent, invalidates stale connections after USB faults, emits compact-protocol target commands, reads back current channel positions for startup alignment, fails clearly when the controller is still in the wrong UART serial mode, and keeps Maestro transport concerns out of the higher servo policy module |
-| [servo_peer.py](./servo_peer.py) | Focused peer-Pi Pololu Maestro HTTP client that lets the main Twinr runtime keep follow policy local while the helper Pi owns the actual Maestro USB command port |
-| [camera.py](./camera.py) | bounded still capture with ffmpeg/V4L2, Pi `rpicam-still` fallback for missing default `video0` nodes and busy `unicam-image` devices, or peer-Pi HTTP snapshot fetches when `TWINR_CAMERA_PROXY_SNAPSHOT_URL` is configured |
+| [servo_peer.py](./servo_peer.py) | Focused legacy peer-Pi Pololu Maestro HTTP client retained for historical helper-Pi artifacts; the active Twinr config now fails closed on that topology |
+| [camera.py](./camera.py) | bounded still capture with ffmpeg/V4L2, Pi `rpicam-still` fallback for missing default `video0` nodes and busy `unicam-image` devices, plus the legacy snapshot-proxy adapter kept for historical compatibility but no longer accepted by the canonical env config |
 | [portrait_identity.py](./portrait_identity.py) | Atomic local portrait-identity store with enrolled reference-image management |
 | [portrait_match.py](./portrait_match.py) | Local YuNet/SFace portrait-match adapter with enrollment flow, multi-reference scoring, and temporal fusion |
 | [household_voice_identity.py](./household_voice_identity.py) | Multi-user local voice-identity store and matcher for enrolled household members, including bounded read-only snapshot export for the live voice gateway |
@@ -114,11 +117,12 @@ camera = V4L2StillCamera.from_config(config)
 pcm_bytes = recorder.record_pcm_until_pause(pause_ms=900)
 ```
 
-When the main Pi has no directly attached still camera, configure
-`TWINR_CAMERA_PROXY_SNAPSHOT_URL=http://10.42.0.2:8767/snapshot.png` and the
-same `V4L2StillCamera.from_config(config)` entrypoint will fetch bounded PNG
-captures from the dedicated peer camera proxy Pi instead of opening
-`/dev/video0`.
+The productive Twinr runtime is now single-Pi only. `TwinrConfig.from_env()`
+expects the still camera on the main Pi and rejects the retired helper-Pi
+camera envs (`TWINR_CAMERA_HOST_MODE=second_pi`,
+`TWINR_CAMERA_SECOND_PI_BASE_URL`, `TWINR_PROACTIVE_REMOTE_CAMERA_BASE_URL`,
+and `TWINR_CAMERA_PROXY_SNAPSHOT_URL`) instead of silently reviving the old
+proxy topology.
 
 When the current camera is the Bitcraze AI-Deck WiFi streamer, configure
 `TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000`. The same

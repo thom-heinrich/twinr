@@ -46,7 +46,8 @@ def load_provider_config(context: ConfigLoadContext) -> dict[str, object]:
             get_value("OPENAI_PROMPT_CACHE_ENABLED"), True
         ),
         "openai_prompt_cache_retention": get_value("OPENAI_PROMPT_CACHE_RETENTION"),
-        "openai_stt_model": get_value("OPENAI_STT_MODEL", "whisper-1") or "whisper-1",
+        "openai_stt_model": get_value("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+        or "gpt-4o-mini-transcribe",
         "openai_tts_model": get_value("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
         or "gpt-4o-mini-tts",
         "openai_tts_voice": get_value("OPENAI_TTS_VOICE", "marin") or "marin",
@@ -85,17 +86,15 @@ def load_provider_config(context: ConfigLoadContext) -> dict[str, object]:
         "groq_model": get_value("GROQ_MODEL", "llama-3.3-70b-versatile")
         or "llama-3.3-70b-versatile",
         "groq_timeout_s": _parse_float(get_value("GROQ_TIMEOUT_S"), 45.0),
-        "openai_realtime_model": get_value(
-            "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"
-        )
-        or "gpt-4o-realtime-preview",
+        "openai_realtime_model": get_value("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
+        or "gpt-realtime-1.5",
         "openai_realtime_voice": get_value("OPENAI_REALTIME_VOICE", "sage") or "sage",
         "openai_realtime_speed": _parse_float(get_value("OPENAI_REALTIME_SPEED"), 1.0),
         "openai_realtime_instructions": get_value("OPENAI_REALTIME_INSTRUCTIONS"),
         "openai_realtime_transcription_model": get_value(
-            "OPENAI_REALTIME_TRANSCRIPTION_MODEL", "whisper-1"
+            "OPENAI_REALTIME_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"
         )
-        or "whisper-1",
+        or "gpt-4o-mini-transcribe",
         "openai_realtime_language": get_value("OPENAI_REALTIME_LANGUAGE", "de") or "de",
         "openai_realtime_input_sample_rate": int(
             get_value("OPENAI_REALTIME_INPUT_SAMPLE_RATE", "24000") or "24000"
