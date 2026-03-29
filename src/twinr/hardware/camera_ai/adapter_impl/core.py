@@ -21,6 +21,7 @@ from .common import LOGGER
 from .composition import AICameraAdapterCompositionMixin
 from .gesture import AICameraAdapterGestureMixin
 from .observe import AICameraAdapterObserveMixin
+from .perception import AICameraAdapterPerceptionMixin
 from .pose import AICameraAdapterPoseMixin
 from .runtime import AICameraAdapterRuntimeMixin
 from .state import AICameraAdapterStateMixin
@@ -31,6 +32,7 @@ logger = LOGGER
 
 class LocalAICameraAdapter(
     AICameraAdapterObserveMixin,
+    AICameraAdapterPerceptionMixin,
     AICameraAdapterAttentionMixin,
     AICameraAdapterGestureMixin,
     AICameraAdapterPoseMixin,
@@ -84,6 +86,7 @@ class LocalAICameraAdapter(
         self._face_anchor_detector = face_anchor_detector
         self._last_gesture_debug_details: dict[str, Any] | None = None
         self._last_attention_debug_details: dict[str, Any] | None = None
+        self._attention_stream_state_by_lane: dict[str, Any] = {}
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LocalAICameraAdapter":

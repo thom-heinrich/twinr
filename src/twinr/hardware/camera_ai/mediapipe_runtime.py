@@ -1,6 +1,7 @@
 # CHANGELOG: 2026-03-28
 # BUG-1: Live recognizer caches now rebuild when the callback or num_hands override changes, preventing silent dispatch to stale callbacks or wrong multi-hand settings.
 # BUG-2: Cached task instances now rebuild when model files or effective config values change, preventing stale models/thresholds in long-lived processes.
+# BUG-3: Stable live callback cache keys now reuse recognizers across observe() ticks while still hot-swapping the active Python callback target.
 # SEC-1: Model assets are size-capped before read and, on old BaseOptions fallbacks, are exposed through verified in-memory compatibility files instead of reopening the original path.
 # IMP-1: Live-stream callbacks now default to a latest-wins background dispatcher so slow Python callbacks do not stall MediaPipe live streams.
 # IMP-2: Model assets are cached and reused across IMAGE/VIDEO/LIVE_STREAM task instances, avoiding repeated SD-card reads and duplicate memory churn on Raspberry Pi.
@@ -29,6 +30,7 @@ _MEDIAPIPE_IMAGE_DTYPES = {"uint8", "uint16", "float32"}
 _DEFAULT_MAX_MODEL_ASSET_BYTES = 128 * 1024 * 1024
 _DEFAULT_LIVE_CALLBACK_QUEUE_SIZE = 1
 _DEFAULT_LIVE_CALLBACK_SHUTDOWN_TIMEOUT_S = 1.0
+MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR = "__twinr_mediapipe_live_callback_cache_key__"
 _INSTANCE_SLOTS = (
     "_pose_landmarker",
     "_gesture_recognizer",
@@ -114,8 +116,8 @@ class _ModelAssetRecord:
 class _LatestWinsCallbackDispatcher:
     """Run live-stream callbacks off the MediaPipe thread with bounded backlog."""
 
-    def __init__(self, callback: Any, *, queue_size: int, name: str) -> None:
-        self._callback = callback
+    def __init__(self, callback_proxy: "_MutableLiveCallbackProxy", *, queue_size: int, name: str) -> None:
+        self._callback_proxy = callback_proxy
         self._queue_size = max(1, int(queue_size))
         self._queue: deque[tuple[Any, Any, int]] = deque(maxlen=self._queue_size)
         self._condition = threading.Condition()
@@ -127,7 +129,7 @@ class _LatestWinsCallbackDispatcher:
     def spec(self) -> tuple[Any, int]:
         """Return the dispatcher identity relevant to cache invalidation."""
 
-        return (self._callback, self._queue_size)
+        return ((*self._callback_proxy.spec,), self._queue_size)
 
     def enqueue(self, result: Any, output_image: Any, timestamp_ms: int) -> None:
         """Queue the newest callback payload without blocking the caller."""
@@ -160,11 +162,55 @@ class _LatestWinsCallbackDispatcher:
                 result, output_image, timestamp_ms = self._queue.popleft()
 
             try:
-                self._callback(result, output_image, timestamp_ms)
+                self._callback_proxy(result, output_image, timestamp_ms)
             except Exception as exc:
                 # BREAKING: callback failures are isolated from MediaPipe's live thread.
                 # Keep the stream alive and surface the original callback traceback.
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
+class _MutableLiveCallbackProxy:
+    """Keep one stable callable identity while swapping the target callback."""
+
+    def __init__(self, callback: Any, *, cache_key: Any) -> None:
+        self._callback: Any | None = None
+        self._cache_key = cache_key
+        self._closed = False
+        self._lock = threading.Lock()
+        self.update_callback(callback)
+
+    @property
+    def spec(self) -> tuple[Any]:
+        """Return the stable cache identity for one live callback target."""
+
+        return (self._cache_key,)
+
+    def update_callback(self, callback: Any) -> None:
+        """Swap in the current Python callback without changing callable identity."""
+
+        if callback is None:
+            raise ValueError("mediapipe_live_result_callback_missing")
+        if not callable(callback):
+            raise ValueError("mediapipe_live_result_callback_invalid")
+        with self._lock:
+            self._callback = callback
+            self._closed = False
+
+    def close(self) -> None:
+        """Fail closed so stale direct callbacks after teardown are ignored."""
+
+        with self._lock:
+            self._closed = True
+            self._callback = None
+
+    def __call__(self, result: Any, output_image: Any, timestamp_ms: int) -> None:
+        """Invoke the latest callback target if this proxy is still active."""
+
+        with self._lock:
+            if self._closed or self._callback is None:
+                return
+            callback = self._callback
+        callback(result, output_image, timestamp_ms)
 
 
 class MediaPipeTaskRuntime:
@@ -186,6 +232,7 @@ class MediaPipeTaskRuntime:
         self._runtime: dict[str, Any] | None = None
         self._instance_specs: dict[str, tuple[Any, ...]] = {}
         self._model_asset_cache: dict[str, _ModelAssetRecord] = {}
+        self._live_callback_proxies: dict[str, _MutableLiveCallbackProxy] = {}
         self._live_callback_dispatchers: dict[str, _LatestWinsCallbackDispatcher] = {}
 
     def close(self) -> None:
@@ -461,6 +508,7 @@ class MediaPipeTaskRuntime:
 
         with self._lock:
             if self._matches_cached_instance("_live_gesture_recognizer", spec):
+                self._prepare_live_callback("_live_gesture_recognizer", result_callback)
                 return self._live_gesture_recognizer
             self._close_instance_slot("_live_gesture_recognizer")
             wrapped_callback = self._prepare_live_callback("_live_gesture_recognizer", result_callback)
@@ -497,6 +545,7 @@ class MediaPipeTaskRuntime:
 
         with self._lock:
             if self._matches_cached_instance("_live_custom_gesture_recognizer", spec):
+                self._prepare_live_callback("_live_custom_gesture_recognizer", result_callback)
                 return self._live_custom_gesture_recognizer
             self._close_instance_slot("_live_custom_gesture_recognizer")
             wrapped_callback = self._prepare_live_callback("_live_custom_gesture_recognizer", result_callback)
@@ -511,6 +560,20 @@ class MediaPipeTaskRuntime:
             )
             self._instance_specs["_live_custom_gesture_recognizer"] = spec
             return self._live_custom_gesture_recognizer
+
+    def reset_live_gesture_recognizers(self) -> None:
+        """Drop the live-stream recognizers so the next observe() rebuilds them.
+
+        Live-stream Tasks can accumulate internal queue pressure when callers
+        continue pushing frames after the current callback missed its latency
+        budget. Expose one focused reset seam so higher layers can fail closed
+        on stale in-flight work without tearing down unrelated IMAGE/VIDEO mode
+        helpers that remain healthy.
+        """
+
+        with self._lock:
+            self._close_instance_slot("_live_gesture_recognizer")
+            self._close_instance_slot("_live_custom_gesture_recognizer")
 
     def _create_gesture_recognizer(
         self,
@@ -572,9 +635,10 @@ class MediaPipeTaskRuntime:
         if model_family == "builtin":
             options_kwargs["canned_gesture_classifier_options"] = self._build_builtin_classifier_options(runtime)
         elif model_family == "custom":
-            custom_classifier_options = self._build_custom_classifier_options(runtime)
-            if custom_classifier_options is not None:
-                options_kwargs["custom_gesture_classifier_options"] = custom_classifier_options
+            # Custom gesture thresholds are enforced by Twinr's post-recognition
+            # arbitration so the same contract stays stable across MediaPipe
+            # runtimes that differ in custom classifier-option support.
+            pass
         else:
             raise ValueError("mediapipe_invalid_config:model_family")
         options = gesture_recognizer_options(**options_kwargs)
@@ -591,6 +655,9 @@ class MediaPipeTaskRuntime:
         dispatcher = self._live_callback_dispatchers.pop(slot_name, None)
         if dispatcher is not None:
             dispatcher.close(timeout_s=self._live_callback_shutdown_timeout_s())
+        callback_proxy = self._live_callback_proxies.pop(slot_name, None)
+        if callback_proxy is not None:
+            callback_proxy.close()
 
         instance = getattr(self, slot_name)
         setattr(self, slot_name, None)
@@ -660,9 +727,10 @@ class MediaPipeTaskRuntime:
             raise ValueError("mediapipe_live_result_callback_missing")
         if not callable(result_callback):
             raise ValueError("mediapipe_live_result_callback_invalid")
+        callback_cache_key = self._live_callback_cache_key(slot_name, result_callback)
         if not self._live_callback_async_enabled():
-            return ("direct", result_callback)
-        return ("async", result_callback, self._live_callback_queue_size(), slot_name)
+            return ("direct", callback_cache_key)
+        return ("async", callback_cache_key, self._live_callback_queue_size())
 
     def _prepare_live_callback(self, slot_name: str, result_callback: Any) -> Any:
         """Wrap one live callback with a bounded background dispatcher when enabled."""
@@ -671,28 +739,51 @@ class MediaPipeTaskRuntime:
             raise ValueError("mediapipe_live_result_callback_missing")
         if not callable(result_callback):
             raise ValueError("mediapipe_live_result_callback_invalid")
+        callback_cache_key = self._live_callback_cache_key(slot_name, result_callback)
+        callback_proxy = self._live_callback_proxies.get(slot_name)
+        expected_proxy_spec = (callback_cache_key,)
+        if callback_proxy is None or callback_proxy.spec != expected_proxy_spec:
+            if callback_proxy is not None:
+                callback_proxy.close()
+            callback_proxy = _MutableLiveCallbackProxy(
+                result_callback,
+                cache_key=callback_cache_key,
+            )
+            self._live_callback_proxies[slot_name] = callback_proxy
+        else:
+            callback_proxy.update_callback(result_callback)
 
         if not self._live_callback_async_enabled():
             existing = self._live_callback_dispatchers.pop(slot_name, None)
             if existing is not None:
                 existing.close(timeout_s=self._live_callback_shutdown_timeout_s())
-            return result_callback
+            return callback_proxy
 
         queue_size = self._live_callback_queue_size()
         existing = self._live_callback_dispatchers.get(slot_name)
-        expected_spec = (result_callback, queue_size)
+        expected_spec = ((*callback_proxy.spec,), queue_size)
         if existing is None or existing.spec != expected_spec:
             if existing is not None:
                 existing.close(timeout_s=self._live_callback_shutdown_timeout_s())
             # BREAKING: live-stream callbacks now run on a dedicated worker thread by default.
             # The dispatcher uses a bounded latest-wins queue to avoid callback-induced stalls.
             existing = _LatestWinsCallbackDispatcher(
-                result_callback,
+                callback_proxy,
                 queue_size=queue_size,
                 name=f"MediaPipeCallback:{slot_name}",
             )
             self._live_callback_dispatchers[slot_name] = existing
         return existing.enqueue
+
+    def _live_callback_cache_key(self, slot_name: str, result_callback: Any) -> tuple[str, Any]:
+        """Return the stable cache identity for one live callback slot."""
+
+        callback_cache_key = getattr(
+            result_callback,
+            MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+            result_callback,
+        )
+        return (slot_name, callback_cache_key)
 
     def _gesture_instance_spec(
         self,

@@ -11,6 +11,8 @@
 # uses explicit period / buffer sizing aligned to chunk_ms instead of inheriting
 # the default large buffering behavior. Capture startup is also non-blocking and
 # self-healing on busy / transiently missing devices.
+# BUG-4: Detect "arecord stays alive but never yields a first frame" capture
+# stalls and route them through bounded XVF3800 recovery instead of hanging.
 # SEC-1: BREAKING: ws:// is now rejected for non-loopback orchestrator endpoints
 # unless explicitly allowed via config.voice_orchestrator_allow_insecure_ws.
 # Raw senior-home microphone audio and shared secret transport must not traverse
@@ -58,8 +60,8 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.respeaker_duplex_keepalive import build_respeaker_duplex_keepalive
 from twinr.hardware.audio import resolve_capture_device
-from twinr.hardware.audio_env import build_audio_subprocess_env
-from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
+from twinr.hardware.audio_env import build_audio_subprocess_env_for_mode
+from twinr.hardware.respeaker_capture_recovery import recover_stalled_respeaker_capture
 from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
@@ -165,6 +167,14 @@ class EdgeVoiceOrchestrator:
             self._capture_period_frames + 1,
             self._capture_period_frames * self._capture_buffer_periods,
         )
+        self._first_frame_timeout_s = self._coerce_positive_float(
+            self._config_value("voice_orchestrator_first_frame_timeout_s", "TWINR_VOICE_FIRST_FRAME_TIMEOUT_S"),
+            default=max(
+                1.0,
+                (self._capture_buffer_frames / max(1, self._sample_rate)) * 4.0,
+                self._select_timeout_s * 8.0,
+            ),
+        )
         self._ws_reconnect_base_s = self._coerce_positive_float(
             self._config_value("voice_orchestrator_reconnect_base_s", "TWINR_VOICE_WS_RECONNECT_BASE_S"),
             default=self._DEFAULT_WS_RECONNECT_BASE_S,
@@ -245,6 +255,10 @@ class EdgeVoiceOrchestrator:
             playback_coordinator=playback_coordinator,
             emit=self.emit,
         )
+        if self._duplex_keepalive is not None and playback_coordinator is not None:
+            playback_coordinator.add_activity_listener(
+                self._duplex_keepalive.handle_playback_activity
+            )
 
     def _config_value(self, attr_name: str, env_name: str | None = None) -> object | None:
         value = getattr(self.config, attr_name, None)
@@ -912,6 +926,7 @@ class EdgeVoiceOrchestrator:
         started_once = False
         sent_any_frame = False
         capture_recovery_attempted = False
+        first_frame_deadline_at: float | None = None
 
         try:
             while not self._stop_event.is_set():
@@ -933,6 +948,7 @@ class EdgeVoiceOrchestrator:
                         pending_pcm.clear()
                         sent_any_frame = False
                         capture_recovery_attempted = False
+                        first_frame_deadline_at = time.monotonic() + self._first_frame_timeout_s
                         self._capture_restart_failures = 0
 
                     if process.stdout is None or process.stderr is None:
@@ -953,12 +969,22 @@ class EdgeVoiceOrchestrator:
                     if stdout_fd not in ready:
                         if process.poll() is not None:
                             raise RuntimeError(self._process_error_message(process))
+                        if self._first_frame_timed_out(
+                            sent_any_frame=sent_any_frame,
+                            first_frame_deadline_at=first_frame_deadline_at,
+                        ):
+                            raise RuntimeError("Voice orchestrator capture produced no first frame before timeout")
                         continue
 
                     pcm_chunk = self._read_stdout_chunk(stdout_fd, self._frame_bytes - len(pending_pcm))
                     if not pcm_chunk:
                         if process.poll() is not None:
                             raise RuntimeError(self._process_error_message(process))
+                        if self._first_frame_timed_out(
+                            sent_any_frame=sent_any_frame,
+                            first_frame_deadline_at=first_frame_deadline_at,
+                        ):
+                            raise RuntimeError("Voice orchestrator capture produced no first frame before timeout")
                         continue
 
                     pending_pcm.extend(pcm_chunk)
@@ -967,6 +993,7 @@ class EdgeVoiceOrchestrator:
                         del pending_pcm[: self._frame_bytes]
                         self._enqueue_frame(frame_bytes)
                         sent_any_frame = True
+                        first_frame_deadline_at = None
                 except Exception as exc:
                     if self._stop_event.is_set():
                         break
@@ -982,11 +1009,6 @@ class EdgeVoiceOrchestrator:
                         },
                     )
 
-                    recovered = False
-                    if not sent_any_frame and not capture_recovery_attempted:
-                        capture_recovery_attempted = True
-                        recovered = self._recover_transient_respeaker_capture()
-
                     if process is not None:
                         stale_process = process
                         self._stop_process(stale_process)
@@ -994,6 +1016,11 @@ class EdgeVoiceOrchestrator:
                         with self._lifecycle_lock:
                             if self._process is stale_process:
                                 self._process = None
+
+                    recovered = False
+                    if not sent_any_frame and not capture_recovery_attempted:
+                        capture_recovery_attempted = True
+                        recovered = self._recover_transient_respeaker_capture()
 
                     if recovered:
                         continue
@@ -1275,7 +1302,9 @@ class EdgeVoiceOrchestrator:
                 "-A",
                 str(self._chunk_ms * 1000),
             ],
-            env=build_audio_subprocess_env(),
+            env=build_audio_subprocess_env_for_mode(
+                allow_root_borrowed_session_audio=True,
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
@@ -1295,10 +1324,21 @@ class EdgeVoiceOrchestrator:
                 "capture_period_frames": self._capture_period_frames,
                 "capture_buffer_frames": self._capture_buffer_frames,
                 "select_timeout_s": self._select_timeout_s,
+                "first_frame_timeout_s": self._first_frame_timeout_s,
             },
         )
         self._emit_status("voice_orchestrator_capture", "started")
         return process
+
+    def _first_frame_timed_out(
+        self,
+        *,
+        sent_any_frame: bool,
+        first_frame_deadline_at: float | None,
+    ) -> bool:
+        if sent_any_frame or first_frame_deadline_at is None:
+            return False
+        return time.monotonic() >= first_frame_deadline_at
 
     def _read_stdout_chunk(self, stdout_fd: int, read_size: int) -> bytes:
         try:
@@ -1329,17 +1369,18 @@ class EdgeVoiceOrchestrator:
         return f"Voice orchestrator capture exited with code {process.returncode}"
 
     def _recover_transient_respeaker_capture(self) -> bool:
-        """Wait briefly for a transient XVF3800 re-enumeration before retrying."""
+        """Recover one stalled XVF3800 capture path before retrying."""
 
-        recovered = wait_for_transient_respeaker_capture_ready(
+        recovered = recover_stalled_respeaker_capture(
             device=self._device,
             sample_rate=self._sample_rate,
             channels=self._channels,
             chunk_ms=self._chunk_ms,
+            max_wait_s=self._capture_restart_max_s,
             should_stop=lambda: self._stop_event.is_set() or self._paused.is_set(),
         )
         if recovered:
-            self._emit_status("voice_orchestrator_capture_recovered", "respeaker_reenumeration")
+            self._emit_status("voice_orchestrator_capture_recovered", "respeaker_recovery")
         return recovered
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:

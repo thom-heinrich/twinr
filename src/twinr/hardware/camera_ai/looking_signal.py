@@ -23,7 +23,7 @@ centering proxy otherwise.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import degrees, hypot, isfinite
 from typing import Any
 
@@ -34,6 +34,8 @@ from .models import AICameraVisiblePerson
 _BODY_PROXY_SCORE_CEILING = 0.35
 _DEFAULT_THRESHOLD = 0.5
 _DEFAULT_HYSTERESIS_MARGIN = 0.03
+_DEFAULT_STREAM_ACTIVATION_DWELL_S = 0.12
+_DEFAULT_STREAM_RELEASE_DWELL_S = 0.18
 _MIN_ASSOCIATION_SCORE = 0.18
 
 
@@ -51,6 +53,60 @@ class FastLookingSignal:
     matched_face_confidence: float | None = None
     matched_face_center_x: float | None = None
     matched_face_center_y: float | None = None
+
+
+@dataclass(slots=True)
+class AttentionStreamState:
+    """Track stable vs candidate fast-looking states across a live stream."""
+
+    stable_signal: FastLookingSignal = field(default_factory=FastLookingSignal)
+    candidate_signal: FastLookingSignal | None = None
+    candidate_started_at: float | None = None
+    last_observed_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamLookingSignal:
+    """Describe one debounced live-stream LOOKING inference."""
+
+    instant_signal: FastLookingSignal
+    stable_signal: FastLookingSignal
+    candidate_signal: FastLookingSignal | None = None
+    candidate_age_s: float | None = None
+    activation_dwell_s: float = _DEFAULT_STREAM_ACTIVATION_DWELL_S
+    release_dwell_s: float = _DEFAULT_STREAM_RELEASE_DWELL_S
+    changed: bool = False
+    transition_state: str = "stable"
+
+    @property
+    def looking_toward_device(self) -> bool | None:
+        """Expose the stable live-stream LOOKING decision."""
+
+        return self.stable_signal.looking_toward_device
+
+    @property
+    def visual_attention_score(self) -> float | None:
+        """Expose the stable live-stream visual-attention score."""
+
+        return self.stable_signal.visual_attention_score
+
+    @property
+    def state(self) -> str:
+        """Expose the stable live-stream state label."""
+
+        return self.stable_signal.state
+
+    @property
+    def source(self) -> str | None:
+        """Expose the stable live-stream source label."""
+
+        return self.stable_signal.source
+
+    @property
+    def reason(self) -> str:
+        """Expose the stable live-stream reason label."""
+
+        return self.stable_signal.reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +221,112 @@ def infer_fast_looking_signal(
     )
 
 
+def infer_stream_looking_signal(
+    *,
+    detection: DetectionResult,
+    face_anchors: SupplementalFaceAnchorResult | None,
+    attention_score_threshold: float,
+    state: AttentionStreamState,
+    observed_at: float,
+    previous_signal: FastLookingSignal | None = None,
+    hysteresis_margin: float = _DEFAULT_HYSTERESIS_MARGIN,
+    activation_dwell_s: float = _DEFAULT_STREAM_ACTIVATION_DWELL_S,
+    release_dwell_s: float = _DEFAULT_STREAM_RELEASE_DWELL_S,
+) -> StreamLookingSignal:
+    """Return one explicit live-stream LOOKING signal with bounded dwell."""
+
+    stable_previous = state.stable_signal if isinstance(state.stable_signal, FastLookingSignal) else None
+    instant_signal = infer_fast_looking_signal(
+        detection=detection,
+        face_anchors=face_anchors,
+        attention_score_threshold=attention_score_threshold,
+        previous_signal=stable_previous or previous_signal,
+        hysteresis_margin=hysteresis_margin,
+    )
+
+    resolved_observed_at = _resolve_stream_observed_at(observed_at, previous_observed_at=state.last_observed_at)
+    state.last_observed_at = resolved_observed_at
+    activation_dwell_s = _sanitize_dwell_seconds(activation_dwell_s, default=_DEFAULT_STREAM_ACTIVATION_DWELL_S)
+    release_dwell_s = _sanitize_dwell_seconds(release_dwell_s, default=_DEFAULT_STREAM_RELEASE_DWELL_S)
+
+    current_stable = stable_previous or FastLookingSignal()
+    if instant_signal.state == "none":
+        state.stable_signal = instant_signal
+        state.candidate_signal = None
+        state.candidate_started_at = None
+        return StreamLookingSignal(
+            instant_signal=instant_signal,
+            stable_signal=instant_signal,
+            activation_dwell_s=activation_dwell_s,
+            release_dwell_s=release_dwell_s,
+            changed=_signal_identity(current_stable) != _signal_identity(instant_signal),
+            transition_state="reset_none",
+        )
+
+    if current_stable.state == "none" and instant_signal.looking_toward_device is not True:
+        state.stable_signal = instant_signal
+        state.candidate_signal = None
+        state.candidate_started_at = None
+        return StreamLookingSignal(
+            instant_signal=instant_signal,
+            stable_signal=instant_signal,
+            activation_dwell_s=activation_dwell_s,
+            release_dwell_s=release_dwell_s,
+            changed=True,
+            transition_state="adopt_initial",
+        )
+
+    if _signal_identity(current_stable) == _signal_identity(instant_signal):
+        state.stable_signal = instant_signal
+        state.candidate_signal = None
+        state.candidate_started_at = None
+        return StreamLookingSignal(
+            instant_signal=instant_signal,
+            stable_signal=instant_signal,
+            activation_dwell_s=activation_dwell_s,
+            release_dwell_s=release_dwell_s,
+            changed=False,
+            transition_state="stable",
+        )
+
+    dwell_s = (
+        activation_dwell_s
+        if instant_signal.looking_toward_device is True
+        else release_dwell_s
+    )
+    candidate_signal = state.candidate_signal if isinstance(state.candidate_signal, FastLookingSignal) else None
+    if _signal_identity(candidate_signal) != _signal_identity(instant_signal):
+        state.candidate_signal = instant_signal
+        state.candidate_started_at = resolved_observed_at
+        candidate_age_s = 0.0
+    else:
+        candidate_age_s = max(0.0, resolved_observed_at - float(state.candidate_started_at or resolved_observed_at))
+
+    if candidate_age_s >= dwell_s:
+        state.stable_signal = instant_signal
+        state.candidate_signal = None
+        state.candidate_started_at = None
+        return StreamLookingSignal(
+            instant_signal=instant_signal,
+            stable_signal=instant_signal,
+            activation_dwell_s=activation_dwell_s,
+            release_dwell_s=release_dwell_s,
+            changed=True,
+            transition_state="switched_after_dwell",
+        )
+
+    return StreamLookingSignal(
+        instant_signal=instant_signal,
+        stable_signal=current_stable,
+        candidate_signal=state.candidate_signal,
+        candidate_age_s=round(candidate_age_s, 3),
+        activation_dwell_s=activation_dwell_s,
+        release_dwell_s=release_dwell_s,
+        changed=False,
+        transition_state="candidate_pending",
+    )
+
+
 def _select_face_anchor_candidate(
     *,
     detection: DetectionResult,
@@ -210,6 +372,14 @@ def _bounds_contains_point(bounds: _Bounds, *, x: float, y: float) -> bool:
     """Return whether one point falls inside the given bounds."""
 
     return bounds.left <= x <= bounds.right and bounds.top <= y <= bounds.bottom
+
+
+def _signal_identity(signal: FastLookingSignal | None) -> tuple[bool | None, str]:
+    """Return the stable identity used for stream-state transitions."""
+
+    if signal is None:
+        return None, "none"
+    return signal.looking_toward_device, signal.state
 
 
 def _body_center_proxy_score(primary_box: _Bounds) -> float:
@@ -709,6 +879,26 @@ def _sanitize_margin(value: Any) -> float:
     return _clamp(margin, 0.0, 0.25)
 
 
+def _sanitize_dwell_seconds(value: Any, *, default: float) -> float:
+    """Return one bounded dwell duration in seconds."""
+
+    dwell_seconds = _coerce_float(value, default=default)
+    if dwell_seconds is None:
+        dwell_seconds = default
+    return _clamp(dwell_seconds, 0.0, 2.0)
+
+
+def _resolve_stream_observed_at(observed_at: Any, *, previous_observed_at: float | None) -> float:
+    """Return a finite monotonic-enough timestamp for stream-state math."""
+
+    resolved = _coerce_float(observed_at, default=previous_observed_at)
+    if resolved is None:
+        resolved = 0.0 if previous_observed_at is None else previous_observed_at
+    if previous_observed_at is not None and resolved < previous_observed_at:
+        return previous_observed_at
+    return resolved
+
+
 def _bounded_score(value: Any, *, default: float | None = None) -> float | None:
     """Return one score clipped to the unit interval."""
 
@@ -745,6 +935,9 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 __all__ = [
+    "AttentionStreamState",
     "FastLookingSignal",
     "infer_fast_looking_signal",
+    "StreamLookingSignal",
+    "infer_stream_looking_signal",
 ]

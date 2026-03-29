@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.attention_targeting import MultimodalAttentionTargetSnapshot
+from twinr.proactive.runtime.display_gesture_emoji import DisplayGestureEmojiDecision
+from twinr.proactive.runtime.perception_orchestrator import (
+    PerceptionAttentionRuntimeSnapshot,
+    PerceptionGestureRuntimeSnapshot,
+    PerceptionRuntimeSnapshot,
+)
+from twinr.proactive.runtime.speaker_association import ReSpeakerSpeakerAssociationSnapshot
 from twinr.proactive.runtime import service as proactive_service_mod
 from twinr.proactive.runtime.service import (
     ProactiveCoordinator,
@@ -21,6 +29,7 @@ from twinr.proactive.runtime.service import (
     _proactive_pcm_capture_conflicts_with_voice_orchestrator,
     _voice_orchestrator_capture_device,
 )
+from twinr.proactive.runtime.service_gesture_helpers import record_gesture_debug_tick
 from twinr.proactive.runtime.service_impl.builder import (
     BuildDefaultProactiveMonitorDependencies,
     build_default_proactive_monitor as build_internal_proactive_monitor,
@@ -34,6 +43,11 @@ from twinr.proactive.social.engine import (
     SocialVisionObservation,
 )
 from twinr.proactive.social.observers import ProactiveAudioSnapshot
+from twinr.proactive.social.observers import ProactiveVisionSnapshot
+from twinr.proactive.social.perception_stream import (
+    PerceptionGestureStreamObservation,
+    PerceptionStreamObservation,
+)
 
 
 class ProactiveCoordinatorTests(unittest.TestCase):
@@ -60,8 +74,6 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             openai_vision_provider_cls=proactive_service_mod.OpenAIVisionObservationProvider,
             aideck_vision_provider_cls=proactive_service_mod.AIDeckOpenAIVisionObservationProvider,
             local_vision_provider_cls=proactive_service_mod.LocalAICameraObservationProvider,
-            remote_proxy_vision_provider_cls=proactive_service_mod.RemoteAICameraObservationProvider,
-            remote_frame_vision_provider_cls=proactive_service_mod.RemoteFrameAICameraObservationProvider,
             vision_reviewer_cls=proactive_service_mod.OpenAIProactiveVisionReviewer,
             vision_frame_buffer_cls=proactive_service_mod.ProactiveVisionFrameBuffer,
             portrait_match_provider_cls=proactive_service_mod.PortraitMatchProvider,
@@ -80,6 +92,30 @@ class ProactiveCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(_voice_orchestrator_capture_device(config), "sysdefault:CARD=Array")
         self.assertTrue(_proactive_pcm_capture_conflicts_with_voice_orchestrator(config))
+
+    def test_shared_capture_conflict_can_require_active_owner_for_standalone_checks(self) -> None:
+        config = TwinrConfig(
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+        )
+
+        with patch("twinr.proactive.runtime.service_impl.compat.loop_lock_owner", side_effect=[None, None]):
+            self.assertFalse(
+                _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+                    config,
+                    require_active_owner=True,
+                )
+            )
+        with patch("twinr.proactive.runtime.service_impl.compat.loop_lock_owner", side_effect=[4321]):
+            self.assertTrue(
+                _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+                    config,
+                    require_active_owner=True,
+                )
+            )
 
     def test_audio_policy_does_not_block_safety_triggers(self) -> None:
         service = object.__new__(ProactiveCoordinator)
@@ -218,6 +254,274 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             ("camera.fine_hand_gesture_detected", "person_state.interaction_ready"),
         )
 
+    def test_update_display_attention_follow_consumes_perception_orchestrator(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        published: list[dict[str, object]] = []
+        speaker_association = ReSpeakerSpeakerAssociationSnapshot(
+            observed_at=12.0,
+            state="primary_visible_person_associated",
+            associated=True,
+            target_id="primary_visible_person",
+            confidence=0.92,
+            camera_person_count=1,
+            direction_confidence=0.89,
+            azimuth_deg=15,
+            primary_person_zone="right",
+        )
+        attention_target = MultimodalAttentionTargetSnapshot(
+            observed_at=12.0,
+            state="active_visible_speaker",
+            active=True,
+            target_horizontal="right",
+            target_zone="right",
+            target_center_x=0.72,
+            focus_source="speaker_association",
+            speaker_locked=True,
+            confidence=0.88,
+        )
+        perception_snapshot = PerceptionRuntimeSnapshot(
+            observed_at=12.0,
+            source="display_attention_refresh",
+            captured_at=11.8,
+            attention=PerceptionAttentionRuntimeSnapshot(
+                live_facts={
+                    "camera": {"person_visible": True, "primary_person_center_x": 0.72},
+                    "vad": {"speech_detected": True},
+                    "respeaker": {"azimuth_deg": 15, "direction_confidence": 0.89},
+                    "audio_policy": {"speaker_direction_stable": True},
+                    "speaker_association": speaker_association.to_automation_facts(),
+                    "attention_target": attention_target.to_automation_facts(),
+                },
+                speaker_association=speaker_association,
+                attention_target=attention_target,
+                attention_target_debug={"source": "test"},
+            ),
+        )
+        orchestrator_calls: list[dict[str, object]] = []
+        service.latest_presence_snapshot = SimpleNamespace(session_id=7)
+        service.latest_identity_fusion_snapshot = None
+        service.runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+        service.config = TwinrConfig(project_root=".")
+        service.attention_servo_controller = None
+        service.perception_orchestrator = SimpleNamespace(
+            observe_attention=lambda **kwargs: orchestrator_calls.append(kwargs) or perception_snapshot
+        )
+        service.display_attention_publisher = SimpleNamespace(
+            publish_from_facts=lambda config, live_facts: (
+                published.append({"config": config, "live_facts": live_facts}) or SimpleNamespace(action="published")
+            )
+        )
+        service._record_fault = lambda **_kwargs: None
+        service._append_ops_event = lambda **_kwargs: None
+        service._emit = lambda _line: None
+        service._last_attention_follow_pipeline_key = None
+        service._last_attention_servo_follow_key = None
+        service.latest_perception_runtime_snapshot = None
+        service.latest_speaker_association_snapshot = None
+        service.latest_attention_target_snapshot = None
+
+        with (
+            patch("twinr.proactive.runtime.service_attention_helpers.record_attention_follow_pipeline_if_changed"),
+            patch("twinr.proactive.runtime.service_attention_helpers.update_attention_servo_follow"),
+        ):
+            result = ProactiveCoordinator._update_display_attention_follow(
+                service,
+                source="display_attention_refresh",
+                observed_at=12.0,
+                camera_snapshot=SimpleNamespace(
+                    last_camera_frame_at=11.8,
+                    to_automation_facts=lambda: {"person_visible": True, "primary_person_center_x": 0.72},
+                ),
+                audio_observation=SocialAudioObservation(
+                    speech_detected=True,
+                    azimuth_deg=15,
+                    direction_confidence=0.89,
+                ),
+                audio_policy_snapshot=SimpleNamespace(speaker_direction_stable=True),
+            )
+
+        self.assertEqual(len(orchestrator_calls), 1)
+        self.assertIs(service.latest_perception_runtime_snapshot, perception_snapshot)
+        self.assertEqual(service.latest_speaker_association_snapshot, speaker_association)
+        self.assertEqual(service.latest_attention_target_snapshot, attention_target)
+        self.assertEqual(len(published), 1)
+        self.assertEqual(
+            published[0]["live_facts"]["attention_target"],
+            attention_target.to_automation_facts(),
+        )
+        self.assertEqual(result.action, "published")
+
+    def test_display_gesture_refresh_consumes_perception_orchestrator(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        calls: list[tuple[str, object]] = []
+
+        class _NullContext:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        snapshot = ProactiveVisionSnapshot(
+            observation=SocialVisionObservation(
+                hand_or_object_near_camera=True,
+                fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+            ),
+            response_text="gesture",
+            captured_at=13.5,
+        )
+        gesture_runtime = PerceptionRuntimeSnapshot(
+            observed_at=14.0,
+            source="gesture_fast",
+            captured_at=13.5,
+            gesture=PerceptionGestureRuntimeSnapshot(
+                ack_decision=DisplayGestureEmojiDecision(
+                    active=True,
+                    reason="fine_hand:peace_sign",
+                    hold_seconds=0.4,
+                ),
+                wakeup_decision=GestureWakeupDecision(
+                    active=True,
+                    reason="gesture_wakeup:peace_sign",
+                    confidence=0.91,
+                ),
+            ),
+        )
+        service.display_gesture_emoji_publisher = SimpleNamespace()
+        service.vision_observer = SimpleNamespace(supports_gesture_refresh=True)
+        service.config = TwinrConfig(
+            project_root=".",
+            display_driver="hdmi_wayland",
+            display_gesture_refresh_interval_s=0.2,
+        )
+        service.runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+        service.clock = lambda: 14.0
+        service._last_display_gesture_refresh_at = None
+        service._last_gesture_vision_refresh_mode = "gesture_fast"
+        service._gesture_forensics = SimpleNamespace(bind_refresh=lambda **_kwargs: _NullContext())
+        service.perception_orchestrator = SimpleNamespace(
+            observe_gesture=lambda **kwargs: calls.append(("orchestrator", kwargs)) or gesture_runtime
+        )
+        service._observe_vision_for_gesture_refresh = lambda: snapshot
+        service._record_vision_snapshot_safe = lambda current: calls.append(("record_snapshot", current))
+        service._remember_display_attention_camera_semantics = (
+            lambda **kwargs: calls.append(("remember", kwargs["source"]))
+        )
+        service._gesture_observation_trace_details = lambda observation: {
+            "fine_hand_gesture": observation.fine_hand_gesture.value
+        }
+        service._trace_gesture_ack_lane_decision = lambda **kwargs: calls.append(("trace_ack", kwargs["decision"]))
+        service._trace_gesture_wakeup_lane_decision = lambda **kwargs: calls.append(("trace_wakeup", kwargs["decision"]))
+        service._publish_display_gesture_decision = lambda decision: calls.append(("publish", decision)) or SimpleNamespace(
+            action="published"
+        )
+        service._dispatch_gesture_wakeup_with_fresh_context = (
+            lambda **kwargs: calls.append(("wakeup", kwargs["decision"])) or True
+        )
+        service._trace_gesture_publish_decision = lambda **kwargs: calls.append(("trace_publish", kwargs["decision"]))
+        service._record_gesture_debug_tick = lambda **kwargs: calls.append(("debug", kwargs["outcome"]))
+        service._record_fault = lambda **kwargs: calls.append(("fault", kwargs["event"]))
+        service.latest_presence_snapshot = None
+        service.latest_perception_runtime_snapshot = None
+
+        refreshed = ProactiveCoordinator.refresh_display_gesture_emoji(service)
+
+        self.assertTrue(refreshed)
+        self.assertIs(service.latest_perception_runtime_snapshot, gesture_runtime)
+        self.assertTrue(any(kind == "orchestrator" for kind, _payload in calls))
+        self.assertTrue(any(kind == "publish" for kind, _payload in calls))
+        self.assertTrue(any(kind == "wakeup" for kind, _payload in calls))
+        self.assertFalse(any(kind == "fault" for kind, _payload in calls))
+
+    def test_display_refresh_cycle_reuses_one_combined_perception_snapshot(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        calls: list[str] = []
+        shared_snapshot = ProactiveVisionSnapshot(
+            observation=SocialVisionObservation(person_visible=True),
+            response_text="shared",
+        )
+
+        class _VisionObserver:
+            def observe_perception_stream(self):
+                del self
+                calls.append("combined")
+                return shared_snapshot
+
+        service.vision_observer = _VisionObserver()
+        service._display_perception_cycle = None
+        service._last_attention_vision_refresh_mode = None
+        service._last_gesture_vision_refresh_mode = None
+        service._observe_vision_with_method = lambda observe_fn: observe_fn()
+
+        ProactiveCoordinator._open_display_perception_cycle(
+            service,
+            attention_due=True,
+            gesture_due=True,
+        )
+        attention_snapshot = ProactiveCoordinator._observe_vision_for_attention_refresh(service)
+        gesture_snapshot = ProactiveCoordinator._observe_vision_for_gesture_refresh(service)
+        ProactiveCoordinator._close_display_perception_cycle(service)
+
+        self.assertIs(attention_snapshot, shared_snapshot)
+        self.assertIs(gesture_snapshot, shared_snapshot)
+        self.assertEqual(calls, ["combined"])
+        self.assertEqual(service._last_attention_vision_refresh_mode, "perception_stream_shared")
+        self.assertEqual(service._last_gesture_vision_refresh_mode, "perception_stream_shared")
+
+    def test_record_gesture_debug_tick_keeps_debug_stream_when_observation_has_perception_stream(self) -> None:
+        appended: list[dict[str, object]] = []
+        faults: list[tuple[str, str]] = []
+
+        class _DebugStream:
+            def append_tick(self, *, outcome, observed_at, data) -> None:
+                appended.append(
+                    {
+                        "outcome": outcome,
+                        "observed_at": observed_at,
+                        "data": data,
+                    }
+                )
+
+        coordinator = SimpleNamespace(
+            display_gesture_debug_stream=_DebugStream(),
+            _last_gesture_vision_refresh_mode="perception_stream_shared",
+            vision_observer=SimpleNamespace(gesture_debug_details=lambda: {"stream_mode": "gesture_stream"}),
+            _record_fault=lambda **kwargs: faults.append((kwargs["event"], str(kwargs["error"]))),
+        )
+        observation = SocialVisionObservation(
+            camera_online=True,
+            camera_ready=True,
+            camera_ai_ready=True,
+            hand_or_object_near_camera=True,
+            fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+            perception_stream=PerceptionStreamObservation(
+                gesture=PerceptionGestureStreamObservation(
+                    authoritative=True,
+                    activation_key="fine:peace_sign",
+                    activation_token=7,
+                    activation_rising=True,
+                )
+            ),
+        )
+
+        record_gesture_debug_tick(
+            coordinator,
+            observed_at=12.0,
+            outcome="published",
+            runtime_status_value="waiting",
+            stage_ms={"observe": 1.2},
+            observation=observation,
+        )
+
+        self.assertEqual(faults, [])
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0]["outcome"], "published")
+        self.assertEqual(appended[0]["observed_at"], 12.0)
+        payload = cast(dict[str, object], appended[0]["data"])
+        self.assertEqual(payload["gesture_stream_activation_key"], "fine:peace_sign")
+        self.assertEqual(payload["gesture_stream_activation_token"], 7)
+        self.assertEqual(payload["gesture_stream_activation_rising"], True)
+
     def test_derive_sensor_events_emits_rising_edges_only_once(self) -> None:
         service = object.__new__(ProactiveCoordinator)
         service._last_sensor_flags = {}
@@ -333,11 +637,10 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertTrue(any(kind == "record_display" for kind, _payload in calls))
         self.assertFalse(any(kind == "fault" for kind, _payload in calls))
 
-    def test_build_default_monitor_uses_remote_camera_provider_when_configured(self) -> None:
+    def test_build_default_monitor_uses_local_camera_provider_by_default(self) -> None:
         config = TwinrConfig(
             display_driver="hdmi_wayland",
-            proactive_vision_provider="remote_proxy",
-            proactive_remote_camera_base_url="http://10.42.0.2:8767",
+            proactive_vision_provider="local_first",
         )
         runtime = SimpleNamespace(
             ops_events=SimpleNamespace(append=lambda **_kwargs: None),
@@ -348,11 +651,8 @@ class ProactiveCoordinatorTests(unittest.TestCase):
 
         with (
             patch(
-                "twinr.proactive.runtime.service.RemoteAICameraObservationProvider.from_config",
-                return_value=sentinel_provider,
-            ) as remote_factory,
-            patch(
                 "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+                return_value=sentinel_provider,
             ) as local_factory,
             patch(
                 "twinr.proactive.runtime.service.OpenAIVisionObservationProvider",
@@ -371,54 +671,7 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertIsNotNone(monitor)
         assert monitor is not None
         self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
-        remote_factory.assert_called_once_with(config)
-        local_factory.assert_not_called()
-        openai_provider.assert_not_called()
-
-    def test_build_default_monitor_uses_remote_frame_provider_when_configured(self) -> None:
-        config = TwinrConfig(
-            display_driver="hdmi_wayland",
-            proactive_vision_provider="remote_frame",
-            proactive_remote_camera_base_url="http://10.42.0.2:8767",
-        )
-        runtime = SimpleNamespace(
-            ops_events=SimpleNamespace(append=lambda **_kwargs: None),
-            fail=lambda _detail: None,
-            status=SimpleNamespace(value="waiting"),
-        )
-        sentinel_provider = object()
-
-        with (
-            patch(
-                "twinr.proactive.runtime.service.RemoteFrameAICameraObservationProvider.from_config",
-                return_value=sentinel_provider,
-            ) as remote_frame_factory,
-            patch(
-                "twinr.proactive.runtime.service.RemoteAICameraObservationProvider.from_config",
-            ) as remote_proxy_factory,
-            patch(
-                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
-            ) as local_factory,
-            patch(
-                "twinr.proactive.runtime.service.OpenAIVisionObservationProvider",
-            ) as openai_provider,
-        ):
-            monitor = build_default_proactive_monitor(
-                config=config,
-                runtime=runtime,
-                backend=cast(Any, object()),
-                camera=cast(Any, object()),
-                camera_lock=None,
-                audio_lock=None,
-                trigger_handler=lambda _decision: False,
-            )
-
-        self.assertIsNotNone(monitor)
-        assert monitor is not None
-        self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
-        remote_frame_factory.assert_called_once_with(config)
-        remote_proxy_factory.assert_not_called()
-        local_factory.assert_not_called()
+        local_factory.assert_called_once_with(config)
         openai_provider.assert_not_called()
 
     def test_build_default_monitor_uses_aideck_openai_provider_when_configured(self) -> None:
@@ -466,22 +719,12 @@ class ProactiveCoordinatorTests(unittest.TestCase):
     def test_wrapper_builder_matches_internal_builder_for_provider_variants(self) -> None:
         cases = [
             (
-                "remote_proxy",
+                "local_first",
                 {
                     "display_driver": "hdmi_wayland",
-                    "proactive_vision_provider": "remote_proxy",
-                    "proactive_remote_camera_base_url": "http://10.42.0.2:8767",
+                    "proactive_vision_provider": "local_first",
                 },
-                "twinr.proactive.runtime.service.RemoteAICameraObservationProvider.from_config",
-            ),
-            (
-                "remote_frame",
-                {
-                    "display_driver": "hdmi_wayland",
-                    "proactive_vision_provider": "remote_frame",
-                    "proactive_remote_camera_base_url": "http://10.42.0.2:8767",
-                },
-                "twinr.proactive.runtime.service.RemoteFrameAICameraObservationProvider.from_config",
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
             ),
             (
                 "aideck_openai",

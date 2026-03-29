@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..engine import SocialFineHandGesture, SocialGestureEvent
+from ..perception_stream import gesture_stream
 from .coercion import coerce_fine_hand_gesture, coerce_gesture_event, coerce_optional_ratio, coerce_timestamp
 
 EXPLICIT_FINE_HAND_GESTURES = frozenset(
@@ -29,6 +30,8 @@ class ProactiveCameraGestureMixin:
         observed_at: float,
         gesture_event: object,
         gesture_confidence: object,
+        temporal_authoritative: bool = False,
+        activation_token: object = None,
     ) -> tuple[SocialGestureEvent, bool, float | None, bool, bool]:
         now = coerce_timestamp(observed_at)
         if inspected:
@@ -38,6 +41,18 @@ class ProactiveCameraGestureMixin:
             self._last_gesture_event_at = now
             self._last_gesture_confidence = confidence
             self._last_gesture_confidence_at = now
+            if temporal_authoritative:
+                rising = self._authoritative_gesture_ready_to_emit(
+                    event=event,
+                    none_event=SocialGestureEvent.NONE,
+                    unknown_event=SocialGestureEvent.UNKNOWN,
+                    last_emitted_attr="_last_gesture_emitted_event",
+                    last_emitted_at_attr="_last_gesture_emitted_at",
+                    last_emitted_token_attr="_last_gesture_emitted_token",
+                    activation_token=activation_token,
+                    now=now,
+                )
+                return event, False, confidence, False, rising
             rising = False
             if event not in {SocialGestureEvent.NONE, SocialGestureEvent.UNKNOWN}:
                 if self._gesture_ready_to_emit(
@@ -72,6 +87,8 @@ class ProactiveCameraGestureMixin:
         observed_at: float,
         fine_hand_gesture: object,
         fine_hand_gesture_confidence: object,
+        temporal_authoritative: bool = False,
+        activation_token: object = None,
     ) -> tuple[SocialFineHandGesture, bool, float | None, bool, bool]:
         """Stabilize fine-hand gesture output with the same bounded cadence rules."""
 
@@ -79,15 +96,30 @@ class ProactiveCameraGestureMixin:
         if inspected:
             raw_event = coerce_fine_hand_gesture(fine_hand_gesture)
             raw_confidence = coerce_optional_ratio(fine_hand_gesture_confidence)
-            event, confidence = self._stabilize_fine_hand_gesture(
-                event=raw_event,
-                confidence=raw_confidence,
-                now=now,
-            )
+            if temporal_authoritative:
+                event, confidence = raw_event, raw_confidence
+            else:
+                event, confidence = self._stabilize_fine_hand_gesture(
+                    event=raw_event,
+                    confidence=raw_confidence,
+                    now=now,
+                )
             self._last_fine_hand_gesture = event
             self._last_fine_hand_gesture_at = now
             self._last_fine_hand_gesture_confidence = confidence
             self._last_fine_hand_gesture_confidence_at = now
+            if temporal_authoritative:
+                rising = self._authoritative_gesture_ready_to_emit(
+                    event=event,
+                    none_event=SocialFineHandGesture.NONE,
+                    unknown_event=SocialFineHandGesture.UNKNOWN,
+                    last_emitted_attr="_last_fine_hand_gesture_emitted_event",
+                    last_emitted_at_attr="_last_fine_hand_gesture_emitted_at",
+                    last_emitted_token_attr="_last_fine_hand_gesture_emitted_token",
+                    activation_token=activation_token,
+                    now=now,
+                )
+                return event, False, confidence, False, rising
             rising = False
             if event not in {SocialFineHandGesture.NONE, SocialFineHandGesture.UNKNOWN}:
                 if self._gesture_ready_to_emit(
@@ -218,3 +250,61 @@ class ProactiveCameraGestureMixin:
         if event != last_emitted:
             return True
         return (now - last_emitted_at) >= self.config.gesture_event_cooldown_s
+
+    def _authoritative_gesture_ready_to_emit(
+        self: Any,
+        *,
+        event: SocialGestureEvent | SocialFineHandGesture,
+        none_event: SocialGestureEvent | SocialFineHandGesture,
+        unknown_event: SocialGestureEvent | SocialFineHandGesture,
+        last_emitted_attr: str,
+        last_emitted_at_attr: str,
+        last_emitted_token_attr: str,
+        activation_token: object,
+        now: float,
+    ) -> bool:
+        """Emit only on stable upstream state transitions for authoritative streams."""
+
+        if event in {none_event, unknown_event}:
+            setattr(self, last_emitted_attr, none_event)
+            setattr(self, last_emitted_at_attr, None)
+            setattr(self, last_emitted_token_attr, None)
+            return False
+        token = _coerce_authoritative_token(activation_token)
+        if token is not None:
+            previous_token = getattr(self, last_emitted_token_attr, None)
+            if token == previous_token:
+                return False
+            setattr(self, last_emitted_token_attr, token)
+            setattr(self, last_emitted_attr, event)
+            setattr(self, last_emitted_at_attr, now)
+            return True
+        previous = getattr(self, last_emitted_attr, none_event)
+        if event == previous:
+            return False
+        setattr(self, last_emitted_attr, event)
+        setattr(self, last_emitted_at_attr, now)
+        return True
+
+
+def authoritative_gesture_activation_token(observation: object) -> int | None:
+    """Return the current authoritative gesture activation token when available."""
+
+    stream = gesture_stream(observation)
+    if stream is None:
+        return None
+    return _coerce_authoritative_token(stream.activation_token)
+
+
+def _coerce_authoritative_token(value: object) -> int | None:
+    """Normalize one optional activation token to a non-negative integer."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number

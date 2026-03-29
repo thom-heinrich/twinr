@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import errno
+import subprocess
 import time
 
 
@@ -98,14 +99,51 @@ def _current_exception() -> BaseException:
 
 
 def _is_gpio_busy_error(error: BaseException | None) -> bool:
-    """Return whether the failure chain contains an exact GPIO ``EBUSY``."""
+    """Return whether the failure chain contains one proven transient GPIO busy."""
 
     current = error
+    seen: set[int] = set()
     while current is not None:
+        current_id = id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
         if isinstance(current, OSError) and getattr(current, "errno", None) == errno.EBUSY:
+            return True
+        if _looks_like_gpio_cli_busy(current):
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _looks_like_gpio_cli_busy(error: BaseException) -> bool:
+    """Return whether one exception matches the libgpiod CLI busy signature."""
+
+    text = _exception_text(error).lower()
+    if "device or resource busy" not in text:
+        return False
+    return any(token in text for token in ("gpioget", "gpiomon", "gpiochip", "gpio"))
+
+
+def _exception_text(error: BaseException) -> str:
+    """Render exception text plus relevant subprocess context for matching."""
+
+    parts = [str(error)]
+    if isinstance(error, subprocess.CalledProcessError):
+        parts.append(_render_subprocess_cmd(error.cmd))
+        if isinstance(error.stderr, bytes):
+            parts.append(error.stderr.decode(errors="replace"))
+        elif isinstance(error.stderr, str):
+            parts.append(error.stderr)
+    return " ".join(part.strip() for part in parts if part).strip()
+
+
+def _render_subprocess_cmd(command: object) -> str:
+    """Render a subprocess command into one stable string."""
+
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command)
+    return str(command).strip()
 
 
 __all__ = [

@@ -25,10 +25,6 @@ from twinr.providers.openai import OpenAIBackend
 from ..social.aideck_camera_provider import AIDeckOpenAIVisionObservationProvider
 from ..social.engine import SocialTriggerDecision, SocialTriggerEngine
 from ..social.local_camera_provider import LocalAICameraObservationProvider
-from ..social.remote_camera_provider import (
-    RemoteAICameraObservationProvider,
-    RemoteFrameAICameraObservationProvider,
-)
 from ..social.observers import (
     AmbientAudioObservationProvider,
     NullAudioObservationProvider,
@@ -104,8 +100,6 @@ def build_default_proactive_monitor(
         openai_vision_provider_cls=OpenAIVisionObservationProvider,
         aideck_vision_provider_cls=AIDeckOpenAIVisionObservationProvider,
         local_vision_provider_cls=LocalAICameraObservationProvider,
-        remote_proxy_vision_provider_cls=RemoteAICameraObservationProvider,
-        remote_frame_vision_provider_cls=RemoteFrameAICameraObservationProvider,
         vision_reviewer_cls=OpenAIProactiveVisionReviewer,
         vision_frame_buffer_cls=ProactiveVisionFrameBuffer,
         portrait_match_provider_cls=PortraitMatchProvider,

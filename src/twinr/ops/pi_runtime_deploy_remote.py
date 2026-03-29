@@ -56,6 +56,8 @@ class PiPythonImportContractResult:
     python_path: str
     checked_modules: tuple[str, ...]
     imported_modules: tuple[str, ...]
+    checked_attribute_contracts: tuple[str, ...]
+    validated_attribute_contracts: tuple[str, ...]
     elapsed_s: float
 
 
@@ -496,15 +498,42 @@ def verify_python_import_contract(
     remote: PiRemoteExecutor,
     remote_python: str,
     modules: Sequence[str],
+    attribute_contracts: dict[str, Sequence[str]] | None = None,
 ) -> PiPythonImportContractResult:
-    """Import a fixed module set inside the remote Pi venv and fail on drift."""
+    """Import and attest a fixed Python surface inside the remote Pi venv.
+
+    ``attribute_contracts`` maps one import target spec to the attributes that
+    must exist on that target after import. A target spec is either one module
+    path (for module-level attributes) or ``module.path:Symbol.path`` for a
+    nested object inside that module.
+    """
 
     normalized_modules = tuple(str(module).strip() for module in modules if str(module).strip())
-    if not normalized_modules:
+    normalized_attribute_contracts: dict[str, tuple[str, ...]] = {}
+    for raw_target, raw_attributes in (attribute_contracts or {}).items():
+        target = str(raw_target).strip()
+        if not target:
+            continue
+        attributes = tuple(
+            dict.fromkeys(str(attribute).strip() for attribute in raw_attributes if str(attribute).strip())
+        )
+        if not attributes:
+            continue
+        normalized_attribute_contracts[target] = attributes
+
+    expected_attribute_checks = tuple(
+        f"{target}.{attribute}"
+        for target, attributes in normalized_attribute_contracts.items()
+        for attribute in attributes
+    )
+
+    if not normalized_modules and not normalized_attribute_contracts:
         return PiPythonImportContractResult(
             python_path=remote_python,
             checked_modules=(),
             imported_modules=(),
+            checked_attribute_contracts=(),
+            validated_attribute_contracts=(),
             elapsed_s=0.0,
         )
 
@@ -515,21 +544,65 @@ def verify_python_import_contract(
             "import json",
             "import time",
             f"modules = {json.dumps(list(normalized_modules), ensure_ascii=False)}",
+            "attribute_contracts = "
+            + json.dumps(
+                {target: list(attributes) for target, attributes in normalized_attribute_contracts.items()},
+                ensure_ascii=False,
+            ),
             "started = time.perf_counter()",
             "imported = []",
             "failed = {}",
+            "checked_attribute_contracts = []",
+            "validated_attribute_contracts = []",
+            "failed_attribute_contracts = {}",
+            "missing_attributes = {}",
+            "module_cache = {}",
+            "def load_module(name):",
+            "    module = module_cache.get(name)",
+            "    if module is not None:",
+            "        return module",
+            "    module = importlib.import_module(name)",
+            "    module_cache[name] = module",
+            "    return module",
+            "def resolve_target(spec):",
+            "    module_name, separator, symbol_path = spec.partition(':')",
+            "    module = load_module(module_name if separator else spec)",
+            "    target = module",
+            "    if separator and symbol_path:",
+            "        for segment in symbol_path.split('.'):",
+            "            target = getattr(target, segment)",
+            "    return target",
             "for name in modules:",
             "    try:",
-            "        importlib.import_module(name)",
+            "        load_module(name)",
             "    except Exception as exc:",
             "        failed[name] = f'{type(exc).__name__}: {exc}'",
             "    else:",
             "        imported.append(name)",
+            "for target_spec, required_attributes in attribute_contracts.items():",
+            "    checked_attribute_contracts.extend(f'{target_spec}.{attribute}' for attribute in required_attributes)",
+            "    try:",
+            "        target = resolve_target(target_spec)",
+            "    except Exception as exc:",
+            "        failed_attribute_contracts[target_spec] = f'{type(exc).__name__}: {exc}'",
+            "        continue",
+            "    missing = []",
+            "    for attribute in required_attributes:",
+            "        if hasattr(target, attribute):",
+            "            validated_attribute_contracts.append(f'{target_spec}.{attribute}')",
+            "            continue",
+            "        missing.append(attribute)",
+            "    if missing:",
+            "        missing_attributes[target_spec] = missing",
             "payload = {",
             "    'python_path': " + json.dumps(remote_python) + ",",
             "    'checked_modules': modules,",
             "    'imported_modules': imported,",
             "    'failed_imports': failed,",
+            "    'checked_attribute_contracts': checked_attribute_contracts,",
+            "    'validated_attribute_contracts': validated_attribute_contracts,",
+            "    'failed_attribute_contracts': failed_attribute_contracts,",
+            "    'missing_attributes': missing_attributes,",
             "    'elapsed_s': round(time.perf_counter() - started, 3),",
             "}",
             "print(json.dumps(payload, ensure_ascii=False))",
@@ -542,6 +615,10 @@ def verify_python_import_contract(
     checked_modules_raw = payload.get("checked_modules", ())
     imported_modules_raw = payload.get("imported_modules", ())
     failed_imports_raw = payload.get("failed_imports", {})
+    checked_attribute_contracts_raw = payload.get("checked_attribute_contracts", ())
+    validated_attribute_contracts_raw = payload.get("validated_attribute_contracts", ())
+    failed_attribute_contracts_raw = payload.get("failed_attribute_contracts", {})
+    missing_attributes_raw = payload.get("missing_attributes", {})
 
     checked_modules = (
         tuple(str(item).strip() for item in checked_modules_raw if str(item).strip())
@@ -573,12 +650,113 @@ def verify_python_import_contract(
             f"{remote_python}: missing {missing_list}"
         )
 
+    checked_attribute_contracts = (
+        tuple(str(item).strip() for item in checked_attribute_contracts_raw if str(item).strip())
+        if isinstance(checked_attribute_contracts_raw, list)
+        else ()
+    )
+    validated_attribute_contracts = (
+        tuple(str(item).strip() for item in validated_attribute_contracts_raw if str(item).strip())
+        if isinstance(validated_attribute_contracts_raw, list)
+        else ()
+    )
+    failed_attribute_contracts = (
+        {
+            str(target).strip(): str(error).strip()
+            for target, error in failed_attribute_contracts_raw.items()
+            if str(target).strip()
+        }
+        if isinstance(failed_attribute_contracts_raw, dict)
+        else {}
+    )
+    missing_attributes = (
+        {
+            str(target).strip(): tuple(
+                str(attribute).strip()
+                for attribute in attributes
+                if str(attribute).strip()
+            )
+            for target, attributes in missing_attributes_raw.items()
+            if str(target).strip() and isinstance(attributes, list)
+        }
+        if isinstance(missing_attributes_raw, dict)
+        else {}
+    )
+    if failed_attribute_contracts:
+        details = "; ".join(
+            f"{target} -> {error}" for target, error in sorted(failed_attribute_contracts.items())
+        )
+        raise RuntimeError(f"remote python attribute contract failed for {remote_python}: {details}")
+    if expected_attribute_checks:
+        missing_checked_contracts = tuple(
+            contract for contract in expected_attribute_checks if contract not in set(checked_attribute_contracts)
+        )
+        if missing_checked_contracts:
+            missing_list = ", ".join(missing_checked_contracts)
+            raise RuntimeError(
+                "remote python import contract returned an incomplete attribute result for "
+                f"{remote_python}: missing {missing_list}"
+            )
+        if missing_attributes:
+            details = "; ".join(
+                f"{target} -> {', '.join(attributes)}"
+                for target, attributes in sorted(missing_attributes.items())
+            )
+            raise RuntimeError(f"remote python attribute contract failed for {remote_python}: {details}")
+        missing_validated_contracts = tuple(
+            contract for contract in expected_attribute_checks if contract not in set(validated_attribute_contracts)
+        )
+        if missing_validated_contracts:
+            missing_list = ", ".join(missing_validated_contracts)
+            raise RuntimeError(
+                "remote python import contract returned an incomplete validation result for "
+                f"{remote_python}: missing {missing_list}"
+            )
+
     return PiPythonImportContractResult(
         python_path=str(payload.get("python_path", remote_python)).strip() or remote_python,
         checked_modules=checked_modules,
         imported_modules=imported_modules,
+        checked_attribute_contracts=checked_attribute_contracts,
+        validated_attribute_contracts=validated_attribute_contracts,
         elapsed_s=max(0.0, float(payload.get("elapsed_s", 0.0) or 0.0)),
     )
+
+
+def refresh_python_bytecode(
+    *,
+    remote: PiRemoteExecutor,
+    remote_python: str,
+    roots: Sequence[str],
+) -> str:
+    """Rebuild checked-hash bytecode for mirrored Python sources on the Pi.
+
+    The repo mirror intentionally excludes ``__pycache__`` and ``*.pyc`` from
+    authoritative sync, so the deploy must refresh mirrored bytecode explicitly
+    to prevent stale timestamp-based caches from shadowing newer source files.
+    Older Pi imports can also leave those cache directories owned by ``root``,
+    so the refresh first hands any existing mirrored ``__pycache__`` trees back
+    to the runtime user before `compileall` rebuilds checked-hash bytecode.
+    """
+
+    normalized_roots = tuple(dict.fromkeys(str(root).strip() for root in roots if str(root).strip()))
+    if not normalized_roots:
+        return ""
+    quoted_roots = " ".join(shlex.quote(root) for root in normalized_roots)
+    completed = remote.run_ssh(
+        "\n".join(
+            (
+                f"remote_python={shlex.quote(remote_python)}",
+                f"find {quoted_roots} -type d -name __pycache__ -exec sudo chown -R \"$(id -u):$(id -g)\" {{}} +",
+                f"\"$remote_python\" -m compileall -q -f --invalidation-mode checked-hash {quoted_roots}",
+            )
+        )
+    )
+    summary = summarize_output(completed)
+    if summary:
+        return summary
+    roots_summary = ", ".join(normalized_roots)
+    return f"refreshed checked-hash bytecode for {roots_summary}"
 
 
 def install_browser_automation_runtime_support(
@@ -873,6 +1051,7 @@ __all__ = [
     "load_service_states",
     "parse_optional_int",
     "read_remote_sha256",
+    "refresh_python_bytecode",
     "restart_services",
     "run_env_contract_probe",
     "repair_venv_python_shebangs",

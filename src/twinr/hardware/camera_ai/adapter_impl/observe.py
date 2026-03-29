@@ -3,6 +3,7 @@
 # BUG-2: Live gesture frame timestamps are now normalized per lane so wall-clock jumps or out-of-order helper frames cannot poison downstream live/video recognizers.
 # BUG-3: observe_attention() no longer hides optional RGB capture failures behind ai_ready=True/error=None; degraded anchor quality is surfaced explicitly.
 # BUG-4: Attention and gesture failure branches now perform best-effort runtime cleanup so broken camera/runtime state does not persist across later calls.
+# BUG-5: Non-gesture runtime recovery can now preserve the dedicated live-gesture pipeline instead of forcing recognizer cold-starts on later gesture ticks.
 # SEC-1: Shape-aware externally supplied frames are now shape/channel/size bounded before entering MediaPipe/OpenCV stacks, while opaque test/mocked frame carriers remain compatibility-allowed.
 # IMP-1: All public observation entrypoints now emit bounded forensic spans/events with consistent degradation semantics for edge debugging.
 # IMP-2: Public entrypoints now attach richer fast-path degradation detail so operators can distinguish local-camera, helper-frame, and RGB-degraded outcomes.
@@ -35,6 +36,7 @@ class AICameraAdapterObserveMixin:
         self,
         *,
         close_pipeline: bool,
+        close_live_gesture_pipeline: bool | None = None,
         clear_pose: bool,
         clear_motion: bool,
     ) -> None:
@@ -43,6 +45,7 @@ class AICameraAdapterObserveMixin:
         try:
             self._reset_runtime_state_locked(
                 close_pipeline=close_pipeline,
+                close_live_gesture_pipeline=close_live_gesture_pipeline,
                 clear_pose=clear_pose,
                 clear_motion=clear_motion,
             )
@@ -207,6 +210,7 @@ class AICameraAdapterObserveMixin:
                     )
                     self._best_effort_reset_runtime_state_locked(
                         close_pipeline=True,
+                        close_live_gesture_pipeline=False,
                         clear_pose=True,
                         clear_motion=True,
                     )
@@ -227,6 +231,7 @@ class AICameraAdapterObserveMixin:
                     )
                     self._best_effort_reset_runtime_state_locked(
                         close_pipeline=True,
+                        close_live_gesture_pipeline=False,
                         clear_pose=True,
                         clear_motion=True,
                     )
@@ -287,6 +292,7 @@ class AICameraAdapterObserveMixin:
             )
             self._best_effort_reset_runtime_state_locked(
                 close_pipeline=True,
+                close_live_gesture_pipeline=False,
                 clear_pose=True,
                 clear_motion=True,
             )
@@ -346,6 +352,7 @@ class AICameraAdapterObserveMixin:
                     )
                     self._best_effort_reset_runtime_state_locked(
                         close_pipeline=True,
+                        close_live_gesture_pipeline=False,
                         clear_pose=False,
                         clear_motion=False,
                     )
@@ -371,6 +378,7 @@ class AICameraAdapterObserveMixin:
                     )
                     self._best_effort_reset_runtime_state_locked(
                         close_pipeline=True,
+                        close_live_gesture_pipeline=False,
                         clear_pose=False,
                         clear_motion=False,
                     )
@@ -436,6 +444,155 @@ class AICameraAdapterObserveMixin:
             )
             self._best_effort_reset_runtime_state_locked(
                 close_pipeline=True,
+                close_live_gesture_pipeline=False,
+                clear_pose=False,
+                clear_motion=False,
+            )
+            return self._health_only_observation(
+                observed_at=observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_attention_stream(self) -> AICameraObservation:
+        """Capture one explicit live-stream attention observation for HDMI eye-follow."""
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        observed_at = self._now()
+        observed_monotonic = self._monotonic_now()
+        try:
+            with workflow_span(
+                name="camera_adapter_observe_attention_stream",
+                kind="io",
+                details={"observed_at": round(float(observed_at), 6), "source": "local_camera_stream"},
+            ):
+                try:
+                    runtime = self._load_detection_runtime()
+                except Exception as exc:  # pragma: no cover - depends on local environment.
+                    code = self._classify_error(exc)
+                    logger.warning("Local AI camera attention stream runtime load failed with %s.", code)
+                    logger.debug("Local AI camera attention stream runtime load exception details.", exc_info=True)
+                    workflow_event(
+                        kind="exception",
+                        msg="camera_adapter_attention_stream_runtime_load_failed",
+                        level="ERROR",
+                        details={"error_type": type(exc).__name__, "error_code": code},
+                    )
+                    self._record_attention_debug_details(
+                        source="local_camera_stream",
+                        frame_error=None,
+                        pipeline_error=code,
+                    )
+                    if isinstance(self._last_attention_debug_details, dict):
+                        self._last_attention_debug_details["mode"] = "attention_stream"
+                        self._last_attention_debug_details["stream_mode"] = "attention_stream"
+                    self._best_effort_reset_runtime_state_locked(
+                        close_pipeline=True,
+                        close_live_gesture_pipeline=False,
+                        clear_pose=False,
+                        clear_motion=False,
+                    )
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=code,
+                    )
+                online_error = self._probe_online(runtime)
+                if online_error is not None:
+                    logger.warning("Local AI camera attention stream online probe failed with %s.", online_error)
+                    workflow_event(
+                        kind="branch",
+                        msg="camera_adapter_attention_stream_camera_offline",
+                        details={"online_error": online_error},
+                    )
+                    self._record_attention_debug_details(
+                        source="local_camera_stream",
+                        frame_error=None,
+                        pipeline_error=online_error,
+                    )
+                    if isinstance(self._last_attention_debug_details, dict):
+                        self._last_attention_debug_details["mode"] = "attention_stream"
+                        self._last_attention_debug_details["stream_mode"] = "attention_stream"
+                    self._best_effort_reset_runtime_state_locked(
+                        close_pipeline=True,
+                        close_live_gesture_pipeline=False,
+                        clear_pose=False,
+                        clear_motion=False,
+                    )
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=online_error,
+                    )
+
+                detection = self._coerce_detection_result(
+                    self._capture_detection(runtime, observed_at=observed_at)
+                )
+                frame_rgb = None
+                frame_error = None
+                if self._needs_rgb_frame_for_attention(detection=detection):
+                    frame_rgb, frame_error = self._capture_optional_rgb_frame(
+                        runtime,
+                        observed_at=observed_at,
+                    )
+                    if frame_error is not None:
+                        workflow_event(
+                            kind="branch",
+                            msg="camera_adapter_attention_stream_rgb_degraded",
+                            details={"frame_error": frame_error},
+                        )
+                observation = self._build_attention_observation_locked(
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    stream_lane="local_attention_stream",
+                )
+                return self._with_health(
+                    observation,
+                    online=True,
+                    ready=True,
+                    ai_ready=(frame_error is None),
+                    error=frame_error,
+                    frame_at=observed_at,
+                )
+        except Exception as exc:  # pragma: no cover - hardware and library behavior are environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("Local AI camera attention stream observation failed with %s.", code)
+            logger.debug("Local AI camera attention stream observation exception details.", exc_info=True)
+            workflow_event(
+                kind="exception",
+                msg="camera_adapter_attention_stream_failed",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error_code": code},
+            )
+            self._record_attention_debug_details(
+                source="local_camera_stream",
+                frame_error=None,
+                pipeline_error=code,
+            )
+            if isinstance(self._last_attention_debug_details, dict):
+                self._last_attention_debug_details["mode"] = "attention_stream"
+                self._last_attention_debug_details["stream_mode"] = "attention_stream"
+            self._best_effort_reset_runtime_state_locked(
+                close_pipeline=True,
+                close_live_gesture_pipeline=False,
                 clear_pose=False,
                 clear_motion=False,
             )
@@ -532,6 +689,91 @@ class AICameraAdapterObserveMixin:
                 frame_error=None,
                 pipeline_error=code,
             )
+            return self._health_only_observation(
+                observed_at=resolved_observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_attention_from_frame_stream(
+        self,
+        *,
+        detection: Any,
+        frame_rgb: Any | None,
+        observed_at: float | None = None,
+        frame_at: float | None = None,
+    ) -> AICameraObservation:
+        """Process one external frame through the explicit live-stream attention lane."""
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        resolved_observed_at = self._coerce_observed_at(observed_at)
+        resolved_frame_at = resolved_observed_at if frame_at is None else self._coerce_observed_at(frame_at)
+        observed_monotonic = self._monotonic_now()
+        self._last_attention_debug_details = None
+        try:
+            with workflow_span(
+                name="camera_adapter_observe_attention_from_frame_stream",
+                kind="io",
+                details={"observed_at": round(float(resolved_observed_at), 6), "source": "external_frame_stream"},
+            ):
+                detection = self._coerce_detection_result(detection)
+                needs_frame = self._needs_rgb_frame_for_attention(detection=detection)
+                frame_error = self._validate_external_frame_rgb(
+                    frame_rgb=frame_rgb,
+                    allow_none=not needs_frame,
+                )
+                if frame_error is not None:
+                    workflow_event(
+                        kind="branch",
+                        msg="camera_adapter_attention_stream_external_frame_degraded",
+                        details={"frame_error": frame_error},
+                    )
+                    frame_rgb = None
+                observation = self._build_attention_observation_locked(
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                    observed_at=resolved_observed_at,
+                    observed_monotonic=observed_monotonic,
+                    stream_lane="external_attention_stream",
+                )
+                return self._with_health(
+                    observation,
+                    online=True,
+                    ready=True,
+                    ai_ready=(frame_error is None),
+                    error=frame_error,
+                    frame_at=resolved_frame_at,
+                )
+        except Exception as exc:  # pragma: no cover - transport/runtime coupling is environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("External AI camera attention stream observation failed with %s.", code)
+            logger.debug("External AI camera attention stream observation exception details.", exc_info=True)
+            workflow_event(
+                kind="exception",
+                msg="camera_adapter_attention_from_frame_stream_failed",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error_code": code},
+            )
+            self._record_attention_debug_details(
+                source="external_frame_stream",
+                frame_error=None,
+                pipeline_error=code,
+            )
+            if isinstance(self._last_attention_debug_details, dict):
+                self._last_attention_debug_details["mode"] = "attention_stream"
+                self._last_attention_debug_details["stream_mode"] = "attention_stream"
             return self._health_only_observation(
                 observed_at=resolved_observed_at,
                 online=True,
@@ -691,6 +933,143 @@ class AICameraAdapterObserveMixin:
         finally:
             self._lock.release()
 
+    def observe_gesture_stream(self) -> AICameraObservation:
+        """Capture one explicit live-stream gesture observation for HDMI ack/wakeup."""
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        observed_at = self._now()
+        observed_monotonic = self._monotonic_now()
+        gesture_frame_at = self._normalize_live_frame_at(lane="gesture_stream", candidate_s=observed_at)
+        try:
+            with workflow_span(
+                name="camera_adapter_observe_gesture_stream",
+                kind="io",
+                details={
+                    "observed_at": round(float(observed_at), 6),
+                    "frame_at": round(float(gesture_frame_at), 6),
+                    "source": "local_camera_stream",
+                    "gesture_fast_path": True,
+                },
+            ):
+                try:
+                    with workflow_span(
+                        name="camera_adapter_gesture_stream_load_runtime",
+                        kind="io",
+                    ):
+                        runtime = self._load_detection_runtime()
+                except Exception as exc:  # pragma: no cover - depends on local environment.
+                    code = self._classify_error(exc)
+                    logger.warning("Local AI camera gesture stream runtime load failed with %s.", code)
+                    logger.debug("Local AI camera gesture stream runtime load exception details.", exc_info=True)
+                    workflow_event(
+                        kind="exception",
+                        msg="camera_adapter_gesture_stream_runtime_load_failed",
+                        level="ERROR",
+                        details={"error_type": type(exc).__name__, "error_code": code},
+                    )
+                    self._last_gesture_debug_details = {
+                        "resolved_source": "local_camera_stream",
+                        "pipeline_error": code,
+                        "gesture_fast_path": True,
+                        "stream_mode": "gesture_stream",
+                        "gesture_stream_source": "local_camera",
+                    }
+                    self._best_effort_close_live_gesture_pipeline_locked()
+                    self._best_effort_close_runtime_locked()
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=code,
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_stream_online_probe",
+                    kind="io",
+                ):
+                    online_error = self._probe_online(runtime)
+                if online_error is not None:
+                    logger.warning("Local AI camera gesture stream online probe failed with %s.", online_error)
+                    workflow_event(
+                        kind="branch",
+                        msg="camera_adapter_gesture_stream_camera_offline",
+                        details={"online_error": online_error},
+                    )
+                    self._last_gesture_debug_details = {
+                        "resolved_source": "camera_offline",
+                        "pipeline_error": online_error,
+                        "stream_mode": "gesture_stream",
+                        "gesture_stream_source": "local_camera",
+                    }
+                    self._best_effort_close_live_gesture_pipeline_locked()
+                    self._best_effort_close_runtime_locked()
+                    return self._health_only_observation(
+                        observed_at=observed_at,
+                        online=False,
+                        ready=False,
+                        ai_ready=False,
+                        error=online_error,
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_stream_capture_detection",
+                    kind="io",
+                ):
+                    detection = self._coerce_detection_result(
+                        self._capture_detection(runtime, observed_at=observed_at)
+                    )
+                with workflow_span(
+                    name="camera_adapter_gesture_stream_capture_rgb",
+                    kind="io",
+                ):
+                    frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+                return self._build_gesture_observation_locked(
+                    runtime=runtime,
+                    observed_at=observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                    frame_at=gesture_frame_at,
+                    gesture_fast_path=True,
+                    stream_mode=True,
+                    stream_source="local_camera",
+                )
+        except Exception as exc:  # pragma: no cover - hardware and library behavior are environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("Local AI camera gesture stream observation failed with %s.", code)
+            logger.debug("Local AI camera gesture stream observation exception details.", exc_info=True)
+            workflow_event(
+                kind="exception",
+                msg="camera_adapter_gesture_stream_failed",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error_code": code},
+            )
+            self._last_gesture_debug_details = {
+                "resolved_source": "local_camera_stream",
+                "pipeline_error": code,
+                "gesture_fast_path": True,
+                "stream_mode": "gesture_stream",
+                "gesture_stream_source": "local_camera",
+            }
+            self._best_effort_close_live_gesture_pipeline_locked()
+            self._best_effort_close_runtime_locked()
+            return self._health_only_observation(
+                observed_at=observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
     def observe_gesture_from_frame(
         self,
         *,
@@ -783,6 +1162,107 @@ class AICameraAdapterObserveMixin:
                 "resolved_source": "external_frame",
                 "pipeline_error": code,
                 "gesture_fast_path": bool(gesture_fast_path),
+            }
+            self._best_effort_close_live_gesture_pipeline_locked()
+            return self._health_only_observation(
+                observed_at=resolved_observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_gesture_from_frame_stream(
+        self,
+        *,
+        detection: Any,
+        frame_rgb: Any,
+        observed_at: float | None = None,
+        frame_at: float | None = None,
+        allow_pose_fallback: bool = False,
+    ) -> AICameraObservation:
+        """Run the explicit gesture stream lane on an externally supplied RGB frame."""
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        resolved_observed_at = self._coerce_observed_at(observed_at)
+        normalized_frame_at = self._normalize_live_frame_at(
+            lane="gesture_stream_external",
+            candidate_s=resolved_observed_at if frame_at is None else frame_at,
+        )
+        observed_monotonic = self._monotonic_now()
+        try:
+            with workflow_span(
+                name="camera_adapter_observe_gesture_from_frame_stream",
+                kind="io",
+                details={
+                    "observed_at": round(float(resolved_observed_at), 6),
+                    "frame_at": round(float(normalized_frame_at), 6),
+                    "source": "external_frame_stream",
+                    "gesture_fast_path": True,
+                },
+            ):
+                frame_error = self._validate_external_frame_rgb(
+                    frame_rgb=frame_rgb,
+                    allow_none=False,
+                )
+                if frame_error is not None:
+                    workflow_event(
+                        kind="branch",
+                        msg="camera_adapter_gesture_stream_external_frame_rejected",
+                        details={"frame_error": frame_error},
+                    )
+                    self._last_gesture_debug_details = {
+                        "resolved_source": "external_frame_stream",
+                        "pipeline_error": frame_error,
+                        "gesture_fast_path": True,
+                        "stream_mode": "gesture_stream",
+                        "gesture_stream_source": "external_frame",
+                    }
+                    return self._health_only_observation(
+                        observed_at=resolved_observed_at,
+                        online=True,
+                        ready=False,
+                        ai_ready=False,
+                        error=frame_error,
+                    )
+                return self._build_gesture_observation_locked(
+                    runtime={},
+                    observed_at=resolved_observed_at,
+                    observed_monotonic=observed_monotonic,
+                    detection=self._coerce_detection_result(detection),
+                    frame_rgb=frame_rgb,
+                    frame_at=normalized_frame_at,
+                    allow_pose_fallback=allow_pose_fallback,
+                    gesture_fast_path=True,
+                    stream_mode=True,
+                    stream_source="external_frame",
+                )
+        except Exception as exc:  # pragma: no cover - transport/runtime coupling is environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("External AI camera gesture stream observation failed with %s.", code)
+            logger.debug("External AI camera gesture stream observation exception details.", exc_info=True)
+            workflow_event(
+                kind="exception",
+                msg="camera_adapter_gesture_from_frame_stream_failed",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error_code": code},
+            )
+            self._last_gesture_debug_details = {
+                "resolved_source": "external_frame_stream",
+                "pipeline_error": code,
+                "gesture_fast_path": True,
+                "stream_mode": "gesture_stream",
+                "gesture_stream_source": "external_frame",
             }
             self._best_effort_close_live_gesture_pipeline_locked()
             return self._health_only_observation(

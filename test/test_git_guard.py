@@ -208,6 +208,43 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["issues"], [])
 
+    def test_scan_staged_allows_custom_header_name_metadata_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                (
+                    'shared_secret_header_name = "x-twinr-secret"\n'
+                    'api_key_header_name = "x-api-key"\n'
+                ),
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_still_blocks_non_header_literals_for_header_name_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                'shared_secret_header_name = "live-real-secret-value"\n',
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            issues = cast(list[dict[str, Any]], payload["issues"])
+            rule_ids = {issue["rule_id"] for issue in issues}
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertIn("sensitive-assignment", rule_ids)
+
     def test_scan_staged_allows_blocked_term_policy_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)

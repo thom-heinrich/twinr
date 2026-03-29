@@ -560,6 +560,14 @@ class OnnxSentenceEncoder:
             return batches[0]
         return np.concatenate(batches, axis=0).astype(np.float32, copy=False)
 
+    def warmup(self, probe_text: str = "warmup") -> None:
+        """Preload tokenizer/session state and execute one bounded probe encode."""
+
+        probe = str(probe_text or "").strip() or "warmup"
+        self._load_tokenizer()
+        self._load_session()
+        self.encode([probe])
+
     def _pool_embeddings(
         self,
         raw_embeddings: np.ndarray,

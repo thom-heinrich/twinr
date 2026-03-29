@@ -29,6 +29,7 @@ from .normalization_updates import (
     apply_general_updates,
 )
 from .topology_validation import (
+    validate_supported_proactive_vision_provider,
     validate_supported_attention_servo_topology,
     validate_supported_camera_topology,
 )
@@ -207,6 +208,14 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
     normalized_display_reserve_bus_nightly_poll_interval_s = max(
         30.0,
         normalized_display_reserve_bus_nightly_poll_interval_s,
+    )
+    normalized_display_gesture_refresh_interval_s = float(
+        config.display_gesture_refresh_interval_s
+    )
+    if not math.isfinite(normalized_display_gesture_refresh_interval_s):
+        raise ValueError("display_gesture_refresh_interval_s must be finite")
+    normalized_display_gesture_refresh_interval_s = max(
+        0.0, normalized_display_gesture_refresh_interval_s
     )
     normalized_display_attention_refresh_interval_s = float(
         config.display_attention_refresh_interval_s
@@ -832,6 +841,9 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
         camera_second_pi_base_url=normalized_camera_second_pi_base_url,
         camera_proxy_snapshot_url=normalized_camera_proxy_snapshot_url,
         proactive_remote_camera_base_url=normalized_proactive_remote_camera_base_url,
+    )
+    validate_supported_proactive_vision_provider(
+        proactive_vision_provider=normalized_proactive_vision_provider,
     )
     validate_supported_attention_servo_topology(
         attention_servo_driver=normalized_attention_servo_driver,

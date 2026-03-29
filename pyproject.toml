@@ -26,6 +26,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-core>=2.41,<3",
     "pillow>=10,<12",
+    "python-multipart>=0.0.20,<1",
     "python-dateutil>=2.9,<3",
     "pypinyin>=0.53,<1",
     "PyYAML>=6,<7",

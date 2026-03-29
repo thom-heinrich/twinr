@@ -4,11 +4,11 @@ This module owns the operator workflow that turns the current authoritative
 repo state in ``/home/thh/twinr`` into a restarted and verified Pi acceptance
 runtime under ``/twinr``. It reuses the one-way repo mirror for code sync,
 optionally overwrites the Pi runtime ``.env`` from the leading repo, refreshes
-the editable install in the Pi virtualenv, installs optional mirrored local
+the editable install in the Pi virtualenv, explicitly syncs optional local
 workspace runtime manifests such as ``browser_automation/runtime_requirements``
-before restart, installs the productive base units plus any repo-backed Pi
-runtime units that are already enabled on the host, supports explicit
-first-rollout activation for optional Pi units, restarts the selected
+before installing them on the Pi, installs the productive base units plus any
+repo-backed Pi runtime units that are already enabled on the host, supports
+explicit first-rollout activation for optional Pi units, restarts the selected
 services, and checks that they came back healthy.
 """
 
@@ -31,6 +31,7 @@ from twinr.ops.pi_runtime_deploy_remote import (
     install_editable_package as _install_editable_package,
     install_python_requirements_manifest as _install_python_requirements_manifest,
     install_service_units as _install_service_units,
+    refresh_python_bytecode as _refresh_python_bytecode,
     restart_services as _restart_services,
     run_env_contract_probe as _run_env_contract_probe,
     sync_authoritative_file as _sync_authoritative_file,
@@ -49,6 +50,10 @@ DEFAULT_DEPLOY_SERVICES: tuple[str, ...] = (
 _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS = Path("browser_automation/runtime_requirements.txt")
 _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS = Path("browser_automation/playwright_browsers.txt")
 _PI_RUNTIME_REQUIREMENTS = Path("hardware/ops/pi_runtime_requirements.txt")
+_PI_RUNTIME_BYTECODE_RELATIVE_ROOTS: tuple[str, ...] = (
+    "src",
+    "hardware",
+)
 _PI_RUNTIME_IMPORT_MODULES: tuple[str, ...] = (
     "dateutil",
     "markupsafe",
@@ -69,6 +74,24 @@ _PI_RUNTIME_IMPORT_MODULES: tuple[str, ...] = (
     "h2",
     "opentelemetry.trace",
 )
+_PI_RUNTIME_ATTRIBUTE_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
+        "observe_attention_stream",
+        "observe_attention_from_frame_stream",
+        "observe_gesture_stream",
+        "observe_gesture_from_frame_stream",
+    ),
+    "twinr.hardware.camera_ai.adapter_impl.perception:AICameraAdapterPerceptionMixin": (
+        "observe_perception_stream",
+    ),
+    "twinr.hardware.camera_ai.adapter_impl.core:LocalAICameraAdapter": (
+        "observe_perception_stream",
+        "observe_attention_stream",
+        "observe_attention_from_frame_stream",
+        "observe_gesture_stream",
+        "observe_gesture_from_frame_stream",
+    ),
+}
 
 
 class _MirrorWatchdog(Protocol):
@@ -94,6 +117,7 @@ class PiRuntimeDeployResult:
     repo_mirror: PiRepoMirrorCycleResult
     env_sync: PiSyncedFileResult | None
     editable_install_summary: str | None
+    bytecode_refresh_summary: str | None
     installed_units: tuple[str, ...]
     restarted_services: tuple[str, ...]
     service_states: tuple[PiSystemdServiceState, ...]
@@ -157,9 +181,10 @@ def deploy_pi_runtime(
             unchanged and updates only the editable package, which avoids
             rebuilding Pi-host packages such as PyQt5 on every deploy.
             When the local ignored ``browser_automation/`` workspace exposes
-            runtime manifests, the deploy also installs those mirrored
+            runtime manifests, the deploy also syncs and installs those
             requirements after the editable refresh so the Pi can execute the
-            mirrored adapter code.
+            local adapter code without relying on the repo mirror to carry
+            ignored workspace files.
         install_systemd_units: Whether to copy the service unit files from
             ``/twinr/hardware/ops`` into ``/etc/systemd/system`` and reload systemd.
         verify_env_contract: Whether to run the bounded Pi env-contract probe.
@@ -196,6 +221,7 @@ def deploy_pi_runtime(
     env_source = (resolved_root / ".env") if env_source_path is None else Path(env_source_path).resolve()
     resolved_remote_root = remote_root.rstrip("/") or "/"
     env_target = remote_env_path or f"{resolved_remote_root}/.env"
+    remote_python = f"{resolved_remote_root}/.venv/bin/python"
     install_browser_requirements = _has_nonempty_local_file(
         resolved_root / _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS
     )
@@ -269,23 +295,56 @@ def deploy_pi_runtime(
                 for part in (editable_install_summary, pi_runtime_requirements_summary)
                 if part and part.strip()
             )
+        if install_browser_requirements:
+            _run_phase(
+                "browser_automation_requirements_sync",
+                lambda: _sync_optional_manifest(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    local_root=resolved_root,
+                    manifest_relpath=_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS,
+                ),
+            )
+        if install_playwright_browsers:
+            _run_phase(
+                "browser_automation_browsers_sync",
+                lambda: _sync_optional_manifest(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    local_root=resolved_root,
+                    manifest_relpath=_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS,
+                ),
+            )
         if install_browser_requirements or install_playwright_browsers:
             _run_phase(
                 "browser_automation_runtime",
-                lambda: _install_browser_automation_runtime_support(
-                    remote=remote,
-                    remote_root=resolved_remote_root,
-                    install_python_requirements=install_browser_requirements,
-                    install_playwright_browsers=install_playwright_browsers,
-                ),
-            )
+            lambda: _install_browser_automation_runtime_support(
+                remote=remote,
+                remote_root=resolved_remote_root,
+                install_python_requirements=install_browser_requirements,
+                install_playwright_browsers=install_playwright_browsers,
+            ),
+        )
+
+    bytecode_refresh_summary = _run_phase(
+        "python_bytecode_refresh",
+        lambda: _refresh_python_bytecode(
+            remote=remote,
+            remote_python=remote_python,
+            roots=tuple(
+                f"{resolved_remote_root}/{relative_root.strip('/')}"
+                for relative_root in _PI_RUNTIME_BYTECODE_RELATIVE_ROOTS
+            ),
+        ),
+    )
 
     import_contract_result = _run_phase(
         "python_import_contract",
         lambda: _verify_python_import_contract(
             remote=remote,
-            remote_python=f"{resolved_remote_root}/.venv/bin/python",
+            remote_python=remote_python,
             modules=_PI_RUNTIME_IMPORT_MODULES,
+            attribute_contracts=_PI_RUNTIME_ATTRIBUTE_CONTRACTS,
         ),
     )
 
@@ -336,6 +395,7 @@ def deploy_pi_runtime(
         repo_mirror=repo_mirror,
         env_sync=env_sync_result,
         editable_install_summary=editable_install_summary,
+        bytecode_refresh_summary=bytecode_refresh_summary,
         installed_units=normalized_services if install_systemd_units else (),
         restarted_services=normalized_services,
         service_states=service_states,
@@ -360,6 +420,27 @@ def _has_nonempty_local_file(path: Path) -> bool:
     """Return whether one local deploy manifest exists and contains data."""
 
     return path.is_file() and bool(path.read_bytes().strip())
+
+
+def _sync_optional_manifest(
+    *,
+    remote: _PiRemoteExecutor,
+    remote_root: str,
+    local_root: Path,
+    manifest_relpath: Path,
+) -> PiSyncedFileResult:
+    """Sync one optional local manifest into the Pi runtime checkout."""
+
+    local_path = (local_root / manifest_relpath).resolve()
+    if not _has_nonempty_local_file(local_path):
+        raise ValueError(f"optional manifest is missing or empty: {local_path}")
+    remote_manifest_path = f"{remote_root.rstrip('/')}/{manifest_relpath.as_posix()}"
+    return _sync_authoritative_file(
+        remote=remote,
+        local_path=local_path,
+        remote_path=remote_manifest_path,
+        mode="644",
+    )
 
 
 def _normalize_services(services: Sequence[str]) -> tuple[str, ...]:

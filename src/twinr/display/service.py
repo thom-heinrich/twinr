@@ -5,6 +5,8 @@
 # SEC-1: Sanitize emitted presentation telemetry tokens so file-backed cue payloads cannot forge key=value operator logs.
 # IMP-1: Move internet and health sampling off the hot render path with bounded async workers and cached fallback values.
 # IMP-2: Add adaptive idle polling, optional systemd sd_notify status/watchdog integration, and periodic maintenance refresh for unchanged Waveshare frames.
+# IMP-3: Persist the last successfully rendered state fields plus health verdict so display-side ERROR claims
+#        can be proven from one authoritative ops artifact.
 
 """Drive the Twinr status display loop from runtime snapshots.
 
@@ -43,10 +45,15 @@ from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
 from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
+from twinr.display.render_state import DisplayRenderStateStore
 from twinr.display.reserve_bus import resolve_display_reserve_bus
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
 from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
-from twinr.ops.health import TwinrSystemHealth, collect_system_health
+from twinr.ops.health import (
+    TwinrSystemHealth,
+    assess_memory_pressure_status,
+    collect_system_health,
+)
 
 _STATUS_ANIMATION_SPECS: dict[str, tuple[int, float]] = {
     "waiting": (12, 0.75),
@@ -73,6 +80,7 @@ _IDLE_POLL_MAX_S = 1.0
 _ACTIVE_STATUS_SNAPSHOT_STALE_AFTER_S = 20.0
 _WAVESHARE_MAINTENANCE_REFRESH_S = 23 * 60 * 60
 _TELEMETRY_TOKEN_MAX_LEN = 48
+_UNSET = object()
 
 _LOGGER = logging.getLogger(__name__)
 _VOICE_QUIET_FACE_CUE = DisplayFaceCue(
@@ -139,6 +147,7 @@ class TwinrStatusDisplayLoop:
     news_ticker_runtime: DisplayNewsTickerRuntime | None = None
     respeaker_hci_store: DisplayReSpeakerHciStore | None = None
     debug_signal_store: DisplayDebugSignalStore | None = None
+    render_state_store: DisplayRenderStateStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -195,6 +204,7 @@ class TwinrStatusDisplayLoop:
             news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
             respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
             debug_signal_store=DisplayDebugSignalStore.from_config(config),
+            render_state_store=DisplayRenderStateStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -214,9 +224,29 @@ class TwinrStatusDisplayLoop:
 
                 snapshot, snapshot_stale = self._load_snapshot()
                 status = self._effective_runtime_status(snapshot, stale=snapshot_stale)
-                headline, details = self._build_status_content(snapshot, status=status, stale=snapshot_stale)
-                state_fields = self._build_state_fields(snapshot, status=status, stale=snapshot_stale)
-                log_sections = self._build_log_sections(snapshot, status=status, stale=snapshot_stale)
+                health = self._current_health(snapshot)
+                internet_ok = self._internet_ok()
+                headline, details = self._build_status_content(
+                    snapshot,
+                    status=status,
+                    stale=snapshot_stale,
+                    health=health,
+                    internet_ok=internet_ok,
+                )
+                state_fields = self._build_state_fields(
+                    snapshot,
+                    status=status,
+                    stale=snapshot_stale,
+                    health=health,
+                    internet_ok=internet_ok,
+                )
+                log_sections = self._build_log_sections(
+                    snapshot,
+                    status=status,
+                    stale=snapshot_stale,
+                    health=health,
+                    internet_ok=internet_ok,
+                )
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue(snapshot=snapshot)
                 emoji_cue = self._active_emoji_cue()
@@ -265,6 +295,15 @@ class TwinrStatusDisplayLoop:
                         self._last_render_status = status
                         self._last_render_monotonic_s = time.monotonic()
                         self._force_render_next_cycle = False
+                        self._save_render_state(
+                            status=status,
+                            headline=headline,
+                            details=details,
+                            state_fields=state_fields,
+                            snapshot=snapshot,
+                            snapshot_stale=snapshot_stale,
+                            health=health,
+                        )
                         self._write_heartbeat(status, phase="idle", force=True)
                         if not self._systemd_ready_sent:
                             self._systemd_notify("READY=1")
@@ -298,14 +337,21 @@ class TwinrStatusDisplayLoop:
         *,
         status: str | None = None,
         stale: bool = False,
+        health: TwinrSystemHealth | None | object = _UNSET,
+        internet_ok: bool | None | object = _UNSET,
     ) -> tuple[str, tuple[str, ...]]:
         status = status or self._snapshot_status(snapshot)
         note = "Status veraltet" if stale else None
         if snapshot is None and not stale:
             note = "Status nicht verfügbar"
+        health, internet_ok = self._resolve_health_context(
+            snapshot,
+            health=health,
+            internet_ok=internet_ok,
+        )
         details = self._detail_lines(
             note,
-            *self._health_detail_values(snapshot),
+            *self._health_detail_values(snapshot, health=health, internet_ok=internet_ok),
         )
         if status == "waiting":
             return "Waiting", details
@@ -348,9 +394,13 @@ class TwinrStatusDisplayLoop:
     def _animation_spec(self, status: str) -> tuple[int, float]:
         return _STATUS_ANIMATION_SPECS.get(self._compact_text(status).lower(), (1, 60.0))
 
-    def _health_detail_values(self, snapshot: RuntimeSnapshot | None) -> tuple[str, str, str, str]:
-        health = self._current_health(snapshot)
-        internet_ok = self._internet_ok()
+    def _health_detail_values(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        *,
+        health: TwinrSystemHealth | None,
+        internet_ok: bool | None,
+    ) -> tuple[str, str, str, str]:
         return (
             self._internet_footer_label(internet_ok),
             self._ai_footer_label(snapshot, health, internet_ok),
@@ -364,13 +414,18 @@ class TwinrStatusDisplayLoop:
         *,
         status: str | None = None,
         stale: bool = False,
+        health: TwinrSystemHealth | None | object = _UNSET,
+        internet_ok: bool | None | object = _UNSET,
     ) -> tuple[tuple[str, str], ...]:
         status = status or self._snapshot_status(snapshot)
         note = "Status veraltet" if stale else None
         if snapshot is None and not stale:
             note = "Status nicht verfügbar"
-        health = self._current_health(snapshot)
-        internet_ok = self._internet_ok()
+        health, internet_ok = self._resolve_health_context(
+            snapshot,
+            health=health,
+            internet_ok=internet_ok,
+        )
         state_fields = [
             ("Status", self._runtime_state_value(snapshot, status=status, stale=stale)),
             ("Internet", self._internet_state_value(internet_ok)),
@@ -403,11 +458,16 @@ class TwinrStatusDisplayLoop:
         *,
         status: str,
         stale: bool = False,
+        health: TwinrSystemHealth | None | object = _UNSET,
+        internet_ok: bool | None | object = _UNSET,
     ) -> LogSections:
         if self._display_layout() != "debug_log":
             return ()
-        health = self._current_health(snapshot)
-        internet_ok = self._internet_ok()
+        health, internet_ok = self._resolve_health_context(
+            snapshot,
+            health=health,
+            internet_ok=internet_ok,
+        )
         return self._debug_log_builder().build_sections(
             snapshot=snapshot,
             runtime_status=self._runtime_state_value(snapshot, status=status, stale=stale),
@@ -418,6 +478,25 @@ class TwinrStatusDisplayLoop:
             health=health,
             stale=stale,
         )
+
+    def _resolve_health_context(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        *,
+        health: TwinrSystemHealth | None | object = _UNSET,
+        internet_ok: bool | None | object = _UNSET,
+    ) -> tuple[TwinrSystemHealth | None, bool | None]:
+        resolved_health = (
+            self._current_health(snapshot)
+            if health is _UNSET
+            else cast(TwinrSystemHealth | None, health)
+        )
+        resolved_internet_ok = (
+            self._internet_ok()
+            if internet_ok is _UNSET
+            else cast(bool | None, internet_ok)
+        )
+        return resolved_health, resolved_internet_ok
 
     def _current_health(self, snapshot: RuntimeSnapshot | None) -> TwinrSystemHealth | None:
         now = time.monotonic()
@@ -607,7 +686,11 @@ class TwinrStatusDisplayLoop:
             return "Fehler"
         if not self._service_running(health, "conversation_loop"):
             return "Achtung"
-        if getattr(health, "memory_used_percent", None) is not None and health.memory_used_percent >= 80:
+        memory_status = assess_memory_pressure_status(
+            memory_available_mb=getattr(health, "memory_available_mb", None),
+            memory_used_percent=getattr(health, "memory_used_percent", None),
+        )
+        if memory_status in {"warn", "fail"}:
             return "Achtung"
         if getattr(health, "disk_used_percent", None) is not None and health.disk_used_percent >= 85:
             return "Achtung"
@@ -660,6 +743,36 @@ class TwinrStatusDisplayLoop:
             if getattr(service, "key", None) == key:
                 return bool(getattr(service, "running", False))
         return True
+
+    def _save_render_state(
+        self,
+        *,
+        status: str,
+        headline: str,
+        details: tuple[str, ...],
+        state_fields: tuple[tuple[str, str], ...],
+        snapshot: RuntimeSnapshot | None,
+        snapshot_stale: bool,
+        health: TwinrSystemHealth | None,
+    ) -> None:
+        store = self.render_state_store
+        if store is None:
+            return
+        try:
+            store.save(
+                layout=self._display_layout(),
+                runtime_status=status,
+                headline=headline,
+                details=details,
+                state_fields=state_fields,
+                health_status=self._compact_text(getattr(health, "status", None)).lower() or None,
+                snapshot_status=self._snapshot_status(snapshot) if snapshot is not None else None,
+                snapshot_stale=snapshot_stale,
+                snapshot_error=self._snapshot_error_message(snapshot),
+                runtime_error=self._compact_text(getattr(health, "runtime_error", None)),
+            )
+        except Exception as exc:
+            self._emit_error("display_render_state_save_failed", exc)
 
     def _load_snapshot(self) -> tuple[RuntimeSnapshot | None, bool]:
         try:

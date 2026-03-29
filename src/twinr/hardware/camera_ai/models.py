@@ -345,6 +345,13 @@ class AICameraObservation:
     gesture_confidence: float | None = None
     fine_hand_gesture: AICameraFineHandGesture = AICameraFineHandGesture.NONE
     fine_hand_gesture_confidence: float | None = None
+    gesture_temporal_authoritative: bool = False
+    gesture_activation_key: str | None = None
+    gesture_activation_token: int | None = None
+    gesture_activation_started_at: float | None = None
+    gesture_activation_changed_at: float | None = None
+    gesture_activation_source: str | None = None
+    gesture_activation_rising: bool = False
     objects: tuple[AICameraObjectDetection, ...] = ()
     model: str = "local-imx500"
 
@@ -531,6 +538,41 @@ class AICameraObservation:
             self,
             "fine_hand_gesture_confidence",
             _coerce_optional_ratio(self.fine_hand_gesture_confidence),
+        )
+        object.__setattr__(
+            self,
+            "gesture_temporal_authoritative",
+            _coerce_bool(self.gesture_temporal_authoritative, default=False),
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_key",
+            _normalize_text(self.gesture_activation_key, max_length=96, default=None),
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_token",
+            _coerce_optional_non_negative_int(self.gesture_activation_token),
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_started_at",
+            _sanitize_relative_timestamp(self.gesture_activation_started_at, default=None, reference=observed_at),
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_changed_at",
+            _sanitize_relative_timestamp(self.gesture_activation_changed_at, default=None, reference=observed_at),
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_source",
+            _normalize_token(self.gesture_activation_source, max_length=64) or None,
+        )
+        object.__setattr__(
+            self,
+            "gesture_activation_rising",
+            _coerce_bool(self.gesture_activation_rising, default=False),
         )
         object.__setattr__(self, "objects", objects)
         object.__setattr__(
@@ -785,6 +827,15 @@ def _coerce_non_negative_int(value: object, *, default: int = 0) -> int:
     if number < 0.0:
         return 0
     return int(number)
+
+
+def _coerce_optional_non_negative_int(value: object) -> int | None:
+    """Coerce one optional count-like value to a non-negative integer."""
+
+    if value is None:
+        return None
+    number = _coerce_non_negative_int(value, default=-1)
+    return None if number < 0 else number
 
 
 def _infer_zone_from_box(box: AICameraBox | None) -> AICameraZone:

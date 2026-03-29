@@ -6,7 +6,11 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+from twinr.agent.workflows.playback_coordinator import (
+    PlaybackActivityEvent,
+    PlaybackCoordinator,
+    PlaybackPriority,
+)
 
 
 class _BlockingTonePlayer:
@@ -113,6 +117,24 @@ class _CoordinatorRequestDouble:
 
 
 class PlaybackCoordinatorTests(unittest.TestCase):
+    def test_activity_listener_receives_start_and_finish_events(self) -> None:
+        player = _ChunkPlayer()
+        events: list[PlaybackActivityEvent] = []
+        coordinator = PlaybackCoordinator(player, activity_listener=events.append)
+
+        coordinator.play_wav_chunks(
+            owner="speech",
+            priority=PlaybackPriority.SPEECH,
+            chunks=iter((b"A", b"B")),
+        )
+        coordinator.close(timeout_s=1.0)
+
+        self.assertEqual([event.phase for event in events], ["starting", "finished"])
+        self.assertEqual([event.owner for event in events], ["speech", "speech"])
+        self.assertEqual([event.category for event in events], ["wav_chunks", "wav_chunks"])
+        self.assertIsNone(events[1].cancel_reason)
+        self.assertIsNone(events[1].error_type)
+
     def test_higher_priority_request_preempts_active_feedback(self) -> None:
         player = _BlockingTonePlayer()
         coordinator = PlaybackCoordinator(player)

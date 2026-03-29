@@ -56,7 +56,6 @@ from ..ambiguous_room_guard import AmbiguousRoomGuardSnapshot
 from ..attention_debug_stream import AttentionDebugStream
 from ..attention_targeting import (
     MultimodalAttentionTargetSnapshot,
-    MultimodalAttentionTargetTracker,
 )
 from ..audio_policy import ReSpeakerAudioPolicySnapshot, ReSpeakerAudioPolicyTracker
 from ..display_ambient_impulses import DisplayAmbientImpulsePublisher
@@ -64,16 +63,16 @@ from ..display_attention import DisplayAttentionCuePublisher
 from ..display_attention_camera_fusion import DisplayAttentionCameraFusion
 from ..display_debug_signals import DisplayDebugSignalPublisher
 from ..display_gesture_emoji import DisplayGestureEmojiPublisher
-from ..gesture_ack_lane import GestureAckLane
 from ..gesture_debug_stream import GestureDebugStream
 from ..gesture_wakeup_dispatcher import GestureWakeupDispatcher
-from ..gesture_wakeup_lane import GestureWakeupDecision, GestureWakeupLane
+from ..gesture_wakeup_lane import GestureWakeupDecision
 from ..identity_fusion import (
     MultimodalIdentityFusionSnapshot,
     TemporalIdentityFusionTracker,
 )
 from ..known_user_hint import KnownUserHintSnapshot
 from ..multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
+from ..perception_orchestrator import PerceptionRuntimeSnapshot, PerceptionStreamOrchestrator
 from ..person_state import PersonStateSnapshot
 from ..portrait_match import PortraitMatchSnapshot
 from ..presence import PresenceSessionController, PresenceSessionSnapshot
@@ -195,6 +194,7 @@ class ProactiveCoordinatorCoreMixin:
         self._last_attention_follow_pipeline_key: tuple[object, ...] | None = None
         self._last_attention_servo_follow_key: tuple[object, ...] | None = None
         self._last_observation_key: tuple[object, ...] | None = None
+        self._display_perception_cycle = None
         self._last_attention_vision_refresh_mode: str | None = None
         self._last_attention_audio_refresh_mode: str | None = None
         self._last_gesture_vision_refresh_mode: str | None = None
@@ -206,8 +206,7 @@ class ProactiveCoordinatorCoreMixin:
             config,
             engine=engine,
         )
-        self._gesture_ack_lane = GestureAckLane.from_config(config)
-        self._gesture_wakeup_lane = GestureWakeupLane.from_config(config)
+        self.perception_orchestrator = PerceptionStreamOrchestrator.from_config(config)
         self._gesture_wakeup_dispatcher = GestureWakeupDispatcher(
             handle_decision=self._run_gesture_wakeup_handler,
         )
@@ -232,10 +231,10 @@ class ProactiveCoordinatorCoreMixin:
         self.latest_known_user_hint_snapshot: KnownUserHintSnapshot | None = None
         self.latest_affect_proxy_snapshot: AffectProxySnapshot | None = None
         self.latest_attention_target_snapshot: MultimodalAttentionTargetSnapshot | None = None
+        self.latest_perception_runtime_snapshot: PerceptionRuntimeSnapshot | None = None
         self.latest_person_state_snapshot: PersonStateSnapshot | None = None
         self.audio_policy_tracker = ReSpeakerAudioPolicyTracker.from_config(config)
         self.identity_fusion_tracker = TemporalIdentityFusionTracker.from_config(config)
-        self.attention_target_tracker = MultimodalAttentionTargetTracker.from_config(config)
 
     def _emit(self, line: str) -> None:
         """Emit one coordinator-local telemetry line safely."""
@@ -371,6 +370,9 @@ class ProactiveCoordinatorCoreMixin:
     def _observe_vision_for_attention_refresh(self):
         """Collect one low-cost vision snapshot for the HDMI eye-follow path."""
 
+        shared_snapshot = self._shared_display_perception_snapshot(consumer="attention")
+        if shared_snapshot is not None:
+            return shared_snapshot
         if self.vision_observer is None:
             self._last_attention_vision_refresh_mode = "missing"
             return None

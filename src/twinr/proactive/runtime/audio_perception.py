@@ -10,7 +10,9 @@ device-directed speech candidacy without duplicating monitor orchestration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import time
+from typing import Callable, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import AmbientAudioSampler, AudioCaptureReadinessProbe
@@ -23,6 +25,10 @@ from twinr.proactive.social.observers import (
 )
 
 from .audio_policy import ReSpeakerAudioPolicySnapshot, ReSpeakerAudioPolicyTracker
+from .service_impl.compat import _proactive_pcm_capture_conflicts_with_voice_orchestrator
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,22 +54,35 @@ class ReSpeakerAudioPerceptionSnapshot:
 def observe_audio_perception_once(config: TwinrConfig) -> ReSpeakerAudioPerceptionSnapshot:
     """Capture one bounded audio-perception snapshot from current config."""
 
-    sampler = AmbientAudioSampler.from_config(config)
-    fallback_observer = AmbientAudioObservationProvider(
-        sampler=sampler,
-        sample_ms=config.proactive_audio_sample_ms,
-        distress_enabled=bool(config.proactive_enabled and config.proactive_audio_distress_enabled),
+    distress_enabled = bool(config.proactive_enabled and config.proactive_audio_distress_enabled)
+    shared_voice_capture_conflict = _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+        config,
+        require_active_owner=True,
     )
-    observer: object = fallback_observer
+    sampler: AmbientAudioSampler | None = None
+    fallback_observer: object | None = None
     capture_probe: AudioCaptureReadinessProbe | None = None
     respeaker_targeted = config_targets_respeaker(
         getattr(config, "audio_input_device", None),
         getattr(config, "proactive_audio_input_device", None),
     )
-    if respeaker_targeted:
-        capture_probe = sampler.require_readable_frames(
-            duration_ms=min(max(sampler.chunk_ms, 250), max(sampler.chunk_ms, config.proactive_audio_sample_ms)),
+    if not shared_voice_capture_conflict:
+        sampler = AmbientAudioSampler.from_config(config)
+        fallback_observer = AmbientAudioObservationProvider(
+            sampler=sampler,
+            sample_ms=config.proactive_audio_sample_ms,
+            distress_enabled=distress_enabled,
         )
+    elif respeaker_targeted:
+        logger.info(
+            "observe_audio_perception_once skipped PCM probe because the active voice orchestrator owns the same capture device"
+        )
+    observer: object = fallback_observer
+    if respeaker_targeted:
+        if sampler is not None:
+            capture_probe = sampler.require_readable_frames(
+                duration_ms=min(max(sampler.chunk_ms, 250), max(sampler.chunk_ms, config.proactive_audio_sample_ms)),
+            )
         observer = ReSpeakerAudioObservationProvider(
             signal_provider=ReSpeakerSignalProvider(
                 sensor_window_ms=config.proactive_audio_sample_ms,
@@ -74,9 +93,9 @@ def observe_audio_perception_once(config: TwinrConfig) -> ReSpeakerAudioPercepti
     try:
         audio_snapshot = observer.observe()
     finally:
-        close = getattr(observer, "close", None)
-        if callable(close):
-            close()
+        close_method = cast(Callable[[], None] | None, getattr(observer, "close", None))
+        if close_method is not None:
+            close_method()
     audio_policy_snapshot = ReSpeakerAudioPolicyTracker.from_config(config).observe(
         now=time.monotonic(),
         audio=audio_snapshot.observation,

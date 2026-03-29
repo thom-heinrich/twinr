@@ -48,6 +48,24 @@ _TEST_PI_IMPORT_MODULES = (
     "h2",
     "opentelemetry.trace",
 )
+_TEST_PI_ATTRIBUTE_CONTRACTS = {
+    "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
+        "observe_attention_stream",
+        "observe_attention_from_frame_stream",
+        "observe_gesture_stream",
+        "observe_gesture_from_frame_stream",
+    ),
+    "twinr.hardware.camera_ai.adapter_impl.perception:AICameraAdapterPerceptionMixin": (
+        "observe_perception_stream",
+    ),
+    "twinr.hardware.camera_ai.adapter_impl.core:LocalAICameraAdapter": (
+        "observe_perception_stream",
+        "observe_attention_stream",
+        "observe_attention_from_frame_stream",
+        "observe_gesture_stream",
+        "observe_gesture_from_frame_stream",
+    ),
+}
 
 
 def _completed(
@@ -64,13 +82,26 @@ def _import_contract_stdout(
     modules: tuple[str, ...] = _TEST_PI_IMPORT_MODULES,
     *,
     python_path: str = "/twinr/.venv/bin/python",
+    attribute_contracts: dict[str, tuple[str, ...]] = _TEST_PI_ATTRIBUTE_CONTRACTS,
+    validated_attribute_contracts: tuple[str, ...] | None = None,
 ) -> str:
+    checked_attribute_contracts = tuple(
+        f"{target}.{attribute}"
+        for target, attributes in attribute_contracts.items()
+        for attribute in attributes
+    )
+    if validated_attribute_contracts is None:
+        validated_attribute_contracts = checked_attribute_contracts
     return json.dumps(
         {
             "python_path": python_path,
             "checked_modules": list(modules),
             "imported_modules": list(modules),
             "failed_imports": {},
+            "checked_attribute_contracts": list(checked_attribute_contracts),
+            "validated_attribute_contracts": list(validated_attribute_contracts),
+            "failed_attribute_contracts": {},
+            "missing_attributes": {},
             "elapsed_s": 0.123,
         }
     ) + "\n"
@@ -302,16 +333,24 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertTrue(all(state.healthy for state in result.service_states))
         assert result.import_contract is not None
         self.assertEqual(result.import_contract.checked_modules, _TEST_PI_IMPORT_MODULES)
+        self.assertIn(
+            "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin.observe_gesture_stream",
+            result.import_contract.validated_attribute_contracts,
+        )
         self.assertEqual(result.env_contract, {"ok": True, "detail": "ready"})
         self.assertEqual(mirror.last_call["apply_sync"], True)
         self.assertEqual(mirror.last_call["checksum"], True)
         joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("-type d -name __pycache__ -exec sudo chown -R", joined)
+        self.assertIn("compileall -q -f --invalidation-mode checked-hash", joined)
         self.assertIn("sshpass -e scp", joined)
         self.assertIn("pip install --no-deps -e", joined)
         self.assertIn("repair_venv_python_shebangs", joined)
         self.assertIn("systemctl daemon-reload", joined)
         self.assertIn("systemctl restart", joined)
         self.assertIn("--live-text", joined)
+        assert result.bytecode_refresh_summary is not None
+        self.assertIn("checked-hash bytecode", result.bytecode_refresh_summary)
         self.assertTrue(any(env and env.get("SSHPASS") == _TEST_PI_SSH_PASSWORD for env in envs))
         assert result.editable_install_summary is not None
         self.assertIn("normalized 1 stale venv wrapper shebang", result.editable_install_summary)
@@ -433,6 +472,56 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("opentelemetry.trace", joined)
         self.assertIn("importlib.import_module", joined)
 
+    def test_verify_python_import_contract_validates_required_attributes(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                return _completed(command)
+
+            remote = PiRemoteExecutor(
+                settings=load_pi_connection_settings(pi_env_path),
+                subprocess_runner=_runner,
+                timeout_s=30,
+            )
+            result = verify_python_import_contract(
+                remote=remote,
+                remote_python="/twinr/.venv/bin/python",
+                modules=_TEST_PI_IMPORT_MODULES,
+                attribute_contracts=_TEST_PI_ATTRIBUTE_CONTRACTS,
+            )
+
+        self.assertIn(
+            "twinr.hardware.camera_ai.adapter_impl.core:LocalAICameraAdapter.observe_attention_stream",
+            result.checked_attribute_contracts,
+        )
+        self.assertIn(
+            "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin.observe_gesture_stream",
+            result.validated_attribute_contracts,
+        )
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("observe_gesture_stream", joined)
+        self.assertIn("AICameraAdapterObserveMixin", joined)
+
     def test_verify_python_import_contract_raises_on_failed_module(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -475,8 +564,60 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     modules=("rapidfuzz", "wcwidth"),
                 )
 
+    def test_verify_python_import_contract_raises_on_missing_required_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "importlib.import_module" in rendered:
+                    return _completed(
+                        command,
+                        stdout=_import_contract_stdout(
+                            modules=("rapidfuzz",),
+                            attribute_contracts={
+                                "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
+                                    "observe_gesture_stream",
+                                ),
+                            },
+                            validated_attribute_contracts=(),
+                        ),
+                    )
+                return _completed(command)
+
+            remote = PiRemoteExecutor(
+                settings=load_pi_connection_settings(pi_env_path),
+                subprocess_runner=_runner,
+                timeout_s=30,
+            )
+            with self.assertRaisesRegex(RuntimeError, "observe_gesture_stream"):
+                verify_python_import_contract(
+                    remote=remote,
+                    remote_python="/twinr/.venv/bin/python",
+                    modules=("rapidfuzz",),
+                    attribute_contracts={
+                        "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
+                            "observe_gesture_stream",
+                        ),
+                    },
+                )
+
     def test_deploy_installs_optional_browser_automation_runtime_support(self) -> None:
         commands: list[list[str]] = []
+        copied_manifests: set[str] = set()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -510,11 +651,21 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 command = [str(part) for part in args]
                 commands.append(command)
                 rendered = " ".join(command)
+                if " scp " in f" {rendered} ":
+                    if "browser_automation/runtime_requirements.txt" in rendered:
+                        copied_manifests.add("runtime_requirements")
+                    if "browser_automation/playwright_browsers.txt" in rendered:
+                        copied_manifests.add("playwright_browsers")
+                    return _completed(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout="")
-                if "runtime_requirements.txt" in rendered:
+                if 'pip install -r "$requirements_path"' in rendered and "browser_automation" in rendered:
+                    if "runtime_requirements" not in copied_manifests:
+                        return _completed(command, returncode=1, stderr="missing browser automation requirements manifest")
                     return _completed(command, stdout="Successfully installed playwright\n")
                 if "playwright install" in rendered:
+                    if "playwright_browsers" not in copied_manifests:
+                        return _completed(command, returncode=1, stderr="missing Playwright browser manifest")
                     return _completed(command, stdout="Downloaded Chromium\n")
                 if "pip install --no-deps -e" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
@@ -541,6 +692,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("browser_automation/runtime_requirements.txt", joined)
+        self.assertIn("browser_automation/playwright_browsers.txt", joined)
         self.assertIn("pip install -r \"$requirements_path\"", joined)
         self.assertIn("-m playwright install", joined)
 

@@ -23,6 +23,7 @@ from twinr.display.emoji_cues import DisplayEmojiCue, DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.heartbeat import DisplayHeartbeatStore
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
+from twinr.display.render_state import DisplayRenderStateStore
 from twinr.display.service import TwinrStatusDisplayLoop
 from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
@@ -180,6 +181,13 @@ class DisplayServiceTests(unittest.TestCase):
 
         self.assertEqual(store.path, Path("/tmp/twinr/artifacts/stores/ops/display_heartbeat.json"))
 
+    def test_display_render_state_store_uses_ops_artifact_path(self) -> None:
+        config = TwinrConfig(project_root="/tmp/twinr")
+
+        store = DisplayRenderStateStore.from_config(config)
+
+        self.assertEqual(store.path, Path("/tmp/twinr/artifacts/stores/ops/display_render_state.json"))
+
     def make_health(
         self,
         *,
@@ -187,6 +195,7 @@ class DisplayServiceTests(unittest.TestCase):
         cpu_temperature_c: float | None = 53.8,
         runtime_error: str | None = None,
         conversation_running: bool = True,
+        memory_available_mb: int | None = 900,
         memory_used_percent: float | None = 42.0,
         disk_used_percent: float | None = 34.0,
     ) -> TwinrSystemHealth:
@@ -195,6 +204,7 @@ class DisplayServiceTests(unittest.TestCase):
             captured_at="2026-03-13T12:00:00+00:00",
             hostname="twinr-test",
             cpu_temperature_c=cpu_temperature_c,
+            memory_available_mb=memory_available_mb,
             memory_used_percent=memory_used_percent,
             disk_used_percent=disk_used_percent,
             runtime_error=runtime_error,
@@ -353,6 +363,56 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertGreaterEqual(heartbeat.seq, 3)
         self.assertIsNotNone(heartbeat.last_render_started_at)
         self.assertIsNotNone(heartbeat.last_render_completed_at)
+
+    def test_display_loop_persists_render_state_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=FakeDisplay(),
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(status="warn"),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                render_state_store=DisplayRenderStateStore.from_config(config),
+            )
+
+            loop.run(max_cycles=1)
+            render_state = DisplayRenderStateStore.from_config(config).load()
+
+        self.assertIsNotNone(render_state)
+        assert render_state is not None
+        self.assertEqual(render_state.runtime_status, "waiting")
+        self.assertEqual(render_state.health_status, "warn")
+        self.assertEqual(render_state.snapshot_status, "waiting")
+        self.assertFalse(render_state.snapshot_stale)
+        self.assertEqual(
+            tuple((item.label, item.value) for item in render_state.state_fields),
+            (
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "Achtung"),
+                ("Zeit", "12:34"),
+            ),
+        )
 
     def test_display_loop_ticks_visible_surface_between_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -559,6 +619,22 @@ class DisplayServiceTests(unittest.TestCase):
                 ("Zeit", "12:34"),
             ),
         )
+
+    def test_system_state_ignores_high_memory_percent_when_memavailable_has_headroom(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+        )
+
+        system_value = loop._system_state_value(
+            RuntimeSnapshot(status="waiting"),
+            self.make_health(status="ok", memory_available_mb=693, memory_used_percent=81.7),
+        )
+
+        self.assertEqual(system_value, "ok")
 
     def test_debug_log_layout_passes_log_sections_and_suppresses_animation_churn(self) -> None:
         display = FakeDisplay()

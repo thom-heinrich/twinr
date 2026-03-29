@@ -133,6 +133,18 @@ class LocalSemanticRouter:
 
         return self.encoder.encode(texts)
 
+    def warmup(self, probe_text: str = "warmup") -> None:
+        """Prime the local route encoder before the first live turn."""
+
+        warmup = getattr(self.encoder, "warmup", None)
+        if callable(warmup):
+            try:
+                warmup(probe_text)
+            except TypeError:
+                warmup()
+            return
+        self.classify(probe_text)
+
     def classify(
         self,
         text: str,

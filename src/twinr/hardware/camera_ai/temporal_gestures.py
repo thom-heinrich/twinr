@@ -69,6 +69,7 @@ _MIN_STATIC_LATEST_GATE_SCORE: Final[float] = 0.62
 _MIN_WAVE_SCORE: Final[float] = 0.60
 _MIN_WAVE_FRAMES: Final[int] = 3
 _MAX_SUPPORT_GAP_S: Final[float] = 0.25
+_MAX_DYNAMIC_SUPPORT_GAP_S: Final[float] = 1.25
 _RECENT_WAVE_WINDOW_S: Final[float] = 1.25
 _STREAM_RELEASE_HOLD_S: Final[float] = 0.12
 _ONE_EURO_MIN_CUTOFF: Final[float] = 1.15
@@ -389,6 +390,39 @@ def _estimate_shoulder_width(frame: TemporalPoseFrame) -> float | None:
     return _distance(left_shoulder, right_shoulder)
 
 
+def _estimate_reference_width(frame: TemporalPoseFrame) -> float | None:
+    """Return one body-width-like scale even when only partial arm joints exist."""
+
+    shoulder_width = _estimate_shoulder_width(frame)
+    if shoulder_width is not None:
+        return shoulder_width
+
+    candidates: list[float] = []
+    left_hip = _usable_point(frame, "left_hip")
+    right_hip = _usable_point(frame, "right_hip")
+    if left_hip is not None and right_hip is not None:
+        candidates.append(_distance(left_hip, right_hip))
+
+    for shoulder_name, elbow_name, wrist_name in (
+        ("left_shoulder", "left_elbow", "left_wrist"),
+        ("right_shoulder", "right_elbow", "right_wrist"),
+    ):
+        shoulder = _usable_point(frame, shoulder_name)
+        elbow = _usable_point(frame, elbow_name)
+        wrist = _usable_point(frame, wrist_name)
+        if shoulder is not None and wrist is not None:
+            candidates.append(_distance(shoulder, wrist) * 0.65)
+        if shoulder is not None and elbow is not None:
+            candidates.append(_distance(shoulder, elbow) * 1.30)
+        if elbow is not None and wrist is not None:
+            candidates.append(_distance(elbow, wrist) * 1.30)
+
+    finite_candidates = [value for value in candidates if math.isfinite(value) and value > 1e-6]
+    if not finite_candidates:
+        return None
+    return float(median(finite_candidates))
+
+
 def _estimate_torso_height(frame: TemporalPoseFrame) -> float | None:
     """Return one shoulder-to-hip center distance estimate for a frame."""
 
@@ -401,6 +435,25 @@ def _estimate_torso_height(frame: TemporalPoseFrame) -> float | None:
     shoulder_center = _midpoint(left_shoulder, right_shoulder)
     hip_center = _midpoint(left_hip, right_hip)
     return _distance(shoulder_center, hip_center)
+
+
+def _adaptive_support_gap_s(frames: Iterable[object]) -> float:
+    """Return one cadence-aware support gap for fresh trailing evidence checks."""
+
+    observed_times = [
+        float(frame.observed_at)
+        for frame in frames
+        if math.isfinite(getattr(frame, "observed_at", float("nan")))
+    ]
+    gaps = [
+        later - earlier
+        for earlier, later in zip(observed_times, observed_times[1:])
+        if later - earlier > _TIMESTAMP_EPSILON_S
+    ]
+    if not gaps:
+        return _MAX_SUPPORT_GAP_S
+    median_gap = _median_or_fallback(gaps, default=_MAX_SUPPORT_GAP_S)
+    return min(_MAX_DYNAMIC_SUPPORT_GAP_S, max(_MAX_SUPPORT_GAP_S, median_gap * 1.75))
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,7 +498,7 @@ def _make_local_frames(ordered_frames: tuple[TemporalPoseFrame, ...]) -> tuple[_
     """Convert frames to a body-relative coordinate system using robust sequence scales."""
 
     shoulder_width = _median_or_fallback(
-        (_estimate_shoulder_width(frame) or float("nan") for frame in ordered_frames),
+        (_estimate_reference_width(frame) or float("nan") for frame in ordered_frames),
         default=1.0,
     )
     torso_height = _median_or_fallback(
@@ -463,6 +516,12 @@ def _make_local_frames(ordered_frames: tuple[TemporalPoseFrame, ...]) -> tuple[_
         if left_shoulder is not None and right_shoulder is not None:
             origin = _midpoint(left_shoulder, right_shoulder)
             lateral_axis = _normalize_vector(_subtract(right_shoulder, left_shoulder))
+        elif left_shoulder is not None:
+            origin = left_shoulder
+            lateral_axis = None
+        elif right_shoulder is not None:
+            origin = right_shoulder
+            lateral_axis = None
         else:
             origin = (0.0, 0.0, 0.0)
             lateral_axis = None
@@ -852,6 +911,7 @@ def _trailing_static_candidate(
 
     if len(local_frames) < min_frames or len(raw_local_frames) < min_frames:
         return None
+    support_gap_s = _adaptive_support_gap_s(local_frames)
     per_frame_scores = [(frame.observed_at, float(score_fn(frame))) for frame in local_frames]
     latest_time, latest_score = per_frame_scores[-1]
     raw_latest_score = float(score_fn(raw_local_frames[-1]))
@@ -862,7 +922,7 @@ def _trailing_static_candidate(
     support_start = latest_time
     previous_time = latest_time
     for observed_at, score in reversed(per_frame_scores):
-        if previous_time - observed_at > _MAX_SUPPORT_GAP_S and support_scores:
+        if previous_time - observed_at > support_gap_s and support_scores:
             break
         if score < _MIN_STATIC_FRAME_SCORE:
             if support_scores:
@@ -900,6 +960,7 @@ def _wave_candidate(
 
     if len(local_frames) < max(min_frames, _MIN_WAVE_FRAMES):
         return None
+    support_gap_s = _adaptive_support_gap_s(local_frames)
     newest_time = local_frames[-1].observed_at
     recent_frames = tuple(
         frame for frame in local_frames if newest_time - frame.observed_at <= _RECENT_WAVE_WINDOW_S
@@ -921,7 +982,7 @@ def _wave_candidate(
 
         if len(series) < max(min_frames, _MIN_WAVE_FRAMES):
             continue
-        if abs(series[-1][0] - newest_time) > _MAX_SUPPORT_GAP_S:
+        if abs(series[-1][0] - newest_time) > support_gap_s:
             continue
 
         xs = [value[1] for value in series]

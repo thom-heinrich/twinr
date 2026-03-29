@@ -246,6 +246,11 @@ def apply_display_updates(config: "TwinrConfig", updates: Mapping[str, object]) 
     )
     object.__setattr__(
         config,
+        "display_gesture_refresh_interval_s",
+        updates["normalized_display_gesture_refresh_interval_s"],
+    )
+    object.__setattr__(
+        config,
         "display_attention_refresh_interval_s",
         updates["normalized_display_attention_refresh_interval_s"],
     )

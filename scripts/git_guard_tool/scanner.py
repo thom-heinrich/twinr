@@ -10,6 +10,7 @@ from git_guard_tool.types import AddedLine, PathChange, ScanIssue, ScanResult
 
 _PHONE_SEPARATORS = set(" +()-./")
 _PLACEHOLDER_CHARS = set("*xX#.")
+_HTTP_HEADER_TOKEN_CHARS = set("!#$%&'*+-.^_`|~")
 _TEST_PATH_MARKERS = ("/test/", "/tests/", ".test.", "_test.")
 
 
@@ -221,6 +222,15 @@ def _strip_wrapping_quotes(text: str) -> str:
     return stripped
 
 
+def _unwrap_literal_value(text: str) -> str | None:
+    parsed_string_literal = _parse_plain_string_literal(text)
+    if parsed_string_literal is not None:
+        return parsed_string_literal
+    if _looks_like_bare_literal_value(text):
+        return _strip_wrapping_quotes(text)
+    return None
+
+
 def _parse_plain_string_literal(text: str) -> str | None:
     stripped = text.strip().strip(",")
     if not stripped:
@@ -261,15 +271,28 @@ def _looks_like_bare_literal_value(text: str) -> bool:
     return True
 
 
+def _is_custom_header_name_metadata_assignment(key_text: str, value_text: str) -> bool:
+    normalized_key = _normalize_key(key_text)
+    key_tokens = tuple(token for token in normalized_key.split("_") if token)
+    if "header" not in key_tokens or "name" not in key_tokens:
+        return False
+
+    literal_value = _unwrap_literal_value(value_text)
+    if literal_value is None:
+        return False
+    normalized_value = literal_value.strip()
+    if not normalized_value or not normalized_value.casefold().startswith("x-"):
+        return False
+    if any(character.isspace() for character in normalized_value):
+        return False
+    return all(character.isalnum() or character in _HTTP_HEADER_TOKEN_CHARS for character in normalized_value)
+
+
 def _looks_like_sensitive_literal_value(value_text: str, *, min_length: int) -> bool:
-    parsed_string_literal = _parse_plain_string_literal(value_text)
-    if parsed_string_literal is not None:
-        unwrapped = parsed_string_literal
-        if _looks_like_path_literal(unwrapped) or _looks_like_regex_literal(unwrapped):
-            return False
-    elif _looks_like_bare_literal_value(value_text):
-        unwrapped = _strip_wrapping_quotes(value_text)
-    else:
+    unwrapped = _unwrap_literal_value(value_text)
+    if unwrapped is None:
+        return False
+    if _looks_like_path_literal(unwrapped) or _looks_like_regex_literal(unwrapped):
         return False
     normalized = _normalize_value(unwrapped)
     if normalized in {"true", "false", "none", "null"}:
@@ -387,6 +410,8 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
         normalized_value = _normalize_value(value_text)
         if _key_matches_sensitive_fragment(key_text, policy.content.sensitive_key_fragments):
             if normalized_value not in policy.content.placeholder_values and not _looks_like_placeholder(normalized_value):
+                if _is_custom_header_name_metadata_assignment(key_text, value_text):
+                    return
                 if _looks_like_sensitive_literal_value(value_text, min_length=policy.content.secret_min_length):
                     issues.append(
                         ScanIssue(

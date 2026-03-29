@@ -142,8 +142,7 @@ def _derive_proactive_vision_provider(
     explicit_value = _parse_optional_text(raw_value)
     if explicit_value is not None:
         return explicit_value.strip().lower()
-    if camera_host_mode == "second_pi" and proactive_remote_camera_base_url is not None:
-        return "remote_frame"
+    del camera_host_mode, proactive_remote_camera_base_url
     if _uses_aideck_camera_device(camera_device):
         return "aideck_openai"
     return "local_first"

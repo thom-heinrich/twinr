@@ -675,10 +675,10 @@ class IMX500RuntimeSessionManager:
                 picam2.start()
 
                 if preserve_aspect_ratio:
-                    set_auto_aspect_ratio = getattr(imx500, "set_auto_aspect_ratio", None)
-                    if callable(set_auto_aspect_ratio):
+                    set_auto_aspect_ratio_fn: Any = getattr(imx500, "set_auto_aspect_ratio", None)
+                    if callable(set_auto_aspect_ratio_fn):
                         try:
-                            set_auto_aspect_ratio()
+                            set_auto_aspect_ratio_fn()  # pylint: disable=not-callable
                         except Exception:
                             logger.warning(
                                 "Failed to apply IMX500 automatic aspect-ratio preservation.",

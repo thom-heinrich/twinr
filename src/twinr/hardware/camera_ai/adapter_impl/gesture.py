@@ -45,7 +45,7 @@ from .types import GesturePersonTargets, PoseResult
 logger = LOGGER
 
 _DEBUG_MAX_DEPTH = 4
-_DEBUG_MAX_ITEMS = 48
+_DEBUG_MAX_ITEMS = 80
 _DEBUG_MAX_STRING = 240
 _DEBUG_MAX_ERROR_STRING = 160
 _GESTURE_TARGET_CACHE_TTL_S = 0.45
@@ -60,6 +60,14 @@ class AICameraAdapterGestureMixin:
     """Encapsulate the user-facing live gesture acknowledgement lane."""
 
     _LEGACY_PUBLIC_GESTURE_DEBUG_KEYS = (
+        "stream_mode",
+        "gesture_stream_source",
+        "gesture_stream_temporal_enabled",
+        "gesture_stream_temporal_reason",
+        "gesture_stream_output_gesture",
+        "gesture_stream_output_confidence",
+        "gesture_stream_output_changed",
+        "gesture_stream_resolved_source",
         "resolved_source",
         "forensics_active",
         "forensics_run_id",
@@ -69,7 +77,19 @@ class AICameraAdapterGestureMixin:
         "live_fine_hand_gesture_confidence",
         "live_gesture_event",
         "live_gesture_confidence",
+        "authoritative_gesture_active",
+        "authoritative_gesture_key",
+        "authoritative_gesture_token",
+        "authoritative_gesture_rising",
+        "authoritative_gesture_started_at",
+        "authoritative_gesture_changed_at",
+        "authoritative_gesture_source",
         "live_hand_count",
+        "live_hand_count_exact",
+        "effective_live_hand_box_count",
+        "live_hand_box_source",
+        "gesture_fast_path",
+        "gesture_observe_policy",
         "pose_hint_source",
         "pose_hint_confidence",
         "pose_fallback_used",
@@ -89,6 +109,11 @@ class AICameraAdapterGestureMixin:
         "gesture_target_face_anchor_count",
         "gesture_target_person_count",
         "gesture_target_primary_person_box_available",
+        "person_roi_detection_count",
+        "person_roi_block_reason",
+        "person_roi_combined_gesture",
+        "person_roi_combined_confidence",
+        "full_frame_hand_attempt_reason",
         "candidate_capture_saved",
         "candidate_capture_reasons",
         "candidate_capture_image_path",
@@ -114,6 +139,28 @@ class AICameraAdapterGestureMixin:
             filtered["forensics_trace_id"] = None
         return filtered
 
+    def _annotate_gesture_stream_debug_locked(self, *, source: str) -> None:
+        """Overlay explicit stream-lane facts onto the current gesture debug snapshot."""
+
+        current = dict(self._last_gesture_debug_details or {})
+        current.update(
+            {
+                "stream_mode": "gesture_stream",
+                "gesture_stream_source": source,
+                "gesture_stream_temporal_enabled": bool(current.get("temporal_enabled")),
+                "gesture_stream_temporal_reason": current.get("temporal_reason"),
+                "gesture_stream_output_gesture": current.get("temporal_output_gesture"),
+                "gesture_stream_output_confidence": current.get("temporal_output_confidence"),
+                "gesture_stream_output_changed": bool(current.get("temporal_output_changed")),
+                "gesture_stream_resolved_source": (
+                    current.get("temporal_resolved_source")
+                    or current.get("final_resolved_source")
+                    or current.get("resolved_source")
+                ),
+            }
+        )
+        self._last_gesture_debug_details = current
+
     def _build_gesture_observation_locked(
         self,
         *,
@@ -125,6 +172,8 @@ class AICameraAdapterGestureMixin:
         frame_at: float | None,
         allow_pose_fallback: bool = True,
         gesture_fast_path: bool = False,
+        stream_mode: bool = False,
+        stream_source: str = "local_camera",
     ) -> AICameraObservation:
         """Run the dedicated gesture lane from one supplied detection/frame pair."""
 
@@ -142,11 +191,23 @@ class AICameraAdapterGestureMixin:
             pose_hint_source: str
             pose_hint_confidence: float | None
             if gesture_fast_path:
+                visible_person_boxes = self._ordered_unique_gesture_boxes(
+                    primary_person_box=detection.primary_person_box,
+                    candidate_boxes=tuple(
+                        person.box
+                        for person in detection.visible_persons
+                        if person.box is not None
+                    ),
+                )
                 gesture_targets = GesturePersonTargets(
-                    primary_person_box=None,
-                    visible_person_boxes=(),
-                    person_count=0,
-                    source="gesture_fast_path_current_frame_only",
+                    primary_person_box=detection.primary_person_box,
+                    visible_person_boxes=visible_person_boxes,
+                    person_count=len(visible_person_boxes),
+                    source=(
+                        "gesture_fast_path_current_frame_person_only"
+                        if visible_person_boxes
+                        else "gesture_fast_path_current_frame_only"
+                    ),
                     face_anchor_state="disabled_fast_path",
                     face_anchor_count=0,
                 )
@@ -175,7 +236,7 @@ class AICameraAdapterGestureMixin:
                 selected={
                     "id": gesture_targets.source,
                     "summary": (
-                        "Stay current-frame-only and skip person-target ROI recovery."
+                        "Stay current-frame-only, but keep the current frame's person boxes available for bounded ROI recovery."
                         if gesture_fast_path
                         else "Use the resolved gesture target set for ROI-conditioned gesture recovery."
                     ),
@@ -192,7 +253,7 @@ class AICameraAdapterGestureMixin:
                     },
                     {
                         "id": "gesture_fast_path_current_frame_only",
-                        "summary": "Skip person-target ROI recovery and trust only current-frame live hand evidence.",
+                        "summary": "Use only current-frame evidence and do not reuse recent person targets.",
                     },
                     {"id": "none", "summary": "Proceed without a usable person target."},
                 ],
@@ -384,6 +445,8 @@ class AICameraAdapterGestureMixin:
                     debug_details=self._last_gesture_debug_details,
                 )
             self._update_last_gesture_debug_details(capture_result.debug_fields())
+            if stream_mode:
+                self._annotate_gesture_stream_debug_locked(source=stream_source)
         except Exception as exc:  # pragma: no cover - hardware/runtime coupling is environment-dependent.
             code = self._classify_error(exc)
             safe_error_message = self._sanitize_error_text(str(exc), limit=_DEBUG_MAX_ERROR_STRING)
@@ -407,6 +470,8 @@ class AICameraAdapterGestureMixin:
                     "resolved_source": "pipeline_error",
                     "pipeline_error": code,
                     "pipeline_error_message": safe_error_message,
+                    "stream_mode": "gesture_stream" if stream_mode else None,
+                    "gesture_stream_source": stream_source if stream_mode else None,
                 }
             )
             self._safe_close_live_gesture_pipeline_locked()
@@ -457,6 +522,23 @@ class AICameraAdapterGestureMixin:
             gesture_confidence=gesture_confidence,
             fine_hand_gesture=fine_hand_gesture,
             fine_hand_gesture_confidence=fine_hand_gesture_confidence,
+            gesture_temporal_authoritative=bool(
+                getattr(gesture_observation, "gesture_temporal_authoritative", False)
+            ),
+            gesture_activation_key=getattr(gesture_observation, "gesture_activation_key", None),
+            gesture_activation_token=getattr(gesture_observation, "gesture_activation_token", None),
+            gesture_activation_started_at=getattr(
+                gesture_observation,
+                "gesture_activation_started_at",
+                None,
+            ),
+            gesture_activation_changed_at=getattr(
+                gesture_observation,
+                "gesture_activation_changed_at",
+                None,
+            ),
+            gesture_activation_source=getattr(gesture_observation, "gesture_activation_source", None),
+            gesture_activation_rising=bool(getattr(gesture_observation, "gesture_activation_rising", False)),
             model=model_name,
         )
         workflow_event(

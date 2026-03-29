@@ -10,7 +10,7 @@ from __future__ import annotations
 import math  # AUDIT-FIX(#2,#4): Finite/monotonic timestamp checks and numeric threshold sanitisation require explicit numeric validation.
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
-from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
+from typing import TYPE_CHECKING, SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -20,6 +20,9 @@ from .normalization import (
     coerce_spatial_box_coordinates,
 )
 from .scoring import TriggerScoreEvidence, bool_score, hold_progress, recent_progress, weighted_trigger_score
+
+if TYPE_CHECKING:
+    from .perception_stream import PerceptionStreamObservation
 
 
 _FloatLike: TypeAlias = str | bytes | bytearray | SupportsFloat | SupportsIndex
@@ -508,6 +511,7 @@ class SocialVisionObservation:
     camera_error: str | None = None
     last_camera_frame_at: float | None = None
     last_camera_health_change_at: float | None = None
+    perception_stream: PerceptionStreamObservation | None = None
 
 
 @dataclass(frozen=True, slots=True)

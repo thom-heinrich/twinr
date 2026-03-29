@@ -2,7 +2,9 @@
 
 This module keeps HDMI attention-follow, servo tracing, and live-context
 projection out of the main monitor orchestrator so `service.py` can stay
-focused on lifecycle and tick sequencing.
+focused on lifecycle and tick sequencing. Attention-target derivation itself
+is delegated to the shared runtime perception orchestrator so servo and HDMI
+consume the same truth.
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from ..social.engine import SocialAudioObservation, SocialObservation, SocialVis
 from .attention_targeting import MultimodalAttentionTargetSnapshot
 from .audio_policy import ReSpeakerAudioPolicySnapshot
 from .display_attention import DisplayAttentionCuePublishResult, display_attention_refresh_supported
-from .speaker_association import derive_respeaker_speaker_association
 
 
 def _round_optional_ratio(value: float | None) -> float | None:
@@ -155,38 +156,25 @@ def update_display_attention_follow(
 
     presence_snapshot = coordinator.latest_presence_snapshot
     presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
-    live_facts = {
-        "camera": camera_snapshot.to_automation_facts(),
-        "vad": {
-            "speech_detected": getattr(audio_observation, "speech_detected", None),
-        },
-        "respeaker": {
-            "azimuth_deg": getattr(audio_observation, "azimuth_deg", None),
-            "direction_confidence": getattr(audio_observation, "direction_confidence", None),
-        },
-        "audio_policy": {
-            "speaker_direction_stable": (
-                None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
-            ),
-        },
-    }
-    speaker_association = derive_respeaker_speaker_association(
+    perception_runtime = coordinator.perception_orchestrator.observe_attention(
         observed_at=observed_at,
-        live_facts=live_facts,
-    )
-    coordinator.latest_speaker_association_snapshot = speaker_association
-    attention_target = coordinator.attention_target_tracker.observe(
-        observed_at=observed_at,
-        live_facts=live_facts,
+        source=source,
+        captured_at=camera_snapshot.last_camera_frame_at,
+        camera_snapshot=camera_snapshot,
+        audio_observation=audio_observation,
+        audio_policy_snapshot=audio_policy_snapshot,
         runtime_status=getattr(getattr(coordinator.runtime, "status", None), "value", None),
         presence_session_id=presence_session_id,
-        speaker_association=speaker_association,
         identity_fusion=coordinator.latest_identity_fusion_snapshot,
     )
-    attention_target_debug = coordinator.attention_target_tracker.debug_snapshot(observed_at=observed_at)
+    assert perception_runtime.attention is not None
+    attention_runtime = perception_runtime.attention
+    live_facts = dict(attention_runtime.live_facts)
+    coordinator.latest_perception_runtime_snapshot = perception_runtime
+    coordinator.latest_speaker_association_snapshot = attention_runtime.speaker_association
+    attention_target = attention_runtime.attention_target
+    attention_target_debug = attention_runtime.attention_target_debug
     coordinator.latest_attention_target_snapshot = attention_target
-    live_facts["speaker_association"] = speaker_association.to_automation_facts()
-    live_facts["attention_target"] = attention_target.to_automation_facts()
     record_attention_follow_pipeline_if_changed(
         coordinator,
         source=source,

@@ -2348,6 +2348,31 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(captured_kwargs["seed_transcript"], "wie geht es dir")
         self.assertFalse(captured_kwargs["play_initial_beep"])
 
+    def test_run_single_text_turn_reuses_existing_listening_state(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(conversation_follow_up_enabled=True)
+        )
+        loop.runtime.begin_listening(request_source="follow_up")
+        active_turn_id = loop.runtime._runtime_flow_state()["active_turn_id"]
+        completed_turns: list[dict[str, object]] = []
+
+        def fake_complete_realtime_turn(**kwargs):
+            completed_turns.append(dict(kwargs))
+            return True
+
+        loop._complete_realtime_turn = fake_complete_realtime_turn  # type: ignore[method-assign]
+
+        handled = loop._run_single_text_turn(
+            transcript="wie geht es dir",
+            listen_source="follow_up",
+            proactive_trigger=None,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(loop.runtime._runtime_flow_state()["active_turn_id"], active_turn_id)
+        self.assertEqual(completed_turns[0]["transcript_seed"], "wie geht es dir")
+
     def test_remote_follow_up_closed_resets_local_runtime_to_waiting(self) -> None:
         config = TwinrConfig(conversation_follow_up_enabled=True)
         loop, _lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(

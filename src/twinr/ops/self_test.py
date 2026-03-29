@@ -30,6 +30,9 @@ from twinr.hardware.printer import RawReceiptPrinter
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
+from twinr.proactive.runtime.service_impl.compat import (
+    _proactive_pcm_capture_conflicts_with_voice_orchestrator,
+)
 
 
 def _utc_stamp() -> str:
@@ -315,6 +318,13 @@ class TwinrSelfTestRunner:
     def _run_proactive_mic_test(self) -> SelfTestResult:
         if not self.config.proactive_audio_enabled and not (self.config.proactive_audio_input_device or "").strip():
             raise RuntimeError("No proactive background-audio device is configured.")
+        if _proactive_pcm_capture_conflicts_with_voice_orchestrator(
+            self.config,
+            require_active_owner=True,
+        ):
+            raise SelfTestBlockedError(
+                "Proactive microphone self-test is unavailable while the voice orchestrator owns the same capture device. Stop the active streaming runtime first."
+            )
 
         sampler = self.ambient_sampler_factory(self.config)
         try:

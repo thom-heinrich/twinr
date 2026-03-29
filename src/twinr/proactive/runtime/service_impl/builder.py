@@ -26,10 +26,6 @@ from twinr.providers.openai import OpenAIBackend
 from ...social.aideck_camera_provider import AIDeckOpenAIVisionObservationProvider
 from ...social.engine import SocialTriggerDecision, SocialTriggerEngine
 from ...social.local_camera_provider import LocalAICameraObservationProvider
-from ...social.remote_camera_provider import (
-    RemoteAICameraObservationProvider,
-    RemoteFrameAICameraObservationProvider,
-)
 from ...social.observers import (
     AmbientAudioObservationProvider,
     NullAudioObservationProvider,
@@ -77,8 +73,6 @@ class BuildDefaultProactiveMonitorDependencies:
     openai_vision_provider_cls: Any = OpenAIVisionObservationProvider
     aideck_vision_provider_cls: Any = AIDeckOpenAIVisionObservationProvider
     local_vision_provider_cls: Any = LocalAICameraObservationProvider
-    remote_proxy_vision_provider_cls: Any = RemoteAICameraObservationProvider
-    remote_frame_vision_provider_cls: Any = RemoteFrameAICameraObservationProvider
     vision_reviewer_cls: Any = OpenAIProactiveVisionReviewer
     vision_frame_buffer_cls: Any = ProactiveVisionFrameBuffer
     portrait_match_provider_cls: Any = PortraitMatchProvider
@@ -322,10 +316,11 @@ def build_default_proactive_monitor(
                     camera=camera,
                     camera_lock=camera_lock,
                 )
-            elif provider_name == "remote_proxy":
-                vision_observer = deps.remote_proxy_vision_provider_cls.from_config(config)
-            elif provider_name == "remote_frame":
-                vision_observer = deps.remote_frame_vision_provider_cls.from_config(config)
+            elif provider_name in {"remote_proxy", "remote_frame"}:
+                raise ValueError(
+                    "Legacy helper-Pi proactive vision providers are no longer supported. "
+                    "Twinr now requires local proactive vision on the main Pi."
+                )
             else:
                 vision_observer = deps.local_vision_provider_cls.from_config(config)
         except Exception as exc:

@@ -12,11 +12,13 @@ from twinr.proactive.runtime.service_impl.coordinator_core import (
 )
 from twinr.proactive.runtime.service_impl.coordinator_display import ProactiveCoordinatorDisplayMixin
 from twinr.proactive.runtime.service_impl.coordinator_observation import ProactiveCoordinatorObservationMixin
+from twinr.proactive.runtime.service_impl.coordinator_perception import ProactiveCoordinatorPerceptionMixin
 
 
 class ProactiveCoordinator(
     ProactiveCoordinatorDisplayMixin,
     ProactiveCoordinatorObservationMixin,
+    ProactiveCoordinatorPerceptionMixin,
     ProactiveCoordinatorCoreMixin,
 ):
     """Coordinate one proactive monitor tick across sensors and policies.

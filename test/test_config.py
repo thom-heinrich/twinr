@@ -73,6 +73,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LOCAL_SEMANTIC_ROUTER_MODEL_DIR=artifacts/router/bundle",
                         "TWINR_LOCAL_SEMANTIC_ROUTER_USER_INTENT_MODEL_DIR=artifacts/router/user_intent_bundle",
                         "TWINR_LOCAL_SEMANTIC_ROUTER_TRACE=false",
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_WARMUP_ENABLED=true",
+                        "TWINR_LOCAL_SEMANTIC_ROUTER_WARMUP_PROBE=wie ist die lage",
                     ]
                 )
                 + "\n",
@@ -88,6 +90,8 @@ class TwinrConfigTests(unittest.TestCase):
             "artifacts/router/user_intent_bundle",
         )
         self.assertFalse(config.local_semantic_router_trace)
+        self.assertTrue(config.local_semantic_router_warmup_enabled)
+        self.assertEqual(config.local_semantic_router_warmup_probe, "wie ist die lage")
 
     def test_from_env_reads_browser_automation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -165,6 +169,29 @@ class TwinrConfigTests(unittest.TestCase):
                 "Legacy helper-Pi camera topology is no longer supported",
             ):
                 TwinrConfig.from_env(env_path)
+
+    def test_from_env_rejects_legacy_remote_camera_provider_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_PROACTIVE_VISION_PROVIDER=remote_frame\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Legacy helper-Pi proactive vision providers are no longer supported",
+            ):
+                TwinrConfig.from_env(env_path)
+
+    def test_direct_config_rejects_legacy_remote_camera_provider_override(self) -> None:
+        for provider_name in ("remote_proxy", "remote_frame"):
+            with self.subTest(provider_name=provider_name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Legacy helper-Pi proactive vision providers are no longer supported",
+                ):
+                    TwinrConfig(proactive_vision_provider=provider_name)
 
     def test_from_env_aideck_camera_defaults_to_aideck_openai_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

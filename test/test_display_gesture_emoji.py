@@ -11,6 +11,7 @@ from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.proactive.runtime.display_gesture_emoji import (
     DisplayGestureEmojiPublisher,
     derive_display_gesture_emoji,
+    resolve_display_gesture_refresh_interval,
 )
 from twinr.proactive.social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurfaceUpdate
 from twinr.proactive.social.engine import (
@@ -105,6 +106,17 @@ def _snapshot(
 
 
 class DisplayGestureEmojiTests(unittest.TestCase):
+    def test_refresh_interval_uses_dedicated_gesture_setting_instead_of_attention_cadence(self) -> None:
+        config = TwinrConfig(
+            project_root=".",
+            display_attention_refresh_interval_s=0.6,
+            display_gesture_refresh_interval_s=0.2,
+        )
+
+        interval_s = resolve_display_gesture_refresh_interval(config)
+
+        self.assertEqual(interval_s, 0.2)
+
     def test_derive_prefers_fine_hand_gesture_symbols(self) -> None:
         decision = derive_display_gesture_emoji(
             snapshot=_snapshot(fine_hand_gesture=SocialFineHandGesture.THUMBS_UP),

@@ -313,16 +313,15 @@ def _round_seconds(value: float | None) -> float | None:
 
 
 def _has_pose_semantics(observation: SocialVisionObservation) -> bool:
-    """Return whether one source carries richer pose/attention semantics."""
+    """Return whether one source carries richer pose/motion semantics."""
 
     return any(
         (
-            observation.looking_toward_device,
-            observation.person_near_device is not None,
-            observation.engaged_with_device is not None,
-            observation.visual_attention_score is not None,
             observation.body_pose != SocialBodyPose.UNKNOWN,
             observation.motion_state != SocialMotionState.UNKNOWN,
+            observation.person_recently_visible is not None,
+            observation.person_appeared_at is not None,
+            observation.person_disappeared_at is not None,
         )
     )
 
@@ -381,24 +380,9 @@ def _apply_pose_semantics(
     current: SocialVisionObservation,
     candidate: SocialVisionObservation,
 ) -> SocialVisionObservation:
-    """Overlay recent pose/attention semantics onto one fast observation."""
+    """Overlay recent non-authoritative pose semantics onto one fast observation."""
 
     updates: dict[str, object] = {}
-    if candidate.looking_toward_device:
-        updates["looking_toward_device"] = True
-        if candidate.looking_signal_state:
-            updates["looking_signal_state"] = candidate.looking_signal_state
-        if candidate.looking_signal_source:
-            updates["looking_signal_source"] = candidate.looking_signal_source
-    if candidate.person_near_device is not None and (candidate.person_near_device or current.person_near_device is None):
-        updates["person_near_device"] = candidate.person_near_device
-    if candidate.engaged_with_device is not None and (candidate.engaged_with_device or current.engaged_with_device is None):
-        updates["engaged_with_device"] = candidate.engaged_with_device
-    if candidate.visual_attention_score is not None and (
-        current.visual_attention_score is None
-        or float(candidate.visual_attention_score) > float(current.visual_attention_score)
-    ):
-        updates["visual_attention_score"] = candidate.visual_attention_score
     if candidate.body_pose != SocialBodyPose.UNKNOWN and current.body_pose == SocialBodyPose.UNKNOWN:
         updates["body_pose"] = candidate.body_pose
         updates["pose_confidence"] = candidate.pose_confidence

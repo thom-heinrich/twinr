@@ -1,15 +1,20 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.camera_ai.models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 from twinr.hardware.hand_landmarks import HandLandmarkDetection, HandLandmarkResult, HandLandmarkPoint, HandRoiSource
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
-from twinr.hardware.camera_ai.mediapipe_runtime import MediaPipeTaskRuntime
+from twinr.hardware.camera_ai.mediapipe_runtime import (
+    MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+    MediaPipeTaskRuntime,
+)
 from twinr.hardware.camera_ai.fine_hand_gestures import (
     combine_builtin_and_custom_gesture_choice as _combine_builtin_and_custom_gesture_choice,
     combine_task_specific_custom_gesture_choice as _combine_task_specific_custom_gesture_choice,
@@ -68,6 +73,194 @@ class _FakeImageArray:
 
 
 class MediaPipeVisionTests(unittest.TestCase):
+    def test_runtime_reuses_live_recognizer_when_callbacks_share_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "gesture.task"
+            model_path.write_bytes(b"gesture")
+            runtime = MediaPipeTaskRuntime(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path="hand.task",
+                    gesture_model_path=str(model_path),
+                )
+            )
+            created_callbacks: list[object] = []
+
+            def _create_from_options(options):
+                created_callbacks.append(options.result_callback)
+                return SimpleNamespace(close=lambda: None)
+
+            vision_runtime = {
+                "vision": SimpleNamespace(
+                    RunningMode=SimpleNamespace(LIVE_STREAM="live"),
+                    GestureRecognizerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                    GestureRecognizer=SimpleNamespace(create_from_options=_create_from_options),
+                ),
+                "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                "ClassifierOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+            }
+
+            first_calls: list[int] = []
+            second_calls: list[int] = []
+
+            def _first_callback(result, output_image, timestamp_ms):
+                del result, output_image
+                first_calls.append(timestamp_ms)
+
+            def _second_callback(result, output_image, timestamp_ms):
+                del result, output_image
+                second_calls.append(timestamp_ms)
+
+            setattr(
+                _first_callback,
+                MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+                ("test_runtime_reuses_live_recognizer", "builtin"),
+            )
+            setattr(
+                _second_callback,
+                MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+                ("test_runtime_reuses_live_recognizer", "builtin"),
+            )
+
+            recognizer_one = runtime.ensure_live_gesture_recognizer(
+                vision_runtime,
+                result_callback=_first_callback,
+                num_hands_override=1,
+            )
+            recognizer_two = runtime.ensure_live_gesture_recognizer(
+                vision_runtime,
+                result_callback=_second_callback,
+                num_hands_override=1,
+            )
+
+            self.assertIs(recognizer_one, recognizer_two)
+            self.assertEqual(len(created_callbacks), 1)
+            runtime.close()
+
+    def test_runtime_direct_live_callback_proxy_swaps_target_without_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "gesture.task"
+            model_path.write_bytes(b"gesture")
+            runtime = MediaPipeTaskRuntime(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path="hand.task",
+                    gesture_model_path=str(model_path),
+                )
+            )
+            created_callbacks: list[object] = []
+
+            def _create_from_options(options):
+                created_callbacks.append(options.result_callback)
+                return SimpleNamespace(close=lambda: None)
+
+            vision_runtime = {
+                "vision": SimpleNamespace(
+                    RunningMode=SimpleNamespace(LIVE_STREAM="live"),
+                    GestureRecognizerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                    GestureRecognizer=SimpleNamespace(create_from_options=_create_from_options),
+                ),
+                "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                "ClassifierOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+            }
+
+            calls: list[tuple[str, int]] = []
+
+            def _first_callback(result, output_image, timestamp_ms):
+                del result, output_image
+                calls.append(("first", timestamp_ms))
+
+            def _second_callback(result, output_image, timestamp_ms):
+                del result, output_image
+                calls.append(("second", timestamp_ms))
+
+            setattr(
+                _first_callback,
+                MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+                ("test_runtime_direct_live_callback_proxy", "builtin"),
+            )
+            setattr(
+                _second_callback,
+                MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
+                ("test_runtime_direct_live_callback_proxy", "builtin"),
+            )
+
+            with mock.patch.dict(os.environ, {"TWINR_MEDIAPIPE_LIVE_CALLBACK_ASYNC": "0"}, clear=False):
+                recognizer_one = runtime.ensure_live_gesture_recognizer(
+                    vision_runtime,
+                    result_callback=_first_callback,
+                    num_hands_override=1,
+                )
+                created_callbacks[0]("result", "image", 101)
+                recognizer_two = runtime.ensure_live_gesture_recognizer(
+                    vision_runtime,
+                    result_callback=_second_callback,
+                    num_hands_override=1,
+                )
+                created_callbacks[0]("result", "image", 202)
+
+            self.assertIs(recognizer_one, recognizer_two)
+            self.assertEqual(len(created_callbacks), 1)
+            self.assertEqual(calls, [("first", 101), ("second", 202)])
+            runtime.close()
+
+    def test_runtime_reset_live_gesture_recognizers_closes_only_live_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gesture_model_path = Path(temp_dir) / "gesture.task"
+            custom_model_path = Path(temp_dir) / "custom.task"
+            gesture_model_path.write_bytes(b"gesture")
+            custom_model_path.write_bytes(b"custom")
+            runtime = MediaPipeTaskRuntime(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path="hand.task",
+                    gesture_model_path=str(gesture_model_path),
+                    custom_gesture_model_path=str(custom_model_path),
+                )
+            )
+            closed: list[str] = []
+
+            def _create_builtin(options):
+                del options
+                return SimpleNamespace(close=lambda: closed.append("builtin"))
+
+            def _create_custom(options):
+                del options
+                return SimpleNamespace(close=lambda: closed.append("custom"))
+
+            vision_runtime = {
+                "vision": SimpleNamespace(
+                    RunningMode=SimpleNamespace(LIVE_STREAM="live"),
+                    GestureRecognizerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                    GestureRecognizer=SimpleNamespace(
+                        create_from_options=lambda options: (
+                            _create_custom(options)
+                            if getattr(options.base_options, "model_asset_buffer", None) == b"custom"
+                            else _create_builtin(options)
+                        )
+                    ),
+                ),
+                "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+                "ClassifierOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+            }
+
+            runtime.ensure_live_gesture_recognizer(
+                vision_runtime,
+                result_callback=lambda *_args: None,
+                num_hands_override=1,
+            )
+            runtime.ensure_live_custom_gesture_recognizer(
+                vision_runtime,
+                result_callback=lambda *_args: None,
+            )
+
+            runtime.reset_live_gesture_recognizers()
+
+            self.assertCountEqual(closed, ["builtin", "custom"])
+            self.assertIsNone(runtime._live_gesture_recognizer)
+            self.assertIsNone(runtime._live_custom_gesture_recognizer)
+            runtime.close()
+
     def test_runtime_build_image_normalizes_non_contiguous_uint8_view(self) -> None:
         runtime = MediaPipeTaskRuntime(
             config=MediaPipeVisionConfig(

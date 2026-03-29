@@ -1,4 +1,4 @@
-"""Official XVF3800 write specs used by Twinr LED control."""
+"""Official XVF3800 write specs used by Twinr host-control writes."""
 
 from __future__ import annotations
 
@@ -27,8 +27,19 @@ LED_COLOR_PARAMETER: Final[ReSpeakerParameterSpec] = ReSpeakerParameterSpec(
     description="Set the LED color for breath or single-color mode as 0xRRGGBB.",
 )
 
+REBOOT_PARAMETER: Final[ReSpeakerParameterSpec] = ReSpeakerParameterSpec(
+    name="REBOOT",
+    resid=48,
+    cmdid=7,
+    value_count=1,
+    access_mode="wo",
+    value_type=ReSpeakerParameterType.UINT8,
+    description="Set to any value to reboot the chip and reset all parameters to default.",
+)
+
 
 __all__ = [
     "LED_COLOR_PARAMETER",
     "LED_EFFECT_PARAMETER",
+    "REBOOT_PARAMETER",
 ]

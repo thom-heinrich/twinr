@@ -78,3 +78,19 @@ def validate_supported_attention_servo_topology(
         + ", ".join(detected)
         + "."
     )
+
+
+def validate_supported_proactive_vision_provider(
+    *,
+    proactive_vision_provider: str,
+) -> None:
+    """Reject retired helper-Pi proactive vision provider modes."""
+
+    normalized = str(proactive_vision_provider or "").strip().lower()
+    if normalized not in {"remote_proxy", "remote_frame"}:
+        return
+    raise ValueError(
+        "Legacy helper-Pi proactive vision providers are no longer supported. "
+        "Twinr now requires local proactive vision on the main Pi. "
+        f"Remove the retired provider setting: TWINR_PROACTIVE_VISION_PROVIDER={normalized}."
+    )

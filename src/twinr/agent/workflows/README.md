@@ -15,7 +15,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - keep the yellow print button latency-safe by queuing prints from local short-term context only instead of synchronously rebuilding remote provider context before the print lane starts
 - route beep, feedback, and spoken playback through one priority-aware playback coordinator instead of scattered per-call locks
 - play one bounded startup boot clip from `media/boot.mp3` through the same playback coordinator, trimmed from the calmer middle of the asset and faded so loop startup stays gentle and interruptible
-- render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, play it about `35 %` slower and `30 %` quieter than the prior setting, loop it without an added idle gap until the answer starts, and let long processing loops duck gently over time while bounded tone fallbacks stay available
+- render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, keep the quieter/slower loop tuning, and still prewarm the clip asynchronously so cold caches fall back to tones instead of blocking turn startup
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
 - forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized, but keep that learning work off the user-facing audio-completion path so a slow background flush cannot leave Twinr visibly `speaking` after playback ends
@@ -34,6 +34,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - let the idle housekeeping worker trigger one bounded overnight reserve-lane maintenance pass so the next local day starts from a reviewed/prepared ambient companion plan instead of an ad-hoc rebuild
 - package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
+- reuse that already-open `listening` state when a same-stream remote follow-up transcript is committed as a seeded text turn, instead of reopening listening and surfacing a false runtime `error`
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep the post-playback join against the closure guard bounded so a stalled steering, remote-memory, or closure-provider path cannot leave the runtime stuck in `answering` after speech has ended
 - translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
@@ -42,6 +43,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
 - let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
+- when the local semantic router is enabled on the Pi, prewarm its ONNX path before the first live turn so weather/tool/memory turns do not spend the user's first reply budget on cold-start model load
 - when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
 - when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall straight through to the generic supervisor loop instead of starting another structured-decision roundtrip
@@ -90,7 +92,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_runner_impl/turn_capture.py](./realtime_runner_impl/turn_capture.py) | Turn-controller streaming capture, transcript recovery, and early-snapshot coercion |
 | [realtime_runner_impl/turn_execution.py](./realtime_runner_impl/turn_execution.py) | Single-turn execution, streamed playback/interrupt handling, activation ack caching, and print-lane enqueue helpers |
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
-| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery and startup-time reconnect recovery when the gateway appears late |
+| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery, first-frame stall healing via host-control reboot, and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
 | [remote_transcript_commit.py](./remote_transcript_commit.py) | Bounded wait coordinator for same-stream server transcript commits during live remote listening |
@@ -107,7 +109,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [streaming_turn_coordinator.py](./streaming_turn_coordinator.py) | Authoritative streaming turn state machine and completion coordinator |
 | [streaming_turn_orchestrator.py](./streaming_turn_orchestrator.py) | Low-level parallel bridge/final lane watchdog executor used by the coordinator |
 | [playback_coordinator.py](./playback_coordinator.py) | Single-owner speaker queue with priority-aware, request-bound preemption for beep, feedback, and TTS |
-| [respeaker_duplex_keepalive.py](./respeaker_duplex_keepalive.py) | ReSpeaker XVF3800 duplex-stability helper that keeps one low-priority Twinr playback stream alive so Pi-side capture does not fall into immediate `arecord` I/O errors |
+| [respeaker_duplex_keepalive.py](./respeaker_duplex_keepalive.py) | ReSpeaker XVF3800 duplex-stability helper that keeps one Twinr-owned playback stream alive; on the productive softvol path it uses the direct `/dev/zero` ALSA guard instead of silence piped through `WaveAudioPlayer`, and now suspends that direct guard around real foreground playback so TTS can claim the device cleanly |
 | [rendered_audio_clip.py](./rendered_audio_clip.py) | Bounded media-clip renderer/cache for reusable workflow WAV payloads |
 | [startup_boot_sound.py](./startup_boot_sound.py) | Bounded startup earcon helper that renders a faded `media/boot.mp3` clip and queues it through the shared playback coordinator |
 | [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop, including idle-transition-safe reminder/automation/proactive delivery, routing display-first proactive prompts into the reserve lane, and triggering the overnight reserve-lane maintenance hook |
@@ -125,8 +127,8 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [forensics.py](./forensics.py) | Queue-based forensic runpack tracing for live workflow bugs, including bounded thread snapshots for stuck workflow helpers |
 | [listen_timeout_diagnostics.py](./listen_timeout_diagnostics.py) | Shared bounded no-speech timeout diagnostics emission |
 | [print_lane.py](./print_lane.py) | Background print lane |
-| [working_feedback.py](./working_feedback.py) | Bounded tone/media feedback with coordinator-owned stop semantics so the significantly slowed quieter default processing clip can loop cleanly until speech starts and long thinking loops can quiet down over time |
-| [working_feedback_tone.py](./working_feedback_tone.py) | Optional synthesized processing-tone helper kept available for non-default workflow experiments and direct tests |
+| [working_feedback.py](./working_feedback.py) | Bounded processing, answering, and printing feedback loops with the dragon MP3 as the default think cue, synthesized fallback tones, asynchronous media prewarm, and coordinator-owned stop semantics |
+| [working_feedback_tone.py](./working_feedback_tone.py) | Synthesized processing-tone helper used for fallback/defaultless paths and direct tests |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 Legacy compatibility shims that no longer belong to the active package are

@@ -27,6 +27,11 @@ from twinr.proactive.social.observers import (
     ProactiveVisionSnapshot,
     parse_vision_observation_text,
 )
+from twinr.proactive.social.perception_stream import (
+    PerceptionAttentionStreamObservation,
+    PerceptionGestureStreamObservation,
+    PerceptionStreamObservation,
+)
 from twinr.proactive.social.prompting import is_safety_trigger, proactive_observation_facts, proactive_prompt_mode
 from twinr.proactive.social.scoring import (
     TriggerScoreEvidence,
@@ -49,6 +54,9 @@ __all__ = [
     "NullAudioObservationProvider",
     "OpenAIVisionObservationProvider",
     "OpenAIProactiveVisionReviewer",
+    "PerceptionAttentionStreamObservation",
+    "PerceptionGestureStreamObservation",
+    "PerceptionStreamObservation",
     "ProactiveAudioSnapshot",
     "ProactiveVisionFrameBuffer",
     "ProactiveVisionReview",

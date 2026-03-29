@@ -52,6 +52,15 @@ class FakeEncoder:
         return np.vstack([self._vectors[text] for text in texts]).astype(np.float32)
 
 
+class WarmupEncoder(FakeEncoder):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.calls: list[str] = []
+
+    def warmup(self, probe_text: str = "warmup") -> None:
+        self.calls.append(str(probe_text))
+
+
 def _write_test_onnx_model(
     path: Path,
     *,
@@ -952,6 +961,33 @@ class SemanticRouterTests(unittest.TestCase):
             decision.route_decision.scores["memory"],
             decision.route_decision.scores["tool"],
         )
+
+    def test_local_semantic_router_warmup_delegates_to_encoder(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle = load_semantic_router_bundle(_write_bundle(Path(temp_dir)))
+            encoder = WarmupEncoder()
+            router = LocalSemanticRouter(bundle, encoder=encoder)
+
+            router.warmup("bereit")
+
+        self.assertEqual(encoder.calls, ["bereit"])
+
+    def test_two_stage_router_warmup_reuses_shared_encoder_once(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            user_bundle = load_user_intent_bundle(_write_user_intent_bundle(root))
+            route_bundle = load_semantic_router_bundle(_write_bundle(root))
+            shared_encoder = WarmupEncoder()
+            router = TwoStageLocalSemanticRouter(
+                user_bundle,
+                route_bundle,
+                user_intent_router=LocalUserIntentRouter(user_bundle, encoder=shared_encoder),
+                route_router=LocalSemanticRouter(route_bundle, encoder=shared_encoder),
+            )
+
+            router.warmup("vorheizen")
+
+        self.assertEqual(shared_encoder.calls, ["vorheizen"])
 
 
 if __name__ == "__main__":

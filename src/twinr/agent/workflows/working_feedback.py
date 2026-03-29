@@ -4,6 +4,9 @@
 # BUG-3: Fixed long-think attenuation; the default processing media now actually ducks over time instead of staying at full configured gain.
 # BUG-4: Fixed playback-coordinator owner collisions by making owners unique per loop instance.
 # SEC-1: Replaced the unbounded id()-fallback registry with attached-state / weakref.finalize cleanup plus a bounded last-resort cache to prevent practical local memory-DoS on Raspberry Pi deployments.
+# BUG-5: Keep processing-feedback startup off the foreground turn path by warming rendered media asynchronously and falling back to tones while the clip cache is still cold.
+# BUG-6: Restored the synthesized default processing cue; the dragon media clip is no longer the default think sound, while optional media-loop support remains available for explicit non-default specs.
+# BUG-7: Restored the dragon processing MP3 as the default think cue while preserving BUG-5's async prewarm and tone fallback, so user-visible thinking audio matches the expected runtime sound without reintroducing cold-start silence.
 # IMP-1: Pre-render and cache click-free PCM tone assets, then prefer raw-buffer playback for lower jitter, cleaner cancellation, and better compatibility with modern Pi audio backends.
 # IMP-2: Retuned the default cue palette and added default runtime ceilings so senior-facing devices avoid shrill feedback and endless loops when upstream workflows hang.
 
@@ -36,6 +39,11 @@ from twinr.agent.workflows.rendered_audio_clip import (
     RenderedAudioClipSpec,
     build_rendered_audio_clip_wav_bytes,
     iter_wav_bytes_chunks,
+)
+from twinr.agent.workflows.working_feedback_tone import (
+    PROCESSING_SWELL_TONE_SPEC,
+    build_swelling_feedback_tone_pcm16,
+    build_swelling_feedback_tone_wav_bytes,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -184,9 +192,12 @@ _RENDERED_MEDIA_CACHE_LOCK = Lock()
 _RENDERED_MEDIA_CACHE: OrderedDict[tuple[int, str], _ResolvedWorkingFeedbackMedia] = OrderedDict()
 _RENDERED_MEDIA_CACHE_FINALIZERS: dict[int, weakref.finalize] = {}
 _RENDERED_MEDIA_CACHE_MAX = 12
+_RENDERED_MEDIA_PREWARM_LOCK = Lock()
+_RENDERED_MEDIA_PREWARM: dict[tuple[int, str], Event] = {}
 
 _PCM_CHUNK_MS = 40
 _NOTE_FADE_MS = 5
+_MEDIA_PREWARM_READY_BUDGET_S = 0.05
 
 
 def _safe_emit(emit: Callable[[str], None] | None, message: str) -> None:
@@ -936,12 +947,35 @@ def _rendered_audio_clip_cache_key(media_spec: WorkingFeedbackMediaSpec) -> str:
     return repr(media_spec)
 
 
+def _resolved_media_from_cache_entry(
+    cached: _ResolvedWorkingFeedbackMedia,
+    *,
+    media_spec: WorkingFeedbackMediaSpec,
+    allow_pcm16: bool,
+) -> _ResolvedWorkingFeedbackMedia:
+    """Return one cache-derived media view shaped for the current playback path."""
+
+    if _media_uses_long_think_attenuation(media_spec) and not allow_pcm16:
+        return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=cached.wav_bytes)
+    return _ResolvedWorkingFeedbackMedia(
+        spec=media_spec,
+        wav_bytes=cached.wav_bytes,
+        pcm_bytes=cached.pcm_bytes,
+        sample_rate=cached.sample_rate,
+        channels=cached.channels,
+    )
+
+
 def _cleanup_rendered_media_cache_for_config(config_id: int) -> None:
     with _RENDERED_MEDIA_CACHE_LOCK:
         doomed_keys = [key for key in _RENDERED_MEDIA_CACHE if key[0] == config_id]
         for key in doomed_keys:
             _RENDERED_MEDIA_CACHE.pop(key, None)
         _RENDERED_MEDIA_CACHE_FINALIZERS.pop(config_id, None)
+    with _RENDERED_MEDIA_PREWARM_LOCK:
+        doomed_prewarms = [key for key in _RENDERED_MEDIA_PREWARM if key[0] == config_id]
+        for key in doomed_prewarms:
+            _RENDERED_MEDIA_PREWARM.pop(key, None)
 
 
 def _prune_rendered_media_cache() -> None:
@@ -965,14 +999,10 @@ def _resolve_media_clip(
         cached = _RENDERED_MEDIA_CACHE.get(cache_key)
         if cached is not None:
             _RENDERED_MEDIA_CACHE.move_to_end(cache_key)
-            if _media_uses_long_think_attenuation(media_spec) and not allow_pcm16:
-                return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=cached.wav_bytes)
-            return _ResolvedWorkingFeedbackMedia(
-                spec=media_spec,
-                wav_bytes=cached.wav_bytes,
-                pcm_bytes=cached.pcm_bytes,
-                sample_rate=cached.sample_rate,
-                channels=cached.channels,
+            return _resolved_media_from_cache_entry(
+                cached,
+                media_spec=media_spec,
+                allow_pcm16=allow_pcm16,
             )
 
     try:
@@ -1031,6 +1061,83 @@ def _resolve_media_clip(
         return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=wav_bytes)
 
     return resolved
+
+
+def _peek_cached_media_clip(
+    *,
+    kind: WorkingFeedbackKind,
+    config: TwinrConfig | None,
+    allow_pcm16: bool,
+) -> _ResolvedWorkingFeedbackMedia | None:
+    """Return cached processing media immediately without triggering a render."""
+
+    media_spec = _resolve_media_spec(kind)
+    if media_spec is None or config is None:
+        return None
+    cache_key = (id(config), _rendered_audio_clip_cache_key(media_spec))
+    with _RENDERED_MEDIA_CACHE_LOCK:
+        cached = _RENDERED_MEDIA_CACHE.get(cache_key)
+        if cached is not None:
+            _RENDERED_MEDIA_CACHE.move_to_end(cache_key)
+    if cached is None:
+        return None
+    return _resolved_media_from_cache_entry(
+        cached,
+        media_spec=media_spec,
+        allow_pcm16=allow_pcm16,
+    )
+
+
+def _start_media_prewarm(
+    *,
+    kind: WorkingFeedbackKind,
+    config: TwinrConfig | None,
+    allow_pcm16: bool,
+    emit: Callable[[str], None] | None,
+) -> Event | None:
+    """Warm one rendered feedback clip off the foreground turn path."""
+
+    media_spec = _resolve_media_spec(kind)
+    if media_spec is None or config is None:
+        return None
+    cache_key = (id(config), _rendered_audio_clip_cache_key(media_spec))
+    if _peek_cached_media_clip(kind=kind, config=config, allow_pcm16=allow_pcm16) is not None:
+        ready = Event()
+        ready.set()
+        return ready
+    with _RENDERED_MEDIA_PREWARM_LOCK:
+        event = _RENDERED_MEDIA_PREWARM.get(cache_key)
+        if event is not None:
+            return event
+        event = Event()
+        _RENDERED_MEDIA_PREWARM[cache_key] = event
+
+    def worker() -> None:
+        try:
+            _resolve_media_clip(
+                kind=kind,
+                config=config,
+                allow_pcm16=allow_pcm16,
+                emit=emit,
+            )
+        except Exception as exc:  # pragma: no cover - defensive containment
+            _safe_emit(
+                emit,
+                f"working_feedback_media_prewarm_failed={kind}:{exc.__class__.__name__}",
+            )
+        finally:
+            event.set()
+            with _RENDERED_MEDIA_PREWARM_LOCK:
+                current_event = _RENDERED_MEDIA_PREWARM.get(cache_key)
+                if current_event is event:
+                    _RENDERED_MEDIA_PREWARM.pop(cache_key, None)
+
+    Thread(
+        target=worker,
+        name=f"working-feedback-media-prewarm-{kind}",
+        daemon=True,
+    ).start()
+    return event
 
 
 def _pcm16_bytes_to_wav_bytes(
@@ -1152,11 +1259,40 @@ def _render_tone_sequence(
     )
 
 
+def _build_default_processing_tone_render(
+    profile: WorkingFeedbackProfile,
+    *,
+    sample_rate: int,
+) -> _RenderedToneSequence:
+    """Render the default calm processing hum into reusable PCM/WAV buffers."""
+
+    pcm_bytes = build_swelling_feedback_tone_pcm16(
+        PROCESSING_SWELL_TONE_SPEC,
+        sample_rate=sample_rate,
+        peak_gain=profile.volume,
+    )
+    wav_bytes = build_swelling_feedback_tone_wav_bytes(
+        PROCESSING_SWELL_TONE_SPEC,
+        sample_rate=sample_rate,
+        peak_gain=profile.volume,
+    )
+    return _RenderedToneSequence(
+        sequence=profile.patterns[0],
+        pcm_bytes=pcm_bytes,
+        wav_bytes=wav_bytes,
+        sample_rate=sample_rate,
+        channels=1,
+    )
+
+
 def _resolve_tone_renders(
+    kind: WorkingFeedbackKind,
     profile: WorkingFeedbackProfile,
     *,
     sample_rate: int,
 ) -> tuple[_RenderedToneSequence, ...]:
+    if kind == "processing":
+        return (_build_default_processing_tone_render(profile, sample_rate=sample_rate),)
     return tuple(
         _render_tone_sequence(
             sequence,
@@ -1206,12 +1342,20 @@ def start_working_feedback_loop(
         delay_override_ms,
         emit,
     )
-    resolved_media = _resolve_media_clip(
+    allow_pcm16_media = playback_coordinator is not None or _player_supports_pcm16_chunks(player)
+    resolved_media = _peek_cached_media_clip(
         kind=kind,
         config=config,
-        allow_pcm16=(playback_coordinator is not None or _player_supports_pcm16_chunks(player)),
-        emit=emit,
+        allow_pcm16=allow_pcm16_media,
     )
+    prewarm_event = None
+    if resolved_media is None:
+        prewarm_event = _start_media_prewarm(
+            kind=kind,
+            config=config,
+            allow_pcm16=allow_pcm16_media,
+            emit=emit,
+        )
     resolved_tones: tuple[_RenderedToneSequence, ...] = ()
     if (
         playback_coordinator is not None
@@ -1219,6 +1363,7 @@ def start_working_feedback_loop(
         or _player_supports_wav_chunks(player)
     ):
         resolved_tones = _resolve_tone_renders(
+            kind,
             profile,
             sample_rate=normalized_sample_rate,
         )
@@ -1253,9 +1398,31 @@ def start_working_feedback_loop(
         return True
 
     def worker() -> None:
+        nonlocal resolved_media, prewarm_event
+
+        def maybe_refresh_media(*, wait_budget_s: float = 0.0) -> None:
+            nonlocal resolved_media, prewarm_event
+            if resolved_media is not None or config is None:
+                return
+            if prewarm_event is not None and wait_budget_s > 0.0:
+                prewarm_event.wait(wait_budget_s)
+            resolved_media = _peek_cached_media_clip(
+                kind=kind,
+                config=config,
+                allow_pcm16=allow_pcm16_media,
+            )
+            if resolved_media is None and prewarm_event is None:
+                prewarm_event = _start_media_prewarm(
+                    kind=kind,
+                    config=config,
+                    allow_pcm16=allow_pcm16_media,
+                    emit=emit,
+                )
+
         try:
             if stop_event.wait(profile.delay_ms / 1000.0):
                 return
+            maybe_refresh_media(wait_budget_s=_MEDIA_PREWARM_READY_BUDGET_S)
             feedback_started_at = time.monotonic()
             pattern_index = 0
             chunk_player = _resolved_chunk_player(
@@ -1348,6 +1515,7 @@ def start_working_feedback_loop(
             while not stop_event.is_set():
                 if not _is_active_player_loop(player_state, generation, stop_event):
                     return
+                maybe_refresh_media()
 
                 loop_elapsed_s = max(0.0, time.monotonic() - feedback_started_at)
                 if profile.max_runtime_s is not None and loop_elapsed_s >= profile.max_runtime_s:

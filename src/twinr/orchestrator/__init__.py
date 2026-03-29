@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from importlib import import_module
 
+# Pylint cannot resolve names populated via __getattr__ for lazy package exports.
+# pylint: disable=undefined-all-variable
+
 __all__ = [
     "ACK_ID_TO_TEXT",
     "EdgeOrchestratorServer",

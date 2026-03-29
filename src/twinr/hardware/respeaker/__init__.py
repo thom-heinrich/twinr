@@ -56,7 +56,7 @@ from twinr.hardware.respeaker.scheduled_provider import (
     ScheduledReSpeakerSignalProvider,
 )
 from twinr.hardware.respeaker.transport import ReSpeakerLibusbTransport
-from twinr.hardware.respeaker.write_specs import LED_COLOR_PARAMETER, LED_EFFECT_PARAMETER
+from twinr.hardware.respeaker.write_specs import LED_COLOR_PARAMETER, LED_EFFECT_PARAMETER, REBOOT_PARAMETER
 
 __all__ = [
     "AEC_AZIMUTH_VALUES_PARAMETER",
@@ -66,6 +66,7 @@ __all__ = [
     "DOA_VALUE_PARAMETER",
     "LED_COLOR_PARAMETER",
     "LED_EFFECT_PARAMETER",
+    "REBOOT_PARAMETER",
     "GPO_READ_VALUES_PARAMETER",
     "VERSION_PARAMETER",
     "ReSpeakerClaimMetadata",

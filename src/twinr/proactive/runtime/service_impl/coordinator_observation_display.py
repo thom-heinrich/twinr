@@ -494,6 +494,9 @@ class ProactiveCoordinatorObservationDisplayMixin:
     def _observe_vision_for_gesture_refresh(self):
         """Capture one gesture-only vision snapshot for HDMI emoji acknowledgement."""
 
+        shared_snapshot = self._shared_display_perception_snapshot(consumer="gesture")
+        if shared_snapshot is not None:
+            return shared_snapshot
         if self.vision_observer is None:
             self._last_gesture_vision_refresh_mode = "missing"
             return None

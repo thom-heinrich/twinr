@@ -141,7 +141,7 @@ files:
   - path: pi_runtime_deploy_remote.py
     role: Internal SSH, SCP, sync, and systemd verification helpers used by the Pi deploy orchestrator
   - path: self_test.py
-    role: Bounded hardware self-test execution and artifact capture, including AI-Deck WiFi handover, frame capture, and image-sanity probes
+    role: Bounded hardware self-test execution and artifact capture, including AI-Deck WiFi handover, frame capture, image-sanity probes, and proactive-mic ownership guards that only block while an active Twinr voice runtime already owns the same capture device
     exports:
       - SelfTestResult
       - TwinrSelfTestRunner

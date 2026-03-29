@@ -38,6 +38,7 @@ tools.
 - run bounded self-tests and build support bundles
 - mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, `artifacts/`, and `.cache/`, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
 - deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, restart the productive Pi service set, and verify post-restart health
+- hand root-owned mirrored `__pycache__/` trees back to the runtime user, rebuild checked-hash Python bytecode for mirrored source trees during Pi deploys, and attest critical runtime APIs such as the local camera stream surface before services restart
 - bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
 - expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
 
@@ -58,7 +59,7 @@ tools.
 | [usage.py](./usage.py) | Usage telemetry store |
 | [checks.py](./checks.py) | Config audit checks |
 | [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
-| [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract |
+| [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog process for live Pi loops and reseed bootstrap attestation when the owner PID changes |
@@ -72,7 +73,7 @@ tools.
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
 | [devices.py](./devices.py) | Device overview probes |
-| [self_test.py](./self_test.py) | Bounded hardware self-tests, including AI-Deck WiFi handover, frame capture, and image-sanity checks |
+| [self_test.py](./self_test.py) | Bounded hardware self-tests, including AI-Deck WiFi handover, frame capture, image-sanity checks, and proactive-mic ownership guards that only block while an active Twinr voice runtime already owns the same capture device |
 | [support.py](./support.py) | Support bundle export |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
@@ -164,10 +165,18 @@ Captured `browser_automation/artifacts/` output is intentionally excluded from
 the mirror as well, so gitignored screenshots/HTML traces on either host do not
 block official Pi deploy convergence while the small mirrored browser-runtime
 manifests remain available for install.
-The Pi deploy also attests `/twinr/.venv/bin` after the editable refresh and
-normalizes stale copied Python-wrapper shebangs back to `/twinr/.venv/bin/python`,
-so direct console scripts under the preserved Pi venv do not stay pinned to an
-old `/home/thh/twinr/.venv/...` path after historical checkout moves.
+The generated Crazyflie STM32 failsafe build tree under
+`hardware/bitcraze/twinr_on_device_failsafe/build/` is intentionally excluded
+from the mirror as well because it is a large local firmware build workspace,
+not authoritative Twinr runtime source, and it can mutate mid-transfer.
+The Pi deploy also attests `/twinr/.venv/bin` after the editable refresh,
+normalizes stale copied Python-wrapper shebangs back to
+`/twinr/.venv/bin/python`, hands any existing root-owned mirrored
+`__pycache__/` trees back to the runtime user, rebuilds mirrored source
+bytecode with `compileall --invalidation-mode checked-hash`, and verifies a
+critical runtime API contract for camera-stream entrypoints before productive
+services restart. That keeps preserved Pi bytecode caches from shadowing fresh
+source files after mirror syncs or historical checkout moves.
 When a deleted remote tree survives only because it still contains ignored
 Python caches, the mirror prunes those cache-only stale directories and reruns
 the sync once so the acceptance checkout can still converge cleanly.
@@ -179,7 +188,8 @@ Pi-only runtime supplement installs via `hardware/ops/pi_runtime_requirements.tx
 which mirrors `project.optional-dependencies.pi-runtime` in `pyproject.toml`,
 optional mirrored browser-automation runtime installs via
 `browser_automation/runtime_requirements.txt` plus
-`browser_automation/playwright_browsers.txt`, productive unit
+`browser_automation/playwright_browsers.txt`, with those ignored workspace
+manifests synced explicitly before the remote install step, productive unit
 installation/restart, a fixed `/twinr/.venv/bin/python` import contract for
 critical direct-import modules, and bounded post-restart verification. By default it
 always manages the base runtime units and also picks up any repo-backed Pi unit

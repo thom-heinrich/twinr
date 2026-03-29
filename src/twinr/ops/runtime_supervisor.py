@@ -688,8 +688,13 @@ class TwinrRuntimeSupervisor:
 
     def _streaming_startup_has_progress(self, snapshot: RuntimeSnapshot | None) -> bool:
         del snapshot
+        return self._current_streaming_child_owns_lock()
+
+    def _current_streaming_child_owns_lock(self) -> bool:
         process = self._streaming.process
-        current_pid = getattr(process, "pid", None) if process is not None else None
+        if process is None or process.poll() is not None:
+            return False
+        current_pid = getattr(process, "pid", None)
         if current_pid is None:
             return False
         owner_pid = self.loop_owner(self.config, "streaming-loop")
@@ -765,6 +770,13 @@ class TwinrRuntimeSupervisor:
         return any(fragment in error_text for fragment in _REQUIRED_REMOTE_RECOVERY_ERROR_FRAGMENTS)
 
     def _streaming_health_issue(self, health: TwinrSystemHealth) -> str | None:
+        # The supervisor already gates health enforcement on the current child
+        # owning the singleton streaming lock and refreshing the runtime
+        # snapshot. Once that authoritative contract is satisfied, auxiliary
+        # ops process inventories must not tear down the healthy child because
+        # transient `ps`/count drift would otherwise trigger false restarts.
+        if self._current_streaming_child_owns_lock():
+            return None
         conversation = self._service(health, "conversation_loop")
         if conversation is None or not conversation.running or conversation.count != 1:
             return "conversation_loop_unhealthy"

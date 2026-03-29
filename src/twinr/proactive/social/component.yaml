@@ -108,16 +108,10 @@ files:
       - AIDeckOpenAIVisionObservationProvider
       - AIDeckOpenAIVisionProviderConfig
   - path: local_camera_provider.py
-    role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including bounded multi-person visibility plus motion and coarse/fine gesture output
+    role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, preferring explicit adapter stream attention/gesture methods for productive HDMI refresh while preserving the stable provider surface
     exports:
       - LocalAICameraObservationProvider
       - LocalAICameraProviderConfig
-  - path: remote_camera_provider.py
-    role: Peer-LAN IMX500 providers that either consume helper-Pi observation JSON directly or run the hot attention/gesture lifting on the main Pi from remote frames
-    exports:
-      - RemoteAICameraObservationProvider
-      - RemoteAICameraProviderConfig
-      - RemoteFrameAICameraObservationProvider
   - path: normalization.py
     role: Shared low-risk enum, box, and integer coercion helpers reused by social hot paths
     exports:
@@ -236,7 +230,6 @@ primary_callers:
 tests:
   - path: test/test_aideck_camera_provider.py
   - path: test/test_local_ai_camera_provider.py
-  - path: test/test_remote_ai_camera_provider.py
   - path: test/test_gesture_calibration.py
   - path: test/test_proactive_camera_surface.py
   - path: test/test_social_triggers.py

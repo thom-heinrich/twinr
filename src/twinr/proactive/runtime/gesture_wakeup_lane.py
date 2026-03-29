@@ -1,11 +1,4 @@
-"""Translate one configured hand gesture into a bounded listen-start request.
-
-This module keeps visual hands-free turn entry separate from both HDMI emoji
-acknowledgement and the broader social camera surface. It accepts only one
-configured fine-hand symbol, applies bounded confirmation and cooldown rules,
-and returns a ready-to-dispatch wake decision without touching eye-follow,
-emoji publish policy, or workflow orchestration.
-"""
+"""Consume authoritative gesture-stream activations for visual wakeup."""
 
 from __future__ import annotations
 
@@ -16,12 +9,11 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_decision
 
 from ..social.engine import SocialFineHandGesture, SocialVisionObservation
-from ..social.gesture_calibration import GestureCalibrationProfile
+from ..social.perception_stream import gesture_stream, gesture_stream_authoritative
 
 
 _DEFAULT_TRIGGER_GESTURE = SocialFineHandGesture.PEACE_SIGN
 _DEFAULT_REQUEST_SOURCE = "gesture"
-_PENDING_RESET_AFTER_S = 0.9
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +29,7 @@ class GestureWakeupDecision:
 
 
 class GestureWakeupLane:
-    """Keep the visual wake trigger independent from display and social policy."""
+    """Keep visual wake tied to the authoritative gesture stream only."""
 
     def __init__(
         self,
@@ -45,15 +37,11 @@ class GestureWakeupLane:
         enabled: bool,
         trigger_gesture: SocialFineHandGesture,
         cooldown_s: float,
-        calibration: GestureCalibrationProfile,
     ) -> None:
         self.enabled = bool(enabled)
         self.trigger_gesture = trigger_gesture
         self.cooldown_s = max(0.0, float(cooldown_s))
-        self.calibration = calibration
-        self._pending_count = 0
-        self._pending_seen_at: float | None = None
-        self._pending_started_at: float | None = None
+        self._last_seen_activation_token: int | None = None
         self._last_triggered_at: float | None = None
 
     @classmethod
@@ -69,7 +57,6 @@ class GestureWakeupLane:
                 getattr(config, "gesture_wakeup_cooldown_s", 3.0),
                 default=3.0,
             ),
-            calibration=GestureCalibrationProfile.from_runtime_config(config),
         )
 
     def observe(
@@ -86,68 +73,45 @@ class GestureWakeupLane:
                 trigger_gesture=self.trigger_gesture,
             )
             self._trace_wakeup_decision(
-                observed_at=observed_at,
                 observation=observation,
                 decision=decision,
             )
             return decision
 
+        activation_token = self._candidate_activation_token(observation)
         observed_gesture = observation.fine_hand_gesture
         confidence = _coerce_confidence(observation.fine_hand_gesture_confidence)
-        policy = self.calibration.fine_hand_policy(
-            self.trigger_gesture,
-            fallback_min_confidence=0.78,
-            fallback_confirm_samples=1,
-            fallback_hold_s=0.40,
-            fallback_min_visible_s=1.0,
-        )
-        if not observation.hand_or_object_near_camera:
-            self._reset_pending_if_stale(observed_at)
+        if activation_token is None:
             decision = GestureWakeupDecision(
-                reason="no_gesture_wakeup_candidate",
+                reason=(
+                    "gesture_wakeup_not_authoritative"
+                    if not gesture_stream_authoritative(observation)
+                    else "no_gesture_wakeup_candidate"
+                ),
                 trigger_gesture=self.trigger_gesture,
                 observed_gesture=observed_gesture,
                 confidence=confidence,
             )
             self._trace_wakeup_decision(
-                observed_at=observed_at,
-                observation=observation,
-                decision=decision,
-            )
-            return decision
-        if observed_gesture != self.trigger_gesture:
-            self._reset_pending_if_stale(observed_at)
-            decision = GestureWakeupDecision(
-                reason="no_gesture_wakeup_candidate",
-                trigger_gesture=self.trigger_gesture,
-                observed_gesture=observed_gesture,
-                confidence=confidence,
-            )
-            self._trace_wakeup_decision(
-                observed_at=observed_at,
-                observation=observation,
-                decision=decision,
-            )
-            return decision
-        if confidence < policy.min_confidence:
-            self._reset_pending_if_stale(observed_at)
-            decision = GestureWakeupDecision(
-                reason="gesture_wakeup_low_confidence",
-                trigger_gesture=self.trigger_gesture,
-                observed_gesture=observed_gesture,
-                confidence=confidence,
-            )
-            self._trace_wakeup_decision(
-                observed_at=observed_at,
                 observation=observation,
                 decision=decision,
             )
             return decision
 
-        self._pending_seen_at = observed_at
-        if self._pending_count <= 0:
-            self._pending_started_at = observed_at
-        self._pending_count += 1
+        if activation_token == self._last_seen_activation_token:
+            decision = GestureWakeupDecision(
+                reason="gesture_wakeup_already_active",
+                trigger_gesture=self.trigger_gesture,
+                observed_gesture=observed_gesture,
+                confidence=confidence,
+            )
+            self._trace_wakeup_decision(
+                observation=observation,
+                decision=decision,
+            )
+            return decision
+
+        self._last_seen_activation_token = activation_token
         if (
             self._last_triggered_at is not None
             and (observed_at - self._last_triggered_at) < self.cooldown_s
@@ -159,41 +123,12 @@ class GestureWakeupLane:
                 confidence=confidence,
             )
             self._trace_wakeup_decision(
-                observed_at=observed_at,
-                observation=observation,
-                decision=decision,
-            )
-            return decision
-        if self._pending_count < policy.confirm_samples:
-            decision = GestureWakeupDecision(
-                reason="awaiting_gesture_wakeup_confirmation",
-                trigger_gesture=self.trigger_gesture,
-                observed_gesture=observed_gesture,
-                confidence=confidence,
-            )
-            self._trace_wakeup_decision(
-                observed_at=observed_at,
-                observation=observation,
-                decision=decision,
-            )
-            return decision
-        if self._pending_visible_s(observed_at) < policy.min_visible_s:
-            decision = GestureWakeupDecision(
-                reason="awaiting_gesture_wakeup_visibility",
-                trigger_gesture=self.trigger_gesture,
-                observed_gesture=observed_gesture,
-                confidence=confidence,
-            )
-            self._trace_wakeup_decision(
-                observed_at=observed_at,
                 observation=observation,
                 decision=decision,
             )
             return decision
 
         self._last_triggered_at = observed_at
-        self._pending_count = 0
-        self._pending_seen_at = observed_at
         decision = GestureWakeupDecision(
             active=True,
             reason=f"gesture_wakeup:{self.trigger_gesture.value}",
@@ -202,37 +137,30 @@ class GestureWakeupLane:
             confidence=confidence,
         )
         self._trace_wakeup_decision(
-            observed_at=observed_at,
             observation=observation,
             decision=decision,
         )
         return decision
 
-    def _reset_pending_if_stale(self, observed_at: float) -> None:
-        """Clear partial confirmation state after a bounded gap."""
-
-        seen_at = self._pending_seen_at
-        if seen_at is None or (observed_at - seen_at) < _PENDING_RESET_AFTER_S:
-            return
-        self._pending_count = 0
-        self._pending_seen_at = None
-        self._pending_started_at = None
-
-    def _pending_visible_s(self, observed_at: float) -> float:
-        started_at = self._pending_started_at
-        if started_at is None:
-            return 0.0
-        return max(0.0, observed_at - started_at)
+    def _candidate_activation_token(self, observation: SocialVisionObservation) -> int | None:
+        if not gesture_stream_authoritative(observation):
+            return None
+        if observation.fine_hand_gesture != self.trigger_gesture:
+            return None
+        stream = gesture_stream(observation)
+        if stream is None:
+            return None
+        return _coerce_optional_non_negative_int(stream.activation_token)
 
     def _trace_wakeup_decision(
         self,
         *,
-        observed_at: float,
         observation: SocialVisionObservation,
         decision: GestureWakeupDecision,
     ) -> None:
         """Emit one bounded decision ledger entry for the wake lane."""
 
+        stream = gesture_stream(observation)
         workflow_decision(
             msg="gesture_wakeup_lane_observe",
             question="Should the visual wake lane request a new voice turn now?",
@@ -246,18 +174,21 @@ class GestureWakeupLane:
             },
             options=[
                 {"id": "dispatch", "summary": "Dispatch the configured wake gesture immediately."},
-                {"id": "awaiting_gesture_wakeup_confirmation", "summary": "Keep the wake gesture pending until confirmation."},
-                {"id": "awaiting_gesture_wakeup_visibility", "summary": "Keep the wake gesture pending until it stayed visible long enough."},
-                {"id": "gesture_wakeup_low_confidence", "summary": "Reject the wake gesture because confidence is too low."},
+                {"id": "gesture_wakeup_disabled", "summary": "Skip wakeup because the feature is disabled."},
+                {"id": "gesture_wakeup_not_authoritative", "summary": "Ignore the frame because no authoritative gesture stream was attached."},
+                {"id": "gesture_wakeup_already_active", "summary": "Do not re-dispatch while the same authoritative activation token remains active."},
                 {"id": "gesture_wakeup_cooldown", "summary": "Suppress a repeated wake gesture during cooldown."},
-                {"id": "no_gesture_wakeup_candidate", "summary": "Ignore the frame because the trigger gesture is absent."},
+                {"id": "no_gesture_wakeup_candidate", "summary": "Ignore the frame because the configured trigger gesture is absent."},
             ],
             context={
+                "gesture_stream_authoritative": gesture_stream_authoritative(observation),
                 "trigger_gesture": self.trigger_gesture.value,
                 "observed_gesture": observation.fine_hand_gesture.value,
                 "observed_confidence": _coerce_confidence(observation.fine_hand_gesture_confidence),
-                "pending_count": self._pending_count,
-                "pending_visible_s": round(self._pending_visible_s(observed_at), 3),
+                "stream_activation_key": None if stream is None else stream.activation_key,
+                "stream_activation_token": None if stream is None else stream.activation_token,
+                "stream_activation_rising": None if stream is None else stream.activation_rising,
+                "last_seen_activation_token": self._last_seen_activation_token,
                 "cooldown_s": self.cooldown_s,
             },
             confidence=decision.confidence,
@@ -272,25 +203,14 @@ def _coerce_trigger_gesture(value: object) -> SocialFineHandGesture:
     text = " ".join(str(value or "").strip().lower().replace("-", " ").split())
     if not text:
         return _DEFAULT_TRIGGER_GESTURE
-    normalized = text.replace(" ", "_")
-    aliases = {
-        "peace": SocialFineHandGesture.PEACE_SIGN,
-        "victory": SocialFineHandGesture.PEACE_SIGN,
-    }
-    gesture = aliases.get(normalized)
-    if gesture is not None:
-        return gesture
-    try:
-        parsed = SocialFineHandGesture(normalized)
-    except ValueError:
-        return _DEFAULT_TRIGGER_GESTURE
-    if parsed in {SocialFineHandGesture.NONE, SocialFineHandGesture.UNKNOWN}:
-        return _DEFAULT_TRIGGER_GESTURE
-    return parsed
+    for member in SocialFineHandGesture:
+        if member.value == text.replace(" ", "_"):
+            return member
+    return _DEFAULT_TRIGGER_GESTURE
 
 
 def _coerce_confidence(value: object) -> float:
-    """Clamp one optional confidence score into a bounded ratio."""
+    """Clamp one optional gesture confidence into a bounded float."""
 
     try:
         numeric = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
@@ -306,7 +226,7 @@ def _coerce_confidence(value: object) -> float:
 
 
 def _coerce_non_negative_float(value: object, *, default: float) -> float:
-    """Return one finite non-negative float with fallback."""
+    """Clamp one optional cooldown to a finite non-negative float."""
 
     try:
         numeric = float(cast(str | bytes | bytearray | SupportsFloat | SupportsIndex, value))
@@ -314,6 +234,20 @@ def _coerce_non_negative_float(value: object, *, default: float) -> float:
         return default
     if numeric != numeric or numeric < 0.0:
         return default
+    return numeric
+
+
+def _coerce_optional_non_negative_int(value: object) -> int | None:
+    """Return one optional activation token as a non-negative integer."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 0:
+        return None
     return numeric
 
 

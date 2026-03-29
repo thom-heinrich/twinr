@@ -4,7 +4,9 @@ Purpose: keep fact payload construction and rising-edge event derivation
 separate from ops recording and display bridge helpers.
 
 Invariants: automation fact schemas, snapshot side effects, and derived sensor
-event names must remain compatible with the legacy observation mixin.
+event names must remain compatible with the legacy observation mixin, while
+attention-target derivation now reuses the same runtime perception
+orchestrator that drives HDMI and servo follow.
 """
 
 # mypy: ignore-errors
@@ -207,14 +209,20 @@ class ProactiveCoordinatorObservationFactsMixin:
             live_facts=facts,
             ambiguous_room_guard=ambiguous_room_guard,
         )
-        attention_target = self.attention_target_tracker.observe(
+        perception_runtime = self.perception_orchestrator.observe_attention(
             observed_at=now,
-            live_facts=facts,
+            source="automation_observation",
+            captured_at=camera_snapshot.last_camera_frame_at,
+            camera_snapshot=camera_snapshot,
+            audio_observation=audio_snapshot.observation,
+            audio_policy_snapshot=audio_policy_snapshot,
             runtime_status=getattr(getattr(self.runtime, "status", None), "value", None),
             presence_session_id=presence_session_id,
             speaker_association=speaker_association,
             identity_fusion=identity_fusion,
         )
+        assert perception_runtime.attention is not None
+        attention_target = perception_runtime.attention.attention_target
         person_state = derive_person_state(
             observed_at=now,
             live_facts={
@@ -234,6 +242,7 @@ class ProactiveCoordinatorObservationFactsMixin:
         self.latest_portrait_match_snapshot = portrait_match
         self.latest_known_user_hint_snapshot = known_user_hint
         self.latest_affect_proxy_snapshot = affect_proxy
+        self.latest_perception_runtime_snapshot = perception_runtime
         self.latest_attention_target_snapshot = attention_target
         self.latest_person_state_snapshot = person_state
         facts["speaker_association"] = speaker_association.to_automation_facts()

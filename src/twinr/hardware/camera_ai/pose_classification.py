@@ -245,6 +245,17 @@ class PoseTemporalState:
     right_wrist_history: Deque[_WristHistorySample] = field(default_factory=lambda: deque(maxlen=12))
 
 
+@dataclass(frozen=True, slots=True)
+class StreamGestureDecision:
+    """Describe one debounced gesture decision for live-stream callers."""
+
+    current_event: AICameraGestureEvent
+    emitted_event: AICameraGestureEvent
+    candidate_event: AICameraGestureEvent
+    confidence: float | None
+    cooldown_until_ms: int
+
+
 def _build_geometry_context(
     *,
     left_shoulder: Joint | None,
@@ -1198,6 +1209,35 @@ def classify_gesture(
     )
 
 
+def classify_gesture_stream(
+    keypoints: Mapping[int, Joint],
+    *,
+    attention_score: float,
+    fallback_box: AICameraBox,
+    state: PoseTemporalState,
+    timestamp_ms: int,
+) -> StreamGestureDecision:
+    """Return one explicit stream gesture decision on top of the debounced API."""
+
+    emitted_event, confidence = classify_gesture(
+        keypoints,
+        attention_score=attention_score,
+        fallback_box=fallback_box,
+        state=state,
+        timestamp_ms=timestamp_ms,
+    )
+    current_event = state.gesture_last_emitted
+    if emitted_event is not AICameraGestureEvent.NONE:
+        current_event = emitted_event
+    return StreamGestureDecision(
+        current_event=current_event,
+        emitted_event=emitted_event,
+        candidate_event=state.gesture_candidate,
+        confidence=confidence,
+        cooldown_until_ms=max(0, int(state.gesture_cooldown_until_ms)),
+    )
+
+
 def _body_evidence_from_centerline(
     *,
     left_shoulder: Joint | None,
@@ -1476,8 +1516,10 @@ def classify_body_pose(
 
 __all__ = [
     "PoseTemporalState",
+    "StreamGestureDecision",
     "classify_body_pose",
     "classify_gesture",
+    "classify_gesture_stream",
     "matches_horizontal_arm_toward_center",
     "matches_vertical_arm",
     "matches_wave_arm",

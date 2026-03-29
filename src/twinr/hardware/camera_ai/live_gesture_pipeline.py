@@ -3,6 +3,7 @@
 # BUG-2: Fixed stale hand-box rescue leakage after fresh live no-hand results; recent cached boxes can no longer bypass the current-frame no-hand veto.
 # BUG-3: Enforced monotonically increasing LIVE_STREAM timestamps before recognize_async() to avoid MediaPipe timestamp regressions and silent frame drops.
 # BUG-4: Fixed the logically dead wave path; wave tracking now consumes current-frame open-palm center evidence directly instead of requiring an allowlisted fine-hand label.
+# BUG-5: Live-stream callbacks now carry stable runtime cache keys, so per-frame generation closures no longer force recognizer recreation.
 # SEC-1: Added bounded person-ROI / hand-ROI candidate budgets and full-frame rescue rate limiting to reduce practical CPU-exhaustion and latency-collapse attacks on Raspberry Pi 4.
 # SEC-2: Added generation-guarded callbacks and fail-closed exception handling so late callbacks after close() and recognizer/runtime errors do not corrupt live state or crash the lane.
 # IMP-1: Added bounded per-timestamp snapshot history so fallback reads exact-or-older results but never "future" callbacks from later frames.
@@ -42,6 +43,7 @@ from twinr.hardware.hand_landmarks import (
     MediaPipeHandLandmarkWorker,
 )
 
+from .authoritative_gestures import AuthoritativeGestureLane
 from .config import MediaPipeVisionConfig
 from .fine_hand_gestures import (
     BUILTIN_FINE_GESTURE_MAP,
@@ -52,13 +54,14 @@ from .fine_hand_gestures import (
     resolve_fine_hand_gesture,
 )
 from .geometry import iou
-from .mediapipe_runtime import MediaPipeTaskRuntime
+from .mediapipe_runtime import MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR, MediaPipeTaskRuntime
 from .models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
 
 _DEFAULT_MAX_RESULT_AGE_S = 0.75
 _DEFAULT_CURRENT_RESULT_WAIT_S = 0.20
 _DEFAULT_RESULT_HISTORY_SIZE = 12
+_DEFAULT_MAX_PENDING_LIVE_RESULT_AGE_S = 1.0
 _LIVE_CUSTOM_MIN_SCORE_FLOOR = 0.60
 
 _WAVE_WINDOW_S = 0.55
@@ -147,6 +150,13 @@ class LiveGestureFrameObservation:
     gesture_confidence: float | None = None
     hand_count: int = 0
     result_age_s: float | None = None
+    gesture_temporal_authoritative: bool = False
+    gesture_activation_key: str | None = None
+    gesture_activation_token: int | None = None
+    gesture_activation_started_at: float | None = None
+    gesture_activation_changed_at: float | None = None
+    gesture_activation_source: str | None = None
+    gesture_activation_rising: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +171,8 @@ class LiveGestureObservePolicy:
     allow_full_frame_hand_recovery: bool = True
     allow_recent_person_boxes: bool = True
     allow_recent_hand_boxes: bool = True
+    prefer_live_hand_roi_before_person_roi: bool = False
+    require_weak_live_stream_consensus: bool = False
 
     @classmethod
     def full(cls) -> "LiveGestureObservePolicy":
@@ -172,11 +184,13 @@ class LiveGestureObservePolicy:
             name="user_facing_fast",
             enable_custom_live=True,
             enable_custom_roi=False,
-            allow_person_roi_recovery=False,
+            allow_person_roi_recovery=True,
             allow_live_hand_roi_recovery=True,
             allow_full_frame_hand_recovery=False,
             allow_recent_person_boxes=False,
             allow_recent_hand_boxes=False,
+            prefer_live_hand_roi_before_person_roi=True,
+            require_weak_live_stream_consensus=True,
         )
 
 
@@ -310,8 +324,11 @@ class _GestureStabilityTracker:
         confidence: float | None,
         resolved_source: str,
         hand_count: int,
+        require_weak_live_stream_consensus: bool = False,
     ) -> tuple[AICameraFineHandGesture, float | None, dict[str, object]]:
-        if not _live_temporal_stability_enabled(self._config):
+        temporal_stability_enabled = _live_temporal_stability_enabled(self._config)
+        temporal_enabled = temporal_stability_enabled or require_weak_live_stream_consensus
+        if not temporal_enabled:
             return gesture, confidence, {
                 "temporal_enabled": False,
                 "temporal_reason": "disabled",
@@ -340,7 +357,7 @@ class _GestureStabilityTracker:
             if score >= strong_confidence:
                 self._remember_output(gesture, confidence, observed_at)
                 return gesture, confidence, {
-                    "temporal_enabled": True,
+                    "temporal_enabled": temporal_enabled,
                     "temporal_reason": "strong_current",
                     "temporal_votes": votes,
                     "temporal_output_gesture": gesture.value,
@@ -352,7 +369,7 @@ class _GestureStabilityTracker:
                 stabilized_confidence = max(score, mean_confidence or 0.0)
                 self._remember_output(gesture, stabilized_confidence, observed_at)
                 return gesture, stabilized_confidence, {
-                    "temporal_enabled": True,
+                    "temporal_enabled": temporal_enabled,
                     "temporal_reason": "consensus",
                     "temporal_votes": votes,
                     "temporal_output_gesture": gesture.value,
@@ -361,9 +378,29 @@ class _GestureStabilityTracker:
                     "temporal_resolved_source": "temporal_consensus",
                 }
             if resolved_source != "live_stream":
+                if not temporal_stability_enabled:
+                    return gesture, confidence, {
+                        "temporal_enabled": temporal_enabled,
+                        "temporal_reason": "rescue_passthrough",
+                        "temporal_votes": votes,
+                        "temporal_output_gesture": gesture.value,
+                        "temporal_output_confidence": _round_optional_confidence(confidence),
+                        "temporal_output_changed": False,
+                        "temporal_resolved_source": resolved_source,
+                    }
                 return AICameraFineHandGesture.NONE, None, {
-                    "temporal_enabled": True,
+                    "temporal_enabled": temporal_enabled,
                     "temporal_reason": "rescue_waiting_for_consensus",
+                    "temporal_votes": votes,
+                    "temporal_output_gesture": AICameraFineHandGesture.NONE.value,
+                    "temporal_output_confidence": None,
+                    "temporal_output_changed": True,
+                    "temporal_resolved_source": "temporal_guard",
+                }
+            if require_weak_live_stream_consensus:
+                return AICameraFineHandGesture.NONE, None, {
+                    "temporal_enabled": temporal_enabled,
+                    "temporal_reason": "weak_live_waiting_for_consensus",
                     "temporal_votes": votes,
                     "temporal_output_gesture": AICameraFineHandGesture.NONE.value,
                     "temporal_output_confidence": None,
@@ -372,7 +409,7 @@ class _GestureStabilityTracker:
                 }
             self._remember_output(gesture, confidence, observed_at)
             return gesture, confidence, {
-                "temporal_enabled": True,
+                "temporal_enabled": temporal_enabled,
                 "temporal_reason": "live_passthrough",
                 "temporal_votes": votes,
                 "temporal_output_gesture": gesture.value,
@@ -388,7 +425,7 @@ class _GestureStabilityTracker:
             and (hand_count > 0 or (observed_at - self._last_output_at) <= (hold_s * 0.5))
         ):
             return self._last_output_gesture, self._last_output_confidence, {
-                "temporal_enabled": True,
+                "temporal_enabled": temporal_enabled,
                 "temporal_reason": "hold_recent",
                 "temporal_votes": 0,
                 "temporal_output_gesture": self._last_output_gesture.value,
@@ -398,7 +435,7 @@ class _GestureStabilityTracker:
             }
 
         return gesture, confidence, {
-            "temporal_enabled": True,
+            "temporal_enabled": temporal_enabled,
             "temporal_reason": "none",
             "temporal_votes": 0,
             "temporal_output_gesture": gesture.value,
@@ -455,6 +492,7 @@ class LiveGesturePipeline:
 
         self._wave_tracker = _WaveGestureTracker()
         self._stability_tracker = _GestureStabilityTracker(config=config)
+        self._authoritative_gesture_lane = AuthoritativeGestureLane()
         self._hand_landmark_worker: MediaPipeHandLandmarkWorker | None = None
 
         self._recent_primary_person_box: AICameraBox | None = None
@@ -467,7 +505,13 @@ class LiveGesturePipeline:
         self._last_debug_snapshot: dict[str, object] = {}
         self._last_submitted_live_timestamp_ms = 0
         self._last_full_frame_rescue_at: float | None = None
+        self._pending_live_builtin_timestamp_ms: int | None = None
+        self._pending_live_custom_timestamp_ms: int | None = None
+        self._pending_live_builtin_submitted_mono_s: float | None = None
+        self._pending_live_custom_submitted_mono_s: float | None = None
         self._callback_generation = 0
+        self._builtin_callback_cache_key = ("LiveGesturePipeline", id(self), "builtin")
+        self._custom_callback_cache_key = ("LiveGesturePipeline", id(self), "custom")
 
     def close(self) -> None:
         """Close live-stream recognizers and reset cached callback state."""
@@ -480,8 +524,13 @@ class LiveGesturePipeline:
             self._custom_history.clear()
             self._wave_tracker = _WaveGestureTracker()
             self._stability_tracker = _GestureStabilityTracker(config=self.config)
+            self._authoritative_gesture_lane.reset()
             self._last_submitted_live_timestamp_ms = 0
             self._last_full_frame_rescue_at = None
+            self._pending_live_builtin_timestamp_ms = None
+            self._pending_live_custom_timestamp_ms = None
+            self._pending_live_builtin_submitted_mono_s = None
+            self._pending_live_custom_submitted_mono_s = None
 
             worker = self._hand_landmark_worker
             self._hand_landmark_worker = None
@@ -531,29 +580,38 @@ class LiveGesturePipeline:
                 image = self._runtime.build_image(runtime, frame_rgb=frame_rgb)
                 timestamp_ms = self._next_live_timestamp_ms(observed_at)
                 frame_time_s = timestamp_ms / 1000.0
+                observe_started_mono_s = monotonic()
                 live_custom_enabled = (
                     active_policy.enable_custom_live and _live_custom_gesture_enabled(self.config)
+                )
+                live_submission_debug = self._reset_stale_live_submissions(
+                    observed_mono_s=observe_started_mono_s,
                 )
                 with self._lock:
                     generation = self._callback_generation
 
-                builtin_recognizer = self._runtime.ensure_live_gesture_recognizer(
-                    runtime,
-                    result_callback=self._make_builtin_result_handler(generation),
-                    num_hands_override=_LIVE_GESTURE_NUM_HANDS,
+                builtin_submitted = self._submit_live_builtin_frame(
+                    runtime=runtime,
+                    image=image,
+                    timestamp_ms=timestamp_ms,
+                    generation=generation,
+                    observed_mono_s=observe_started_mono_s,
                 )
-                builtin_recognizer.recognize_async(image, timestamp_ms)
 
+                custom_submitted = False
                 if live_custom_enabled:
-                    custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
-                        runtime,
-                        result_callback=self._make_custom_result_handler(generation),
+                    custom_submitted = self._submit_live_custom_frame(
+                        runtime=runtime,
+                        image=image,
+                        timestamp_ms=timestamp_ms,
+                        generation=generation,
+                        observed_mono_s=observe_started_mono_s,
                     )
-                    custom_recognizer.recognize_async(image, timestamp_ms)
 
                 wait_s, builtin_ready, custom_ready = self._await_current_live_results(
                     timestamp_ms=timestamp_ms,
-                    expect_custom=live_custom_enabled,
+                    expect_builtin=builtin_submitted,
+                    expect_custom=live_custom_enabled and custom_submitted,
                 )
 
                 return self._build_observation(
@@ -565,6 +623,9 @@ class LiveGesturePipeline:
                     live_result_wait_s=wait_s,
                     current_live_builtin_ready=builtin_ready,
                     current_live_custom_ready=(custom_ready if live_custom_enabled else None),
+                    live_builtin_submitted=builtin_submitted,
+                    live_custom_submitted=(custom_submitted if live_custom_enabled else None),
+                    live_submission_debug=live_submission_debug,
                     observe_policy=active_policy,
                     primary_person_box=primary_person_box,
                     visible_person_boxes=visible_person_boxes,
@@ -593,6 +654,9 @@ class LiveGesturePipeline:
         live_result_wait_s: float,
         current_live_builtin_ready: bool,
         current_live_custom_ready: bool | None,
+        live_builtin_submitted: bool,
+        live_custom_submitted: bool | None,
+        live_submission_debug: Mapping[str, object],
         observe_policy: LiveGestureObservePolicy,
         primary_person_box: AICameraBox | None,
         visible_person_boxes: tuple[AICameraBox, ...],
@@ -723,6 +787,8 @@ class LiveGesturePipeline:
             "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
             "current_live_builtin_ready": current_live_builtin_ready,
             "current_live_custom_ready": current_live_custom_ready,
+            "live_builtin_submitted": live_builtin_submitted,
+            "live_custom_submitted": live_custom_submitted,
             "fresh_live_results_confirm_no_hand": fresh_live_results_confirm_no_hand,
             "input_person_count": max(0, int(person_count)),
             "primary_person_box_available": primary_person_box is not None,
@@ -754,7 +820,11 @@ class LiveGesturePipeline:
             "observe_policy_allow_full_frame_hand_recovery": observe_policy.allow_full_frame_hand_recovery,
             "observe_policy_allow_recent_person_boxes": observe_policy.allow_recent_person_boxes,
             "observe_policy_allow_recent_hand_boxes": observe_policy.allow_recent_hand_boxes,
+            "observe_policy_require_weak_live_stream_consensus": (
+                observe_policy.require_weak_live_stream_consensus
+            ),
         }
+        debug_snapshot.update(dict(live_submission_debug))
 
         if fine_hand_gesture == AICameraFineHandGesture.NONE:
             rescue_blocked_by_live_no_hand = (
@@ -767,8 +837,21 @@ class LiveGesturePipeline:
                 limit=_live_max_person_roi_candidates(self.config),
             )
             debug_snapshot["person_roi_candidate_count"] = len(selected_person_boxes)
+            selected_hand_boxes = _prioritize_hand_boxes(
+                hand_boxes=effective_hand_boxes,
+                limit=_live_max_hand_roi_candidates(self.config),
+            )
+            debug_snapshot["live_roi_candidate_count"] = len(selected_hand_boxes)
+            debug_snapshot["live_roi_hand_box_count"] = len(selected_hand_boxes)
 
-            if selected_person_boxes and observe_policy.allow_person_roi_recovery:
+            if (
+                selected_person_boxes
+                and observe_policy.allow_person_roi_recovery
+                and not (
+                    observe_policy.prefer_live_hand_roi_before_person_roi
+                    and selected_hand_boxes
+                )
+            ):
                 person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
                     runtime=runtime,
                     frame_rgb=frame_rgb,
@@ -797,15 +880,14 @@ class LiveGesturePipeline:
                     )
             elif selected_person_boxes and not observe_policy.allow_person_roi_recovery:
                 debug_snapshot["person_roi_block_reason"] = "observe_policy_disallows_person_roi_recovery"
+            elif (
+                selected_person_boxes
+                and observe_policy.prefer_live_hand_roi_before_person_roi
+                and selected_hand_boxes
+            ):
+                debug_snapshot["person_roi_block_reason"] = "deferred_until_live_hand_roi_exhausted"
             elif rescue_blocked_by_live_no_hand:
                 debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
-
-            selected_hand_boxes = _prioritize_hand_boxes(
-                hand_boxes=effective_hand_boxes,
-                limit=_live_max_hand_roi_candidates(self.config),
-            )
-            debug_snapshot["live_roi_candidate_count"] = len(selected_hand_boxes)
-            debug_snapshot["live_roi_hand_box_count"] = len(selected_hand_boxes)
 
             if fine_hand_gesture == AICameraFineHandGesture.NONE and rescue_blocked_by_live_no_hand:
                 debug_snapshot["live_roi_skip_reason"] = "fresh_live_results_confirm_no_hand"
@@ -825,6 +907,40 @@ class LiveGesturePipeline:
                     )
             elif fine_hand_gesture == AICameraFineHandGesture.NONE:
                 debug_snapshot["live_roi_skip_reason"] = "observe_policy_disallows_live_hand_roi_recovery"
+
+            if (
+                fine_hand_gesture == AICameraFineHandGesture.NONE
+                and selected_person_boxes
+                and observe_policy.allow_person_roi_recovery
+                and observe_policy.prefer_live_hand_roi_before_person_roi
+                and selected_hand_boxes
+            ):
+                person_roi_choice, person_roi_debug = self._recognize_from_person_rois(
+                    runtime=runtime,
+                    frame_rgb=frame_rgb,
+                    timestamp_ms=timestamp_ms,
+                    primary_person_box=effective_primary_person_box,
+                    person_boxes=selected_person_boxes,
+                    sparse_keypoints=sparse_keypoints,
+                    allow_custom=observe_policy.enable_custom_roi,
+                )
+                debug_snapshot.update(person_roi_debug)
+                if rescue_blocked_by_live_no_hand and not _allow_person_roi_rescue_despite_live_no_hand(
+                    person_roi_choice[0],
+                    detection_debug=person_roi_debug.get("person_roi_detection_debug", ()),
+                ):
+                    debug_snapshot["person_roi_block_reason"] = "fresh_live_results_confirm_no_hand"
+                elif person_roi_choice[0] != AICameraFineHandGesture.NONE:
+                    fine_hand_gesture, fine_hand_confidence = person_roi_choice
+                    debug_snapshot["resolved_source"] = (
+                        "recent_visible_person_roi"
+                        if len(selected_person_boxes) > 1 and visible_person_box_source == "recent"
+                        else "visible_person_roi"
+                        if len(selected_person_boxes) > 1
+                        else "recent_person_roi"
+                        if visible_person_box_source == "recent"
+                        else "person_roi"
+                    )
 
             if rescue_blocked_by_live_no_hand and fine_hand_gesture == AICameraFineHandGesture.NONE:
                 debug_snapshot["full_frame_hand_attempt_reason"] = "fresh_live_results_confirm_no_hand"
@@ -878,15 +994,26 @@ class LiveGesturePipeline:
             confidence=fine_hand_confidence,
             resolved_source=raw_resolved_source,
             hand_count=hand_count,
+            require_weak_live_stream_consensus=observe_policy.require_weak_live_stream_consensus,
         )
         debug_snapshot.update(temporal_debug)
-        if bool(debug_snapshot.get("temporal_output_changed")):
+        temporal_resolved_source = str(
+            debug_snapshot.get("temporal_resolved_source", raw_resolved_source) or raw_resolved_source
+        )
+        if temporal_resolved_source != raw_resolved_source:
             debug_snapshot["resolved_source_raw"] = raw_resolved_source
-            debug_snapshot["resolved_source"] = str(
-                debug_snapshot.get("temporal_resolved_source", raw_resolved_source) or raw_resolved_source
-            )
+            debug_snapshot["resolved_source"] = temporal_resolved_source
         fine_hand_gesture = stabilized_gesture
         fine_hand_confidence = stabilized_confidence
+        authoritative_activation, authoritative_debug = self._authoritative_gesture_lane.observe(
+            observed_at=observed_at,
+            fine_hand_gesture=fine_hand_gesture,
+            fine_hand_gesture_confidence=fine_hand_confidence,
+            gesture_event=gesture_event,
+            gesture_confidence=gesture_confidence,
+            resolved_source=str(debug_snapshot.get("resolved_source", "none") or "none"),
+        )
+        debug_snapshot.update(authoritative_debug)
 
         workflow_decision(
             msg="live_gesture_pipeline_resolution",
@@ -946,6 +1073,13 @@ class LiveGesturePipeline:
             gesture_confidence=gesture_confidence,
             hand_count=hand_count,
             result_age_s=result_age_s,
+            gesture_temporal_authoritative=True,
+            gesture_activation_key=authoritative_activation.activation_key,
+            gesture_activation_token=authoritative_activation.activation_token,
+            gesture_activation_started_at=authoritative_activation.activation_started_at,
+            gesture_activation_changed_at=authoritative_activation.activation_changed_at,
+            gesture_activation_source=authoritative_activation.activation_source,
+            gesture_activation_rising=authoritative_activation.activation_rising,
         )
 
     def _recognize_from_person_rois(
@@ -1244,6 +1378,7 @@ class LiveGesturePipeline:
                 timestamp_ms=timestamp_ms,
                 generation=generation,
             )
+        setattr(_callback, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR, self._builtin_callback_cache_key)
         return _callback
 
     def _make_custom_result_handler(self, generation: int):
@@ -1254,6 +1389,7 @@ class LiveGesturePipeline:
                 timestamp_ms=timestamp_ms,
                 generation=generation,
             )
+        setattr(_callback, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR, self._custom_callback_cache_key)
         return _callback
 
     def _handle_builtin_result(
@@ -1283,6 +1419,12 @@ class LiveGesturePipeline:
         with self._result_condition:
             if generation != self._callback_generation:
                 return
+            if (
+                self._pending_live_builtin_timestamp_ms is not None
+                and timestamp_ms >= self._pending_live_builtin_timestamp_ms
+            ):
+                self._pending_live_builtin_timestamp_ms = None
+                self._pending_live_builtin_submitted_mono_s = None
             _remember_snapshot(
                 self._builtin_history,
                 snapshot,
@@ -1316,6 +1458,12 @@ class LiveGesturePipeline:
         with self._result_condition:
             if generation != self._callback_generation:
                 return
+            if (
+                self._pending_live_custom_timestamp_ms is not None
+                and timestamp_ms >= self._pending_live_custom_timestamp_ms
+            ):
+                self._pending_live_custom_timestamp_ms = None
+                self._pending_live_custom_submitted_mono_s = None
             _remember_snapshot(
                 self._custom_history,
                 snapshot,
@@ -1593,6 +1741,120 @@ class LiveGesturePipeline:
             )
             return self._hand_landmark_worker
 
+    def _submit_live_builtin_frame(
+        self,
+        *,
+        runtime: dict[str, Any],
+        image: Any,
+        timestamp_ms: int,
+        generation: int,
+        observed_mono_s: float,
+    ) -> bool:
+        with self._lock:
+            if self._pending_live_builtin_timestamp_ms is not None:
+                return False
+            self._pending_live_builtin_timestamp_ms = timestamp_ms
+            self._pending_live_builtin_submitted_mono_s = observed_mono_s
+        try:
+            builtin_recognizer = self._runtime.ensure_live_gesture_recognizer(
+                runtime,
+                result_callback=self._make_builtin_result_handler(generation),
+                num_hands_override=_LIVE_GESTURE_NUM_HANDS,
+            )
+            builtin_recognizer.recognize_async(image, timestamp_ms)
+            return True
+        except Exception:
+            with self._lock:
+                if self._pending_live_builtin_timestamp_ms == timestamp_ms:
+                    self._pending_live_builtin_timestamp_ms = None
+                    self._pending_live_builtin_submitted_mono_s = None
+            raise
+
+    def _submit_live_custom_frame(
+        self,
+        *,
+        runtime: dict[str, Any],
+        image: Any,
+        timestamp_ms: int,
+        generation: int,
+        observed_mono_s: float,
+    ) -> bool:
+        with self._lock:
+            if self._pending_live_custom_timestamp_ms is not None:
+                return False
+            self._pending_live_custom_timestamp_ms = timestamp_ms
+            self._pending_live_custom_submitted_mono_s = observed_mono_s
+        try:
+            custom_recognizer = self._runtime.ensure_live_custom_gesture_recognizer(
+                runtime,
+                result_callback=self._make_custom_result_handler(generation),
+            )
+            custom_recognizer.recognize_async(image, timestamp_ms)
+            return True
+        except Exception:
+            with self._lock:
+                if self._pending_live_custom_timestamp_ms == timestamp_ms:
+                    self._pending_live_custom_timestamp_ms = None
+                    self._pending_live_custom_submitted_mono_s = None
+            raise
+
+    def _reset_stale_live_submissions(
+        self,
+        *,
+        observed_mono_s: float,
+    ) -> dict[str, object]:
+        timeout_s = _live_pending_result_timeout_s(self.config)
+        debug: dict[str, object] = {
+            "live_pending_backpressure": False,
+            "live_pending_reset": False,
+            "live_pending_reset_reason": None,
+            "live_builtin_pending_age_s": None,
+            "live_custom_pending_age_s": None,
+        }
+
+        reset_required = False
+        with self._lock:
+            builtin_age_s = (
+                None
+                if self._pending_live_builtin_submitted_mono_s is None
+                else max(0.0, observed_mono_s - self._pending_live_builtin_submitted_mono_s)
+            )
+            custom_age_s = (
+                None
+                if self._pending_live_custom_submitted_mono_s is None
+                else max(0.0, observed_mono_s - self._pending_live_custom_submitted_mono_s)
+            )
+            debug["live_builtin_pending_age_s"] = _round_optional_confidence(builtin_age_s)
+            debug["live_custom_pending_age_s"] = _round_optional_confidence(custom_age_s)
+            debug["live_pending_backpressure"] = (
+                self._pending_live_builtin_timestamp_ms is not None
+                or self._pending_live_custom_timestamp_ms is not None
+            )
+            builtin_stale = builtin_age_s is not None and builtin_age_s >= timeout_s
+            custom_stale = custom_age_s is not None and custom_age_s >= timeout_s
+            if builtin_stale or custom_stale:
+                self._callback_generation += 1
+                self._latest_builtin = None
+                self._latest_custom = None
+                self._builtin_history.clear()
+                self._custom_history.clear()
+                self._pending_live_builtin_timestamp_ms = None
+                self._pending_live_custom_timestamp_ms = None
+                self._pending_live_builtin_submitted_mono_s = None
+                self._pending_live_custom_submitted_mono_s = None
+                debug["live_pending_backpressure"] = False
+                debug["live_pending_reset"] = True
+                reasons: list[str] = []
+                if builtin_stale:
+                    reasons.append("builtin_timeout")
+                if custom_stale:
+                    reasons.append("custom_timeout")
+                debug["live_pending_reset_reason"] = "+".join(reasons)
+                reset_required = True
+        if reset_required:
+            self._runtime.reset_live_gesture_recognizers()
+        return debug
+
     def _select_snapshot_from_history(
         self,
         *,
@@ -1630,23 +1892,26 @@ class LiveGesturePipeline:
         self,
         *,
         timestamp_ms: int,
+        expect_builtin: bool,
         expect_custom: bool,
     ) -> tuple[float, bool, bool]:
         wait_started_at = monotonic()
+        if not expect_builtin and not expect_custom:
+            return 0.0, False, False
         with self._result_condition:
-            builtin_ready = timestamp_ms in self._builtin_history
+            builtin_ready = (not expect_builtin) or (timestamp_ms in self._builtin_history)
             custom_ready = (not expect_custom) or (timestamp_ms in self._custom_history)
             if not (builtin_ready and custom_ready):
                 self._result_condition.wait_for(
                     lambda: (
-                        timestamp_ms in self._builtin_history
+                        ((not expect_builtin) or (timestamp_ms in self._builtin_history))
                         and ((not expect_custom) or (timestamp_ms in self._custom_history))
                     ),
                     timeout=_DEFAULT_CURRENT_RESULT_WAIT_S,
                 )
-                builtin_ready = timestamp_ms in self._builtin_history
+                builtin_ready = (not expect_builtin) or (timestamp_ms in self._builtin_history)
                 custom_ready = (not expect_custom) or (timestamp_ms in self._custom_history)
-        return monotonic() - wait_started_at, builtin_ready, custom_ready
+        return monotonic() - wait_started_at, (builtin_ready and expect_builtin), (custom_ready and expect_custom)
 
     def _fail_closed_observation(
         self,
@@ -2466,6 +2731,15 @@ def _live_full_frame_rescue_min_interval_s(config: MediaPipeVisionConfig) -> flo
         default=_DEFAULT_FULL_FRAME_RESCUE_MIN_INTERVAL_S,
         minimum=0.0,
         maximum=2.0,
+    )
+
+
+def _live_pending_result_timeout_s(config: MediaPipeVisionConfig) -> float:
+    return _coerce_bounded_float(
+        getattr(config, "live_pending_result_timeout_s", None),
+        default=_DEFAULT_MAX_PENDING_LIVE_RESULT_AGE_S,
+        minimum=max(_DEFAULT_CURRENT_RESULT_WAIT_S, 0.25),
+        maximum=5.0,
     )
 
 

@@ -16,17 +16,14 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.memory import ConversationTurn
-from twinr.ops import (
-    TwinrOpsEventStore,
-    TwinrSelfTestRunner,
-    TwinrUsageStore,
-    TokenUsage,
-    build_support_bundle,
-    collect_system_health,
-    run_config_checks,
-)
+from twinr.ops.checks import run_config_checks
+from twinr.ops.events import TwinrOpsEventStore
+from twinr.ops.health import collect_system_health
 from twinr.ops.locks import loop_instance_lock
 from twinr.ops.runtime_scope import build_scoped_runtime_config, resolve_scoped_runtime_state_path
+from twinr.ops.self_test import TwinrSelfTestRunner
+from twinr.ops.support import build_support_bundle
+from twinr.ops.usage import TokenUsage, TwinrUsageStore
 
 _TINY_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl9l2sAAAAASUVORK5CYII="
@@ -507,6 +504,63 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(result.summary, "Proactive background-microphone sample captured.")
         self.assertIn("plughw:CARD=CameraB409241,DEV=0", result.details[0])
         self.assertIn("Speech-like activity: yes", result.details[-1])
+
+    def test_proactive_mic_self_test_is_blocked_when_voice_orchestrator_owns_same_device(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_audio_enabled=True,
+                voice_orchestrator_enabled=True,
+                voice_orchestrator_ws_url="ws://127.0.0.1:8765/voice",
+                audio_input_device="plughw:CARD=Array,DEV=0",
+                proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+                voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            )
+            runner = TwinrSelfTestRunner(
+                config,
+                ambient_sampler_factory=lambda _config: self.fail("ambient sampler must not be constructed"),
+            )
+
+            with patch("twinr.proactive.runtime.service_impl.compat.loop_lock_owner", side_effect=[9876]):
+                result = runner.run("proactive_mic")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("voice orchestrator owns the same capture device", result.summary)
+
+    def test_proactive_mic_self_test_uses_pcm_when_voice_orchestrator_is_inactive(self) -> None:
+        class FakeAmbientSampler:
+            def sample_levels(self, *, duration_ms: int | None = None):
+                return AmbientAudioLevelSample(
+                    duration_ms=duration_ms or 900,
+                    chunk_count=4,
+                    active_chunk_count=0,
+                    average_rms=220,
+                    peak_rms=400,
+                    active_ratio=0.0,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_audio_enabled=True,
+                proactive_audio_sample_ms=900,
+                voice_orchestrator_enabled=True,
+                voice_orchestrator_ws_url="ws://127.0.0.1:8765/voice",
+                audio_input_device="plughw:CARD=Array,DEV=0",
+                proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+                voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            )
+            runner = TwinrSelfTestRunner(
+                config,
+                ambient_sampler_factory=lambda _config: FakeAmbientSampler(),
+            )
+
+            with patch("twinr.proactive.runtime.service_impl.compat.loop_lock_owner", side_effect=[None, None]):
+                result = runner.run("proactive_mic")
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.summary, "Proactive background-microphone sample captured.")
+        self.assertIn("plughw:CARD=Array,DEV=0", result.details[0])
 
     def test_printer_self_test_requires_manual_confirmation(self) -> None:
         class FakePrinter:

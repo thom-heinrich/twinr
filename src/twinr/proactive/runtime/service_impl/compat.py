@@ -21,6 +21,7 @@ from twinr.hardware.audio import (
     capture_device_identity,
     resolve_capture_device,
 )
+from twinr.ops.locks import loop_lock_owner
 
 if TYPE_CHECKING:
     from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
@@ -156,8 +157,17 @@ def _voice_orchestrator_capture_device(config: TwinrConfig) -> str:
 
 def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
     config: TwinrConfig,
+    *,
+    require_active_owner: bool = False,
 ) -> bool:
-    """Return whether proactive PCM fallback would fight a shared voice capture."""
+    """Return whether proactive PCM fallback would fight a shared voice capture.
+
+    Production monitor assembly uses the shared-device check alone because the
+    proactive monitor and voice orchestrator run inside the same long-lived
+    process. Standalone diagnostics and self-tests can opt into
+    ``require_active_owner`` so a merely configured voice orchestrator does not
+    block bounded PCM probes after the runtime supervisor was stopped.
+    """
 
     if not bool(getattr(config, "voice_orchestrator_enabled", False)):
         return False
@@ -167,7 +177,23 @@ def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
     voice_device = _voice_orchestrator_capture_device(config)
     if not proactive_device or not voice_device:
         return False
-    return capture_device_identity(proactive_device) == capture_device_identity(voice_device)
+    if capture_device_identity(proactive_device) != capture_device_identity(voice_device):
+        return False
+    if not require_active_owner:
+        return True
+    for loop_name in ("runtime-supervisor", "streaming-loop"):
+        try:
+            owner = loop_lock_owner(config, loop_name)
+        except OSError:
+            _LOGGER.warning(
+                "Could not inspect %s lock owner while deciding standalone proactive PCM ownership; failing closed.",
+                loop_name,
+                exc_info=True,
+            )
+            return True
+        if owner is not None:
+            return True
+    return False
 
 
 def _normalize_text_tuple(values: Any) -> tuple[str, ...]:

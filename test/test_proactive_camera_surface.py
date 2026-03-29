@@ -21,6 +21,11 @@ from twinr.proactive.social.engine import (
     SocialVisionObservation,
 )
 from twinr.proactive.social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
+from twinr.proactive.social.perception_stream import (
+    PerceptionAttentionStreamObservation,
+    PerceptionGestureStreamObservation,
+    PerceptionStreamObservation,
+)
 from twinr.agent.base_agent import TwinrRuntime
 
 from test.test_proactive_monitor import FakeAudioObserver, FakePirMonitor, FakeVisionObserver, MutableClock
@@ -99,6 +104,99 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertIn("camera.fine_hand_gesture_detected", update.event_names)
         self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
         self.assertAlmostEqual(update.snapshot.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
+
+    def test_surface_uses_authoritative_attention_stream_without_local_looking_debounce(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                looking_toward_device_on_samples=2,
+                person_near_device_on_samples=2,
+                engaged_with_device_on_samples=2,
+                hand_or_object_near_camera_on_samples=2,
+                showing_intent_on_samples=2,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=2.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                looking_toward_device=True,
+                person_near_device=True,
+                engaged_with_device=True,
+                hand_or_object_near_camera=True,
+                showing_intent_likely=True,
+                perception_stream=PerceptionStreamObservation(
+                    attention=PerceptionAttentionStreamObservation(authoritative=True)
+                ),
+            ),
+        )
+
+        self.assertTrue(update.snapshot.looking_toward_device)
+        self.assertTrue(update.snapshot.person_near_device)
+        self.assertTrue(update.snapshot.engaged_with_device)
+        self.assertTrue(update.snapshot.hand_or_object_near_camera)
+        self.assertTrue(update.snapshot.showing_intent_likely)
+        self.assertIn("camera.attention_window_opened", update.event_names)
+        self.assertIn("camera.hand_or_object_near_camera", update.event_names)
+        self.assertIn("camera.showing_intent_started", update.event_names)
+
+    def test_surface_uses_authoritative_gesture_stream_without_local_reconfirmation(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=6.0,
+                fine_hand_explicit_confirm_samples=2,
+                fine_hand_explicit_min_confidence=0.72,
+                gesture_calibration=GestureCalibrationProfile(fine_hand={}),
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                hand_or_object_near_camera=True,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.63,
+                perception_stream=PerceptionStreamObservation(
+                    gesture=PerceptionGestureStreamObservation(
+                        authoritative=True,
+                        activation_key="fine:thumbs_up",
+                        activation_token=1,
+                        activation_rising=True,
+                    )
+                ),
+            ),
+        )
+        repeated = surface.observe(
+            inspected=True,
+            observed_at=1.2,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                hand_or_object_near_camera=True,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.63,
+                perception_stream=PerceptionStreamObservation(
+                    gesture=PerceptionGestureStreamObservation(
+                        authoritative=True,
+                        activation_key="fine:thumbs_up",
+                        activation_token=1,
+                        activation_rising=False,
+                    )
+                ),
+            ),
+        )
+
+        self.assertEqual(first.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(first.snapshot.fine_hand_gesture_confidence or 0.0, 0.63, places=3)
+        self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertNotIn("camera.fine_hand_gesture_detected", repeated.event_names)
 
     def test_surface_emits_changed_fine_hand_gesture_inside_cooldown(self) -> None:
         surface = ProactiveCameraSurface(

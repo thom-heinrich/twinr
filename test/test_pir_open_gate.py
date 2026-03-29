@@ -1,5 +1,6 @@
 from pathlib import Path
 import errno
+import subprocess
 import sys
 import unittest
 
@@ -44,6 +45,45 @@ class _BrokenMonitor:
         )
 
 
+class _CliBusyThenReadyMonitor:
+    def __init__(self, *, busy_failures: int) -> None:
+        self.busy_failures = busy_failures
+        self.open_attempts = 0
+
+    def open(self) -> "_CliBusyThenReadyMonitor":
+        self.open_attempts += 1
+        if self.busy_failures > 0:
+            self.busy_failures -= 1
+            raise PirMonitorError("Failed to open PIR monitor on 'gpiochip0'") from RuntimeError(
+                "gpioget failed with exit code 1: /usr/bin/gpioget: error reading GPIO values: Device or resource busy"
+            )
+        return self
+
+
+class _NonGpioBusyMonitor:
+    def open(self) -> "_NonGpioBusyMonitor":
+        raise PirMonitorError("Failed to open PIR monitor on 'gpiochip0'") from RuntimeError(
+            "arecord: main:828: audio open error: Device or resource busy"
+        )
+
+
+class _CliCalledProcessBusyThenReadyMonitor:
+    def __init__(self, *, busy_failures: int) -> None:
+        self.busy_failures = busy_failures
+        self.open_attempts = 0
+
+    def open(self) -> "_CliCalledProcessBusyThenReadyMonitor":
+        self.open_attempts += 1
+        if self.busy_failures > 0:
+            self.busy_failures -= 1
+            raise PirMonitorError("Failed to open PIR monitor on 'gpiochip0'") from subprocess.CalledProcessError(
+                1,
+                ["/usr/bin/gpioget", "--chip", "gpiochip0", "--numeric", "17"],
+                stderr="/usr/bin/gpioget: error reading GPIO values: Device or resource busy\n",
+            )
+        return self
+
+
 class PirOpenGateTests(unittest.TestCase):
     def test_open_retries_exact_busy_until_success(self) -> None:
         clock = _FakeClock()
@@ -61,9 +101,54 @@ class PirOpenGateTests(unittest.TestCase):
         self.assertEqual(result.attempt_count, 3)
         self.assertEqual(result.busy_retry_count, 2)
 
+    def test_open_retries_libgpiod_runtimeerror_busy_until_success(self) -> None:
+        clock = _FakeClock()
+        monitor = _CliBusyThenReadyMonitor(busy_failures=2)
+
+        result = open_pir_monitor_with_busy_retry(
+            monitor,
+            timeout_s=1.0,
+            retry_interval_s=0.1,
+            monotonic=clock,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(monitor.open_attempts, 3)
+        self.assertEqual(result.attempt_count, 3)
+        self.assertEqual(result.busy_retry_count, 2)
+
+    def test_open_retries_libgpiod_calledprocess_busy_until_success(self) -> None:
+        clock = _FakeClock()
+        monitor = _CliCalledProcessBusyThenReadyMonitor(busy_failures=2)
+
+        result = open_pir_monitor_with_busy_retry(
+            monitor,
+            timeout_s=1.0,
+            retry_interval_s=0.1,
+            monotonic=clock,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(monitor.open_attempts, 3)
+        self.assertEqual(result.attempt_count, 3)
+        self.assertEqual(result.busy_retry_count, 2)
+
     def test_open_propagates_non_busy_errors_without_retry(self) -> None:
         clock = _FakeClock()
         monitor = _BrokenMonitor()
+
+        with self.assertRaises(PirMonitorError):
+            open_pir_monitor_with_busy_retry(
+                monitor,
+                timeout_s=1.0,
+                retry_interval_s=0.1,
+                monotonic=clock,
+                sleep=clock.sleep,
+            )
+
+    def test_open_does_not_retry_non_gpio_busy_messages(self) -> None:
+        clock = _FakeClock()
+        monitor = _NonGpioBusyMonitor()
 
         with self.assertRaises(PirMonitorError):
             open_pir_monitor_with_busy_retry(

@@ -20,7 +20,7 @@ owned_concerns:
   - Adapt authoritative local semantic-router decisions, including optional two-stage user-intent routing, into supervisor-compatible handoffs for the streaming loop without moving bundle or ONNX logic into this package
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Render and queue one bounded startup boot clip from media/boot.mp3 through the shared playback coordinator without blocking loop startup
-  - Render and cache reusable workflow media clips such as the processing waiting ambience so repeated thinking loops stay bounded on the Pi
+  - Render and cache reusable workflow media clips while keeping the dragon processing MP3 as the default Pi thinking sound and falling back to synthesized tones when a cold cache or missing asset prevents immediate media playback
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Bridge structured personality steering cues into concrete follow-up reopen/close decisions
   - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns, with display-first prompts routed into the right-hand reserve lane instead of fullscreen presentation
@@ -252,13 +252,13 @@ files:
       - PrintLaneRequest
       - TwinrPrintLane
   - path: working_feedback.py
-    role: Bounded processing, answering, and printing tone/media loops with the significantly slowed quieter dragon processing clip as the default think cue and long-think attenuation
+    role: Bounded processing, answering, and printing tone/media loops with the dragon processing MP3 as the default think cue plus synthesized fallback support
     exports:
       - WorkingFeedbackKind
       - WorkingFeedbackProfile
       - start_working_feedback_loop
   - path: working_feedback_tone.py
-    role: Optional synthesized processing-tone helper kept for non-default cue experiments and direct tests
+    role: Synthesized processing-tone helper used by fallback/defaultless processing paths and direct tests
     exports:
       - PROCESSING_SWELL_TONE_SPEC
       - SwellingFeedbackToneSpec

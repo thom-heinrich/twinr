@@ -1,7 +1,35 @@
 # mypy: disable-error-code="attr-defined,has-type,assignment"
+# CHANGELOG: 2026-03-29
+# BUG-1: Recompute pending utterance timing after buffer trims so `active_ms`,
+#        `trailing_silence_ms`, and `speech_active` never drift away from the
+#        actual retained frame window.
+# BUG-2: Compute capture `active_ratio` by retained speech duration rather than
+#        frame count so jittery/variable websocket chunking cannot bias VAD
+#        gating decisions.
+# BUG-3: Guard direct barge-in transcription against transient backend errors so
+#        a network/provider blip does not tear down the voice loop.
+# BUG-4: Ignore zero-byte PCM ingress instead of fabricating a full silent chunk;
+#        treating empty frames as real time could force false endpointing.
+# SEC-1: Bound oversized PCM ingress and retain only the newest aligned tail so
+#        malformed or malicious websocket frames cannot force large allocations
+#        or oversized remote uploads on a Raspberry Pi.
+# SEC-2: Redact transcript previews in generic trace events by default to avoid
+#        leaking sensitive user speech into routine logs; raw previews remain
+#        opt-in via `voice_trace_include_transcripts=True`.
+# IMP-1: Add optional neural-VAD speech-probability support (e.g. Silero/openWakeWord
+#        side-channel scores) while preserving RMS fallback for drop-in compatibility.
+# IMP-2: Add duplicate-window suppression for remote stage-1 and barge-in scans to
+#        avoid rescanning identical audio and wasting latency, CPU, and API budget.
+# IMP-3: Preserve a small true pre-roll before the latest active burst, including
+#        zero-RMS frames, to reduce clipped wake-word/utterance onsets.
+# IMP-4: Add an optional semantic endpoint hook so newer 2026-style turn-state
+#        predictors can override fixed trailing-silence endpointing without
+#        changing this mixin's public API.
 """Frame buffering, utterance assembly, and candidate scanning helpers."""
 
 from __future__ import annotations
+
+import hashlib
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
@@ -34,6 +62,68 @@ class VoiceSessionScannerMixin:
             ),
         )
 
+    def _remote_asr_speech_probability_threshold(self) -> float | None:
+        """Return an optional neural-VAD threshold if the runtime exposes one."""
+
+        raw_threshold = getattr(self, "remote_asr_speech_probability_threshold", None)
+        if raw_threshold is None:
+            raw_threshold = getattr(
+                getattr(self, "config", None),
+                "remote_asr_speech_probability_threshold",
+                None,
+            )
+        if raw_threshold is None:
+            return None
+        try:
+            threshold = float(raw_threshold)
+        except (TypeError, ValueError):
+            return None
+        return min(1.0, max(0.0, threshold))
+
+    def _remote_asr_speech_continue_probability_threshold(self) -> float | None:
+        """Return the lower neural-VAD threshold for already-open speech bursts."""
+
+        threshold = self._remote_asr_speech_probability_threshold()
+        if threshold is None:
+            return None
+        return min(
+            threshold,
+            max(0.0, threshold * float(self._REMOTE_ASR_SPEECH_CONTINUE_RATIO)),
+        )
+
+    def _frame_speech_probability(self, frame: _RecentFrame) -> float | None:
+        """Resolve an optional per-frame speech probability from runtime hooks."""
+
+        raw_probability = None
+        for attribute in (
+            "speech_probability",
+            "vad_probability",
+            "speech_prob",
+            "vad_score",
+        ):
+            raw_probability = getattr(frame, attribute, None)
+            if raw_probability is not None:
+                break
+        if raw_probability is None:
+            resolver = getattr(self, "_resolve_frame_speech_probability", None)
+            if callable(resolver):
+                try:
+                    raw_probability = resolver(frame)  # pylint: disable=not-callable
+                except Exception:
+                    raw_probability = None
+        if raw_probability is None:
+            return None
+        try:
+            probability_input = (
+                raw_probability
+                if isinstance(raw_probability, (bool, int, float, str, bytes, bytearray))
+                else str(raw_probability)
+            )
+            probability = float(probability_input)
+        except (TypeError, ValueError):
+            return None
+        return min(1.0, max(0.0, probability))
+
     def _frame_counts_as_remote_asr_speech(
         self,
         frame: _RecentFrame,
@@ -42,6 +132,13 @@ class VoiceSessionScannerMixin:
     ) -> bool:
         """Treat speech bursts with bounded hysteresis for wake-duration accounting."""
 
+        speech_probability = self._frame_speech_probability(frame)
+        probability_threshold = self._remote_asr_speech_probability_threshold()
+        if speech_probability is not None and probability_threshold is not None:
+            if speech_probability >= probability_threshold:
+                return True
+            continue_threshold = self._remote_asr_speech_continue_probability_threshold()
+            return continuing and continue_threshold is not None and speech_probability >= continue_threshold
         if frame.rms >= self.speech_threshold:
             return True
         return continuing and frame.rms >= self._remote_asr_speech_continue_threshold()
@@ -74,20 +171,97 @@ class VoiceSessionScannerMixin:
             "pending_trailing_silence_ms": int(pending.trailing_silence_ms),
         }
 
+    def _bytes_per_pcm_sample(self) -> int:
+        """Return the PCM alignment size for one interleaved sample across channels."""
+
+        return max(2, int(self.channels) * 2)
+
+    def _expected_chunk_pcm_bytes(self) -> int:
+        """Return the nominal byte size for one configured audio chunk."""
+
+        bytes_per_second = max(1, int(self.sample_rate) * self._bytes_per_pcm_sample())
+        expected = int(round((bytes_per_second * max(1, int(self.chunk_ms))) / 1000.0))
+        alignment = self._bytes_per_pcm_sample()
+        expected -= expected % alignment
+        return max(alignment, expected)
+
+    def _max_ingress_pcm_bytes(self) -> int:
+        """Return the maximum PCM payload accepted from a single ingress frame."""
+
+        configured_limit = getattr(self, "max_ingress_pcm_bytes", None)
+        if configured_limit is None:
+            configured_limit = getattr(
+                getattr(self, "config", None),
+                "max_ingress_pcm_bytes",
+                None,
+            )
+        if configured_limit is not None:
+            try:
+                limit = int(configured_limit)
+            except (TypeError, ValueError):
+                limit = 0
+            if limit > 0:
+                alignment = self._bytes_per_pcm_sample()
+                limit -= limit % alignment
+                return max(alignment, limit)
+        return max(
+            self._expected_chunk_pcm_bytes(),
+            self._expected_chunk_pcm_bytes() * 32,
+        )
+
+    def _bounded_ingress_pcm_fragments(self, pcm_bytes: bytes) -> tuple[bytes, ...]:
+        """Normalize one ingress payload into aligned, bounded PCM chunks."""
+
+        if not pcm_bytes:
+            return ()
+        alignment = self._bytes_per_pcm_sample()
+        normalized = pcm_bytes
+        max_ingress_bytes = self._max_ingress_pcm_bytes()
+        if len(normalized) > max_ingress_bytes:
+            # BREAKING: Oversized ingress payloads are truncated to the newest
+            # aligned tail instead of being buffered whole. This prevents
+            # oversized websocket/audio frames from causing memory spikes or
+            # oversized uploads on constrained devices.
+            retained = max_ingress_bytes - (max_ingress_bytes % alignment)
+            normalized = normalized[-retained:]
+            self._trace_event(
+                "voice_frame_oversize_truncated",
+                kind="security",
+                details={
+                    "received_bytes": len(pcm_bytes),
+                    "retained_bytes": len(normalized),
+                    "max_ingress_pcm_bytes": max_ingress_bytes,
+                },
+            )
+        retained_bytes = len(normalized) - (len(normalized) % alignment)
+        if retained_bytes <= 0:
+            return ()
+        normalized = normalized[-retained_bytes:]
+        expected_chunk_bytes = self._expected_chunk_pcm_bytes()
+        if len(normalized) <= expected_chunk_bytes:
+            return (normalized,)
+        return tuple(
+            normalized[index : index + expected_chunk_bytes]
+            for index in range(0, len(normalized), expected_chunk_bytes)
+            if normalized[index : index + expected_chunk_bytes]
+        )
+
     def _remember_frame(self, pcm_bytes: bytes) -> None:
         """Append one PCM chunk into the bounded recent-history buffer."""
 
-        duration_ms = max(
-            self.chunk_ms,
-            int(round((len(pcm_bytes) / max(1, self.channels * 2 * self.sample_rate)) * 1000.0)),
-        )
-        self._history.append(
-            _RecentFrame(
-                pcm_bytes=pcm_bytes,
-                rms=_pcm16_rms(pcm_bytes),
-                duration_ms=duration_ms,
+        for fragment in self._bounded_ingress_pcm_fragments(pcm_bytes):
+            duration_ms = int(
+                round(
+                    (len(fragment) / max(1, self.channels * 2 * self.sample_rate)) * 1000.0,
+                ),
             )
-        )
+            self._history.append(
+                _RecentFrame(
+                    pcm_bytes=fragment,
+                    rms=_pcm16_rms(fragment),
+                    duration_ms=max(1, duration_ms),
+                )
+            )
 
     def _flush_received_frame_bucket(self) -> None:
         """Persist one bounded summary of recently received websocket frames."""
@@ -99,6 +273,198 @@ class VoiceSessionScannerMixin:
             kind="io",
             details=self._received_frame_bucket.flush_details(),
         )
+
+    def _trace_transcript_previews_enabled(self) -> bool:
+        """Return whether routine traces may include raw transcript previews."""
+
+        return bool(
+            getattr(self, "voice_trace_include_transcripts", False)
+            or getattr(
+                getattr(self, "config", None),
+                "voice_trace_include_transcripts",
+                False,
+            )
+        )
+
+    def _safe_transcript_preview(self, text: str | None, *, limit: int) -> str:
+        """Return a preview that is privacy-safe for generic trace events."""
+
+        resolved_text = str(text or "").strip()
+        if not resolved_text:
+            return ""
+        if self._trace_transcript_previews_enabled():
+            return resolved_text[:limit]
+        # BREAKING: Routine trace events now redact transcript previews by
+        # default. Set `voice_trace_include_transcripts=True` to restore raw
+        # previews for explicit debugging sessions.
+        digest = hashlib.blake2s(resolved_text.encode("utf-8"), digest_size=6).hexdigest()
+        return f"[redacted chars={len(resolved_text)} hash={digest}]"
+
+    def _scan_cache(self) -> dict[str, tuple[str, int, float]]:
+        """Return the mutable cache used to suppress duplicate remote scans."""
+
+        cache = getattr(self, "_recent_remote_scan_cache", None)
+        if cache is None:
+            cache = {}
+            self._recent_remote_scan_cache = cache
+        return cache
+
+    def _duplicate_remote_scan_ttl_s(self) -> float:
+        """Return how long an identical window should be considered a duplicate."""
+
+        raw_value = getattr(self, "duplicate_remote_scan_ttl_s", None)
+        if raw_value is None:
+            raw_value = getattr(
+                getattr(self, "config", None),
+                "duplicate_remote_scan_ttl_s",
+                None,
+            )
+        if raw_value is not None:
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0.0:
+                return value
+        return max(0.5, (max(1, int(self.chunk_ms)) * 4) / 1000.0)
+
+    def _capture_fingerprint(self, capture: AmbientAudioCaptureWindow) -> str:
+        """Build one stable content fingerprint for one capture window."""
+
+        digest = hashlib.blake2s(digest_size=12)
+        digest.update(int(capture.sample.duration_ms).to_bytes(4, "little", signed=False))
+        digest.update(int(capture.sample_rate).to_bytes(4, "little", signed=False))
+        digest.update(int(capture.channels).to_bytes(2, "little", signed=False))
+        digest.update(capture.pcm_bytes)
+        return digest.hexdigest()
+
+    def _duplicate_remote_scan_min_new_audio_ms(self) -> int:
+        """Return the minimum audio novelty required before re-scanning a window."""
+
+        raw_value = getattr(self, "duplicate_remote_scan_min_new_audio_ms", None)
+        if raw_value is None:
+            raw_value = getattr(
+                getattr(self, "config", None),
+                "duplicate_remote_scan_min_new_audio_ms",
+                None,
+            )
+        if raw_value is None:
+            return max(1, int(self.chunk_ms))
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return max(1, int(self.chunk_ms))
+        return max(1, value)
+
+    def _should_skip_duplicate_remote_scan(
+        self,
+        *,
+        scan_kind: str,
+        capture: AmbientAudioCaptureWindow,
+    ) -> bool:
+        """Return whether an identical capture window was already scanned recently."""
+
+        fingerprint = self._capture_fingerprint(capture)
+        cache = self._scan_cache()
+        previous = cache.get(scan_kind)
+        now = self._monotonic()
+        cache[scan_kind] = (fingerprint, int(capture.sample.duration_ms), now)
+        if previous is None:
+            return False
+        previous_fingerprint, previous_duration_ms, previous_at = previous
+        return (
+            previous_fingerprint == fingerprint
+            and abs(previous_duration_ms - int(capture.sample.duration_ms))
+            < self._duplicate_remote_scan_min_new_audio_ms()
+            and (now - previous_at) <= self._duplicate_remote_scan_ttl_s()
+        )
+
+    def _recompute_pending_utterance_metrics(
+        self,
+        pending: _PendingTranscriptUtterance,
+    ) -> None:
+        """Rebuild utterance timing from retained frames after every trim/mutation."""
+
+        frames = tuple(pending.frames)
+        speech_flags = self._remote_asr_speech_flags(frames)
+        pending.captured_ms = 0
+        pending.active_ms = 0
+        pending.trailing_silence_ms = 0
+        pending.speech_active = False
+        for frame, is_active in zip(frames, speech_flags, strict=False):
+            frame_ms = max(0, int(frame.duration_ms))
+            pending.captured_ms += frame_ms
+            if is_active:
+                pending.active_ms += frame_ms
+                pending.trailing_silence_ms = 0
+            else:
+                pending.trailing_silence_ms += frame_ms
+            pending.speech_active = bool(is_active)
+        if not frames:
+            pending.trailing_silence_ms = 0
+            pending.speech_active = False
+
+    def _maybe_semantic_endpoint_ready(
+        self,
+        pending: _PendingTranscriptUtterance,
+    ) -> bool | None:
+        """Ask an optional semantic endpointing hook whether the utterance is done."""
+
+        resolver = getattr(self, "_semantic_endpoint_ready", None)
+        if not callable(resolver):
+            return None
+        capture = self._pending_transcript_capture_window(pending)
+        try:
+            decision = resolver(  # pylint: disable=not-callable
+                capture=capture,
+                pending=pending,
+                origin_state=pending.origin_state,
+                active_ms=int(pending.active_ms),
+                trailing_silence_ms=int(pending.trailing_silence_ms),
+            )
+        except TypeError:
+            decision = resolver(capture)  # pylint: disable=not-callable
+        except Exception:
+            return None
+        if decision is None:
+            return None
+        return bool(decision)
+
+    def _safe_backend_transcribe_capture(
+        self,
+        *,
+        capture: AmbientAudioCaptureWindow,
+        stage: str,
+        filename: str = "voice-window.wav",
+    ) -> str | None:
+        """Run one backend transcription without letting transient errors kill the loop."""
+
+        try:
+            with self._backend_request_context(stage=stage, capture=capture):
+                transcript = self.backend.transcribe(
+                    pcm_capture_to_wav_bytes(capture),
+                    filename=filename,
+                    content_type="audio/wav",
+                    language=self.config.openai_realtime_language,
+                )
+        except Exception as exc:
+            self._record_transcript_debug(
+                stage=stage,
+                outcome="backend_error",
+                capture=capture,
+                details={"error_type": type(exc).__name__},
+            )
+            self._trace_event(
+                "voice_backend_transcribe_error",
+                kind="error",
+                details={
+                    "stage": stage,
+                    "error_type": type(exc).__name__,
+                    "window_ms": int(capture.sample.duration_ms),
+                },
+            )
+            return None
+        return str(transcript or "").strip()
 
     def _advance_remote_asr_utterance(
         self,
@@ -112,7 +478,7 @@ class VoiceSessionScannerMixin:
             return None
         pending = self._pending_transcript_utterance
         if pending is None:
-            if not self._waiting_activation_allowed():
+            if self._state == "waiting" and not self._waiting_activation_allowed():
                 return None
             if not self._frame_counts_as_remote_asr_speech(latest_frame):
                 return None
@@ -140,20 +506,17 @@ class VoiceSessionScannerMixin:
             )
             return None
         self._append_pending_frame(pending, latest_frame)
-        pending.speech_active = self._frame_counts_as_remote_asr_speech(
-            latest_frame,
-            continuing=pending.speech_active,
-        )
-        if pending.speech_active:
-            pending.active_ms += latest_frame.duration_ms
-            pending.trailing_silence_ms = 0
-        else:
-            pending.trailing_silence_ms += latest_frame.duration_ms
         should_finalize = False
         if pending.captured_ms >= pending.max_capture_ms:
             should_finalize = True
-        elif pending.active_ms > 0 and pending.trailing_silence_ms >= self.wake_tail_endpoint_silence_ms:
-            should_finalize = True
+        elif pending.active_ms > 0:
+            semantic_endpoint = self._maybe_semantic_endpoint_ready(pending)
+            if semantic_endpoint is True:
+                should_finalize = True
+            elif semantic_endpoint is None and (
+                pending.trailing_silence_ms >= self.wake_tail_endpoint_silence_ms
+            ):
+                should_finalize = True
         if not should_finalize:
             return None
         self._pending_transcript_utterance = None
@@ -188,10 +551,11 @@ class VoiceSessionScannerMixin:
                 details=match_details,
             )
         else:
-            if self._wake_phrase_spotter_supports_transcript_matching(
+            supports_transcript_matching = self._wake_phrase_spotter_supports_transcript_matching(
                 capture=capture,
                 origin_state=pending.origin_state,
-            ):
+            )
+            if supports_transcript_matching:
                 transcript = self._transcribe_capture(
                     capture=capture,
                     stage="activation_utterance",
@@ -211,6 +575,22 @@ class VoiceSessionScannerMixin:
                     stage="activation_utterance",
                     details=match_details,
                 )
+                if match is None:
+                    return None
+                if not match.detected:
+                    transcript = self._transcribe_capture(
+                        capture=capture,
+                        stage="activation_utterance",
+                        details=match_details,
+                    )
+                    if transcript is None:
+                        return None
+                    match = VoiceActivationMatch(
+                        detected=False,
+                        transcript=transcript,
+                        normalized_transcript=str(transcript or "").strip().lower(),
+                        backend=self.backend_name,
+                    )
         if match is None:
             return None
         outcome = "matched" if match.detected else "no_match"
@@ -274,7 +654,7 @@ class VoiceSessionScannerMixin:
                 kind="decision",
                 details={
                     "transcript_chars": len(transcript),
-                    "transcript_preview": transcript[:80],
+                    "transcript_preview": self._safe_transcript_preview(transcript, limit=80),
                 },
             )
             return OrchestratorVoiceTranscriptCommittedEvent(
@@ -324,13 +704,6 @@ class VoiceSessionScannerMixin:
         )
         for frame in frames:
             self._append_pending_frame(pending, frame)
-            pending.speech_active = self._frame_counts_as_remote_asr_speech(
-                frame,
-                continuing=pending.speech_active,
-            )
-            if pending.speech_active:
-                pending.active_ms += frame.duration_ms
-        pending.trailing_silence_ms = 0 if pending.speech_active else pending.captured_ms
         return pending
 
     def _recent_frames_window(self, duration_ms: int) -> tuple[_RecentFrame, ...]:
@@ -359,6 +732,7 @@ class VoiceSessionScannerMixin:
         while pending.captured_ms > pending.max_capture_ms and pending.frames:
             removed = pending.frames.popleft()
             pending.captured_ms = max(0, pending.captured_ms - removed.duration_ms)
+        self._recompute_pending_utterance_metrics(pending)
 
     def _pending_transcript_capture_window(
         self,
@@ -404,7 +778,7 @@ class VoiceSessionScannerMixin:
         self,
         frames: tuple[_RecentFrame, ...],
     ) -> tuple[_RecentFrame, ...]:
-        """Return the latest speech burst plus a tiny pre-roll for quiet onsets."""
+        """Return the latest speech burst plus contiguous non-silent onset frames."""
 
         resolved_frames = tuple(frames)
         if not resolved_frames:
@@ -441,7 +815,7 @@ class VoiceSessionScannerMixin:
         collected_pre_roll_ms = 0
         while pre_roll_start_index > 0 and collected_pre_roll_ms < pre_roll_ms:
             previous_frame = resolved_frames[pre_roll_start_index - 1]
-            if previous_frame.rms <= 0:
+            if max(0, int(getattr(previous_frame, "rms", 0))) <= 0:
                 break
             collected_pre_roll_ms += max(0, int(previous_frame.duration_ms))
             pre_roll_start_index -= 1
@@ -579,6 +953,17 @@ class VoiceSessionScannerMixin:
                         capture,
                         origin_state="waiting",
                     )
+            if self._should_skip_duplicate_remote_scan(
+                scan_kind="remote_asr_stage1",
+                capture=capture,
+            ):
+                self._record_transcript_debug(
+                    stage="activation_stage1",
+                    outcome="buffering_duplicate_window",
+                    capture=capture,
+                    details={"reason": "duplicate_remote_scan"},
+                )
+                return None
             match = self._detect_wake_capture(
                 capture=capture,
                 stage="activation_stage1",
@@ -713,18 +1098,25 @@ class VoiceSessionScannerMixin:
                 guardrails=["speech_activity_threshold"],
             )
             return None
+        if self._should_skip_duplicate_remote_scan(scan_kind="barge_in", capture=capture):
+            self._record_transcript_debug(
+                stage="barge_in_candidate",
+                outcome="buffering_duplicate_window",
+                capture=capture,
+                details={"reason": "duplicate_remote_scan"},
+            )
+            return None
         with self._trace_span(
             name="voice_barge_in_candidate_transcribe",
             kind="llm_call",
             details={"window_ms": capture.sample.duration_ms},
         ):
-            with self._backend_request_context(stage="barge_in_candidate", capture=capture):
-                transcript = self.backend.transcribe(
-                    pcm_capture_to_wav_bytes(capture),
-                    filename="voice-window.wav",
-                    content_type="audio/wav",
-                    language=self.config.openai_realtime_language,
-                ).strip()
+            transcript = self._safe_backend_transcribe_capture(
+                capture=capture,
+                stage="barge_in_candidate",
+            )
+        if transcript is None:
+            return None
         self._record_transcript_debug(
             stage="barge_in_candidate",
             outcome="transcribed",
@@ -764,7 +1156,10 @@ class VoiceSessionScannerMixin:
         self._trace_event(
             "voice_barge_in_candidate_triggered",
             kind="decision",
-            details={"transcript_chars": len(transcript), "transcript_preview": transcript[:80]},
+            details={
+                "transcript_chars": len(transcript),
+                "transcript_preview": self._safe_transcript_preview(transcript, limit=80),
+            },
         )
         return OrchestratorVoiceBargeInInterruptEvent(transcript_preview=transcript[:160])
 
@@ -785,15 +1180,25 @@ class VoiceSessionScannerMixin:
             resolved_frames = (_RecentFrame(pcm_bytes=b"", rms=0, duration_ms=0),)
         pcm_fragments = [frame.pcm_bytes for frame in resolved_frames]
         rms_values = [int(frame.rms) for frame in resolved_frames]
-        collected_ms = sum(max(0, int(frame.duration_ms)) for frame in resolved_frames)
-        active_chunk_count = sum(1 for active in self._remote_asr_speech_flags(resolved_frames) if active)
+        duration_values = [max(0, int(frame.duration_ms)) for frame in resolved_frames]
+        collected_ms = sum(duration_values)
+        speech_flags = self._remote_asr_speech_flags(resolved_frames)
+        active_chunk_count = sum(1 for active in speech_flags if active)
+        active_ms = sum(
+            duration_ms
+            for duration_ms, is_active in zip(duration_values, speech_flags, strict=False)
+            if is_active
+        )
         sample = AmbientAudioLevelSample(
             duration_ms=collected_ms,
             chunk_count=len(rms_values),
             active_chunk_count=active_chunk_count,
             average_rms=int(sum(rms_values) / max(1, len(rms_values))),
             peak_rms=max(rms_values),
-            active_ratio=active_chunk_count / max(1, len(rms_values)),
+            # BREAKING: `active_ratio` is now duration-weighted rather than
+            # frame-count-weighted so variable-size chunks cannot skew VAD
+            # gating decisions.
+            active_ratio=(active_ms / collected_ms) if collected_ms > 0 else 0.0,
         )
         return AmbientAudioCaptureWindow(
             sample=sample,

@@ -6,14 +6,17 @@ exhausted so follow-up ticks stay deterministic.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.pir import PirMotionEvent
 from twinr.proactive.social.engine import SocialAudioObservation, SocialBodyPose, SocialVisionObservation
 from twinr.proactive.social.observers import ProactiveAudioSnapshot, ProactiveVisionSnapshot
+from twinr.proactive.runtime.service_impl.monitor import ProactiveMonitorService
 
 
 class MutableClock:
@@ -124,6 +127,87 @@ class ProactiveMonitorTestDoubleTests(unittest.TestCase):
         assert second is not None
         self.assertFalse(second.motion_detected)
         self.assertFalse(monitor.motion_detected())
+
+    def test_shared_perception_cycle_keeps_due_lanes_aligned_under_overrun(self) -> None:
+        clock = MutableClock()
+
+        class _StopEvent:
+            def __init__(self) -> None:
+                self._set = False
+
+            def is_set(self) -> bool:
+                return self._set
+
+            def wait(self, timeout: float) -> bool:
+                clock.now += float(timeout)
+                return self._set
+
+            def set(self) -> None:
+                self._set = True
+
+        stop_event = _StopEvent()
+
+        class _Coordinator:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace()
+                self.runtime = SimpleNamespace(
+                    ops_events=SimpleNamespace(append=lambda **_kwargs: None),
+                )
+                self.audio_observer = None
+                self.attention_servo_controller = None
+                self.pir_monitor = None
+                self._display_perception_cycle = None
+                self.open_calls: list[tuple[bool, bool]] = []
+                self.attention_calls = 0
+                self.gesture_calls = 0
+                self.tick_calls = 0
+
+            def _open_display_perception_cycle(self, *, attention_due: bool, gesture_due: bool) -> None:
+                self.open_calls.append((attention_due, gesture_due))
+                self._display_perception_cycle = object() if attention_due and gesture_due else None
+
+            def _close_display_perception_cycle(self) -> None:
+                self._display_perception_cycle = None
+
+            def refresh_display_attention(self) -> bool:
+                self.attention_calls += 1
+                clock.now += 1.0
+                return True
+
+            def refresh_display_gesture_emoji(self) -> bool:
+                self.gesture_calls += 1
+                clock.now += 0.6
+                if self.gesture_calls >= 2:
+                    stop_event.set()
+                return True
+
+            def tick(self) -> None:
+                self.tick_calls += 1
+
+        service = ProactiveMonitorService(
+            coordinator=_Coordinator(),
+            poll_interval_s=0.2,
+        )
+        service._stop_event = stop_event  # type: ignore[assignment]
+
+        with (
+            patch("twinr.proactive.runtime.service_impl.monitor.time.monotonic", side_effect=clock),
+            patch(
+                "twinr.proactive.runtime.service_impl.monitor.resolve_display_attention_refresh_interval",
+                return_value=0.6,
+            ),
+            patch(
+                "twinr.proactive.runtime.service_impl.monitor.resolve_display_gesture_refresh_interval",
+                return_value=0.2,
+            ),
+        ):
+            service._run()  # pylint: disable=protected-access
+
+        coordinator = service.coordinator
+        self.assertGreaterEqual(coordinator.attention_calls, 2)
+        self.assertGreaterEqual(coordinator.gesture_calls, 2)
+        self.assertGreaterEqual(len(coordinator.open_calls), 2)
+        self.assertEqual(coordinator.open_calls[:2], [(True, True), (True, True)])
 
 
 if __name__ == "__main__":

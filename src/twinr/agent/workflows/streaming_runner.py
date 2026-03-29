@@ -2,6 +2,9 @@
 # BUG-1: Fixed partial provider auto-resolution so custom tool providers no longer leave STT/agent/TTS/print dependencies unset.
 # BUG-2: Fixed live-config reload to refresh derived turn/verifier providers, recorder state, and voice-orchestrator recovery on coordinator failures.
 # BUG-3: Fixed unsafe sentence segmentation that split on decimals/abbreviations, causing incorrect or confusing streamed TTS output.
+# BUG-4: Seeded text turns now reuse an already-open `listening` state so remote
+#        follow-up transcript commits cannot reopen listening and surface a false
+#        runtime `error` after follow-up rearm.
 # SEC-1: Hardened live .env reload against symlink/permission attacks and reduced TOCTOU risk by loading from a validated file snapshot.
 # IMP-1: Added transactional live reload with reconfiguration locking and managed-component rebuilds for stable long-running Pi deployments.
 # IMP-2: Added async speculative cache warmup with bounded join and speculation locking to cut cold-start latency without racing cache state.
@@ -170,10 +173,6 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._streaming_speculation = StreamingSpeculationController(self)
         self._streaming_lane_planner = StreamingLanePlanner(self)
         self._streaming_semantic_router = StreamingSemanticRouterRuntime(self)
-        self._warmup_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="twinr-streaming-warmup",
-        )
         self._schedule_speculative_warmups()
         self._trace_event(
             "streaming_workflow_initialized",
@@ -186,13 +185,32 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             },
         )
 
-    def __del__(self) -> None:
-        executor = getattr(self, "_warmup_executor", None)
+    def close(self, *, timeout_s: float = 1.0) -> None:
+        """Release streaming-loop resources, including speculative warmups."""
+
+        warmup_lock = getattr(self, "_warmup_lock", None)
+        warmup_futures = getattr(self, "_warmup_futures", None)
+        executor = None
+        if warmup_lock is not None and isinstance(warmup_futures, dict):
+            with warmup_lock:
+                executor = getattr(self, "_warmup_executor", None)
+                self._warmup_generation = getattr(self, "_warmup_generation", 0) + 1
+                for future in warmup_futures.values():
+                    future.cancel()
+                warmup_futures.clear()
+                self._warmup_executor = None
         if executor is not None:
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
+        super().close(timeout_s=timeout_s)
+
+    def __del__(self) -> None:
+        try:
+            self.close(timeout_s=0.2)
+        except Exception:
+            pass
 
     def _resolve_runtime_dependencies(
         self,
@@ -592,15 +610,18 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         name: str,
         runner: Callable[[], None],
     ) -> None:
-        executor = self._warmup_executor
-        if executor is None:
-            runner()
-            return
         with self._warmup_lock:
             existing = self._warmup_futures.get(name)
             if existing is not None and not existing.done():
                 return
             generation = self._warmup_generation
+            executor = self._warmup_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="twinr-streaming-warmup",
+                )
+                self._warmup_executor = executor
             self._warmup_futures[name] = executor.submit(
                 self._run_speculative_warmup,
                 generation,
@@ -910,8 +931,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 "transcript_len": len(transcript),
             },
         )
-        self.runtime.begin_listening(
-            request_source=listen_source,
+        self._begin_text_turn_listening(
+            listen_source=listen_source,
             proactive_trigger=proactive_trigger,
         )
         self._emit_status(force=True)

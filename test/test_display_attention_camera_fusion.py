@@ -16,7 +16,7 @@ from twinr.proactive.social.engine import (
 
 
 class DisplayAttentionCameraFusionTests(unittest.TestCase):
-    def test_fuse_attention_overlays_recent_pose_and_gesture_semantics(self) -> None:
+    def test_fuse_attention_keeps_current_attention_truth_while_overlaying_pose_and_gesture_semantics(self) -> None:
         config = TwinrConfig(
             display_driver="hdmi_wayland",
             display_attention_refresh_interval_s=0.5,
@@ -67,10 +67,10 @@ class DisplayAttentionCameraFusionTests(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(result.observation.looking_toward_device)
-        self.assertTrue(result.observation.person_near_device)
-        self.assertTrue(result.observation.engaged_with_device)
-        self.assertEqual(result.observation.visual_attention_score, 0.82)
+        self.assertFalse(result.observation.looking_toward_device)
+        self.assertIsNone(result.observation.person_near_device)
+        self.assertIsNone(result.observation.engaged_with_device)
+        self.assertIsNone(result.observation.visual_attention_score)
         self.assertEqual(result.observation.body_pose, SocialBodyPose.UPRIGHT)
         self.assertEqual(result.observation.motion_state, SocialMotionState.STILL)
         self.assertTrue(result.observation.hand_or_object_near_camera)

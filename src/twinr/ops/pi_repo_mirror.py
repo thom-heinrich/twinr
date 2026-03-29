@@ -60,6 +60,7 @@ DEFAULT_IGNORED_PATTERNS: tuple[str, ...] = (
     "**/*.egg-info/",
     "**/node_modules/",
     "**/browser_automation/artifacts/",
+    "/hardware/bitcraze/twinr_on_device_failsafe/build/",
 )
 
 

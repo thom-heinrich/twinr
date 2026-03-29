@@ -91,6 +91,54 @@ class DebouncedBooleanSignal:
             rising_edge=rising_edge,
         )
 
+    def observe_authoritative(
+        self,
+        value: bool | None,
+        *,
+        observed_at: float,
+    ) -> BooleanSignalView:
+        """Adopt one already-stabilized upstream value without local debounce."""
+
+        now = coerce_timestamp(observed_at, previous=self._last_observed_at)
+        self._last_observed_at = now
+
+        if value is None:
+            self._clear_pending()
+            if (
+                self._last_concrete_at is not None
+                and self._stable_value
+                and (now - self._last_concrete_at) > self.unknown_hold_s
+            ):
+                self._stable_value = False
+                self._active_since = None
+            return BooleanSignalView(
+                value=self._stable_value,
+                unknown=True,
+                active_for_s=duration_since(self._active_since, now),
+                rising_edge=False,
+            )
+
+        self._last_concrete_at = now
+        self._clear_pending()
+        current_value = bool(value)
+        was_active = self._stable_value
+        self._stable_value = current_value
+        rising_edge = False
+        if current_value:
+            if not was_active:
+                self._active_since = now
+                rising_edge = self._allow_rising_edge(now)
+            elif self._active_since is None:
+                self._active_since = now
+        else:
+            self._active_since = None
+        return BooleanSignalView(
+            value=self._stable_value,
+            unknown=False,
+            active_for_s=duration_since(self._active_since, now),
+            rising_edge=rising_edge,
+        )
+
     def _advance_pending(self, value: bool, *, now: float) -> None:
         if self._pending_value is value:
             self._pending_count += 1

@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -114,7 +115,7 @@ class ButtonHelperTests(unittest.TestCase):
         self.assertEqual(values, {23: 0})
         self.assertEqual(
             commands[1],
-            ["/usr/bin/gpioget", "--bias=pull-up", "gpiochip0", "23"],
+            ["/usr/bin/gpioget", "--bias", "pull-up", "gpiochip0", "23"],
         )
 
     def test_cli_monitor_uses_named_gpioget_flags_when_help_advertises_them(self) -> None:
@@ -152,7 +153,7 @@ class ButtonHelperTests(unittest.TestCase):
         self.assertEqual(values, {17: 1, 27: 0})
         self.assertEqual(
             commands[1],
-            ["/usr/bin/gpioget", "--bias=pull-up", "--chip", "gpiochip0", "--numeric", "17", "27"],
+            ["/usr/bin/gpioget", "--bias", "pull-up", "--chip", "gpiochip0", "--numeric", "17", "27"],
         )
 
     def test_cli_monitor_retries_with_legacy_syntax_when_named_flags_are_rejected(self) -> None:
@@ -182,5 +183,95 @@ class ButtonHelperTests(unittest.TestCase):
         self.assertEqual(values, {23: 1})
         self.assertEqual(
             commands[-1],
-            ["/usr/bin/gpioget", "--bias=pull-up", "gpiochip0", "23"],
+            ["/usr/bin/gpioget", "--bias", "pull-up", "gpiochip0", "23"],
         )
+
+    def test_gpiomon_legacy_command_places_options_before_chip_and_offsets(self) -> None:
+        spec = buttons_module._legacy_gpiomon_cli_spec()
+
+        with patch.object(buttons_module, "_GPIOMON_CLI_SPECS", {"/usr/bin/gpiomon": spec}, create=True):
+            command = buttons_module._build_gpiomon_command(
+                "/usr/bin/gpiomon",
+                chip_name="gpiochip0",
+                bindings=(ButtonBinding(name="green", line_offset=17),),
+                bias="pull-up",
+                consumer="twinr-buttons",
+                debounce_ms=40,
+            )
+
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/gpiomon",
+                "--bias",
+                "pull-up",
+                "--line-buffered",
+                "--format",
+                "%o\t%e",
+                "gpiochip0",
+                "17",
+            ],
+        )
+
+    def test_gpiomon_named_command_keeps_chip_flag_before_offsets(self) -> None:
+        spec = buttons_module._GpiomonCliSpec(
+            supports_chip_option=True,
+            supports_consumer_option=True,
+            supports_edges_option=True,
+            supports_event_clock_option=True,
+            supports_debounce_option=True,
+            supports_line_buffered_option=False,
+            disabled_bias_keyword="disabled",
+        )
+
+        with patch.object(buttons_module, "_GPIOMON_CLI_SPECS", {"/usr/bin/gpiomon": spec}, create=True):
+            command = buttons_module._build_gpiomon_command(
+                "/usr/bin/gpiomon",
+                chip_name="gpiochip0",
+                bindings=(
+                    ButtonBinding(name="green", line_offset=17),
+                    ButtonBinding(name="yellow", line_offset=27),
+                ),
+                bias="pull-up",
+                consumer="twinr-buttons",
+                debounce_ms=40,
+            )
+
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/gpiomon",
+                "--bias",
+                "pull-up",
+                "--chip",
+                "gpiochip0",
+                "--consumer",
+                "twinr-buttons",
+                "--edges",
+                "both",
+                "--event-clock",
+                "monotonic",
+                "--debounce-period",
+                "40ms",
+                "--format",
+                "%o\t%e",
+                "17",
+                "27",
+            ],
+        )
+
+    def test_snapshot_values_uses_cached_state_while_gpiomon_backend_owns_lines(self) -> None:
+        monitor = GpioButtonMonitor(
+            "gpiochip0",
+            bindings=(
+                ButtonBinding(name="green", line_offset=17),
+                ButtonBinding(name="yellow", line_offset=27),
+            ),
+        )
+        monitor._gpiomon_process = cast(Any, object())
+        monitor._last_values = {17: 1, 27: 0}
+
+        with patch.object(monitor, "_read_cli_values", side_effect=AssertionError("gpioget must not run")):
+            values = monitor.snapshot_values()
+
+        self.assertEqual(values, {17: 1, 27: 0})

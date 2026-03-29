@@ -19,7 +19,12 @@ from typing import Any, Final
 
 from ..detection import DetectionResult
 from ..face_anchors import SupplementalFaceAnchorResult
-from ..looking_signal import infer_fast_looking_signal
+from ..looking_signal import (
+    AttentionStreamState,
+    StreamLookingSignal,
+    infer_fast_looking_signal,
+    infer_stream_looking_signal,
+)
 from ..models import AICameraObservation
 from .common import LOGGER
 
@@ -70,6 +75,22 @@ class AICameraAdapterAttentionMixin:
         "detection_primary_person_center_y",
         "detection_primary_person_area",
         "detection_primary_person_height",
+        "stream_mode",
+        "attention_stream_lane",
+        "attention_stream_transition_state",
+        "attention_stream_changed",
+        "attention_stream_activation_dwell_s",
+        "attention_stream_release_dwell_s",
+        "attention_stream_candidate_age_s",
+        "attention_instant_visual_attention_score",
+        "attention_instant_looking_toward_device",
+        "attention_instant_looking_signal_state",
+        "attention_instant_looking_signal_source",
+        "attention_instant_looking_reason",
+        "attention_stream_candidate_state",
+        "attention_stream_candidate_source",
+        "attention_stream_candidate_reason",
+        "attention_stream_candidate_score",
     )
 
     def get_last_attention_debug_details(self) -> dict[str, Any] | None:
@@ -161,6 +182,122 @@ class AICameraAdapterAttentionMixin:
             if math.isfinite(numeric):
                 return round(numeric, _DEBUG_FLOAT_DIGITS)
         return None
+
+    def _attention_stream_state_for_lane(self, lane: str) -> AttentionStreamState:
+        """Return the mutable attention-stream state for one logical lane."""
+
+        state_by_lane = getattr(self, "_attention_stream_state_by_lane", None)
+        if not isinstance(state_by_lane, dict):
+            state_by_lane = {}
+            self._attention_stream_state_by_lane = state_by_lane
+        state = state_by_lane.get(lane)
+        if isinstance(state, AttentionStreamState):
+            return state
+        state = AttentionStreamState()
+        state_by_lane[lane] = state
+        return state
+
+    def _apply_attention_stream_locked(
+        self,
+        *,
+        lane: str,
+        detection: DetectionResult,
+        face_anchors: SupplementalFaceAnchorResult | None,
+        observation: AICameraObservation,
+        observed_at: float,
+    ) -> AICameraObservation:
+        """Apply explicit live-stream stabilization on top of one instant observation."""
+
+        stream_signal = infer_stream_looking_signal(
+            detection=detection,
+            face_anchors=face_anchors,
+            attention_score_threshold=self.config.attention_score_threshold,
+            state=self._attention_stream_state_for_lane(lane),
+            observed_at=observed_at,
+        )
+        engaged_score_threshold = self._coerce_debug_scalar(getattr(self.config, "engaged_score_threshold", 0.5))
+        try:
+            engaged_threshold = float(engaged_score_threshold)
+        except (TypeError, ValueError):
+            engaged_threshold = 0.5
+        stable_score = stream_signal.visual_attention_score
+        engaged_with_device = (
+            observation.person_near_device is True
+            and (stable_score or 0.0) >= max(0.0, min(1.0, engaged_threshold))
+        )
+        showing_intent_likely = bool(
+            observation.hand_or_object_near_camera
+            and (stream_signal.looking_toward_device is True or observation.person_near_device is True)
+        )
+        updated_observation = self._observation_copy(
+            observation,
+            looking_toward_device=stream_signal.looking_toward_device,
+            looking_signal_state=stream_signal.state if stream_signal.source is not None else None,
+            looking_signal_source=stream_signal.source,
+            visual_attention_score=stream_signal.visual_attention_score,
+            engaged_with_device=engaged_with_device,
+            showing_intent_likely=showing_intent_likely,
+        )
+        self._annotate_attention_stream_debug_locked(
+            lane=lane,
+            stream_signal=stream_signal,
+            observation=updated_observation,
+        )
+        return updated_observation
+
+    def _annotate_attention_stream_debug_locked(
+        self,
+        *,
+        lane: str,
+        stream_signal: StreamLookingSignal,
+        observation: AICameraObservation,
+    ) -> None:
+        """Overlay explicit stream facts onto the latest attention debug snapshot."""
+
+        payload = dict(self._last_attention_debug_details or {})
+        instant_signal = stream_signal.instant_signal
+        candidate_signal = stream_signal.candidate_signal
+        payload.update(
+            {
+                "mode": "attention_stream",
+                "stream_mode": "attention_stream",
+                "attention_stream_lane": lane,
+                "attention_stream_transition_state": stream_signal.transition_state,
+                "attention_stream_changed": stream_signal.changed,
+                "attention_stream_activation_dwell_s": self._coerce_debug_scalar(stream_signal.activation_dwell_s),
+                "attention_stream_release_dwell_s": self._coerce_debug_scalar(stream_signal.release_dwell_s),
+                "attention_stream_candidate_age_s": self._coerce_debug_scalar(stream_signal.candidate_age_s),
+                "attention_instant_visual_attention_score": self._coerce_debug_scalar(
+                    instant_signal.visual_attention_score
+                ),
+                "attention_instant_looking_toward_device": self._coerce_debug_scalar(
+                    instant_signal.looking_toward_device
+                ),
+                "attention_instant_looking_signal_state": self._coerce_debug_scalar(instant_signal.state),
+                "attention_instant_looking_signal_source": self._coerce_debug_scalar(instant_signal.source),
+                "attention_instant_looking_reason": self._coerce_debug_scalar(instant_signal.reason),
+                "attention_stream_candidate_state": self._coerce_debug_scalar(
+                    None if candidate_signal is None else candidate_signal.state
+                ),
+                "attention_stream_candidate_source": self._coerce_debug_scalar(
+                    None if candidate_signal is None else candidate_signal.source
+                ),
+                "attention_stream_candidate_reason": self._coerce_debug_scalar(
+                    None if candidate_signal is None else candidate_signal.reason
+                ),
+                "attention_stream_candidate_score": self._coerce_debug_scalar(
+                    None if candidate_signal is None else candidate_signal.visual_attention_score
+                ),
+                "attention_visual_attention_score": self._coerce_debug_scalar(observation.visual_attention_score),
+                "attention_looking_toward_device": self._coerce_debug_scalar(observation.looking_toward_device),
+                "attention_looking_signal_state": self._coerce_debug_scalar(observation.looking_signal_state),
+                "attention_looking_signal_source": self._coerce_debug_scalar(observation.looking_signal_source),
+                "attention_looking_reason": self._coerce_debug_scalar(stream_signal.reason),
+                "attention_showing_intent_likely": self._coerce_debug_scalar(observation.showing_intent_likely),
+                "attention_showing_intent_reason": self._derive_showing_intent_reason(observation),
+            }
+        )
+        self._last_attention_debug_details = payload
 
     def _derive_showing_intent_reason(self, observation: AICameraObservation) -> str:
         """Explain the current showing-intent state without guessing hidden upstream logic."""
@@ -377,6 +514,7 @@ class AICameraAdapterAttentionMixin:
         frame_rgb: Any | None,
         observed_at: float,
         observed_monotonic: float,
+        stream_lane: str | None = None,
     ) -> AICameraObservation:
         """Compose one fast attention observation from supplied detection/frame facts."""
 
@@ -492,4 +630,12 @@ class AICameraAdapterAttentionMixin:
                     (time.perf_counter() - pipeline_started) * 1000.0
                 ),
             }
+        if stream_lane is not None:
+            observation = self._apply_attention_stream_locked(
+                lane=stream_lane,
+                detection=detection_for_observation,
+                face_anchors=face_anchors,
+                observation=observation,
+                observed_at=observed_at,
+            )
         return observation

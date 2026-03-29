@@ -138,7 +138,14 @@ def _build_assessment(
     )
 
 
-def _build_health(*, display_running: bool, display_count: int = 1) -> TwinrSystemHealth:
+def _build_health(
+    *,
+    display_running: bool,
+    display_count: int = 1,
+    conversation_running: bool = True,
+    conversation_count: int = 1,
+    conversation_detail: str | None = None,
+) -> TwinrSystemHealth:
     return TwinrSystemHealth(
         status="ok",
         captured_at="2026-03-16T21:00:00Z",
@@ -149,9 +156,14 @@ def _build_health(*, display_running: bool, display_count: int = 1) -> TwinrSyst
             ServiceHealth(
                 key="conversation_loop",
                 label="Conversation loop",
-                running=True,
-                count=1,
-                detail="pid=123 python --run-streaming-loop",
+                running=conversation_running,
+                count=conversation_count,
+                detail=conversation_detail
+                or (
+                    "pid=123 python --run-streaming-loop"
+                    if conversation_running and conversation_count == 1
+                    else "Service not detected."
+                ),
             ),
             ServiceHealth(
                 key="display",
@@ -627,6 +639,58 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
             supervisor.run(duration_s=2.0)
 
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
+
+    def test_run_ignores_transient_conversation_service_miss_when_current_child_owns_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            health_call_count = 0
+
+            def _health_collector(*_args, **_kwargs):
+                nonlocal health_call_count
+                health_call_count += 1
+                return _build_health(
+                    display_running=True,
+                    conversation_running=False,
+                    conversation_count=0,
+                )
+
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=_health_collector,
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: (
+                    next(
+                        (
+                            process.pid
+                            for process in reversed(factory.processes)
+                            if process.key == "streaming" and process.exit_code is None
+                        ),
+                        None,
+                    )
+                    if name == "streaming-loop"
+                    else None
+                ),
+                pid_alive=lambda pid: any(
+                    process.pid == pid and process.exit_code is None
+                    for process in factory.processes
+                ),
+                streaming_health_grace_s=0.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=3.0)
+
+        self.assertGreaterEqual(health_call_count, 2)
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
 
     def test_run_waits_for_streaming_startup_progress_before_enforcing_display_health(self) -> None:

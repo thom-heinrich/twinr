@@ -62,6 +62,7 @@ def build_wake_phrase_spotter(
     *,
     backend: _TranscriptBackend,
     phrases: tuple[str, ...] | None = None,
+    allow_twi_head_variant_recovery: bool | None = None,
 ) -> VoiceActivationPhraseMatcher:
     """Build the bounded transcript matcher used for wake confirmation."""
 
@@ -74,6 +75,7 @@ def build_wake_phrase_spotter(
         ),
         language=config.openai_realtime_language,
         suppress_transcription_errors=False,
+        allow_twi_head_variant_recovery=allow_twi_head_variant_recovery,
     )
 
 

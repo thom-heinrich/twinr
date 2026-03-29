@@ -14,6 +14,7 @@ from twinr.hardware.ai_camera import (
     AICameraFineHandGesture,
     AICameraGestureEvent,
     AICameraMotionState,
+    AICameraObservation,
     AICameraVisiblePerson,
     AICameraZone,
     AICameraAdapterConfig,
@@ -30,9 +31,12 @@ from twinr.hardware.camera_ai.adapter import PoseResult
 from twinr.hardware.camera_ai.mediapipe_pipeline import MediaPipeVisionResult
 from twinr.hardware.camera_ai.motion import infer_motion_state as _infer_motion_state
 from twinr.hardware.camera_ai.pose_classification import (
+    PoseTemporalState,
     classify_body_pose as _classify_body_pose,
     classify_gesture as _classify_gesture,
+    classify_gesture_stream as _classify_gesture_stream,
 )
+from twinr.hardware.camera_ai.looking_signal import AttentionStreamState, infer_stream_looking_signal
 from twinr.hardware.camera_ai.pose_features import support_pose_confidence as _support_pose_confidence
 from twinr.hardware.camera_ai.pose_selection import rank_pose_candidates as _rank_pose_candidates
 from twinr.hardware.ai_camera_diagnostics import capture_pose_probe
@@ -281,6 +285,191 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(debug["final_resolved_source"], "live_stream")
         self.assertAlmostEqual(debug["live_fine_hand_gesture_confidence"] or 0.0, 0.84, places=3)
 
+    def test_adapter_gesture_stream_exposes_temporal_debug_fields(self) -> None:
+        adapter = LocalAICameraAdapter()
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=0,
+            primary_person_box=None,
+            primary_person_zone=AICameraZone.UNKNOWN,
+            visible_persons=(),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: "frame"
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=lambda **_: SimpleNamespace(
+                hand_count=1,
+                fine_hand_gesture=AICameraFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.84,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            ),
+            debug_snapshot=lambda: {
+                "resolved_source": "live_stream",
+                "temporal_enabled": True,
+                "temporal_reason": "consensus",
+                "temporal_output_gesture": AICameraFineHandGesture.THUMBS_UP.value,
+                "temporal_output_confidence": 0.84,
+                "temporal_output_changed": True,
+                "temporal_resolved_source": "temporal_consensus",
+            },
+        )
+
+        observation = adapter.observe_gesture_stream()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        debug = adapter.get_last_gesture_debug_details()
+        self.assertEqual(debug["stream_mode"], "gesture_stream")
+        self.assertEqual(debug["gesture_stream_temporal_reason"], "consensus")
+        self.assertEqual(debug["gesture_stream_output_gesture"], AICameraFineHandGesture.THUMBS_UP.value)
+        self.assertEqual(debug["gesture_stream_resolved_source"], "temporal_consensus")
+
+    def test_adapter_gesture_stream_fast_path_keeps_current_frame_person_targets(self) -> None:
+        adapter = LocalAICameraAdapter()
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        captured_kwargs: dict[str, object] = {}
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(SimpleNamespace(box=primary_box, zone=AICameraZone.CENTER, confidence=0.91),),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: "frame"
+        adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+            observe=lambda **kwargs: captured_kwargs.update(kwargs) or SimpleNamespace(
+                hand_count=0,
+                fine_hand_gesture=AICameraFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+                gesture_event=AICameraGestureEvent.NONE,
+                gesture_confidence=None,
+            ),
+            debug_snapshot=lambda: {
+                "resolved_source": "none",
+                "live_hand_count_exact": 0,
+                "effective_live_hand_box_count": 0,
+                "live_hand_box_source": "none",
+                "person_roi_detection_count": 1,
+                "person_roi_block_reason": "deferred_until_live_hand_roi_exhausted",
+                "full_frame_hand_attempt_reason": None,
+            },
+        )
+
+        observation = adapter.observe_gesture_stream()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertEqual(captured_kwargs["primary_person_box"], primary_box)
+        self.assertEqual(captured_kwargs["visible_person_boxes"], (primary_box,))
+        self.assertEqual(captured_kwargs["person_count"], 1)
+        self.assertEqual(captured_kwargs["sparse_keypoints"], {})
+        debug = adapter.get_last_gesture_debug_details()
+        self.assertEqual(debug["stream_mode"], "gesture_stream")
+        self.assertTrue(debug["gesture_fast_path"])
+        self.assertEqual(debug["gesture_observe_policy"], "user_facing_fast")
+        self.assertEqual(debug["gesture_target_source"], "gesture_fast_path_current_frame_person_only")
+        self.assertEqual(debug["gesture_target_person_count"], 1)
+        self.assertEqual(debug["person_roi_detection_count"], 1)
+        self.assertEqual(debug["person_roi_block_reason"], "deferred_until_live_hand_roi_exhausted")
+        self.assertEqual(debug["live_hand_box_source"], "none")
+
+    def test_adapter_perception_stream_reuses_one_capture_for_attention_and_gesture(self) -> None:
+        adapter = LocalAICameraAdapter()
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(AICameraVisiblePerson(box=primary_box, zone=AICameraZone.CENTER, confidence=0.91),),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        counts = {
+            "detection": 0,
+            "rgb": 0,
+            "attention": 0,
+            "gesture": 0,
+        }
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+
+        def _capture_detection(runtime, observed_at):
+            del runtime, observed_at
+            counts["detection"] += 1
+            return detection
+
+        def _capture_rgb_frame(runtime, observed_at):
+            del runtime, observed_at
+            counts["rgb"] += 1
+            return "frame"
+
+        def _build_attention(**kwargs):
+            del kwargs
+            counts["attention"] += 1
+            return AICameraObservation(
+                observed_at=21.0,
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                person_count=1,
+                primary_person_box=primary_box,
+                primary_person_zone=AICameraZone.CENTER,
+                visible_persons=(AICameraVisiblePerson(box=primary_box, zone=AICameraZone.CENTER, confidence=0.91),),
+                looking_toward_device=True,
+                looking_signal_state="confirmed",
+                looking_signal_source="face_anchor_matched",
+                person_near_device=True,
+                engaged_with_device=True,
+                visual_attention_score=0.84,
+            )
+
+        def _build_gesture(**kwargs):
+            del kwargs
+            counts["gesture"] += 1
+            return AICameraObservation(
+                observed_at=21.0,
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                person_count=1,
+                primary_person_box=primary_box,
+                primary_person_zone=AICameraZone.CENTER,
+                visible_persons=(AICameraVisiblePerson(box=primary_box, zone=AICameraZone.CENTER, confidence=0.91),),
+                hand_or_object_near_camera=True,
+                showing_intent_likely=True,
+                fine_hand_gesture=AICameraFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.93,
+                gesture_temporal_authoritative=True,
+                gesture_activation_key="fine:thumbs_up",
+                gesture_activation_token=3,
+                gesture_activation_started_at=20.8,
+                gesture_activation_changed_at=21.0,
+                gesture_activation_source="live_stream",
+                gesture_activation_rising=True,
+            )
+
+        adapter._capture_detection = _capture_detection  # type: ignore[method-assign]
+        adapter._capture_rgb_frame = _capture_rgb_frame  # type: ignore[method-assign]
+        adapter._build_attention_observation_locked = _build_attention  # type: ignore[method-assign]
+        adapter._build_gesture_observation_locked = _build_gesture  # type: ignore[method-assign]
+
+        observation = adapter.observe_perception_stream()
+
+        self.assertEqual(counts, {"detection": 1, "rgb": 1, "attention": 1, "gesture": 1})
+        self.assertTrue(observation.camera_ready)
+        self.assertTrue(observation.looking_toward_device)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertTrue(observation.hand_or_object_near_camera)
+        self.assertEqual(observation.gesture_activation_token, 3)
+
     def test_adapter_attention_observe_records_fast_path_gate_reasons(self) -> None:
         adapter = LocalAICameraAdapter(
             config=AICameraAdapterConfig(
@@ -425,6 +614,99 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(observation.looking_signal_state, "confirmed")
         debug = adapter.get_last_attention_debug_details()
         self.assertEqual(debug["attention_face_anchor_state"], "ok")
+
+    def test_adapter_attention_stream_requires_dwell_before_confirming_looking(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        face_box = AICameraBox(top=0.26, left=0.42, bottom=0.40, right=0.56)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            ),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.CENTER,
+                            confidence=0.93,
+                            attention_hint_score=0.82,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+
+        first = adapter.observe_attention_from_frame_stream(
+            detection=detection,
+            frame_rgb=object(),
+            observed_at=50.0,
+            frame_at=49.9,
+        )
+        second = adapter.observe_attention_from_frame_stream(
+            detection=detection,
+            frame_rgb=object(),
+            observed_at=50.2,
+            frame_at=50.1,
+        )
+
+        self.assertIsNone(first.looking_toward_device)
+        self.assertEqual(first.looking_signal_state, None)
+        self.assertTrue(second.looking_toward_device)
+        self.assertEqual(second.looking_signal_state, "confirmed")
+        debug = adapter.get_last_attention_debug_details()
+        self.assertIsNotNone(debug)
+        assert debug is not None
+        self.assertEqual(debug["stream_mode"], "attention_stream")
+        self.assertTrue(debug["attention_stream_changed"])
+        self.assertEqual(debug["attention_stream_transition_state"], "switched_after_dwell")
+        self.assertTrue(debug["attention_instant_looking_toward_device"])
+
+    def test_infer_stream_looking_signal_adopts_initial_inactive_state_immediately(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        state = AttentionStreamState()
+
+        signal = infer_stream_looking_signal(
+            detection=DetectionResult(
+                person_count=1,
+                primary_person_box=primary_box,
+                primary_person_zone=AICameraZone.CENTER,
+                visible_persons=(
+                    AICameraVisiblePerson(
+                        box=primary_box,
+                        zone=AICameraZone.CENTER,
+                        confidence=0.81,
+                    ),
+                ),
+                person_near_device=False,
+                hand_or_object_near_camera=False,
+                objects=(),
+            ),
+            face_anchors=None,
+            attention_score_threshold=0.62,
+            state=state,
+            observed_at=10.0,
+        )
+
+        self.assertFalse(signal.looking_toward_device)
+        self.assertEqual(signal.state, "inactive")
+        self.assertEqual(signal.transition_state, "adopt_initial")
 
     def test_adapter_gesture_from_frame_runs_live_pipeline_without_local_runtime(self) -> None:
         adapter = LocalAICameraAdapter(
@@ -609,6 +891,35 @@ class AICameraTests(unittest.TestCase):
         self.assertIsNotNone(debug)
         assert debug is not None
         self.assertEqual(debug["attention_looking_reason"], "matched_face_anchor_landmark_attention_meets_threshold")
+
+    def test_adapter_attention_runtime_failure_preserves_live_gesture_pipeline(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            )
+        )
+        live_close_calls: list[str] = []
+        mediapipe_close_calls: list[str] = []
+        adapter._live_gesture_pipeline = SimpleNamespace(
+            close=lambda: live_close_calls.append("live"),
+        )
+        adapter._mediapipe_pipeline = SimpleNamespace(
+            close=lambda: mediapipe_close_calls.append("mediapipe"),
+        )
+
+        def _raise_runtime_error():
+            raise RuntimeError("attention_runtime_boom")
+
+        adapter._load_detection_runtime = _raise_runtime_error
+
+        observation = adapter.observe_attention()
+
+        self.assertEqual(observation.camera_error, "runtimeerror")
+        self.assertFalse(observation.camera_ready)
+        self.assertEqual(live_close_calls, [])
+        self.assertEqual(mediapipe_close_calls, ["mediapipe"])
+        self.assertIsNotNone(adapter._live_gesture_pipeline)
+        self.assertIsNone(adapter._mediapipe_pipeline)
 
     def test_visible_person_from_face_row_reduces_landmark_attention_hint_for_side_glance(self) -> None:
         person = _visible_person_from_face_row(
@@ -1277,6 +1588,36 @@ class AICameraTests(unittest.TestCase):
 
         self.assertEqual(gesture, AICameraGestureEvent.TIMEOUT_T)
         self.assertGreater(confidence or 0.0, 0.6)
+
+    def test_classify_gesture_stream_exposes_candidate_then_emitted_event(self) -> None:
+        box = AICameraBox(top=0.20, left=0.34, bottom=0.88, right=0.66)
+        keypoints = {
+            5: (0.42, 0.47, 0.96),
+            9: (0.44, 0.28, 0.95),
+        }
+        state = PoseTemporalState()
+
+        first = _classify_gesture_stream(
+            keypoints,
+            attention_score=0.42,
+            fallback_box=box,
+            state=state,
+            timestamp_ms=1000,
+        )
+        second = _classify_gesture_stream(
+            keypoints,
+            attention_score=0.42,
+            fallback_box=box,
+            state=state,
+            timestamp_ms=1100,
+        )
+
+        self.assertEqual(first.candidate_event, AICameraGestureEvent.STOP)
+        self.assertEqual(first.emitted_event, AICameraGestureEvent.NONE)
+        self.assertEqual(second.emitted_event, AICameraGestureEvent.STOP)
+        self.assertEqual(second.current_event, AICameraGestureEvent.STOP)
+        self.assertGreater(second.cooldown_until_ms, 1100)
+        self.assertIsNotNone(second.confidence)
 
     def test_gesture_bbox_fallback_detects_wide_dismiss_without_shoulder_joint(self) -> None:
         box = AICameraBox(top=0.20, left=0.34, bottom=0.84, right=0.66)

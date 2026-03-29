@@ -123,6 +123,18 @@ def _validate_positive_finite(value: float, name: str) -> float:
     return numeric
 
 
+def _call_optional_warmup(callback: object, probe_text: str) -> bool:
+    """Invoke one optional warmup callback and report whether it existed."""
+
+    if not callable(callback):
+        return False
+    try:
+        callback(probe_text)
+    except TypeError:
+        callback()
+    return True
+
+
 def _validate_artifact_path(
     path_like: os.PathLike[str] | str,
     *,
@@ -342,6 +354,14 @@ class LocalUserIntentRouter:
         latency_ms = (time.perf_counter() - started) * 1000.0
         return self.classify_embedding(embedding, latency_ms=latency_ms)
 
+    def warmup(self, probe_text: str = "warmup") -> None:
+        """Prime the user-intent encoder before the first live turn."""
+
+        encoder = self.encoder
+        if _call_optional_warmup(getattr(encoder, "warmup", None), probe_text):
+            return
+        self.classify(probe_text)
+
     def classify_embedding(
         self,
         embedding: np.ndarray,
@@ -509,6 +529,19 @@ class TwoStageLocalSemanticRouter:
             route_decision=route_decision,
             allowed_route_labels=allowed_route_labels,
         )
+
+    def warmup(self, probe_text: str = "warmup") -> None:
+        """Prime shared or per-stage encoders before the first live turn."""
+
+        if _call_optional_warmup(getattr(self.shared_encoder, "warmup", None), probe_text):
+            return
+
+        if not _call_optional_warmup(getattr(self.user_intent_router, "warmup", None), probe_text):
+            self.user_intent_router.classify(probe_text)
+
+        if _call_optional_warmup(getattr(self.route_router, "warmup", None), probe_text):
+            return
+        self.route_router.classify(probe_text)
 
     def _classify_user_intent_with_router_encoder(self, cleaned: str) -> UserIntentDecision:
         encoder = getattr(self.user_intent_router, "encoder", None)

@@ -87,6 +87,18 @@ class PlaybackRunResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class PlaybackActivityEvent:
+    """Describe one observable playback lifecycle transition."""
+
+    phase: str
+    owner: str
+    priority: int
+    category: str
+    cancel_reason: str | None = None
+    error_type: str | None = None
+
+
 @dataclass(slots=True)
 class _PlaybackRequest:
     """Track one queued or active playback operation."""
@@ -192,6 +204,7 @@ class PlaybackCoordinator:
         *,
         emit: Callable[[str], None] | None = None,
         io_lock: Lock | None = None,
+        activity_listener: Callable[[PlaybackActivityEvent], None] | None = None,
         max_queue_size: int = 64,
         max_wav_bytes: int = 32 * 1024 * 1024,
         io_lock_poll_interval_s: float = 0.05,
@@ -219,6 +232,9 @@ class PlaybackCoordinator:
         self._current: _PlaybackRequest | None = None
         self._closed = False
         self._sequence = 0
+        self._activity_listeners: list[Callable[[PlaybackActivityEvent], None]] = []
+        if activity_listener is not None:
+            self.add_activity_listener(activity_listener)
 
         # BREAKING: the worker is non-daemonic so ALSA/PortAudio-backed players do
         # not get torn down abruptly at interpreter exit; callers should close()
@@ -229,6 +245,18 @@ class PlaybackCoordinator:
             name="twinr-playback-coordinator",
         )
         self._worker.start()
+
+    def add_activity_listener(
+        self,
+        listener: Callable[[PlaybackActivityEvent], None],
+    ) -> None:
+        """Register one best-effort observer for playback lifecycle events."""
+
+        if not callable(listener):
+            raise ValueError("activity listener must be callable")
+        with self._condition:
+            if listener not in self._activity_listeners:
+                self._activity_listeners.append(listener)
 
     def __enter__(self) -> "PlaybackCoordinator":
         return self
@@ -838,9 +866,17 @@ class PlaybackCoordinator:
                         queue_wait_ms=queue_wait_ms,
                         runtime_ms=0.0,
                         started=False,
-                    )
+                )
             return
 
+        self._notify_activity(
+            PlaybackActivityEvent(
+                phase="starting",
+                owner=request.owner,
+                priority=request.priority,
+                category=request.category,
+            )
+        )
         self._emit(f"playback_started={self._safe_owner_for_emit(request.owner)}")
         runtime_start_ns = time.monotonic_ns()
         try:
@@ -858,6 +894,17 @@ class PlaybackCoordinator:
                     started=request.started,
                 )
 
+        result = request.result
+        self._notify_activity(
+            PlaybackActivityEvent(
+                phase="finished",
+                owner=request.owner,
+                priority=request.priority,
+                category=request.category,
+                cancel_reason=None if result is None else result.cancel_reason,
+                error_type=None if request.error is None else type(request.error).__name__,
+            )
+        )
         self._emit(f"playback_completed={self._safe_owner_for_emit(request.owner)}")
 
     def _finalize_pending_request_locked(
@@ -1176,6 +1223,15 @@ class PlaybackCoordinator:
             callback()
         except Exception:
             return
+
+    def _notify_activity(self, event: PlaybackActivityEvent) -> None:
+        with self._condition:
+            listeners = tuple(self._activity_listeners)
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception as exc:  # Defensive containment: observers must not break playback.
+                self._emit(f"playback_listener_error={type(exc).__name__}")
 
     def _emit(self, message: str) -> None:
         if not callable(self.emit):

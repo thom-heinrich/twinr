@@ -33,14 +33,14 @@ Out of scope:
 - `pir/probe_pir.py` - print PIR state and motion events
 - `printer/setup_printer.sh` - configure the raw CUPS queue and optional test print
 - `ops/deploy_pi_runtime.py` - operator-facing Pi deploy command that replaces the old manual mirror-as-deploy step, performs repo sync plus runtime `.env` sync, and restarts/verifies the productive Pi unit set
-- `ops/peer_ai_camera_observation_proxy.py` - transport-only HTTP service for live IMX500 observations on the dedicated AI-camera proxy Pi
-- `ops/peer_camera_snapshot_proxy.py` - transport-only HTTP snapshot service for the dedicated AI-camera proxy Pi on the direct peer link
-- `ops/twinr-peer-ai-camera-proxy.service` - systemd unit that keeps the proxy-Pi live observation service alive on `10.42.0.2:8767`
-- `ops/twinr-peer-camera-proxy.service` - legacy dedicated snapshot unit on `10.42.0.2:8766`; prefer the combined AI-camera proxy on `10.42.0.2:8767` when live HDMI camera behavior is active
 - `ops/voice_gateway_tcp_proxy.py` - transport-only bridge that exposes a LAN-visible socket and forwards it into an existing thh1986 voice-gateway tunnel
 - `servo_kernel/twinr_servo.c` - out-of-tree Raspberry Pi servo kernel module for low-level body-orientation PWM
 - `servo_kernel/Makefile` - out-of-tree kernel module build entrypoint
 - `component.yaml` - structured metadata and manual-check map
+
+Historical helper-Pi proxy scripts and units are archived under
+`__legacy__/hardware/ops/` and are outside the active `hardware` validation
+and editing surface unless they are being intentionally revived.
 
 ## Invariants
 
@@ -57,12 +57,6 @@ Out of scope:
 - Kernel modules or other OS-facing driver code for Pi peripherals also stay here; keep the runtime-facing policy and control logic out of the module itself.
 - Transport bridges under `hardware/ops` must stay transport-only. Do not add
   voice activation, transcript, or fallback-routing logic there.
-- The peer camera proxy must bind only to the dedicated direct-link address and
-  must not become a second Twinr runtime or a policy-bearing camera service.
-- The peer AI-camera observation proxy must remain transport-only as well; it
-  may expose bounded camera facts, but HDMI behavior, gesture policy, and main
-  runtime orchestration stay on the main Pi.
-
 ## Verification
 
 After any edit in this directory, run:
@@ -79,20 +73,6 @@ If `hardware/ops/deploy_pi_runtime.py` changed, also run:
 ```bash
 PYTHONPATH=src ./.venv/bin/pytest test/test_ops_pi_runtime_deploy.py test/test_ops_pi_repo_mirror.py test/test_ops_self_coding_pi.py -q
 python3 hardware/ops/deploy_pi_runtime.py --skip-env-sync --skip-editable-install --skip-systemd-install --skip-env-contract-check --service twinr-runtime-supervisor
-```
-
-If `hardware/ops/peer_camera_snapshot_proxy.py` or `hardware/ops/twinr-peer-camera-proxy.service` changed, also run:
-
-```bash
-PYTHONPATH=src python3 -m py_compile hardware/ops/peer_camera_snapshot_proxy.py
-PYTHONPATH=src ./.venv/bin/pytest test/test_peer_camera_snapshot_proxy.py -q
-```
-
-If `hardware/ops/peer_ai_camera_observation_proxy.py` or `hardware/ops/twinr-peer-ai-camera-proxy.service` changed, also run:
-
-```bash
-PYTHONPATH=src python3 -m py_compile hardware/ops/peer_ai_camera_observation_proxy.py
-PYTHONPATH=src ./.venv/bin/pytest test/test_peer_ai_camera_observation_proxy.py -q
 ```
 
 If button, Pi AI Camera, PIR, or display probes changed and you are on Pi acceptance hardware, also run:

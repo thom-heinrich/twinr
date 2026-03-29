@@ -13,6 +13,7 @@ from twinr.agent.workflows.forensics import workflow_decision
 
 from ..social.camera_surface import ProactiveCameraSurfaceUpdate
 from ..social.engine import SocialObservation, SocialVisionObservation
+from ..social.perception_stream import gesture_stream, gesture_stream_authoritative
 from .display_gesture_emoji import DisplayGestureEmojiDecision, DisplayGestureEmojiPublishResult
 from .gesture_wakeup_lane import GestureWakeupDecision
 
@@ -195,8 +196,8 @@ def record_gesture_debug_tick(
 ) -> None:
     """Append one continuous bounded gesture-debug tick."""
 
-    stream = coordinator.display_gesture_debug_stream
-    if stream is None:
+    debug_stream = coordinator.display_gesture_debug_stream
+    if debug_stream is None:
         return
     payload: dict[str, Any] = {
         "runtime_status": str(runtime_status_value or "").strip().lower() or None,
@@ -204,6 +205,7 @@ def record_gesture_debug_tick(
         "stage_ms": dict(stage_ms),
     }
     if observation is not None:
+        gesture_stream_observation = gesture_stream(observation)
         payload.update(
             {
                 "camera_online": observation.camera_online,
@@ -219,6 +221,16 @@ def record_gesture_debug_tick(
                 "camera_gesture_confidence": _round_optional_ratio(observation.gesture_confidence),
                 "camera_hand_or_object_near": observation.hand_or_object_near_camera,
                 "camera_showing_intent_likely": observation.showing_intent_likely,
+                "gesture_stream_authoritative": gesture_stream_authoritative(observation),
+                "gesture_stream_activation_key": (
+                    None if gesture_stream_observation is None else gesture_stream_observation.activation_key
+                ),
+                "gesture_stream_activation_token": (
+                    None if gesture_stream_observation is None else gesture_stream_observation.activation_token
+                ),
+                "gesture_stream_activation_rising": (
+                    None if gesture_stream_observation is None else gesture_stream_observation.activation_rising
+                ),
             }
         )
     gesture_debug_details_getter = getattr(coordinator.vision_observer, "gesture_debug_details", None)
@@ -259,7 +271,7 @@ def record_gesture_debug_tick(
             }
         )
     try:
-        stream.append_tick(
+        debug_stream.append_tick(
             outcome=outcome,
             observed_at=observed_at,
             data=payload,
@@ -291,6 +303,9 @@ def gesture_observation_trace_details(
         "gesture_confidence": _round_optional_ratio(observation.gesture_confidence),
         "hand_or_object_near_camera": observation.hand_or_object_near_camera,
         "showing_intent_likely": observation.showing_intent_likely,
+        "gesture_stream_authoritative": gesture_stream_authoritative(observation),
+        "gesture_stream_activation_key": None if gesture_stream(observation) is None else gesture_stream(observation).activation_key,
+        "gesture_stream_activation_token": None if gesture_stream(observation) is None else gesture_stream(observation).activation_token,
     }
 
 
@@ -312,15 +327,19 @@ def trace_gesture_ack_lane_decision(
         options=[
             {"id": "publish_fine_hand_gesture", "summary": "Emit one fine-hand acknowledgement immediately."},
             {"id": "publish_coarse_gesture", "summary": "Emit one coarse motion acknowledgement immediately."},
-            {"id": "awaiting_live_gesture_confirmation", "summary": "Keep the candidate pending until confirmation."},
+            {"id": "gesture_stream_not_authoritative", "summary": "Ignore the frame because no authoritative gesture stream was attached."},
+            {"id": "live_gesture_already_active", "summary": "Do not re-emit while the same authoritative activation token remains active."},
             {"id": "live_gesture_cooldown", "summary": "Suppress a repeated acknowledgement during cooldown."},
-            {"id": "no_supported_live_gesture", "summary": "Ignore the frame because no supported gesture survived gating."},
+            {"id": "no_supported_live_gesture", "summary": "Ignore the frame because the authoritative gesture is unsupported by the HDMI path."},
         ],
         context={
+            "gesture_stream_authoritative": gesture_stream_authoritative(observation),
             "observed_fine_hand_gesture": observation.fine_hand_gesture.value,
             "observed_fine_hand_confidence": _round_optional_ratio(observation.fine_hand_gesture_confidence),
             "observed_gesture_event": observation.gesture_event.value,
             "observed_gesture_confidence": _round_optional_ratio(observation.gesture_confidence),
+            "stream_activation_key": None if gesture_stream(observation) is None else gesture_stream(observation).activation_key,
+            "stream_activation_token": None if gesture_stream(observation) is None else gesture_stream(observation).activation_token,
         },
         confidence=_round_optional_ratio(observation.fine_hand_gesture_confidence or observation.gesture_confidence),
         guardrails=["gesture_ack_lane", "display_only"],
@@ -346,8 +365,8 @@ def trace_gesture_wakeup_lane_decision(
         },
         options=[
             {"id": f"gesture_wakeup:{decision.trigger_gesture.value}", "summary": "Trigger a wake request immediately."},
-            {"id": "awaiting_gesture_wakeup_confirmation", "summary": "Keep the wake candidate pending until confirmation."},
-            {"id": "gesture_wakeup_low_confidence", "summary": "Reject the wake candidate because confidence is too low."},
+            {"id": "gesture_wakeup_not_authoritative", "summary": "Ignore the frame because no authoritative gesture stream was attached."},
+            {"id": "gesture_wakeup_already_active", "summary": "Do not re-dispatch while the same authoritative activation token remains active."},
             {"id": "gesture_wakeup_cooldown", "summary": "Suppress a repeated wake request during cooldown."},
             {"id": "no_gesture_wakeup_candidate", "summary": "Ignore the frame because the trigger gesture was not present."},
         ],

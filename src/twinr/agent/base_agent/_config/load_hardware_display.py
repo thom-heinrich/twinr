@@ -192,6 +192,9 @@ def load_hardware_display_config(context: ConfigLoadContext) -> dict[str, object
         "display_reserve_bus_max_hold_s": _parse_float(
             get_value("TWINR_DISPLAY_RESERVE_BUS_MAX_HOLD_S"), 720.0, minimum=60.0
         ),
+        "display_gesture_refresh_interval_s": _parse_float(
+            get_value("TWINR_DISPLAY_GESTURE_REFRESH_INTERVAL_S"), 0.2, minimum=0.0
+        ),
         "display_attention_refresh_interval_s": _parse_float(
             get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"), 0.2, minimum=0.0
         ),

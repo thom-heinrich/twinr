@@ -17,6 +17,7 @@ from twinr.hardware.camera_ai.live_gesture_pipeline import (
     LiveGesturePipeline,
     _crop_hand_box,
 )
+from twinr.hardware.camera_ai.mediapipe_runtime import MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR
 from twinr.hardware.camera_ai.models import AICameraBox, AICameraFineHandGesture, AICameraGestureEvent
 
 
@@ -61,11 +62,13 @@ class _StubRecognizer:
         self._results = list(results)
         self._async_delay_s = max(0.0, float(async_delay_s))
         self._threads: list[threading.Thread] = []
+        self.async_call_count = 0
 
     def _next(self):
         return self._results.pop(0) if len(self._results) > 1 else self._results[0]
 
     def recognize_async(self, image, timestamp_ms: int) -> None:
+        self.async_call_count += 1
         result = self._next()
         if self._callback is None:
             return
@@ -112,6 +115,9 @@ class _StubRuntime:
         self._roi_builtin = None
         self._roi_custom = None
         self.live_num_hands_override = None
+        self.live_reset_count = 0
+        self.live_builtin_submit_count = 0
+        self.live_custom_submit_count = 0
 
     def load_runtime(self):
         return {}
@@ -130,6 +136,9 @@ class _StubRuntime:
                 self._builtin_results,
                 async_delay_s=self._builtin_async_delay_s,
             )
+        else:
+            self._builtin._callback = result_callback
+        self.live_builtin_submit_count = self._builtin.async_call_count
         return self._builtin
 
     def ensure_live_custom_gesture_recognizer(self, runtime, *, result_callback):
@@ -139,6 +148,9 @@ class _StubRuntime:
                 self._custom_results,
                 async_delay_s=self._custom_async_delay_s,
             )
+        else:
+            self._custom._callback = result_callback
+        self.live_custom_submit_count = self._custom.async_call_count
         return self._custom
 
     def ensure_roi_gesture_recognizer(self, runtime):
@@ -156,6 +168,14 @@ class _StubRuntime:
             if recognizer is not None:
                 recognizer.wait()
         return None
+
+    def reset_live_gesture_recognizers(self) -> None:
+        self.live_reset_count += 1
+        for recognizer in (self._builtin, self._custom):
+            if recognizer is not None:
+                recognizer.wait()
+        self._builtin = None
+        self._custom = None
 
 
 class _StubHandLandmarkWorker:
@@ -229,6 +249,35 @@ class _ImageSelectiveRoiRuntime(_StubRuntime):
 
 
 class LiveGesturePipelineTests(unittest.TestCase):
+    def test_live_callback_cache_keys_stay_stable_across_per_frame_handlers(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+
+        builtin_one = pipeline._make_builtin_result_handler(0)
+        builtin_two = pipeline._make_builtin_result_handler(0)
+        custom_one = pipeline._make_custom_result_handler(0)
+        custom_two = pipeline._make_custom_result_handler(0)
+
+        self.assertIsNot(builtin_one, builtin_two)
+        self.assertIsNot(custom_one, custom_two)
+        self.assertEqual(
+            getattr(builtin_one, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+            getattr(builtin_two, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+        )
+        self.assertEqual(
+            getattr(custom_one, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+            getattr(custom_two, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+        )
+        self.assertNotEqual(
+            getattr(builtin_one, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+            getattr(custom_one, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR),
+        )
+
     def test_observe_uses_live_stream_builtin_result_for_fast_symbol(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -252,6 +301,52 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.92, places=3)
         self.assertEqual(observation.gesture_event, AICameraGestureEvent.NONE)
         self.assertEqual(observation.hand_count, 1)
+        self.assertTrue(observation.gesture_temporal_authoritative)
+        self.assertEqual(observation.gesture_activation_key, "fine:thumbs_up")
+        self.assertEqual(observation.gesture_activation_token, 1)
+        self.assertTrue(observation.gesture_activation_rising)
+
+    def test_observe_reuses_authoritative_activation_token_until_gesture_resets(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[ _Category("Thumb_Up", 0.92) ]],
+                    hand_landmarks=[[ _Landmark(0.42), _Landmark(0.44) ]],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("Thumb_Up", 0.81) ]],
+                    hand_landmarks=[[ _Landmark(0.43), _Landmark(0.45) ]],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("none", 0.96) ]],
+                    hand_landmarks=[],
+                ),
+                _GestureResult(
+                    gestures=[[ _Category("Thumb_Up", 0.88) ]],
+                    hand_landmarks=[[ _Landmark(0.44), _Landmark(0.46) ]],
+                ),
+            ]
+        )
+
+        first = pipeline.observe(frame_rgb="frame", observed_at=10.0)
+        held = pipeline.observe(frame_rgb="frame", observed_at=10.1)
+        reset = pipeline.observe(frame_rgb="frame", observed_at=10.3)
+        replay = pipeline.observe(frame_rgb="frame", observed_at=10.6)
+
+        self.assertEqual(first.gesture_activation_token, 1)
+        self.assertTrue(first.gesture_activation_rising)
+        self.assertEqual(held.gesture_activation_token, 1)
+        self.assertFalse(held.gesture_activation_rising)
+        self.assertIsNone(reset.gesture_activation_token)
+        self.assertEqual(replay.gesture_activation_token, 2)
+        self.assertTrue(replay.gesture_activation_rising)
 
     def test_observe_ignores_live_stream_custom_symbol_outside_three_gesture_path(self) -> None:
         pipeline = LiveGesturePipeline(
@@ -420,6 +515,78 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertTrue(debug_snapshot["current_live_builtin_ready"])
         self.assertTrue(debug_snapshot["current_live_custom_ready"])
         self.assertGreater(debug_snapshot["current_live_result_wait_s"], 0.0)
+
+    def test_observe_does_not_queue_second_live_frame_while_first_is_still_pending(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("Thumb_Up", 0.91)]],
+                    hand_landmarks=[[_Landmark(0.44), _Landmark(0.48)]],
+                )
+            ],
+            builtin_async_delay_s=0.45,
+        )
+        pipeline._runtime = runtime
+
+        try:
+            first = pipeline.observe(frame_rgb="frame", observed_at=10.0)
+            first_debug = pipeline.debug_snapshot()
+            second = pipeline.observe(frame_rgb="frame", observed_at=10.1)
+            second_debug = pipeline.debug_snapshot()
+        finally:
+            pipeline.close()
+
+        self.assertEqual(first.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertFalse(first_debug["current_live_builtin_ready"])
+        self.assertEqual(runtime._builtin.async_call_count, 1)
+        self.assertEqual(second.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertFalse(second_debug["live_builtin_submitted"])
+        self.assertTrue(second_debug["live_pending_backpressure"])
+        self.assertEqual(runtime._builtin.async_call_count, 1)
+
+    def test_observe_resets_stale_live_pending_request_before_submitting_again(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                live_pending_result_timeout_s=0.25,
+            )
+        )
+        runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("Thumb_Up", 0.91)]],
+                    hand_landmarks=[[_Landmark(0.44), _Landmark(0.48)]],
+                )
+            ],
+            builtin_async_delay_s=0.45,
+        )
+        pipeline._runtime = runtime
+
+        try:
+            first = pipeline.observe(frame_rgb="frame", observed_at=10.0)
+            self.assertEqual(first.fine_hand_gesture, AICameraFineHandGesture.NONE)
+            pipeline._pending_live_builtin_submitted_mono_s = time.monotonic() - 1.0
+            second = pipeline.observe(frame_rgb="frame", observed_at=10.3)
+            second_debug = pipeline.debug_snapshot()
+        finally:
+            pipeline.close()
+
+        self.assertEqual(second.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertEqual(runtime.live_reset_count, 1)
+        self.assertTrue(second_debug["live_pending_reset"])
+        self.assertEqual(second_debug["live_pending_reset_reason"], "builtin_timeout")
+        self.assertTrue(second_debug["live_builtin_submitted"])
+        self.assertIsNotNone(runtime._builtin)
+        self.assertEqual(runtime._builtin.async_call_count, 1)
 
     def test_observe_rejects_low_confidence_live_stream_custom_symbol(self) -> None:
         pipeline = LiveGesturePipeline(
@@ -608,7 +775,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
         self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
 
-    def test_observe_user_facing_fast_policy_uses_current_live_hand_roi_only(self) -> None:
+    def test_observe_user_facing_fast_policy_prefers_current_live_hand_roi_before_person_roi(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
                 pose_model_path="pose.task",
@@ -659,12 +826,60 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(debug_snapshot["observe_policy"], "user_facing_fast")
         self.assertEqual(
             debug_snapshot["person_roi_block_reason"],
-            "observe_policy_disallows_person_roi_recovery",
+            "deferred_until_live_hand_roi_exhausted",
         )
         self.assertIsNone(debug_snapshot["full_frame_hand_attempt_reason"])
         self.assertEqual(len(worker.calls), 0)
         self.assertEqual(len(worker.full_frame_calls), 0)
         self.assertIsNone(pipeline._runtime._custom)
+
+    def test_observe_user_facing_fast_policy_falls_back_to_current_person_roi_when_live_hand_path_has_no_boxes(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.95)]],
+                    hand_landmarks=[],
+                )
+            ],
+            roi_builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("Victory", 0.88)]],
+                    hand_landmarks=[],
+                )
+            ],
+        )
+        worker = _RecordingHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(SimpleNamespace(roi_frame_rgb="roi-frame"),),
+                final_timestamp_ms=7000,
+            )
+        )
+        pipeline._hand_landmark_worker = worker
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.0,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+            primary_person_box=AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),
+            visible_person_boxes=(AICameraBox(top=0.2, left=0.2, bottom=0.8, right=0.8),),
+            person_count=1,
+        )
+
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertEqual(debug_snapshot["resolved_source"], "person_roi")
+        self.assertEqual(debug_snapshot["observe_policy"], "user_facing_fast")
+        self.assertEqual(debug_snapshot["live_hand_count_exact"], 0)
+        self.assertEqual(debug_snapshot["person_roi_combined_gesture"], AICameraFineHandGesture.PEACE_SIGN.value)
+        self.assertEqual(len(worker.calls), 1)
+        self.assertEqual(len(worker.full_frame_calls), 0)
 
     def test_observe_user_facing_fast_policy_keeps_live_custom_peace_sign(self) -> None:
         pipeline = LiveGesturePipeline(
@@ -704,6 +919,54 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertTrue(debug_snapshot["live_custom_enabled"])
         self.assertTrue(debug_snapshot["observe_policy_enable_custom_live"])
 
+    def test_observe_user_facing_fast_policy_waits_for_consensus_before_emitting_weak_live_stream_symbol(
+        self,
+    ) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("Thumb_Up", 0.62)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                ),
+                _GestureResult(
+                    gestures=[[_Category("Thumb_Up", 0.62)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                ),
+            ],
+        )
+
+        first = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.0,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+        )
+        first_debug = pipeline.debug_snapshot()
+        second = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.1,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+        )
+        second_debug = pipeline.debug_snapshot()
+
+        self.assertEqual(first.fine_hand_gesture, AICameraFineHandGesture.NONE)
+        self.assertIsNone(first.fine_hand_gesture_confidence)
+        self.assertIsNone(first.gesture_activation_token)
+        self.assertEqual(first_debug["resolved_source"], "temporal_guard")
+        self.assertEqual(first_debug["temporal_reason"], "weak_live_waiting_for_consensus")
+        self.assertEqual(second.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(second.fine_hand_gesture_confidence or 0.0, 0.62, places=3)
+        self.assertEqual(second.gesture_activation_key, "fine:thumbs_up")
+        self.assertEqual(second.gesture_activation_source, "temporal_consensus")
+        self.assertEqual(second_debug["resolved_source"], "temporal_consensus")
+        self.assertEqual(second_debug["temporal_reason"], "consensus")
+
     def test_observe_user_facing_fast_policy_ignores_recent_hand_box_reuse(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -730,6 +993,12 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 )
             },
         )
+        pipeline._hand_landmark_worker = _RecordingHandLandmarkWorker(
+            SimpleNamespace(
+                detections=(),
+                final_timestamp_ms=7200,
+            )
+        )
 
         pipeline.observe(frame_rgb="frame", observed_at=7.0)
         observation = pipeline.observe(
@@ -746,10 +1015,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertEqual(debug_snapshot["resolved_source"], "none")
         self.assertEqual(debug_snapshot["effective_live_hand_box_count"], 0)
         self.assertEqual(debug_snapshot["live_hand_box_source"], "none")
-        self.assertEqual(
-            debug_snapshot["person_roi_block_reason"],
-            "observe_policy_disallows_person_roi_recovery",
-        )
+        self.assertEqual(debug_snapshot["person_roi_detection_count"], 0)
 
     def test_observe_recovers_symbol_from_primary_person_roi_when_live_path_stays_none(self) -> None:
         pipeline = LiveGesturePipeline(

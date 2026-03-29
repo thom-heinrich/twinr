@@ -8,6 +8,7 @@ from typing import Callable
 import sys
 import time
 import unittest
+import gc
 from datetime import datetime
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ from twinr.agent.base_agent.contracts import (
 )
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
+from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
 from twinr.agent.workflows.streaming_semantic_router import _synthesize_supervisor_decision
 from twinr.agent.workflows.streaming_turn_coordinator import (
@@ -981,8 +983,28 @@ class StreamingRunnerTests(unittest.TestCase):
         os.environ["TWINR_WORKFLOW_TRACE_ENABLED"] = "0"
         os.environ.pop("TWINR_WORKFLOW_TRACE_MODE", None)
         os.environ.pop("TWINR_WORKFLOW_TRACE_DIR", None)
+        self._created_streaming_loops: list[TwinrStreamingHardwareLoop] = []
+        original_init = TwinrStreamingHardwareLoop.__init__
+
+        def tracking_init(loop_self, *args, **kwargs):
+            original_init(loop_self, *args, **kwargs)
+            self._created_streaming_loops.append(loop_self)
+
+        self._streaming_loop_init_patcher = mock.patch.object(
+            TwinrStreamingHardwareLoop,
+            "__init__",
+            new=tracking_init,
+        )
+        self._streaming_loop_init_patcher.start()
 
     def tearDown(self) -> None:
+        self._streaming_loop_init_patcher.stop()
+        for loop in reversed(self._created_streaming_loops):
+            try:
+                loop.close(timeout_s=0.2)
+            except Exception:
+                pass
+        gc.collect()
         for key, value in self._workflow_trace_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -1121,6 +1143,52 @@ class StreamingRunnerTests(unittest.TestCase):
                 "processing_stop",
             ],
         )
+
+    def test_streaming_loop_close_shuts_down_warmup_executor_and_chains_base_close(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+        fake_future = mock.Mock()
+        fake_executor = mock.Mock()
+        loop._warmup_executor = fake_executor
+        loop._warmup_futures = {"first_word": fake_future}
+
+        with mock.patch.object(TwinrRealtimeHardwareLoop, "close", autospec=True) as parent_close:
+            loop.close(timeout_s=0.7)
+
+        fake_future.cancel.assert_called_once_with()
+        fake_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        self.assertEqual(loop._warmup_futures, {})
+        self.assertIsNone(loop._warmup_executor)
+        parent_close.assert_called_once_with(loop, timeout_s=0.7)
+
+    def test_streaming_loop_del_delegates_to_close(self) -> None:
+        loop = object.__new__(TwinrStreamingHardwareLoop)
+        with mock.patch.object(TwinrStreamingHardwareLoop, "close", autospec=True) as close:
+            TwinrStreamingHardwareLoop.__del__(loop)
+
+        close.assert_called_once_with(loop, timeout_s=0.2)
 
     def test_audio_turn_uses_same_stream_remote_commit_when_voice_orchestrator_owns_listening(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -3158,6 +3226,53 @@ class StreamingRunnerTests(unittest.TestCase):
             "Ich meinte, ich wollte mein WhatsApp bei dir als App einrichten.",
         )
         self.assertFalse(captured_kwargs["play_initial_beep"])
+
+    def test_streaming_text_turn_reuses_existing_listening_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.runtime.begin_listening(request_source="follow_up")
+            active_turn_id = loop.runtime._runtime_flow_state()["active_turn_id"]
+            completed_turns: list[dict[str, object]] = []
+
+            def fake_complete_streaming_turn(**kwargs):
+                completed_turns.append(dict(kwargs))
+                return True
+
+            loop._complete_streaming_turn = fake_complete_streaming_turn  # type: ignore[method-assign]
+
+            handled = loop._run_single_text_turn(
+                transcript="wie geht es dir",
+                listen_source="follow_up",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(loop.runtime.status.value, "listening")
+        self.assertEqual(loop.runtime._runtime_flow_state()["active_turn_id"], active_turn_id)
+        self.assertEqual(completed_turns[0]["transcript"], "wie geht es dir")
 
     def test_direct_follow_up_rearms_to_listening_without_waiting_gap(self) -> None:
         class SequencedRecorder:

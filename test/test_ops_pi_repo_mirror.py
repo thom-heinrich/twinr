@@ -87,6 +87,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--exclude=**/*.egg-info/", commands[0])
         self.assertIn("--exclude=**/node_modules/", commands[0])
         self.assertIn("--exclude=**/browser_automation/artifacts/", commands[0])
+        self.assertIn("--exclude=/hardware/bitcraze/twinr_on_device_failsafe/build/", commands[0])
         self.assertIn("--filter=-p /.cache/", joined)
         self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])

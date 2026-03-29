@@ -26,6 +26,10 @@ _PGREP_TIMEOUT_SECONDS = 0.5  # AUDIT-FIX(#4): Keep fallback probing short to li
 _MAX_SERVICE_DETAIL_ITEMS = 2
 _MAX_SERVICE_DETAIL_LENGTH = 160
 _ERROR_LEVELS = frozenset({"error", "critical", "fatal"})  # AUDIT-FIX(#7): Count severe events beyond only "error".
+_MEMORY_WARN_AVAILABLE_MB = 512
+_MEMORY_FAIL_AVAILABLE_MB = 256
+_MEMORY_WARN_USED_PERCENT = 80.0
+_MEMORY_FAIL_USED_PERCENT = 90.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,7 @@ class _ProcessEntry:
     pid: str
     ppid: str
     command: str
+    argv: tuple[str, ...] = ()
 
 
 def collect_system_health(
@@ -137,14 +142,11 @@ def collect_system_health(
     if not recent_errors_ok or not service_probe_ok or not project_root_ok:
         status = _escalate_status(status, "warn")  # AUDIT-FIX(#1): Partial health-capture failures must degrade, not disappear.
 
-    conversation_service = _get_service(services, "conversation_loop")
     display_service = _get_service(services, "display")
-    if service_probe_ok and (
-        conversation_service is None
-        or not conversation_service.running
-        or conversation_service.count != 1
-    ):
-        status = _escalate_status(status, "fail")  # AUDIT-FIX(#2): Core conversation service must exist exactly once.
+    if service_probe_ok:
+        conversation_status = _conversation_loop_status_level(services)
+        if conversation_status is not None:
+            status = _escalate_status(status, conversation_status)
     if (
         service_probe_ok
         and display_service is not None
@@ -156,10 +158,12 @@ def collect_system_health(
     if runtime_status_level is not None:
         status = _escalate_status(status, runtime_status_level)  # AUDIT-FIX(#3): Propagate runtime snapshot state into overall health.
 
-    if memory_used_percent is not None and memory_used_percent >= 90:
-        status = _escalate_status(status, "fail")
-    elif memory_used_percent is not None and memory_used_percent >= 80:
-        status = _escalate_status(status, "warn")
+    memory_status = assess_memory_pressure_status(
+        memory_available_mb=memory_available_mb,
+        memory_used_percent=memory_used_percent,
+    )
+    if memory_status is not None:
+        status = _escalate_status(status, memory_status)
 
     if disk_used_percent is not None and disk_used_percent >= 95:
         status = _escalate_status(status, "fail")
@@ -258,6 +262,35 @@ def _read_memory() -> tuple[int | None, int | None, float | None]:
     return (total_mb, available_mb, used_percent)
 
 
+def assess_memory_pressure_status(
+    *,
+    memory_available_mb: int | None,
+    memory_used_percent: float | None,
+) -> str | None:
+    """Classify memory pressure for operator-facing health surfaces.
+
+    Linux exposes ``MemAvailable`` as the estimate of how much memory can still
+    be used for new work without swapping, which is a better operator signal
+    than raw used percentage once page cache and reclaimable memory dominate.
+    Fall back to used-percent thresholds only when ``MemAvailable`` is
+    unavailable.
+    """
+
+    if memory_available_mb is not None:
+        if memory_available_mb <= _MEMORY_FAIL_AVAILABLE_MB:
+            return "fail"
+        if memory_available_mb <= _MEMORY_WARN_AVAILABLE_MB:
+            return "warn"
+        return None
+    if memory_used_percent is None:
+        return None
+    if memory_used_percent >= _MEMORY_FAIL_USED_PERCENT:
+        return "fail"
+    if memory_used_percent >= _MEMORY_WARN_USED_PERCENT:
+        return "warn"
+    return None
+
+
 def _read_disk(project_root: Path | None) -> tuple[float | None, float | None, float | None]:
     target_path = _coerce_disk_usage_path(project_root)  # AUDIT-FIX(#8): Fall back to a real on-disk path instead of returning no disk telemetry.
     if target_path is None:
@@ -295,6 +328,11 @@ def _collect_service_health(config: TwinrConfig | None = None) -> tuple[tuple[Se
             "Conversation loop",
             ("--run-streaming-loop",),
         ),
+        (
+            "runtime_supervisor",
+            "Runtime supervisor",
+            ("--run-runtime-supervisor",),
+        ),
         ("display", "Display loop", ("--run-display-loop",)),
     )
     process_entries = _list_process_entries()
@@ -304,7 +342,7 @@ def _collect_service_health(config: TwinrConfig | None = None) -> tuple[tuple[Se
         parent_by_pid = {entry.pid: entry.ppid for entry in process_entries}
         for key, label, alternatives in service_specs:
             matching_entries = tuple(
-                entry for entry in process_entries if _command_matches(entry.command, alternatives)
+                entry for entry in process_entries if _command_matches(entry, alternatives)
             )  # AUDIT-FIX(#10): Match exact argv tokens to avoid substring false positives.
             if key == "conversation_loop":
                 matching_entries = _filter_conversation_loop_entries(
@@ -313,7 +351,8 @@ def _collect_service_health(config: TwinrConfig | None = None) -> tuple[tuple[Se
                     parent_by_pid=parent_by_pid,
                 )  # AUDIT-FIX(#13): Ignore multiprocessing workers that inherit the parent's streaming-loop argv.
             matches = tuple(
-                _format_process_detail(entry.pid, entry.command) for entry in matching_entries
+                _format_process_detail(entry.pid, entry.command, argv=entry.argv)
+                for entry in matching_entries
             )
             rows.append(
                 ServiceHealth(
@@ -465,7 +504,14 @@ def _list_process_entries() -> tuple[_ProcessEntry, ...] | None:
         if pid is None or command is None:
             continue
         pid_value, ppid_value = pid
-        entries.append(_ProcessEntry(pid=pid_value, ppid=ppid_value, command=command))
+        entries.append(
+            _ProcessEntry(
+                pid=pid_value,
+                ppid=ppid_value,
+                command=command,
+                argv=_read_process_argv(pid_value),
+            )
+        )
     return tuple(entries)
 
 
@@ -479,15 +525,48 @@ def _split_process_line(line: str) -> tuple[tuple[str, str] | None, str | None]:
     return ((pid, ppid), command)
 
 
-def _command_matches(command: str, alternatives: tuple[str, ...]) -> bool:
-    tokens = command.split()
+def _read_process_argv(pid: str) -> tuple[str, ...]:
+    path = Path("/proc") / pid / "cmdline"
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        return ()
+    if not raw:
+        return ()
+    return tuple(
+        part.decode("utf-8", errors="replace")
+        for part in raw.split(b"\0")
+        if part
+    )
+
+
+def _command_tokens(entry: _ProcessEntry) -> tuple[str, ...]:
+    if entry.argv:
+        return entry.argv
+    tokens = tuple(entry.command.split())
+    if len(tokens) >= 2 and tokens[1] == "-c" and Path(tokens[0]).name in {
+        "ash",
+        "bash",
+        "dash",
+        "ksh",
+        "sh",
+        "zsh",
+    }:
+        # Shell `-c` script text is a single argv item that can mention Twinr
+        # service flags in diagnostics or debug snippets without launching them.
+        return tokens[:2]
+    return tokens
+
+
+def _command_matches(entry: _ProcessEntry, alternatives: tuple[str, ...]) -> bool:
+    tokens = _command_tokens(entry)
     if not tokens:
         return False
     return any(token in alternatives for token in tokens)
 
 
-def _format_process_detail(pid: str, command: str) -> str:
-    tokens = command.split()
+def _format_process_detail(pid: str, command: str, *, argv: tuple[str, ...] = ()) -> str:
+    tokens = argv or _command_tokens(_ProcessEntry(pid=pid, ppid="0", command=command))
     executable = Path(tokens[0]).name if tokens else "<unknown>"
     safe_flags = [token for token in tokens[1:] if token.startswith("--run-")]
     detail = f"pid={pid} {executable}"
@@ -633,6 +712,24 @@ def _get_service(
         if service.key == key:
             return service
     return None
+
+
+def _conversation_loop_status_level(services: tuple[ServiceHealth, ...]) -> str | None:
+    conversation_service = _get_service(services, "conversation_loop")
+    if _service_running_exactly_once(conversation_service):
+        return None
+
+    runtime_supervisor = _get_service(services, "runtime_supervisor")
+    if _service_running_exactly_once(runtime_supervisor):
+        # The Pi runtime supervisor intentionally owns streaming-loop restarts.
+        # During bounded child churn, operator surfaces should show degradation,
+        # not a hard system failure, unless the snapshot itself is already fatal.
+        return "warn"
+    return "fail"
+
+
+def _service_running_exactly_once(service: ServiceHealth | None) -> bool:
+    return service is not None and service.running and service.count == 1
 
 
 def _clamp_percentage(value: float | None) -> float | None:

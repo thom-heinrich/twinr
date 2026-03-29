@@ -224,46 +224,69 @@ class ProactiveMonitorService:
         try:
             while not self._stop_event.is_set():
                 did_work = False
-                now = time.monotonic()
-                if now >= next_attention_refresh_at:
-                    try:
-                        if self.coordinator.refresh_display_attention():
-                            did_work = True
-                    except Exception as exc:
-                        error_text = _exception_text(exc)
-                        self._emit(f"proactive_error={error_text}")
-                        self._append_ops_event(
-                            event="proactive_error",
-                            level="error",
-                            message="Display attention refresh failed.",
-                            data={"error": error_text},
-                        )
-                    interval_s = resolve_display_attention_refresh_interval(self.coordinator.config)
-                    next_attention_refresh_at = (
-                        time.monotonic() + interval_s
-                        if interval_s is not None
-                        else time.monotonic() + self.poll_interval_s
+                loop_now = time.monotonic()
+                attention_due = loop_now >= next_attention_refresh_at
+                gesture_due = loop_now >= next_gesture_refresh_at
+                shared_cycle_armed = False
+                if attention_due or gesture_due:
+                    self.coordinator._open_display_perception_cycle(  # pylint: disable=protected-access
+                        attention_due=attention_due,
+                        gesture_due=gesture_due,
                     )
-                now = time.monotonic()
-                if now >= next_gesture_refresh_at:
-                    try:
-                        if self.coordinator.refresh_display_gesture_emoji():
-                            did_work = True
-                    except Exception as exc:
-                        error_text = _exception_text(exc)
-                        self._emit(f"proactive_error={error_text}")
-                        self._append_ops_event(
-                            event="proactive_error",
-                            level="error",
-                            message="Display gesture refresh failed.",
-                            data={"error": error_text},
+                    shared_cycle_armed = getattr(
+                        self.coordinator,
+                        "_display_perception_cycle",
+                        None,
+                    ) is not None
+                refresh_anchor_s = loop_now if shared_cycle_armed else None
+                try:
+                    if attention_due:
+                        try:
+                            if self.coordinator.refresh_display_attention():
+                                did_work = True
+                        except Exception as exc:
+                            error_text = _exception_text(exc)
+                            self._emit(f"proactive_error={error_text}")
+                            self._append_ops_event(
+                                event="proactive_error",
+                                level="error",
+                                message="Display attention refresh failed.",
+                                data={"error": error_text},
+                            )
+                        interval_s = resolve_display_attention_refresh_interval(self.coordinator.config)
+                        attention_base_s = (
+                            time.monotonic() if refresh_anchor_s is None else refresh_anchor_s
                         )
-                    interval_s = resolve_display_gesture_refresh_interval(self.coordinator.config)
-                    next_gesture_refresh_at = (
-                        time.monotonic() + interval_s
-                        if interval_s is not None
-                        else time.monotonic() + self.poll_interval_s
-                    )
+                        next_attention_refresh_at = (
+                            attention_base_s + interval_s
+                            if interval_s is not None
+                            else attention_base_s + self.poll_interval_s
+                        )
+                    if gesture_due:
+                        try:
+                            if self.coordinator.refresh_display_gesture_emoji():
+                                did_work = True
+                        except Exception as exc:
+                            error_text = _exception_text(exc)
+                            self._emit(f"proactive_error={error_text}")
+                            self._append_ops_event(
+                                event="proactive_error",
+                                level="error",
+                                message="Display gesture refresh failed.",
+                                data={"error": error_text},
+                            )
+                        interval_s = resolve_display_gesture_refresh_interval(self.coordinator.config)
+                        gesture_base_s = (
+                            time.monotonic() if refresh_anchor_s is None else refresh_anchor_s
+                        )
+                        next_gesture_refresh_at = (
+                            gesture_base_s + interval_s
+                            if interval_s is not None
+                            else gesture_base_s + self.poll_interval_s
+                        )
+                finally:
+                    if attention_due or gesture_due:
+                        self.coordinator._close_display_perception_cycle()  # pylint: disable=protected-access
                 now = time.monotonic()
                 if now >= next_tick_at:
                     try:

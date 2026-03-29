@@ -146,6 +146,12 @@ bash hardware/bitcraze/build_on_device_failsafe.sh
 /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
 ```
 
+The generated build output stays under
+`hardware/bitcraze/twinr_on_device_failsafe/build/`, but that tree is a local
+firmware workspace only. It is not treated as authoritative source for Pi repo
+mirroring and is intentionally excluded from the `/home/thh/twinr -> /twinr`
+sync contract.
+
 The post-flash helper reconnects over the normal radio URI and proves the app
 through `twinrFs.protocolVersion`, `twinrFs.enable`, `twinrFs.state`, and
 `twinrFs.reason`. The hover worker's default `--on-device-failsafe-mode required`

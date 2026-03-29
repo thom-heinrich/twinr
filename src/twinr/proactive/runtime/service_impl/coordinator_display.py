@@ -5,7 +5,9 @@ one focused module so the main coordinator file stays centered on monitor ticks
 and trigger policy.
 
 Invariants: refresh cadence, runtime gating, forensic tracing, and publish
-outcomes must stay behavior-identical to the legacy service implementation.
+outcomes must stay behavior-identical to the legacy service implementation,
+while downstream attention/gesture semantics now come from the shared runtime
+perception orchestrator instead of lane-local temporal truth.
 """
 
 # mypy: ignore-errors
@@ -315,28 +317,24 @@ class ProactiveCoordinatorDisplayMixin:
                 )
                 stage_started_ns = time.monotonic_ns()
                 with workflow_span(
-                    name="proactive_display_gesture_ack_lane_observe",
+                    name="proactive_display_gesture_perception_orchestrator",
                     kind="decision",
                 ):
-                    decision = self._gesture_ack_lane.observe(
+                    perception_runtime = self.perception_orchestrator.observe_gesture(
                         observed_at=now,
-                        observation=snapshot.observation,
+                        source=self._last_gesture_vision_refresh_mode,
+                        captured_at=snapshot.captured_at,
+                        vision_observation=snapshot.observation,
                     )
-                stage_ms["ack_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+                self.latest_perception_runtime_snapshot = perception_runtime
+                assert perception_runtime.gesture is not None
+                decision = perception_runtime.gesture.ack_decision
+                wakeup_decision = perception_runtime.gesture.wakeup_decision
+                stage_ms["gesture_orchestrator"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
                 self._trace_gesture_ack_lane_decision(
                     observation=snapshot.observation,
                     decision=decision,
                 )
-                stage_started_ns = time.monotonic_ns()
-                with workflow_span(
-                    name="proactive_display_gesture_wakeup_lane_observe",
-                    kind="decision",
-                ):
-                    wakeup_decision = self._gesture_wakeup_lane.observe(
-                        observed_at=now,
-                        observation=snapshot.observation,
-                    )
-                stage_ms["wakeup_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
                 self._trace_gesture_wakeup_lane_decision(decision=wakeup_decision)
                 if wakeup_decision.active:
                     stage_started_ns = time.monotonic_ns()

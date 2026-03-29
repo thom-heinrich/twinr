@@ -45,11 +45,7 @@ _COARSE_GESTURE_MAP: dict[SocialGestureEvent, tuple[DisplayEmojiSymbol, str]] = 
 def resolve_display_gesture_refresh_interval(config: TwinrConfig) -> float | None:
     """Return the bounded local refresh cadence for HDMI gesture acknowledgement."""
 
-    raw_interval = getattr(
-        config,
-        "display_gesture_refresh_interval_s",
-        getattr(config, "display_attention_refresh_interval_s", 0.2),
-    )
+    raw_interval = getattr(config, "display_gesture_refresh_interval_s", 0.2)
     try:
         interval_s = float(raw_interval or 0.0)
     except (TypeError, ValueError):

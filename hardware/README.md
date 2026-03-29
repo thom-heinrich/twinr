@@ -10,7 +10,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 - install and stage vendor prerequisites for optional Bitcraze Crazyradio/Crazyflie experimentation under an isolated runtime workspace
 - install or stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
 - install or stage the development-host bounded drone daemon that exposes Twinr's mission-level inspection surface behind preflight and manual-arm gates
-- retain historical helper-Pi proxy service definitions under `hardware/ops` for reference or migration only; they are no longer part of the productive single-Pi runtime topology
+- keep only the productive hardware/bootstrap surface in the tracked tree; retired helper-Pi proxy artifacts now live under `__legacy__/hardware/ops/`
 - stage low-level Pi-side kernel or OS integration code when a peripheral needs a real kernel-facing driver path instead of a userspace helper
 - run bounded manual probes for buttons, PIR motion, display, and printer setup
 - run the end-to-end acceptance deploy command that mirrors the leading repo to the Pi, syncs productive runtime settings, restarts services, and verifies post-restart health
@@ -67,8 +67,7 @@ python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
 
 Legacy helper-Pi proxy install commands are intentionally omitted from the main
 usage path. Current Twinr runtime wiring is single-Pi; the historical proxy
-scripts remain under [`hardware/ops`](./ops/README.md) only as retired
-reference material.
+artifacts now live only under `__legacy__/hardware/ops/`.
 
 ## See also
 

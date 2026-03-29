@@ -1,7 +1,6 @@
 from array import array
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import io
 import json
 import math
 from pathlib import Path
@@ -10,12 +9,12 @@ import sys
 from threading import Event, Thread
 import time
 import unittest
-from urllib import error as urllib_error
 from unittest.mock import patch
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -533,24 +532,6 @@ def _pcm_frames_from_audio(pcm_bytes: bytes) -> tuple[bytes, ...]:
     return tuple(frames)
 
 
-class _FakeUrlOpenResponse:
-    def __init__(self, payload: bytes, *, status: int = 200) -> None:
-        self._payload = payload
-        self.status = status
-
-    def read(self) -> bytes:
-        return self._payload
-
-    def getcode(self) -> int:
-        return self.status
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
 class VoiceActivationMatcherTests(unittest.TestCase):
     _EXPLICIT_ALIAS_FAMILY = (
         "hey twinr",
@@ -815,7 +796,8 @@ class VoiceRuntimeIntentContextTests(unittest.TestCase):
 
         context = VoiceRuntimeIntentContext.from_sensor_facts(facts)
 
-        self.assertTrue(context.person_visible)
+        self.assertFalse(context.person_visible)
+        self.assertTrue(context.waiting_activation_allowed())
         self.assertTrue(context.presence_active)
         self.assertTrue(context.waiting_activation_allowed())
         self.assertFalse(context.audio_bias_allowed())
@@ -1203,7 +1185,10 @@ class OrchestratorClientTests(unittest.TestCase):
 
             def recv(self, timeout=None) -> str:
                 del timeout
-                return next(self.messages)
+                try:
+                    return next(self.messages)
+                except StopIteration as exc:
+                    raise TimeoutError() from exc
 
             def __enter__(self):
                 return self
@@ -1245,7 +1230,10 @@ class OrchestratorClientTests(unittest.TestCase):
 
             def recv(self, timeout=None) -> str:
                 del timeout
-                return next(self.messages)
+                try:
+                    return next(self.messages)
+                except StopIteration as exc:
+                    raise TimeoutError() from exc
 
             def __enter__(self):
                 return self
@@ -1534,13 +1522,18 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
     def test_remote_asr_backend_adapter_posts_audio_and_returns_text(self) -> None:
         captured = {}
 
-        def _fake_urlopen(request, timeout=0):
-            captured["url"] = request.full_url
-            captured["headers"] = dict(request.header_items())
-            captured["body"] = request.data
-            captured["timeout"] = timeout
-            return _FakeUrlOpenResponse(
-                b'{"text":"Hallo, Twinner!","language":"de","segments":[{"start":0.0,"end":1.0,"text":"Hallo, Twinner!"}],"duration_sec":1.0}'
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["headers"] = dict(request.headers.items())
+            captured["body"] = request.read()
+            return httpx.Response(
+                200,
+                json={
+                    "text": "Hallo, Twinner!",
+                    "language": "de",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "Hallo, Twinner!"}],
+                    "duration_sec": 1.0,
+                },
             )
 
         adapter = RemoteAsrBackendAdapter(
@@ -1549,20 +1542,20 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
             language="de",
             mode="active_listening",
             timeout_s=2.5,
+            transport=httpx.MockTransport(_handler),
         )
 
-        with patch("urllib.request.urlopen", _fake_urlopen):
-            text = adapter.transcribe(
-                b"RIFFdata",
-                filename="voice-activation.wav",
-                content_type="audio/wav",
-                prompt="Twinr, Twinna.",
-            )
+        text = adapter.transcribe(
+            b"RIFFdata",
+            filename="voice-activation.wav",
+            content_type="audio/wav",
+            prompt="Twinr, Twinna.",
+        )
 
         self.assertEqual(text, "Hallo, Twinner!")
         self.assertEqual(captured["url"], "http://127.0.0.1:18090/v1/transcribe")
-        self.assertEqual(captured["timeout"], 2.5)
-        self.assertEqual(captured["headers"]["Authorization"], "Bearer secret")
+        headers = {key.lower(): value for key, value in captured["headers"].items()}
+        self.assertEqual(headers["authorization"], "Bearer secret")
         self.assertIn(b'name="language"', captured["body"])
         self.assertIn(b"active_listening", captured["body"])
         self.assertIn(b'name="prompt"', captured["body"])
@@ -1574,19 +1567,22 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
         attempts: list[int] = []
         sleep_calls: list[float] = []
 
-        def _fake_urlopen(request, timeout=0):
-            del request, timeout
+        def _handler(request: httpx.Request) -> httpx.Response:
+            del request
             attempts.append(1)
             if len(attempts) == 1:
-                raise urllib_error.HTTPError(
-                    url="http://127.0.0.1:18090/v1/transcribe",
-                    code=429,
-                    msg="Too Many Requests",
-                    hdrs=None,
-                    fp=io.BytesIO(b'{"detail":"stt busy"}'),
+                return httpx.Response(
+                    429,
+                    json={"detail": "stt busy"},
                 )
-            return _FakeUrlOpenResponse(
-                b'{"text":"Hey Twinna","language":"de","segments":[],"duration_sec":1.0}'
+            return httpx.Response(
+                200,
+                json={
+                    "text": "Hey Twinna",
+                    "language": "de",
+                    "segments": [],
+                    "duration_sec": 1.0,
+                },
             )
 
         adapter = RemoteAsrBackendAdapter(
@@ -1596,11 +1592,11 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
             timeout_s=2.5,
             retry_attempts=1,
             retry_backoff_s=0.4,
+            retry_jitter_s=0.0,
+            transport=httpx.MockTransport(_handler),
         )
 
-        with patch("urllib.request.urlopen", _fake_urlopen), patch(
-            "time.sleep", lambda seconds: sleep_calls.append(seconds)
-        ):
+        with patch("time.sleep", lambda seconds: sleep_calls.append(seconds)):
             text = adapter.transcribe(b"RIFFdata", filename="voice-activation.wav", content_type="audio/wav")
 
         self.assertEqual(text, "Hey Twinna")
@@ -1610,32 +1606,33 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
     def test_remote_asr_backend_adapter_projects_request_context_into_headers(self) -> None:
         captured = {}
 
-        def _fake_urlopen(request, timeout=0):
-            captured["headers"] = dict(request.header_items())
-            captured["timeout"] = timeout
-            return _FakeUrlOpenResponse(b'{"text":"","language":"de","segments":[],"duration_sec":0.5}')
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["headers"] = dict(request.headers.items())
+            return httpx.Response(
+                200,
+                json={"text": "", "language": "de", "segments": [], "duration_sec": 0.5},
+            )
 
         adapter = RemoteAsrBackendAdapter(
             base_url="http://127.0.0.1:18090",
             language="de",
             mode="active_listening",
             timeout_s=1.5,
+            transport=httpx.MockTransport(_handler),
         )
 
-        with patch("urllib.request.urlopen", _fake_urlopen):
-            with adapter.bind_request_context(
-                {
-                    "session_id": "voice-test-1",
-                    "trace_id": "trace-voice-test-1",
-                    "stage": "activation_utterance",
-                    "state": "waiting",
-                    "capture_duration_ms": 2200,
-                    "capture_signal_sha256": "abc123def456",
-                }
-            ):
-                adapter.transcribe(b"RIFFdata", filename="voice-activation.wav", content_type="audio/wav")
+        with adapter.bind_request_context(
+            {
+                "session_id": "voice-test-1",
+                "trace_id": "trace-voice-test-1",
+                "stage": "activation_utterance",
+                "state": "waiting",
+                "capture_duration_ms": 2200,
+                "capture_signal_sha256": "abc123def456",
+            }
+        ):
+            adapter.transcribe(b"RIFFdata", filename="voice-activation.wav", content_type="audio/wav")
 
-        self.assertEqual(captured["timeout"], 1.5)
         headers = {key.lower(): value for key, value in captured["headers"].items()}
         self.assertEqual(headers["x-twinr-voice-session-id"], "voice-test-1")
         self.assertEqual(headers["x-twinr-voice-trace-id"], "trace-voice-test-1")

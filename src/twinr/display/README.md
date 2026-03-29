@@ -20,6 +20,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - persist an authoritative display heartbeat so ops health and the runtime
   supervisor can detect a hung companion thread instead of trusting lock
   ownership alone
+- persist one authoritative rendered-state artifact with the last successful
+  `state_fields`, headline, and health verdict so "display says ERROR" can be
+  proven from exactly what the panel rendered instead of inferred from separate
+  runtime/health stores
 - expose one shared heartbeat contract for display writes, ops companion-health
   assessment, and runtime-supervisor progress checks so those three paths
   evaluate the same signal instead of drifting apart
@@ -111,6 +115,11 @@ on the Pi so runtime deploy syncs do not wipe the driver package. The
 authoritative display heartbeat lives separately under
 `artifacts/stores/ops/display_heartbeat.json` so the unprivileged runtime can
 always refresh it even when the vendor directory is root-owned.
+The last successfully rendered bounded display state now also lives under
+`artifacts/stores/ops/display_render_state.json`; that artifact mirrors the
+actual `state_fields` and computed `health.status` used for the last successful
+frame so operator claims like "the display says ERROR" can be checked against a
+single authoritative display-side record.
 
 For the Waveshare default face layout, Twinr keeps the `waiting` state static
 instead of animating it on a timer. That idle motion produced unnecessary

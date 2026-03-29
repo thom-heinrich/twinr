@@ -12,9 +12,12 @@ scored proactive trigger candidates and optional visual second opinions.
 - Define the social-trigger domain models and score thresholds
 - Evaluate stateful trigger candidates from normalized observation ticks
 - Wrap ambient-audio, ReSpeaker XVF3800, legacy OpenAI vision, and local-first AI-camera observations into bounded conservative snapshots
-- Keep the live AI-camera contract bounded and portable inside the main-Pi runtime while treating any older helper-Pi camera transport as legacy-only code rather than a supported productive topology
+- Keep the live AI-camera contract bounded and portable inside the main-Pi runtime while treating any older helper-Pi camera transport as legacy-only code under `__legacy__/`, not as a supported productive topology
 - Preserve conservative ReSpeaker facts such as `assistant_output_active`, `direction_confidence`, `speech_overlap_likely`, and `barge_in_detected`
 - Stabilize automation-facing camera snapshots, including person-count/zone anchors, coarse motion, and coarse/fine gesture event surfaces
+- Treat the adapter stream as the authoritative temporal truth for productive local attention refresh, so `camera_surface` and HDMI-only fusion do not invent a second stable `looking`/`engaged` state on top of it
+- Treat stream-marked local gesture snapshots as the authoritative stable fine-hand/coarse-gesture truth for productive HDMI HCI, carrying one activation token through `perception_stream` so `camera_surface` only shapes unknown-hold and rising edges instead of re-confirming already stable stream gestures
+- Expose that productive temporal truth as one explicit `perception_stream` contract on `SocialVisionObservation`, so display/runtime lanes consume one stable attention/gesture source instead of loose authority booleans
 - Preserve bounded `looking_signal_state/source` metadata on camera snapshots so downstream HDMI/runtime debug surfaces can distinguish face-confirmed `LOOKING` from the cheap body-box proxy without inventing a second camera truth
 - Preserve bounded multi-person camera anchors, not just the single primary person box, so higher runtime layers can track who moved last or which visible person is most relevant without treating that as identity
 - Treat local camera health faults as `unknown` camera semantics instead of authoritative "no person" ticks, so short IMX500/runtime problems do not instantly erase the last stable person anchor
@@ -47,10 +50,10 @@ scored proactive trigger candidates and optional visual second opinions.
 | `gesture_calibration.py` | Bounded per-symbol fine-hand calibration profile loaded from `state/mediapipe/gesture_calibration.json` |
 | `engine.py` | Stateful social-trigger scoring engine and normalized vision contract, including visible-person anchor payloads |
 | `aideck_camera_provider.py` | Bounded continuous AI-Deck still-camera provider that feeds the OpenAI proactive vision classifier from `aideck://` captures |
-| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and a current-frame fast gesture snapshot for HDMI ack/wakeup |
-| `remote_camera_provider.py` | Fetches bounded IMX500 observations from the helper Pi over the direct-link HTTP proxy and also supports a `remote_frame` mode where the main Pi runs the hot attention/gesture lifting locally from a coherent helper-side detection-plus-frame bundle, keeping the user-facing gesture lane on the same current-frame fast policy |
+| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract and now exposes the adapter's combined `observe_perception_stream()` capture plus explicit `perception_stream` state for productive HDMI refresh, while keeping the provider surface itself stable |
 | `normalization.py` | Shared low-risk enum, box, and integer coercion helpers reused by `engine.py` and `camera_surface.py` |
 | `observers.py` | Audio, ReSpeaker overlay, and vision observation providers |
+| `perception_stream.py` | Explicit productive temporal contract for stable attention/gesture stream state on `SocialVisionObservation` |
 | `prompting.py` | Prompt routing and evidence rendering |
 | `scoring.py` | Weighted scoring primitives |
 | `vision_review.py` | Buffered visual second-opinion reviewer |
@@ -77,7 +80,9 @@ decision = engine.observe(
 
 The productive Twinr runtime is now single-Pi only. `TwinrConfig.from_env()`
 expects the AI camera on the main Pi and fail-closes the retired helper-Pi
-camera envs instead of deriving `second_pi` / proxy behavior implicitly.
+camera envs instead of deriving `second_pi` / proxy behavior implicitly. The
+retired peer-LAN proactive providers now live only in
+`__legacy__/src/twinr/proactive/social/remote_camera_provider.py`.
 
 For a direct Bitcraze AI-Deck camera, set `TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000`.
 When no explicit proactive provider override is set, `TwinrConfig.from_env()`

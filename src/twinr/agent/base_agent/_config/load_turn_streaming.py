@@ -244,6 +244,12 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         "local_semantic_router_trace": _parse_bool(
             get_value("TWINR_LOCAL_SEMANTIC_ROUTER_TRACE"), True
         ),
+        "local_semantic_router_warmup_enabled": _parse_bool(
+            get_value("TWINR_LOCAL_SEMANTIC_ROUTER_WARMUP_ENABLED"), False
+        ),
+        "local_semantic_router_warmup_probe": _parse_optional_text(
+            get_value("TWINR_LOCAL_SEMANTIC_ROUTER_WARMUP_PROBE")
+        ),
         "conversation_follow_up_enabled": _parse_bool(
             get_value("TWINR_CONVERSATION_FOLLOW_UP_ENABLED"), False
         ),

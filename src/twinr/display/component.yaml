@@ -31,6 +31,7 @@ owned_concerns:
   - Keep native Wayland surface hosting separate from framebuffer rendering so richer HDMI-only content surfaces can evolve without polluting the generic renderer
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
   - Persist authoritative display forward-progress heartbeats so ops health and supervision can detect hung companion threads
+  - Persist one authoritative rendered-state artifact with the last successful bounded state fields and health verdict so display-side ERROR reports can be verified without reconstructing them from separate stores
   - Manage the optional companion display loop that shadows other runtime loops
 out_of_scope:
   - Runtime snapshot persistence, health collection, or loop-lock implementations
@@ -68,6 +69,8 @@ files:
     role: Shared adapter and payload contracts for display backends
   - path: debug_signals.py
     role: Persist and normalize optional HDMI header debug-signal pills for bounded operator inspection
+  - path: render_state.py
+    role: Persist the last successfully rendered display state fields plus the health verdict that produced them
   - path: factory.py
     role: Select the configured display backend
     exports:

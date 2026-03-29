@@ -6,9 +6,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import math
 from threading import Event, Thread
-from typing import Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 
-from twinr.agent.base_agent.config import TwinrConfig
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.config import TwinrConfig
+else:
+    TwinrConfig = Any
 
 
 class ReSpeakerLedLoopLike(Protocol):
@@ -52,7 +55,7 @@ def _join_timeout_seconds(loop: ReSpeakerLedLoopLike) -> float:
 def _default_lock_factory(config: TwinrConfig, loop_name: str) -> object:
     """Build the loop-instance lock context manager for the LED loop."""
 
-    from twinr.ops import loop_instance_lock
+    from twinr.ops.locks import loop_instance_lock
 
     return loop_instance_lock(config, loop_name)
 
@@ -60,7 +63,7 @@ def _default_lock_factory(config: TwinrConfig, loop_name: str) -> object:
 def _default_lock_owner(config: TwinrConfig, loop_name: str) -> int | None:
     """Return the PID that currently owns the LED companion lock."""
 
-    from twinr.ops import loop_lock_owner
+    from twinr.ops.locks import loop_lock_owner
 
     return loop_lock_owner(config, loop_name)
 

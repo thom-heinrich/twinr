@@ -9,6 +9,9 @@
 #        performing explicit failure cleanup before re-raising.
 # BUG-4: Fixed unbounded streamed-audio buffering that could grow until RAM pressure
 #        on Raspberry Pi 4; playback now uses bounded backpressure-aware queues.
+# BUG-5: Seeded text turns now reuse an already-open `listening` state so remote
+#        follow-up transcript commits cannot reopen listening and trip the runtime
+#        state machine into a spurious live `error`.
 # SEC-1: Fixed raw transcript/response log leakage and log-injection risk by sanitizing
 #        emitted text and making raw text observability opt-in.
 # IMP-1: Added pluggable interrupt-front-end hooks so AEC/NS/pVAD/EOT front-ends can be
@@ -514,8 +517,8 @@ class TwinrRealtimeTurnExecutionMixin:
         proactive_trigger: str | None,
     ) -> bool:
         turn_started = time.monotonic()
-        self.runtime.begin_listening(
-            request_source=listen_source,
+        self._begin_text_turn_listening(
+            listen_source=listen_source,
             proactive_trigger=proactive_trigger,
         )
         self._emit_status(force=True)
@@ -537,6 +540,26 @@ class TwinrRealtimeTurnExecutionMixin:
                 on_output_text_delta=on_output_text_delta,
             ),
             realtime_started=realtime_started,
+        )
+
+    def _begin_text_turn_listening(
+        self,
+        *,
+        listen_source: str,
+        proactive_trigger: str | None,
+    ) -> None:
+        """Reuse an already-open listening window before seeded text turns."""
+
+        if getattr(self.runtime.status, "value", None) == "listening":
+            self._trace_event(
+                "text_turn_reuse_listening_state",
+                kind="branch",
+                details={"listen_source": listen_source},
+            )
+            return
+        self.runtime.begin_listening(
+            request_source=listen_source,
+            proactive_trigger=proactive_trigger,
         )
 
     def _run_interrupt_follow_up_turn(self) -> bool:

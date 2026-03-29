@@ -128,6 +128,8 @@ class TwinrConfig:
     local_semantic_router_model_dir: str | None = None
     local_semantic_router_user_intent_model_dir: str | None = None
     local_semantic_router_trace: bool = True
+    local_semantic_router_warmup_enabled: bool = False
+    local_semantic_router_warmup_probe: str | None = None
     conversation_follow_up_enabled: bool = False
     conversation_follow_up_after_proactive_enabled: bool = False
     conversation_closure_guard_enabled: bool = True
@@ -546,6 +548,7 @@ class TwinrConfig:
     display_reserve_bus_min_hold_s: float = 240.0
     display_reserve_bus_base_hold_s: float = 480.0
     display_reserve_bus_max_hold_s: float = 720.0
+    display_gesture_refresh_interval_s: float = 0.2
     display_attention_refresh_interval_s: float = 0.2
     display_attention_session_focus_hold_s: float = 4.5
     attention_servo_enabled: bool = False

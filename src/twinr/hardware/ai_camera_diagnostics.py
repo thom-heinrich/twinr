@@ -1,3 +1,13 @@
+# CHANGELOG: 2026-03-28
+# BUG-1: Fixed hard-coded pose tensor assumptions (min=3 tensors, fixed 17/34-axis swap, first-tensor-derived output_shape)
+#        that could mis-decode valid IMX500 pose outputs and silently return wrong keypoints/candidate selection.
+# BUG-2: Fixed acceptance of mismatched keypoint/score/box result lengths, which could corrupt ranking or raise later.
+# SEC-1: Added bounded lock acquisition for diagnostics so one stalled hardware probe cannot indefinitely block all later probes.
+# IMP-1: Added model-aware pose decoding fallback paths (raw spatial tensors vs network-postprocessed tensors) driven by metadata,
+#        input size, and output shapes instead of a single HigherHRNet-only assumption.
+# IMP-2: Added frontier diagnostics for model postprocess metadata, raw output shapes, decoder backend, and IMX500 KPI timings.
+# BREAKING: AICameraPoseProbeDiagnostic gained additive fields for model/tensor/timing diagnostics.
+
 """Capture bounded diagnostics for local IMX500 pose selection on the Pi.
 
 This module is intentionally separate from the runtime adapter so operator
@@ -14,6 +24,8 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
+
 from .camera_ai.adapter import LocalAICameraAdapter
 from .camera_ai.models import AICameraBodyPose, AICameraBox, AICameraGestureEvent
 from .camera_ai.pose_classification import (
@@ -29,17 +41,21 @@ from .camera_ai.pose_features import (
 )
 from .camera_ai.pose_selection import rank_pose_candidates as _rank_pose_candidates
 
-# AUDIT-FIX(#2): Serialize hardware-facing diagnostic captures inside this module
-# to reduce races on the shared adapter/session when diagnostics overlap.
+# Serialize hardware-facing diagnostic captures inside this module to reduce
+# races on the shared adapter/session when diagnostics overlap.
 _PROBE_CAPTURE_LOCK = threading.RLock()
 
-# AUDIT-FIX(#1): Keep "bounded diagnostics" actually bounded on the single-process
-# Pi so malformed operator input cannot monopolize the event loop for minutes.
+# Keep "bounded diagnostics" actually bounded on the single-process Pi so
+# malformed operator input cannot monopolize the event loop for minutes.
 _MAX_SEQUENCE_ATTEMPTS = 8
 _MAX_SEQUENCE_SLEEP_S = 2.0
-_MIN_POSE_OUTPUT_TENSORS = 3
-_EXPECTED_POSE_SCORE_AXIS = 17
-_EXPECTED_POSE_COORD_AXIS = 34
+_PROBE_CAPTURE_LOCK_TIMEOUT_S = 5.0
+
+# HigherHRNet / COCO pose hints and safe fallbacks. Output layouts vary by
+# model/export path, so these are treated as hints instead of hard contracts.
+_POSE_CHANNEL_HINTS = frozenset({4, 17, 34})
+_DEFAULT_POSE_CONFIDENCE_THRESHOLD = 0.3
+_DEFAULT_OUTPUT_SCALE_DIVISOR = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +72,7 @@ class AICameraPoseSupportDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class AICameraPoseCandidateDiagnostic:
-    """Describe one ranked HigherHRNet candidate."""
+    """Describe one ranked pose candidate."""
 
     candidate_index: int
     raw_score: float
@@ -87,10 +103,15 @@ class AICameraPoseProbeDiagnostic:
     gesture_confidence: float | None
     support: AICameraPoseSupportDiagnostic | None
     camera_error: str | None = None
+    pose_model_postprocess: str | None = None
+    pose_decoder_backend: str | None = None
+    pose_decoder_output_shape: tuple[int, int] | None = None
+    pose_input_size: tuple[int, int] | None = None
+    pose_output_shapes: tuple[tuple[int, ...], ...] = ()
+    dnn_runtime_ms: float | None = None
+    dsp_runtime_ms: float | None = None
 
 
-# AUDIT-FIX(#7): Export only finite floats so diagnostics stay JSON-safe even if
-# the model math produced NaN/Inf under degenerate inputs.
 def _finite_float_or_default(value: object, *, default: float | None) -> float | None:
     try:
         number = float(value)
@@ -139,8 +160,17 @@ def _coerce_camera_error(value: object, *, default: str) -> str:
     return default
 
 
-# AUDIT-FIX(#3): Timestamping and error classification are part of the failure
-# path, so they need their own defensive fallbacks to avoid secondary crashes.
+def _coerce_probability(value: object, *, default: float) -> float:
+    number = _finite_float_or_default(value, default=default)
+    if number is None:
+        return default
+    if number < 0.0:
+        return 0.0
+    if number > 1.0:
+        return 1.0
+    return number
+
+
 def _safe_observed_at(adapter: LocalAICameraAdapter) -> float:
     fallback = time.time()
     try:
@@ -168,8 +198,6 @@ def _result_length(value: object) -> int:
         return 0
 
 
-# AUDIT-FIX(#4): Avoid ambiguous truth-value checks on array-like model outputs
-# and validate tensor shapes before indexing into them.
 def _has_items(value: object) -> bool:
     return _result_length(value) > 0
 
@@ -185,35 +213,24 @@ def _shape_tuple(value: object) -> tuple[int, ...] | None:
     return normalized or None
 
 
-def _normalize_pose_outputs(outputs: object) -> tuple[list[Any], tuple[int, int]]:
-    if outputs is None:
-        raise RuntimeError("pose_outputs_missing")
+def _normalize_shape_list(value: object) -> tuple[tuple[int, ...], ...]:
+    if value is None:
+        return ()
+    shapes: list[tuple[int, ...]] = []
     try:
-        normalized_outputs = list(outputs)
-    except TypeError as exc:
-        raise RuntimeError("pose_outputs_missing") from exc
-    if len(normalized_outputs) < _MIN_POSE_OUTPUT_TENSORS:
-        raise RuntimeError("pose_outputs_missing")
-
-    first_shape = _shape_tuple(normalized_outputs[0])
-    second_shape = _shape_tuple(normalized_outputs[1])
-    if (
-        first_shape is not None
-        and second_shape is not None
-        and first_shape[-1] == _EXPECTED_POSE_SCORE_AXIS
-        and second_shape[-1] == _EXPECTED_POSE_COORD_AXIS
-    ):
-        normalized_outputs[0], normalized_outputs[1] = normalized_outputs[1], normalized_outputs[0]
-        first_shape = _shape_tuple(normalized_outputs[0])
-
-    if first_shape is None or len(first_shape) < 3:
-        raise RuntimeError("pose_outputs_invalid_shape")
-
-    output_height = _coerce_non_negative_int(first_shape[-3])
-    output_width = _coerce_non_negative_int(first_shape[-2])
-    if output_height <= 0 or output_width <= 0:
-        raise RuntimeError("pose_outputs_invalid_shape")
-    return normalized_outputs, (output_height, output_width)
+        iterator = list(value)
+    except TypeError:
+        return ()
+    for item in iterator:
+        try:
+            shape = tuple(max(0, int(dim)) for dim in item)
+        except TypeError:
+            continue
+        except ValueError:
+            continue
+        if shape:
+            shapes.append(shape)
+    return tuple(shapes)
 
 
 def _normalize_size_pair(value: object, *, error_code: str) -> tuple[int, int]:
@@ -228,10 +245,11 @@ def _normalize_size_pair(value: object, *, error_code: str) -> tuple[int, int]:
     return width_px, height_px
 
 
-def _has_pose_network_path(value: object) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    return bool(value)
+def _optional_size_pair(value: object) -> tuple[int, int] | None:
+    try:
+        return _normalize_size_pair(value, error_code="size_invalid")
+    except RuntimeError:
+        return None
 
 
 def _normalize_body_pose(value: AICameraBodyPose | None) -> AICameraBodyPose:
@@ -272,6 +290,13 @@ def _build_probe_diagnostic(
     gesture_confidence: float | None,
     support: AICameraPoseSupportDiagnostic | None,
     camera_error: str | None,
+    pose_model_postprocess: str | None = None,
+    pose_decoder_backend: str | None = None,
+    pose_decoder_output_shape: tuple[int, int] | None = None,
+    pose_input_size: tuple[int, int] | None = None,
+    pose_output_shapes: tuple[tuple[int, ...], ...] = (),
+    dnn_runtime_ms: float | None = None,
+    dsp_runtime_ms: float | None = None,
 ) -> AICameraPoseProbeDiagnostic:
     return AICameraPoseProbeDiagnostic(
         observed_at=_finite_float(observed_at, default=time.time()),
@@ -293,7 +318,325 @@ def _build_probe_diagnostic(
             if camera_error is not None
             else None
         ),
+        pose_model_postprocess=(
+            pose_model_postprocess.strip() if isinstance(pose_model_postprocess, str) and pose_model_postprocess.strip() else None
+        ),
+        pose_decoder_backend=(
+            pose_decoder_backend.strip() if isinstance(pose_decoder_backend, str) and pose_decoder_backend.strip() else None
+        ),
+        pose_decoder_output_shape=_optional_size_pair(pose_decoder_output_shape),
+        pose_input_size=_optional_size_pair(pose_input_size),
+        pose_output_shapes=_normalize_shape_list(pose_output_shapes),
+        dnn_runtime_ms=_finite_float_or_default(dnn_runtime_ms, default=None),
+        dsp_runtime_ms=_finite_float_or_default(dsp_runtime_ms, default=None),
     )
+
+
+def _tensor_supports_moveaxis(value: object) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "transpose")
+
+
+def _move_axis(value: Any, source: int, destination: int) -> Any:
+    if not _tensor_supports_moveaxis(value):
+        return value
+    try:
+        return np.moveaxis(value, source, destination)
+    except Exception:
+        return value
+
+
+def _normalize_tensor_layout(value: Any) -> Any:
+    shape = _shape_tuple(value)
+    if shape is None:
+        return value
+
+    if len(shape) == 4:
+        if shape[-1] in _POSE_CHANNEL_HINTS:
+            return value
+        if shape[1] in _POSE_CHANNEL_HINTS:
+            return _move_axis(value, 1, -1)
+        return value
+
+    if len(shape) == 3:
+        if shape[-1] in _POSE_CHANNEL_HINTS:
+            return value
+        if shape[0] == 1 and shape[1] in _POSE_CHANNEL_HINTS:
+            return _move_axis(value, 1, -1)
+        if shape[0] in _POSE_CHANNEL_HINTS and shape[1] > 1 and shape[2] > 1:
+            return _move_axis(value, 0, -1)
+        return value
+
+    return value
+
+
+def _normalize_output_tensor_list(outputs: object) -> list[Any]:
+    if outputs is None:
+        raise RuntimeError("pose_outputs_missing")
+    try:
+        normalized_outputs = list(outputs)
+    except TypeError as exc:
+        raise RuntimeError("pose_outputs_missing") from exc
+    if not normalized_outputs:
+        raise RuntimeError("pose_outputs_missing")
+    return [_normalize_tensor_layout(item) for item in normalized_outputs]
+
+
+def _infer_spatial_pose_output_shape(outputs: list[Any]) -> tuple[int, int] | None:
+    for output in outputs:
+        shape = _shape_tuple(output)
+        if shape is None:
+            continue
+
+        if len(shape) >= 4 and shape[-1] in _POSE_CHANNEL_HINTS:
+            height = _coerce_non_negative_int(shape[-3])
+            width = _coerce_non_negative_int(shape[-2])
+            if height > 0 and width > 0:
+                return height, width
+
+        if len(shape) == 3 and shape[-1] in _POSE_CHANNEL_HINTS and shape[0] > 1 and shape[1] > 1:
+            height = _coerce_non_negative_int(shape[0])
+            width = _coerce_non_negative_int(shape[1])
+            if height > 0 and width > 0:
+                return height, width
+    return None
+
+
+def _default_pose_output_shape(input_size: tuple[int, int]) -> tuple[int, int]:
+    width, height = input_size
+    return max(1, height // _DEFAULT_OUTPUT_SCALE_DIVISOR), max(1, width // _DEFAULT_OUTPUT_SCALE_DIVISOR)
+
+
+def _looks_like_network_postprocessed_pose(outputs: list[Any]) -> bool:
+    if len(outputs) < 3:
+        return False
+
+    if _infer_spatial_pose_output_shape(outputs) is not None:
+        return False
+
+    shapes = [_shape_tuple(item) for item in outputs[:3]]
+    if not all(shape is not None for shape in shapes):
+        return False
+
+    score_like = any(shape[-1] == 17 for shape in shapes if shape)
+    coord_like = any(shape[-1] == 34 for shape in shapes if shape)
+    flat_like = all(len(shape) <= 3 for shape in shapes if shape)
+    return flat_like and score_like and coord_like
+
+
+def _validate_pose_results(
+    keypoints: object,
+    scores: object,
+    bboxes: object,
+) -> tuple[object, object, object, int]:
+    if not _has_items(keypoints) or not _has_items(scores) or not _has_items(bboxes):
+        raise RuntimeError("pose_people_missing")
+
+    keypoint_count = _result_length(keypoints)
+    score_count = _result_length(scores)
+    bbox_count = _result_length(bboxes)
+    if keypoint_count <= 0 or score_count <= 0 or bbox_count <= 0:
+        raise RuntimeError("pose_people_missing")
+    if keypoint_count != score_count or keypoint_count != bbox_count:
+        raise RuntimeError("pose_outputs_misaligned")
+
+    return keypoints, scores, bboxes, keypoint_count
+
+
+def _call_pose_postprocess(
+    pose_postprocess: Any,
+    *,
+    outputs: list[Any],
+    frame_size: tuple[int, int],
+    input_size: tuple[int, int],
+    output_shape: tuple[int, int],
+    network_postprocess: bool,
+    detection_threshold: float,
+) -> tuple[object, object, object]:
+    try:
+        return pose_postprocess(
+            outputs,
+            frame_size,
+            (0, 0),
+            (0, 0),
+            network_postprocess,
+            input_image_size=(input_size[1], input_size[0]),
+            output_shape=output_shape,
+            detection_threshold=detection_threshold,
+        )
+    except TypeError:
+        return pose_postprocess(
+            outputs,
+            frame_size,
+            (0, 0),
+            (0, 0),
+            network_postprocess,
+            input_image_size=(input_size[1], input_size[0]),
+            output_shape=output_shape,
+        )
+
+
+def _run_pose_postprocess(
+    pose_postprocess: Any,
+    *,
+    outputs: list[Any],
+    frame_size: tuple[int, int],
+    input_size: tuple[int, int],
+    model_postprocess: str | None,
+    detection_threshold: float,
+) -> tuple[object, object, object, int, str, tuple[int, int]]:
+    spatial_output_shape = _infer_spatial_pose_output_shape(outputs)
+    default_output_shape = _default_pose_output_shape(input_size)
+    prefer_network_postprocess = _looks_like_network_postprocessed_pose(outputs)
+
+    attempts: list[tuple[str, bool, tuple[int, int]]] = []
+    if prefer_network_postprocess:
+        attempts.append(("higherhrnet_network_postprocess", True, default_output_shape))
+        if spatial_output_shape is not None:
+            attempts.append(("higherhrnet_raw", False, spatial_output_shape))
+        if default_output_shape != spatial_output_shape:
+            attempts.append(("higherhrnet_legacy", False, default_output_shape))
+    else:
+        if spatial_output_shape is not None:
+            attempts.append(("higherhrnet_raw", False, spatial_output_shape))
+        attempts.append(("higherhrnet_network_postprocess", True, default_output_shape))
+        if spatial_output_shape != default_output_shape:
+            attempts.append(("higherhrnet_legacy", False, default_output_shape))
+
+    if isinstance(model_postprocess, str):
+        lowered = model_postprocess.strip().lower()
+        if "higher" in lowered and attempts:
+            attempts = sorted(
+                attempts,
+                key=lambda item: 0 if item[0].startswith("higherhrnet") else 1,
+            )
+
+    deduped_attempts: list[tuple[str, bool, tuple[int, int]]] = []
+    seen_attempts: set[tuple[bool, tuple[int, int]]] = set()
+    for backend, network_postprocess, output_shape in attempts:
+        key = (network_postprocess, output_shape)
+        if key in seen_attempts:
+            continue
+        seen_attempts.add(key)
+        deduped_attempts.append((backend, network_postprocess, output_shape))
+
+    last_error: Exception | None = None
+    for backend, network_postprocess, output_shape in deduped_attempts:
+        try:
+            keypoints, scores, bboxes = _call_pose_postprocess(
+                pose_postprocess,
+                outputs=outputs,
+                frame_size=frame_size,
+                input_size=input_size,
+                output_shape=output_shape,
+                network_postprocess=network_postprocess,
+                detection_threshold=detection_threshold,
+            )
+            keypoints, scores, bboxes, people_count = _validate_pose_results(keypoints, scores, bboxes)
+            return keypoints, scores, bboxes, people_count, backend, output_shape
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("pose_people_missing")
+
+
+def _safe_get_model_postprocess(session: object) -> str | None:
+    imx500 = getattr(session, "imx500", None)
+    intrinsics = getattr(imx500, "network_intrinsics", None)
+    if intrinsics is None:
+        return None
+    value = getattr(intrinsics, "postprocess", None)
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def _safe_get_output_shapes(session: object, metadata: object) -> tuple[tuple[int, ...], ...]:
+    imx500 = getattr(session, "imx500", None)
+    getter = getattr(imx500, "get_output_shapes", None)
+    if getter is None:
+        return ()
+    try:
+        return _normalize_shape_list(getter(metadata))
+    except Exception:
+        return ()
+
+
+def _safe_get_kpi_info(session: object, metadata: object) -> tuple[float | None, float | None]:
+    imx500 = getattr(session, "imx500", None)
+    getter = getattr(imx500, "get_kpi_info", None)
+    if getter is None:
+        return None, None
+    try:
+        result = getter(metadata)
+    except Exception:
+        return None, None
+    if not result or len(result) < 2:
+        return None, None
+    return (
+        _finite_float_or_default(result[0], default=None),
+        _finite_float_or_default(result[1], default=None),
+    )
+
+
+def _safe_get_input_size(session: object) -> tuple[int, int]:
+    direct = getattr(session, "input_size", None)
+    normalized = _optional_size_pair(direct)
+    if normalized is not None:
+        return normalized
+
+    imx500 = getattr(session, "imx500", None)
+    getter = getattr(imx500, "get_input_size", None)
+    if getter is not None:
+        try:
+            normalized = _optional_size_pair(getter())
+        except Exception:
+            normalized = None
+        if normalized is not None:
+            return normalized
+
+    raise RuntimeError("pose_input_size_invalid")
+
+
+def _safe_get_frame_size(adapter: LocalAICameraAdapter, session: object) -> tuple[int, int]:
+    normalized = _optional_size_pair(getattr(adapter.config, "main_size", None))
+    if normalized is not None:
+        return normalized
+
+    picam2 = getattr(session, "picam2", None)
+    if picam2 is not None:
+        try:
+            configuration = picam2.camera_configuration()
+            normalized = _optional_size_pair(configuration.get("main", {}).get("size"))
+        except Exception:
+            normalized = None
+        if normalized is not None:
+            return normalized
+
+    raise RuntimeError("frame_size_invalid")
+
+
+def _resolve_pose_detection_threshold(adapter: LocalAICameraAdapter) -> float:
+    config = getattr(adapter, "config", None)
+    for attribute_name in (
+        "pose_detection_threshold",
+        "pose_threshold",
+        "detection_threshold",
+    ):
+        value = getattr(config, attribute_name, None)
+        if value is not None:
+            return _coerce_probability(value, default=_DEFAULT_POSE_CONFIDENCE_THRESHOLD)
+    return _DEFAULT_POSE_CONFIDENCE_THRESHOLD
+
+
+def _acquire_probe_lock() -> bool:
+    try:
+        return _PROBE_CAPTURE_LOCK.acquire(timeout=_PROBE_CAPTURE_LOCK_TIMEOUT_S)
+    except TypeError:
+        return _PROBE_CAPTURE_LOCK.acquire()
 
 
 def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagnostic:
@@ -313,10 +656,35 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
     gesture_event = AICameraGestureEvent.UNKNOWN
     gesture_confidence: float | None = None
     support: AICameraPoseSupportDiagnostic | None = None
+    pose_model_postprocess: str | None = None
+    pose_decoder_backend: str | None = None
+    pose_decoder_output_shape: tuple[int, int] | None = None
+    pose_input_size: tuple[int, int] | None = None
+    pose_output_shapes: tuple[tuple[int, ...], ...] = ()
+    dnn_runtime_ms: float | None = None
+    dsp_runtime_ms: float | None = None
 
-    # AUDIT-FIX(#2): Keep hardware-facing probe work single-filed inside this
-    # module so overlapping diagnostics do not interleave on one camera session.
-    with _PROBE_CAPTURE_LOCK:
+    if not _acquire_probe_lock():
+        observed_at = _safe_observed_at(adapter)
+        return _build_probe_diagnostic(
+            observed_at=observed_at,
+            person_count=person_count,
+            primary_person_box=primary_person_box,
+            pose_people_count=pose_people_count,
+            candidates=candidates,
+            selected_candidate_index=selected_candidate_index,
+            selected_box=selected_box,
+            selected_raw_score=selected_raw_score,
+            pose_confidence=pose_confidence,
+            body_pose=body_pose,
+            attention_score=attention_score,
+            gesture_event=gesture_event,
+            gesture_confidence=gesture_confidence,
+            support=support,
+            camera_error="pose_probe_busy",
+        )
+
+    try:
         observed_at = _safe_observed_at(adapter)
         try:
             runtime = adapter._load_detection_runtime()
@@ -341,15 +709,11 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
                 )
 
             detection = adapter._capture_detection(runtime, observed_at=observed_at)
-            # AUDIT-FIX(#5): Preserve already-captured detection evidence so later
-            # pose-stage failures remain diagnosable instead of collapsing to zeros.
             person_count = _coerce_non_negative_int(detection.person_count)
             primary_person_box = detection.primary_person_box
 
             pose_network_path = getattr(adapter.config, "pose_network_path", None)
-            if not _has_pose_network_path(pose_network_path):
-                # AUDIT-FIX(#6): Report missing pose-model configuration explicitly
-                # so acceptance probes do not look falsely healthy.
+            if not pose_network_path:
                 gesture_event = AICameraGestureEvent.NONE if person_count <= 0 else AICameraGestureEvent.UNKNOWN
                 return _build_probe_diagnostic(
                     observed_at=observed_at,
@@ -396,31 +760,34 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
                 task_name="pose",
             )
             metadata = adapter._capture_metadata(session, observed_at=observed_at)
+
+            pose_model_postprocess = _safe_get_model_postprocess(session)
+            pose_output_shapes = _safe_get_output_shapes(session, metadata)
+            dnn_runtime_ms, dsp_runtime_ms = _safe_get_kpi_info(session, metadata)
+
             outputs = session.imx500.get_outputs(metadata, add_batch=True)
-            normalized_outputs, output_shape = _normalize_pose_outputs(outputs)
+            normalized_outputs = _normalize_output_tensor_list(outputs)
 
-            input_width, input_height = _normalize_size_pair(
-                session.input_size,
-                error_code="pose_input_size_invalid",
-            )
-            frame_width, frame_height = _normalize_size_pair(
-                adapter.config.main_size,
-                error_code="frame_size_invalid",
+            pose_input_size = _safe_get_input_size(session)
+            frame_width, frame_height = _safe_get_frame_size(adapter, session)
+            detection_threshold = _resolve_pose_detection_threshold(adapter)
+
+            (
+                keypoints,
+                scores,
+                bboxes,
+                pose_people_count,
+                pose_decoder_backend,
+                pose_decoder_output_shape,
+            ) = _run_pose_postprocess(
+                pose_postprocess,
+                outputs=normalized_outputs,
+                frame_size=(frame_height, frame_width),
+                input_size=pose_input_size,
+                model_postprocess=pose_model_postprocess,
+                detection_threshold=detection_threshold,
             )
 
-            keypoints, scores, bboxes = pose_postprocess(
-                normalized_outputs,
-                (frame_height, frame_width),
-                (0, 0),
-                (0, 0),
-                False,
-                input_image_size=(input_height, input_width),
-                output_shape=output_shape,
-            )
-            if not _has_items(keypoints) or not _has_items(scores) or not _has_items(bboxes):
-                raise RuntimeError("pose_people_missing")
-
-            pose_people_count = _result_length(keypoints)
             ranked = tuple(
                 _rank_pose_candidates(
                     keypoints=keypoints,
@@ -436,9 +803,9 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
 
             candidates = tuple(_build_candidate_diagnostic(item) for item in ranked)
             selected = ranked[0]
-            selected_candidate_index = _coerce_optional_int(selected.candidate_index)
+            selected_candidate_index = _coerce_optional_int(getattr(selected, "candidate_index", None))
             selected_box = selected.box
-            selected_raw_score = _finite_float_or_default(selected.raw_score, default=None)
+            selected_raw_score = _finite_float_or_default(getattr(selected, "raw_score", None), default=None)
 
             parsed_keypoints = _parse_keypoints(
                 selected.raw_keypoints,
@@ -459,7 +826,7 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
             gesture_confidence = _finite_float_or_default(gesture_confidence, default=None)
             pose_confidence = _finite_float_or_default(
                 _support_pose_confidence(
-                    selected.raw_score,
+                    getattr(selected, "raw_score", None),
                     parsed_keypoints,
                     fallback_box=selected_box,
                 ),
@@ -485,6 +852,13 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
                 gesture_confidence=gesture_confidence,
                 support=support,
                 camera_error=None,
+                pose_model_postprocess=pose_model_postprocess,
+                pose_decoder_backend=pose_decoder_backend,
+                pose_decoder_output_shape=pose_decoder_output_shape,
+                pose_input_size=pose_input_size,
+                pose_output_shapes=pose_output_shapes,
+                dnn_runtime_ms=dnn_runtime_ms,
+                dsp_runtime_ms=dsp_runtime_ms,
             )
         except Exception as exc:  # pragma: no cover - hardware path depends on Pi runtime.
             return _build_probe_diagnostic(
@@ -503,7 +877,16 @@ def capture_pose_probe(adapter: LocalAICameraAdapter) -> AICameraPoseProbeDiagno
                 gesture_confidence=gesture_confidence,
                 support=support,
                 camera_error=_safe_classify_error(adapter, exc),
+                pose_model_postprocess=pose_model_postprocess,
+                pose_decoder_backend=pose_decoder_backend,
+                pose_decoder_output_shape=pose_decoder_output_shape,
+                pose_input_size=pose_input_size,
+                pose_output_shapes=pose_output_shapes,
+                dnn_runtime_ms=dnn_runtime_ms,
+                dsp_runtime_ms=dsp_runtime_ms,
             )
+    finally:
+        _PROBE_CAPTURE_LOCK.release()
 
 
 def _coerce_sequence_attempts(attempts: object) -> int:
@@ -530,14 +913,10 @@ def capture_pose_probe_sequence(
 ) -> tuple[AICameraPoseProbeDiagnostic, ...]:
     """Capture several bounded diagnostic probes with one shared adapter."""
 
-    # AUDIT-FIX(#1): Coerce and clamp operator-provided sequence parameters so
-    # diagnostics stay bounded and malformed values do not crash the service.
     total = _coerce_sequence_attempts(attempts)
     sleep_seconds = _coerce_sequence_sleep_seconds(sleep_s)
     probes: list[AICameraPoseProbeDiagnostic] = []
     for index in range(total):
-        # AUDIT-FIX(#3): Even if an unexpected regression escapes
-        # capture_pose_probe(), the sequence API still returns an error sample.
         try:
             probes.append(capture_pose_probe(adapter))
         except Exception as exc:

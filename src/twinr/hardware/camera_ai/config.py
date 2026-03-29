@@ -128,6 +128,7 @@ class AICameraAdapterConfig:
     primary_person_roi_padding: float = 0.18
     primary_person_upper_body_ratio: float = 0.78
     wrist_roi_scale: float = 0.34
+    live_pending_result_timeout_s: float = 1.0
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -431,6 +432,16 @@ class AICameraAdapterConfig:
         )
         object.__setattr__(
             self,
+            "live_pending_result_timeout_s",
+            _coerce_bounded_float(
+                self.live_pending_result_timeout_s,
+                default=1.0,
+                minimum=0.25,
+                maximum=5.0,
+            ),
+        )
+        object.__setattr__(
+            self,
             "pose_refresh_s",
             _coerce_bounded_float(
                 self.pose_refresh_s,
@@ -677,6 +688,7 @@ class MediaPipeVisionConfig:
     primary_person_roi_padding: float = 0.18
     primary_person_upper_body_ratio: float = 0.78
     wrist_roi_scale: float = 0.34
+    live_pending_result_timeout_s: float = 1.0
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -821,6 +833,16 @@ class MediaPipeVisionConfig:
             "wrist_roi_scale",
             _clamp_ratio(self.wrist_roi_scale, default=0.34),
         )
+        object.__setattr__(
+            self,
+            "live_pending_result_timeout_s",
+            _coerce_bounded_float(
+                self.live_pending_result_timeout_s,
+                default=1.0,
+                minimum=0.25,
+                maximum=5.0,
+            ),
+        )
 
     @classmethod
     def from_ai_camera_config(cls, config: object) -> "MediaPipeVisionConfig":
@@ -897,6 +919,7 @@ class MediaPipeVisionConfig:
             primary_person_roi_padding=_safe_getattr(config, "primary_person_roi_padding", 0.18),
             primary_person_upper_body_ratio=_safe_getattr(config, "primary_person_upper_body_ratio", 0.78),
             wrist_roi_scale=_safe_getattr(config, "wrist_roi_scale", 0.34),
+            live_pending_result_timeout_s=_safe_getattr(config, "live_pending_result_timeout_s", 1.0),
         )
 
 

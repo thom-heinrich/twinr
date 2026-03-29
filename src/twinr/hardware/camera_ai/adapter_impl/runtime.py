@@ -2,6 +2,7 @@
 # CHANGELOG: 2026-03-28
 # BUG-1: Serialize lazy pipeline init/teardown to prevent duplicate MediaPipe/gesture pipeline construction, leaked Pi-side resources, and inconsistent state under concurrent callers.
 # BUG-2: Make pose/motion cache cleanup best-effort too, so secondary cleanup errors never mask the primary capture/runtime failure.
+# BUG-3: Runtime reset now separates generic pipeline teardown from the dedicated live-gesture pipeline so non-gesture recovery does not force gesture cold-start churn.
 # SEC-1: Close a practical availability hole where concurrent requests could force repeated heavy pipeline creation on a Raspberry Pi 4 and exhaust memory/CPU.
 # IMP-1: Add lifecycle telemetry and generation counters for self-healing, stale-result fencing, and field debugging.
 # IMP-2: Add explicit backend factory hooks plus a centralized config builder so callers can swap in 2026-era accelerated backends without rewriting lifecycle ownership code.
@@ -289,16 +290,20 @@ class AICameraAdapterRuntimeMixin:
         self,
         *,
         close_pipeline: bool,
+        close_live_gesture_pipeline: bool | None = None,
         clear_pose: bool,
         clear_motion: bool,
     ) -> None:
         """Best-effort cleanup for runtime failures while the adapter lock is held."""
 
+        close_live_pipeline = close_pipeline if close_live_gesture_pipeline is None else close_live_gesture_pipeline
         with self._get_runtime_lifecycle_lock():
             self._bump_runtime_generation_locked()
+            setattr(self, "_attention_stream_state_by_lane", {})
             self._safe_close_runtime_locked()  # Cleanup must never raise over the primary capture failure.
             if close_pipeline:
                 self._safe_close_mediapipe_pipeline_locked()  # Drop potentially corrupted MediaPipe state before the next attempt.
+            if close_live_pipeline:
                 self._safe_close_live_gesture_pipeline_locked()
             if clear_pose:
                 self._safe_clear_pose_cache_locked()  # Reset stale pose cache across runtime failures and close().

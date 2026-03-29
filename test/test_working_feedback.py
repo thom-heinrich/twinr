@@ -149,13 +149,36 @@ def _write_placeholder_processing_asset(temp_dir: str) -> None:
     asset_path.write_bytes(b"ID3-DRAGON")
 
 
+def _build_processing_media_spec() -> WorkingFeedbackMediaSpec:
+    return WorkingFeedbackMediaSpec(
+        clip=RenderedAudioClipSpec(
+            relative_path=_PROCESSING_ASSET_RELATIVE_PATH,
+            clip_start_s=0.0,
+            clip_duration_s=0.8,
+            fade_in_duration_s=0.09,
+            fade_out_start_s=1.08,
+            fade_out_duration_s=0.15,
+            output_gain=0.105,
+            playback_speed=0.65,
+            normalize_max_gain=1.0,
+        ),
+        pause_ms=0,
+        attenuation_start_s=4.0,
+        attenuation_reach_floor_s=30.0,
+        minimum_output_gain_ratio=0.15,
+        attenuation_step_ms=160,
+    )
+
+
 class WorkingFeedbackTests(unittest.TestCase):
     def setUp(self) -> None:
         with working_feedback_mod._RENDERED_MEDIA_CACHE_LOCK:
             working_feedback_mod._RENDERED_MEDIA_CACHE.clear()
             working_feedback_mod._RENDERED_MEDIA_CACHE_FINALIZERS.clear()
+        with working_feedback_mod._RENDERED_MEDIA_PREWARM_LOCK:
+            working_feedback_mod._RENDERED_MEDIA_PREWARM.clear()
 
-    def test_processing_feedback_renders_requested_media_clip_when_available(self) -> None:
+    def test_processing_feedback_defaults_to_dragon_media_clip_when_available(self) -> None:
         player = _FakeFeedbackPlayer()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -180,14 +203,39 @@ class WorkingFeedbackTests(unittest.TestCase):
         self.assertEqual(player.wav_payloads, [b"RIFFDRAGON"])
         self.assertEqual(player.tone_sequences, [])
         rendered_spec = render_mock.call_args.args[1]
-        self.assertEqual(rendered_spec.relative_path, _PROCESSING_ASSET_RELATIVE_PATH)
-        self.assertEqual(rendered_spec.clip_start_s, 0.0)
-        self.assertEqual(rendered_spec.clip_duration_s, 0.8)
-        self.assertEqual(rendered_spec.fade_in_duration_s, 0.09)
-        self.assertEqual(rendered_spec.fade_out_start_s, 1.08)
-        self.assertEqual(rendered_spec.fade_out_duration_s, 0.15)
-        self.assertEqual(rendered_spec.output_gain, 0.105)
-        self.assertEqual(rendered_spec.playback_speed, 0.65)
+        media_spec = _build_processing_media_spec()
+        self.assertEqual(rendered_spec.relative_path, media_spec.clip.relative_path)
+        self.assertEqual(rendered_spec.clip_start_s, media_spec.clip.clip_start_s)
+        self.assertEqual(rendered_spec.clip_duration_s, media_spec.clip.clip_duration_s)
+        self.assertEqual(rendered_spec.fade_in_duration_s, media_spec.clip.fade_in_duration_s)
+        self.assertEqual(rendered_spec.fade_out_start_s, media_spec.clip.fade_out_start_s)
+        self.assertEqual(rendered_spec.fade_out_duration_s, media_spec.clip.fade_out_duration_s)
+        self.assertEqual(rendered_spec.output_gain, media_spec.clip.output_gain)
+        self.assertEqual(rendered_spec.playback_speed, media_spec.clip.playback_speed)
+
+    def test_processing_feedback_falls_back_to_swelling_tone_when_default_media_is_missing(self) -> None:
+        player = _PCMFeedbackPlayer()
+
+        with mock.patch(
+            "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+            return_value=None,
+        ) as render_mock:
+            stop = start_working_feedback_loop(
+                player,
+                kind="processing",
+                sample_rate=24000,
+                config=TwinrConfig(project_root="."),
+                delay_override_ms=0,
+            )
+            try:
+                self.assertTrue(player.pcm_started.wait(timeout=1.0))
+            finally:
+                stop()
+
+        render_mock.assert_called_once()
+        self.assertEqual(player.sample_rates, [24000])
+        self.assertEqual(player.channels, [1])
+        self.assertGreaterEqual(len(player.pcm_chunks), 3)
 
     def test_processing_feedback_falls_back_to_tones_when_media_render_fails(self) -> None:
         player = _ToneOnlyFeedbackPlayer()
@@ -203,9 +251,15 @@ class WorkingFeedbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_placeholder_processing_asset(temp_dir)
             stop = None
-            with mock.patch(
-                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
-                side_effect=RenderedAudioClipConfigurationError("ffmpeg_missing"),
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    side_effect=RenderedAudioClipConfigurationError("ffmpeg_missing"),
+                ),
             ):
                 stop = start_working_feedback_loop(
                     player,
@@ -241,9 +295,15 @@ class WorkingFeedbackTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             stop = None
-            with mock.patch(
-                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
-                return_value=None,
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    return_value=None,
+                ),
             ):
                 stop = start_working_feedback_loop(
                     player,
@@ -293,9 +353,15 @@ class WorkingFeedbackTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_placeholder_processing_asset(temp_dir)
-            with mock.patch(
-                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
-                return_value=b"RIFFDRAGON",
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    return_value=b"RIFFDRAGON",
+                ),
             ):
                 stop = start_working_feedback_loop(
                     player,
@@ -315,9 +381,15 @@ class WorkingFeedbackTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_placeholder_processing_asset(temp_dir)
-            with mock.patch(
-                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
-                return_value=b"RIFFDRAGON",
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    return_value=b"RIFFDRAGON",
+                ),
             ):
                 stop = start_working_feedback_loop(
                     player,
@@ -338,9 +410,15 @@ class WorkingFeedbackTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_placeholder_processing_asset(temp_dir)
-            with mock.patch(
-                "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
-                return_value=_constant_pcm16_wav_bytes(duration_s=0.05),
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    return_value=_constant_pcm16_wav_bytes(duration_s=0.05),
+                ),
             ):
                 stop = start_working_feedback_loop(
                     player,
@@ -411,3 +489,52 @@ class WorkingFeedbackTests(unittest.TestCase):
         self.assertGreater(first_three_rms[1], first_three_rms[2])
         self.assertEqual(player.sample_rates, [24000])
         self.assertEqual(player.channels, [1])
+
+    def test_processing_feedback_start_stays_non_blocking_while_media_warms_in_background(self) -> None:
+        player = _ToneOnlyFeedbackPlayer()
+        profile = WorkingFeedbackProfile(
+            delay_ms=0,
+            pause_ms=1000,
+            volume=0.1,
+            gap_ms=0,
+            patterns=(((440, 40),),),
+        )
+        render_started = Event()
+        release_render = Event()
+
+        def slow_render(*_args, **_kwargs) -> bytes:
+            render_started.set()
+            release_render.wait(timeout=1.0)
+            return b"RIFFDRAGON"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_placeholder_processing_asset(temp_dir)
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._resolve_media_spec",
+                    return_value=_build_processing_media_spec(),
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    side_effect=slow_render,
+                ),
+            ):
+                started_at = time.monotonic()
+                stop = start_working_feedback_loop(
+                    player,
+                    kind="processing",
+                    sample_rate=24000,
+                    config=TwinrConfig(project_root=temp_dir),
+                    profiles={"processing": profile},
+                    delay_override_ms=0,
+                )
+                try:
+                    self.assertLess(time.monotonic() - started_at, 0.1)
+                    self.assertTrue(render_started.wait(timeout=0.2))
+                    deadline = time.monotonic() + 0.5
+                    while time.monotonic() < deadline and not player.tone_sequences:
+                        time.sleep(0.01)
+                    self.assertEqual(player.tone_sequences, [((440, 40),)])
+                finally:
+                    release_render.set()
+                    stop()

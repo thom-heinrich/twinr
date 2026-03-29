@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from ..engine import SocialBodyPose, SocialFineHandGesture, SocialGestureEvent, SocialMotionState, SocialPersonZone, SocialVisionObservation
+from ..perception_stream import attention_stream_authoritative, gesture_stream_authoritative
 from .coercion import camera_semantics_authoritative, coalesce_coarse_gesture_aliases, coerce_detected_objects, coerce_timestamp
 from .config import ProactiveCameraSurfaceConfig
-from .gestures import ProactiveCameraGestureMixin
+from .gestures import ProactiveCameraGestureMixin, authoritative_gesture_activation_token
 from .models import ProactiveCameraSnapshot, ProactiveCameraSurfaceUpdate
 from .presence import ProactiveCameraPresenceMixin
 from .signals import DebouncedBooleanSignal, StableObjectTracker
@@ -124,12 +125,14 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
         self._last_gesture_confidence_at: float | None = None
         self._last_gesture_emitted_at: float | None = None
         self._last_gesture_emitted_event = SocialGestureEvent.NONE
+        self._last_gesture_emitted_token: int | None = None
         self._last_fine_hand_gesture = SocialFineHandGesture.NONE
         self._last_fine_hand_gesture_at: float | None = None
         self._last_fine_hand_gesture_confidence: float | None = None
         self._last_fine_hand_gesture_confidence_at: float | None = None
         self._last_fine_hand_gesture_emitted_at: float | None = None
         self._last_fine_hand_gesture_emitted_event = SocialFineHandGesture.NONE
+        self._last_fine_hand_gesture_emitted_token: int | None = None
         self._last_explicit_fine_hand_gesture = SocialFineHandGesture.NONE
         self._last_explicit_fine_hand_gesture_at: float | None = None
         self._last_explicit_fine_hand_gesture_confidence: float | None = None
@@ -158,6 +161,13 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
 
         now = coerce_timestamp(observed_at)
         camera_semantics_ok = inspected and camera_semantics_authoritative(observation)
+        attention_temporal_authoritative = bool(
+            camera_semantics_ok and attention_stream_authoritative(observation)
+        )
+        gesture_temporal_authoritative = bool(
+            camera_semantics_ok and gesture_stream_authoritative(observation)
+        )
+        gesture_activation_token = authoritative_gesture_activation_token(observation)
         person_sample = self._person_visible.observe(
             observation.person_visible if camera_semantics_ok else None,
             observed_at=now,
@@ -211,10 +221,19 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
             axis="y",
         )
 
-        looking_sample = self._looking_toward_device.observe(
-            (person_sample.value and observation.looking_toward_device) if camera_semantics_ok else None,
-            observed_at=now,
-        )
+        looking_sample_input = (
+            person_sample.value and observation.looking_toward_device
+        ) if camera_semantics_ok else None
+        if attention_temporal_authoritative:
+            looking_sample = self._looking_toward_device.observe_authoritative(
+                looking_sample_input,
+                observed_at=now,
+            )
+        else:
+            looking_sample = self._looking_toward_device.observe(
+                looking_sample_input,
+                observed_at=now,
+            )
         looking_signal_state, looking_signal_state_unknown = self._resolve_secondary_text(
             inspected=camera_semantics_ok,
             observed_at=now,
@@ -237,30 +256,58 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
             cache_attr="_last_looking_signal_source",
             cache_seen_attr="_last_looking_signal_source_at",
         )
-        person_near_sample = self._person_near_device.observe(
-            (
-                person_sample.value and bool(getattr(observation, "person_near_device", False))
-            ) if camera_semantics_ok else None,
-            observed_at=now,
+        person_near_sample_input = (
+            person_sample.value and bool(getattr(observation, "person_near_device", False))
+        ) if camera_semantics_ok else None
+        if attention_temporal_authoritative:
+            person_near_sample = self._person_near_device.observe_authoritative(
+                person_near_sample_input,
+                observed_at=now,
+            )
+        else:
+            person_near_sample = self._person_near_device.observe(
+                person_near_sample_input,
+                observed_at=now,
+            )
+        engaged_sample_input = (
+            person_sample.value and bool(getattr(observation, "engaged_with_device", False))
+        ) if camera_semantics_ok else None
+        if attention_temporal_authoritative:
+            engaged_sample = self._engaged_with_device.observe_authoritative(
+                engaged_sample_input,
+                observed_at=now,
+            )
+        else:
+            engaged_sample = self._engaged_with_device.observe(
+                engaged_sample_input,
+                observed_at=now,
+            )
+        hand_sample_input = bool(observation.hand_or_object_near_camera) if camera_semantics_ok else None
+        if attention_temporal_authoritative or gesture_temporal_authoritative:
+            hand_sample = self._hand_near_camera.observe_authoritative(
+                hand_sample_input,
+                observed_at=now,
+            )
+        else:
+            hand_sample = self._hand_near_camera.observe(
+                hand_sample_input,
+                observed_at=now,
+            )
+        showing_sample_input = (
+            bool(getattr(observation, "showing_intent_likely", False))
+            if camera_semantics_ok
+            else None
         )
-        engaged_sample = self._engaged_with_device.observe(
-            (
-                person_sample.value and bool(getattr(observation, "engaged_with_device", False))
-            ) if camera_semantics_ok else None,
-            observed_at=now,
-        )
-        hand_sample = self._hand_near_camera.observe(
-            (bool(observation.hand_or_object_near_camera) if camera_semantics_ok else None),
-            observed_at=now,
-        )
-        showing_sample = self._showing_intent.observe(
-            (
-                bool(getattr(observation, "showing_intent_likely", False))
-                if camera_semantics_ok
-                else None
-            ),
-            observed_at=now,
-        )
+        if attention_temporal_authoritative or gesture_temporal_authoritative:
+            showing_sample = self._showing_intent.observe_authoritative(
+                showing_sample_input,
+                observed_at=now,
+            )
+        else:
+            showing_sample = self._showing_intent.observe(
+                showing_sample_input,
+                observed_at=now,
+            )
         self._resolve_showing_started_at(
             inspected=camera_semantics_ok,
             observed_at=now,
@@ -317,6 +364,8 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
                 observed_at=now,
                 gesture_event=coalesce_coarse_gesture_aliases(observation),
                 gesture_confidence=getattr(observation, "gesture_confidence", None),
+                temporal_authoritative=gesture_temporal_authoritative,
+                activation_token=gesture_activation_token,
             )
         )
         (
@@ -330,6 +379,8 @@ class ProactiveCameraSurfaceImpl(ProactiveCameraPresenceMixin, ProactiveCameraGe
             observed_at=now,
             fine_hand_gesture=getattr(observation, "fine_hand_gesture", SocialFineHandGesture.NONE),
             fine_hand_gesture_confidence=getattr(observation, "fine_hand_gesture_confidence", None),
+            temporal_authoritative=gesture_temporal_authoritative,
+            activation_token=gesture_activation_token,
         )
         objects_view = self._object_tracker.observe(
             coerce_detected_objects(getattr(observation, "objects", ())) if camera_semantics_ok else None,

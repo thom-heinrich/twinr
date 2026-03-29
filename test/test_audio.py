@@ -2,14 +2,19 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from unittest import mock
 import io
+import itertools
 import os
 import sys
 import unittest
 import wave
+from typing import BinaryIO, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.hardware.audio_env import build_audio_subprocess_env
+from twinr.hardware.audio_env import (
+    build_audio_subprocess_env,
+    build_audio_subprocess_env_for_mode,
+)
 from twinr.hardware.audio import (
     AmbientAudioSampler,
     AudioCaptureReadinessError,
@@ -22,6 +27,8 @@ from twinr.hardware.audio import (
     resolve_dynamic_pause_thresholds,
     resolve_pause_resume_confirmation,
 )
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.respeaker_capture_recovery import recover_stalled_respeaker_capture
 
 
 class DynamicPauseThresholdTests(unittest.TestCase):
@@ -140,6 +147,81 @@ class AudioEnvTests(unittest.TestCase):
         self.assertNotIn("SDL_VIDEODRIVER", env)
         self.assertEqual(env["KEEP_ME"], "1")
 
+    def test_build_audio_subprocess_env_for_mode_keeps_root_borrowed_session_audio(self) -> None:
+        base_env = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "QT_QPA_PLATFORM": "wayland",
+            "SDL_VIDEODRIVER": "wayland",
+            "KEEP_ME": "1",
+        }
+        with (
+            mock.patch("twinr.hardware.audio_env.os.getuid", return_value=0),
+            mock.patch("twinr.hardware.audio_env.runtime_dir_owner_uid", return_value=1000),
+        ):
+            env = build_audio_subprocess_env_for_mode(
+                base_env,
+                allow_root_borrowed_session_audio=True,
+            )
+
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
+        self.assertEqual(env["PULSE_SERVER"], "unix:/run/user/1000/pulse/native")
+        self.assertNotIn("WAYLAND_DISPLAY", env)
+        self.assertNotIn("QT_QPA_PLATFORM", env)
+        self.assertNotIn("SDL_VIDEODRIVER", env)
+        self.assertEqual(env["KEEP_ME"], "1")
+
+
+class ReSpeakerCaptureRecoveryTests(unittest.TestCase):
+    def test_recover_stalled_capture_reboots_after_transient_wait_fails(self) -> None:
+        with (
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery.wait_for_transient_respeaker_capture_ready",
+                side_effect=[False, True],
+            ) as wait_ready,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_host_control_reboot",
+                return_value=True,
+            ) as reboot_capture,
+        ):
+            recovered = recover_stalled_respeaker_capture(
+                device="plughw:CARD=Array,DEV=0",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+                max_wait_s=2.5,
+            )
+
+        self.assertTrue(recovered)
+        reboot_capture.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        self.assertEqual(wait_ready.call_count, 2)
+        self.assertGreaterEqual(wait_ready.call_args_list[1].kwargs["max_wait_s"], 8.0)
+
+    def test_recover_stalled_capture_stops_when_reboot_is_unavailable(self) -> None:
+        with (
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery.wait_for_transient_respeaker_capture_ready",
+                return_value=False,
+            ) as wait_ready,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_host_control_reboot",
+                return_value=False,
+            ) as reboot_capture,
+        ):
+            recovered = recover_stalled_respeaker_capture(
+                device="plughw:CARD=Array,DEV=0",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+            )
+
+        self.assertFalse(recovered)
+        reboot_capture.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        wait_ready.assert_called_once()
+
     def test_build_audio_subprocess_env_keeps_same_owner_session_audio(self) -> None:
         base_env = {
             "XDG_RUNTIME_DIR": "/run/user/1000",
@@ -160,10 +242,33 @@ class AudioEnvTests(unittest.TestCase):
         self.assertNotIn("WAYLAND_DISPLAY", env)
         self.assertEqual(env["KEEP_ME"], "1")
 
-    def test_spawn_audio_process_uses_sanitized_env(self) -> None:
+    def test_spawn_audio_process_uses_sanitized_env_by_default(self) -> None:
         fake_process = _FakeCaptureProcess()
         with (
-            mock.patch("twinr.hardware.audio.build_audio_subprocess_env", return_value={"KEEP_ME": "1"}) as env_builder,
+            mock.patch(
+                "twinr.hardware.audio.build_audio_subprocess_env_for_mode",
+                return_value={"KEEP_ME": "1"},
+            ) as env_builder,
+            mock.patch("twinr.hardware.audio.subprocess.Popen", return_value=fake_process) as popen,
+        ):
+            process = __import__("twinr.hardware.audio", fromlist=["_spawn_audio_process"])._spawn_audio_process(
+                ["aplay", "-D", "default"],
+                stdout=-1,
+                stderr=-1,
+                purpose="Audio playback",
+            )
+
+        self.assertIs(process, fake_process)
+        env_builder.assert_called_once_with(allow_root_borrowed_session_audio=False)
+        self.assertEqual(popen.call_args.kwargs["env"], {"KEEP_ME": "1"})
+
+    def test_spawn_audio_process_can_keep_root_borrowed_session_audio(self) -> None:
+        fake_process = _FakeCaptureProcess()
+        with (
+            mock.patch(
+                "twinr.hardware.audio.build_audio_subprocess_env_for_mode",
+                return_value={"KEEP_ME": "1"},
+            ) as env_builder,
             mock.patch("twinr.hardware.audio.subprocess.Popen", return_value=fake_process) as popen,
         ):
             process = __import__("twinr.hardware.audio", fromlist=["_spawn_audio_process"])._spawn_audio_process(
@@ -171,10 +276,11 @@ class AudioEnvTests(unittest.TestCase):
                 stdout=-1,
                 stderr=-1,
                 purpose="Audio capture",
+                allow_root_borrowed_session_audio=True,
             )
 
         self.assertIs(process, fake_process)
-        env_builder.assert_called_once_with()
+        env_builder.assert_called_once_with(allow_root_borrowed_session_audio=True)
         self.assertEqual(popen.call_args.kwargs["env"], {"KEEP_ME": "1"})
 
 
@@ -235,14 +341,26 @@ class _FakeCaptureProcess:
 
 
 class WaveAudioPlayerTests(unittest.TestCase):
+    def test_from_config_reasserts_respeaker_playback_mixer(self) -> None:
+        with mock.patch("twinr.hardware.audio.ensure_respeaker_playback_mixer") as normalize_mixer:
+            player = WaveAudioPlayer.from_config(
+                TwinrConfig(audio_output_device="twinr_playback_softvol")
+            )
+
+        normalize_mixer.assert_called_once_with("twinr_playback_softvol")
+        self.assertEqual(player.device, "twinr_playback_softvol")
+
     def test_normalize_wav_playback_level_boosts_quiet_pcm16_wav(self) -> None:
         frames = (b"\x10\x00" + b"\xf0\xff") * 800
         buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as writer:
+        # pylint misclassifies stdlib wave writers from wave.open(..., "wb") as Wave_read.
+        # pylint: disable=no-member
+        with cast(wave.Wave_write, wave.open(cast(BinaryIO, buffer), "wb")) as writer:
             writer.setnchannels(1)
             writer.setsampwidth(2)
             writer.setframerate(24000)
             writer.writeframes(frames)
+        # pylint: enable=no-member
 
         normalized = normalize_wav_playback_level(buffer.getvalue(), target_peak=20000, max_gain=4.0)
 
@@ -300,6 +418,62 @@ class WaveAudioPlayerTests(unittest.TestCase):
 
 
 class SilenceDetectedRecorderTests(unittest.TestCase):
+    def test_capture_uses_respeaker_duplex_guard_for_respeaker_input(self) -> None:
+        recorder = SilenceDetectedRecorder(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            speech_threshold=700,
+            speech_start_chunks=1,
+            start_timeout_s=1.0,
+            duplex_playback_device="twinr_playback_softvol",
+            duplex_playback_sample_rate_hz=24000,
+            vad_mode="rms",
+            adaptive_noise_enabled=False,
+        )
+        process = _FakeCaptureProcess()
+        speech_chunk = b"\xff\x7f" * 1600
+        silence_chunk = b"\x00\x00" * 1600
+
+        class _Guard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        class _AdvancingMonotonic:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                current = self.value
+                self.value += 0.02
+                return current
+
+        with (
+            mock.patch("twinr.hardware.audio.maybe_open_respeaker_duplex_playback_guard", return_value=_Guard()) as guard_factory,
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch(
+                "twinr.hardware.audio._wait_for_readable",
+                side_effect=itertools.chain([True, True], itertools.repeat(False)),
+            ),
+            mock.patch("twinr.hardware.audio.os.read", side_effect=[speech_chunk, silence_chunk]),
+            mock.patch("twinr.hardware.audio.time.monotonic", side_effect=_AdvancingMonotonic()),
+        ):
+            result = recorder.capture_pcm_until_pause_with_options(
+                pause_ms=0,
+                speech_start_chunks=1,
+            )
+
+        guard_factory.assert_called_once_with(
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_device="twinr_playback_softvol",
+            sample_rate_hz=24000,
+        )
+        self.assertGreater(len(result.pcm_bytes), 0)
+
     def test_retries_transient_respeaker_capture_loss_before_speech(self) -> None:
         recorder = SilenceDetectedRecorder(
             device="plughw:CARD=Array,DEV=0",
@@ -309,6 +483,8 @@ class SilenceDetectedRecorderTests(unittest.TestCase):
             speech_threshold=700,
             speech_start_chunks=1,
             start_timeout_s=1.0,
+            vad_mode="rms",
+            adaptive_noise_enabled=False,
         )
         failed_process = _FakeCaptureProcess()
         failed_process.returncode = 1
@@ -322,7 +498,7 @@ class SilenceDetectedRecorderTests(unittest.TestCase):
 
             def __call__(self) -> float:
                 current = self.value
-                self.value += 0.11
+                self.value += 0.02
                 return current
 
         with (
@@ -331,10 +507,13 @@ class SilenceDetectedRecorderTests(unittest.TestCase):
                 side_effect=[failed_process, recovered_process],
             ) as spawn_process,
             mock.patch(
-                "twinr.hardware.audio.wait_for_transient_respeaker_capture_ready",
+                "twinr.hardware.respeaker_capture_recovery.wait_for_transient_respeaker_capture_ready",
                 return_value=True,
             ) as recover_capture,
-            mock.patch("twinr.hardware.audio._wait_for_readable", side_effect=[True, True]),
+            mock.patch(
+                "twinr.hardware.audio._wait_for_readable",
+                side_effect=itertools.chain([True, True], itertools.repeat(False)),
+            ),
             mock.patch("twinr.hardware.audio.os.read", side_effect=[speech_chunk, silence_chunk]),
             mock.patch("twinr.hardware.audio.time.monotonic", side_effect=_AdvancingMonotonic()),
         ):
@@ -396,6 +575,62 @@ class SilenceDetectedRecorderTests(unittest.TestCase):
 
 
 class AmbientAudioSamplerTests(unittest.TestCase):
+    def test_require_readable_frames_uses_respeaker_duplex_guard_for_respeaker_input(self) -> None:
+        sampler = AmbientAudioSampler(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            default_duration_ms=200,
+            duplex_playback_device="twinr_playback_softvol",
+            duplex_playback_sample_rate_hz=24000,
+        )
+        process = _FakeCaptureProcess()
+        pcm_chunk = b"\x01\x00" * 1600
+
+        class _Guard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with (
+            mock.patch("twinr.hardware.audio.maybe_open_respeaker_duplex_playback_guard", return_value=_Guard()) as guard_factory,
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch("twinr.hardware.audio._wait_for_readable", return_value=True),
+            mock.patch("twinr.hardware.audio.os.read", return_value=pcm_chunk),
+        ):
+            probe = sampler.require_readable_frames(duration_ms=200)
+
+        guard_factory.assert_called_once_with(
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_device="twinr_playback_softvol",
+            sample_rate_hz=24000,
+        )
+        self.assertTrue(probe.ready)
+
+    def test_sample_window_surfaces_duplex_guard_failure_as_readiness_error(self) -> None:
+        sampler = AmbientAudioSampler(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            default_duration_ms=200,
+            duplex_playback_device="twinr_playback_softvol",
+            duplex_playback_sample_rate_hz=24000,
+        )
+
+        with mock.patch(
+            "twinr.hardware.audio.maybe_open_respeaker_duplex_playback_guard",
+            side_effect=RuntimeError("Required ReSpeaker duplex playback guard exited immediately"),
+        ):
+            with self.assertRaises(AudioCaptureReadinessError) as captured:
+                sampler.sample_window(duration_ms=200)
+
+        self.assertEqual(captured.exception.probe.failure_reason, "duplex_playback_failed")
+        self.assertIn("duplex playback guard", str(captured.exception))
+
     def test_require_readable_frames_returns_probe_after_first_chunk(self) -> None:
         sampler = AmbientAudioSampler(
             device="default",
