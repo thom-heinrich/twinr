@@ -264,6 +264,7 @@ class LongTermRemoteHealthProbe:
             probe = probe_loader(
                 snapshot_kind=normalized_kind,
                 prefer_cached_document_id=True,
+                prefer_metadata_only=True,
             )
         else:
             payload = remote_state.load_snapshot(snapshot_kind=normalized_kind)

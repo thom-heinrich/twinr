@@ -949,6 +949,16 @@ class WorkflowForensics:
                 or self._trace_truncated
             )
 
+    def remaining_event_budget(self) -> int:
+        """Return the bounded number of non-critical events this run can still accept."""
+
+        if not self.enabled:
+            return 0
+        with self._stats_lock:
+            if self._closed or self._writer_failed:
+                return 0
+            return max(0, self._max_events - self._event_count)
+
     def decision(
         self,
         *,

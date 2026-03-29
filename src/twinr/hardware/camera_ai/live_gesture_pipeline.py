@@ -166,9 +166,11 @@ class LiveGestureObservePolicy:
     name: str = "full"
     enable_custom_live: bool = True
     enable_custom_roi: bool = True
+    allow_custom_recovery_when_live_custom_pending: bool = False
     allow_person_roi_recovery: bool = True
     allow_live_hand_roi_recovery: bool = True
     allow_full_frame_hand_recovery: bool = True
+    allow_full_frame_hand_recovery_after_person_roi_detection: bool = False
     allow_recent_person_boxes: bool = True
     allow_recent_hand_boxes: bool = True
     prefer_live_hand_roi_before_person_roi: bool = False
@@ -184,9 +186,11 @@ class LiveGestureObservePolicy:
             name="user_facing_fast",
             enable_custom_live=True,
             enable_custom_roi=False,
+            allow_custom_recovery_when_live_custom_pending=True,
             allow_person_roi_recovery=True,
             allow_live_hand_roi_recovery=True,
             allow_full_frame_hand_recovery=False,
+            allow_full_frame_hand_recovery_after_person_roi_detection=True,
             allow_recent_person_boxes=False,
             allow_recent_hand_boxes=False,
             prefer_live_hand_roi_before_person_roi=True,
@@ -768,6 +772,25 @@ class LiveGesturePipeline:
             hand_count=current_live_hand_count_exact,
             live_hand_box_count=len(current_live_hand_boxes),
         )
+        live_custom_enabled = (
+            observe_policy.enable_custom_live and _live_custom_gesture_enabled(self.config)
+        )
+        sync_custom_recovery_enabled, sync_custom_recovery_reason = _resolve_sync_custom_recovery_mode(
+            observe_policy=observe_policy,
+            live_custom_enabled=live_custom_enabled,
+            current_live_custom_ready=current_live_custom_ready,
+        )
+        deferred_live_stream_choice: _GestureChoice | None = None
+        if _should_defer_live_stream_candidate_for_sync_custom_recovery(
+            config=self.config,
+            observe_policy=observe_policy,
+            sync_custom_recovery_enabled=sync_custom_recovery_enabled,
+            gesture=fine_hand_gesture,
+            confidence=fine_hand_confidence,
+        ):
+            deferred_live_stream_choice = (fine_hand_gesture, fine_hand_confidence)
+            fine_hand_gesture = AICameraFineHandGesture.NONE
+            fine_hand_confidence = None
 
         debug_snapshot: dict[str, object] = {
             "resolved_source": "none" if fine_hand_gesture == AICameraFineHandGesture.NONE else "live_stream",
@@ -775,9 +798,7 @@ class LiveGesturePipeline:
             "live_builtin_confidence": _round_optional_confidence(builtin_choice[1]),
             "live_custom_gesture": custom_choice[0].value,
             "live_custom_confidence": _round_optional_confidence(custom_choice[1]),
-            "live_custom_enabled": (
-                observe_policy.enable_custom_live and _live_custom_gesture_enabled(self.config)
-            ),
+            "live_custom_enabled": live_custom_enabled,
             "live_hand_count": hand_count,
             "live_hand_count_exact": current_live_hand_count_exact,
             "live_hand_box_count": len(current_live_hand_boxes),
@@ -815,13 +836,26 @@ class LiveGesturePipeline:
             "observe_policy": observe_policy.name,
             "observe_policy_enable_custom_live": observe_policy.enable_custom_live,
             "observe_policy_enable_custom_roi": observe_policy.enable_custom_roi,
+            "observe_policy_allow_custom_recovery_when_live_custom_pending": (
+                observe_policy.allow_custom_recovery_when_live_custom_pending
+            ),
             "observe_policy_allow_person_roi_recovery": observe_policy.allow_person_roi_recovery,
             "observe_policy_allow_live_hand_roi_recovery": observe_policy.allow_live_hand_roi_recovery,
             "observe_policy_allow_full_frame_hand_recovery": observe_policy.allow_full_frame_hand_recovery,
+            "observe_policy_allow_full_frame_after_person_roi_detection": (
+                observe_policy.allow_full_frame_hand_recovery_after_person_roi_detection
+            ),
             "observe_policy_allow_recent_person_boxes": observe_policy.allow_recent_person_boxes,
             "observe_policy_allow_recent_hand_boxes": observe_policy.allow_recent_hand_boxes,
             "observe_policy_require_weak_live_stream_consensus": (
                 observe_policy.require_weak_live_stream_consensus
+            ),
+            "sync_custom_recovery_enabled": sync_custom_recovery_enabled,
+            "sync_custom_recovery_reason": sync_custom_recovery_reason,
+            "live_stream_recovery_gate": (
+                "deferred_for_sync_custom_recovery"
+                if deferred_live_stream_choice is not None
+                else "not_needed"
             ),
         }
         debug_snapshot.update(dict(live_submission_debug))
@@ -859,7 +893,7 @@ class LiveGesturePipeline:
                     primary_person_box=effective_primary_person_box,
                     person_boxes=selected_person_boxes,
                     sparse_keypoints=sparse_keypoints,
-                    allow_custom=observe_policy.enable_custom_roi,
+                    allow_custom=sync_custom_recovery_enabled,
                 )
                 debug_snapshot.update(person_roi_debug)
                 if rescue_blocked_by_live_no_hand and not _allow_person_roi_rescue_despite_live_no_hand(
@@ -897,7 +931,7 @@ class LiveGesturePipeline:
                     frame_rgb=frame_rgb,
                     hand_boxes=selected_hand_boxes,
                     hand_box_source=hand_box_source,
-                    allow_custom=observe_policy.enable_custom_roi,
+                    allow_custom=sync_custom_recovery_enabled,
                 )
                 debug_snapshot.update(live_roi_debug)
                 if rescue_choice[0] != AICameraFineHandGesture.NONE:
@@ -922,7 +956,7 @@ class LiveGesturePipeline:
                     primary_person_box=effective_primary_person_box,
                     person_boxes=selected_person_boxes,
                     sparse_keypoints=sparse_keypoints,
-                    allow_custom=observe_policy.enable_custom_roi,
+                    allow_custom=sync_custom_recovery_enabled,
                 )
                 debug_snapshot.update(person_roi_debug)
                 if rescue_blocked_by_live_no_hand and not _allow_person_roi_rescue_despite_live_no_hand(
@@ -942,50 +976,72 @@ class LiveGesturePipeline:
                         else "person_roi"
                     )
 
-            if rescue_blocked_by_live_no_hand and fine_hand_gesture == AICameraFineHandGesture.NONE:
+            full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
+                fine_hand_gesture=fine_hand_gesture,
+                effective_visible_person_boxes=selected_person_boxes,
+                effective_hand_boxes=selected_hand_boxes,
+                person_roi_detection_count=_coerce_nonnegative_int(
+                    debug_snapshot.get("person_roi_detection_count")
+                ),
+                person_roi_combined_gesture=str(
+                    debug_snapshot.get(
+                        "person_roi_combined_gesture",
+                        AICameraFineHandGesture.NONE.value,
+                    )
+                    or AICameraFineHandGesture.NONE.value
+                ),
+                live_roi_hand_box_count=_coerce_nonnegative_int(
+                    debug_snapshot.get("live_roi_hand_box_count")
+                ),
+                live_roi_combined_gesture=str(
+                    debug_snapshot.get(
+                        "live_roi_combined_gesture",
+                        AICameraFineHandGesture.NONE.value,
+                    )
+                    or AICameraFineHandGesture.NONE.value
+                ),
+            )
+            if (
+                rescue_blocked_by_live_no_hand
+                and fine_hand_gesture == AICameraFineHandGesture.NONE
+                and not _allow_full_frame_rescue_despite_live_no_hand(full_frame_rescue_reason)
+            ):
                 debug_snapshot["full_frame_hand_attempt_reason"] = "fresh_live_results_confirm_no_hand"
-            elif fine_hand_gesture == AICameraFineHandGesture.NONE and not observe_policy.allow_full_frame_hand_recovery:
-                debug_snapshot["full_frame_hand_attempt_reason"] = "observe_policy_disallows_full_frame_hand_recovery"
-            else:
-                full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
-                    fine_hand_gesture=fine_hand_gesture,
-                    effective_visible_person_boxes=selected_person_boxes,
-                    effective_hand_boxes=selected_hand_boxes,
-                    person_roi_detection_count=_coerce_nonnegative_int(
-                        debug_snapshot.get("person_roi_detection_count")
-                    ),
-                    live_roi_hand_box_count=_coerce_nonnegative_int(
-                        debug_snapshot.get("live_roi_hand_box_count")
-                    ),
-                    live_roi_combined_gesture=str(
-                        debug_snapshot.get(
-                            "live_roi_combined_gesture",
-                            AICameraFineHandGesture.NONE.value,
-                        )
-                        or AICameraFineHandGesture.NONE.value
-                    ),
-                )
-                if full_frame_rescue_reason is not None:
-                    if not self._reserve_full_frame_rescue(observed_at):
-                        debug_snapshot["full_frame_hand_attempt_reason"] = (
-                            f"{full_frame_rescue_reason}_rate_limited"
-                        )
-                    else:
-                        full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
-                            runtime=runtime,
-                            frame_rgb=frame_rgb,
-                            timestamp_ms=timestamp_ms,
-                            allow_custom=observe_policy.enable_custom_roi,
-                        )
-                        debug_snapshot.update(full_frame_debug)
-                        debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
-                        hand_count = max(
-                            hand_count,
-                            _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
-                        )
-                        if full_frame_choice[0] != AICameraFineHandGesture.NONE:
-                            fine_hand_gesture, fine_hand_confidence = full_frame_choice
-                            debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+            elif full_frame_rescue_reason is not None:
+                if not _full_frame_rescue_allowed_for_reason(
+                    observe_policy=observe_policy,
+                    reason=full_frame_rescue_reason,
+                ):
+                    debug_snapshot["full_frame_hand_attempt_reason"] = (
+                        "observe_policy_disallows_full_frame_hand_recovery"
+                    )
+                elif not self._reserve_full_frame_rescue(observed_at):
+                    debug_snapshot["full_frame_hand_attempt_reason"] = (
+                        f"{full_frame_rescue_reason}_rate_limited"
+                    )
+                else:
+                    full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
+                        runtime=runtime,
+                        frame_rgb=frame_rgb,
+                        timestamp_ms=timestamp_ms,
+                        allow_custom=sync_custom_recovery_enabled,
+                    )
+                    debug_snapshot.update(full_frame_debug)
+                    debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
+                    hand_count = max(
+                        hand_count,
+                        _coerce_nonnegative_int(debug_snapshot.get("full_frame_hand_detection_count")),
+                    )
+                    if full_frame_choice[0] != AICameraFineHandGesture.NONE:
+                        fine_hand_gesture, fine_hand_confidence = full_frame_choice
+                        debug_snapshot["resolved_source"] = "full_frame_hand_roi"
+
+        if fine_hand_gesture == AICameraFineHandGesture.NONE and deferred_live_stream_choice is not None:
+            fine_hand_gesture, fine_hand_confidence = deferred_live_stream_choice
+            debug_snapshot["resolved_source"] = "live_stream"
+            debug_snapshot["live_stream_recovery_gate"] = (
+                "restored_after_sync_custom_recovery_miss"
+            )
 
         raw_resolved_source = str(debug_snapshot.get("resolved_source", "none") or "none")
         stabilized_gesture, stabilized_confidence, temporal_debug = self._stability_tracker.observe(
@@ -2264,6 +2320,43 @@ def _fresh_live_results_confirm_no_hand(
     return hand_count <= 0 and live_hand_box_count <= 0
 
 
+def _resolve_sync_custom_recovery_mode(
+    *,
+    observe_policy: LiveGestureObservePolicy,
+    live_custom_enabled: bool,
+    current_live_custom_ready: bool | None,
+) -> tuple[bool, str]:
+    if observe_policy.enable_custom_roi:
+        return True, "policy_enabled"
+    if not observe_policy.allow_custom_recovery_when_live_custom_pending:
+        return False, "observe_policy_disabled"
+    if not live_custom_enabled:
+        return False, "live_custom_disabled"
+    if current_live_custom_ready is False:
+        return True, "live_custom_pending"
+    if current_live_custom_ready:
+        return False, "current_live_custom_ready"
+    return False, "live_custom_status_unknown"
+
+
+def _should_defer_live_stream_candidate_for_sync_custom_recovery(
+    *,
+    config: MediaPipeVisionConfig,
+    observe_policy: LiveGestureObservePolicy,
+    sync_custom_recovery_enabled: bool,
+    gesture: AICameraFineHandGesture,
+    confidence: float | None,
+) -> bool:
+    if gesture == AICameraFineHandGesture.NONE:
+        return False
+    if not sync_custom_recovery_enabled:
+        return False
+    if not observe_policy.require_weak_live_stream_consensus:
+        return False
+    score = _coerce_unit_interval(confidence) or 0.0
+    return score < _live_temporal_strong_confidence(config)
+
+
 def _allow_person_roi_rescue_despite_live_no_hand(
     gesture: AICameraFineHandGesture,
     *,
@@ -2286,6 +2379,10 @@ def _allow_person_roi_rescue_despite_live_no_hand(
         )
         for entry in detections
     )
+
+
+def _allow_full_frame_rescue_despite_live_no_hand(reason: str | None) -> bool:
+    return reason == "visible_person_roi_with_hand_detection_without_symbol"
 
 
 def _summarize_gesture_categories(
@@ -2332,6 +2429,7 @@ def _resolve_full_frame_rescue_reason(
     effective_visible_person_boxes: tuple[AICameraBox, ...],
     effective_hand_boxes: tuple[_HandBox, ...],
     person_roi_detection_count: int,
+    person_roi_combined_gesture: str,
     live_roi_hand_box_count: int,
     live_roi_combined_gesture: str,
 ) -> str | None:
@@ -2353,7 +2451,22 @@ def _resolve_full_frame_rescue_reason(
         return "live_hand_roi_without_symbol"
     if person_roi_detection_count <= 0:
         return "visible_person_roi_without_hand_detection"
+    if person_roi_combined_gesture == AICameraFineHandGesture.NONE.value:
+        return "visible_person_roi_with_hand_detection_without_symbol"
     return None
+
+
+def _full_frame_rescue_allowed_for_reason(
+    *,
+    observe_policy: LiveGestureObservePolicy,
+    reason: str,
+) -> bool:
+    if observe_policy.allow_full_frame_hand_recovery:
+        return True
+    return (
+        reason == "visible_person_roi_with_hand_detection_without_symbol"
+        and observe_policy.allow_full_frame_hand_recovery_after_person_roi_detection
+    )
 
 
 def _coerce_roi_source_value(value: object) -> str:

@@ -359,6 +359,18 @@ class AICameraTests(unittest.TestCase):
                 "live_hand_box_source": "none",
                 "person_roi_detection_count": 1,
                 "person_roi_block_reason": "deferred_until_live_hand_roi_exhausted",
+                "person_roi_detection_debug": (
+                    {
+                        "gesture_frame_source": "full_frame_landmark_crop",
+                        "builtin_categories": (
+                            {"label": "Victory", "normalized_label": "victory", "score": 0.88},
+                        ),
+                    },
+                ),
+                "sync_custom_recovery_enabled": True,
+                "sync_custom_recovery_reason": "live_custom_pending",
+                "live_stream_recovery_gate": "deferred_for_sync_custom_recovery",
+                "observe_policy_allow_full_frame_after_person_roi_detection": True,
                 "full_frame_hand_attempt_reason": None,
             },
         )
@@ -378,6 +390,14 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(debug["gesture_target_person_count"], 1)
         self.assertEqual(debug["person_roi_detection_count"], 1)
         self.assertEqual(debug["person_roi_block_reason"], "deferred_until_live_hand_roi_exhausted")
+        self.assertTrue(debug["sync_custom_recovery_enabled"])
+        self.assertEqual(debug["sync_custom_recovery_reason"], "live_custom_pending")
+        self.assertEqual(debug["live_stream_recovery_gate"], "deferred_for_sync_custom_recovery")
+        self.assertTrue(debug["observe_policy_allow_full_frame_after_person_roi_detection"])
+        self.assertEqual(
+            debug["person_roi_detection_debug"][0]["gesture_frame_source"],
+            "full_frame_landmark_crop",
+        )
         self.assertEqual(debug["live_hand_box_source"], "none")
 
     def test_adapter_perception_stream_reuses_one_capture_for_attention_and_gesture(self) -> None:

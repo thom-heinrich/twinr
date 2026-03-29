@@ -416,6 +416,12 @@ def _candidate_reasons(debug_details: Mapping[str, object] | None) -> tuple[str,
     if _normalized_label(details.get("pose_hint_source")) not in _NEGATIVE_LABELS:
         if _finite_float_or_default(details.get("pose_hint_confidence"), default=None) is not None:
             reasons.append("pose_hint")
+    if (
+        _coerce_non_negative_int(details.get("person_roi_detection_count")) > 0
+        and _normalized_label(details.get("person_roi_combined_gesture")) in _NEGATIVE_LABELS
+        and _normalized_label(details.get("final_resolved_source")) in _NEGATIVE_LABELS
+    ):
+        reasons.append("person_roi_hand_without_symbol")
     if _normalized_label(details.get("final_resolved_source")) not in _NEGATIVE_LABELS:
         reasons.append("resolved_candidate")
     return tuple(dict.fromkeys(reasons))

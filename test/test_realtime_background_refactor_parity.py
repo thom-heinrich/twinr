@@ -28,10 +28,10 @@ from test.test_realtime_runner import FakePlayer, FakePrintBackend, FakePrinter
 
 
 _EXPECTED_GOLDEN_DIGESTS = {
-    "sensor_merge": "ac597e383247c2c23e8b89386ff3213248fa5e87258d2eaec413ff3dff29f8e8",
+    "sensor_merge": "ba8536ab06a3466e07b19b8c8e557cf69107a09ef5f5bbc7be7937a17bc5043c",
     "social_visual_first": "6669363a676429b09571fd61ba4a91905e82aa5e704ed9538e62db08354738c3",
     "printed_automation": "c97aafeb579d9b71b432a96ace3bee0ded3482985101e670b7cb117c6b718228",
-    "longterm_observation_facts": "95d7023310911e6be86f9792a5678954dab37814ec5197a0ed171faefdc2f9a9",
+    "longterm_observation_facts": "1fb87300ae51050f8ff0111c265f3ea6c48c8d937c02033104efc2d78efc0137",
 }
 _WORKING_FEEDBACK_OWNER_RE = re.compile(
     r"(working_feedback:[a-z_]+:)\d+(?::\d+)?"

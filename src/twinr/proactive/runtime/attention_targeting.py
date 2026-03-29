@@ -1,3 +1,15 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: Focus matching is now track/geometry-aware instead of horizontal-zone only, so two
+#        visible people in the same zone are no longer conflated.
+# BUG-2: Fresh stable identity-fusion focus now overrides stale remembered focus instead of
+#        being masked for the full hold window.
+# SEC-1: Replayed/stale upstream sensor claims are now rejected with bounded timestamp freshness
+#        checks and clock-skew guards before they can pin HDMI attention.
+# IMP-1: Source timestamps, optional track IDs, center coordinates, and tracking confidence now
+#        propagate through the policy for better edge-runtime fusion.
+# IMP-2: Focus memory now survives brief dropouts more safely and expires correctly even under
+#        out-of-order telemetry common in Raspberry Pi real-time pipelines.
+
 """Prioritize conservative HDMI attention targets from multimodal runtime signals.
 
 This module keeps short-lived attention-target policy out of the proactive
@@ -11,6 +23,7 @@ remain reserved for explicit semantic face states.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -36,6 +49,17 @@ from twinr.proactive.runtime.speaker_association import (
 
 _DEFAULT_SESSION_FOCUS_HOLD_S = 4.5
 _MIN_SESSION_FOCUS_HOLD_S = 0.5
+_DEFAULT_SOURCE_MAX_STALENESS_S = 1.25
+_MIN_SOURCE_MAX_STALENESS_S = 0.25
+_DEFAULT_IDENTITY_MAX_STALENESS_S = 2.5
+_MIN_IDENTITY_MAX_STALENESS_S = 0.5
+_DEFAULT_CLOCK_SKEW_TOLERANCE_S = 0.35
+_MIN_CLOCK_SKEW_TOLERANCE_S = 0.0
+_DEFAULT_FOCUS_MATCH_CENTER_X_DELTA = 0.14
+_MIN_FOCUS_MATCH_CENTER_X_DELTA = 0.02
+_DEFAULT_FOCUS_MATCH_CENTER_Y_DELTA = 0.2
+_MIN_FOCUS_MATCH_CENTER_Y_DELTA = 0.02
+
 _INTERACTIVE_RUNTIME_STATES = frozenset({"listening", "processing", "answering"})
 _ACTIVE_RUNTIME_STATES = _INTERACTIVE_RUNTIME_STATES | {"waiting"}
 _VALID_HORIZONTAL = frozenset({"left", "center", "right"})
@@ -50,25 +74,54 @@ class MultimodalAttentionTargetConfig:
     """Store bounded tuning values for multimodal HDMI attention targeting."""
 
     session_focus_hold_s: float = _DEFAULT_SESSION_FOCUS_HOLD_S
+    source_max_staleness_s: float = _DEFAULT_SOURCE_MAX_STALENESS_S
+    identity_max_staleness_s: float = _DEFAULT_IDENTITY_MAX_STALENESS_S
+    clock_skew_tolerance_s: float = _DEFAULT_CLOCK_SKEW_TOLERANCE_S
+    focus_match_center_x_delta: float = _DEFAULT_FOCUS_MATCH_CENTER_X_DELTA
+    focus_match_center_y_delta: float = _DEFAULT_FOCUS_MATCH_CENTER_Y_DELTA
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "MultimodalAttentionTargetConfig":
         """Build one bounded targeting config from the global Twinr config."""
 
-        try:
-            hold_s = float(
-                getattr(
-                    config,
-                    "display_attention_session_focus_hold_s",
-                    _DEFAULT_SESSION_FOCUS_HOLD_S,
-                )
-                or 0.0
-            )
-        except (TypeError, ValueError):
-            hold_s = _DEFAULT_SESSION_FOCUS_HOLD_S
-        if hold_s != hold_s or hold_s <= 0.0:
-            hold_s = _DEFAULT_SESSION_FOCUS_HOLD_S
-        return cls(session_focus_hold_s=max(_MIN_SESSION_FOCUS_HOLD_S, hold_s))
+        return cls(
+            session_focus_hold_s=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_session_focus_hold_s",
+                default=_DEFAULT_SESSION_FOCUS_HOLD_S,
+                minimum=_MIN_SESSION_FOCUS_HOLD_S,
+            ),
+            source_max_staleness_s=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_source_max_staleness_s",
+                default=_DEFAULT_SOURCE_MAX_STALENESS_S,
+                minimum=_MIN_SOURCE_MAX_STALENESS_S,
+            ),
+            identity_max_staleness_s=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_identity_max_staleness_s",
+                default=_DEFAULT_IDENTITY_MAX_STALENESS_S,
+                minimum=_MIN_IDENTITY_MAX_STALENESS_S,
+            ),
+            clock_skew_tolerance_s=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_clock_skew_tolerance_s",
+                default=_DEFAULT_CLOCK_SKEW_TOLERANCE_S,
+                minimum=_MIN_CLOCK_SKEW_TOLERANCE_S,
+            ),
+            focus_match_center_x_delta=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_focus_match_center_x_delta",
+                default=_DEFAULT_FOCUS_MATCH_CENTER_X_DELTA,
+                minimum=_MIN_FOCUS_MATCH_CENTER_X_DELTA,
+            ),
+            focus_match_center_y_delta=_bounded_config_float(
+                config=config,
+                attr_name="display_attention_focus_match_center_y_delta",
+                default=_DEFAULT_FOCUS_MATCH_CENTER_Y_DELTA,
+                minimum=_MIN_FOCUS_MATCH_CENTER_Y_DELTA,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,17 +197,17 @@ class MultimodalAttentionTargetSnapshot:
         confidence = coerce_optional_ratio(payload.get("confidence"))
         return cls(
             observed_at=_coerce_optional_float(payload.get("observed_at")),
-            state=normalize_text(payload.get("state")) or "inactive",
+            state=_normalize_optional_text(payload.get("state")) or "inactive",
             active=coerce_optional_bool(payload.get("active")) is True,
             target_horizontal=_normalize_direction(payload.get("target_horizontal"), allowed=_VALID_HORIZONTAL),
             target_vertical=_normalize_direction(payload.get("target_vertical"), allowed=_VALID_VERTICAL),
             target_zone=_normalize_direction(payload.get("target_zone"), allowed=_VALID_HORIZONTAL),
-            target_track_id=normalize_text(payload.get("target_track_id")) or None,
+            target_track_id=_normalize_optional_text(payload.get("target_track_id")) or None,
             target_center_x=coerce_optional_ratio(payload.get("target_center_x")),
             target_center_y=coerce_optional_ratio(payload.get("target_center_y")),
             target_velocity_x=_coerce_optional_float(payload.get("target_velocity_x")),
-            focus_source=normalize_text(payload.get("focus_source")) or "none",
-            runtime_status=normalize_text(payload.get("runtime_status")) or None,
+            focus_source=_normalize_optional_text(payload.get("focus_source")) or "none",
+            runtime_status=_normalize_optional_text(payload.get("runtime_status")) or None,
             presence_session_id=coerce_optional_int(payload.get("presence_session_id")),
             speaker_locked=coerce_optional_bool(payload.get("speaker_locked")) is True,
             session_focus_active=coerce_optional_bool(payload.get("session_focus_active")) is True,
@@ -172,6 +225,7 @@ class _AttentionAnchor:
     center_x: float | None = None
     center_y: float | None = None
     velocity_x: float | None = None
+    observed_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -215,8 +269,6 @@ class MultimodalAttentionTargetTracker:
     ) -> MultimodalAttentionTargetSnapshot:
         """Return one prioritized HDMI attention target snapshot."""
 
-        checked_at = 0.0 if observed_at is None else float(observed_at)
-        normalized_runtime_status = normalize_text(runtime_status).lower() or None
         camera = coerce_mapping(None if live_facts is None else live_facts.get("camera"))
         vad = coerce_mapping(None if live_facts is None else live_facts.get("vad"))
         continuous_target = (
@@ -227,25 +279,82 @@ class MultimodalAttentionTargetTracker:
                 live_facts=live_facts,
             )
         )
-        current_anchor = _anchor_from_continuous_target(continuous_target)
-        if current_anchor is None:
-            current_anchor = _camera_anchor(camera)
-        speech_detected = coerce_optional_bool(vad.get("speech_detected")) is True
+        checked_at = (
+            _latest_timestamp(
+                observed_at,
+                _mapping_timestamp(camera),
+                _mapping_timestamp(live_facts),
+                _object_timestamp(continuous_target),
+                _object_timestamp(speaker_association),
+                _object_timestamp(identity_fusion),
+            )
+            or 0.0
+        )
+        normalized_runtime_status = (_normalize_optional_text(runtime_status) or "").lower() or None
+
+        camera_is_fresh = _source_is_fresh(
+            checked_at=checked_at,
+            source_observed_at=_mapping_timestamp(camera) or _mapping_timestamp(live_facts),
+            max_age_s=self.config.source_max_staleness_s,
+            clock_skew_tolerance_s=self.config.clock_skew_tolerance_s,
+        )
+        camera_policy: Mapping[str, object] = (
+            camera
+            if camera_is_fresh
+            else {
+                "camera_online": False,
+                "camera_ready": False,
+            }
+        )
+
         current_speaker_association = speaker_association
         if current_speaker_association is None:
             current_speaker_association = derive_respeaker_speaker_association(
                 observed_at=observed_at,
                 live_facts=(live_facts or {}),
             )
+        if not _source_is_fresh(
+            checked_at=checked_at,
+            source_observed_at=_object_timestamp(current_speaker_association),
+            max_age_s=self.config.source_max_staleness_s,
+            clock_skew_tolerance_s=self.config.clock_skew_tolerance_s,
+        ):
+            current_speaker_association = None
+
+        if not _source_is_fresh(
+            checked_at=checked_at,
+            source_observed_at=_object_timestamp(identity_fusion),
+            max_age_s=self.config.identity_max_staleness_s,
+            clock_skew_tolerance_s=self.config.clock_skew_tolerance_s,
+        ):
+            identity_fusion = None
+
+        current_anchor = _anchor_from_continuous_target(
+            continuous_target,
+            checked_at=checked_at,
+            config=self.config,
+        )
+        current_camera_anchor = _camera_anchor(
+            camera_policy,
+            default_observed_at=_mapping_timestamp(camera) or _mapping_timestamp(live_facts),
+        )
+        if current_anchor is None:
+            current_anchor = current_camera_anchor
+
+        speech_detected = coerce_optional_bool(vad.get("speech_detected")) is True
+        speaker_associated = (
+            current_speaker_association is not None
+            and coerce_optional_bool(getattr(current_speaker_association, "associated", None)) is True
+        )
         speaking_to_visible_person = (
             current_anchor is not None
             and speech_detected
             and (
                 (continuous_target is not None and continuous_target.speaker_locked)
-                or current_speaker_association.associated
+                or speaker_associated
             )
         )
-        showing_intent_active = _showing_intent_active(camera)
+        showing_intent_active = current_camera_anchor is not None and _showing_intent_active(camera_policy)
 
         if speaking_to_visible_person:
             assert current_anchor is not None
@@ -257,6 +366,7 @@ class MultimodalAttentionTargetTracker:
                 center_x=current_anchor.center_x,
                 center_y=current_anchor.center_y,
                 velocity_x=current_anchor.velocity_x,
+                observed_at=current_anchor.observed_at,
             )
             self._remember_focus(
                 observed_at=checked_at,
@@ -277,51 +387,48 @@ class MultimodalAttentionTargetTracker:
                 confidence=mean_confidence(
                     (
                         None if continuous_target is None else continuous_target.confidence,
-                        current_speaker_association.confidence,
-                        _camera_anchor_confidence(camera),
+                        None if current_speaker_association is None else _coerce_optional_ratio_attr(
+                            current_speaker_association,
+                            "confidence",
+                        ),
+                        _camera_anchor_confidence(camera_policy),
                     )
                 )
                 or 0.82,
             )
 
         if current_anchor is not None and showing_intent_active and not _showing_intent_must_yield(
-            camera=camera,
+            camera=camera_policy,
             speech_detected=speech_detected,
             continuous_target=continuous_target,
         ):
+            showing_anchor = _AttentionAnchor(
+                horizontal=current_anchor.horizontal,
+                vertical=current_anchor.vertical,
+                source="showing_intent",
+                track_id=current_anchor.track_id,
+                center_x=current_anchor.center_x,
+                center_y=current_anchor.center_y,
+                velocity_x=current_anchor.velocity_x,
+                observed_at=current_anchor.observed_at,
+            )
             self._remember_focus(
                 observed_at=checked_at,
                 presence_session_id=presence_session_id,
-                anchor=_AttentionAnchor(
-                    horizontal=current_anchor.horizontal,
-                    vertical=current_anchor.vertical,
-                    source="showing_intent",
-                    track_id=current_anchor.track_id,
-                    center_x=current_anchor.center_x,
-                    center_y=current_anchor.center_y,
-                    velocity_x=current_anchor.velocity_x,
-                ),
+                anchor=showing_anchor,
             )
             return _snapshot_from_anchor(
                 observed_at=observed_at,
                 runtime_status=normalized_runtime_status,
                 presence_session_id=presence_session_id,
-                anchor=_AttentionAnchor(
-                    horizontal=current_anchor.horizontal,
-                    vertical=current_anchor.vertical,
-                    source="showing_intent",
-                    track_id=current_anchor.track_id,
-                    center_x=current_anchor.center_x,
-                    center_y=current_anchor.center_y,
-                    velocity_x=current_anchor.velocity_x,
-                ),
+                anchor=showing_anchor,
                 state="showing_intent_visible_person",
                 showing_intent_active=True,
                 confidence=mean_confidence(
                     (
                         None if continuous_target is None else continuous_target.confidence,
-                        _camera_anchor_confidence(camera),
-                        coerce_optional_ratio(camera.get("visual_attention_score")),
+                        _camera_anchor_confidence(camera_policy),
+                        coerce_optional_ratio(camera_policy.get("visual_attention_score")),
                         0.82,
                     )
                 )
@@ -333,14 +440,16 @@ class MultimodalAttentionTargetTracker:
             runtime_status=normalized_runtime_status,
             presence_session_id=presence_session_id,
             current_anchor=current_anchor,
-            camera=camera,
+            camera=camera_policy,
             identity_fusion=identity_fusion,
         )
         if current_anchor is not None and focus_anchor is not None and _prefer_focus_anchor(
-            camera=camera,
+            camera=camera_policy,
             runtime_status=normalized_runtime_status,
             focus_anchor=focus_anchor,
             current_anchor=current_anchor,
+            continuous_target=continuous_target,
+            config=self.config,
         ):
             return _snapshot_from_anchor(
                 observed_at=observed_at,
@@ -352,8 +461,8 @@ class MultimodalAttentionTargetTracker:
                 confidence=mean_confidence(
                     (
                         None if continuous_target is None else continuous_target.confidence,
-                        _focus_anchor_confidence(identity_fusion, camera),
-                        _camera_anchor_confidence(camera),
+                        _focus_anchor_confidence(identity_fusion, camera_policy),
+                        _camera_anchor_confidence(camera_policy),
                     )
                 )
                 or 0.78,
@@ -376,34 +485,57 @@ class MultimodalAttentionTargetTracker:
                     presence_session_id=presence_session_id,
                     anchor=current_anchor,
                     state=continuous_target.state,
-                    confidence=continuous_target.confidence or _camera_anchor_confidence(camera),
+                    confidence=mean_confidence(
+                        (
+                            continuous_target.confidence,
+                            _camera_anchor_confidence(camera_policy),
+                        )
+                    )
+                    or 0.74,
                     speaker_locked=continuous_target.speaker_locked,
                     showing_intent_active=showing_intent_active,
                 )
-            if focus_anchor is not None and _matches_focus(current_anchor, focus_anchor):
+            if focus_anchor is not None and _matches_focus(
+                current_anchor,
+                focus_anchor,
+                config=self.config,
+            ):
+                matched_anchor = _merge_preferred_focus_with_current(focus_anchor, current_anchor)
+                self._remember_focus(
+                    observed_at=checked_at,
+                    presence_session_id=presence_session_id,
+                    anchor=matched_anchor,
+                )
                 return _snapshot_from_anchor(
                     observed_at=observed_at,
                     runtime_status=normalized_runtime_status,
                     presence_session_id=presence_session_id,
-                    anchor=_AttentionAnchor(
-                        horizontal=current_anchor.horizontal,
-                        vertical=current_anchor.vertical,
-                        source=focus_anchor.source,
-                        track_id=current_anchor.track_id,
-                        center_x=current_anchor.center_x,
-                        center_y=current_anchor.center_y,
-                        velocity_x=current_anchor.velocity_x,
-                    ),
+                    anchor=matched_anchor,
                     state="session_focus_visible_person",
                     session_focus_active=True,
                     confidence=mean_confidence(
                         (
                             None if continuous_target is None else continuous_target.confidence,
-                            _camera_anchor_confidence(camera),
-                            _focus_anchor_confidence(identity_fusion, camera),
+                            _camera_anchor_confidence(camera_policy),
+                            _focus_anchor_confidence(identity_fusion, camera_policy),
                         )
                     )
                     or 0.76,
+                )
+            visible_track_count = None if continuous_target is None else continuous_target.visible_track_count
+            person_count = coerce_optional_int(camera_policy.get("person_count"))
+            if (
+                normalized_runtime_status in _ACTIVE_RUNTIME_STATES
+                and (
+                    (visible_track_count is not None and visible_track_count <= 1)
+                    or person_count is None
+                    or person_count <= 1
+                )
+            ):
+                self._remember_focus(
+                    observed_at=checked_at,
+                    presence_session_id=presence_session_id,
+                    anchor=current_anchor,
                 )
             return _snapshot_from_anchor(
                 observed_at=observed_at,
@@ -411,10 +543,16 @@ class MultimodalAttentionTargetTracker:
                 presence_session_id=presence_session_id,
                 anchor=current_anchor,
                 state="visible_primary_person",
-                confidence=_camera_anchor_confidence(camera),
+                confidence=mean_confidence(
+                    (
+                        None if continuous_target is None else continuous_target.confidence,
+                        _camera_anchor_confidence(camera_policy),
+                    )
+                )
+                or 0.7,
             )
 
-        if focus_anchor is not None and _allow_focus_hold(camera=camera, runtime_status=normalized_runtime_status):
+        if focus_anchor is not None and _allow_focus_hold(camera=camera_policy, runtime_status=normalized_runtime_status):
             return _snapshot_from_anchor(
                 observed_at=observed_at,
                 runtime_status=normalized_runtime_status,
@@ -422,7 +560,7 @@ class MultimodalAttentionTargetTracker:
                 anchor=focus_anchor,
                 state="holding_session_focus",
                 session_focus_active=True,
-                confidence=_focus_anchor_confidence(identity_fusion, camera),
+                confidence=_focus_anchor_confidence(identity_fusion, camera_policy) or 0.72,
             )
 
         return MultimodalAttentionTargetSnapshot(
@@ -437,10 +575,13 @@ class MultimodalAttentionTargetTracker:
     def debug_snapshot(self, *, observed_at: float | None) -> dict[str, object]:
         """Return one bounded debug snapshot of the targeting internals."""
 
-        checked_at = 0.0 if observed_at is None else float(observed_at)
+        checked_at = _latest_timestamp(observed_at) or 0.0
         focus_memory = self._focus_memory
         focus_summary = None
         if focus_memory is not None:
+            focus_age = checked_at - focus_memory.updated_at
+            if focus_age < 0.0:
+                focus_age = 0.0
             focus_summary = {
                 "presence_session_id": focus_memory.presence_session_id,
                 "source": focus_memory.source,
@@ -448,7 +589,7 @@ class MultimodalAttentionTargetTracker:
                 "center_x": focus_memory.center_x,
                 "center_y": focus_memory.center_y,
                 "velocity_x": focus_memory.velocity_x,
-                "age_s": round(max(0.0, checked_at - focus_memory.updated_at), 3),
+                "age_s": round(focus_age, 3),
             }
         continuous_summary = None
         if self._continuous_tracker is not None:
@@ -465,6 +606,17 @@ class MultimodalAttentionTargetTracker:
         presence_session_id: int | None,
         anchor: _AttentionAnchor,
     ) -> None:
+        anchor_observed_at = _coerce_optional_float(anchor.observed_at)
+        if anchor_observed_at is not None and not _source_is_fresh(
+            checked_at=observed_at,
+            source_observed_at=anchor_observed_at,
+            max_age_s=self.config.identity_max_staleness_s,
+            clock_skew_tolerance_s=self.config.clock_skew_tolerance_s,
+        ):
+            return
+        updated_at = observed_at
+        if anchor_observed_at is not None and anchor_observed_at <= (observed_at + self.config.clock_skew_tolerance_s):
+            updated_at = min(observed_at, anchor_observed_at)
         self._focus_memory = _SessionFocusMemory(
             presence_session_id=presence_session_id,
             horizontal=anchor.horizontal,
@@ -474,7 +626,7 @@ class MultimodalAttentionTargetTracker:
             center_x=anchor.center_x,
             center_y=anchor.center_y,
             velocity_x=anchor.velocity_x,
-            updated_at=observed_at,
+            updated_at=updated_at,
         )
 
     def _resolve_focus_anchor(
@@ -497,33 +649,26 @@ class MultimodalAttentionTargetTracker:
             presence_session_id=presence_session_id,
         )
         if identity_anchor is not None:
-            if current_anchor is not None and _matches_focus(current_anchor, identity_anchor):
+            if current_anchor is not None and _matches_focus(
+                current_anchor,
+                identity_anchor,
+                config=self.config,
+            ):
+                merged_anchor = _merge_preferred_focus_with_current(identity_anchor, current_anchor)
                 self._remember_focus(
                     observed_at=observed_at,
                     presence_session_id=presence_session_id,
-                    anchor=_AttentionAnchor(
-                        horizontal=current_anchor.horizontal,
-                        vertical=current_anchor.vertical,
-                        source=identity_anchor.source,
-                        track_id=current_anchor.track_id,
-                        center_x=current_anchor.center_x,
-                        center_y=current_anchor.center_y,
-                        velocity_x=current_anchor.velocity_x,
-                    ),
+                    anchor=merged_anchor,
                 )
-                return _AttentionAnchor(
-                    horizontal=current_anchor.horizontal,
-                    vertical=current_anchor.vertical,
-                    source=identity_anchor.source,
-                    track_id=current_anchor.track_id,
-                    center_x=current_anchor.center_x,
-                    center_y=current_anchor.center_y,
-                    velocity_x=current_anchor.velocity_x,
-                )
-            if remembered is None:
-                return identity_anchor
-        if remembered is None:
+                return merged_anchor
+            self._remember_focus(
+                observed_at=observed_at,
+                presence_session_id=presence_session_id,
+                anchor=identity_anchor,
+            )
             return identity_anchor
+        if remembered is None:
+            return None
         if runtime_status not in _ACTIVE_RUNTIME_STATES and not _allow_focus_hold(
             camera=camera,
             runtime_status=runtime_status,
@@ -542,7 +687,12 @@ class MultimodalAttentionTargetTracker:
             return None
         if memory.presence_session_id != presence_session_id:
             return None
-        if (observed_at - memory.updated_at) > self.config.session_focus_hold_s:
+        age_s = observed_at - memory.updated_at
+        if age_s < -self.config.clock_skew_tolerance_s:
+            return None
+        if age_s < 0.0:
+            age_s = 0.0
+        if age_s > self.config.session_focus_hold_s:
             return None
         return _AttentionAnchor(
             horizontal=memory.horizontal,
@@ -552,6 +702,7 @@ class MultimodalAttentionTargetTracker:
             center_x=memory.center_x,
             center_y=memory.center_y,
             velocity_x=memory.velocity_x,
+            observed_at=memory.updated_at,
         )
 
 
@@ -588,7 +739,11 @@ def _snapshot_from_anchor(
     )
 
 
-def _camera_anchor(camera: Mapping[str, object]) -> _AttentionAnchor | None:
+def _camera_anchor(
+    camera: Mapping[str, object],
+    *,
+    default_observed_at: float | None = None,
+) -> _AttentionAnchor | None:
     if coerce_optional_bool(camera.get("person_visible")) is not True:
         return None
     horizontal = _camera_horizontal(camera)
@@ -598,17 +753,31 @@ def _camera_anchor(camera: Mapping[str, object]) -> _AttentionAnchor | None:
         horizontal=horizontal,
         vertical=_FOLLOW_VERTICAL,
         source="camera_primary_person",
+        track_id=_normalize_optional_text(camera.get("primary_person_track_id")) or None,
         center_x=coerce_optional_ratio(camera.get("primary_person_center_x")),
         center_y=coerce_optional_ratio(camera.get("primary_person_center_y")),
+        velocity_x=_coerce_optional_float(camera.get("primary_person_velocity_x")),
+        observed_at=_mapping_timestamp(camera) or default_observed_at,
     )
 
 
 def _anchor_from_continuous_target(
     snapshot: ContinuousAttentionTargetSnapshot | None,
+    *,
+    checked_at: float,
+    config: MultimodalAttentionTargetConfig,
 ) -> _AttentionAnchor | None:
     """Translate one continuous visible-person target into the generic anchor."""
 
     if snapshot is None or snapshot.active is not True:
+        return None
+    observed_at = _object_timestamp(snapshot)
+    if not _source_is_fresh(
+        checked_at=checked_at,
+        source_observed_at=observed_at,
+        max_age_s=config.source_max_staleness_s,
+        clock_skew_tolerance_s=config.clock_skew_tolerance_s,
+    ):
         return None
     horizontal = _normalize_direction(snapshot.target_horizontal, allowed=_VALID_HORIZONTAL)
     if horizontal is None:
@@ -628,6 +797,7 @@ def _anchor_from_continuous_target(
         center_x=snapshot.target_center_x,
         center_y=snapshot.target_center_y,
         velocity_x=snapshot.target_velocity_x,
+        observed_at=observed_at,
     )
 
 
@@ -690,7 +860,19 @@ def _identity_focus_anchor(
         return None
     if identity_fusion.track_consistency_state not in {"stable_anchor", "speaker_locked"}:
         return None
-    horizontal = _normalize_direction(identity_fusion.track_anchor_zone, allowed=_VALID_HORIZONTAL)
+    center_x = _coerce_optional_ratio_attr(
+        identity_fusion,
+        "track_anchor_center_x",
+        "track_center_x",
+        "center_x",
+    )
+    horizontal = _normalize_direction(getattr(identity_fusion, "track_anchor_zone", None), allowed=_VALID_HORIZONTAL)
+    if horizontal is None and center_x is not None:
+        horizontal = _camera_horizontal(
+            {
+                "primary_person_center_x": center_x,
+            }
+        )
     if horizontal is None:
         return None
     vertical = _FOLLOW_VERTICAL if current_anchor is None else current_anchor.vertical
@@ -698,6 +880,26 @@ def _identity_focus_anchor(
         horizontal=horizontal,
         vertical=vertical,
         source="identity_fusion_track",
+        track_id=_normalize_optional_text_attr(
+            identity_fusion,
+            "track_anchor_track_id",
+            "anchor_track_id",
+            "track_id",
+        ),
+        center_x=center_x,
+        center_y=_coerce_optional_ratio_attr(
+            identity_fusion,
+            "track_anchor_center_y",
+            "track_center_y",
+            "center_y",
+        ),
+        velocity_x=_coerce_optional_float_attr(
+            identity_fusion,
+            "track_anchor_velocity_x",
+            "track_velocity_x",
+            "velocity_x",
+        ),
+        observed_at=_object_timestamp(identity_fusion),
     )
 
 
@@ -707,13 +909,20 @@ def _prefer_focus_anchor(
     runtime_status: str | None,
     focus_anchor: _AttentionAnchor,
     current_anchor: _AttentionAnchor,
+    continuous_target: ContinuousAttentionTargetSnapshot | None,
+    config: MultimodalAttentionTargetConfig,
 ) -> bool:
     if runtime_status not in _INTERACTIVE_RUNTIME_STATES:
         return False
     person_count = coerce_optional_int(camera.get("person_count"))
-    if person_count is None or person_count <= 1:
+    visible_track_count = None if continuous_target is None else continuous_target.visible_track_count
+    multi_person_visible = (
+        (visible_track_count is not None and visible_track_count > 1)
+        or (person_count is not None and person_count > 1)
+    )
+    if not multi_person_visible:
         return False
-    return not _matches_focus(focus_anchor, current_anchor)
+    return not _matches_focus(focus_anchor, current_anchor, config=config)
 
 
 def _allow_focus_hold(*, camera: Mapping[str, object], runtime_status: str | None) -> bool:
@@ -724,8 +933,36 @@ def _allow_focus_hold(*, camera: Mapping[str, object], runtime_status: str | Non
     return coerce_optional_bool(camera.get("person_recently_visible")) is True
 
 
-def _matches_focus(left: _AttentionAnchor, right: _AttentionAnchor) -> bool:
+def _matches_focus(
+    left: _AttentionAnchor,
+    right: _AttentionAnchor,
+    *,
+    config: MultimodalAttentionTargetConfig,
+) -> bool:
+    if left.track_id and right.track_id:
+        return left.track_id == right.track_id
+    if left.center_x is not None and right.center_x is not None:
+        if abs(left.center_x - right.center_x) <= config.focus_match_center_x_delta:
+            if left.center_y is None or right.center_y is None:
+                return True
+            return abs(left.center_y - right.center_y) <= config.focus_match_center_y_delta
     return left.horizontal == right.horizontal
+
+
+def _merge_preferred_focus_with_current(
+    preferred_focus: _AttentionAnchor,
+    current_anchor: _AttentionAnchor,
+) -> _AttentionAnchor:
+    return _AttentionAnchor(
+        horizontal=current_anchor.horizontal,
+        vertical=current_anchor.vertical,
+        source=preferred_focus.source,
+        track_id=current_anchor.track_id or preferred_focus.track_id,
+        center_x=current_anchor.center_x if current_anchor.center_x is not None else preferred_focus.center_x,
+        center_y=current_anchor.center_y if current_anchor.center_y is not None else preferred_focus.center_y,
+        velocity_x=current_anchor.velocity_x if current_anchor.velocity_x is not None else preferred_focus.velocity_x,
+        observed_at=current_anchor.observed_at if current_anchor.observed_at is not None else preferred_focus.observed_at,
+    )
 
 
 def _camera_attention_unavailable(camera: Mapping[str, object]) -> bool:
@@ -735,36 +972,47 @@ def _camera_attention_unavailable(camera: Mapping[str, object]) -> bool:
     )
 
 
-def _camera_anchor_confidence(camera: Mapping[str, object]) -> float:
-    return (
-        mean_confidence(
-            (
-                coerce_optional_ratio(camera.get("visual_attention_score")),
-                0.84 if coerce_optional_bool(camera.get("engaged_with_device")) is True else None,
-                0.8 if coerce_optional_bool(camera.get("looking_toward_device")) is True else None,
-                0.76 if coerce_optional_bool(camera.get("person_near_device")) is True else None,
-            )
+def _camera_anchor_confidence(camera: Mapping[str, object]) -> float | None:
+    base_confidence = mean_confidence(
+        (
+            coerce_optional_ratio(camera.get("visual_attention_score")),
+            coerce_optional_ratio(camera.get("primary_person_confidence")),
+            coerce_optional_ratio(camera.get("primary_person_tracking_confidence")),
+            0.84 if coerce_optional_bool(camera.get("engaged_with_device")) is True else None,
+            0.8 if coerce_optional_bool(camera.get("looking_toward_device")) is True else None,
+            0.76 if coerce_optional_bool(camera.get("person_near_device")) is True else None,
         )
-        or 0.7
     )
+    if base_confidence is not None:
+        return base_confidence
+    if coerce_optional_bool(camera.get("person_visible")) is True:
+        return 0.7
+    return None
 
 
 def _focus_anchor_confidence(
     identity_fusion: MultimodalIdentityFusionSnapshot | None,
     camera: Mapping[str, object],
-) -> float:
+) -> float | None:
     if identity_fusion is not None:
-        fusion_confidence = coerce_optional_ratio(identity_fusion.claim.confidence)
+        fusion_confidence = coerce_optional_ratio(getattr(getattr(identity_fusion, "claim", None), "confidence", None))
         if fusion_confidence is not None:
             return fusion_confidence
     return _camera_anchor_confidence(camera)
 
 
 def _normalize_direction(value: object | None, *, allowed: frozenset[str]) -> str | None:
-    normalized = normalize_text(value).lower()
+    normalized = (_normalize_optional_text(value) or "").lower()
     if normalized in allowed:
         return normalized
     return None
+
+
+def _normalize_optional_text(value: object | None) -> str | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return None
+    return normalized
 
 
 def _coerce_optional_float(value: object | None) -> float | None:
@@ -774,9 +1022,105 @@ def _coerce_optional_float(value: object | None) -> float | None:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
-    if numeric != numeric:
+    if not math.isfinite(numeric):
         return None
     return numeric
+
+
+def _bounded_config_float(
+    *,
+    config: TwinrConfig,
+    attr_name: str,
+    default: float,
+    minimum: float,
+) -> float:
+    try:
+        candidate = float(getattr(config, attr_name, default))
+    except (TypeError, ValueError):
+        candidate = default
+    if not math.isfinite(candidate):
+        candidate = default
+    if candidate < minimum:
+        candidate = default
+    return max(minimum, candidate)
+
+
+def _latest_timestamp(*values: object | None) -> float | None:
+    latest = None
+    for value in values:
+        candidate = _coerce_optional_float(value)
+        if candidate is None:
+            continue
+        if latest is None or candidate > latest:
+            latest = candidate
+    return latest
+
+
+def _mapping_timestamp(mapping: Mapping[str, object] | None) -> float | None:
+    if not mapping:
+        return None
+    for key in ("observed_at", "captured_at", "frame_observed_at", "updated_at", "timestamp"):
+        value = _coerce_optional_float(mapping.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _object_timestamp(value: object | None) -> float | None:
+    if value is None:
+        return None
+    for attr_name in ("observed_at", "captured_at", "frame_observed_at", "updated_at", "timestamp"):
+        candidate = _coerce_optional_float(getattr(value, attr_name, None))
+        if candidate is not None:
+            return candidate
+    claim = getattr(value, "claim", None)
+    if claim is not None:
+        for attr_name in ("observed_at", "captured_at", "updated_at", "timestamp"):
+            candidate = _coerce_optional_float(getattr(claim, attr_name, None))
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _source_is_fresh(
+    *,
+    checked_at: float,
+    source_observed_at: float | None,
+    max_age_s: float,
+    clock_skew_tolerance_s: float,
+) -> bool:
+    if source_observed_at is None:
+        return True
+    age_s = checked_at - source_observed_at
+    if age_s < -clock_skew_tolerance_s:
+        return False
+    if age_s < 0.0:
+        age_s = 0.0
+    return age_s <= max_age_s
+
+
+def _coerce_optional_ratio_attr(value: object | None, *attr_names: str) -> float | None:
+    for attr_name in attr_names:
+        candidate = coerce_optional_ratio(getattr(value, attr_name, None))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _coerce_optional_float_attr(value: object | None, *attr_names: str) -> float | None:
+    for attr_name in attr_names:
+        candidate = _coerce_optional_float(getattr(value, attr_name, None))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _normalize_optional_text_attr(value: object | None, *attr_names: str) -> str | None:
+    for attr_name in attr_names:
+        candidate = _normalize_optional_text(getattr(value, attr_name, None))
+        if candidate:
+            return candidate
+    return None
 
 
 __all__ = [

@@ -376,6 +376,12 @@ def load_vision_proactive_config(context: ConfigLoadContext) -> dict[str, object
             get_value("TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_PROMPT_LIMIT", "2")
             or "2"
         ),
+        "proactive_governor_presence_session_window_s": _parse_float(
+            get_value("TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_WINDOW_S"), 0.0
+        ),
+        "proactive_governor_presence_grace_s": _parse_float(
+            get_value("TWINR_PROACTIVE_GOVERNOR_PRESENCE_GRACE_S"), 0.0
+        ),
         "proactive_governor_source_repeat_cooldown_s": _parse_float(
             get_value("TWINR_PROACTIVE_GOVERNOR_SOURCE_REPEAT_COOLDOWN_S"), 10.0 * 60.0
         ),

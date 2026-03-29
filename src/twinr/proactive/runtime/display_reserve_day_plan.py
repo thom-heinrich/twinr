@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: Fixed cursor semantics after topic retirement so the next item no longer skips/repeats cards.
+# BUG-2: Fixed last-shown resolution so idle fill still returns the real last published card even when all active topics are retired.
+# BUG-3: Fixed plan persistence races/corruption by adding inter-process locking plus atomic fsync+replace writes.
+# SEC-1: Refuse oversized/non-regular persisted plan files and write plan artifacts with owner-only permissions.
+# IMP-1: Upgraded subset selection from static top-weight picking to adaptive multi-objective re-ranking with relevance/diversity/coverage balancing.
+# IMP-2: Upgraded ordering from hard local gap heuristics to intent-aware whole-cycle scheduling with adaptive diversity pressure.
+
 """Plan one full local day of calm HDMI reserve impulses.
 
 The live proactive monitor should not improvise reserve-card timing on every
@@ -13,14 +21,25 @@ broader and less repetitive.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date as LocalDate, datetime, time as LocalTime, timedelta, timezone
+import errno
 import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path
+import stat as statmod
+import tempfile
+
+try:  # Raspberry Pi 4 / Linux path.
+    import fcntl
+except Exception:  # pragma: no cover - only relevant on unsupported platforms.
+    fcntl = None
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
@@ -52,6 +71,11 @@ _EMPTY_PLAN_RETRY_S = 60.0
 _DEFAULT_MIN_HOLD_S = 4.0 * 60.0
 _DEFAULT_BASE_HOLD_S = 8.0 * 60.0
 _DEFAULT_MAX_HOLD_S = 12.0 * 60.0
+_DEFAULT_DIVERSITY_PRESSURE = 0.42
+_MAX_DIVERSITY_PRESSURE = 0.85
+_MIN_DIVERSITY_PRESSURE = 0.08
+_PLAN_SCHEMA_VERSION = 2
+_MAX_PLAN_BYTES = 1_048_576
 
 _ACTION_BONUS_S = {
     "silent": -2.0 * 60.0,
@@ -68,6 +92,7 @@ _ATTENTION_BONUS_S = {
 }
 
 _LOGGER = logging.getLogger(__name__)
+
 
 def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
     """Return one finite bounded integer config value."""
@@ -111,6 +136,12 @@ def _normalize_topic_keys(values: Iterable[object] | None) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _normalize_source_key(value: object) -> str:
+    """Return one normalized source token."""
+
+    return compact_text(value, max_len=48).casefold() or "unknown"
+
+
 def _stable_fraction(*parts: object) -> float:
     """Return one deterministic fraction in the inclusive 0..1 range."""
 
@@ -118,6 +149,58 @@ def _stable_fraction(*parts: object) -> float:
         "::".join(compact_text(part, max_len=160) for part in parts).encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:4], "big") / 4_294_967_295.0
+
+
+def _largest_remainder_allocation(
+    *,
+    weights: Mapping[str, float],
+    slots: int,
+    availability: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Allocate integer targets from fractional weights with bounded availability."""
+
+    if slots <= 0 or not weights:
+        return {key: 0 for key in weights}
+    positive = {key: max(0.0, float(value)) for key, value in weights.items()}
+    total = sum(positive.values())
+    if total <= 0.0:
+        positive = {key: 1.0 for key in weights}
+        total = float(len(positive))
+    allocations: dict[str, int] = {key: 0 for key in positive}
+    remainders: list[tuple[float, str]] = []
+    remaining = slots
+    for key, weight in positive.items():
+        ideal = (weight / total) * float(slots)
+        initial = int(math.floor(ideal))
+        if availability is not None:
+            initial = min(initial, max(0, int(availability.get(key, 0))))
+        allocations[key] = max(0, initial)
+        remaining -= allocations[key]
+        remainders.append((ideal - initial, key))
+    if remaining > 0:
+        for _remainder, key in sorted(remainders, reverse=True):
+            if remaining <= 0:
+                break
+            if availability is not None and allocations[key] >= max(0, int(availability.get(key, 0))):
+                continue
+            allocations[key] += 1
+            remaining -= 1
+    return allocations
+
+
+def _best_effort_fsync_directory(path: Path) -> None:
+    """Flush one directory entry update when the host platform supports it."""
+
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        return
+    finally:
+        os.close(directory_fd)
 
 
 def _default_candidate_loader(
@@ -241,6 +324,7 @@ class DisplayReserveDayPlan:
     items: tuple[DisplayReservePlannedItem, ...]
     candidate_count: int = 0
     retired_topic_keys: tuple[str, ...] = ()
+    schema_version: int = _PLAN_SCHEMA_VERSION
 
     @classmethod
     def empty(cls, *, local_day: LocalDate, generated_at: datetime | None = None) -> "DisplayReserveDayPlan":
@@ -253,6 +337,7 @@ class DisplayReserveDayPlan:
             items=(),
             candidate_count=0,
             retired_topic_keys=(),
+            schema_version=_PLAN_SCHEMA_VERSION,
         )
 
     @classmethod
@@ -263,10 +348,10 @@ class DisplayReserveDayPlan:
         if not local_day:
             raise ValueError("display reserve day plan requires local_day")
         generated_at = _parse_timestamp(payload.get("generated_at")) or utc_now()
-        cursor = _bounded_int(payload.get("cursor"), default=0, minimum=0, maximum=10_000)
+        cursor = _bounded_int(payload.get("cursor"), default=0, minimum=0, maximum=10_000_000)
         raw_items = payload.get("items")
         raw_retired_topic_keys = payload.get("retired_topic_keys")
-        if not isinstance(raw_items, Sequence):
+        if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes, bytearray)):
             raise ValueError("display reserve day plan items must be a sequence")
         items = tuple(
             DisplayReservePlannedItem.from_dict(entry)
@@ -290,12 +375,19 @@ class DisplayReserveDayPlan:
                 and not isinstance(raw_retired_topic_keys, (str, bytes, bytearray))
                 else None,
             ),
+            schema_version=_bounded_int(
+                payload.get("schema_version"),
+                default=1,
+                minimum=1,
+                maximum=_PLAN_SCHEMA_VERSION,
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the plan into JSON-safe data."""
 
         return {
+            "schema_version": self.schema_version,
             "local_day": self.local_day,
             "generated_at": self.generated_at,
             "cursor": self.cursor,
@@ -312,39 +404,55 @@ class DisplayReserveDayPlan:
         retired = set(self.retired_topic_keys)
         return tuple(item for item in self.items if item.semantic_key() not in retired)
 
+    def _next_active_position(self, *, cursor: int | None = None) -> int | None:
+        """Return the absolute cursor position of the next active item."""
+
+        if not self.items:
+            return None
+        retired = set(self.retired_topic_keys)
+        start = max(0, int(self.cursor if cursor is None else cursor))
+        size = len(self.items)
+        for offset in range(size):
+            absolute_position = start + offset
+            item = self.items[absolute_position % size]
+            if item.semantic_key() not in retired:
+                return absolute_position
+        return None
+
     def current_item(self) -> DisplayReservePlannedItem | None:
         """Return the current rotating item for the local day."""
 
-        active_items = self.active_items()
-        if not active_items:
+        position = self._next_active_position()
+        if position is None:
             return None
-        return active_items[self.cursor % len(active_items)]
+        return self.items[position % len(self.items)]
 
     def last_shown_item(self) -> DisplayReservePlannedItem | None:
         """Return the most recently shown item for the current local day."""
 
-        active_items = self.active_items()
-        if not active_items or self.cursor <= 0:
+        if not self.items or self.cursor <= 0:
             return None
-        return active_items[(self.cursor - 1) % len(active_items)]
+        return self.items[(self.cursor - 1) % len(self.items)]
 
     def is_exhausted(self) -> bool:
         """Return whether no active same-day rotation items remain."""
 
-        return not bool(self.active_items())
+        return self._next_active_position() is None
 
     def advance(self) -> "DisplayReserveDayPlan":
         """Return one copy of the plan with the cursor advanced by one slot."""
 
-        if not self.active_items():
+        position = self._next_active_position()
+        if position is None:
             return self
         return DisplayReserveDayPlan(
             local_day=self.local_day,
             generated_at=self.generated_at,
-            cursor=self.cursor + 1,
+            cursor=position + 1,
             items=self.items,
             candidate_count=self.candidate_count,
             retired_topic_keys=self.retired_topic_keys,
+            schema_version=self.schema_version,
         )
 
     def retire_topics(self, topic_keys: Sequence[object]) -> "DisplayReserveDayPlan":
@@ -360,6 +468,7 @@ class DisplayReserveDayPlan:
             items=self.items,
             candidate_count=self.candidate_count,
             retired_topic_keys=retired_topic_keys,
+            schema_version=self.schema_version,
         )
 
 
@@ -368,6 +477,7 @@ class DisplayReserveDayPlanStore:
     """Read and write the persistent local-day reserve plan artifact."""
 
     path: Path
+    max_bytes: int = _MAX_PLAN_BYTES
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayReserveDayPlanStore":
@@ -380,16 +490,103 @@ class DisplayReserveDayPlanStore:
         resolved = configured if configured.is_absolute() else project_root / configured
         return cls(path=resolved)
 
+    @property
+    def _lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.lock")
+
+    @contextmanager
+    def _locked(self, *, exclusive: bool) -> Iterator[None]:
+        """Serialize cross-process access to the persisted plan file."""
+
+        if fcntl is None:
+            yield
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(
+            self._lock_path,
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        try:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(lock_fd, operation)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+    def _safe_existing_stat(self) -> os.stat_result | None:
+        """Return one validated stat result for the persisted plan file."""
+
+        try:
+            stat_result = self.path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            _LOGGER.warning("Failed to stat display reserve day plan at %s.", self.path, exc_info=True)
+            return None
+        if statmod.S_ISLNK(stat_result.st_mode):
+            _LOGGER.warning("Ignoring symlinked display reserve day plan at %s.", self.path)
+            return None
+        if not statmod.S_ISREG(stat_result.st_mode):
+            _LOGGER.warning("Ignoring non-regular display reserve day plan at %s.", self.path)
+            return None
+        if stat_result.st_size > self.max_bytes:
+            _LOGGER.warning(
+                "Ignoring oversized display reserve day plan at %s (%s bytes > %s bytes).",
+                self.path,
+                stat_result.st_size,
+                self.max_bytes,
+            )
+            return None
+        return stat_result
+
     def load(self) -> DisplayReserveDayPlan | None:
         """Load the currently persisted day plan, if one exists and parses."""
 
-        if not self.path.exists():
-            return None
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            _LOGGER.warning("Failed to read display reserve day plan from %s.", self.path, exc_info=True)
-            return None
+        with self._locked(exclusive=False):
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                file_descriptor = os.open(self.path, flags)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if getattr(exc, "errno", None) in {getattr(errno, "ELOOP", None), getattr(errno, "EMLINK", None)}:
+                    _LOGGER.warning("Ignoring symlinked display reserve day plan at %s.", self.path)
+                    return None
+                _LOGGER.warning("Failed to open display reserve day plan at %s.", self.path, exc_info=True)
+                return None
+            try:
+                stat_result = os.fstat(file_descriptor)
+                if not statmod.S_ISREG(stat_result.st_mode):
+                    _LOGGER.warning("Ignoring non-regular display reserve day plan at %s.", self.path)
+                    return None
+                if stat_result.st_size > self.max_bytes:
+                    _LOGGER.warning(
+                        "Ignoring oversized display reserve day plan at %s (%s bytes > %s bytes).",
+                        self.path,
+                        stat_result.st_size,
+                        self.max_bytes,
+                    )
+                    return None
+                with os.fdopen(file_descriptor, "r", encoding="utf-8") as handle:
+                    file_descriptor = -1
+                    payload = json.load(handle)
+            except FileNotFoundError:
+                return None
+            except Exception:
+                _LOGGER.warning("Failed to read display reserve day plan from %s.", self.path, exc_info=True)
+                return None
+            finally:
+                if file_descriptor >= 0:
+                    try:
+                        os.close(file_descriptor)
+                    except OSError:
+                        pass
         if not isinstance(payload, Mapping):
             _LOGGER.warning(
                 "Ignoring invalid display reserve day plan payload at %s because it is not an object.",
@@ -403,22 +600,70 @@ class DisplayReserveDayPlanStore:
             return None
 
     def save(self, plan: DisplayReserveDayPlan) -> DisplayReserveDayPlan:
-        """Persist one full day plan atomically enough for runtime use."""
+        """Persist one full day plan with atomic replacement and inter-process locking."""
 
+        payload = json.dumps(plan.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        encoded = payload.encode("utf-8")
+        if len(encoded) > self.max_bytes:
+            raise ValueError(
+                f"display reserve day plan payload exceeds {self.max_bytes} bytes ({len(encoded)} bytes)"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        with self._locked(exclusive=True):
+            temp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.path.parent,
+                    prefix=f".{self.path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temp_path = Path(handle.name)
+                    try:
+                        os.chmod(temp_path, 0o600)
+                    except OSError:
+                        pass
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, self.path)
+                try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
+                _best_effort_fsync_directory(self.path)
+            except Exception:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        _LOGGER.warning(
+                            "Failed to clean temporary display reserve day plan %s.",
+                            temp_path,
+                            exc_info=True,
+                        )
+                raise
         return plan
 
     def clear(self) -> None:
         """Remove the persisted plan artifact when it exists."""
 
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            return
+        with self._locked(exclusive=True):
+            try:
+                existing = self._safe_existing_stat()
+                if existing is not None:
+                    self.path.unlink()
+            except FileNotFoundError:
+                return
+            _best_effort_fsync_directory(self.path)
 
 
 @dataclass(slots=True)
@@ -457,16 +702,27 @@ class DisplayReserveDayPlanner:
         feedback_signal = self._load_active_feedback(local_now=effective_now)
         if self._plan_is_current(existing, current_day=current_day, local_now=effective_now, refresh_after=refresh_after):
             if self._feedback_requires_rebuild(existing, feedback_signal=feedback_signal):
+                retired_topic_keys = self._retired_topic_keys(
+                    existing,
+                    feedback_signal=feedback_signal,
+                )
                 rebuilt = self._build_plan(
                     config=config,
                     local_now=effective_now,
                     local_day=current_day,
                     feedback_signal=feedback_signal,
-                    retired_topic_keys=self._retired_topic_keys(
-                        existing,
-                        feedback_signal=feedback_signal,
-                    ),
+                    retired_topic_keys=retired_topic_keys,
                 )
+                if not rebuilt.items and existing is not None and existing.items:
+                    rebuilt = DisplayReserveDayPlan(
+                        local_day=rebuilt.local_day,
+                        generated_at=rebuilt.generated_at,
+                        cursor=existing.cursor,
+                        items=existing.items,
+                        candidate_count=max(existing.candidate_count, len(existing.items)),
+                        retired_topic_keys=_normalize_topic_keys(retired_topic_keys),
+                        schema_version=_PLAN_SCHEMA_VERSION,
+                    )
                 return self.store.save(rebuilt)
             if not self._should_retry_empty_current_plan(existing, local_now=effective_now):
                 assert existing is not None
@@ -598,7 +854,7 @@ class DisplayReserveDayPlanner:
             getattr(config, "display_reserve_bus_candidate_limit", _DEFAULT_CANDIDATE_LIMIT),
             default=_DEFAULT_CANDIDATE_LIMIT,
             minimum=1,
-            maximum=24,
+            maximum=96,
         )
         items_per_day = _bounded_int(
             getattr(config, "display_reserve_bus_items_per_day", _DEFAULT_ITEMS_PER_DAY),
@@ -612,9 +868,24 @@ class DisplayReserveDayPlanner:
             minimum=0,
             maximum=8,
         )
-        source_gap = _DEFAULT_SOURCE_GAP
-        family_gap = _DEFAULT_FAMILY_GAP
-        axis_gap = _DEFAULT_AXIS_GAP
+        source_gap = _bounded_int(
+            getattr(config, "display_reserve_bus_source_gap", _DEFAULT_SOURCE_GAP),
+            default=_DEFAULT_SOURCE_GAP,
+            minimum=0,
+            maximum=8,
+        )
+        family_gap = _bounded_int(
+            getattr(config, "display_reserve_bus_family_gap", _DEFAULT_FAMILY_GAP),
+            default=_DEFAULT_FAMILY_GAP,
+            minimum=0,
+            maximum=8,
+        )
+        axis_gap = _bounded_int(
+            getattr(config, "display_reserve_bus_axis_gap", _DEFAULT_AXIS_GAP),
+            default=_DEFAULT_AXIS_GAP,
+            minimum=0,
+            maximum=8,
+        )
         candidates = tuple(
             self.candidate_loader(
                 config,
@@ -637,15 +908,9 @@ class DisplayReserveDayPlanner:
             candidates=candidates,
             configured_slots=items_per_day,
         )
-        counts = self._allocate_counts(
+        ordered = self._plan_unique_cycle(
             candidates,
             slots=cycle_slots,
-            local_day=local_day,
-            feedback_signal=feedback_signal,
-        )
-        ordered = self._schedule_candidates(
-            candidates,
-            counts=counts,
             local_day=local_day,
             topic_gap=topic_gap,
             source_gap=source_gap,
@@ -668,6 +933,7 @@ class DisplayReserveDayPlanner:
             items=items,
             candidate_count=len(candidates),
             retired_topic_keys=_normalize_topic_keys(retired_topic_keys),
+            schema_version=_PLAN_SCHEMA_VERSION,
         )
 
     def _cycle_slots(
@@ -688,80 +954,11 @@ class DisplayReserveDayPlanner:
             return 0
         return min(max(1, int(configured_slots)), len(candidates))
 
-    def _allocate_counts(
+    def _plan_unique_cycle(
         self,
         candidates: Sequence[AmbientDisplayImpulseCandidate],
         *,
         slots: int,
-        local_day: LocalDate,
-        feedback_signal: DisplayReserveBusFeedbackSignal | None,
-    ) -> dict[str, int]:
-        """Allocate a bounded number of daily plan slots across candidates."""
-
-        if slots <= 0:
-            return {candidate.topic_key: 0 for candidate in candidates}
-        if len(candidates) >= slots:
-            selected = sorted(
-                candidates,
-                key=lambda item: (
-                    self._candidate_weight(item, feedback_signal=feedback_signal),
-                    _stable_fraction(local_day.isoformat(), item.topic_key, "select"),
-                ),
-                reverse=True,
-            )[:slots]
-            selected_keys = {candidate.topic_key for candidate in selected}
-            return {
-                candidate.topic_key: 1 if candidate.topic_key in selected_keys else 0
-                for candidate in candidates
-            }
-        weights = {
-            candidate.topic_key: self._candidate_weight(candidate, feedback_signal=feedback_signal)
-            for candidate in candidates
-        }
-        total = sum(weights.values()) or float(len(candidates))
-        counts: dict[str, int] = {}
-        remainders: list[tuple[float, AmbientDisplayImpulseCandidate]] = []
-        remaining_slots = slots
-        for candidate in candidates:
-            ideal = (weights[candidate.topic_key] / total) * float(slots)
-            count = max(1, int(math.floor(ideal)))
-            counts[candidate.topic_key] = count
-            remaining_slots -= count
-            remainders.append((ideal - count, candidate))
-        if remaining_slots < 0:
-            for _remainder, candidate in sorted(
-                remainders,
-                key=lambda item: (
-                    item[0],
-                    _stable_fraction(local_day.isoformat(), item[1].topic_key, "trim"),
-                ),
-            ):
-                if remaining_slots >= 0:
-                    break
-                if counts[candidate.topic_key] <= 1:
-                    continue
-                counts[candidate.topic_key] -= 1
-                remaining_slots += 1
-        if remaining_slots > 0:
-            for _remainder, candidate in sorted(
-                remainders,
-                key=lambda item: (
-                    item[0],
-                    _stable_fraction(local_day.isoformat(), item[1].topic_key, "fill"),
-                ),
-                reverse=True,
-            ):
-                if remaining_slots <= 0:
-                    break
-                counts[candidate.topic_key] += 1
-                remaining_slots -= 1
-        return counts
-
-    def _schedule_candidates(
-        self,
-        candidates: Sequence[AmbientDisplayImpulseCandidate],
-        *,
-        counts: Mapping[str, int],
         local_day: LocalDate,
         topic_gap: int,
         source_gap: int,
@@ -769,60 +966,260 @@ class DisplayReserveDayPlanner:
         axis_gap: int,
         feedback_signal: DisplayReserveBusFeedbackSignal | None,
     ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
-        """Spread repeated candidates across the day without topic clustering."""
+        """Select and order one unique daily cycle with adaptive multi-objective reranking."""
 
-        remaining = {candidate.topic_key: max(0, counts.get(candidate.topic_key, 0)) for candidate in candidates}
-        ordered: list[AmbientDisplayImpulseCandidate] = []
-        while any(remaining.values()):
-            recent_topics = tuple(item.semantic_key() for item in ordered[-topic_gap:]) if topic_gap > 0 else ()
-            recent_sources = tuple(item.source for item in ordered[-source_gap:]) if source_gap > 0 else ()
-            recent_families = (
-                tuple(self._candidate_family(item) for item in ordered[-family_gap:])
-                if family_gap > 0
-                else ()
-            )
-            recent_axes = (
-                tuple(self._candidate_axis(item) for item in ordered[-axis_gap:])
-                if axis_gap > 0
-                else ()
-            )
-            eligible = [
-                candidate
-                for candidate in candidates
-                if remaining.get(candidate.topic_key, 0) > 0
-                and candidate.semantic_key() not in recent_topics
-                and candidate.source not in recent_sources
-                and self._candidate_family(candidate) not in recent_families
-            ]
-            if not eligible:
-                eligible = [
-                    candidate
-                    for candidate in candidates
-                    if remaining.get(candidate.topic_key, 0) > 0
-                    and candidate.semantic_key() not in recent_topics
-                    and self._candidate_family(candidate) not in recent_families
-                ]
-            if not eligible:
-                eligible = [
-                    candidate
-                    for candidate in candidates
-                    if remaining.get(candidate.topic_key, 0) > 0
-                    and candidate.semantic_key() not in recent_topics
-                ]
-            if not eligible:
-                eligible = [candidate for candidate in candidates if remaining.get(candidate.topic_key, 0) > 0]
+        if slots <= 0 or not candidates:
+            return ()
+        selected: list[AmbientDisplayImpulseCandidate] = []
+        remaining = list(candidates)
+        diversity_pressure = self._diversity_pressure(
+            candidates,
+            feedback_signal=feedback_signal,
+        )
+        targets = self._coverage_targets(candidates, slots=slots)
+        while remaining and len(selected) < slots:
             candidate = max(
-                eligible,
+                remaining,
                 key=lambda item: (
-                    remaining[item.topic_key],
-                    self._candidate_weight(item, feedback_signal=feedback_signal)
-                    + self._candidate_axis_spacing_bonus(item, recent_axes=recent_axes),
-                    _stable_fraction(local_day.isoformat(), item.topic_key, len(ordered)),
+                    self._selection_score(
+                        item,
+                        selected=selected,
+                        targets=targets,
+                        local_day=local_day,
+                        topic_gap=topic_gap,
+                        source_gap=source_gap,
+                        family_gap=family_gap,
+                        axis_gap=axis_gap,
+                        diversity_pressure=diversity_pressure,
+                        feedback_signal=feedback_signal,
+                    ),
+                    _stable_fraction(local_day.isoformat(), item.topic_key, "select", len(selected)),
                 ),
             )
-            ordered.append(candidate)
-            remaining[candidate.topic_key] -= 1
-        return tuple(ordered)
+            selected.append(candidate)
+            remaining.remove(candidate)
+        return tuple(selected)
+
+    def _coverage_targets(
+        self,
+        candidates: Sequence[AmbientDisplayImpulseCandidate],
+        *,
+        slots: int,
+    ) -> dict[str, dict[str, int]]:
+        """Estimate intent-aware coverage targets for source/family/axis buckets."""
+
+        weights = {
+            candidate.topic_key: self._candidate_weight(candidate, feedback_signal=None)
+            for candidate in candidates
+        }
+        availability = {
+            "family": Counter(self._candidate_family(candidate) for candidate in candidates),
+            "axis": Counter(self._candidate_axis(candidate) for candidate in candidates),
+            "source": Counter(_normalize_source_key(candidate.source) for candidate in candidates),
+        }
+        bucket_weights: dict[str, defaultdict[str, float]] = {
+            "family": defaultdict(float),
+            "axis": defaultdict(float),
+            "source": defaultdict(float),
+        }
+        for candidate in candidates:
+            weight = weights[candidate.topic_key]
+            bucket_weights["family"][self._candidate_family(candidate)] += weight
+            bucket_weights["axis"][self._candidate_axis(candidate)] += weight
+            bucket_weights["source"][_normalize_source_key(candidate.source)] += weight
+        return {
+            dimension: _largest_remainder_allocation(
+                weights=dict(bucket_weights[dimension]),
+                slots=min(slots, len(bucket_weights[dimension]) + max(0, slots // 3)),
+                availability=dict(availability[dimension]),
+            )
+            for dimension in ("family", "axis", "source")
+        }
+
+    def _selection_score(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        selected: Sequence[AmbientDisplayImpulseCandidate],
+        targets: Mapping[str, Mapping[str, int]],
+        local_day: LocalDate,
+        topic_gap: int,
+        source_gap: int,
+        family_gap: int,
+        axis_gap: int,
+        diversity_pressure: float,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> float:
+        """Score one candidate for the next slot in the unique cycle."""
+
+        base_weight = self._candidate_weight(candidate, feedback_signal=feedback_signal)
+        if not selected:
+            return base_weight + (0.15 * self._coverage_bonus(candidate, selected=selected, targets=targets))
+        recent_topics = tuple(item.semantic_key() for item in selected[-topic_gap:]) if topic_gap > 0 else ()
+        if recent_topics and candidate.semantic_key() in recent_topics:
+            return -1_000_000.0
+        novelty = self._novelty_gain(candidate, selected=selected)
+        coverage = self._coverage_bonus(candidate, selected=selected, targets=targets)
+        recency = self._recency_spacing_score(
+            candidate,
+            selected=selected,
+            source_gap=source_gap,
+            family_gap=family_gap,
+            axis_gap=axis_gap,
+        )
+        position = len(selected)
+        return (
+            base_weight * (1.0 - (0.48 * diversity_pressure))
+            + (1.35 * diversity_pressure * novelty)
+            + (0.78 * diversity_pressure * coverage)
+            + recency
+            + (
+                0.05
+                * self._candidate_axis_spacing_bonus(
+                    candidate,
+                    recent_axes=tuple(self._candidate_axis(item) for item in selected[-axis_gap:]) if axis_gap > 0 else (),
+                )
+            )
+            + (0.02 * _stable_fraction(local_day.isoformat(), candidate.topic_key, "score", position))
+        )
+
+    def _novelty_gain(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        selected: Sequence[AmbientDisplayImpulseCandidate],
+    ) -> float:
+        """Return one whole-list novelty gain for the candidate."""
+
+        if not selected:
+            return 1.0
+        maximum_similarity = max(self._candidate_similarity(candidate, previous) for previous in selected)
+        return max(0.0, 1.0 - maximum_similarity)
+
+    def _candidate_similarity(
+        self,
+        left: AmbientDisplayImpulseCandidate,
+        right: AmbientDisplayImpulseCandidate,
+    ) -> float:
+        """Return one bounded structural similarity between two candidates."""
+
+        similarity = 0.0
+        if left.semantic_key() == right.semantic_key():
+            return 1.0
+        if self._candidate_family(left) == self._candidate_family(right):
+            similarity += 0.44
+        if _normalize_source_key(left.source) == _normalize_source_key(right.source):
+            similarity += 0.24
+        if self._candidate_axis(left) == self._candidate_axis(right):
+            similarity += 0.16
+        if compact_text(left.action, max_len=24).casefold() == compact_text(right.action, max_len=24).casefold():
+            similarity += 0.08
+        if compact_text(left.attention_state, max_len=24).casefold() == compact_text(
+            right.attention_state,
+            max_len=24,
+        ).casefold():
+            similarity += 0.05
+        return max(0.0, min(1.0, similarity))
+
+    def _coverage_bonus(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        selected: Sequence[AmbientDisplayImpulseCandidate],
+        targets: Mapping[str, Mapping[str, int]],
+    ) -> float:
+        """Return one bonus for under-covered semantic buckets."""
+
+        selected_family = Counter(self._candidate_family(item) for item in selected)
+        selected_axis = Counter(self._candidate_axis(item) for item in selected)
+        selected_source = Counter(_normalize_source_key(item.source) for item in selected)
+
+        family = self._candidate_family(candidate)
+        axis = self._candidate_axis(candidate)
+        source = _normalize_source_key(candidate.source)
+
+        family_target = max(0, int(targets.get("family", {}).get(family, 0)))
+        axis_target = max(0, int(targets.get("axis", {}).get(axis, 0)))
+        source_target = max(0, int(targets.get("source", {}).get(source, 0)))
+
+        family_gap = max(0, family_target - selected_family[family])
+        axis_gap_value = max(0, axis_target - selected_axis[axis])
+        source_gap_value = max(0, source_target - selected_source[source])
+
+        return (
+            (0.54 * min(1.0, float(family_gap)))
+            + (0.31 * min(1.0, float(axis_gap_value)))
+            + (0.15 * min(1.0, float(source_gap_value)))
+        )
+
+    def _recency_spacing_score(
+        self,
+        candidate: AmbientDisplayImpulseCandidate,
+        *,
+        selected: Sequence[AmbientDisplayImpulseCandidate],
+        source_gap: int,
+        family_gap: int,
+        axis_gap: int,
+    ) -> float:
+        """Return one soft spacing score against the recent local context."""
+
+        score = 0.0
+        if source_gap > 0:
+            recent_sources = tuple(_normalize_source_key(item.source) for item in selected[-source_gap:])
+            candidate_source = _normalize_source_key(candidate.source)
+            if candidate_source in recent_sources:
+                score -= 0.42
+            else:
+                score += 0.06
+        if family_gap > 0:
+            recent_families = tuple(self._candidate_family(item) for item in selected[-family_gap:])
+            candidate_family = self._candidate_family(candidate)
+            if candidate_family in recent_families:
+                score -= 0.34
+            else:
+                score += 0.07
+        if axis_gap > 0:
+            recent_axes = tuple(self._candidate_axis(item) for item in selected[-axis_gap:])
+            candidate_axis = self._candidate_axis(candidate)
+            if candidate_axis in recent_axes:
+                score -= 0.15
+            else:
+                score += 0.04
+        return score
+
+    def _diversity_pressure(
+        self,
+        candidates: Sequence[AmbientDisplayImpulseCandidate],
+        *,
+        feedback_signal: DisplayReserveBusFeedbackSignal | None,
+    ) -> float:
+        """Return the adaptive quality/diversity trade-off for the current day."""
+
+        pressure = _bounded_seconds(
+            _DEFAULT_DIVERSITY_PRESSURE,
+            default=_DEFAULT_DIVERSITY_PRESSURE,
+            minimum=_MIN_DIVERSITY_PRESSURE,
+            maximum=_MAX_DIVERSITY_PRESSURE,
+        )
+        if not candidates:
+            return pressure
+        family_counts = Counter(self._candidate_family(candidate) for candidate in candidates)
+        axis_counts = Counter(self._candidate_axis(candidate) for candidate in candidates)
+        source_counts = Counter(_normalize_source_key(candidate.source) for candidate in candidates)
+        total = float(len(candidates))
+        concentration = max(
+            max(family_counts.values(), default=0) / total,
+            max(axis_counts.values(), default=0) / total,
+            max(source_counts.values(), default=0) / total,
+        )
+        pressure += max(0.0, concentration - 0.34) * 0.45
+        if feedback_signal is not None:
+            intensity = max(0.0, min(1.0, float(feedback_signal.intensity)))
+            if feedback_signal.reaction in {"avoided", "cooled", "ignored"}:
+                pressure += 0.18 * intensity
+            elif feedback_signal.reaction in {"engaged", "immediate_engagement"}:
+                pressure -= 0.10 * intensity
+        return max(_MIN_DIVERSITY_PRESSURE, min(_MAX_DIVERSITY_PRESSURE, pressure))
 
     def _candidate_family(self, candidate: AmbientDisplayImpulseCandidate) -> str:
         """Return one generic family token for reserve-plan mixing."""
@@ -886,7 +1283,9 @@ class DisplayReserveDayPlanner:
 
         if feedback_signal is None:
             return 0.0
-        if candidate.semantic_key() != feedback_signal.topic_key:
+        candidate_topic_key = compact_text(candidate.semantic_key(), max_len=96).casefold()
+        feedback_topic_key = compact_text(feedback_signal.topic_key, max_len=96).casefold()
+        if not feedback_topic_key or candidate_topic_key != feedback_topic_key:
             return 0.0
         intensity = max(0.0, min(1.0, float(feedback_signal.intensity)))
         if feedback_signal.reaction == "immediate_engagement":
@@ -949,7 +1348,7 @@ class DisplayReserveDayPlanner:
         if not feedback_signal.topic_key:
             return frozenset(retired)
         if feedback_signal.reaction in {"immediate_engagement", "engaged", "cooled", "avoided"}:
-            retired.add(feedback_signal.topic_key)
+            retired.add(compact_text(feedback_signal.topic_key, max_len=96).casefold())
         return frozenset(retired)
 
     def _hold_seconds_for_candidate(

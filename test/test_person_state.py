@@ -79,6 +79,7 @@ class PersonStateTests(unittest.TestCase):
         self.assertTrue(facts["presence_active"])
         self.assertTrue(facts["interaction_ready"])
         self.assertTrue(facts["calm_personalization_allowed"])
+        self.assertTrue(facts["confirmation_required"])
         self.assertFalse(facts["targeted_inference_blocked"])
         self.assertEqual(facts["recommended_channel"], "speech")
 

@@ -9,6 +9,8 @@
 # IMP-1: Added transactional live reload with reconfiguration locking and managed-component rebuilds for stable long-running Pi deployments.
 # IMP-2: Added async speculative cache warmup with bounded join and speculation locking to cut cold-start latency without racing cache state.
 # IMP-3: Exposed dual-lane round budget through config and improved tracing around warmup/reload/failure paths.
+# BUG-5: Re-prewarm the processing feedback media clip after live config reloads so the dragon THINKING cue does
+#        not regress back to a cold-cache tone fallback on the next turn.
 
 """Run the speculative streaming workflow with dual-lane tool orchestration."""
 
@@ -25,6 +27,9 @@ import time
 from typing import Any, Callable
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    pending_conversation_follow_up_hint_scope,
+)
 from twinr.agent.base_agent.contracts import (
     FirstWordProvider,
     FirstWordReply,
@@ -721,6 +726,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 self._schedule_speculative_warmups()
                 raise
             self._schedule_speculative_warmups()
+            self._prewarm_working_feedback_media("processing")
 
     def _build_runtime_tool_schemas(self):
         tool_names = self._runtime_tool_names
@@ -895,20 +901,24 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         timeout_message: str,
         play_initial_beep: bool,
     ) -> bool:
-        return self._streaming_capture.run_audio_turn(
-            StreamingAudioTurnRequest(
-                initial_source=initial_source,
-                follow_up=follow_up,
-                listening_window=listening_window,
-                listen_source=listen_source,
-                proactive_trigger=proactive_trigger,
-                speech_start_chunks=speech_start_chunks,
-                ignore_initial_ms=ignore_initial_ms,
-                timeout_emit_key=timeout_emit_key,
-                timeout_message=timeout_message,
-                play_initial_beep=play_initial_beep,
+        with pending_conversation_follow_up_hint_scope(
+            self.runtime,
+            active=listen_source == "follow_up",
+        ):
+            return self._streaming_capture.run_audio_turn(
+                StreamingAudioTurnRequest(
+                    initial_source=initial_source,
+                    follow_up=follow_up,
+                    listening_window=listening_window,
+                    listen_source=listen_source,
+                    proactive_trigger=proactive_trigger,
+                    speech_start_chunks=speech_start_chunks,
+                    ignore_initial_ms=ignore_initial_ms,
+                    timeout_emit_key=timeout_emit_key,
+                    timeout_message=timeout_message,
+                    play_initial_beep=play_initial_beep,
+                )
             )
-        )
 
     def _run_single_text_turn(
         self,
@@ -937,15 +947,19 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         )
         self._emit_status(force=True)
         try:
-            result = self._complete_streaming_turn(
-                transcript=transcript,
-                listen_source=listen_source,
-                proactive_trigger=proactive_trigger,
-                turn_started=turn_started,
-                capture_ms=0,
-                stt_ms=0,
-                allow_follow_up_rearm=allow_remote_follow_up_rearm,
-            )
+            with pending_conversation_follow_up_hint_scope(
+                self.runtime,
+                active=listen_source == "follow_up",
+            ):
+                result = self._complete_streaming_turn(
+                    transcript=transcript,
+                    listen_source=listen_source,
+                    proactive_trigger=proactive_trigger,
+                    turn_started=turn_started,
+                    capture_ms=0,
+                    stt_ms=0,
+                    allow_follow_up_rearm=allow_remote_follow_up_rearm,
+                )
         except Exception as exc:
             self._trace_event(
                 "streaming_text_turn_failed",

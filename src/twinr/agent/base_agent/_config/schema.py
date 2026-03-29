@@ -365,6 +365,8 @@ class TwinrConfig:
     proactive_governor_window_s: float = 20.0 * 60.0
     proactive_governor_window_prompt_limit: int = 4
     proactive_governor_presence_session_prompt_limit: int = 2
+    proactive_governor_presence_session_window_s: float = 0.0
+    proactive_governor_presence_grace_s: float = 0.0
     proactive_governor_source_repeat_cooldown_s: float = 10.0 * 60.0
     proactive_governor_history_limit: int = 128
     proactive_visual_first_audio_global_cooldown_s: float = 5.0 * 60.0

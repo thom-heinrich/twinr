@@ -283,6 +283,12 @@ def _ambiguous_room_guard(live_facts: Mapping[str, object] | None) -> AmbiguousR
     )
 
 
+def _ambiguous_room_guard_requires_hard_block(reason: object | None) -> bool:
+    from twinr.proactive.runtime.ambiguous_room_guard import ambiguous_room_guard_requires_hard_block
+
+    return ambiguous_room_guard_requires_hard_block(reason)
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermProactivePlanner:
     """Rank bounded proactive candidates for the long-term memory runtime.
@@ -472,7 +478,11 @@ class LongTermProactivePlanner:
         if _has_concerning_body_pose(live_facts):
             return ()
         room_guard = _ambiguous_room_guard(live_facts)
-        if room_guard is not None and room_guard.guard_active:
+        if (
+            room_guard is not None
+            and room_guard.guard_active
+            and _ambiguous_room_guard_requires_hard_block(room_guard.reason)
+        ):
             return ()
         candidates: list[LongTermProactiveCandidateV1] = []
         current_daypart = _daypart_for_datetime(reference)

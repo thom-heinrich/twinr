@@ -44,12 +44,15 @@ class _ProbeAwareFakeRemoteState(_FakeRemoteState):
         snapshot_kind: str,
         local_path=None,
         prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
     ):
-        del local_path
+        del local_path, fast_fail
         self.probe_calls.append(
             {
                 "snapshot_kind": snapshot_kind,
                 "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
             }
         )
         payload = self._payloads[snapshot_kind]
@@ -180,6 +183,7 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         self.assertTrue(result.archive_safe)
         for state in (prompt_state, object_state, graph_state, midterm_state):
             self.assertTrue(all(call["prefer_cached_document_id"] for call in state.probe_calls))
+            self.assertTrue(all(call["prefer_metadata_only"] for call in state.probe_calls))
 
     def test_probe_operational_can_skip_archive_for_steady_state(self) -> None:
         prompt_state = _ProbeAwareFakeRemoteState(

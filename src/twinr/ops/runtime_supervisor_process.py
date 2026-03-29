@@ -1,4 +1,10 @@
-"""Process and timestamp helpers for the runtime supervisor."""
+"""Process and timestamp helpers for the runtime supervisor.
+
+The productive runtime can spawn helper descendants such as ``gpiomon`` that
+must die with the owning streaming child during supervisor restarts. This
+module therefore launches supervisor-owned children in their own sessions and
+prefers signaling that dedicated process group when it is safe to do so.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +37,25 @@ class ProcessHandle(Protocol):
 
     def wait(self, timeout: float | None = None) -> int:
         """Wait for the child process to exit."""
+
+
+def _signal_dedicated_process_group(
+    pid: int,
+    sig: int,
+    *,
+    pid_getpgid,
+    group_signal,
+) -> bool:
+    """Signal one owned process group when the PID leads its own session."""
+
+    try:
+        pgid = int(pid_getpgid(int(pid)))
+    except Exception:
+        return False
+    if pgid <= 0 or pgid != int(pid):
+        return False
+    group_signal(pgid, sig)
+    return True
 
 
 @dataclass(slots=True)
@@ -128,12 +153,16 @@ class PidProcessHandle:
         *,
         pid_alive,
         pid_signal,
+        pid_getpgid=os.getpgid,
+        group_signal=os.killpg,
         monotonic,
         sleep,
     ) -> None:
         self.pid = int(pid)
         self._pid_alive = pid_alive
         self._pid_signal = pid_signal
+        self._pid_getpgid = pid_getpgid
+        self._group_signal = group_signal
         self._monotonic = monotonic
         self._sleep = sleep
 
@@ -141,10 +170,22 @@ class PidProcessHandle:
         return None if self._pid_alive(self.pid) else 0
 
     def terminate(self) -> None:
-        self._pid_signal(self.pid, signal.SIGTERM)
+        if not _signal_dedicated_process_group(
+            self.pid,
+            signal.SIGTERM,
+            pid_getpgid=self._pid_getpgid,
+            group_signal=self._group_signal,
+        ):
+            self._pid_signal(self.pid, signal.SIGTERM)
 
     def kill(self) -> None:
-        self._pid_signal(self.pid, signal.SIGKILL)
+        if not _signal_dedicated_process_group(
+            self.pid,
+            signal.SIGKILL,
+            pid_getpgid=self._pid_getpgid,
+            group_signal=self._group_signal,
+        ):
+            self._pid_signal(self.pid, signal.SIGKILL)
 
     def wait(self, timeout: float | None = None) -> int:
         deadline = None if timeout is None else self._monotonic() + max(0.0, float(timeout))
@@ -155,23 +196,70 @@ class PidProcessHandle:
         return 0
 
 
+class SessionPopenProcessHandle:
+    """Wrap one supervisor-owned ``Popen`` child with group-aware signals."""
+
+    def __init__(
+        self,
+        process: subprocess.Popen[object],
+        *,
+        pid_getpgid=os.getpgid,
+        group_signal=os.killpg,
+    ) -> None:
+        self._process = process
+        self.pid = int(process.pid)
+        self._pid_getpgid = pid_getpgid
+        self._group_signal = group_signal
+
+    def poll(self) -> int | None:
+        return self._process.poll()
+
+    def terminate(self) -> None:
+        if not _signal_dedicated_process_group(
+            self.pid,
+            signal.SIGTERM,
+            pid_getpgid=self._pid_getpgid,
+            group_signal=self._group_signal,
+        ):
+            self._process.terminate()
+
+    def kill(self) -> None:
+        if not _signal_dedicated_process_group(
+            self.pid,
+            signal.SIGKILL,
+            pid_getpgid=self._pid_getpgid,
+            group_signal=self._group_signal,
+        ):
+            self._process.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return int(self._process.wait(timeout=timeout))
+
+
 def default_process_factory(
     argv: tuple[str, ...],
     *,
     cwd: Path,
     env: dict[str, str],
 ) -> ProcessHandle:
-    """Launch one child process for the supervisor."""
+    """Launch one child process for the supervisor.
 
-    return subprocess.Popen(
+    Each child runs in its own session so the supervisor can later terminate the
+    entire child process group, including helper descendants spawned by the
+    runtime itself.
+    """
+
+    process = subprocess.Popen(
         list(argv),
         cwd=str(cwd),
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
+        start_new_session=True,
         close_fds=True,
     )
+    return SessionPopenProcessHandle(process)
 
 
 def parse_utc_timestamp(value: str | None) -> datetime | None:

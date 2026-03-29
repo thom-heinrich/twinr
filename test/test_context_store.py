@@ -18,11 +18,36 @@ class _FakeRemoteState:
         self.enabled = True
         self.config = SimpleNamespace(long_term_memory_migration_enabled=migration_enabled)
         self.snapshots: dict[str, dict[str, object]] = {}
+        self.probe_calls: list[dict[str, object]] = []
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         del local_path
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        del local_path, fast_fail
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+            }
+        )
+        payload = self.snapshots.get(snapshot_kind)
+        return SimpleNamespace(
+            status="found" if isinstance(payload, dict) else "not_found",
+            payload=dict(payload) if isinstance(payload, dict) else None,
+            detail=None,
+        )
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
@@ -31,6 +56,20 @@ class _FakeRemoteState:
 class _FailingRemoteState(_FakeRemoteState):
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         del local_path
+        raise LongTermRemoteUnavailableError(
+            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
+        )
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        del local_path, prefer_cached_document_id, prefer_metadata_only, fast_fail
         raise LongTermRemoteUnavailableError(
             f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
         )

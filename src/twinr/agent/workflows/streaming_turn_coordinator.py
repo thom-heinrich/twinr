@@ -11,6 +11,9 @@
 #        losing them inside worker threads.
 # BUG-7: Move personality tool-history recording off the foreground turn thread so budget-triggered background
 #        flushes cannot leave Twinr visibly speaking after audio already finished.
+# BUG-8: Keep dual-lane processing feedback behind the bridge/direct speech gate so
+#        auxiliary THINKING audio does not restart the old Pi first-word stutter /
+#        audio-busy failure mode by starting before the first spoken reply.
 # SEC-1: Sanitize and length-bound emitted key=value payloads so model/user-controlled text cannot inject extra
 #        protocol/log lines via CR/LF or other control characters.
 # SEC-2: Bound concurrent deferred closure-evaluation workers to avoid practical thread/resource exhaustion on
@@ -41,7 +44,10 @@ from typing import Callable, Protocol
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.conversation.closure import ConversationClosureEvaluation
+from twinr.agent.base_agent.conversation.closure import (
+    ConversationClosureEvaluation,
+    assistant_expects_immediate_reply,
+)
 from twinr.agent.base_agent.contracts import FirstWordReply
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator
@@ -545,7 +551,10 @@ class _DeferredFollowUpClosureEvaluation:
         )
         if not _FOLLOW_UP_CLOSURE_EVAL_SLOTS.acquire(blocking=False):
             self._evaluation = ConversationClosureEvaluation(
-                error_type="closure_eval_capacity_exhausted"
+                error_type="closure_eval_capacity_exhausted",
+                assistant_expects_reply=assistant_expects_immediate_reply(
+                    self.assistant_response
+                ),
             )
             self._ready.set()
             self.trace_event(
@@ -568,7 +577,12 @@ class _DeferredFollowUpClosureEvaluation:
                         proactive_trigger=self.proactive_trigger,
                     )
                 except Exception as exc:  # pragma: no cover - guarded by realtime runner
-                    evaluation = ConversationClosureEvaluation(error_type=type(exc).__name__)
+                    evaluation = ConversationClosureEvaluation(
+                        error_type=type(exc).__name__,
+                        assistant_expects_reply=assistant_expects_immediate_reply(
+                            self.assistant_response
+                        ),
+                    )
                 self._evaluation = evaluation
                 self._ready.set()
                 self.trace_event(
@@ -596,7 +610,12 @@ class _DeferredFollowUpClosureEvaluation:
             if self._slot_acquired:
                 _FOLLOW_UP_CLOSURE_EVAL_SLOTS.release()
                 self._slot_acquired = False
-            self._evaluation = ConversationClosureEvaluation(error_type=type(exc).__name__)
+            self._evaluation = ConversationClosureEvaluation(
+                error_type=type(exc).__name__,
+                assistant_expects_reply=assistant_expects_immediate_reply(
+                    self.assistant_response
+                ),
+            )
             self._ready.set()
             self.trace_event(
                 "streaming_follow_up_closure_eval_start_failed",
@@ -630,7 +649,12 @@ class _DeferredFollowUpClosureEvaluation:
                     details={"timeout_s": timeout_s},
                     kpi={"wait_ms": wait_ms},
                 )
-                return ConversationClosureEvaluation(error_type="closure_eval_interrupted")
+                return ConversationClosureEvaluation(
+                    error_type="closure_eval_interrupted",
+                    assistant_expects_reply=assistant_expects_immediate_reply(
+                        self.assistant_response
+                    ),
+                )
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
                 self.trace_event(
@@ -640,9 +664,19 @@ class _DeferredFollowUpClosureEvaluation:
                     details={"timeout_s": timeout_s},
                     kpi={"wait_ms": wait_ms},
                 )
-                return ConversationClosureEvaluation(error_type="closure_eval_timeout")
+                return ConversationClosureEvaluation(
+                    error_type="closure_eval_timeout",
+                    assistant_expects_reply=assistant_expects_immediate_reply(
+                        self.assistant_response
+                    ),
+                )
         wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
-        evaluation = self._evaluation or ConversationClosureEvaluation(error_type="closure_eval_missing")
+        evaluation = self._evaluation or ConversationClosureEvaluation(
+            error_type="closure_eval_missing",
+            assistant_expects_reply=assistant_expects_immediate_reply(
+                self.assistant_response
+            ),
+        )
         self.trace_event(
             "streaming_follow_up_closure_eval_joined",
             kind="metric",

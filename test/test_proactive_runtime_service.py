@@ -468,6 +468,55 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertEqual(service._last_attention_vision_refresh_mode, "perception_stream_shared")
         self.assertEqual(service._last_gesture_vision_refresh_mode, "perception_stream_shared")
 
+    def test_display_refresh_cycle_keeps_gesture_lane_dedicated_when_fast_refresh_exists(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        calls: list[str] = []
+        shared_snapshot = ProactiveVisionSnapshot(
+            observation=SocialVisionObservation(person_visible=True),
+            response_text="shared",
+        )
+        gesture_snapshot = ProactiveVisionSnapshot(
+            observation=SocialVisionObservation(
+                hand_or_object_near_camera=True,
+                fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+            ),
+            response_text="gesture_fast",
+        )
+
+        class _VisionObserver:
+            supports_gesture_refresh = True
+
+            def observe_perception_stream(self):
+                del self
+                calls.append("combined")
+                return shared_snapshot
+
+            def observe_gesture(self):
+                del self
+                calls.append("gesture_fast")
+                return gesture_snapshot
+
+        service.vision_observer = _VisionObserver()
+        service._display_perception_cycle = None
+        service._last_attention_vision_refresh_mode = None
+        service._last_gesture_vision_refresh_mode = None
+        service._observe_vision_with_method = lambda observe_fn: observe_fn()
+
+        ProactiveCoordinator._open_display_perception_cycle(
+            service,
+            attention_due=True,
+            gesture_due=True,
+        )
+        attention_snapshot = ProactiveCoordinator._observe_vision_for_attention_refresh(service)
+        gesture_observation_snapshot = ProactiveCoordinator._observe_vision_for_gesture_refresh(service)
+        ProactiveCoordinator._close_display_perception_cycle(service)
+
+        self.assertIs(attention_snapshot, shared_snapshot)
+        self.assertIs(gesture_observation_snapshot, gesture_snapshot)
+        self.assertEqual(calls, ["combined", "gesture_fast"])
+        self.assertEqual(service._last_attention_vision_refresh_mode, "perception_stream_shared")
+        self.assertEqual(service._last_gesture_vision_refresh_mode, "gesture_fast")
+
     def test_record_gesture_debug_tick_keeps_debug_stream_when_observation_has_perception_stream(self) -> None:
         appended: list[dict[str, object]] = []
         faults: list[tuple[str, str]] = []

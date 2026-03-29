@@ -27,6 +27,7 @@ tools.
 - reseed the persisted watchdog bootstrap snapshot when the detached companion adopts or spawns a new external owner PID, so handoff windows do not keep advertising a dead previous process
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
 - supervise the productive Pi streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
+- launch supervisor-owned runtime children in dedicated process groups so restart/stop paths also tear down helper descendants that still own GPIO or other runtime-critical resources
 - adopt an already-running streaming-loop owner after supervisor restarts instead of thrashing new children into singleton-lock failures
 - consume the shared display heartbeat contract so ops health and the runtime supervisor read the same companion-progress semantics the display loop writes
 - keep display-companion degradation visible in ops health without letting a display fault tear down the speech path
@@ -66,7 +67,7 @@ tools.
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment |
 | [runtime_scope.py](./runtime_scope.py) | Build scoped runtime configs so auxiliary loops do not overwrite the primary display/runtime snapshot |
 | [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, and leave display degradation to ops health instead of recycling the speech path |
-| [runtime_supervisor_process.py](./runtime_supervisor_process.py) | Internal child-process, timestamp, and runtime-env helpers kept separate from supervisor orchestration |
+| [runtime_supervisor_process.py](./runtime_supervisor_process.py) | Internal child-process, timestamp, and runtime-env helpers kept separate from supervisor orchestration, including dedicated child process-group handling for restart-safe teardown |
 | [pi_repo_mirror.py](./pi_repo_mirror.py) | One-way repo mirror watchdog that keeps `/twinr` aligned with the authoritative leading repo without deleting Pi-local runtime state |
 | [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: mirror code, sync the authoritative runtime `.env`, refresh the editable install, restart the base services plus any repo-backed Pi runtime units already enabled on the host, support first rollout of disabled optional Pi units, and verify restart health |
 | [pi_runtime_deploy_remote.py](./pi_runtime_deploy_remote.py) | Internal SSH/SCP/service-state helper layer kept separate from deploy phase orchestration |

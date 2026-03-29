@@ -32,6 +32,9 @@ from typing import Any, Callable, cast
 
 from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow
 from twinr.agent.base_agent.conversation.decision_core import normalize_turn_text
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    pending_conversation_follow_up_hint_scope,
+)
 from twinr.agent.base_agent.contracts import StreamingSpeechToTextProvider
 from twinr.agent.workflows.listen_timeout_diagnostics import (
     diagnostics_from_exception,
@@ -388,23 +391,27 @@ class TwinrRealtimeTurnExecutionMixin:
                 return False
             capture_ms = int((time.monotonic() - capture_started) * 1000)
             realtime_started = time.monotonic()
-            return self._complete_realtime_turn(
-                transcript_seed=committed.transcript,
-                turn_label=None,
-                initial_source=initial_source,
-                listen_source=listen_source,
-                proactive_trigger=proactive_trigger,
-                turn_started=turn_started,
-                capture_ms=capture_ms,
-                stt_ms=-1,
-                turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
-                    committed.transcript,
-                    conversation=self._conversation_context_for_turn_label(None),
-                    on_audio_chunk=on_audio_chunk,
-                    on_output_text_delta=on_output_text_delta,
-                ),
-                realtime_started=realtime_started,
-            )
+            with pending_conversation_follow_up_hint_scope(
+                self.runtime,
+                active=listen_source == "follow_up",
+            ):
+                return self._complete_realtime_turn(
+                    transcript_seed=committed.transcript,
+                    turn_label=None,
+                    initial_source=initial_source,
+                    listen_source=listen_source,
+                    proactive_trigger=proactive_trigger,
+                    turn_started=turn_started,
+                    capture_ms=capture_ms,
+                    stt_ms=-1,
+                    turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
+                        committed.transcript,
+                        conversation=self._conversation_context_for_turn_label(None),
+                        on_audio_chunk=on_audio_chunk,
+                        on_output_text_delta=on_output_text_delta,
+                    ),
+                    realtime_started=realtime_started,
+                )
         self._notify_voice_orchestrator_state(
             "listening",
             detail=listen_source,
@@ -488,23 +495,27 @@ class TwinrRealtimeTurnExecutionMixin:
         if turn_label:
             self.emit(f"turn_controller_selected_label={turn_label}")
         try:
-            return self._complete_realtime_turn(
-                transcript_seed=transcript_seed.strip() or "[voice input]",
-                turn_label=turn_label,
-                initial_source=initial_source,
-                listen_source=listen_source,
-                proactive_trigger=proactive_trigger,
-                turn_started=turn_started,
-                capture_ms=capture_ms,
-                stt_ms=stt_ms,
-                turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_audio_turn(
-                    audio_pcm,
-                    conversation=self._conversation_context_for_turn_label(turn_label),
-                    on_audio_chunk=on_audio_chunk,
-                    on_output_text_delta=on_output_text_delta,
-                ),
-                realtime_started=realtime_started,
-            )
+            with pending_conversation_follow_up_hint_scope(
+                self.runtime,
+                active=listen_source == "follow_up",
+            ):
+                return self._complete_realtime_turn(
+                    transcript_seed=transcript_seed.strip() or "[voice input]",
+                    turn_label=turn_label,
+                    initial_source=initial_source,
+                    listen_source=listen_source,
+                    proactive_trigger=proactive_trigger,
+                    turn_started=turn_started,
+                    capture_ms=capture_ms,
+                    stt_ms=stt_ms,
+                    turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_audio_turn(
+                        audio_pcm,
+                        conversation=self._conversation_context_for_turn_label(turn_label),
+                        on_audio_chunk=on_audio_chunk,
+                        on_output_text_delta=on_output_text_delta,
+                    ),
+                    realtime_started=realtime_started,
+                )
         finally:
             self._current_turn_audio_pcm = None
             self._current_turn_audio_sample_rate = None
@@ -524,23 +535,27 @@ class TwinrRealtimeTurnExecutionMixin:
         self._emit_status(force=True)
         self._notify_voice_orchestrator_state("thinking", detail=listen_source)
         realtime_started = time.monotonic()
-        return self._complete_realtime_turn(
-            transcript_seed=transcript,
-            turn_label=None,
-            initial_source=listen_source,
-            listen_source=listen_source,
-            proactive_trigger=proactive_trigger,
-            turn_started=turn_started,
-            capture_ms=0,
-            stt_ms=-1,
-            turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
-                transcript,
-                conversation=self._conversation_context_for_turn_label(None),
-                on_audio_chunk=on_audio_chunk,
-                on_output_text_delta=on_output_text_delta,
-            ),
-            realtime_started=realtime_started,
-        )
+        with pending_conversation_follow_up_hint_scope(
+            self.runtime,
+            active=listen_source == "follow_up",
+        ):
+            return self._complete_realtime_turn(
+                transcript_seed=transcript,
+                turn_label=None,
+                initial_source=listen_source,
+                listen_source=listen_source,
+                proactive_trigger=proactive_trigger,
+                turn_started=turn_started,
+                capture_ms=0,
+                stt_ms=-1,
+                turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
+                    transcript,
+                    conversation=self._conversation_context_for_turn_label(None),
+                    on_audio_chunk=on_audio_chunk,
+                    on_output_text_delta=on_output_text_delta,
+                ),
+                realtime_started=realtime_started,
+            )
 
     def _begin_text_turn_listening(
         self,

@@ -14,6 +14,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    pending_conversation_follow_up_hint_scope,
+    remember_pending_conversation_follow_up_hint,
+)
 from twinr.agent.base_agent.runtime import snapshot as runtime_snapshot_module
 from twinr.agent.base_agent.runtime.display_grounding import (
     _config_cache_key,
@@ -692,6 +696,31 @@ class RuntimeContextTests(unittest.TestCase):
                     any("Twinr memory summary:" in message for message in system_messages)
                 )
                 self.assertIn(("user", "Bitte sei kurz ruhig."), context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_follow_up_carryover_injection_emits_runtime_trace_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            traces: list[tuple[str, dict[str, object]]] = []
+            runtime._trace_event = lambda msg, **kwargs: traces.append((msg, kwargs))  # type: ignore[attr-defined]
+            try:
+                remember_pending_conversation_follow_up_hint(
+                    runtime,
+                    summary="Recent turns: user=wie spaet ist es in New York; assistant=In New York ist es gerade 10:53 Uhr.",
+                )
+                with pending_conversation_follow_up_hint_scope(runtime, active=True):
+                    runtime.search_provider_conversation_context()
+
+                self.assertTrue(traces)
+                message, payload = traces[-1]
+                self.assertEqual(message, "provider_context_follow_up_carryover_injected")
+                self.assertEqual(payload["kind"], "workflow")
+                self.assertEqual(
+                    payload["details"]["context_builder"],
+                    "search_provider_conversation_context",
+                )
+                self.assertTrue(payload["details"]["summary"]["present"])
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

@@ -1,3 +1,20 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: _round_optional_seconds/_round_optional_ratio could emit NaN/Inf or raise on malformed values,
+#        which can poison JSON/OTel exporters and silently drop ops events; both now fail safe to None.
+# BUG-2: _respeaker_capture_probe_duration_ms claimed to be short and bounded but could block startup for
+#        arbitrarily long windows on bad config; it now uses safe parsing and a hard upper bound.
+# BUG-3: _normalize_text_tuple crashed on scalar non-iterables (for example misconfigured numeric/env-backed
+#        values); it now accepts singleton scalars and normalizes them safely.
+# SEC-1: _append_ops_event forwarded arbitrary nested objects/strings directly into ops persistence, creating
+#        practical log/parser-poisoning and memory-amplification risk from config/device/error text; payloads
+#        are now recursively copied into bounded JSON-safe primitives before persistence.
+# IMP-1: _safe_emit now rate-limits sink-failure warnings so a broken telemetry sink cannot trigger a Pi-wide
+#        log storm and CPU churn during hot loops.
+# IMP-2: shared-capture Linux backends (PipeWire / ALSA dsnoop / Pulse compatibility) are now treated as
+#        non-conflicting when both paths intentionally use a multiplexing capture source.
+# IMP-3: project-root discovery now searches sentinel files before falling back, avoiding brittle import-time
+#        failures from fixed parent-depth assumptions while staying drop-in compatible.
+
 """Compatibility helpers for the proactive runtime service refactor.
 
 Purpose: keep stable helper functions, constants, and telemetry formatting in a
@@ -10,10 +27,13 @@ semantics must stay identical to the legacy implementation.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable
 import logging
 import math
+import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import (
@@ -33,9 +53,147 @@ _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
 _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES = frozenset({"error"})
 _ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S = 2.0
-_DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_PROJECT_ROOT_SENTINELS = (
+    "pyproject.toml",
+    ".git",
+    "setup.cfg",
+    "setup.py",
+    "README.md",
+)
+_DEFAULT_PROJECT_ROOT_FALLBACK_DEPTH = 4
+_EMIT_SINK_FAILURE_LOG_INTERVAL_S = 30.0
+_MAX_EMIT_FAILURE_LINE_CHARS = 160
+_OPS_EVENT_MESSAGE_MAX_CHARS = 512
+_OPS_EVENT_STRING_MAX_CHARS = 512
+_OPS_EVENT_MAX_CONTAINER_ITEMS = 64
+_OPS_EVENT_MAX_DEPTH = 6
+_RESPEAKER_CAPTURE_PROBE_MIN_MS = 250
+_RESPEAKER_CAPTURE_PROBE_MAX_MS = 2000
+_DEFAULT_PROJECT_ROOT = None  # populated below after helper definitions
 
 _LOGGER = logging.getLogger("twinr.proactive.runtime.service")
+_EMIT_SINK_FAILURE_STATE_LOCK = Lock()
+_EMIT_SINK_FAILURE_STATE = {
+    "last_warning_monotonic": 0.0,
+    "suppressed_count": 0,
+}
+
+
+JSONScalar = None | bool | int | float | str
+JSONValue = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
+
+
+def _collapse_whitespace(value: object, *, limit: int | None = None) -> str:
+    """Return one printable single-line representation with optional truncation."""
+
+    text = " ".join(str(value).split())
+    if not text:
+        text = "none"
+    if limit is not None and limit >= 0 and len(text) > limit:
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _discover_project_root(anchor: Path) -> Path:
+    """Discover the repository/project root without assuming a fixed depth."""
+
+    resolved = anchor.resolve()
+    for candidate in resolved.parents:
+        for sentinel in _PROJECT_ROOT_SENTINELS:
+            if (candidate / sentinel).exists():
+                return candidate
+    parents = resolved.parents
+    if not parents:
+        return resolved.parent
+    fallback_index = min(_DEFAULT_PROJECT_ROOT_FALLBACK_DEPTH, len(parents) - 1)
+    return parents[fallback_index]
+
+
+_DEFAULT_PROJECT_ROOT = _discover_project_root(Path(__file__))
+
+
+def _coerce_int(value: object, *, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Parse one int-like config value with bounds and a safe fallback."""
+
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if minimum is not None and parsed < minimum:
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+    return parsed
+
+
+def _finite_float_or_none(value: object | None) -> float | None:
+    """Convert a numeric-like value to a finite float or return ``None``."""
+
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _ops_json_safe(value: object, *, depth: int = 0) -> JSONValue:
+    """Convert arbitrary event payload data into bounded JSON-safe primitives."""
+
+    if depth >= _OPS_EVENT_MAX_DEPTH:
+        return _collapse_whitespace(value, limit=_OPS_EVENT_STRING_MAX_CHARS)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return _collapse_whitespace(value, limit=16)
+        return value
+    if isinstance(value, (str, Path)):
+        return _collapse_whitespace(value, limit=_OPS_EVENT_STRING_MAX_CHARS)
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8", errors="replace")
+        except Exception:
+            decoded = repr(value)
+        return _collapse_whitespace(decoded, limit=_OPS_EVENT_STRING_MAX_CHARS)
+    if isinstance(value, Mapping):
+        safe_items: dict[str, JSONValue] = {}
+        for index, (raw_key, raw_value) in enumerate(value.items()):
+            if index >= _OPS_EVENT_MAX_CONTAINER_ITEMS:
+                safe_items["_truncated"] = True
+                safe_items["_truncated_count"] = len(value) - _OPS_EVENT_MAX_CONTAINER_ITEMS
+                break
+            safe_key = _collapse_whitespace(raw_key, limit=64)
+            safe_items[safe_key] = _ops_json_safe(raw_value, depth=depth + 1)
+        return safe_items
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        safe_values: list[JSONValue] = []
+        for index, item in enumerate(value):
+            if index >= _OPS_EVENT_MAX_CONTAINER_ITEMS:
+                safe_values.append("...")
+                break
+            safe_values.append(_ops_json_safe(item, depth=depth + 1))
+        return safe_values
+    return _collapse_whitespace(value, limit=_OPS_EVENT_STRING_MAX_CHARS)
+
+
+def _capture_device_supports_shared_readers(device: str) -> bool:
+    """Return whether the configured capture device is a known multiplexing source."""
+
+    normalized = str(device or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"pipewire", "pulse"}:
+        return True
+    if normalized.startswith("pipewire:") or normalized.startswith("pulse:"):
+        return True
+    tokenized = normalized.replace(",", ":").replace(";", ":").split(":")
+    return any(token in {"pipewire", "pulse", "dsnoop"} for token in tokenized)
 
 
 def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
@@ -46,7 +204,29 @@ def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
     try:
         emit(line)
     except Exception:
-        _LOGGER.warning("Proactive emit sink failed.", exc_info=True)
+        now = time.monotonic()
+        with _EMIT_SINK_FAILURE_STATE_LOCK:
+            last_warning = float(_EMIT_SINK_FAILURE_STATE["last_warning_monotonic"])
+            elapsed = now - last_warning
+            if elapsed < _EMIT_SINK_FAILURE_LOG_INTERVAL_S:
+                _EMIT_SINK_FAILURE_STATE["suppressed_count"] = int(_EMIT_SINK_FAILURE_STATE["suppressed_count"]) + 1
+                return
+            suppressed = int(_EMIT_SINK_FAILURE_STATE["suppressed_count"])
+            _EMIT_SINK_FAILURE_STATE["last_warning_monotonic"] = now
+            _EMIT_SINK_FAILURE_STATE["suppressed_count"] = 0
+        if suppressed:
+            _LOGGER.warning(
+                "Proactive emit sink failed repeatedly; %s additional failures were suppressed. line=%s",
+                suppressed,
+                _collapse_whitespace(line, limit=_MAX_EMIT_FAILURE_LINE_CHARS),
+                exc_info=True,
+            )
+        else:
+            _LOGGER.warning(
+                "Proactive emit sink failed. line=%s",
+                _collapse_whitespace(line, limit=_MAX_EMIT_FAILURE_LINE_CHARS),
+                exc_info=True,
+            )
         return
 
 
@@ -58,6 +238,8 @@ def _exception_text(error: BaseException | object, *, limit: int = 240) -> str:
     if not text:
         text = "unknown_error"
     if len(text) > limit:
+        if limit <= 3:
+            return text[:limit]
         return f"{text[: limit - 3]}..."
     return text
 
@@ -112,12 +294,12 @@ def _append_ops_event(
     """Append one ops event without letting persistence failures escape."""
 
     kwargs: dict[str, Any] = {
-        "event": event,
-        "message": message,
-        "data": data,
+        "event": _collapse_whitespace(event, limit=96),
+        "message": _collapse_whitespace(message, limit=_OPS_EVENT_MESSAGE_MAX_CHARS),
+        "data": _ops_json_safe(dict(data)),
     }
     if level is not None:
-        kwargs["level"] = level
+        kwargs["level"] = _collapse_whitespace(level, limit=16)
     try:
         runtime.ops_events.append(**kwargs)
     except Exception:
@@ -177,6 +359,11 @@ def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
     voice_device = _voice_orchestrator_capture_device(config)
     if not proactive_device or not voice_device:
         return False
+    if (
+        _capture_device_supports_shared_readers(proactive_device)
+        and _capture_device_supports_shared_readers(voice_device)
+    ):
+        return False
     if capture_device_identity(proactive_device) != capture_device_identity(voice_device):
         return False
     if not require_active_owner:
@@ -201,7 +388,11 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
 
     if values is None:
         return ()
-    if isinstance(values, (str, Path)):
+    if isinstance(values, (str, bytes, bytearray, Path)):
+        values = (values,)
+    elif isinstance(values, Mapping):
+        values = tuple(values.values())
+    elif not isinstance(values, Iterable):
         values = (values,)
     normalized: list[str] = []
     for value in values:
@@ -214,17 +405,19 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
 def _round_optional_seconds(value: float | None) -> float | None:
     """Round one optional duration to milliseconds for ops-safe payloads."""
 
-    if value is None:
+    parsed = _finite_float_or_none(value)
+    if parsed is None:
         return None
-    return round(max(0.0, float(value)), 3)
+    return round(max(0.0, parsed), 3)
 
 
 def _round_optional_ratio(value: float | None) -> float | None:
     """Round one optional bounded ratio or score for ops-safe payloads."""
 
-    if value is None:
+    parsed = _finite_float_or_none(value)
+    if parsed is None:
         return None
-    return round(float(value), 4)
+    return round(parsed, 4)
 
 
 def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None:
@@ -232,15 +425,29 @@ def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None
 
     if version is None:
         return None
-    return ".".join(str(int(part)) for part in version)
+    try:
+        return ".".join(str(int(part)) for part in version)
+    except (TypeError, ValueError, OverflowError):
+        return _collapse_whitespace(version, limit=32)
 
 
 def _respeaker_capture_probe_duration_ms(config: TwinrConfig) -> int:
     """Return a short bounded capture probe window for ReSpeaker startup checks."""
 
-    chunk_ms = max(20, int(getattr(config, "audio_chunk_ms", 100) or 100))
-    requested_ms = max(chunk_ms, int(getattr(config, "proactive_audio_sample_ms", chunk_ms) or chunk_ms))
-    return min(requested_ms, max(250, chunk_ms * 3))
+    chunk_ms = _coerce_int(
+        getattr(config, "audio_chunk_ms", 100),
+        default=100,
+        minimum=20,
+        maximum=_RESPEAKER_CAPTURE_PROBE_MAX_MS,
+    )
+    requested_ms = _coerce_int(
+        getattr(config, "proactive_audio_sample_ms", chunk_ms),
+        default=chunk_ms,
+        minimum=chunk_ms,
+        maximum=_RESPEAKER_CAPTURE_PROBE_MAX_MS,
+    )
+    bounded_ms = min(requested_ms, max(_RESPEAKER_CAPTURE_PROBE_MIN_MS, chunk_ms * 3))
+    return max(_RESPEAKER_CAPTURE_PROBE_MIN_MS, min(bounded_ms, _RESPEAKER_CAPTURE_PROBE_MAX_MS))
 
 
 def _display_attention_refresh_allowed_runtime_status(runtime_status_value: object) -> bool:
@@ -378,7 +585,7 @@ def _assistant_output_active(runtime: TwinrRuntime) -> bool:
     """Return whether Twinr is actively speaking right now."""
 
     try:
-        return getattr(runtime.status, "value", None) == "answering"
+        return str(getattr(runtime.status, "value", "")).strip().lower() == "answering"
     except Exception:
         return False
 

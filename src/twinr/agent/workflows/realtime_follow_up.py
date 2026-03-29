@@ -142,6 +142,13 @@ def _normalize_reason(reason: object) -> str:
     return text
 
 
+def _normalize_follow_up_action(value: object) -> str | None:
+    text = _normalize_reason(value)
+    if text in {"continue", "end"}:
+        return text
+    return None
+
+
 def _coerce_confidence(value: object, *, default: float = 0.0) -> float:
     try:
         confidence = float(value)
@@ -302,6 +309,9 @@ def emit_closure_decision(loop: LoopProtocol, decision: ConversationClosureDecis
     force_close = _read_bool_attr(decision, "force_close", default=close_now)
     confidence = round(_coerce_confidence(getattr(decision, "confidence", 0.0)), 6)
     reason = _normalize_reason(getattr(decision, "reason", ""))
+    follow_up_action = _normalize_follow_up_action(
+        getattr(decision, "follow_up_action", None)
+    )
 
     emitter = getattr(loop, "emit", None)
     if callable(emitter):
@@ -309,6 +319,8 @@ def emit_closure_decision(loop: LoopProtocol, decision: ConversationClosureDecis
             emitter(f"conversation_closure_close_now={str(close_now).lower()}")
             emitter(f"conversation_closure_confidence={confidence:.3f}")
             emitter(f"conversation_closure_reason={reason}")
+            if follow_up_action is not None:
+                emitter(f"conversation_closure_follow_up_action={follow_up_action}")
         except Exception:
             return
 
@@ -324,6 +336,7 @@ def emit_closure_decision(loop: LoopProtocol, decision: ConversationClosureDecis
                     "force_close": force_close,
                     "confidence": confidence,
                     "reason": reason,
+                    "follow_up_action": follow_up_action,
                 },
             )
         except Exception:

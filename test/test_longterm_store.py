@@ -78,6 +78,67 @@ class _FakeRemoteState:
         self.snapshots[snapshot_kind] = dict(payload)
 
 
+class _ProbeOnlyCatalogRemoteState(_FakeRemoteState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.required = True
+        self.load_calls: list[str] = []
+        self.probe_calls: list[dict[str, object]] = []
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        self.load_calls.append(snapshot_kind)
+        return super().load_snapshot(snapshot_kind=snapshot_kind)
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        del local_path
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+                "fast_fail": fast_fail,
+            }
+        )
+        payloads = {
+            "objects": {
+                "schema": "twinr_memory_object_catalog_v3",
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+                "written_at": "2026-03-29T16:00:00+00:00",
+            },
+            "conflicts": {
+                "schema": "twinr_memory_conflict_catalog_v3",
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+                "written_at": "2026-03-29T16:00:00+00:00",
+            },
+            "archive": {
+                "schema": "twinr_memory_archive_catalog_v3",
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+                "written_at": "2026-03-29T16:00:00+00:00",
+            },
+        }
+        return SimpleNamespace(
+            snapshot_kind=snapshot_kind,
+            status="found",
+            detail=None,
+            payload=dict(payloads[snapshot_kind]),
+        )
+
+
 class _ConcurrentEnsureRemoteState(_FakeRemoteState):
     def __init__(self) -> None:
         super().__init__()
@@ -1111,7 +1172,7 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_record_v2"), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_catalog_segment_v1"), 1)
 
-    def test_remote_primary_store_persists_conflicts_into_remote_catalog(self) -> None:
+    def test_remote_primary_store_persists_conflicts_as_raw_snapshot_body(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
             writer_store = LongTermStructuredStore(
@@ -1161,11 +1222,11 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].slot_key, "contact:person:corinna_maier:phone")
-        self.assertEqual(remote_state.snapshots["conflicts"]["schema"], "twinr_memory_conflict_catalog_v3")
-        self.assertEqual(remote_state.snapshots["conflicts"]["items_count"], 1)
-        self.assertEqual(len(remote_state.snapshots["conflicts"]["segments"]), 1)
-        self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_record_v2"), 1)
-        self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_catalog_segment_v1"), 1)
+        self.assertEqual(remote_state.snapshots["conflicts"]["schema"], "twinr_memory_conflict_store")
+        self.assertEqual(remote_state.snapshots["conflicts"]["version"], 1)
+        self.assertEqual(len(remote_state.snapshots["conflicts"]["conflicts"]), 1)
+        self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_record_v2"), 0)
+        self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_catalog_segment_v1"), 0)
 
     def test_remote_read_diagnostics_classify_timeout_backend_and_contract_failures(self) -> None:
         timeout_exc = TimeoutError("retrieve timed out")
@@ -2223,20 +2284,18 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             ensured = store.ensure_remote_snapshots()
 
         self.assertEqual(set(ensured), {"objects", "conflicts", "archive"})
-        self.assertEqual(remote_state.snapshots["conflicts"]["schema"], "twinr_memory_conflict_catalog_v3")
-        self.assertEqual(remote_state.snapshots["archive"]["schema"], "twinr_memory_archive_catalog_v3")
+        self.assertEqual(remote_state.snapshots["conflicts"]["schema"], "twinr_memory_conflict_store")
+        self.assertEqual(remote_state.snapshots["archive"]["schema"], "twinr_memory_archive_store")
         self.assertEqual(remote_state.snapshots["objects"]["schema"], "twinr_memory_object_catalog_v3")
-        self.assertEqual(remote_state.snapshots["conflicts"]["version"], 3)
-        self.assertEqual(remote_state.snapshots["archive"]["version"], 3)
+        self.assertEqual(remote_state.snapshots["conflicts"]["version"], 1)
+        self.assertEqual(remote_state.snapshots["archive"]["version"], 1)
         self.assertEqual(remote_state.snapshots["objects"]["version"], 3)
-        self.assertEqual(remote_state.snapshots["conflicts"]["items_count"], 0)
-        self.assertEqual(remote_state.snapshots["archive"]["items_count"], 0)
+        self.assertEqual(remote_state.snapshots["conflicts"]["conflicts"], [])
+        self.assertEqual(remote_state.snapshots["archive"]["objects"], [])
         self.assertEqual(remote_state.snapshots["objects"]["items_count"], 0)
-        self.assertEqual(remote_state.snapshots["conflicts"]["segments"], [])
-        self.assertEqual(remote_state.snapshots["archive"]["segments"], [])
         self.assertEqual(remote_state.snapshots["objects"]["segments"], [])
-        self.assertIn("written_at", remote_state.snapshots["conflicts"])
-        self.assertIn("written_at", remote_state.snapshots["archive"])
+        self.assertNotIn("written_at", remote_state.snapshots["conflicts"])
+        self.assertNotIn("written_at", remote_state.snapshots["archive"])
         self.assertIn("written_at", remote_state.snapshots["objects"])
 
     def test_ensure_remote_snapshots_bootstraps_empty_remote_documents_for_fresh_required_namespace(self) -> None:
@@ -2251,6 +2310,10 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(remote_state.snapshots["objects"]["schema"], "twinr_memory_object_catalog_v3")
         self.assertEqual(remote_state.snapshots["objects"]["items_count"], 0)
         self.assertEqual(remote_state.snapshots["objects"]["segments"], [])
+        self.assertEqual(remote_state.snapshots["conflicts"]["schema"], "twinr_memory_conflict_store")
+        self.assertEqual(remote_state.snapshots["conflicts"]["conflicts"], [])
+        self.assertEqual(remote_state.snapshots["archive"]["schema"], "twinr_memory_archive_store")
+        self.assertEqual(remote_state.snapshots["archive"]["objects"], [])
         self.assertFalse(store.objects_path.exists())
 
     def test_ensure_remote_snapshots_serializes_required_remote_reads(self) -> None:
@@ -2267,6 +2330,24 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(set(ensured), {"objects", "conflicts", "archive"})
         self.assertEqual(collapsed_load_calls, ["objects", "conflicts", "archive"])
         self.assertEqual(remote_state.max_concurrent_loads, 1)
+
+    def test_ensure_remote_snapshots_skips_catalog_hydration_when_probe_already_proves_remote_heads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _ProbeOnlyCatalogRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+
+            ensured = store.ensure_remote_snapshots()
+
+        self.assertEqual(ensured, ())
+        self.assertEqual(remote_state.load_calls, [])
+        self.assertEqual(
+            remote_state.probe_calls,
+            [
+                {"snapshot_kind": "objects", "prefer_cached_document_id": True, "prefer_metadata_only": True, "fast_fail": True},
+                {"snapshot_kind": "conflicts", "prefer_cached_document_id": True, "prefer_metadata_only": True, "fast_fail": True},
+                {"snapshot_kind": "archive", "prefer_cached_document_id": True, "prefer_metadata_only": True, "fast_fail": True},
+            ],
+        )
 
     def test_ensure_remote_snapshots_still_fails_closed_when_required_remote_write_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

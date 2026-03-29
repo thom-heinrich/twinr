@@ -6,6 +6,8 @@
 # SEC-1: Harden emitted error redaction to avoid leaking API keys, bearer tokens, signed URLs, or passwords.
 # IMP-1: Add cooperative TTS stream cancellation hooks and Python 3.13+ Queue.shutdown support for deterministic teardown.
 # IMP-2: Add dedicated playback sample-rate selection and an optional structured logger bridge for OTel-style log/trace correlation.
+# BUG-5: Prewarm the default processing media clip outside live turns so the first THINKING cue can reach the
+#        dragon MP3 path without blocking transcript submission.
 """Provide shared support helpers for realtime-style workflow loops."""
 
 from __future__ import annotations
@@ -50,7 +52,11 @@ from twinr.agent.workflows.required_remote_snapshot import (
 from twinr.agent.workflows.voice_identity_runtime import (
     update_household_voice_assessment_from_pcm,
 )
-from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
+from twinr.agent.workflows.working_feedback import (
+    WorkingFeedbackKind,
+    prewarm_working_feedback_media,
+    start_working_feedback_loop,
+)
 from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractError
 from twinr.providers.openai import (
     OpenAIConversationClosureDecisionProvider,
@@ -85,6 +91,7 @@ _DEFAULT_TTS_STREAM_CHUNK_TIMEOUT_SECONDS = 15.0
 _DEFAULT_STOP_JOIN_TIMEOUT_SECONDS = 2.0
 _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS = 5.0
 _DEFAULT_PLAYBACK_SAMPLE_RATE_HZ = 24000
+_DEFAULT_WORKFLOW_TRACE_MIN_SESSION_EVENT_BUDGET = 512
 _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "no speech detected before timeout",
     "no speech detected",
@@ -275,6 +282,26 @@ class TwinrRealtimeSupportMixin:
             fallback = _DEFAULT_PLAYBACK_SAMPLE_RATE_HZ
         return max(8000, fallback)
 
+    def _prewarm_working_feedback_media(self, kind: WorkingFeedbackKind = "processing") -> None:
+        """Best-effort cache warmup for feedback media outside an active turn."""
+
+        try:
+            prewarm_working_feedback_media(
+                kind=kind,
+                config=self.config,
+                player=self.player,
+                playback_coordinator=self._get_playback_coordinator(),
+                emit=self._try_emit,
+            )
+        except Exception as exc:
+            self._try_emit(f"working_feedback_prewarm_error={self._safe_error_text(exc)}")
+            self._trace_event(
+                "working_feedback_prewarm_failed",
+                kind="exception",
+                level="WARN",
+                details={"kind": kind, "error": self._safe_error_text(exc)},
+            )
+
     def _resolve_workflow_logger(self) -> logging.Logger | None:
         for candidate in (
             getattr(self, "workflow_logger", None),
@@ -328,6 +355,84 @@ class TwinrRealtimeSupportMixin:
 
     def _workflow_trace_set_active(self, trace_id: str | None) -> None:
         self._workflow_active_trace_id = trace_id
+
+    def _workflow_trace_min_session_event_budget(self) -> int:
+        """Return the minimum remaining event budget required to start a fresh turn."""
+
+        return _DEFAULT_WORKFLOW_TRACE_MIN_SESSION_EVENT_BUDGET
+
+    def _ensure_workflow_trace_capacity_for_session(
+        self,
+        *,
+        initial_source: str,
+        proactive_trigger: str | None,
+        seed_present: bool,
+    ) -> None:
+        """Rotate the workflow run pack when the current one is exhausted."""
+
+        current = getattr(self, "workflow_forensics", None)
+        if not isinstance(current, WorkflowForensics) or not current.enabled:
+            return
+        remaining_budget = current.remaining_event_budget()
+        if current.can_accept_events() and remaining_budget >= self._workflow_trace_min_session_event_budget():
+            return
+
+        try:
+            replacement = WorkflowForensics.from_env(
+                project_root=Path(getattr(self, "_project_root", Path.cwd())),
+                service=getattr(current, "service", self.__class__.__name__),
+            )
+        except Exception as exc:
+            self._try_emit(
+                f"workflow_forensics_rotate_failed={self._safe_error_text(exc)}"
+            )
+            return
+        if not isinstance(replacement, WorkflowForensics) or not replacement.enabled:
+            try:
+                replacement.close()
+            except Exception:
+                pass
+            self._try_emit("workflow_forensics_rotate_failed=disabled")
+            return
+
+        self.workflow_forensics = replacement
+        voice_orchestrator = getattr(self, "voice_orchestrator", None)
+        if voice_orchestrator is not None:
+            try:
+                voice_orchestrator._forensics = replacement
+            except Exception:
+                pass
+
+        self._trace_event(
+            "workflow_trace_rotated_for_conversation_session",
+            kind="run_start",
+            details={
+                "initial_source": initial_source,
+                "proactive_trigger": proactive_trigger,
+                "seed_present": seed_present,
+                "previous_run_id": getattr(current, "run_id", ""),
+                "previous_remaining_event_budget": remaining_budget,
+                "previous_can_accept_events": current.can_accept_events(),
+                "replacement_run_id": getattr(replacement, "run_id", ""),
+            },
+        )
+
+        Thread(
+            target=self._close_workflow_trace_replacement,
+            args=(current,),
+            daemon=True,
+            name="twinr-workflow-trace-rotate-close",
+        ).start()
+
+    def _close_workflow_trace_replacement(self, tracer: WorkflowForensics) -> None:
+        """Close one replaced workflow tracer off the active turn path."""
+
+        try:
+            tracer.close()
+        except Exception as exc:
+            self._try_emit(
+                f"workflow_forensics_close_failed={self._safe_error_text(exc)}"
+            )
 
     def _trace_event(
         self,
@@ -718,6 +823,7 @@ class TwinrRealtimeSupportMixin:
                     self.turn_decision_evaluator = self._build_turn_decision_evaluator(updated_config)
                 if hasattr(self, "conversation_closure_evaluator"):
                     self.conversation_closure_evaluator = self._build_conversation_closure_evaluator(updated_config)
+                self._prewarm_working_feedback_media("processing")
             except Exception as exc:
                 if previous_config is not None:
                     try:

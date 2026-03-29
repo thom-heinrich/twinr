@@ -121,6 +121,27 @@ class _ImmediateLoopingFeedbackPlayer(_FakeFeedbackPlayer):
             self.looped_twice.set()
 
 
+class _PCMUpgradeFeedbackPlayer(_FakeFeedbackPlayer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tone_started = Event()
+        self.media_started = Event()
+        self.chunk_markers: list[bytes] = []
+
+    def play_pcm16_chunks(self, chunks, *, sample_rate: int, channels: int = 1, should_stop=None) -> None:
+        del sample_rate, channels
+        for chunk in chunks:
+            marker = bytes(chunk[:2])
+            self.chunk_markers.append(marker)
+            if marker == b"\x01\x00":
+                self.tone_started.set()
+            if marker == b"\x02\x00":
+                self.media_started.set()
+            if should_stop is not None and should_stop():
+                return
+            time.sleep(0.005)
+
+
 def _constant_pcm16_bytes(*, duration_s: float = 3.0, sample_rate: int = 24000, amplitude: int = 8000) -> bytes:
     pcm_frame = int(amplitude).to_bytes(2, byteorder="little", signed=True)
     return pcm_frame * int(round(sample_rate * duration_s))
@@ -538,3 +559,53 @@ class WorkingFeedbackTests(unittest.TestCase):
                 finally:
                     release_render.set()
                     stop()
+
+    def test_processing_feedback_pcm_fallback_upgrades_to_media_once_prewarm_finishes(self) -> None:
+        player = _PCMUpgradeFeedbackPlayer()
+        render_started = Event()
+        release_render = Event()
+        tone_pcm = b"\x01\x00" * 1200
+        media_wav = _constant_pcm16_wav_bytes(duration_s=0.12, amplitude=2)
+
+        def slow_render(*_args, **_kwargs) -> bytes:
+            render_started.set()
+            release_render.wait(timeout=1.0)
+            return media_wav
+
+        rendered_tone = working_feedback_mod._RenderedToneSequence(
+            sequence=((440, 40),),
+            pcm_bytes=tone_pcm,
+            wav_bytes=_constant_pcm16_wav_bytes(duration_s=0.12, amplitude=1),
+            sample_rate=24000,
+            channels=1,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _write_placeholder_processing_asset(temp_dir)
+            with (
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback.build_rendered_audio_clip_wav_bytes",
+                    side_effect=slow_render,
+                ),
+                mock.patch(
+                    "twinr.agent.workflows.working_feedback._build_default_processing_tone_render",
+                    return_value=rendered_tone,
+                ),
+            ):
+                stop = start_working_feedback_loop(
+                    player,
+                    kind="processing",
+                    sample_rate=24000,
+                    config=TwinrConfig(project_root=temp_dir),
+                    delay_override_ms=0,
+                )
+                try:
+                    self.assertTrue(render_started.wait(timeout=0.3))
+                    self.assertTrue(player.tone_started.wait(timeout=0.3))
+                    release_render.set()
+                    self.assertTrue(player.media_started.wait(timeout=1.0))
+                finally:
+                    stop()
+
+        self.assertIn(b"\x01\x00", player.chunk_markers)
+        self.assertIn(b"\x02\x00", player.chunk_markers)

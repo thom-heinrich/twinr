@@ -149,6 +149,18 @@ def _normalize_optional_text(value: object | None) -> str | None:
     return text or None
 
 
+def _normalize_conversation_follow_up_action(value: object | None) -> str | None:
+    text = _normalize_optional_text(value)
+    if text is None:
+        return None
+    normalized = text.casefold()
+    if normalized in {"continue", "end"}:
+        return normalized
+    raise ValueError(
+        "Conversation follow-up action must be 'continue' or 'end'"
+    )
+
+
 def _validate_probability(name: str, value: float | None) -> float | None:
     if value is None:
         return None
@@ -721,6 +733,9 @@ class ConversationClosureProviderDecision:
         reason: Short provider-supplied reason string.
         matched_topics: Up to two matched steering-topic titles echoed from the
             current turn context.
+        follow_up_action: Explicit assistant follow-up directive. ``continue``
+            keeps the listening window open because the assistant still awaits
+            immediate user input; ``end`` returns the runtime to waiting.
         response_id: Provider response identifier when available.
         request_id: Transport request identifier when available.
         model: Provider model identifier when available.
@@ -731,6 +746,7 @@ class ConversationClosureProviderDecision:
     confidence: float
     reason: str
     matched_topics: tuple[str, ...] = ()
+    follow_up_action: str | None = None
     response_id: str | None = None
     request_id: str | None = None
     model: str | None = None
@@ -747,6 +763,11 @@ class ConversationClosureProviderDecision:
         if len(normalized_topics) > 2:
             raise ValueError("ConversationClosureProviderDecision.matched_topics may contain at most two entries")
         object.__setattr__(self, "matched_topics", normalized_topics)
+        object.__setattr__(
+            self,
+            "follow_up_action",
+            _normalize_conversation_follow_up_action(self.follow_up_action),
+        )
 
 
 @dataclass(frozen=True, slots=True)

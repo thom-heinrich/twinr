@@ -626,13 +626,18 @@ _CONVERSATION_CLOSURE_DECISION_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Short canonical English reason code or phrase.",
         },
+        "follow_up_action": {
+            "type": "string",
+            "enum": ["continue", "end"],
+            "description": "continue when the assistant reply still expects immediate user input right now; end when Twinr should return to waiting after the answer.",
+        },
         "matched_topics": {
             "type": "array",
             "description": "Up to two matched topic titles echoed from the provided steering context.",
             "items": {"type": "string"},
         },
     },
-    "required": ["close_now", "confidence", "reason", "matched_topics"],
+    "required": ["close_now", "confidence", "reason", "follow_up_action", "matched_topics"],
     "additionalProperties": False,
 }
 
@@ -748,6 +753,7 @@ class OpenAIConversationClosureDecisionProvider:
             confidence=float(payload.get("confidence", 0.0) or 0.0),
             reason=_coerce_text(payload.get("reason")),
             matched_topics=_coerce_topic_titles(payload.get("matched_topics")),
+            follow_up_action=_coerce_text(payload.get("follow_up_action")) or None,
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=extract_model_name(response, model),

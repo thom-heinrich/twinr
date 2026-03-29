@@ -12,6 +12,7 @@ from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureDecision,
     StructuredConversationClosureEvaluator,
     ToolCallingConversationClosureEvaluator,
+    assistant_expects_immediate_reply,
 )
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
@@ -28,10 +29,12 @@ class FakeClosureToolAgentProvider:
         config: TwinrConfig,
         *,
         close_now: bool = True,
+        follow_up_action: str = "end",
         matched_topics: tuple[str, ...] = (),
     ) -> None:
         self.config = config
         self.close_now = close_now
+        self.follow_up_action = follow_up_action
         self.matched_topics = matched_topics
         self.calls: list[dict[str, object]] = []
 
@@ -67,11 +70,18 @@ class FakeClosureToolAgentProvider:
                         "close_now": self.close_now,
                         "confidence": 0.93 if self.close_now else 0.22,
                         "reason": "explicit_goodbye" if self.close_now else "still_engaged",
+                        "follow_up_action": self.follow_up_action,
                         "matched_topics": list(self.matched_topics),
                     },
-                    raw_arguments='{"close_now":true,"confidence":0.93,"reason":"explicit_goodbye"}'
-                    if self.close_now
-                    else '{"close_now":false,"confidence":0.22,"reason":"still_engaged"}',
+                    raw_arguments=json.dumps(
+                        {
+                            "close_now": self.close_now,
+                            "confidence": 0.93 if self.close_now else 0.22,
+                            "reason": "explicit_goodbye" if self.close_now else "still_engaged",
+                            "follow_up_action": self.follow_up_action,
+                            "matched_topics": list(self.matched_topics),
+                        }
+                    ),
                 ),
             ),
         )
@@ -131,10 +141,12 @@ class FakeStructuredClosureProvider:
         config: TwinrConfig,
         *,
         close_now: bool = False,
+        follow_up_action: str = "end",
         matched_topics: tuple[str, ...] = (),
     ) -> None:
         self.config = config
         self.close_now = close_now
+        self.follow_up_action = follow_up_action
         self.matched_topics = matched_topics
         self.calls: list[dict[str, object]] = []
 
@@ -159,10 +171,26 @@ class FakeStructuredClosureProvider:
             confidence=0.87 if self.close_now else 0.34,
             reason="explicit_goodbye" if self.close_now else "still_engaged",
             matched_topics=self.matched_topics,
+            follow_up_action=self.follow_up_action,
         )
 
 
 class ConversationClosureEvaluatorTests(unittest.TestCase):
+    def test_assistant_expects_immediate_reply_is_question_gated(self) -> None:
+        self.assertTrue(assistant_expects_immediate_reply("Moechtest du noch etwas wissen?"))
+        self.assertTrue(assistant_expects_immediate_reply("Soll ich das gleich drucken?"))
+        self.assertTrue(
+            assistant_expects_immediate_reply(
+                "Das haengt von der Zeitzone ab. Welche Zeitzone meinst du"
+            )
+        )
+        self.assertFalse(
+            assistant_expects_immediate_reply(
+                "Ich brauche deine Zeitzone oder deinen Ort, um dir die genaue Uhrzeit zu sagen. Wenn du mir das nennst, sage ich dir sofort die aktuelle Zeit."
+            )
+        )
+        self.assertFalse(assistant_expects_immediate_reply("Es ist zehn Uhr."))
+
     def test_evaluator_returns_structured_close_decision(self) -> None:
         config = TwinrConfig(
             openai_api_key="test-key",
@@ -185,6 +213,7 @@ class ConversationClosureEvaluatorTests(unittest.TestCase):
                 close_now=True,
                 confidence=0.93,
                 reason="explicit_goodbye",
+                follow_up_action="end",
             ),
         )
         self.assertEqual(provider.calls[0]["allow_web_search"], False)
@@ -206,6 +235,31 @@ class ConversationClosureEvaluatorTests(unittest.TestCase):
 
         self.assertFalse(decision.close_now)
         self.assertEqual(decision.reason, "still_engaged")
+
+    def test_structured_follow_up_action_can_keep_statement_style_clarification_open(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        provider = FakeStructuredClosureProvider(
+            config,
+            close_now=False,
+            follow_up_action="continue",
+        )
+        evaluator = StructuredConversationClosureEvaluator(config=config, provider=provider)
+
+        decision = evaluator.evaluate(
+            user_transcript="Wie spaet ist es in New York?",
+            assistant_response=(
+                "Ich brauche deine Zeitzone oder deinen Ort, um dir die genaue Uhrzeit zu sagen. "
+                "Wenn du mir das nennst, sage ich dir sofort die aktuelle Zeit."
+            ),
+            request_source="voice_activation",
+        )
+
+        self.assertFalse(decision.close_now)
+        self.assertEqual(decision.follow_up_action, "continue")
 
     def test_evaluator_serializes_turn_steering_and_parses_matched_topics(self) -> None:
         config = TwinrConfig(

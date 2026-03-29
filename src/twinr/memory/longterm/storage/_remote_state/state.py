@@ -63,7 +63,8 @@ from .shared import (
     _utcnow_iso,
 )
 
-_STATUS_PROBE_SENTINEL_URI = "__status_probe__:remote_status"
+_STATUS_PROBE_SENTINEL_DOCUMENT_ID = "00000000-0000-0000-0000-000000000000"
+_STATUS_PROBE_LIVENESS_HTTP_CODES = frozenset({400, 404})
 
 
 class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-methods,no-member
@@ -197,9 +198,12 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
 
         The public ``/v1/external/instance`` route can occasionally stall while the
         normal exact-document read path is already responsive again. In that case,
-        a synthetic missing-document lookup is still sufficient to prove that the
-        remote API, auth, and routing path are alive. The deeper readiness probe
-        still has to prove the real Twinr snapshot namespace afterwards.
+        one synthetic exact-document request is still sufficient to prove that the
+        remote API, auth, and routing path are alive. Current ChonkyDB builds can
+        reject the synthetic selector earlier with ``400`` instead of surfacing a
+        later ``404`` missing-document path; both bounded client responses are
+        acceptable liveness proofs here. The deeper readiness probe still has to
+        prove the real Twinr snapshot namespace afterwards.
         """
 
         if self.read_client is None:
@@ -207,12 +211,12 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         client = self._status_probe_client(self.read_client)
         try:
             client.fetch_full_document(
-                origin_uri=_STATUS_PROBE_SENTINEL_URI,
+                document_id=_STATUS_PROBE_SENTINEL_DOCUMENT_ID,
                 include_content=False,
-                max_content_chars=0,
+                max_content_chars=1,
             )
         except ChonkyDBError as exc:
-            return int(exc.status_code or 0) == 404
+            return int(exc.status_code or 0) in _STATUS_PROBE_LIVENESS_HTTP_CODES
         except Exception:
             return False
         return True
@@ -504,7 +508,7 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         """Return one client tuned for cold `origin_uri` resolution."""
 
         target_timeout_s = self._origin_resolution_bootstrap_timeout_s()
-        if float(client.config.timeout_s) >= target_timeout_s:
+        if math.isclose(float(client.config.timeout_s), target_timeout_s, rel_tol=0.0, abs_tol=1e-9):
             return client
         return client.clone_with_timeout(target_timeout_s)
 
@@ -565,7 +569,7 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         """Return one client tuned for fail-closed remote health probes."""
 
         target_timeout_s = self._status_probe_timeout_s()
-        if float(client.config.timeout_s) >= target_timeout_s:
+        if math.isclose(float(client.config.timeout_s), target_timeout_s, rel_tol=0.0, abs_tol=1e-9):
             return client
         return client.clone_with_timeout(target_timeout_s)
 

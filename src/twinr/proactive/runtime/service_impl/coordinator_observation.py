@@ -8,11 +8,33 @@ Invariants: fact payloads, rising-edge event names, ops-event schemas, and
 display helper calls must remain compatible with the legacy implementation.
 """
 
+# CHANGELOG: 2026-03-29
+# BUG-1: Changed-only observation dedupe now tracks discrete camera/audio health
+#        and snapshot event-data fields that were emitted but not part of the
+#        dedupe key, fixing silent misses for camera outages, person-count
+#        changes, gesture-state changes, and similar operator-visible state.
+# BUG-2: ReSpeaker runtime blocker lifecycle now clears correctly when the
+#        runtime alert code returns to a neutral/None state.
+# BUG-3: Ops-state caches are only advanced after successful event append so a
+#        transient logging/backend failure does not permanently suppress the
+#        next retry for the same state.
+# SEC-1: All externally influenced event strings and nested payload values are
+#        now bounded and control-character neutralized before emit/logging to
+#        prevent log injection and log-flood amplification on edge deployments.
+# IMP-1: Observation keys now use stable numeric normalization to avoid event
+#        churn from float jitter in multimodal confidence fields.
+# IMP-2: Snapshot-key derivation now reuses snapshot event_data() payloads so
+#        new snapshot fields participate in changed-only recording without
+#        manual tuple maintenance in this mixin.
+
 # mypy: ignore-errors
 
 from __future__ import annotations
 
-from typing import Callable, cast
+import math
+import re
+from collections.abc import Mapping, Sequence
+from typing import Any, Callable, cast
 
 from .coordinator_observation_display import ProactiveCoordinatorObservationDisplayMixin
 from .coordinator_observation_facts import ProactiveCoordinatorObservationFactsMixin
@@ -30,11 +52,254 @@ from ..audio_policy import ReSpeakerAudioPolicySnapshot
 from ..runtime_contract import is_respeaker_runtime_hard_block
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_EVENT_TEXT_MAX_LEN = 512
+_EVENT_MESSAGE_MAX_LEN = 256
+_EVENT_EMIT_TOKEN_MAX_LEN = 96
+_EVENT_LIST_MAX_ITEMS = 16
+_EVENT_DICT_MAX_ITEMS = 32
+_EVENT_MAX_DEPTH = 4
+
+
+def _neutralize_log_text(value: str | None, *, max_len: int = _EVENT_TEXT_MAX_LEN) -> str | None:
+    """Return one bounded single-line string safe to emit into operator logs."""
+
+    if value is None:
+        return None
+    normalized = _CONTROL_CHAR_RE.sub(" ", str(value))
+    normalized = " ".join(normalized.split())
+    if len(normalized) <= max_len:
+        return normalized
+    if max_len <= 1:
+        return normalized[:max_len]
+    return normalized[: max_len - 1] + "…"
+
+
+def _stable_number_for_key(value: Any) -> Any:
+    """Return a hash-stable numeric representation for changed-only keys."""
+
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return round(value, 3)
+    return value
+
+
+def _freeze_for_key(value: Any, *, depth: int = 0) -> Any:
+    """Convert nested payloads to a bounded hashable form for dedupe keys."""
+
+    if depth >= _EVENT_MAX_DEPTH:
+        return "max_depth"
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return _stable_number_for_key(value)
+    if isinstance(value, str):
+        return _neutralize_log_text(value, max_len=128)
+    if isinstance(value, Mapping):
+        items = list(value.items())[:_EVENT_DICT_MAX_ITEMS]
+        return tuple(
+            sorted(
+                (
+                    _neutralize_log_text(str(key), max_len=96),
+                    _freeze_for_key(item, depth=depth + 1),
+                )
+                for key, item in items
+            )
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_freeze_for_key(item, depth=depth + 1) for item in list(value)[:_EVENT_LIST_MAX_ITEMS])
+    return _neutralize_log_text(repr(value), max_len=128)
+
+
+def _sanitize_event_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound nested event values before shipping them to logging backends."""
+
+    if depth >= _EVENT_MAX_DEPTH:
+        return _neutralize_log_text("max_depth", max_len=32)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, str):
+        return _neutralize_log_text(value)
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, item in list(value.items())[:_EVENT_DICT_MAX_ITEMS]:
+            safe_key = _neutralize_log_text(str(key), max_len=96)
+            if safe_key is None:
+                continue
+            sanitized[safe_key] = _sanitize_event_value(item, depth=depth + 1)
+        return sanitized
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_sanitize_event_value(item, depth=depth + 1) for item in list(value)[:_EVENT_LIST_MAX_ITEMS]]
+    return _neutralize_log_text(repr(value))
+
+
 class ProactiveCoordinatorObservationMixin(
     ProactiveCoordinatorObservationDisplayMixin,
     ProactiveCoordinatorObservationFactsMixin,
 ):
     """Provide changed-only ops recording plus composed observation helpers."""
+
+    def _emit_safe(self, key: str, value: str | None) -> None:
+        """Emit one bounded operator token without propagating logging junk."""
+
+        safe_value = _neutralize_log_text(value, max_len=_EVENT_EMIT_TOKEN_MAX_LEN) or "unknown"
+        emit = getattr(self, "_emit", None)
+        if not callable(emit):
+            return
+        emit_fn = cast(Callable[[str], None] | None, emit)
+        try:
+            if emit_fn is None:
+                return
+            emit_fn(f"{key}={safe_value}")  # pylint: disable=not-callable
+        except Exception:
+            return
+
+    def _append_ops_event_safe(
+        self,
+        *,
+        event: str,
+        message: str,
+        data: Mapping[str, Any],
+        level: str | None = None,
+    ) -> bool:
+        """Append one ops event with bounded payloads and failure isolation."""
+
+        payload = cast(dict[str, Any], _sanitize_event_value(dict(data)))
+        kwargs: dict[str, Any] = {
+            "event": event,
+            "message": _neutralize_log_text(message, max_len=_EVENT_MESSAGE_MAX_LEN) or message,
+            "data": payload,
+        }
+        if level is not None:
+            kwargs["level"] = level
+        try:
+            self._append_ops_event(**kwargs)
+            return True
+        except Exception as exc:
+            self._emit_safe("ops_event_recording_failed", type(exc).__name__)
+            return False
+
+    def _snapshot_event_key(self, snapshot: Any) -> Any:
+        """Return one hashable representation of snapshot.event_data()."""
+
+        if snapshot is None:
+            return None
+        callback = getattr(snapshot, "event_data", None)
+        if not callable(callback):
+            return None
+        try:
+            return _freeze_for_key(callback())
+        except Exception:
+            return None
+
+    def _normalised_azimuth_key(self, value: Any) -> int | None:
+        """Bucket azimuth readings to suppress jitter-driven event churn."""
+
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return int(round(numeric / 5.0) * 5)
+
+    def _observation_key(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        presence_snapshot: Any,
+        runtime_status_value: str | None,
+    ) -> tuple[Any, ...]:
+        """Return the stable changed-only key for one observation event."""
+
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        top_evaluation = self._safety_trigger_fusion.best_evaluation
+
+        return (
+            inspected,
+            runtime_status_value,
+            observation.pir_motion_detected,
+            observation.low_motion,
+            observation.vision.person_visible,
+            observation.vision.person_count,
+            observation.vision.primary_person_zone.value,
+            observation.vision.looking_toward_device,
+            observation.vision.person_near_device,
+            observation.vision.engaged_with_device,
+            observation.vision.body_pose.value,
+            observation.vision.motion_state.value,
+            observation.vision.smiling,
+            observation.vision.hand_or_object_near_camera,
+            observation.vision.gesture_event.value,
+            observation.vision.fine_hand_gesture.value,
+            observation.vision.camera_online,
+            observation.vision.camera_ready,
+            observation.vision.camera_ai_ready,
+            _neutralize_log_text(observation.vision.camera_error, max_len=128),
+            observation.audio.speech_detected,
+            observation.audio.distress_detected,
+            observation.audio.room_quiet,
+            observation.audio.assistant_output_active,
+            observation.audio.device_runtime_mode,
+            observation.audio.host_control_ready,
+            observation.audio.transport_reason,
+            observation.audio.non_speech_audio_likely,
+            observation.audio.background_media_likely,
+            observation.audio.signal_source,
+            _round_optional_ratio(observation.audio.direction_confidence),
+            observation.audio.speech_overlap_likely,
+            observation.audio.barge_in_detected,
+            observation.audio.mute_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.initiative_block_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code,
+            None if presence_snapshot is None else presence_snapshot.armed,
+            None if presence_snapshot is None else presence_snapshot.reason,
+            presence_session_id,
+            None if presence_snapshot is None else presence_snapshot.presence_audio_active,
+            None if presence_snapshot is None else presence_snapshot.recent_follow_up_speech,
+            None if presence_snapshot is None else presence_snapshot.room_busy_or_overlapping,
+            None if presence_snapshot is None else presence_snapshot.quiet_window_open,
+            None if presence_snapshot is None else presence_snapshot.barge_in_recent,
+            None if presence_snapshot is None else presence_snapshot.speaker_direction_stable,
+            None if presence_snapshot is None else presence_snapshot.mute_blocks_voice_capture,
+            None if presence_snapshot is None else presence_snapshot.resume_window_open,
+            self._snapshot_event_key(self.latest_speaker_association_snapshot),
+            self._snapshot_event_key(self.latest_multimodal_initiative_snapshot),
+            self._snapshot_event_key(self.latest_ambiguous_room_guard_snapshot),
+            self._snapshot_event_key(self.latest_identity_fusion_snapshot),
+            self._snapshot_event_key(self.latest_portrait_match_snapshot),
+            self._snapshot_event_key(self.latest_known_user_hint_snapshot),
+            self._snapshot_event_key(self.latest_affect_proxy_snapshot),
+            self._snapshot_event_key(self.latest_attention_target_snapshot),
+            self._snapshot_event_key(self.latest_person_state_snapshot),
+            None if top_evaluation is None else top_evaluation.trigger_id,
+            None if top_evaluation is None else top_evaluation.passed,
+            None if top_evaluation is None else top_evaluation.blocked_reason,
+        )
 
     def _is_low_motion(self, now: float, *, motion_active: bool) -> bool:
         """Return whether recent PIR history qualifies as low motion."""
@@ -96,85 +361,31 @@ class ProactiveCoordinatorObservationMixin(
         """Append one observation event only when the visible state changed."""
 
         presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
-        observation_key = (
-            inspected,
-            runtime_status_value,
-            observation.pir_motion_detected,
-            observation.low_motion,
-            observation.vision.person_visible,
-            observation.vision.looking_toward_device,
-            observation.vision.body_pose.value,
-            observation.vision.smiling,
-            observation.vision.hand_or_object_near_camera,
-            observation.audio.speech_detected,
-            observation.audio.distress_detected,
-            observation.audio.assistant_output_active,
-            observation.audio.device_runtime_mode,
-            observation.audio.host_control_ready,
-            observation.audio.transport_reason,
-            observation.audio.non_speech_audio_likely,
-            observation.audio.background_media_likely,
-            observation.audio.signal_source,
-            observation.audio.direction_confidence,
-            observation.audio.speech_overlap_likely,
-            observation.audio.barge_in_detected,
-            observation.audio.mute_active,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.initiative_block_reason,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason,
-            None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code,
-            None if presence_snapshot is None else presence_snapshot.armed,
-            None if presence_snapshot is None else presence_snapshot.reason,
-            presence_session_id,
-            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.state,
-            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.associated,
-            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.confidence,
-            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.ready,
-            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.confidence,
-            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.block_reason,
-            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.guard_active,
-            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.reason,
-            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.state,
-            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.matches_main_user,
-            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.claim.confidence,
-            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.state,
-            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.matches_reference_user,
-            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.claim.confidence,
-            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.state,
-            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.matches_main_user,
-            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.claim.confidence,
-            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.state,
-            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.claim.confidence,
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
-            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source,
+        observation_key = self._observation_key(
+            observation,
+            inspected=inspected,
+            audio_policy_snapshot=audio_policy_snapshot,
+            presence_snapshot=presence_snapshot,
+            runtime_status_value=runtime_status_value,
         )
         if observation_key == self._last_observation_key:
             return
         if not inspected and self._last_observation_key is None:
             self._last_observation_key = observation_key
             return
-        self._last_observation_key = observation_key
+
         if audio_policy_snapshot is not None:
             self._record_respeaker_runtime_alert_if_changed(
                 observation.audio,
                 audio_policy_snapshot=audio_policy_snapshot,
             )
+
         indicator_state = self._indicator_state_for_observation(
             observation=observation,
             audio_policy_snapshot=audio_policy_snapshot,
             runtime_status_value=runtime_status_value,
         )
-        data = {
+        data: dict[str, Any] = {
             "inspected": inspected,
             "runtime_status": runtime_status_value,
             "pir_motion_detected": observation.pir_motion_detected,
@@ -315,11 +526,13 @@ class ProactiveCoordinatorObservationMixin(
                 data["top_blocked_reason"] = top_evaluation.blocked_reason
             if top_evaluation.passed and audio_policy_snapshot is not None:
                 data["top_audio_policy_block_reason"] = audio_policy_snapshot.initiative_block_reason
-        self._append_ops_event(
+
+        if self._append_ops_event_safe(
             event="proactive_observation",
             message="Proactive monitor recorded a changed observation.",
             data=data,
-        )
+        ):
+            self._last_observation_key = observation_key
 
     def _indicator_state_for_observation(
         self,
@@ -359,8 +572,7 @@ class ProactiveCoordinatorObservationMixin(
         )
         if key == self._last_presence_key:
             return
-        self._last_presence_key = key
-        self._append_ops_event(
+        if self._append_ops_event_safe(
             event="voice_activation_presence_changed",
             message="Voice-activation presence session changed.",
             data={
@@ -382,7 +594,8 @@ class ProactiveCoordinatorObservationMixin(
                 "device_runtime_mode": snapshot.device_runtime_mode,
                 "transport_reason": snapshot.transport_reason,
             },
-        )
+        ):
+            self._last_presence_key = key
 
     def _record_respeaker_runtime_alert_if_changed(
         self,
@@ -394,14 +607,26 @@ class ProactiveCoordinatorObservationMixin(
 
         alert_code = audio_policy_snapshot.runtime_alert_code
         if alert_code is None:
+            self._last_respeaker_runtime_alert_code = None
+            self._record_respeaker_runtime_blocker_if_changed(
+                alert_code=None,
+                message="ReSpeaker runtime state returned to neutral monitoring.",
+                audio=audio,
+            )
             return
+
         if alert_code == self._last_respeaker_runtime_alert_code:
+            self._record_respeaker_runtime_blocker_if_changed(
+                alert_code=alert_code,
+                message=audio_policy_snapshot.runtime_alert_message or "ReSpeaker runtime state changed.",
+                audio=audio,
+            )
             return
-        self._last_respeaker_runtime_alert_code = alert_code
+
         level = "warning" if alert_code != "ready" else "info"
         message = audio_policy_snapshot.runtime_alert_message or "ReSpeaker runtime state changed."
-        self._emit(f"respeaker_runtime_alert={alert_code}")
-        self._append_ops_event(
+        self._emit_safe("respeaker_runtime_alert", alert_code)
+        if self._append_ops_event_safe(
             event="respeaker_runtime_alert",
             level=level,
             message=message,
@@ -412,7 +637,8 @@ class ProactiveCoordinatorObservationMixin(
                 "transport_reason": audio.transport_reason,
                 "mute_active": audio.mute_active,
             },
-        )
+        ):
+            self._last_respeaker_runtime_alert_code = alert_code
         self._record_respeaker_runtime_blocker_if_changed(
             alert_code=alert_code,
             message=message,
@@ -422,18 +648,17 @@ class ProactiveCoordinatorObservationMixin(
     def _record_respeaker_runtime_blocker_if_changed(
         self,
         *,
-        alert_code: str,
+        alert_code: str | None,
         message: str,
         audio: SocialAudioObservation,
     ) -> None:
         """Emit explicit hard-block lifecycle events for DFU runtime states."""
 
-        if is_respeaker_runtime_hard_block(alert_code):
+        if alert_code is not None and is_respeaker_runtime_hard_block(alert_code):
             if alert_code == self._last_respeaker_runtime_blocker_code:
                 return
-            self._last_respeaker_runtime_blocker_code = alert_code
-            self._emit(f"respeaker_runtime_blocker={alert_code}")
-            self._append_ops_event(
+            self._emit_safe("respeaker_runtime_blocker", alert_code)
+            if self._append_ops_event_safe(
                 event="respeaker_runtime_blocker",
                 level="error",
                 message=message,
@@ -444,15 +669,15 @@ class ProactiveCoordinatorObservationMixin(
                     "transport_reason": audio.transport_reason,
                     "mute_active": audio.mute_active,
                 },
-            )
+            ):
+                self._last_respeaker_runtime_blocker_code = alert_code
             return
 
         if self._last_respeaker_runtime_blocker_code is None:
             return
         cleared_code = self._last_respeaker_runtime_blocker_code
-        self._last_respeaker_runtime_blocker_code = None
-        self._emit(f"respeaker_runtime_blocker_cleared={cleared_code}")
-        self._append_ops_event(
+        self._emit_safe("respeaker_runtime_blocker_cleared", cleared_code)
+        if self._append_ops_event_safe(
             event="respeaker_runtime_blocker_cleared",
             message="ReSpeaker hard runtime blocker cleared and capture is usable again.",
             data={
@@ -461,7 +686,8 @@ class ProactiveCoordinatorObservationMixin(
                 "device_runtime_mode": audio.device_runtime_mode,
                 "host_control_ready": audio.host_control_ready,
             },
-        )
+        ):
+            self._last_respeaker_runtime_blocker_code = None
 
     def _block_respeaker_dead_capture(self, error) -> None:
         """Fail closed on unreadable ReSpeaker capture during live monitoring."""
@@ -490,7 +716,7 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record one proactive trigger that reached dispatch evaluation."""
 
-        data = {
+        data: dict[str, Any] = {
             "trigger": decision.trigger_id,
             "reason": decision.reason,
             "priority": int(decision.priority),
@@ -530,7 +756,7 @@ class ProactiveCoordinatorObservationMixin(
                     "vision_review_model": review.model,
                 }
             )
-        self._append_ops_event(
+        self._append_ops_event_safe(
             event="proactive_trigger_detected",
             message="Proactive trigger conditions were met.",
             data=data,
@@ -544,7 +770,7 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record one buffered vision review result."""
 
-        self._append_ops_event(
+        self._append_ops_event_safe(
             event="proactive_vision_reviewed",
             message="Buffered proactive camera frames were reviewed before speaking.",
             data={
@@ -569,8 +795,8 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record that buffered vision review rejected one trigger."""
 
-        self._emit("social_trigger_skipped=vision_review_rejected")
-        self._append_ops_event(
+        self._emit_safe("social_trigger_skipped", "vision_review_rejected")
+        self._append_ops_event_safe(
             event="social_trigger_skipped",
             message="Social trigger prompt was skipped because buffered frame review rejected it.",
             data={
@@ -596,8 +822,8 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record that buffered vision review was unavailable for one trigger."""
 
-        self._emit("social_trigger_skipped=vision_review_unavailable")
-        self._append_ops_event(
+        self._emit_safe("social_trigger_skipped", "vision_review_unavailable")
+        self._append_ops_event_safe(
             event="social_trigger_skipped",
             message="Social trigger prompt was skipped because buffered frame review was unavailable.",
             data={
@@ -617,6 +843,8 @@ class ProactiveCoordinatorObservationMixin(
     ) -> str | None:
         """Return a presence-session block reason for one trigger if any."""
 
+        if presence_snapshot is None:
+            return None
         session_id = getattr(presence_snapshot, "session_id", None)
         if decision.trigger_id != "possible_fall":
             return None
@@ -637,16 +865,16 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record that a trigger was skipped by per-session suppression."""
 
-        session_id = getattr(presence_snapshot, "session_id", None)
-        self._emit(f"social_trigger_skipped={reason}")
-        self._append_ops_event(
+        session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        self._emit_safe("social_trigger_skipped", reason)
+        self._append_ops_event_safe(
             event="social_trigger_skipped",
             message="Social trigger prompt was skipped because it already fired in the current presence session.",
             data={
                 "trigger": decision.trigger_id,
                 "reason": reason,
                 "presence_session_id": session_id,
-                "presence_reason": presence_snapshot.reason,
+                "presence_reason": None if presence_snapshot is None else presence_snapshot.reason,
                 "priority": int(decision.priority),
                 "score": decision.score,
                 "threshold": decision.threshold,
@@ -679,16 +907,16 @@ class ProactiveCoordinatorObservationMixin(
     ) -> None:
         """Record that a trigger was skipped by conservative ReSpeaker policy hooks."""
 
-        session_id = getattr(presence_snapshot, "session_id", None)
-        self._emit(f"social_trigger_skipped={reason}")
-        self._append_ops_event(
+        session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        self._emit_safe("social_trigger_skipped", reason)
+        self._append_ops_event_safe(
             event="social_trigger_skipped",
             message="Social trigger prompt was skipped by conservative ReSpeaker audio policy.",
             data={
                 "trigger": decision.trigger_id,
                 "reason": reason,
                 "presence_session_id": session_id,
-                "presence_reason": presence_snapshot.reason,
+                "presence_reason": None if presence_snapshot is None else presence_snapshot.reason,
                 "priority": int(decision.priority),
                 "score": decision.score,
                 "threshold": decision.threshold,

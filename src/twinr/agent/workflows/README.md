@@ -15,7 +15,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - keep the yellow print button latency-safe by queuing prints from local short-term context only instead of synchronously rebuilding remote provider context before the print lane starts
 - route beep, feedback, and spoken playback through one priority-aware playback coordinator instead of scattered per-call locks
 - play one bounded startup boot clip from `media/boot.mp3` through the same playback coordinator, trimmed from the calmer middle of the asset and faded so loop startup stays gentle and interruptible
-- render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, keep the quieter/slower loop tuning, and still prewarm the clip asynchronously so cold caches fall back to tones instead of blocking turn startup
+- render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, prewarm that clip during loop startup/reload, and let a short tone fallback upgrade into the cached media path once the render finishes so THINKING does not stay on the synthetic hum for a whole turn
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
 - forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized, but keep that learning work off the user-facing audio-completion path so a slow background flush cannot leave Twinr visibly `speaking` after playback ends
@@ -24,6 +24,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
 - resynchronize runtime-local remote-memory cooldown state after a successful external watchdog attestation so foreground turns do not fail against a stale in-process circuit breaker while the Pi watchdog already proved the namespace healthy
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
+- start the processing cue immediately when a submitted transcript moves the runtime into `processing`, including dual-lane bridge/direct-reply turns, so visible THINKING phases do not sit silent while the lane planner or fast bridge path is still working
 - keep coordinator-backed streamed TTS from preempting the processing cue until the first real speech chunk is ready, so long model/TTS startup gaps do not create dead air after only one or two thinking loops
 - stop processing/search feedback owners before waiting on streamed speech-output close, so feedback cannot keep reacquiring the speaker while the final reply is draining
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
@@ -35,6 +36,8 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - reuse that already-open `listening` state when a same-stream remote follow-up transcript is committed as a seeded text turn, instead of reopening listening and surfacing a false runtime `error`
+- inject one bounded carryover hint into explicit follow-up turns so short repairs like "I meant the time" continue the just-established thread instead of dropping back to a generic local answer
+- emit privacy-safe accountability events for committed follow-up transcripts, carryover-hint build/store decisions, and provider-context carryover injection so live wrong-answer turns can be reconstructed after the fact without logging raw speech
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep the post-playback join against the closure guard bounded so a stalled steering, remote-memory, or closure-provider path cannot leave the runtime stuck in `answering` after speech has ended
 - translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
@@ -97,7 +100,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
 | [remote_transcript_commit.py](./remote_transcript_commit.py) | Bounded wait coordinator for same-stream server transcript commits during live remote listening |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
-| [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions |
+| [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions, including storage of the next-turn carryover hint |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
 | [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
 | [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |
@@ -150,6 +153,24 @@ Set `TWINR_WORKFLOW_TRACE_ENABLED=1` to write a bounded workflow run pack under
 - `run.metrics.json` — aggregated counts and slow spans
 - `run.summary.json` — top messages, failure buckets, and slowest spans
 - `run.repro/` — sanitized runtime and environment snapshot
+
+Before each new conversation session, the active loop also checks whether the
+current run pack still has enough event budget left to capture a real spoken
+turn. If the service-lifetime pack is exhausted or nearly exhausted, the loop
+rotates to a fresh `WorkflowForensics` run and closes the old writer
+asynchronously. That keeps late live turns from disappearing behind background
+noise in a long-running Pi service.
+
+The follow-up path now emits a focused set of privacy-safe accountability
+records in those run packs:
+
+- `voice_orchestrator_transcript_committed_payload`
+- `conversation_follow_up_context_hint_built`
+- `conversation_follow_up_context_hint_update`
+- `provider_context_follow_up_carryover_injected`
+
+Each record is redacted by default and carries only bounded structural details
+such as source, presence, counts, and short hashes.
 
 ## Usage
 

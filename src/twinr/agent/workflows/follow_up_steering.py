@@ -41,17 +41,29 @@ try:
     from twinr.agent.base_agent.conversation.closure import (
         ConversationClosureDecision,
         ConversationClosureEvaluation,
+        assistant_expects_immediate_reply,
     )
 except ImportError:
-    from twinr.agent.base_agent.conversation.closure import ConversationClosureEvaluation
+    from twinr.agent.base_agent.conversation.closure import (
+        ConversationClosureEvaluation,
+        assistant_expects_immediate_reply,
+    )
 
     @dataclass(frozen=True, slots=True)
     class ConversationClosureDecision:
         close_now: bool
         confidence: float
         reason: str
+        follow_up_action: str | None = None
         matched_topics: tuple[str, ...] = ()
 
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    build_follow_up_context_hint,
+    clear_pending_conversation_follow_up_hint,
+    follow_up_context_hint_trace_details,
+    pending_conversation_follow_up_hint_trace_details,
+    remember_pending_conversation_follow_up_hint,
+)
 from twinr.agent.personality.service import PersonalityContextService
 try:
     from twinr.agent.personality.steering import (
@@ -73,6 +85,8 @@ except ImportError:
         return ()
 
 _WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
+_FOLLOW_UP_ACTION_CONTINUE = "continue"
+_FOLLOW_UP_ACTION_END = "end"
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,15 +219,41 @@ class FollowUpSteeringRuntime:
         speaker-selection signals from a real-time voice front-end.
         """
 
+        heuristic_assistant_expects_reply = assistant_expects_immediate_reply(
+            assistant_response
+        )
+        follow_up_context_hint = build_follow_up_context_hint(
+            conversation=self._loop.runtime.conversation_context(),
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+        )
+        self._safe_trace_event(
+            "conversation_follow_up_context_hint_built",
+            kind="workflow",
+            details={
+                "request_source": self._normalized_label(request_source, default="unknown"),
+                "proactive_trigger": self._normalized_label(proactive_trigger, default="none"),
+                **follow_up_context_hint_trace_details(
+                    conversation=self._loop.runtime.conversation_context(),
+                    user_transcript=user_transcript,
+                    assistant_response=assistant_response,
+                    summary=follow_up_context_hint,
+                ),
+            },
+        )
         evaluator = getattr(self._loop, "conversation_closure_evaluator", None)
         if evaluator is None or not self._coerce_bool(
             getattr(self._loop.config, "conversation_closure_guard_enabled", False)
         ):
             return ConversationClosureEvaluation(
+                assistant_expects_reply=heuristic_assistant_expects_reply,
+                follow_up_context_hint=follow_up_context_hint,
                 turn_steering_cues=self.load_turn_steering_cues(allow_remote=False)
             )
         if not self._loop._follow_up_allowed_for_source(initial_source=request_source):
             return ConversationClosureEvaluation(
+                assistant_expects_reply=heuristic_assistant_expects_reply,
+                follow_up_context_hint=follow_up_context_hint,
                 turn_steering_cues=self.load_turn_steering_cues(allow_remote=False)
             )
 
@@ -243,14 +283,35 @@ class FollowUpSteeringRuntime:
                 )
                 return ConversationClosureEvaluation(
                     decision=fallback_decision,
+                    assistant_expects_reply=self._assistant_expects_reply_from_action(
+                        self._coerce_follow_up_action(
+                            getattr(fallback_decision, "follow_up_action", None)
+                        ),
+                        default=heuristic_assistant_expects_reply,
+                    ),
+                    follow_up_action=self._coerce_follow_up_action(
+                        getattr(fallback_decision, "follow_up_action", None)
+                    ),
+                    follow_up_context_hint=follow_up_context_hint,
                     turn_steering_cues=steering_cues,
                 )
             return ConversationClosureEvaluation(
                 error_type=type(exc).__name__,
+                assistant_expects_reply=heuristic_assistant_expects_reply,
+                follow_up_context_hint=follow_up_context_hint,
                 turn_steering_cues=steering_cues,
             )
+        follow_up_action = self._coerce_follow_up_action(
+            getattr(decision, "follow_up_action", None)
+        )
         return ConversationClosureEvaluation(
             decision=decision,
+            assistant_expects_reply=self._assistant_expects_reply_from_action(
+                follow_up_action,
+                default=heuristic_assistant_expects_reply,
+            ),
+            follow_up_action=follow_up_action,
+            follow_up_context_hint=follow_up_context_hint,
             turn_steering_cues=steering_cues,
         )
 
@@ -263,11 +324,98 @@ class FollowUpSteeringRuntime:
     ) -> FollowUpRuntimeDecision:
         """Apply closure plus steering state to the runtime follow-up decision."""
 
+        follow_up_action = self._coerce_follow_up_action(
+            getattr(evaluation, "follow_up_action", None)
+        )
+        follow_up_context_hint = self._normalized_text(
+            getattr(evaluation, "follow_up_context_hint", None),
+            max_chars=768,
+        ) or None
+
+        def _update_follow_up_context(*, force_close: bool) -> None:
+            runtime = getattr(self._loop, "runtime", None)
+            action = "clear" if force_close else "store"
+            if force_close:
+                clear_pending_conversation_follow_up_hint(runtime)
+            else:
+                remember_pending_conversation_follow_up_hint(
+                    runtime,
+                    summary=follow_up_context_hint,
+                )
+            self._safe_trace_decision(
+                "conversation_follow_up_context_hint_update",
+                question="What should Twinr do with the pending immediate follow-up carryover hint after this answer?",
+                selected={
+                    "id": action,
+                    "justification": (
+                        "Automatic follow-up is being force-closed."
+                        if force_close
+                        else "Automatic follow-up remains open for the next turn."
+                    ),
+                    "expected_outcome": (
+                        "No carryover hint will be available to the next turn."
+                        if force_close
+                        else "The next explicit follow-up turn can inject the carryover hint."
+                    ),
+                },
+                options=[
+                    {
+                        "id": "store",
+                        "summary": "Keep one bounded carryover hint for the next immediate follow-up turn.",
+                    },
+                    {
+                        "id": "clear",
+                        "summary": "Drop the carryover hint because the thread is closing or cannot safely continue.",
+                    },
+                ],
+                context={
+                    "request_source": self._normalized_label(request_source, default="unknown"),
+                    "proactive_trigger": self._normalized_label(proactive_trigger, default="none"),
+                    "follow_up_action": follow_up_action or "none",
+                    "assistant_expects_reply": bool(getattr(evaluation, "assistant_expects_reply", False)),
+                    "error_type": self._normalized_label(getattr(evaluation, "error_type", None), default="none"),
+                    "hint": follow_up_context_hint_trace_details(
+                        conversation=(),
+                        user_transcript="",
+                        assistant_response="",
+                        summary=follow_up_context_hint,
+                    )["summary"],
+                    "runtime_hint": pending_conversation_follow_up_hint_trace_details(runtime),
+                },
+                confidence=self._bounded_probability(getattr(getattr(evaluation, "decision", None), "confidence", 0.0)),
+                guardrails=[
+                    "Keep redaction-by-default; never trace raw carryover text.",
+                    "Store the hint only while the next immediate follow-up is still expected.",
+                ],
+            )
+
+        if follow_up_action is not None:
+            self._safe_emit(f"conversation_follow_up_action={follow_up_action}")
+
+        if self._reply_gate_applies(request_source) and not self._coerce_bool(
+            getattr(evaluation, "assistant_expects_reply", False)
+        ):
+            _update_follow_up_context(force_close=True)
+            self._safe_emit("conversation_follow_up_reply_gate=assistant_no_reply_expected")
+            self._safe_record_event(
+                "conversation_follow_up_reply_gate_closed",
+                "Twinr closed automatic follow-up because the delivered answer did not ask for immediate user input.",
+                request_source=request_source,
+                proactive_trigger=proactive_trigger,
+            )
+            return FollowUpRuntimeDecision(
+                force_close=True,
+                source="reply_gate",
+                reason="assistant_no_reply_expected",
+            )
+
         if evaluation.error_type:
+            _update_follow_up_context(force_close=False)
             self._safe_emit(f"conversation_closure_fallback={evaluation.error_type}")
             return FollowUpRuntimeDecision()
         decision = evaluation.decision
         if decision is None:
+            _update_follow_up_context(force_close=False)
             return FollowUpRuntimeDecision()
 
         self._safe_emit_closure_decision(decision)
@@ -276,6 +424,7 @@ class FollowUpSteeringRuntime:
             matched_topics=getattr(decision, "matched_topics", ()),
         )
         if self._closure_decision_passes_threshold(decision):
+            _update_follow_up_context(force_close=True)
             self._safe_record_event(
                 "conversation_closure_detected",
                 "Twinr suppressed automatic follow-up listening because the exchange clearly ended for now.",
@@ -301,6 +450,7 @@ class FollowUpSteeringRuntime:
             )
 
         if steering.force_close:
+            _update_follow_up_context(force_close=True)
             self._emit_steering_signal(steering)
             self._safe_record_event(
                 "conversation_follow_up_steering_vetoed",
@@ -330,6 +480,7 @@ class FollowUpSteeringRuntime:
             )
 
         if steering.keep_open:
+            _update_follow_up_context(force_close=False)
             self._emit_steering_signal(steering)
             self._safe_record_event(
                 "conversation_follow_up_steering_kept_open",
@@ -357,6 +508,7 @@ class FollowUpSteeringRuntime:
                     default="silent",
                 ),
             )
+        _update_follow_up_context(force_close=False)
         return FollowUpRuntimeDecision(
             force_close=False,
             source="none",
@@ -368,6 +520,30 @@ class FollowUpSteeringRuntime:
                 default="silent",
             ),
         )
+
+    def _coerce_follow_up_action(self, value: object) -> str | None:
+        """Normalize the closure contract's follow-up action enum."""
+
+        normalized = self._normalized_label(value, default="", max_chars=32)
+        if normalized == _FOLLOW_UP_ACTION_CONTINUE:
+            return _FOLLOW_UP_ACTION_CONTINUE
+        if normalized == _FOLLOW_UP_ACTION_END:
+            return _FOLLOW_UP_ACTION_END
+        return None
+
+    def _assistant_expects_reply_from_action(
+        self,
+        follow_up_action: str | None,
+        *,
+        default: bool,
+    ) -> bool:
+        """Prefer the explicit closure-model action over local heuristics."""
+
+        if follow_up_action == _FOLLOW_UP_ACTION_CONTINUE:
+            return True
+        if follow_up_action == _FOLLOW_UP_ACTION_END:
+            return False
+        return default
 
     def _evaluate_with_optional_context(
         self,
@@ -548,6 +724,58 @@ class FollowUpSteeringRuntime:
         except Exception:
             return
 
+    def _safe_trace_event(
+        self,
+        message: str,
+        *,
+        kind: str,
+        details: Mapping[str, object] | None = None,
+        level: str = "INFO",
+    ) -> None:
+        """Emit one structured workflow event when the loop exposes tracing."""
+
+        tracer = getattr(self._loop, "_trace_event", None)
+        if not callable(tracer):
+            return
+        try:
+            tracer(
+                message,
+                kind=kind,
+                details=dict(details or {}),
+                level=level,
+            )
+        except Exception:
+            return
+
+    def _safe_trace_decision(
+        self,
+        message: str,
+        *,
+        question: str,
+        selected: Mapping[str, object],
+        options: Sequence[Mapping[str, object]],
+        context: Mapping[str, object] | None = None,
+        confidence: object | None = None,
+        guardrails: Sequence[str] | None = None,
+    ) -> None:
+        """Emit one structured workflow decision when the loop supports it."""
+
+        tracer = getattr(self._loop, "_trace_decision", None)
+        if not callable(tracer):
+            return
+        try:
+            tracer(
+                message,
+                question=question,
+                selected=dict(selected),
+                options=[dict(option) for option in options],
+                context=dict(context or {}),
+                confidence=confidence,
+                guardrails=list(guardrails or ()),
+            )
+        except Exception:
+            return
+
     def _safe_emit_closure_decision(self, decision) -> None:
         """Emit closure telemetry without letting instrumentation crash runtime."""
 
@@ -711,6 +939,12 @@ class FollowUpSteeringRuntime:
             if len(topics) >= max_topics:
                 break
         return tuple(topics)
+
+    def _reply_gate_applies(self, request_source: str) -> bool:
+        """Return whether the assistant-reply gate should control auto-rearm."""
+
+        normalized = self._normalized_label(request_source, default="")
+        return normalized in {"voice_activation", "proactive"}
 
     def _keyword_tokens(self, text: object | None) -> set[str]:
         """Extract lower-cased significant tokens for strict local matching."""

@@ -108,7 +108,7 @@ class DisplayReserveExpansionTests(unittest.TestCase):
         ]
         self.assertEqual([candidate.expansion_angle for candidate in world_cards], ["primary", "public_reaction", "broader_view"])
         self.assertTrue(all(candidate.support_sources == ("world",) for candidate in world_cards))
-        self.assertTrue(all(candidate.topic_key.startswith("world politics::") for candidate in world_cards))
+        self.assertTrue(all(candidate.topic_key.startswith("reserve_card::") for candidate in world_cards))
 
 
 if __name__ == "__main__":

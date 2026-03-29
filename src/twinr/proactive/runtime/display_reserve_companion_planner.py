@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: Prepared plans are no longer cleared before the adopted current-day plan has been durably saved, preventing data loss on I/O errors and power-loss windows.
+# BUG-2: Reflection / learning-profile / outcome-summary failures no longer abort next-day preparation; nightly planning now degrades gracefully and stays useful offline.
+# BUG-3: Persisted state parsing is hardened against invalid ISO days, malformed counters, and string-as-sequence topic corruption.
+# SEC-1: Nightly maintenance now uses an advisory lock, atomic fsync-backed state writes, and private file permissions to reduce race-driven corruption and local data leakage on Raspberry Pi deployments.
+# IMP-1: Explicit IANA timezone handling removes dependence on the host system timezone and makes DST/night-window behavior deterministic.
+# IMP-2: Existing target-day plans are reused, late prepared plans can replace pristine live-built plans, and non-critical telemetry steps are isolated from the critical prepare-and-adopt path.
+
 """Own nightly reserve-lane recalibration and prepared next-day plans.
 
 The right-hand HDMI reserve lane already has a deterministic current-day
@@ -16,12 +24,29 @@ display-publish path and the generic realtime loop.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import date as LocalDate, datetime, timedelta, timezone
+import errno
 import json
 import logging
+import os
 from pathlib import Path
+import tempfile
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - only relevant on non-Unix platforms
+    fcntl = None
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - Python < 3.9 or stripped builds
+    ZoneInfo = None  # type: ignore[assignment]
+
+    class ZoneInfoNotFoundError(Exception):
+        """Fallback placeholder when zoneinfo is unavailable."""
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_history import DisplayAmbientImpulseHistoryStore
@@ -49,10 +74,14 @@ from .display_reserve_support import (
 
 _DEFAULT_PREPARED_PLAN_PATH = "artifacts/stores/ops/display_reserve_bus_plan_prepared.json"
 _DEFAULT_MAINTENANCE_STATE_PATH = "artifacts/stores/ops/display_reserve_bus_maintenance.json"
+_DEFAULT_MAINTENANCE_LOCK_PATH = "artifacts/stores/ops/display_reserve_bus_maintenance.lock"
 _DEFAULT_NIGHTLY_AFTER_LOCAL = "00:30"
 _DEFAULT_OUTCOME_LOOKBACK_DAYS = 2.0
+_MAX_TOPIC_COUNT = 4
+_PRIVATE_FILE_MODE = 0o600
 
 _LOGGER = logging.getLogger(__name__)
+
 
 def _resolve_store_path(config: TwinrConfig, attr_name: str, default_path: str) -> Path:
     """Resolve one configured artifact path under the current project root."""
@@ -62,17 +91,198 @@ def _resolve_store_path(config: TwinrConfig, attr_name: str, default_path: str) 
     return configured if configured.is_absolute() else project_root / configured
 
 
+def _resolve_local_timezone(config: TwinrConfig):
+    """Return one explicit IANA timezone from config when available."""
+
+    for attr_name in (
+        "display_reserve_bus_timezone",
+        "display_reserve_timezone",
+        "local_timezone",
+        "timezone",
+        "time_zone",
+    ):
+        raw = compact_text(getattr(config, attr_name, None), max_len=128)
+        if not raw:
+            continue
+        if ZoneInfo is None:
+            _LOGGER.warning(
+                "Configured timezone %r ignored because zoneinfo is unavailable.",
+                raw,
+            )
+            return None
+        try:
+            return ZoneInfo(raw)
+        except ZoneInfoNotFoundError:
+            _LOGGER.warning("Ignoring unknown reserve-bus timezone %r.", raw)
+            continue
+    return None
+
+
+def _coerce_local_datetime(config: TwinrConfig, value: datetime) -> datetime:
+    """Normalize one datetime into the configured local timezone."""
+
+    target_tz = _resolve_local_timezone(config)
+    if value.tzinfo is None:
+        if target_tz is not None:
+            return value.replace(tzinfo=target_tz)
+        fallback_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        return value.replace(tzinfo=fallback_tz)
+    return value.astimezone(target_tz) if target_tz is not None else value.astimezone()
+
+
 def _coerce_iso_day(value: object | None) -> str | None:
     """Normalize one stored local-day string."""
 
     text = compact_text(value, max_len=16)
-    return text or None
+    if not text:
+        return None
+    try:
+        return LocalDate.fromisoformat(text).isoformat()
+    except (TypeError, ValueError):
+        return None
 
 
 def _topic_key(value: object | None) -> str:
     """Return one normalized topic key."""
 
     return compact_text(value, max_len=96).casefold()
+
+
+def _normalized_topic_keys(value: object | None) -> tuple[str, ...]:
+    """Normalize one persisted topic collection without treating strings as iterables."""
+
+    if value is None or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    if not isinstance(value, Iterable):
+        return ()
+    normalized: list[str] = []
+    for entry in value:
+        topic = _topic_key(entry)
+        if topic:
+            normalized.append(topic)
+    return tuple(normalized)
+
+
+def _safe_non_negative_int(value: object | None) -> int:
+    """Parse one possibly malformed integer into a non-negative counter."""
+
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_timestamp_text(value: object | None) -> str | None:
+    """Normalize one persisted timestamp when it parses."""
+
+    try:
+        parsed = _parse_timestamp(value)
+    except Exception:
+        return None
+    return format_timestamp(parsed) if parsed is not None else None
+
+
+def _set_private_permissions(path: Path) -> None:
+    """Best-effort harden one artifact to user-only permissions."""
+
+    with suppress(OSError):
+        os.chmod(path, _PRIVATE_FILE_MODE)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync for the parent directory after one atomic replace."""
+
+    flags = getattr(os, "O_RDONLY", 0)
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write one UTF-8 text file atomically enough for crash-prone edge devices."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _set_private_permissions(tmp_path)
+        os.replace(tmp_path, path)
+        _set_private_permissions(path)
+        _fsync_directory(path.parent)
+    finally:
+        with suppress(FileNotFoundError):
+            tmp_path.unlink()
+
+
+@contextmanager
+def _advisory_file_lock(path: Path, *, blocking: bool) -> Iterator[bool]:
+    """Acquire one best-effort cross-process lock around nightly maintenance."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    _set_private_permissions(path)
+    if fcntl is None:  # pragma: no cover - Raspberry Pi / Linux normally has fcntl
+        try:
+            yield True
+        finally:
+            handle.close()
+        return
+
+    try:
+        operation = fcntl.LOCK_EX
+        if not blocking:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), operation)
+        except OSError as exc:
+            if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                yield False
+                return
+            raise
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} acquired_at={format_timestamp(utc_now())}\n")
+        handle.flush()
+        with suppress(OSError):
+            os.fsync(handle.fileno())
+        try:
+            yield True
+        finally:
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            with suppress(OSError):
+                os.fsync(handle.fileno())
+            with suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _join_error_messages(parts: Sequence[str]) -> str | None:
+    """Compact one list of degraded auxiliary-step errors for persisted state."""
+
+    if not parts:
+        return None
+    return compact_text("; ".join(part for part in parts if part), max_len=240) or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,30 +303,18 @@ class DisplayReserveNightlyOutcomeSummary:
     def from_dict(cls, payload: Mapping[str, object]) -> "DisplayReserveNightlyOutcomeSummary":
         """Build one summary from persisted JSON-safe data."""
 
-        positive_topics = payload.get("positive_topics")
-        cooling_topics = payload.get("cooling_topics")
         return cls(
-            exposure_count=max(0, int(payload.get("exposure_count", 0) or 0)),
-            engaged_count=max(0, int(payload.get("engaged_count", 0) or 0)),
-            immediate_pickup_count=max(0, int(payload.get("immediate_pickup_count", 0) or 0)),
-            cooling_count=max(0, int(payload.get("cooling_count", 0) or 0)),
-            avoided_count=max(0, int(payload.get("avoided_count", 0) or 0)),
-            ignored_count=max(0, int(payload.get("ignored_count", 0) or 0)),
-            pending_count=max(0, int(payload.get("pending_count", 0) or 0)),
-            positive_topics=tuple(
-                _topic_key(entry)
-                for entry in positive_topics
-                if _topic_key(entry)
-            )
-            if isinstance(positive_topics, Sequence)
-            else (),
-            cooling_topics=tuple(
-                _topic_key(entry)
-                for entry in cooling_topics
-                if _topic_key(entry)
-            )
-            if isinstance(cooling_topics, Sequence)
-            else (),
+            exposure_count=_safe_non_negative_int(payload.get("exposure_count", 0)),
+            engaged_count=_safe_non_negative_int(payload.get("engaged_count", 0)),
+            immediate_pickup_count=_safe_non_negative_int(
+                payload.get("immediate_pickup_count", 0)
+            ),
+            cooling_count=_safe_non_negative_int(payload.get("cooling_count", 0)),
+            avoided_count=_safe_non_negative_int(payload.get("avoided_count", 0)),
+            ignored_count=_safe_non_negative_int(payload.get("ignored_count", 0)),
+            pending_count=_safe_non_negative_int(payload.get("pending_count", 0)),
+            positive_topics=_normalized_topic_keys(payload.get("positive_topics")),
+            cooling_topics=_normalized_topic_keys(payload.get("cooling_topics")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -149,38 +347,22 @@ class DisplayReserveNightlyMaintenanceState:
         outcome_payload = payload.get("outcome_summary")
         return cls(
             prepared_local_day=_coerce_iso_day(payload.get("prepared_local_day")),
-            last_attempted_at=(
-                format_timestamp(_parse_timestamp(payload.get("last_attempted_at")))
-                if _parse_timestamp(payload.get("last_attempted_at")) is not None
-                else None
-            ),
-            last_completed_at=(
-                format_timestamp(_parse_timestamp(payload.get("last_completed_at")))
-                if _parse_timestamp(payload.get("last_completed_at")) is not None
-                else None
-            ),
+            last_attempted_at=_safe_timestamp_text(payload.get("last_attempted_at")),
+            last_completed_at=_safe_timestamp_text(payload.get("last_completed_at")),
             last_status=compact_text(payload.get("last_status"), max_len=24).lower() or "idle",
             last_error=compact_text(payload.get("last_error"), max_len=240) or None,
-            reflection_reflected_object_count=max(
-                0,
-                int(payload.get("reflection_reflected_object_count", 0) or 0),
+            reflection_reflected_object_count=_safe_non_negative_int(
+                payload.get("reflection_reflected_object_count", 0)
             ),
-            reflection_created_summary_count=max(
-                0,
-                int(payload.get("reflection_created_summary_count", 0) or 0),
+            reflection_created_summary_count=_safe_non_negative_int(
+                payload.get("reflection_created_summary_count", 0)
             ),
-            prepared_candidate_count=max(0, int(payload.get("prepared_candidate_count", 0) or 0)),
-            prepared_item_count=max(0, int(payload.get("prepared_item_count", 0) or 0)),
-            positive_topics=tuple(
-                _topic_key(entry)
-                for entry in payload.get("positive_topics", ())
-                if _topic_key(entry)
+            prepared_candidate_count=_safe_non_negative_int(
+                payload.get("prepared_candidate_count", 0)
             ),
-            cooling_topics=tuple(
-                _topic_key(entry)
-                for entry in payload.get("cooling_topics", ())
-                if _topic_key(entry)
-            ),
+            prepared_item_count=_safe_non_negative_int(payload.get("prepared_item_count", 0)),
+            positive_topics=_normalized_topic_keys(payload.get("positive_topics")),
+            cooling_topics=_normalized_topic_keys(payload.get("cooling_topics")),
             outcome_summary=DisplayReserveNightlyOutcomeSummary.from_dict(outcome_payload)
             if isinstance(outcome_payload, Mapping)
             else DisplayReserveNightlyOutcomeSummary(),
@@ -244,11 +426,13 @@ class DisplayReserveNightlyMaintenanceStateStore:
     ) -> DisplayReserveNightlyMaintenanceState:
         """Persist one maintenance state atomically enough for runtime use."""
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        payload = json.dumps(
+            state.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
+        _atomic_write_text(self.path, payload)
         return state
 
 
@@ -274,6 +458,7 @@ class DisplayReserveCompanionPlanner:
     learning_builder_factory: type[DisplayReserveLearningProfileBuilder] = DisplayReserveLearningProfileBuilder
     long_term_memory_factory: Callable[[TwinrConfig], LongTermMemoryService] = LongTermMemoryService.from_config
     local_now: Callable[[], datetime] = default_local_now
+    maintenance_lock_path: Path | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayReserveCompanionPlanner":
@@ -290,6 +475,11 @@ class DisplayReserveCompanionPlanner:
             ),
             state_store=DisplayReserveNightlyMaintenanceStateStore.from_config(config),
             history_store=DisplayAmbientImpulseHistoryStore.from_config(config),
+            maintenance_lock_path=_resolve_store_path(
+                config,
+                "display_reserve_bus_maintenance_lock_path",
+                _DEFAULT_MAINTENANCE_LOCK_PATH,
+            ),
         )
 
     @property
@@ -324,12 +514,15 @@ class DisplayReserveCompanionPlanner:
     ) -> DisplayReserveDayPlan:
         """Return the active plan, adopting a prepared next-day plan when due."""
 
-        effective_now = (local_now or self.local_now()).astimezone()
+        effective_now = self._effective_local_now(config=config, local_now=local_now)
         self._clear_stale_prepared_plan(current_day=effective_now.date())
         adopted = self._adopt_prepared_plan_if_due(config=config, local_now=effective_now)
         if adopted is not None:
+            self._harden_store_file(self.store)
             return adopted
-        return self.day_planner.ensure_plan(config=config, local_now=effective_now)
+        plan = self.day_planner.ensure_plan(config=config, local_now=effective_now)
+        self._harden_store_file(self.store)
+        return plan
 
     def peek_next_item(
         self,
@@ -364,7 +557,9 @@ class DisplayReserveCompanionPlanner:
 
         plan = self.ensure_plan(config=config, local_now=local_now)
         advanced = plan.advance()
-        return self.store.save(advanced)
+        saved = self.store.save(advanced)
+        self._harden_store_file(self.store)
+        return saved
 
     def maybe_run_nightly_maintenance(
         self,
@@ -381,7 +576,7 @@ class DisplayReserveCompanionPlanner:
         prepares the next day plan into a separate artifact.
         """
 
-        effective_now = (local_now or self.local_now()).astimezone()
+        effective_now = self._effective_local_now(config=config, local_now=local_now)
         if not bool(getattr(config, "display_reserve_bus_nightly_enabled", True)):
             return DisplayReserveNightlyMaintenanceResult(
                 action="inactive",
@@ -394,110 +589,173 @@ class DisplayReserveCompanionPlanner:
                 action="skipped",
                 reason="not_due",
             )
-        existing_state = self.state_store.load()
-        prepared = self.prepared_store.load()
-        active_plan = self.store.load()
         target_day_text = target_day.isoformat()
-        if (
-            existing_state is not None
-            and existing_state.prepared_local_day == target_day_text
-            and existing_state.last_status == "prepared"
-            and (
-                (prepared is not None and prepared.local_day == target_day_text)
-                or (active_plan is not None and active_plan.local_day == target_day_text)
-            )
-        ):
-            return DisplayReserveNightlyMaintenanceResult(
-                action="skipped",
-                reason="already_prepared",
-                target_local_day=target_day_text,
-                plan=prepared if prepared is not None else active_plan,
-                state=existing_state,
-            )
 
-        attempted_at = effective_now.astimezone(timezone.utc)
-        try:
-            memory_service = self.long_term_memory_factory(config)
-            reflection = memory_service.run_reflection(search_backend=search_backend)
-            learning_profile = self.learning_builder_factory.from_config(config).build(now=effective_now)
-            outcome_summary = self._build_outcome_summary(
-                previous_state=existing_state,
-                local_now=effective_now,
-            )
-            plan = self.day_planner.build_plan_for_day(
-                config=config,
-                local_day=target_day,
-                local_now=effective_now,
-            )
-            prepared_plan = DisplayReserveDayPlan(
-                local_day=plan.local_day,
-                generated_at=plan.generated_at,
-                cursor=0,
-                items=plan.items,
-                candidate_count=plan.candidate_count,
-                retired_topic_keys=plan.retired_topic_keys,
-            )
-            self.prepared_store.save(prepared_plan)
-            state = DisplayReserveNightlyMaintenanceState(
-                prepared_local_day=target_day_text,
-                last_attempted_at=format_timestamp(attempted_at),
-                last_completed_at=format_timestamp(utc_now()),
-                last_status="prepared",
-                last_error=None,
-                reflection_reflected_object_count=len(reflection.reflected_objects),
-                reflection_created_summary_count=len(reflection.created_summaries),
-                prepared_candidate_count=prepared_plan.candidate_count,
-                prepared_item_count=len(prepared_plan.items),
-                positive_topics=self._positive_topics_from_profile(learning_profile),
-                cooling_topics=self._cooling_topics_from_profile(learning_profile),
-                outcome_summary=outcome_summary,
-            )
-            self.state_store.save(state)
-            return DisplayReserveNightlyMaintenanceResult(
-                action="prepared",
-                reason="prepared_next_day",
-                target_local_day=target_day_text,
-                plan=prepared_plan,
-                state=state,
-            )
-        except LongTermRemoteUnavailableError:
-            failed_state = DisplayReserveNightlyMaintenanceState(
-                prepared_local_day=target_day_text,
-                last_attempted_at=format_timestamp(attempted_at),
-                last_completed_at=existing_state.last_completed_at if existing_state is not None else None,
-                last_status="failed",
-                last_error="remote_unavailable",
-                reflection_reflected_object_count=0,
-                reflection_created_summary_count=0,
-                prepared_candidate_count=0,
-                prepared_item_count=0,
-                positive_topics=existing_state.positive_topics if existing_state is not None else (),
-                cooling_topics=existing_state.cooling_topics if existing_state is not None else (),
-                outcome_summary=existing_state.outcome_summary
+        with self._maintenance_lock(blocking=False) as acquired:
+            if not acquired:
+                return DisplayReserveNightlyMaintenanceResult(
+                    action="skipped",
+                    reason="locked",
+                    target_local_day=target_day_text,
+                )
+
+            existing_state = self.state_store.load()
+            existing_plan = self._existing_plan_for_local_day(target_day_text)
+            if existing_plan is not None:
+                return DisplayReserveNightlyMaintenanceResult(
+                    action="skipped",
+                    reason="already_prepared",
+                    target_local_day=target_day_text,
+                    plan=existing_plan,
+                    state=self._state_for_existing_plan(
+                        target_day_text=target_day_text,
+                        plan=existing_plan,
+                        previous_state=existing_state,
+                    ),
+                )
+
+            attempted_at = effective_now.astimezone(timezone.utc)
+            reflected_count = 0
+            created_summary_count = 0
+            learning_profile: DisplayReserveLearningProfile | None = None
+            outcome_summary = (
+                existing_state.outcome_summary
                 if existing_state is not None
-                else DisplayReserveNightlyOutcomeSummary(),
+                else DisplayReserveNightlyOutcomeSummary()
             )
-            self.state_store.save(failed_state)
-            raise
-        except Exception as exc:
-            failed_state = DisplayReserveNightlyMaintenanceState(
-                prepared_local_day=target_day_text,
-                last_attempted_at=format_timestamp(attempted_at),
-                last_completed_at=existing_state.last_completed_at if existing_state is not None else None,
-                last_status="failed",
-                last_error=compact_text(exc, max_len=240) or exc.__class__.__name__,
-                reflection_reflected_object_count=0,
-                reflection_created_summary_count=0,
-                prepared_candidate_count=0,
-                prepared_item_count=0,
-                positive_topics=existing_state.positive_topics if existing_state is not None else (),
-                cooling_topics=existing_state.cooling_topics if existing_state is not None else (),
-                outcome_summary=existing_state.outcome_summary
-                if existing_state is not None
-                else DisplayReserveNightlyOutcomeSummary(),
-            )
-            self.state_store.save(failed_state)
-            raise
+            aux_errors: list[str] = []
+            first_aux_exception: Exception | None = None
+
+            try:
+                try:
+                    memory_service = self.long_term_memory_factory(config)
+                    reflection = memory_service.run_reflection(search_backend=search_backend)
+                    reflected_count = len(getattr(reflection, "reflected_objects", ()))
+                    created_summary_count = len(getattr(reflection, "created_summaries", ()))
+                except Exception as exc:
+                    first_aux_exception = first_aux_exception or exc
+                    aux_errors.append(
+                        "reflection:"
+                        + (
+                            "remote_unavailable"
+                            if isinstance(exc, LongTermRemoteUnavailableError)
+                            else (compact_text(exc, max_len=80) or exc.__class__.__name__)
+                        )
+                    )
+                    _LOGGER.warning(
+                        "Nightly reflection degraded while preparing reserve day %s.",
+                        target_day_text,
+                        exc_info=True,
+                    )
+
+                try:
+                    learning_profile = self.learning_builder_factory.from_config(config).build(
+                        now=effective_now
+                    )
+                except Exception as exc:
+                    first_aux_exception = first_aux_exception or exc
+                    aux_errors.append(
+                        f"learning:{compact_text(exc, max_len=80) or exc.__class__.__name__}"
+                    )
+                    _LOGGER.warning(
+                        "Nightly learning-profile build degraded while preparing reserve day %s.",
+                        target_day_text,
+                        exc_info=True,
+                    )
+
+                try:
+                    outcome_summary = self._build_outcome_summary(
+                        config=config,
+                        previous_state=existing_state,
+                        local_now=effective_now,
+                    )
+                except Exception as exc:
+                    first_aux_exception = first_aux_exception or exc
+                    aux_errors.append(
+                        f"outcomes:{compact_text(exc, max_len=80) or exc.__class__.__name__}"
+                    )
+                    _LOGGER.warning(
+                        "Nightly outcome summary degraded while preparing reserve day %s.",
+                        target_day_text,
+                        exc_info=True,
+                    )
+
+                # BREAKING: nightly auxiliary-step failures no longer abort next-day plan
+                # preparation by default. Set
+                # display_reserve_bus_fail_closed_on_nightly_aux_error=True to restore the
+                # previous fail-closed behavior.
+                if (
+                    aux_errors
+                    and bool(
+                        getattr(
+                            config,
+                            "display_reserve_bus_fail_closed_on_nightly_aux_error",
+                            False,
+                        )
+                    )
+                    and first_aux_exception is not None
+                ):
+                    raise first_aux_exception
+
+                plan = self.day_planner.build_plan_for_day(
+                    config=config,
+                    local_day=target_day,
+                    local_now=effective_now,
+                )
+                prepared_plan = DisplayReserveDayPlan(
+                    local_day=target_day_text,
+                    generated_at=plan.generated_at,
+                    cursor=0,
+                    items=plan.items,
+                    candidate_count=plan.candidate_count,
+                    retired_topic_keys=plan.retired_topic_keys,
+                )
+                self.prepared_store.save(prepared_plan)
+                self._harden_store_file(self.prepared_store)
+
+                state = DisplayReserveNightlyMaintenanceState(
+                    prepared_local_day=target_day_text,
+                    last_attempted_at=format_timestamp(attempted_at),
+                    last_completed_at=format_timestamp(utc_now()),
+                    last_status="prepared_degraded" if aux_errors else "prepared",
+                    last_error=_join_error_messages(aux_errors),
+                    reflection_reflected_object_count=reflected_count,
+                    reflection_created_summary_count=created_summary_count,
+                    prepared_candidate_count=prepared_plan.candidate_count,
+                    prepared_item_count=len(prepared_plan.items),
+                    positive_topics=(
+                        self._positive_topics_from_profile(learning_profile)
+                        if learning_profile is not None
+                        else outcome_summary.positive_topics
+                    ),
+                    cooling_topics=(
+                        self._cooling_topics_from_profile(learning_profile)
+                        if learning_profile is not None
+                        else outcome_summary.cooling_topics
+                    ),
+                    outcome_summary=outcome_summary,
+                )
+                saved_state = self._save_state_best_effort(state)
+
+                return DisplayReserveNightlyMaintenanceResult(
+                    action="prepared",
+                    reason=(
+                        "prepared_next_day_degraded"
+                        if aux_errors
+                        else "prepared_next_day"
+                    ),
+                    target_local_day=target_day_text,
+                    plan=prepared_plan,
+                    state=saved_state,
+                )
+            except Exception as exc:
+                self._save_failed_state_best_effort(
+                    target_day_text=target_day_text,
+                    attempted_at=attempted_at,
+                    previous_state=existing_state,
+                    error=exc,
+                )
+                raise
 
     def _nightly_target_local_day(
         self,
@@ -541,43 +799,60 @@ class DisplayReserveCompanionPlanner:
         current_time = local_now.timetz().replace(tzinfo=None)
         if current_time < refresh_after:
             return None
-        prepared = self.prepared_store.load()
+
+        prepared = self._safe_load_plan(self.prepared_store, label="prepared")
         if prepared is None:
             return None
         current_day_text = local_now.date().isoformat()
-        if prepared.local_day != current_day_text:
+        prepared_day = _coerce_iso_day(getattr(prepared, "local_day", None))
+        if prepared_day != current_day_text:
             return None
-        existing = self.store.load()
-        if existing is not None and existing.local_day == current_day_text:
-            self.prepared_store.clear()
+
+        existing = self._safe_load_plan(self.store, label="active")
+        if existing is not None and _coerce_iso_day(getattr(existing, "local_day", None)) == current_day_text:
+            if self._should_replace_existing_plan(existing=existing, prepared=prepared):
+                replacement = DisplayReserveDayPlan(
+                    local_day=current_day_text,
+                    generated_at=prepared.generated_at,
+                    cursor=0,
+                    items=prepared.items,
+                    candidate_count=prepared.candidate_count,
+                    retired_topic_keys=prepared.retired_topic_keys,
+                )
+                saved = self.store.save(replacement)
+                self._harden_store_file(self.store)
+                self._safe_clear_store(self.prepared_store, label="prepared")
+                return saved
+            self._safe_clear_store(self.prepared_store, label="prepared")
             return existing
+
         adopted = DisplayReserveDayPlan(
-            local_day=prepared.local_day,
+            local_day=current_day_text,
             generated_at=prepared.generated_at,
             cursor=0,
             items=prepared.items,
             candidate_count=prepared.candidate_count,
             retired_topic_keys=prepared.retired_topic_keys,
         )
-        self.prepared_store.clear()
-        return self.store.save(adopted)
+        saved = self.store.save(adopted)
+        self._harden_store_file(self.store)
+        self._safe_clear_store(self.prepared_store, label="prepared")
+        return saved
 
     def _clear_stale_prepared_plan(self, *, current_day: LocalDate) -> None:
         """Drop prepared plans that missed their day and can no longer be used."""
 
-        prepared = self.prepared_store.load()
+        prepared = self._safe_load_plan(self.prepared_store, label="prepared")
         if prepared is None:
             return
-        prepared_day = _coerce_iso_day(prepared.local_day)
-        if prepared_day is None:
-            self.prepared_store.clear()
-            return
-        if prepared_day < current_day.isoformat():
-            self.prepared_store.clear()
+        prepared_day = _coerce_iso_day(getattr(prepared, "local_day", None))
+        if prepared_day is None or prepared_day < current_day.isoformat():
+            self._safe_clear_store(self.prepared_store, label="prepared")
 
     def _build_outcome_summary(
         self,
         *,
+        config: TwinrConfig,
         previous_state: DisplayReserveNightlyMaintenanceState | None,
         local_now: datetime,
     ) -> DisplayReserveNightlyOutcomeSummary:
@@ -589,13 +864,16 @@ class DisplayReserveCompanionPlanner:
             )
         else:
             window_start = local_now.astimezone(timezone.utc) - timedelta(
-                days=_DEFAULT_OUTCOME_LOOKBACK_DAYS
+                days=float(
+                    getattr(
+                        config,
+                        "display_reserve_bus_outcome_lookback_days",
+                        _DEFAULT_OUTCOME_LOOKBACK_DAYS,
+                    )
+                )
             )
-        exposures = [
-            exposure
-            for exposure in self.history_store.load()
-            if exposure.shown_at_datetime() >= window_start
-        ]
+        window_end = local_now.astimezone(timezone.utc) + timedelta(minutes=5)
+
         positive_topics = Counter[str]()
         cooling_topics = Counter[str]()
         engaged_count = 0
@@ -604,34 +882,62 @@ class DisplayReserveCompanionPlanner:
         avoided_count = 0
         ignored_count = 0
         pending_count = 0
-        for exposure in exposures:
-            status = compact_text(exposure.response_status, max_len=24).casefold()
+        exposure_count = 0
+
+        for exposure in self.history_store.load():
+            try:
+                shown_at = exposure.shown_at_datetime()
+                if shown_at.tzinfo is None:
+                    shown_at = shown_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                _LOGGER.warning(
+                    "Skipping reserve exposure with invalid shown_at timestamp during nightly review.",
+                    exc_info=True,
+                )
+                continue
+            if shown_at < window_start or shown_at > window_end:
+                continue
+
+            exposure_count += 1
+            topic = _topic_key(getattr(exposure, "topic_key", None))
+            status = compact_text(getattr(exposure, "response_status", None), max_len=24).casefold()
+            response_mode = compact_text(getattr(exposure, "response_mode", None), max_len=48).casefold()
+
             if status == "engaged":
                 engaged_count += 1
-                positive_topics[exposure.topic_key] += 1
-                if exposure.response_mode == "voice_immediate_pickup":
+                if topic:
+                    positive_topics[topic] += 1
+                if response_mode == "voice_immediate_pickup":
                     immediate_pickup_count += 1
             elif status == "cooled":
                 cooling_count += 1
-                cooling_topics[exposure.topic_key] += 1
+                if topic:
+                    cooling_topics[topic] += 1
             elif status == "avoided":
                 avoided_count += 1
-                cooling_topics[exposure.topic_key] += 2
+                if topic:
+                    cooling_topics[topic] += 2
             elif status == "ignored":
                 ignored_count += 1
-                cooling_topics[exposure.topic_key] += 1
+                if topic:
+                    cooling_topics[topic] += 1
             elif status == "pending":
                 pending_count += 1
+
         return DisplayReserveNightlyOutcomeSummary(
-            exposure_count=len(exposures),
+            exposure_count=exposure_count,
             engaged_count=engaged_count,
             immediate_pickup_count=immediate_pickup_count,
             cooling_count=cooling_count,
             avoided_count=avoided_count,
             ignored_count=ignored_count,
             pending_count=pending_count,
-            positive_topics=tuple(topic for topic, _count in positive_topics.most_common(4)),
-            cooling_topics=tuple(topic for topic, _count in cooling_topics.most_common(4)),
+            positive_topics=tuple(
+                topic for topic, _count in positive_topics.most_common(_MAX_TOPIC_COUNT)
+            ),
+            cooling_topics=tuple(
+                topic for topic, _count in cooling_topics.most_common(_MAX_TOPIC_COUNT)
+            ),
         )
 
     def _positive_topics_from_profile(
@@ -654,7 +960,7 @@ class DisplayReserveCompanionPlanner:
             if signal.normalized_score <= 0.0 and signal.immediate_pickup_weight <= 0.0:
                 continue
             selected.append(signal.key)
-            if len(selected) >= 4:
+            if len(selected) >= _MAX_TOPIC_COUNT:
                 break
         return tuple(selected)
 
@@ -678,9 +984,193 @@ class DisplayReserveCompanionPlanner:
             if signal.normalized_score >= 0.0 and signal.negative_weight <= 0.0:
                 continue
             selected.append(signal.key)
-            if len(selected) >= 4:
+            if len(selected) >= _MAX_TOPIC_COUNT:
                 break
         return tuple(selected)
+
+    def _effective_local_now(
+        self,
+        *,
+        config: TwinrConfig,
+        local_now: datetime | None,
+    ) -> datetime:
+        """Return one aware local datetime in the configured timezone."""
+
+        return _coerce_local_datetime(config, local_now or self.local_now())
+
+    @contextmanager
+    def _maintenance_lock(self, *, blocking: bool) -> Iterator[bool]:
+        """Hold one best-effort process lock around nightly maintenance."""
+
+        with _advisory_file_lock(
+            self.maintenance_lock_path
+            or self.state_store.path.with_suffix(self.state_store.path.suffix + ".lock"),
+            blocking=blocking,
+        ) as acquired:
+            yield acquired
+
+    def _existing_plan_for_local_day(self, target_day_text: str) -> DisplayReserveDayPlan | None:
+        """Return one already prepared/active plan for the target local day."""
+
+        for label, store in (("prepared", self.prepared_store), ("active", self.store)):
+            plan = self._safe_load_plan(store, label=label)
+            if plan is None:
+                continue
+            if _coerce_iso_day(getattr(plan, "local_day", None)) == target_day_text:
+                return plan
+        return None
+
+    def _state_for_existing_plan(
+        self,
+        *,
+        target_day_text: str,
+        plan: DisplayReserveDayPlan,
+        previous_state: DisplayReserveNightlyMaintenanceState | None,
+    ) -> DisplayReserveNightlyMaintenanceState:
+        """Return one best-effort state when a target-day plan already exists."""
+
+        if (
+            previous_state is not None
+            and previous_state.prepared_local_day == target_day_text
+            and previous_state.last_status in {"prepared", "prepared_degraded"}
+        ):
+            return previous_state
+        return DisplayReserveNightlyMaintenanceState(
+            prepared_local_day=target_day_text,
+            last_attempted_at=previous_state.last_attempted_at if previous_state else None,
+            last_completed_at=previous_state.last_completed_at if previous_state else None,
+            last_status="prepared",
+            last_error=previous_state.last_error if previous_state else None,
+            reflection_reflected_object_count=(
+                previous_state.reflection_reflected_object_count if previous_state else 0
+            ),
+            reflection_created_summary_count=(
+                previous_state.reflection_created_summary_count if previous_state else 0
+            ),
+            prepared_candidate_count=plan.candidate_count,
+            prepared_item_count=len(plan.items),
+            positive_topics=previous_state.positive_topics if previous_state else (),
+            cooling_topics=previous_state.cooling_topics if previous_state else (),
+            outcome_summary=(
+                previous_state.outcome_summary
+                if previous_state is not None
+                else DisplayReserveNightlyOutcomeSummary()
+            ),
+        )
+
+    def _save_state_best_effort(
+        self,
+        state: DisplayReserveNightlyMaintenanceState,
+    ) -> DisplayReserveNightlyMaintenanceState | None:
+        """Persist one maintenance state without turning success into failure."""
+
+        try:
+            return self.state_store.save(state)
+        except Exception:
+            _LOGGER.warning(
+                "Prepared reserve nightly state but failed to persist maintenance metadata to %s.",
+                self.state_store.path,
+                exc_info=True,
+            )
+            return None
+
+    def _save_failed_state_best_effort(
+        self,
+        *,
+        target_day_text: str,
+        attempted_at: datetime,
+        previous_state: DisplayReserveNightlyMaintenanceState | None,
+        error: Exception,
+    ) -> None:
+        """Persist one failure record without masking the original exception."""
+
+        failed_state = DisplayReserveNightlyMaintenanceState(
+            prepared_local_day=target_day_text,
+            last_attempted_at=format_timestamp(attempted_at),
+            last_completed_at=previous_state.last_completed_at if previous_state is not None else None,
+            last_status="failed",
+            last_error=compact_text(error, max_len=240) or error.__class__.__name__,
+            reflection_reflected_object_count=0,
+            reflection_created_summary_count=0,
+            prepared_candidate_count=0,
+            prepared_item_count=0,
+            positive_topics=previous_state.positive_topics if previous_state is not None else (),
+            cooling_topics=previous_state.cooling_topics if previous_state is not None else (),
+            outcome_summary=(
+                previous_state.outcome_summary
+                if previous_state is not None
+                else DisplayReserveNightlyOutcomeSummary()
+            ),
+        )
+        try:
+            self.state_store.save(failed_state)
+        except Exception:
+            _LOGGER.warning(
+                "Failed to persist reserve nightly failure state to %s.",
+                self.state_store.path,
+                exc_info=True,
+            )
+
+    def _safe_load_plan(
+        self,
+        store: DisplayReserveDayPlanStore,
+        *,
+        label: str,
+    ) -> DisplayReserveDayPlan | None:
+        """Load one plan store without letting corrupt artifacts break runtime flow."""
+
+        try:
+            return store.load()
+        except Exception:
+            _LOGGER.warning(
+                "Failed to load %s display reserve plan from %s.",
+                label,
+                getattr(store, "path", "<unknown>"),
+                exc_info=True,
+            )
+            return None
+
+    def _safe_clear_store(self, store: DisplayReserveDayPlanStore, *, label: str) -> None:
+        """Clear one plan store best-effort."""
+
+        try:
+            store.clear()
+        except Exception:
+            _LOGGER.warning(
+                "Failed to clear %s display reserve plan at %s.",
+                label,
+                getattr(store, "path", "<unknown>"),
+                exc_info=True,
+            )
+
+    def _harden_store_file(self, store_or_path: object) -> None:
+        """Best-effort harden one plan/store artifact to private permissions."""
+
+        path = store_or_path if isinstance(store_or_path, Path) else getattr(store_or_path, "path", None)
+        if isinstance(path, Path) and path.exists():
+            _set_private_permissions(path)
+
+    def _should_replace_existing_plan(
+        self,
+        *,
+        existing: DisplayReserveDayPlan,
+        prepared: DisplayReserveDayPlan,
+    ) -> bool:
+        """Return whether a pristine live-built plan should be swapped for prepared."""
+
+        if getattr(existing, "cursor", 0) not in {0, None}:
+            return False
+        if not getattr(prepared, "items", ()):
+            return False
+        try:
+            existing_ts = _parse_timestamp(getattr(existing, "generated_at", None))
+            prepared_ts = _parse_timestamp(getattr(prepared, "generated_at", None))
+        except Exception:
+            existing_ts = None
+            prepared_ts = None
+        if existing_ts is None or prepared_ts is None:
+            return prepared.candidate_count > existing.candidate_count
+        return prepared_ts >= existing_ts
 
 
 __all__ = [

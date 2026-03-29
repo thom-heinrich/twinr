@@ -442,12 +442,31 @@ class ManagedContextFileStore:
             if not self._remote_enabled():
                 return False
 
-            status, _entries = self._try_load_remote_entries()
-            if status == "ok":
-                return False
-            if status == "error":
+            try:
+                probe = self.remote_state.probe_snapshot_load(
+                    snapshot_kind=self.remote_snapshot_kind,
+                    prefer_cached_document_id=True,
+                    prefer_metadata_only=True,
+                )
+            except Exception as exc:
+                if _is_remote_unavailable_error(exc):
+                    raise
                 # AUDIT-FIX(#4): Network or backend outages should not crash startup-time snapshot checks.
+                LOGGER.warning(
+                    "Failed to probe managed-context snapshot %r: %s",
+                    self.remote_snapshot_kind,
+                    exc,
+                )
                 return False
+            if isinstance(probe.payload, dict) and self._is_managed_context_payload(probe.payload):
+                return False
+            if probe.status == "unavailable":
+                from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+
+                raise LongTermRemoteUnavailableError(
+                    probe.detail
+                    or f"Failed to read remote long-term snapshot {self.remote_snapshot_kind!r}."
+                )
             return self._try_save_remote_entries(self._load_local_entries())
 
     def _split_document(self) -> tuple[str, tuple[ManagedContextEntry, ...], str]:
@@ -710,12 +729,31 @@ class PersistentMemoryMarkdownStore:
             if not self._remote_enabled():
                 return False
 
-            status, _entries = self._try_load_remote_entries()
-            if status == "ok":
-                return False
-            if status == "error":
+            try:
+                probe = self.remote_state.probe_snapshot_load(
+                    snapshot_kind=self.remote_snapshot_kind,
+                    prefer_cached_document_id=True,
+                    prefer_metadata_only=True,
+                )
+            except Exception as exc:
+                if _is_remote_unavailable_error(exc):
+                    raise
                 # AUDIT-FIX(#4): Avoid crashing the app when the remote backend is temporarily unavailable.
+                LOGGER.warning(
+                    "Failed to probe prompt-memory snapshot %r: %s",
+                    self.remote_snapshot_kind,
+                    exc,
+                )
                 return False
+            if isinstance(probe.payload, dict) and self._is_prompt_memory_payload(probe.payload):
+                return False
+            if probe.status == "unavailable":
+                from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+
+                raise LongTermRemoteUnavailableError(
+                    probe.detail
+                    or f"Failed to read remote long-term snapshot {self.remote_snapshot_kind!r}."
+                )
             return self._try_save_remote_entries(self._load_local_entries())
 
     def _load_local_entries(self) -> tuple[PersistentMemoryEntry, ...]:

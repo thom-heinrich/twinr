@@ -38,6 +38,8 @@ from .shared import (
 class LongTermRemoteStateReadMixin:
     """Read, probe, and parse remote long-term snapshot state."""
 
+    _METADATA_ONLY_MAX_CONTENT_CHARS = 1
+
     namespace: str | None
     read_client: ChonkyDBClient | None
     write_client: ChonkyDBClient | None
@@ -238,8 +240,11 @@ class LongTermRemoteStateReadMixin:
         document_id: str | None = None,
         source: str,
         retry_not_found: bool = False,
+        prefer_metadata_only: bool = False,
+        bypass_circuit_open: bool = False,
+        fast_fail: bool = False,
     ) -> _RemoteSnapshotFetchResult:
-        if self._circuit_is_open():
+        if not bypass_circuit_open and self._circuit_is_open():
             return _RemoteSnapshotFetchResult(
                 status="unavailable",
                 detail="Remote long-term memory is temporarily cooling down after recent failures.",
@@ -247,21 +252,22 @@ class LongTermRemoteStateReadMixin:
             )
 
         last_error: Exception | None = None
-        attempts = self._retry_attempts()
-        backoff_s = self._retry_backoff_s()
+        attempts = 1 if fast_fail else self._retry_attempts()
+        backoff_s = 0.0 if fast_fail else self._retry_backoff_s()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
         started = time.monotonic()
         effective_client = client
-        if document_id is None:
+        if document_id is None and not fast_fail:
             effective_client = self._origin_resolution_client(client)
         for attempt in range(attempts):
             attempt_started = time.monotonic()
             try:
-                payload = effective_client.fetch_full_document(
+                payload = self._fetch_snapshot_document(
+                    effective_client,
+                    snapshot_kind=snapshot_kind,
+                    local_path=local_path,
                     document_id=document_id,
-                    origin_uri=None if document_id else self._snapshot_uri(snapshot_kind),
-                    include_content=True,
-                    max_content_chars=self._max_content_chars(local_path=local_path),
+                    prefer_metadata_only=prefer_metadata_only,
                 )
             except Exception as exc:
                 latency_ms = round(max(0.0, (time.monotonic() - attempt_started) * 1000.0), 3)
@@ -523,6 +529,8 @@ class LongTermRemoteStateReadMixin:
         snapshot_kind: str,
         local_path: Path | None = None,
         prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one remote snapshot read and preserve pointer/origin evidence."""
 
@@ -530,6 +538,8 @@ class LongTermRemoteStateReadMixin:
             snapshot_kind=snapshot_kind,
             local_path=local_path,
             prefer_cached_document_id=prefer_cached_document_id,
+            prefer_metadata_only=prefer_metadata_only,
+            fast_fail=fast_fail,
         )
 
     def _probe_snapshot_load_internal(
@@ -538,6 +548,8 @@ class LongTermRemoteStateReadMixin:
         snapshot_kind: str,
         local_path: Path | None = None,
         prefer_cached_document_id: bool,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one remote snapshot read, optionally reusing a learned document id."""
 
@@ -566,12 +578,16 @@ class LongTermRemoteStateReadMixin:
                 client,
                 snapshot_kind=normalized_snapshot_kind,
                 local_path=local_path,
+                prefer_metadata_only=prefer_metadata_only,
+                fast_fail=fast_fail,
             )
         else:
             probe = self._load_snapshot_with_pointer_fallback(
                 client,
                 snapshot_kind=normalized_snapshot_kind,
                 local_path=local_path,
+                prefer_metadata_only=prefer_metadata_only,
+                fast_fail=fast_fail,
             )
         self._store_cached_probe(probe)
         return probe
@@ -582,6 +598,8 @@ class LongTermRemoteStateReadMixin:
         *,
         snapshot_kind: str,
         local_path: Path | None = None,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one snapshot by a remembered document id before pointer/origin resolution."""
 
@@ -595,6 +613,8 @@ class LongTermRemoteStateReadMixin:
                 local_path=local_path,
                 document_id=hinted_document_id,
                 source="cached_document",
+                prefer_metadata_only=prefer_metadata_only,
+                fast_fail=fast_fail,
             )
             attempt_records.extend(hinted_result.attempts)
             if hinted_result.payload is not None:
@@ -614,6 +634,8 @@ class LongTermRemoteStateReadMixin:
             client,
             snapshot_kind=snapshot_kind,
             local_path=local_path,
+            prefer_metadata_only=prefer_metadata_only,
+            fast_fail=fast_fail,
         )
         if (
             hinted_document_id
@@ -649,6 +671,9 @@ class LongTermRemoteStateReadMixin:
         *,
         snapshot_kind: str,
         local_path: Path | None = None,
+        prefer_metadata_only: bool = False,
+        bypass_circuit_open: bool = False,
+        fast_fail: bool = False,
     ) -> LongTermRemoteSnapshotProbe:
         started = time.monotonic()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
@@ -659,6 +684,9 @@ class LongTermRemoteStateReadMixin:
                 client,
                 snapshot_kind=self._pointer_snapshot_kind(snapshot_kind),
                 source="pointer_lookup",
+                prefer_metadata_only=prefer_metadata_only,
+                bypass_circuit_open=bypass_circuit_open,
+                fast_fail=fast_fail,
             )
             attempt_records.extend(pointer_lookup_result.attempts)
             pointer_document_id = self._extract_pointer_document_id(
@@ -672,6 +700,9 @@ class LongTermRemoteStateReadMixin:
                     local_path=local_path,
                     document_id=pointer_document_id,
                     source="pointer_document",
+                    prefer_metadata_only=prefer_metadata_only,
+                    bypass_circuit_open=bypass_circuit_open,
+                    fast_fail=fast_fail,
                 )
                 attempt_records.extend(pointer_result.attempts)
                 if pointer_result.payload is not None:
@@ -697,6 +728,9 @@ class LongTermRemoteStateReadMixin:
             snapshot_kind=snapshot_kind,
             local_path=local_path,
             source="origin_uri",
+            prefer_metadata_only=prefer_metadata_only,
+            bypass_circuit_open=bypass_circuit_open or bool(attempt_records),
+            fast_fail=fast_fail,
         )
         attempt_records.extend(origin_result.attempts)
         if origin_result.payload is not None and origin_result.document_id and not self._is_pointer_snapshot_kind(snapshot_kind):
@@ -724,6 +758,49 @@ class LongTermRemoteStateReadMixin:
             selected_source=origin_result.selected_source,
             payload=origin_result.payload,
             attempts=tuple(attempt_records),
+        )
+
+    def _fetch_snapshot_document(
+        self,
+        client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        local_path: Path | None,
+        document_id: str | None,
+        prefer_metadata_only: bool,
+    ) -> object:
+        """Fetch one snapshot document, preferring metadata-only reads when safe.
+
+        Readiness and bootstrap probes only need a parseable snapshot candidate.
+        ChonkyDB can often return that directly in record payload/meta without
+        streaming the larger ``content`` field, so probe callers can try the
+        cheaper metadata-only route first and fall back to the historical
+        content-bearing request only when needed.
+        """
+
+        selector = {
+            "document_id": document_id,
+            "origin_uri": None if document_id else self._snapshot_uri(snapshot_kind),
+        }
+        if prefer_metadata_only:
+            try:
+                payload = client.fetch_full_document(
+                    **selector,
+                    include_content=False,
+                    max_content_chars=self._METADATA_ONLY_MAX_CONTENT_CHARS,
+                )
+            except ChonkyDBError as exc:
+                if int(exc.status_code or 0) != 400:
+                    raise
+            else:
+                if isinstance(payload, Mapping):
+                    candidate = self._extract_snapshot_candidate(payload, snapshot_kind=snapshot_kind)
+                    if candidate is not None:
+                        return payload
+        return client.fetch_full_document(
+            **selector,
+            include_content=True,
+            max_content_chars=self._max_content_chars(local_path=local_path),
         )
 
     def _extract_pointer_document_id(

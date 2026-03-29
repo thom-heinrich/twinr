@@ -756,6 +756,11 @@ class TwinrRealtimeSessionMixin:
         trace_id = None
         session_active_marked = False
         try:
+            self._ensure_workflow_trace_capacity_for_session(
+                initial_source=initial_source,
+                proactive_trigger=proactive_trigger,
+                seed_present=bool(seed_transcript and str(seed_transcript).strip()),
+            )
             trace_id = self._new_workflow_trace_id()
             self._workflow_trace_set_active(trace_id)
             self._set_active_turn_stop_event(stop_event)

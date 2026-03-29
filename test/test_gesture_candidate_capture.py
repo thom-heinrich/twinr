@@ -90,6 +90,30 @@ class GestureCandidateCaptureTests(unittest.TestCase):
             self.assertEqual(metadata["reasons"], ["forensics_zero_signal"])
             self.assertTrue(metadata["gesture_debug"]["forensics_zero_signal_capture_requested"])
 
+    def test_store_saves_frame_when_person_roi_localizes_hand_without_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = GestureCandidateCaptureStore(
+                capture_dir=tmpdir,
+                cooldown_s=0.0,
+                max_images=4,
+            )
+
+            result = store.maybe_capture(
+                observed_at=1710000003.0,
+                frame_rgb=np.full((8, 8, 3), 96, dtype=np.uint8),
+                debug_details={
+                    "person_roi_detection_count": 1,
+                    "person_roi_combined_gesture": "none",
+                    "final_resolved_source": "none",
+                },
+            )
+
+            self.assertTrue(result.saved)
+            self.assertEqual(result.reasons, ("person_roi_hand_without_symbol",))
+            metadata = json.loads(Path(result.metadata_path or "").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["reasons"], ["person_roi_hand_without_symbol"])
+            self.assertEqual(metadata["gesture_debug"]["person_roi_detection_count"], 1)
+
     def test_store_prunes_older_capture_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = GestureCandidateCaptureStore(

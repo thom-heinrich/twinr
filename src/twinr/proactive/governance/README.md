@@ -44,6 +44,16 @@ if decision.allowed and decision.reservation is not None:
     governor.mark_delivered(decision.reservation)
 ```
 
+## Config Notes
+
+- Presence-session prompt budgets can be bounded explicitly with
+  `TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_WINDOW_S`.
+- `TWINR_PROACTIVE_GOVERNOR_PRESENCE_GRACE_S` remains available as a legacy
+  alias for the same budget window.
+- If neither field is set, the governor now falls back conservatively to the
+  largest of the default grace window, the rolling governor window, and the
+  voice follow-up timeout instead of collapsing to the short follow-up timeout.
+
 ## See also
 
 - [component.yaml](./component.yaml)

@@ -28,6 +28,10 @@ from twinr.agent.base_agent.contracts import (
     StreamingTranscriptionResult,
     ToolCallingTurnResponse,
 )
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    peek_pending_conversation_follow_up_hint,
+    remember_pending_conversation_follow_up_hint,
+)
 from twinr.agent.base_agent import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
 from twinr.hardware.buttons import ButtonAction, ButtonEvent
@@ -2298,7 +2302,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(print_backend.transcribe_calls, [])
         self.assertIn("interrupt_watcher_remote_owned=true", lines)
 
-    def test_voice_orchestrator_handles_follow_up_remotely_after_answer(self) -> None:
+    def test_voice_orchestrator_handles_follow_up_remotely_after_follow_up_question(self) -> None:
         config = TwinrConfig(conversation_follow_up_enabled=True)
         loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
             config=config
@@ -2308,7 +2312,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         realtime_session.turns = [
             OpenAIRealtimeTurn(
                 transcript="Wie spaet ist es?",
-                response_text="Es ist zehn Uhr.",
+                response_text="Es ist zehn Uhr. Brauchst du noch etwas?",
                 response_id="resp_rt_123",
                 end_conversation=False,
             )
@@ -2326,6 +2330,87 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn(("speaking", "voice_activation", True), fake_voice.states)
         self.assertIn(("follow_up_open", "voice_activation", True), fake_voice.states)
         self.assertNotIn("conversation_follow_up_vetoed=closure", lines)
+
+    def test_voice_orchestrator_keeps_follow_up_open_for_timezone_clarification_without_question_mark(self) -> None:
+        config = TwinrConfig(conversation_follow_up_enabled=True)
+        closure_evaluator = FakeConversationClosureEvaluator(
+            ConversationClosureDecision(
+                close_now=False,
+                confidence=0.21,
+                reason="still_engaged",
+                follow_up_action="continue",
+            )
+        )
+        loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+            conversation_closure_evaluator=closure_evaluator,
+        )
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie spaet ist es in New York?",
+                response_text=(
+                    "Ich brauche deine Zeitzone oder deinen Ort, um dir die genaue Uhrzeit zu sagen. "
+                    "Wenn du mir das nennst, sage ich dir sofort die aktuelle Zeit."
+                ),
+                response_id="resp_rt_timezone_clarification",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_single_text_turn(
+            transcript="wie spaet ist es in new york",
+            listen_source="voice_activation",
+            proactive_trigger=None,
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(len(closure_evaluator.calls), 1)
+        self.assertIn(("follow_up_open", "voice_activation", True), fake_voice.states)
+        self.assertIn("conversation_follow_up_action=continue", lines)
+        self.assertNotIn("conversation_follow_up_reply_gate=assistant_no_reply_expected", lines)
+
+    def test_non_question_answer_does_not_reopen_remote_follow_up(self) -> None:
+        config = TwinrConfig(conversation_follow_up_enabled=True)
+        closure_evaluator = FakeConversationClosureEvaluator(
+            ConversationClosureDecision(
+                close_now=False,
+                confidence=0.21,
+                reason="still_engaged",
+            )
+        )
+        loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+            conversation_closure_evaluator=closure_evaluator,
+        )
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie spaet ist es?",
+                response_text="Es ist zehn Uhr.",
+                response_id="resp_rt_statement",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_single_text_turn(
+            transcript="wie spaet ist es",
+            listen_source="voice_activation",
+            proactive_trigger=None,
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertEqual(len(closure_evaluator.calls), 1)
+        self.assertIn(("thinking", "voice_activation", False), fake_voice.states)
+        self.assertIn(("speaking", "voice_activation", True), fake_voice.states)
+        self.assertIn(("waiting", "voice_activation", False), fake_voice.states)
+        self.assertNotIn(("follow_up_open", "voice_activation", True), fake_voice.states)
+        self.assertIn("conversation_follow_up_reply_gate=assistant_no_reply_expected", lines)
+        self.assertIn("conversation_follow_up_vetoed=closure", lines)
 
     def test_remote_follow_up_transcript_commit_reopens_text_turn_without_beep(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
@@ -2373,6 +2458,45 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime._runtime_flow_state()["active_turn_id"], active_turn_id)
         self.assertEqual(completed_turns[0]["transcript_seed"], "wie geht es dir")
 
+    def test_follow_up_text_turn_includes_pending_carryover_guidance(self) -> None:
+        loop, _lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(conversation_follow_up_enabled=True)
+        )
+        loop.runtime.begin_listening(request_source="follow_up")
+        remember_pending_conversation_follow_up_hint(
+            loop.runtime,
+            summary=(
+                "Recent turns: user=wie spaet ist es in New York; assistant=In New York ist es gerade 10:53 Uhr; "
+                "user=mich; assistant=Meinst du etwas Bestimmtes?."
+            ),
+        )
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Ich meinte, wie spaet es ist.",
+                response_text="In New York ist es gerade 10:54 Uhr.",
+                response_id="resp_rt_follow_up_hint",
+                end_conversation=False,
+            )
+        ]
+
+        handled = loop._run_single_text_turn(
+            transcript="Ich meinte, wie spaet es ist.",
+            listen_source="follow_up",
+            proactive_trigger=None,
+        )
+
+        self.assertTrue(handled)
+        conversation = realtime_session.conversations[0]
+        assert conversation is not None
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Preserve explicit anchors already established" in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
+
     def test_remote_follow_up_closed_resets_local_runtime_to_waiting(self) -> None:
         config = TwinrConfig(conversation_follow_up_enabled=True)
         loop, _lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
@@ -2383,7 +2507,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         realtime_session.turns = [
             OpenAIRealtimeTurn(
                 transcript="Wie spaet ist es?",
-                response_text="Es ist zehn Uhr.",
+                response_text="Es ist zehn Uhr. Brauchst du noch etwas?",
                 response_id="resp_rt_123",
                 end_conversation=False,
             )
@@ -2398,10 +2522,16 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
         self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("follow_up_open", "voice_activation", True))
+        remember_pending_conversation_follow_up_hint(
+            loop.runtime,
+            summary="Recent turns: user=wie spaet ist es in New York; assistant=In New York ist es gerade 10:53 Uhr.",
+        )
+        self.assertIsNotNone(peek_pending_conversation_follow_up_hint(loop.runtime))
 
         loop.handle_remote_follow_up_closed("timeout")
 
         self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertIsNone(peek_pending_conversation_follow_up_hint(loop.runtime))
         self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("waiting", "timeout", False))
         self.assertIn(("waiting", "timeout", False), fake_voice.states)
 
@@ -2736,14 +2866,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(realtime_session.conversations[1][0][0], "system")
         self.assertIn(self._LANGUAGE_CONTRACT, realtime_session.conversations[1][0][1])
         self.assertEqual(realtime_session.conversations[1][1][0], "system")
-        self.assertIn("Twinr memory summary", realtime_session.conversations[1][1][1])
-        self.assertEqual(
-            realtime_session.conversations[1][2:],
-            (
-                ("user", "Erste Frage"),
-                ("assistant", "Erste Antwort"),
-            ),
+        self.assertIn("Immediate follow-up carryover for this turn.", realtime_session.conversations[1][1][1])
+        self.assertTrue(
+            any(
+                role == "system" and "Twinr memory summary" in content
+                for role, content in realtime_session.conversations[1]
+            )
         )
+        self.assertIn(("assistant", "Erste Antwort"), realtime_session.conversations[1])
 
     def test_end_conversation_tool_stops_follow_up_loop(self) -> None:
         config = TwinrConfig(
@@ -5999,18 +6129,20 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             ),
         )
 
-        ready_after = time.monotonic() + 0.02
-
         class _RecoveringRequiredRemote:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def remote_required(self):
                 return True
 
             def ensure_remote_ready(self):
-                if time.monotonic() < ready_after:
+                self.calls += 1
+                if self.calls < 3:
                     raise LongTermRemoteUnavailableError("remote unavailable")
 
             def remote_status(self):
-                if time.monotonic() < ready_after:
+                if self.calls < 3:
                     return LongTermRemoteStatus(
                         mode="remote_primary",
                         ready=False,
@@ -6022,9 +6154,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.runtime.reset_error()
         loop._enter_required_remote_error(LongTermRemoteUnavailableError("remote unavailable"))
 
-        while time.monotonic() < ready_after:
-            self.assertFalse(loop._refresh_required_remote_dependency(force=True, force_sync=True))
-            time.sleep(0.005)
+        self.assertFalse(loop._refresh_required_remote_dependency(force=True, force_sync=True))
+        self.assertFalse(loop._refresh_required_remote_dependency(force=True, force_sync=True))
         refreshed = loop._refresh_required_remote_dependency(force=True, force_sync=True)
 
         self.assertTrue(refreshed)

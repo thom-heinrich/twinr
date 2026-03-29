@@ -102,6 +102,7 @@ def _make_config(
         uncertain_threshold=0.34,
         reference_max_bytes=4096,
         capture_lock_timeout_s=0.1,
+        live_capture_burst_interval_s=0.0,
     )
 
 
@@ -111,7 +112,7 @@ class PortraitMatchProviderTests(unittest.TestCase):
             reference_path = Path(temp_dir) / "reference.jpg"
             reference_path.write_bytes(b"legacy-reference")
             provider = PortraitMatchProvider(
-                camera=FakeCamera([b"live-primary"]),
+                camera=FakeCamera([b"live-primary", b"live-primary", b"live-primary"]),
                 config=_make_config(temp_dir, reference_image_path=reference_path, max_age_s=60.0),
                 backend=FakeBackend(),
                 clock=FakeClock(100.0, 100.0),
@@ -130,7 +131,7 @@ class PortraitMatchProviderTests(unittest.TestCase):
         self.assertEqual(first.reference_image_count, 1)
         self.assertEqual(first.temporal_state, "insufficient_history")
         self.assertEqual(second, first)
-        self.assertEqual(provider.camera.calls, 1)
+        self.assertEqual(provider.camera.calls, 3)
 
     def test_enrollment_flow_supports_multiple_reference_images_and_temporal_fusion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,7 +174,7 @@ class PortraitMatchProviderTests(unittest.TestCase):
     def test_provider_detects_other_enrolled_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = PortraitMatchProvider(
-                camera=FakeCamera([b"live-guest"]),
+                camera=FakeCamera([b"live-guest", b"live-guest", b"live-guest"]),
                 config=_make_config(temp_dir, max_age_s=0.0),
                 backend=FakeBackend(),
                 clock=FakeClock(20.0),

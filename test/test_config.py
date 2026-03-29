@@ -1101,6 +1101,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_GOVERNOR_WINDOW_S=2400",
                         "TWINR_PROACTIVE_GOVERNOR_WINDOW_PROMPT_LIMIT=5",
                         "TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_PROMPT_LIMIT=3",
+                        "TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_WINDOW_S=900",
+                        "TWINR_PROACTIVE_GOVERNOR_PRESENCE_GRACE_S=300",
                         "TWINR_PROACTIVE_GOVERNOR_SOURCE_REPEAT_COOLDOWN_S=420",
                         "TWINR_PROACTIVE_GOVERNOR_HISTORY_LIMIT=96",
                         "TWINR_PROACTIVE_VISUAL_FIRST_AUDIO_GLOBAL_COOLDOWN_S=240",
@@ -1406,6 +1408,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_governor_window_s, 2400.0)
         self.assertEqual(config.proactive_governor_window_prompt_limit, 5)
         self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 3)
+        self.assertEqual(config.proactive_governor_presence_session_window_s, 900.0)
+        self.assertEqual(config.proactive_governor_presence_grace_s, 300.0)
         self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 420.0)
         self.assertEqual(config.proactive_governor_history_limit, 96)
         self.assertEqual(config.proactive_visual_first_audio_global_cooldown_s, 240.0)
@@ -1661,6 +1665,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_governor_window_s, 1200.0)
         self.assertEqual(config.proactive_governor_window_prompt_limit, 4)
         self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 2)
+        self.assertEqual(config.proactive_governor_presence_session_window_s, 0.0)
+        self.assertEqual(config.proactive_governor_presence_grace_s, 0.0)
         self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 600.0)
         self.assertEqual(config.proactive_governor_history_limit, 128)
         self.assertEqual(config.proactive_visual_first_audio_global_cooldown_s, 300.0)

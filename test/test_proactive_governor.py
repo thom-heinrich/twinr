@@ -129,6 +129,42 @@ class ProactiveGovernorTests(unittest.TestCase):
         self.assertFalse(longterm.allowed)
         self.assertEqual(longterm.reason, "governor_presence_session_budget_exhausted")
 
+    def test_explicit_presence_session_window_override_can_shorten_same_session_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            governor = ProactiveGovernor.from_config(
+                self._config(
+                    temp_dir,
+                    proactive_governor_global_prompt_cooldown_s=0.0,
+                    proactive_governor_source_repeat_cooldown_s=0.0,
+                    proactive_governor_presence_session_prompt_limit=1,
+                    proactive_governor_presence_session_window_s=5.0,
+                    voice_orchestrator_follow_up_timeout_s=120.0,
+                )
+            )
+            first = governor.try_reserve(
+                ProactiveGovernorCandidate(
+                    source_kind="social",
+                    source_id="attention_window",
+                    summary="Gentle greeting.",
+                    presence_session_id=7,
+                ),
+                now=datetime(2026, 3, 14, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+            )
+            self.assertTrue(first.allowed)
+            governor.mark_delivered(first.reservation, now=datetime(2026, 3, 14, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")))
+
+            second = governor.try_reserve(
+                ProactiveGovernorCandidate(
+                    source_kind="longterm",
+                    source_id="candidate:walk_weather",
+                    summary="It looks like a good time for a walk.",
+                    presence_session_id=7,
+                ),
+                now=datetime(2026, 3, 14, 10, 0, 10, tzinfo=ZoneInfo("Europe/Berlin")),
+            )
+
+        self.assertTrue(second.allowed)
+
     def test_active_reservation_blocks_concurrent_prompt_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             governor = ProactiveGovernor.from_config(

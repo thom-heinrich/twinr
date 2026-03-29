@@ -5,6 +5,8 @@
 # SEC-1: Sensitive realtime tools are now least-privilege by default and are withheld until voice identity or explicit authorization is available.
 # IMP-1: Added 2026 Realtime session feature negotiation (semantic/server VAD, idle timeout, noise reduction, truncation retention ratio, transcription hints) when supported by the session wrapper.
 # IMP-2: Added optional ambient-audio-sampler auto-bootstrap plus stronger config validation and boot diagnostics for Raspberry Pi deployments.
+# BUG-4: Prewarm the processing feedback media clip during loop bootstrap so the first THINKING cue can hit the
+#        dragon MP3 path without waiting for a cold ffmpeg render on demand.
 
 """Bootstrap helpers for the realtime workflow loop."""
 
@@ -196,6 +198,7 @@ class TwinrRealtimeBootstrapMixin:
             emit=self.emit,
             io_lock=self._audio_lock,
         )
+        self._prewarm_working_feedback_media("processing")
         self._active_turn_stop_lock = Lock()
         self._active_turn_stop_event: Event | None = None
         self._active_turn_stop_reason: str | None = None

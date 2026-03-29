@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 from .shared import (
     _ARCHIVE_STORE_MANIFEST_SCHEMA,
@@ -381,6 +382,8 @@ class StructuredStoreSnapshotMixin:
         if self.remote_state is None:
             raise RuntimeError("Remote state store is required to ensure remote snapshots.")
         local_path = self._validated_local_path(local_path)
+        if self._remote_snapshot_exists_via_probe(snapshot_kind=snapshot_kind):
+            return False
         payload = self._load_remote_snapshot_payload(snapshot_kind=snapshot_kind, compatibility_only=True)
         local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
         if payload is None:
@@ -409,6 +412,46 @@ class StructuredStoreSnapshotMixin:
         if self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=payload):
             return False
         raise ValueError(f"Remote structured snapshot {snapshot_kind!r} has an invalid schema.")
+
+    def _remote_snapshot_exists_via_probe(self, *, snapshot_kind: str) -> bool:
+        """Return whether a light remote probe already proves the snapshot exists.
+
+        Bootstrap only needs to distinguish "remote snapshot already exists" from
+        "seed it now". For catalog-backed structured stores, forcing a full
+        snapshot assembly here can hydrate every segment/item and stall the
+        watchdog for tens of seconds after a transient backend flap. A metadata-
+        only probe is enough when it yields either a valid legacy snapshot body
+        or a current catalog manifest.
+        """
+
+        remote_state = self.remote_state
+        if remote_state is None or not remote_state.enabled:
+            return False
+        probe_loader = getattr(remote_state, "probe_snapshot_load", None)
+        if not callable(probe_loader):
+            return False
+        probe = probe_loader(
+            snapshot_kind=snapshot_kind,
+            prefer_cached_document_id=True,
+            prefer_metadata_only=True,
+            fast_fail=True,
+        )
+        if not isinstance(getattr(probe, "payload", None), Mapping):
+            if self._remote_is_required() and getattr(probe, "status", None) == "unavailable":
+                detail = str(getattr(probe, "detail", "") or "")
+                raise LongTermRemoteUnavailableError(
+                    detail or f"Required remote snapshot {snapshot_kind!r} is unavailable."
+                )
+            return False
+        payload = dict(probe.payload)
+        if self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=payload):
+            return True
+        remote_catalog = self._remote_catalog
+        return bool(
+            snapshot_kind in {"objects", "conflicts", "archive"}
+            and remote_catalog is not None
+            and remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload)
+        )
 
     def _is_valid_snapshot_payload(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> bool:
         if snapshot_kind == "objects":
@@ -590,6 +633,17 @@ class StructuredStoreSnapshotMixin:
         if remote_state is None or not remote_state.enabled:
             return
         try:
+            if self._should_persist_raw_structured_snapshot(
+                snapshot_kind=snapshot_kind,
+                payload=payload,
+            ):
+                remote_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != _SNAPSHOT_WRITTEN_AT_KEY
+                }
+                remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=remote_payload)
+                return
             if snapshot_kind in {"objects", "conflicts", "archive"}:
                 remote_catalog = self._remote_catalog
                 if remote_catalog is None:
@@ -620,6 +674,29 @@ class StructuredStoreSnapshotMixin:
             if self._remote_is_required():
                 raise
             _LOG.warning("Failed persisting remote %s snapshot; keeping local snapshot as source of truth.", snapshot_kind, exc_info=True)
+
+    def _should_persist_raw_structured_snapshot(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> bool:
+        """Return whether one structured snapshot should skip remote catalog wrapping.
+
+        Live ChonkyDB evidence on 2026-03-29 showed the external
+        ``snapshot_catalog`` read path timing out for the tiny conflict queue
+        across namespaces, and for an empty archive snapshot as well. These
+        two payloads stay small enough to persist directly as raw snapshot
+        bodies, which keeps Twinr on the stable generic snapshot path while the
+        large object collection still benefits from catalog sharding.
+        """
+
+        if snapshot_kind == "conflicts":
+            return True
+        if snapshot_kind != "archive":
+            return False
+        archive_items = payload.get("objects")
+        return isinstance(archive_items, list) and not archive_items
 
     def _iter_remote_item_payloads(
         self,

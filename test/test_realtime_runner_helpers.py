@@ -1,12 +1,18 @@
 """Targeted regression tests for extracted realtime-runner helper modules."""
 
+from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
+import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.workflows import realtime_follow_up, voice_orchestrator_runtime
+from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.remote_transcript_commit import RemoteTranscriptCommitCoordinator
+from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin
 
 
 class _FakeVoiceOrchestrator:
@@ -130,6 +136,33 @@ class _VoiceHarness:
         )
 
 
+class _FakeWorkflowForensics(WorkflowForensics):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        service: str,
+        run_id: str,
+        remaining_budget: int,
+        can_accept: bool,
+    ) -> None:
+        self.enabled = enabled
+        self.service = service
+        self.run_id = run_id
+        self._remaining_budget = remaining_budget
+        self._can_accept = can_accept
+        self.closed = False
+
+    def remaining_event_budget(self) -> int:
+        return self._remaining_budget
+
+    def can_accept_events(self) -> bool:
+        return self._can_accept
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class RealtimeFollowUpHelpersTests(unittest.TestCase):
     def test_follow_up_allowed_for_source_respects_proactive_gate(self) -> None:
         proactive_loop = _FollowUpHarness(enabled=True, proactive_enabled=False)
@@ -179,6 +212,29 @@ class RealtimeFollowUpHelpersTests(unittest.TestCase):
             ],
         )
 
+    def test_emit_closure_decision_includes_follow_up_action_when_present(self) -> None:
+        loop = _FollowUpHarness()
+
+        realtime_follow_up.emit_closure_decision(
+            loop,
+            ConversationClosureDecision(
+                close_now=False,
+                confidence=0.210,
+                reason="still_engaged",
+                follow_up_action="continue",
+            ),
+        )
+
+        self.assertEqual(
+            loop.emitted,
+            [
+                "conversation_closure_close_now=false",
+                "conversation_closure_confidence=0.210",
+                "conversation_closure_reason=still_engaged",
+                "conversation_closure_follow_up_action=continue",
+            ],
+        )
+
 
 class VoiceOrchestratorRuntimeHelpersTests(unittest.TestCase):
     def test_notify_voice_orchestrator_state_updates_cached_state_and_context(self) -> None:
@@ -223,6 +279,7 @@ class VoiceOrchestratorRuntimeHelpersTests(unittest.TestCase):
 
     def test_handle_remote_transcript_committed_reopens_follow_up_turn(self) -> None:
         loop = _VoiceHarness()
+        loop._last_voice_orchestrator_runtime_state = ("follow_up_open", "voice_activation", True)
 
         handled = voice_orchestrator_runtime.handle_remote_transcript_committed(
             loop,
@@ -241,6 +298,74 @@ class VoiceOrchestratorRuntimeHelpersTests(unittest.TestCase):
                     "play_initial_beep": False,
                 }
             ],
+        )
+        trace_messages = [args[0] for args, _kwargs in loop.traces]
+        self.assertIn("voice_orchestrator_transcript_committed_payload", trace_messages)
+        self.assertIn("voice_orchestrator_follow_up_transcript_committed", trace_messages)
+        payload_kwargs = next(
+            kwargs
+            for args, kwargs in loop.traces
+            if args and args[0] == "voice_orchestrator_transcript_committed_payload"
+        )
+        self.assertEqual(payload_kwargs["details"]["source"], "follow_up")
+        self.assertEqual(payload_kwargs["details"]["normalized"]["chars"], len("wie geht es dir"))
+
+    def test_workflow_trace_capacity_helper_rotates_exhausted_run(self) -> None:
+        old_tracer = _FakeWorkflowForensics(
+            enabled=True,
+            service="TwinrStreamingHardwareLoop",
+            run_id="old-run",
+            remaining_budget=12,
+            can_accept=False,
+        )
+        new_tracer = _FakeWorkflowForensics(
+            enabled=True,
+            service="TwinrStreamingHardwareLoop",
+            run_id="new-run",
+            remaining_budget=5000,
+            can_accept=True,
+        )
+        harness = SimpleNamespace(
+            workflow_forensics=old_tracer,
+            voice_orchestrator=SimpleNamespace(_forensics=old_tracer),
+            _project_root=Path(tempfile.gettempdir()),
+            traces=[],
+            emitted=[],
+        )
+
+        def _trace_event(*args: object, **kwargs: object) -> None:
+            harness.traces.append((args, kwargs))
+
+        def _try_emit(line: str) -> None:
+            harness.emitted.append(line)
+
+        harness._trace_event = _trace_event
+        harness._try_emit = _try_emit
+        harness._safe_error_text = lambda exc: str(exc)
+        harness._workflow_trace_min_session_event_budget = lambda: 512
+        harness._close_workflow_trace_replacement = lambda tracer: tracer.close()
+
+        with patch(
+            "twinr.agent.workflows.realtime_runtime.support.WorkflowForensics.from_env",
+            return_value=new_tracer,
+        ):
+            TwinrRealtimeSupportMixin._ensure_workflow_trace_capacity_for_session(
+                harness,
+                initial_source="follow_up",
+                proactive_trigger=None,
+                seed_present=True,
+            )
+
+        deadline = time.time() + 0.5
+        while not old_tracer.closed and time.time() < deadline:
+            time.sleep(0.01)
+
+        self.assertIs(harness.workflow_forensics, new_tracer)
+        self.assertIs(harness.voice_orchestrator._forensics, new_tracer)
+        self.assertTrue(old_tracer.closed)
+        self.assertIn(
+            "workflow_trace_rotated_for_conversation_session",
+            [args[0] for args, _kwargs in harness.traces],
         )
 
 

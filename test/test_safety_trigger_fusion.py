@@ -50,9 +50,51 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
                 audio=SocialAudioObservation(speech_detected=False),
             )
         )
+        bridge.observe(
+            SocialObservation(
+                observed_at=2.6,
+                inspected=True,
+                low_motion=False,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.FLOOR,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
+        bridge.observe(
+            SocialObservation(
+                observed_at=3.4,
+                inspected=True,
+                low_motion=False,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.FLOOR,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
+        bridge.observe(
+            SocialObservation(
+                observed_at=4.2,
+                inspected=True,
+                low_motion=False,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.FLOOR,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
         decision = bridge.observe(
             SocialObservation(
-                observed_at=5.5,
+                observed_at=5.0,
                 inspected=True,
                 low_motion=False,
                 vision=SocialVisionObservation(
@@ -92,7 +134,21 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
         )
         bridge.observe(
             SocialObservation(
-                observed_at=4.5,
+                observed_at=2.0,
+                inspected=True,
+                low_motion=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
+        bridge.observe(
+            SocialObservation(
+                observed_at=3.0,
                 inspected=True,
                 low_motion=True,
                 vision=SocialVisionObservation(
@@ -106,9 +162,15 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
         )
         decision = bridge.observe(
             SocialObservation(
-                observed_at=4.6,
-                inspected=False,
+                observed_at=4.0,
+                inspected=True,
                 low_motion=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
                 audio=SocialAudioObservation(
                     speech_detected=True,
                     distress_detected=True,
@@ -143,7 +205,21 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
         )
         bridge.observe(
             SocialObservation(
-                observed_at=4.5,
+                observed_at=2.0,
+                inspected=True,
+                low_motion=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
+        bridge.observe(
+            SocialObservation(
+                observed_at=3.0,
                 inspected=True,
                 low_motion=True,
                 vision=SocialVisionObservation(
@@ -157,9 +233,15 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
         )
         first = bridge.observe(
             SocialObservation(
-                observed_at=4.6,
-                inspected=False,
+                observed_at=4.0,
+                inspected=True,
                 low_motion=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
                 audio=SocialAudioObservation(
                     speech_detected=True,
                     distress_detected=True,
@@ -168,9 +250,15 @@ class SafetyTriggerFusionBridgeTests(unittest.TestCase):
         )
         second = bridge.observe(
             SocialObservation(
-                observed_at=5.0,
-                inspected=False,
+                observed_at=4.4,
+                inspected=True,
                 low_motion=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
                 audio=SocialAudioObservation(
                     speech_detected=True,
                     distress_detected=True,

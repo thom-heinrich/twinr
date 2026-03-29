@@ -7,6 +7,8 @@
 # BUG-5: Keep processing-feedback startup off the foreground turn path by warming rendered media asynchronously and falling back to tones while the clip cache is still cold.
 # BUG-6: Restored the synthesized default processing cue; the dragon media clip is no longer the default think sound, while optional media-loop support remains available for explicit non-default specs.
 # BUG-7: Restored the dragon processing MP3 as the default think cue while preserving BUG-5's async prewarm and tone fallback, so user-visible thinking audio matches the expected runtime sound without reintroducing cold-start silence.
+# BUG-8: Let PCM-capable processing fallback tones yield back to the dragon MP3 as soon as background prewarm
+#        finishes, and expose explicit startup prewarm so the first THINKING cue can hit the media path more often.
 # IMP-1: Pre-render and cache click-free PCM tone assets, then prefer raw-buffer playback for lower jitter, cleaner cancellation, and better compatibility with modern Pi audio backends.
 # IMP-2: Retuned the default cue palette and added default runtime ceilings so senior-facing devices avoid shrill feedback and endless loops when upstream workflows hang.
 
@@ -1140,6 +1142,25 @@ def _start_media_prewarm(
     return event
 
 
+def prewarm_working_feedback_media(
+    *,
+    kind: WorkingFeedbackKind,
+    config: TwinrConfig | None,
+    player=None,
+    playback_coordinator: PlaybackCoordinator | None = None,
+    emit: Callable[[str], None] | None = None,
+) -> Event | None:
+    """Best-effort prewarm for one feedback media clip outside a live turn."""
+
+    allow_pcm16_media = playback_coordinator is not None or _player_supports_pcm16_chunks(player)
+    return _start_media_prewarm(
+        kind=kind,
+        config=config,
+        allow_pcm16=allow_pcm16_media,
+        emit=emit,
+    )
+
+
 def _pcm16_bytes_to_wav_bytes(
     pcm_bytes: bytes,
     *,
@@ -1399,10 +1420,11 @@ def start_working_feedback_loop(
 
     def worker() -> None:
         nonlocal resolved_media, prewarm_event
+        media_unavailable_after_prewarm = False
 
         def maybe_refresh_media(*, wait_budget_s: float = 0.0) -> None:
-            nonlocal resolved_media, prewarm_event
-            if resolved_media is not None or config is None:
+            nonlocal resolved_media, prewarm_event, media_unavailable_after_prewarm
+            if resolved_media is not None or config is None or media_unavailable_after_prewarm:
                 return
             if prewarm_event is not None and wait_budget_s > 0.0:
                 prewarm_event.wait(wait_budget_s)
@@ -1411,6 +1433,9 @@ def start_working_feedback_loop(
                 config=config,
                 allow_pcm16=allow_pcm16_media,
             )
+            if resolved_media is None and prewarm_event is not None and prewarm_event.is_set():
+                media_unavailable_after_prewarm = True
+                return
             if resolved_media is None and prewarm_event is None:
                 prewarm_event = _start_media_prewarm(
                     kind=kind,
@@ -1478,10 +1503,13 @@ def start_working_feedback_loop(
                 timed_out = Event()
 
                 def _should_stop_tone_playback() -> bool:
-                    return should_stop_continuous_playback(
+                    if should_stop_continuous_playback(
                         feedback_started_at=feedback_started_at,
                         timed_out=timed_out,
-                    )
+                    ):
+                        return True
+                    maybe_refresh_media()
+                    return resolved_media is not None
 
                 tone_chunks = _iter_repeating_pcm16_clip_chunks(
                     rendered_tone.pcm_bytes,
@@ -1510,7 +1538,49 @@ def start_working_feedback_loop(
                 finally:
                     if timed_out.is_set():
                         _safe_emit(emit, f"working_feedback_timeout={kind}")
-                return
+                if stop_event.is_set() or timed_out.is_set():
+                    return
+                maybe_refresh_media()
+                if (
+                    resolved_media is not None
+                    and resolved_media.pcm_bytes is not None
+                    and resolved_media.sample_rate is not None
+                    and resolved_media.channels is not None
+                ):
+                    timed_out = Event()
+
+                    def _should_stop_upgraded_media_playback() -> bool:
+                        return should_stop_continuous_playback(
+                            feedback_started_at=feedback_started_at,
+                            timed_out=timed_out,
+                        )
+
+                    pcm_chunks = _iter_repeating_attenuated_pcm16_chunks(
+                        resolved_media,
+                        stop_event=stop_event,
+                    )
+                    try:
+                        if playback_coordinator is None:
+                            _play_pcm16_clip(
+                                player,
+                                pcm_chunks=pcm_chunks,
+                                sample_rate=resolved_media.sample_rate,
+                                channels=resolved_media.channels,
+                                should_stop=_should_stop_upgraded_media_playback,
+                            )
+                        else:
+                            playback_coordinator.play_pcm16_chunks(
+                                owner=owner,
+                                priority=PlaybackPriority.FEEDBACK,
+                                chunks=pcm_chunks,
+                                sample_rate=resolved_media.sample_rate,
+                                channels=resolved_media.channels,
+                                should_stop=_should_stop_upgraded_media_playback,
+                            )
+                    finally:
+                        if timed_out.is_set():
+                            _safe_emit(emit, f"working_feedback_timeout={kind}")
+                    return
 
             while not stop_event.is_set():
                 if not _is_active_player_loop(player_state, generation, stop_event):

@@ -15,11 +15,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
 from typing import Any
 
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    clear_pending_conversation_follow_up_hint,
+    pending_conversation_follow_up_hint_trace_details,
+)
 from twinr.agent.workflows.remote_transcript_commit import (
     RemoteTranscriptCommit,
     RemoteTranscriptWaitHandle,
@@ -98,6 +103,20 @@ def _normalize_remote_transcript(transcript: Any) -> str:
     if len(text) > _MAX_REMOTE_TRANSCRIPT_CHARS:
         text = text[:_MAX_REMOTE_TRANSCRIPT_CHARS].rstrip()
     return text
+
+
+def _transcript_trace_details(transcript: str) -> dict[str, object]:
+    """Return privacy-safe trace fields for one committed transcript."""
+
+    normalized = str(transcript or "").strip()
+    if not normalized:
+        return {"present": False, "chars": 0, "words": 0, "sha256_12": ""}
+    return {
+        "present": True,
+        "chars": len(normalized),
+        "words": len(normalized.split()),
+        "sha256_12": hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12],
+    }
 
 
 def _is_timeout_reason(reason: str | None) -> bool:
@@ -551,12 +570,26 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
 
         if len(raw_transcript.strip()) > _MAX_REMOTE_TRANSCRIPT_CHARS:
             loop.emit("voice_orchestrator_transcript_truncated=true")
+        loop._trace_event(
+            "voice_orchestrator_transcript_committed_payload",
+            kind="workflow",
+            details={
+                "source": committed_source,
+                "raw_chars": len(raw_transcript.strip()),
+                "normalized": _transcript_trace_details(committed_transcript),
+                "follow_up_hint": pending_conversation_follow_up_hint_trace_details(
+                    getattr(loop, "runtime", None)
+                ),
+            },
+        )
 
         if committed_source == "follow_up":
             if not _follow_up_reopen_allowed(loop, initial_source="follow_up"):
+                clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
                 loop.emit("voice_orchestrator_follow_up_skipped=disabled")
                 return False
             if not _cached_follow_up_window_open(loop):
+                clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
                 loop.emit("voice_orchestrator_follow_up_skipped=closed")
                 return False
             if bool(getattr(loop, "_conversation_session_active", False)):
@@ -582,6 +615,7 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
 
         if not loop._required_remote_dependency_current_ready():
             loop._request_required_remote_dependency_refresh()
+            clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
             loop.emit("voice_orchestrator_follow_up_skipped=dependency_unready")
             return False
 
@@ -629,10 +663,12 @@ def handle_remote_follow_up_closed(loop: Any, reason: str) -> None:
 
         runtime_status = getattr(getattr(loop, "runtime", None), "status", None)
         if getattr(runtime_status, "value", None) != "listening":
+            clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
             loop.emit("voice_orchestrator_follow_up_closed_ignored=runtime_not_listening")
             _notify_voice_state(loop, "waiting", detail=normalized_reason)
             return
 
+        clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
         loop.runtime.cancel_listening()
         loop._emit_status(force=True)
         _notify_voice_state(loop, "waiting", detail=normalized_reason)

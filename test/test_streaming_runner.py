@@ -22,6 +22,9 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingTurnResponse,
 )
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    remember_pending_conversation_follow_up_hint,
+)
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
@@ -897,11 +900,19 @@ class StubSupervisorDecision:
 
 
 class StubConversationClosureEvaluator:
-    def __init__(self, *, close_now: bool, confidence: float = 0.93, reason: str = "explicit_goodbye") -> None:
+    def __init__(
+        self,
+        *,
+        close_now: bool,
+        confidence: float = 0.93,
+        reason: str = "explicit_goodbye",
+        follow_up_action: str | None = None,
+    ) -> None:
         self.decision = ConversationClosureDecision(
             close_now=close_now,
             confidence=confidence,
             reason=reason,
+            follow_up_action=follow_up_action,
         )
         self.calls: list[dict[str, object]] = []
 
@@ -933,6 +944,7 @@ class TimedConversationClosureEvaluator:
             close_now=self.close_now,
             confidence=0.91 if self.close_now else 0.18,
             reason="explicit_goodbye" if self.close_now else "still_engaged",
+            follow_up_action="end" if self.close_now else None,
         )
 
 
@@ -947,6 +959,7 @@ class BlockingConversationClosureEvaluator:
             close_now=False,
             confidence=0.12,
             reason="slow_closure_eval",
+            follow_up_action=None,
         )
 
 
@@ -966,6 +979,7 @@ class InterruptingConversationClosureEvaluator:
             close_now=False,
             confidence=0.12,
             reason="slow_closure_eval",
+            follow_up_action=None,
         )
 
 
@@ -2495,7 +2509,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(feedback_events, [])
         self.assertEqual(len(dual_lane.run_handoff_calls), 1)
 
-    def test_prefetched_direct_supervisor_reply_returns_to_waiting_without_processing_feedback(self) -> None:
+    def test_prefetched_direct_supervisor_reply_skips_processing_feedback(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -2566,6 +2580,81 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(processing_feedback_calls, [])
         self.assertEqual(runtime.status.value, "waiting")
         self.assertEqual(runtime.snapshot_store.load().status, "waiting")
+
+    def test_dual_lane_bridge_reply_starts_processing_feedback_only_after_first_audio(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            release_first_playback = Event()
+            player = BlockingFirstPlaybackPlayer(release_first_playback=release_first_playback)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=player,
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            feedback_started = Event()
+            processing_feedback_calls: list[str] = []
+
+            def fake_start(kind: str):
+                self.assertTrue(
+                    player.first_playback_started.is_set(),
+                    "processing feedback must not start before the bridge audio begins",
+                )
+                processing_feedback_calls.append(kind)
+                feedback_started.set()
+                return lambda: None
+
+            loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+            loop.first_word_provider = DelayedFirstWordProvider(
+                config,
+                delay_s=0.01,
+                reply=FirstWordReply(mode="filler", spoken_text="Ich schaue kurz nach."),
+            )
+
+            def fake_final_response(transcript: str, *, turn_instructions: str | None, prefetched_decision=None):
+                del transcript, turn_instructions, prefetched_decision
+                if not player.first_playback_started.wait(timeout=1.0):
+                    raise AssertionError("bridge playback never started")
+                release_first_playback.set()
+                if not feedback_started.wait(timeout=1.0):
+                    raise AssertionError("processing feedback never resumed after bridge audio")
+                return SimpleNamespace(
+                    text="Hier sind die heutigen Nachrichten.",
+                    response_id="resp_final",
+                    request_id="req_final",
+                    rounds=1,
+                    tool_calls=(),
+                    used_web_search=True,
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+
+            loop._run_dual_lane_final_response = fake_final_response  # type: ignore[method-assign]
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Was gibt es heute fuer Nachrichten?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(processing_feedback_calls, ["processing"])
 
     def test_dual_lane_direct_reply_uses_supervisor_instead_of_first_word_provider(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -3063,6 +3152,144 @@ class StreamingRunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_voice_activation_statement_answer_does_not_rearm_follow_up(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            lines: list[str] = []
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+            loop.voice_orchestrator = FakeVoiceOrchestrator()
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Es ist zehn Uhr.",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop.conversation_closure_evaluator = StubConversationClosureEvaluator(
+                close_now=False,
+                confidence=0.21,
+                reason="still_engaged",
+            )
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie spaet ist es?",
+                listen_source="voice_activation",
+                proactive_trigger=None,
+            )
+
+        self.assertFalse(keep_listening)
+        self.assertEqual(runtime.status.value, "waiting")
+        assert loop.voice_orchestrator is not None
+        self.assertEqual(
+            loop.voice_orchestrator.states,
+            [
+                ("thinking", "voice_activation", False),
+                ("waiting", "voice_activation", False),
+            ],
+        )
+        self.assertIn("conversation_follow_up_reply_gate=assistant_no_reply_expected", lines)
+        self.assertIn("conversation_follow_up_vetoed=closure", lines)
+
+    def test_voice_activation_timezone_clarification_without_question_mark_rearms_follow_up(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            lines: list[str] = []
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+            loop.voice_orchestrator = FakeVoiceOrchestrator()
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply=(
+                    "Ich brauche deine Zeitzone oder deinen Ort, um dir die genaue Uhrzeit zu sagen. "
+                    "Wenn du mir das nennst, sage ich dir sofort die aktuelle Zeit."
+                ),
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop.conversation_closure_evaluator = StubConversationClosureEvaluator(
+                close_now=False,
+                confidence=0.21,
+                reason="still_engaged",
+                follow_up_action="continue",
+            )
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie spaet ist es in New York?",
+                listen_source="voice_activation",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(runtime.status.value, "listening")
+        assert loop.voice_orchestrator is not None
+        self.assertEqual(
+            loop.voice_orchestrator.states,
+            [
+                ("thinking", "voice_activation", False),
+                ("follow_up_open", "voice_activation", True),
+            ],
+        )
+        self.assertIn("conversation_follow_up_action=continue", lines)
+        self.assertNotIn("conversation_follow_up_reply_gate=assistant_no_reply_expected", lines)
+
     def test_voice_activation_quiet_turn_finishes_speaking_instead_of_rearming_follow_up(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -3130,7 +3357,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 proactive_trigger=None,
             )
 
-        self.assertTrue(keep_listening)
+        self.assertFalse(keep_listening)
         self.assertTrue(runtime.voice_quiet_active())
         self.assertEqual(runtime.status.value, "waiting")
         self.assertNotIn(
@@ -3139,6 +3366,7 @@ class StreamingRunnerTests(unittest.TestCase):
         )
         self.assertIn("streaming_follow_up_rearm_snapshot=true", lines)
         self.assertIn("streaming_follow_up_rearm_allowed_now=false", lines)
+        self.assertIn("conversation_follow_up_reply_gate=assistant_no_reply_expected", lines)
         self.assertIn("streaming_turn_finish_path=finish_speaking", lines)
         assert loop.voice_orchestrator is not None
         self.assertEqual(
@@ -3273,6 +3501,60 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(loop.runtime.status.value, "listening")
         self.assertEqual(loop.runtime._runtime_flow_state()["active_turn_id"], active_turn_id)
         self.assertEqual(completed_turns[0]["transcript"], "wie geht es dir")
+
+    def test_streaming_follow_up_turn_includes_pending_carryover_guidance(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.begin_listening(request_source="follow_up")
+            remember_pending_conversation_follow_up_hint(
+                runtime,
+                summary=(
+                    "Recent turns: user=wie spaet ist es in New York; assistant=In New York ist es gerade 10:53 Uhr; "
+                    "user=mich; assistant=Meinst du etwas Bestimmtes?."
+                ),
+            )
+
+            handled = loop._run_single_text_turn(
+                transcript="Ich meinte, wie spaet es ist.",
+                listen_source="follow_up",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(handled)
+        conversation = dual_lane.run_calls[0]["conversation"]
+        assert conversation is not None
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Preserve explicit anchors already established" in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
 
     def test_direct_follow_up_rearms_to_listening_without_waiting_gap(self) -> None:
         class SequencedRecorder:

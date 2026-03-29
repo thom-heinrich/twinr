@@ -10,7 +10,9 @@ turn-boundary evaluation, and post-response closure checks.
 - Adapt listening timeout, pause, and grace values from observed turns
 - Build bounded language instructions for user replies and memory text
 - Evaluate streaming turn boundaries through tool-calling providers
-- Evaluate whether follow-up listening should close after a response, including a fast structured-decision path for OpenAI and a hard wall-clock watchdog when provider calls stall
+- Evaluate whether follow-up listening should close after a response, including an explicit structured `follow_up_action` contract for continue/end, question-style fast paths, a fast structured-decision path for OpenAI, and a hard wall-clock watchdog when provider calls stall
+- Derive and store one bounded immediate follow-up carryover hint from the just-finished exchange so short clarification turns can preserve the newly established anchors from the still-open thread
+- Expose privacy-safe observability helpers for that carryover hint so workflows can trace whether a hint was built, stored, cleared, or injected without logging raw user text
 - Accept machine-readable turn-steering cues, including compact semantic match summaries, so closure decisions can return matched shared-thread or cooling topics back to the runtime without over-matching nearby themes
 
 `conversation` does **not** own:
@@ -28,11 +30,27 @@ turn-boundary evaluation, and post-response closure checks.
 | `language.py` | Build language and memory instructions |
 | `turn_controller.py` | Evaluate streaming turn boundaries |
 | `closure.py` | Evaluate post-response closure and echo matched steering topics |
+| `follow_up_context.py` | Build and store one bounded carryover hint for the next explicit follow-up turn, plus privacy-safe trace payload helpers for follow-up accountability |
 | `__init__.py` | Mark package only |
 
 `normalize_turn_text()` lives in `decision_core.py` and is the canonical import
 for workflow consumers that need transcript equality checks outside the
 controller itself.
+
+## Follow-up carryover accountability
+
+Immediate follow-up carryover is intentionally observable without leaking raw
+speech text. `follow_up_context.py` exports privacy-safe trace helpers that
+reduce transcripts and summaries to bounded presence, length, and short hash
+metadata. Workflow consumers use those helpers to record:
+
+- whether Twinr built a carryover hint after an answer
+- whether the runtime stored or cleared that hint for the next turn
+- whether provider-context builders actually injected the pending hint
+
+This split keeps the carryover policy inside `conversation` while letting the
+runtime prove, after a live bug, whether the right thread anchor was available
+to the next clarification turn.
 
 ## Usage
 

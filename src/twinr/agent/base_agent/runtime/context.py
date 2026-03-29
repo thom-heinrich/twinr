@@ -17,10 +17,16 @@ import json
 import math
 import threading
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow, AdaptiveTimingProfile
+from twinr.agent.base_agent.conversation.follow_up_context import (
+    pending_conversation_follow_up_hint_trace_details,
+    pending_conversation_follow_up_system_message,
+)
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
 from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError, LongTermRemoteUnavailableError
@@ -336,6 +342,74 @@ class TwinrRuntimeContextMixin:
         text = TwinrRuntimeContextMixin._sanitize_context_message_text(value, limit=limit)
         if text:
             messages.append(("system", text))
+
+    @staticmethod
+    def _invoke_trace_event(
+        trace_event: Callable[..., None],
+        message: str,
+        *,
+        kind: str,
+        details: dict[str, object],
+        level: str,
+    ) -> None:
+        """Call one runtime trace hook through a typed helper."""
+
+        trace_event(
+            message,
+            kind=kind,
+            details=details,
+            level=level,
+        )
+
+    def _safe_trace_runtime_context_event(
+        self,
+        message: str,
+        *,
+        kind: str,
+        details: dict[str, object] | None = None,
+        level: str = "INFO",
+    ) -> None:
+        """Emit one bounded runtime-context trace event when tracing is available."""
+
+        tracer = getattr(self, "_trace_event", None)
+        if not callable(tracer):
+            return
+        trace_event = cast(Callable[..., None], tracer)
+        try:
+            self._invoke_trace_event(
+                trace_event,
+                message,
+                kind=kind,
+                details=dict(details or {}),
+                level=level,
+            )
+        except Exception:
+            return
+
+    def _append_follow_up_carryover_message(
+        self,
+        messages: list[tuple[str, str]],
+        carryover: object | None,
+        *,
+        context_builder: str,
+        tool_context: bool,
+    ) -> None:
+        """Append and trace one active follow-up carryover system message."""
+
+        text = self._sanitize_context_message_text(carryover, limit=_DEFAULT_CONTEXT_MESSAGE_LIMIT)
+        if not text:
+            return
+        messages.append(("system", text))
+        self._safe_trace_runtime_context_event(
+            "provider_context_follow_up_carryover_injected",
+            kind="workflow",
+            details={
+                "context_builder": context_builder,
+                "tool_context": tool_context,
+                "message_count": len(messages),
+                **pending_conversation_follow_up_hint_trace_details(self),
+            },
+        )
 
     @staticmethod
     def _bounded_int(
@@ -677,6 +751,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             discovery_guidance = self._discovery_guidance_message(tool_context=tool_context)
             self_coding_guidance = self._self_coding_guidance_message(tool_context=tool_context)
             display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="provider_context")
@@ -708,6 +783,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the base language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="provider_conversation_context",
+            tool_context=tool_context,
+        )
         self._append_optional_system_message(messages, discovery_guidance)
         self._append_optional_system_message(messages, self_coding_guidance)
         self._append_optional_system_message(messages, display_grounding)
@@ -923,6 +1004,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             discovery_guidance = self._discovery_guidance_message(tool_context=True)
             self_coding_guidance = self._self_coding_guidance_message(tool_context=True)
             display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="tool_tiny_recent_context")
@@ -937,6 +1019,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the compact tool language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="tool_provider_tiny_recent_conversation_context",
+            tool_context=True,
+        )
         self._append_optional_system_message(messages, discovery_guidance)
         self._append_optional_system_message(messages, self_coding_guidance)
         self._append_optional_system_message(messages, display_grounding)
@@ -953,6 +1041,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="supervisor_direct_context")
             retrieval_query = self._normalized_retrieval_query(
                 query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
@@ -988,6 +1077,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the direct-reply language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="supervisor_direct_provider_conversation_context",
+            tool_context=False,
+        )
         self._append_optional_system_message(messages, display_grounding)
         if fast_topic_messages:
             self._append_optional_system_message(messages, _LONG_TERM_MEMORY_TRUST_ENVELOPE, limit=2000)
@@ -1008,6 +1103,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="search_context")
             raw_tail = self._raw_tail_context_unlocked(limit=3)
 
@@ -1019,6 +1115,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the search language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="search_provider_conversation_context",
+            tool_context=False,
+        )
         self._append_optional_system_message(messages, display_grounding)
         messages.extend(raw_tail)
         return tuple(messages)
@@ -1034,6 +1136,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="supervisor_context")
             local_summary = self._local_summary_context_unlocked(limit=1)
             raw_tail = self._raw_tail_context_unlocked(
@@ -1048,6 +1151,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the fast-lane language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="supervisor_provider_conversation_context",
+            tool_context=False,
+        )
         self._append_optional_system_message(messages, display_grounding)
         messages.extend(local_summary)
         messages.extend(raw_tail)
@@ -1059,6 +1168,7 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
             guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
             local_summary = self._local_summary_context_unlocked(limit=1)
             raw_tail = self._raw_tail_context_unlocked(
                 limit=self._streaming_context_turn_limit(attr_name="streaming_first_word_context_turns", default=2)
@@ -1072,6 +1182,12 @@ class TwinrRuntimeContextMixin:
             failure_message="Twinr could not build the first-word language contract and continued with reduced context.",
         )
         self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="first_word_provider_conversation_context",
+            tool_context=False,
+        )
         messages.extend(local_summary)
         messages.extend(raw_tail)
         return tuple(messages)

@@ -24,6 +24,7 @@ from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailable
 from twinr.proactive.governance.governor import ProactiveGovernorCandidate, ProactiveGovernorReservation
 from twinr.proactive.runtime.ambiguous_room_guard import (
     AmbiguousRoomGuardSnapshot,
+    ambiguous_room_guard_requires_hard_block,
     derive_ambiguous_room_guard,
 )
 from twinr.proactive.runtime.multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
@@ -368,7 +369,7 @@ class BackgroundLongTermMixin:
             observed_at=None if observed_at is None else observed_at,
             live_facts=live_facts,
         )
-        if not snapshot.guard_active:
+        if not snapshot.guard_active or not ambiguous_room_guard_requires_hard_block(snapshot.reason):
             return False
 
         reservation, skip_reason = self._longterm_reserve_and_skip_candidate(

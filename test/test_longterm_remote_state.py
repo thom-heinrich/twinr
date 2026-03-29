@@ -126,8 +126,10 @@ class _CacheAwareFakeRemoteState:
         snapshot_kind: str,
         local_path: Path | None = None,
         prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
     ):
-        del local_path
+        del local_path, fast_fail
         cached = self._cache.get(snapshot_kind)
         if cached is not None:
             return LongTermRemoteSnapshotProbe(
@@ -141,6 +143,7 @@ class _CacheAwareFakeRemoteState:
             {
                 "snapshot_kind": snapshot_kind,
                 "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
             }
         )
         payload = dict(self._payloads[snapshot_kind])
@@ -621,22 +624,22 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertTrue(result.ready)
         self.assertEqual(prompt_state.load_calls, [])
         self.assertEqual(prompt_state.probe_calls, [
-            {"snapshot_kind": "prompt_memory", "prefer_cached_document_id": True},
-            {"snapshot_kind": "user_context", "prefer_cached_document_id": True},
-            {"snapshot_kind": "personality_context", "prefer_cached_document_id": True},
+            {"snapshot_kind": "prompt_memory", "prefer_cached_document_id": True, "prefer_metadata_only": True},
+            {"snapshot_kind": "user_context", "prefer_cached_document_id": True, "prefer_metadata_only": True},
+            {"snapshot_kind": "personality_context", "prefer_cached_document_id": True, "prefer_metadata_only": True},
         ])
         self.assertEqual(object_state.load_calls, [])
         self.assertEqual(object_state.probe_calls, [
-            {"snapshot_kind": "objects", "prefer_cached_document_id": True},
-            {"snapshot_kind": "conflicts", "prefer_cached_document_id": True},
+            {"snapshot_kind": "objects", "prefer_cached_document_id": True, "prefer_metadata_only": True},
+            {"snapshot_kind": "conflicts", "prefer_cached_document_id": True, "prefer_metadata_only": True},
         ])
         self.assertEqual(graph_state.load_calls, [])
         self.assertEqual(graph_state.probe_calls, [
-            {"snapshot_kind": "graph", "prefer_cached_document_id": True},
+            {"snapshot_kind": "graph", "prefer_cached_document_id": True, "prefer_metadata_only": True},
         ])
         self.assertEqual(midterm_state.load_calls, [])
         self.assertEqual(midterm_state.probe_calls, [
-            {"snapshot_kind": "midterm", "prefer_cached_document_id": True},
+            {"snapshot_kind": "midterm", "prefer_cached_document_id": True, "prefer_metadata_only": True},
         ])
 
     def test_remote_snapshot_save_and_load_round_trip(self) -> None:
@@ -3723,7 +3726,310 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(opener.calls[1]["timeout"], 20.0)
         self.assertIn("/v1/external/instance", str(opener.calls[0]["full_url"]))
         self.assertIn("/v1/external/documents/full", str(opener.calls[1]["full_url"]))
-        self.assertIn("origin_uri=__status_probe__%3Aremote_status", str(opener.calls[1]["full_url"]))
+        self.assertIn("document_id=00000000-0000-0000-0000-000000000000", str(opener.calls[1]["full_url"]))
+
+    def test_status_accepts_bounded_400_liveness_probe_when_instance_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            opener = FakeOpener()
+            opener.queue_exception(socket.timeout("instance slow"))
+            opener.queue_http_error(400, {"detail": "selector_invalid"})
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+                chonkydb_base_url="https://memory.test",
+                chonkydb_api_key="secret-key",
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(
+                        base_url="https://memory.test",
+                        api_key="secret-key",
+                        timeout_s=8.0,
+                    ),
+                    opener=opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            status = state.status()
+
+        self.assertTrue(status.ready)
+        self.assertIsNone(status.detail)
+        self.assertEqual(len(opener.calls), 2)
+
+    def test_status_probe_clamps_an_overlarge_client_timeout_to_the_probe_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+                chonkydb_base_url="https://memory.test",
+                chonkydb_api_key="secret-key",
+            )
+
+            class _StatusClient:
+                def __init__(self, timeout_s: float, calls: list[float]) -> None:
+                    self.config = SimpleNamespace(timeout_s=timeout_s)
+                    self._calls = calls
+
+                def instance(self):
+                    self._calls.append(float(self.config.timeout_s))
+                    return SimpleNamespace(ready=True)
+
+                def clone_with_timeout(self, timeout_s: float):
+                    return _StatusClient(timeout_s, self._calls)
+
+            observed_timeouts: list[float] = []
+            read_client = _StatusClient(timeout_s=90.0, calls=observed_timeouts)
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=read_client,
+                write_client=object(),
+            )
+
+            status = state.status()
+
+        self.assertTrue(status.ready)
+        self.assertEqual(observed_timeouts, [state._status_probe_timeout_s()])
+
+    def test_origin_resolution_client_clamps_an_overlarge_timeout_to_the_bootstrap_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+
+            class _ClonableClient:
+                def __init__(self, timeout_s: float) -> None:
+                    self.config = SimpleNamespace(timeout_s=timeout_s)
+
+                def clone_with_timeout(self, timeout_s: float):
+                    return _ClonableClient(timeout_s)
+
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=object(),
+                write_client=object(),
+            )
+
+            tuned = state._origin_resolution_client(_ClonableClient(timeout_s=90.0))
+
+        self.assertEqual(tuned.config.timeout_s, state._origin_resolution_bootstrap_timeout_s())
+
+    def test_load_snapshot_via_uri_can_resolve_snapshot_from_metadata_without_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "record": {
+                        "document_id": "doc-123",
+                        "payload": {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-29T10:00:00+00:00",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:meta"}]},
+                        },
+                    },
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            result = state._load_snapshot_via_uri(
+                state.read_client,
+                snapshot_kind="objects",
+                source="origin_uri",
+                prefer_metadata_only=True,
+            )
+
+        self.assertEqual(result.payload, {"schema": "object_store", "objects": [{"memory_id": "fact:meta"}]})
+        self.assertEqual(len(read_opener.calls), 1)
+
+    def test_load_snapshot_via_uri_falls_back_to_content_when_metadata_has_no_snapshot_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_json({"success": True, "record": {"document_id": "doc-123", "metadata": {"status": "ok"}}})
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "doc-123",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-29T10:00:01+00:00",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:content"}]},
+                        }
+                    ),
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            result = state._load_snapshot_via_uri(
+                state.read_client,
+                snapshot_kind="objects",
+                source="origin_uri",
+                prefer_metadata_only=True,
+            )
+
+        self.assertEqual(result.payload, {"schema": "object_store", "objects": [{"memory_id": "fact:content"}]})
+        self.assertEqual(len(read_opener.calls), 2)
+
+    def test_probe_snapshot_load_accepts_prefer_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "record": {
+                        "document_id": "pointer-doc-123",
+                        "payload": {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:objects",
+                            "updated_at": "2026-03-29T10:00:00+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "objects",
+                                "document_id": "doc-123",
+                            },
+                        },
+                    },
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            result = state.probe_snapshot_load(
+                snapshot_kind="__pointer__:objects",
+                prefer_metadata_only=True,
+            )
+
+        self.assertEqual(
+            result.payload,
+            {
+                "schema": "twinr_remote_snapshot_pointer_v1",
+                "version": 1,
+                "snapshot_kind": "objects",
+                "document_id": "doc-123",
+            },
+        )
+        self.assertEqual(len(read_opener.calls), 1)
+
+    def test_probe_snapshot_load_fast_fail_avoids_bootstrap_timeout_inflation_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_http_error(503, {"detail": "busy"})
+            read_opener.queue_http_error(503, {"detail": "busy"})
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key", timeout_s=8.0),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            result = state.probe_snapshot_load(
+                snapshot_kind="conflicts",
+                prefer_cached_document_id=True,
+                prefer_metadata_only=True,
+                fast_fail=True,
+            )
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(len(read_opener.calls), 2)
+        self.assertTrue(all(call["timeout"] == 8.0 for call in read_opener.calls))
+
+    def test_probe_snapshot_load_tries_origin_after_pointer_failure_opens_circuit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=1,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            read_opener = FakeOpener()
+            read_opener.queue_http_error(503, {"detail": "pointer busy"})
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "doc-origin",
+                    "record": {
+                        "document_id": "doc-origin",
+                        "payload": {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-29T10:00:02+00:00",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:origin"}]},
+                        },
+                    },
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+            )
+
+            result = state.probe_snapshot_load(snapshot_kind="objects", prefer_metadata_only=True)
+
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.selected_source, "origin_uri")
+        self.assertEqual(result.payload, {"schema": "object_store", "objects": [{"memory_id": "fact:origin"}]})
+        self.assertFalse(state._circuit_is_open())
+        self.assertEqual(len(read_opener.calls), 2)
+        self.assertIn("__pointer__%253Aobjects", read_opener.calls[0]["full_url"])
+        self.assertIn("%2Fobjects&include_content=false", read_opener.calls[1]["full_url"])
 
     def test_attest_external_readiness_clears_local_cooldown_and_probe_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -11,7 +11,7 @@ No migration is required. The public import path stays
 - `compat.py`: legacy helper functions, constants, and telemetry-safe emit helpers
 - `coordinator_core.py`: dependency wiring plus the main proactive tick/orchestration path
 - `coordinator_display.py`: dedicated HDMI attention and gesture refresh workflows that consume the shared runtime perception orchestrator instead of direct lane-local temporal policy
-- `coordinator_perception.py`: shared display-refresh cycle state that reuses one combined `perception_stream` snapshot when attention and gesture refresh are due together
+- `coordinator_perception.py`: shared display-refresh cycle state that reuses one combined `perception_stream` snapshot when display lanes can safely share it, while dedicated gesture-fast refresh can still bypass the shared capture to preserve low-latency HDMI acknowledgement
 - `coordinator_observation.py`: stable observation-mixin facade that composes the focused observation helper modules
 - `coordinator_observation_display.py`: automation-dispatch, HDMI display, gesture, and camera-surface helper bridges
 - `coordinator_observation_facts.py`: automation fact payload assembly and rising-edge sensor-event derivation, reusing the same runtime attention orchestrator that drives HDMI and servo

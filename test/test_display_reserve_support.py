@@ -29,7 +29,7 @@ class DisplayReserveSupportTests(unittest.TestCase):
     def test_format_timestamp_serializes_as_utc_isoformat(self) -> None:
         value = datetime(2026, 3, 24, 9, 15, tzinfo=timezone.utc)
 
-        self.assertEqual(format_timestamp(value), "2026-03-24T09:15:00+00:00")
+        self.assertEqual(format_timestamp(value), "2026-03-24T09:15:00Z")
 
     def test_parse_local_time_falls_back_for_invalid_values(self) -> None:
         self.assertEqual(

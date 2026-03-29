@@ -8,7 +8,7 @@ owned_concerns:
   - Adaptive listening-window state, learning, and persistence
   - Language-normalized prompt contracts for user replies and memory text
   - Tool-called streaming turn-boundary decisions
-  - Post-response closure decisions, including a fast structured-decision path plus matched turn-steering topics for workflow follow-up policy
+  - Post-response closure decisions, including an explicit structured continue/end follow-up contract, question-style fast paths, a fast structured-decision path, and matched turn-steering topics for workflow follow-up policy
 out_of_scope:
   - Audio capture or playback orchestration
   - Workflow orchestration in src/twinr/agent/workflows
@@ -51,13 +51,14 @@ files:
       - ToolCallingTurnDecisionEvaluator
       - StreamingTurnController
   - path: closure.py
-    role: Post-response closure evaluation plus matched turn-steering topic echo
+    role: Post-response closure evaluation, explicit continue/end follow-up action detection, plus matched turn-steering topic echo
     exports:
       - ConversationClosureEvaluator
       - ConversationClosureDecision
       - ConversationClosureEvaluation
       - StructuredConversationClosureEvaluator
       - ToolCallingConversationClosureEvaluator
+      - assistant_expects_immediate_reply
 root_exports:
   path: src/twinr/agent/base_agent/__init__.py
   names:

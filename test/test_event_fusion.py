@@ -36,14 +36,15 @@ class RollingWindowBufferTests(unittest.TestCase):
         self.assertEqual(buffer.oldest_timestamp, 3.0)
         self.assertEqual(buffer.newest_timestamp, 7.0)
 
-    def test_clamps_regressing_timestamp_to_keep_monotonic_order(self) -> None:
+    def test_clamps_too_late_regressing_timestamp_to_current_watermark(self) -> None:
         buffer = RollingWindowBuffer[str](horizon_s=5.0)
 
         first = buffer.append(5.0, "first")
         second = buffer.append(4.0, "second")
 
         self.assertEqual(first.observed_at, 5.0)
-        self.assertEqual(second.observed_at, 5.0)
+        self.assertEqual(second.observed_at, 4.75)
+        self.assertEqual([sample.observed_at for sample in buffer.snapshot()], [4.75, 5.0])
 
 
 class AudioEventTests(unittest.TestCase):
@@ -70,45 +71,39 @@ class AudioEventTests(unittest.TestCase):
 
 
 class VisionSequenceTests(unittest.TestCase):
-    def test_derives_drop_and_floor_sequences_from_recent_pose_history(self) -> None:
+    def test_derives_edge_sequences_only_near_onset_and_hold_sequences_after_dense_support(self) -> None:
         buffer = RollingWindowBuffer[SocialVisionObservation](horizon_s=8.0)
-        buffer.append(
-            1.0,
-            SocialVisionObservation(
-                person_visible=True,
-                person_count=1,
-                body_pose=SocialBodyPose.SEATED,
-                motion_state=SocialMotionState.STILL,
-            ),
-        )
-        buffer.append(
-            2.0,
-            SocialVisionObservation(
-                person_visible=True,
-                person_count=1,
-                body_pose=SocialBodyPose.FLOOR,
-                motion_state=SocialMotionState.STILL,
-            ),
-        )
-        buffer.append(
-            5.5,
-            SocialVisionObservation(
-                person_visible=True,
-                person_count=1,
-                body_pose=SocialBodyPose.FLOOR,
-                motion_state=SocialMotionState.STILL,
-            ),
-        )
+        for observed_at, body_pose in (
+            (1.0, SocialBodyPose.SEATED),
+            (2.0, SocialBodyPose.FLOOR),
+            (2.6, SocialBodyPose.FLOOR),
+            (3.2, SocialBodyPose.FLOOR),
+            (4.0, SocialBodyPose.FLOOR),
+            (5.0, SocialBodyPose.FLOOR),
+        ):
+            buffer.append(
+                observed_at,
+                SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=body_pose,
+                    motion_state=SocialMotionState.STILL,
+                ),
+            )
 
-        sequences = derive_vision_sequences(observation_buffer=buffer, now=5.5)
+        onset_sequences = derive_vision_sequences(observation_buffer=buffer, now=2.6)
+        settled_sequences = derive_vision_sequences(observation_buffer=buffer, now=5.0)
 
         self.assertEqual(
-            [sequence.kind.value for sequence in sequences],
+            [sequence.kind.value for sequence in onset_sequences],
             [
                 "floor_pose_entered",
                 "downward_transition",
-                "floor_stillness",
             ],
+        )
+        self.assertEqual(
+            [sequence.kind.value for sequence in settled_sequences],
+            ["floor_stillness"],
         )
 
 
@@ -139,97 +134,71 @@ class FusionTrackerTests(unittest.TestCase):
     def test_emits_possible_fall_and_floor_stillness_after_drop(self) -> None:
         tracker = MultimodalEventFusionTracker()
 
-        tracker.observe(
-            SocialObservation(
-                observed_at=1.0,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=1,
-                    body_pose=SocialBodyPose.UPRIGHT,
-                    motion_state=SocialMotionState.STILL,
-                ),
-                audio=SocialAudioObservation(),
+        for observed_at, body_pose in (
+            (1.0, SocialBodyPose.UPRIGHT),
+            (2.0, SocialBodyPose.FLOOR),
+            (2.6, SocialBodyPose.FLOOR),
+            (3.4, SocialBodyPose.FLOOR),
+            (4.2, SocialBodyPose.FLOOR),
+            (5.0, SocialBodyPose.FLOOR),
+        ):
+            claims = tracker.observe(
+                SocialObservation(
+                    observed_at=observed_at,
+                    inspected=True,
+                    vision=SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        body_pose=body_pose,
+                        motion_state=SocialMotionState.STILL,
+                    ),
+                    audio=SocialAudioObservation(),
+                )
             )
-        )
-        tracker.observe(
-            SocialObservation(
-                observed_at=2.0,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=1,
-                    body_pose=SocialBodyPose.FLOOR,
-                    motion_state=SocialMotionState.STILL,
-                ),
-                audio=SocialAudioObservation(),
-            )
-        )
-        claims = tracker.observe(
-            SocialObservation(
-                observed_at=5.5,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=1,
-                    body_pose=SocialBodyPose.FLOOR,
-                    motion_state=SocialMotionState.STILL,
-                ),
-                audio=SocialAudioObservation(),
-            )
-        )
 
-        self.assertEqual([claim.state for claim in claims], ["possible_fall", "floor_stillness_after_drop"])
+        self.assertEqual(
+            [claim.state for claim in claims],
+            ["floor_stillness_after_drop", "possible_fall"],
+        )
         self.assertTrue(all(claim.requires_confirmation for claim in claims))
         self.assertTrue(all(claim.delivery_allowed for claim in claims))
-        possible_fall = claims[0]
+        possible_fall = next(claim for claim in claims if claim.state == "possible_fall")
         self.assertTrue(possible_fall.review_recommended)
         self.assertIsNotNone(possible_fall.keyframe_review_plan)
         self.assertEqual(
             [frame.role for frame in possible_fall.keyframe_review_plan.frames],
-            ["onset", "peak", "latest"],
+            ["onset", "peak"],
         )
 
     def test_blocks_person_targeted_fused_claims_in_multi_person_context(self) -> None:
         tracker = MultimodalEventFusionTracker()
 
-        tracker.observe(
-            SocialObservation(
-                observed_at=1.0,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=2,
-                    body_pose=SocialBodyPose.SLUMPED,
-                    motion_state=SocialMotionState.STILL,
+        for observed_at, confidence in (
+            (1.0, 0.81),
+            (2.0, 0.82),
+            (3.0, 0.83),
+            (4.0, 0.84),
+        ):
+            claims = tracker.observe(
+                SocialObservation(
+                    observed_at=observed_at,
+                    inspected=True,
+                    vision=SocialVisionObservation(
+                        person_visible=True,
+                        person_count=2,
+                        body_pose=SocialBodyPose.SLUMPED,
+                        motion_state=SocialMotionState.STILL,
+                    ),
+                    audio=SocialAudioObservation(),
                 ),
-                audio=SocialAudioObservation(),
-            ),
-            audio_hints=AudioClassifierHints(cry_like_confidence=0.81),
-        )
-        claims = tracker.observe(
-            SocialObservation(
-                observed_at=4.5,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=2,
-                    body_pose=SocialBodyPose.SLUMPED,
-                    motion_state=SocialMotionState.STILL,
-                ),
-                audio=SocialAudioObservation(),
-            ),
-            audio_hints=AudioClassifierHints(cry_like_confidence=0.83),
-        )
+                audio_hints=AudioClassifierHints(cry_like_confidence=confidence),
+            )
 
         states = [claim.state for claim in claims]
-        self.assertIn("distress_possible", states)
         self.assertIn("cry_like_distress_possible", states)
-        distress_claim = next(claim for claim in claims if claim.state == "distress_possible")
+        self.assertNotIn("distress_possible", states)
         cry_claim = next(claim for claim in claims if claim.state == "cry_like_distress_possible")
-        self.assertFalse(distress_claim.delivery_allowed)
         self.assertFalse(cry_claim.delivery_allowed)
-        self.assertIn("multi_person_context", distress_claim.blocked_by)
         self.assertIn("multi_person_context", cry_claim.blocked_by)
         self.assertTrue(cry_claim.review_recommended)
         self.assertIsNotNone(cry_claim.keyframe_review_plan)
@@ -258,22 +227,23 @@ class FusionTrackerTests(unittest.TestCase):
     def test_emits_distress_possible_from_distress_audio_and_slumped_sequence(self) -> None:
         tracker = MultimodalEventFusionTracker()
 
-        tracker.observe(
-            SocialObservation(
-                observed_at=1.0,
-                inspected=True,
-                vision=SocialVisionObservation(
-                    person_visible=True,
-                    person_count=1,
-                    body_pose=SocialBodyPose.SLUMPED,
-                    motion_state=SocialMotionState.STILL,
-                ),
-                audio=SocialAudioObservation(speech_detected=False),
+        for observed_at in (1.0, 2.0, 3.0):
+            tracker.observe(
+                SocialObservation(
+                    observed_at=observed_at,
+                    inspected=True,
+                    vision=SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        body_pose=SocialBodyPose.SLUMPED,
+                        motion_state=SocialMotionState.STILL,
+                    ),
+                    audio=SocialAudioObservation(speech_detected=False),
+                )
             )
-        )
         claims = tracker.observe(
             SocialObservation(
-                observed_at=4.5,
+                observed_at=4.0,
                 inspected=True,
                 vision=SocialVisionObservation(
                     person_visible=True,

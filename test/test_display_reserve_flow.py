@@ -494,7 +494,7 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
             for candidate in candidates
             if candidate.semantic_key() == "ai companions" and candidate.expansion_angle == "primary"
         )
-        self.assertTrue(primary.topic_key.startswith("ai companions::primary::"))
+        self.assertTrue(primary.topic_key.startswith("reserve_card::"))
 
     def test_flow_includes_user_discovery_candidate_when_setup_is_due(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
