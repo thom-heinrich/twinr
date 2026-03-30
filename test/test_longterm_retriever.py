@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -13,11 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphNodeV1
 from twinr.memory.context_store import PromptContextStore
 from twinr.memory.longterm import (
     LongTermConflictResolver,
+    LongTermConflictOptionV1,
+    LongTermConflictQueueItemV1,
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
+    LongTermMidtermPacketV1,
     LongTermMemoryObjectV1,
     LongTermReflectionResultV1,
     LongTermMidtermStore,
@@ -29,6 +34,10 @@ from twinr.memory.longterm import (
 )
 from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.retrieval.unified_plan import (
+    UnifiedGraphSelectionInput,
+    build_unified_retrieval_selection,
+)
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -187,6 +196,197 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("Corinna Maier", context.graph_context or "")
         self.assertIn("contact:person:corinna_maier:phone", context.conflict_context or "")
         self.assertNotIn("This local-only memory should not be used", context.episodic_context or "")
+
+    def test_unified_retrieval_selection_joins_graph_and_structured_candidates_on_explicit_person_anchor(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +15555551234.",
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=0.97,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555551234",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        unrelated_object = LongTermMemoryObjectV1(
+            memory_id="fact:janina_phone",
+            kind="contact_method_fact",
+            summary="Janina can be reached at +15555550001.",
+            source=_source("turn:janina"),
+            status="active",
+            confidence=0.9,
+            slot_key="contact:person:janina:phone",
+            value_key="+15555550001",
+            attributes={"person_ref": "person:janina"},
+        )
+        related_conflict = LongTermConflictQueueItemV1(
+            slot_key="contact:person:corinna_maier:phone",
+            question="Which phone number should I use for Corinna Maier?",
+            reason="Conflicting phone numbers exist.",
+            candidate_memory_id="fact:corinna_phone",
+            options=(
+                LongTermConflictOptionV1(
+                    memory_id="fact:corinna_phone",
+                    summary=related_object.summary,
+                    status="active",
+                    value_key="+15555551234",
+                ),
+            ),
+        )
+        unrelated_conflict = LongTermConflictQueueItemV1(
+            slot_key="contact:person:janina:phone",
+            question="Which phone number should I use for Janina?",
+            reason="Conflicting phone numbers exist.",
+            candidate_memory_id="fact:janina_phone",
+            options=(
+                LongTermConflictOptionV1(
+                    memory_id="fact:janina_phone",
+                    summary=unrelated_object.summary,
+                    status="active",
+                    value_key="+15555550001",
+                ),
+            ),
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-03-30T09:00:00Z",
+                updated_at="2026-03-30T09:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(
+                        node_id="user:main",
+                        node_type="user",
+                        label="Erika",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="person:corinna_maier",
+                        node_type="person",
+                        label="Corinna Maier",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "selected_node_ids": ["person:corinna_maier"],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("What is Corinna's phone number?",),
+            durable_objects=(unrelated_object, related_object),
+            conflict_queue=(unrelated_conflict, related_conflict),
+            conflict_supporting_objects=(unrelated_object, related_object),
+            midterm_packets=(),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.durable_objects[0].memory_id, "fact:corinna_phone")
+        self.assertEqual(selection.conflict_queue[0].slot_key, "contact:person:corinna_maier:phone")
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in selection.query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["conflict", "durable", "graph"],
+        )
+        self.assertIn("structured_query_first", selection.query_plan["access_path"])
+        self.assertIn("graph_neighbors_query", selection.query_plan["access_path"])
+
+    def test_unified_retrieval_selection_reorders_midterm_packets_on_shared_explicit_anchors(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +15555551234.",
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=0.97,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555551234",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        unrelated_object = LongTermMemoryObjectV1(
+            memory_id="fact:janina_phone",
+            kind="contact_method_fact",
+            summary="Janina can be reached at +15555550001.",
+            source=_source("turn:janina"),
+            status="active",
+            confidence=0.9,
+            slot_key="contact:person:janina:phone",
+            value_key="+15555550001",
+            attributes={"person_ref": "person:janina"},
+        )
+        related_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:corinna_today",
+            kind="recent_contact_bundle",
+            summary="Corinna may matter for today's practical phone decision.",
+            source_memory_ids=("fact:corinna_phone",),
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        unrelated_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:janina_today",
+            kind="recent_contact_bundle",
+            summary="Janina may matter for another phone decision.",
+            source_memory_ids=("fact:janina_phone",),
+            attributes={"person_ref": "person:janina"},
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-03-30T09:00:00Z",
+                updated_at="2026-03-30T09:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(
+                        node_id="user:main",
+                        node_type="user",
+                        label="Erika",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="person:corinna_maier",
+                        node_type="person",
+                        label="Corinna Maier",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "selected_node_ids": ["person:corinna_maier"],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("Should I call Corinna today?",),
+            durable_objects=(unrelated_object, related_object),
+            conflict_queue=(),
+            conflict_supporting_objects=(unrelated_object, related_object),
+            midterm_packets=(unrelated_midterm, related_midterm),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.midterm_packets[0].packet_id, "midterm:corinna_today")
+        self.assertEqual(
+            selection.query_plan["selected"]["midterm_packet_ids"],
+            ["midterm:corinna_today", "midterm:janina_today"],
+        )
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in selection.query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["durable", "graph", "midterm"],
+        )
 
     def test_build_context_surfaces_environment_reflection_in_durable_and_midterm_context(self) -> None:
         environment_summary = LongTermMemoryObjectV1(
@@ -374,8 +574,13 @@ class LongTermRetrieverTests(unittest.TestCase):
                 patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
                 patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
                 patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
-                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
-                patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
+                patch.object(
+                    LongTermRetriever,
+                    "_select_conflict_queue_selection_for_texts",
+                    lambda self, query_texts: SimpleNamespace(queue=(), supporting_objects=()),
+                ),
+                patch.object(LongTermRetriever, "_select_graph_context_selection", lambda self, retrieval_text: None),
+                patch.object(LongTermRetriever, "_render_graph_context_selection", lambda self, graph_selection, retrieval_text: None),
                 patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
                 patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: "episodic-context"),
                 patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
@@ -384,7 +589,7 @@ class LongTermRetrieverTests(unittest.TestCase):
                 patch.object(
                     LongTermRetriever,
                     "_build_subtext_context",
-                    lambda self, query_text, retrieval_query_text, episodic_entries: f"subtext:{len(tuple(episodic_entries))}",
+                    lambda self, query_text, retrieval_query_text, episodic_entries, graph_selection=None, unified_query_plan=None: f"subtext:{len(tuple(episodic_entries))}",
                 ),
             ):
                 context = retriever.build_context(
@@ -404,8 +609,17 @@ class LongTermRetrieverTests(unittest.TestCase):
             del query_texts
             return [], ()
 
-        def _build_subtext_context(self, query_text, retrieval_query_text, episodic_entries):
+        def _build_subtext_context(
+            self,
+            query_text,
+            retrieval_query_text,
+            episodic_entries,
+            graph_selection=None,
+            unified_query_plan=None,
+        ):
             del self
+            del graph_selection
+            del unified_query_plan
             subtext_calls.append((query_text, retrieval_query_text, len(tuple(episodic_entries))))
             return "unexpected"
 
@@ -417,8 +631,13 @@ class LongTermRetrieverTests(unittest.TestCase):
                 patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
                 patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
                 patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
-                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
-                patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
+                patch.object(
+                    LongTermRetriever,
+                    "_select_conflict_queue_selection_for_texts",
+                    lambda self, query_texts: SimpleNamespace(queue=(), supporting_objects=()),
+                ),
+                patch.object(LongTermRetriever, "_select_graph_context_selection", lambda self, retrieval_text: None),
+                patch.object(LongTermRetriever, "_render_graph_context_selection", lambda self, graph_selection, retrieval_text: None),
                 patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
                 patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: None),
                 patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
@@ -436,7 +655,7 @@ class LongTermRetrieverTests(unittest.TestCase):
 
     def test_build_context_overlaps_local_sections_without_parallel_remote_searches(self) -> None:
         midterm_started = threading.Event()
-        graph_started = threading.Event()
+        graph_selection_started = threading.Event()
         selector_threads: list[str] = []
 
         def _select_context_object_sections(self, query_texts):
@@ -449,14 +668,14 @@ class LongTermRetrieverTests(unittest.TestCase):
             del self
             del query_texts
             midterm_started.set()
-            if not graph_started.wait(timeout=1.0):
+            if not graph_selection_started.wait(timeout=1.0):
                 raise AssertionError("midterm retrieval did not overlap with graph retrieval")
             return ()
 
-        def _build_graph_context(self, retrieval_text):
+        def _select_graph_context_selection(self, retrieval_text):
             del self
             del retrieval_text
-            graph_started.set()
+            graph_selection_started.set()
             if not midterm_started.wait(timeout=1.0):
                 raise AssertionError("graph retrieval did not overlap with midterm retrieval")
             return None
@@ -469,14 +688,23 @@ class LongTermRetrieverTests(unittest.TestCase):
                 patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
                 patch.object(LongTermRetriever, "_select_midterm_packets", _select_midterm_packets),
                 patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
-                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
-                patch.object(LongTermRetriever, "_build_graph_context", _build_graph_context),
+                patch.object(
+                    LongTermRetriever,
+                    "_select_conflict_queue_selection_for_texts",
+                    lambda self, query_texts: SimpleNamespace(queue=(), supporting_objects=()),
+                ),
+                patch.object(LongTermRetriever, "_select_graph_context_selection", _select_graph_context_selection),
+                patch.object(LongTermRetriever, "_render_graph_context_selection", lambda self, graph_selection, retrieval_text: None),
                 patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
                 patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: None),
                 patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
                 patch.object(LongTermRetriever, "_render_midterm_context", lambda self, packets: None),
                 patch.object(LongTermRetriever, "_combine_query_texts", lambda self, query_texts: " ".join(query_texts)),
-                patch.object(LongTermRetriever, "_build_subtext_context", lambda self, query_text, retrieval_query_text, episodic_entries: None),
+                patch.object(
+                    LongTermRetriever,
+                    "_build_subtext_context",
+                    lambda self, query_text, retrieval_query_text, episodic_entries, graph_selection=None, unified_query_plan=None: None,
+                ),
             ):
                 context = retriever.build_context(
                     query=LongTermQueryProfile.from_text("Hallo"),
@@ -573,11 +801,46 @@ class LongTermRetrieverTests(unittest.TestCase):
                     canonical_english_text="Where did my red thermos flask used to be kept?",
                 ),
                 original_query_text="Wo stand früher meine rote Thermoskanne?",
-            )
+                )
 
         self.assertIsNotNone(context.durable_context)
         self.assertIn("Flurschrank", context.durable_context or "")
         self.assertIn("Thermoskanne", context.durable_context or "")
+
+    def test_build_subtext_context_uses_preselected_graph_payload_and_updates_unified_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, graph_store, _midterm_store = self._make_retriever(temp_dir)
+            graph_store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                role="Physiotherapist",
+            )
+            selection = retriever._select_graph_context_selection("Should I call Corinna today?")
+            self.assertIsNotNone(selection)
+            called_queries: list[str] = []
+            original_build_from_selection = graph_store.build_subtext_payload_from_selection
+            graph_store.build_subtext_payload = lambda query_text: (_ for _ in ()).throw(AssertionError(query_text))  # type: ignore[method-assign]
+
+            def _build_from_selection(selection, *, query_text):
+                called_queries.append(query_text)
+                return original_build_from_selection(selection, query_text=query_text)
+
+            graph_store.build_subtext_payload_from_selection = _build_from_selection  # type: ignore[method-assign]
+            unified_query_plan = {"sources": {"graph_selected": True}}
+
+            context = retriever._build_subtext_context(
+                query_text="Soll ich Corinna heute noch anrufen?",
+                retrieval_query_text="Should I call Corinna today?",
+                episodic_entries=[],
+                graph_selection=selection,
+                unified_query_plan=unified_query_plan,
+            )
+
+        self.assertEqual(called_queries, ["Should I call Corinna today?"])
+        self.assertIsNotNone(context)
+        self.assertIn("social_context", context or "")
+        self.assertEqual(unified_query_plan["subtext"]["graph_payload_source"], "unified_graph_selection")
+        self.assertTrue(unified_query_plan["subtext"]["rendered"])
 
     def test_select_conflict_queue_merges_original_query_with_canonical_rewrite_for_same_language_conflicts(self) -> None:
         existing = LongTermMemoryObjectV1(

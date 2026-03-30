@@ -9,12 +9,17 @@ subpackages.
 
 `memory` owns:
 - expose the canonical `twinr.memory` import surface
+- resolve that public surface lazily so narrow imports do not eagerly pull the
+  full long-term or graph stack into processes that only need prompt-context or
+  on-device memory types
 - persist durable prompt memory, managed user/personality context, and reminders
 - keep reminder reservation state reversible when a background delivery loses its idle window before speech starts, so Twinr does not invent retry backoff for work that never began
 - persist the guided user-discovery state that powers Twinr's resumable onboarding and lifelong profile-learning flow
 - review, correct, and delete learned discovery facts while keeping managed-context and structured-memory commits synchronized
 - write local prompt-context snapshots world-readable (`0644`) so the dedicated remote-memory watchdog can validate them even when the productive runtime itself runs as `root`
-- overlap independent prompt/user/personality remote snapshot bootstrap reads so required-remote readiness is bounded by the slowest prompt-context snapshot instead of the sum of all three
+- persist prompt memory plus managed user/personality context remotely as typed current-head/item records rather than treating ChonkyDB as a generic prompt-context blob store
+- let prompt-memory and managed-context readiness reuse a readable legacy/current head or a synthetic empty head before attempting any bootstrap write, so the Pi watchdog stays read-only while proving an empty remote store is healthy
+- overlap independent prompt/user/personality remote current-head bootstrap reads so required-remote readiness is bounded by the slowest prompt-context check instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
 - keep live long-term recall from blocking on cold query-rewrite misses by returning an immediate fallback profile and filling the rewrite cache asynchronously in the background
 - host the `on_device`, `chonkydb`, and `longterm` subpackages
@@ -29,12 +34,12 @@ subpackages.
 
 | File | Purpose |
 |---|---|
-| [__init__.py](./__init__.py) | Public memory exports |
-| [context_store.py](./context_store.py) | Prompt and managed-context stores |
+| [__init__.py](./__init__.py) | Public memory exports resolved lazily to avoid import-time coupling between prompt-context stores and heavier long-term/graph modules |
+| [context_store.py](./context_store.py) | Prompt and managed-context stores that persist remote current heads plus typed entry records for prompt memory, user context, and personality context, and resolve legacy or synthetic empty heads without blocking readiness on empty-head writes |
 | [reminders.py](./reminders.py) | Reminder persistence, reservation release, and rendering |
 | [user_discovery.py](./user_discovery.py) | Thin compatibility wrapper that preserves the stable `twinr.memory.user_discovery` import surface while delegating the guided-discovery implementation into focused runtime modules |
 | [user_discovery_impl](./user_discovery_impl/) | Internal package split by concern across discovery catalog/helpers, data models, state persistence, commit routing, selection/presentation logic, and the public service orchestration |
-| [user_discovery_authoritative_profile.py](./user_discovery_authoritative_profile.py) | Narrow adapter that projects authoritative graph and structured long-term profile facts into discovery-topic coverage |
+| [user_discovery_authoritative_profile.py](./user_discovery_authoritative_profile.py) | Narrow adapter that projects authoritative graph facts and the shared runtime query-first structured-memory selector layer into discovery-topic coverage without hydrating full remote object snapshots |
 | [user_discovery_policy.py](./user_discovery_policy.py) | Adaptive discovery topic scoring from reserve-lane engagement |
 | [query_normalization.py](./query_normalization.py) | Retrieval query rewrite cache |
 | [fulltext.py](./fulltext.py) | In-memory FTS selector |

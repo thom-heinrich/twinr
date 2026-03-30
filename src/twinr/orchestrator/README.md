@@ -50,6 +50,7 @@ contracts used by the Alexa-like hybrid voice path.
 | [voice_client.py](./voice_client.py) | Blocking client for the voice websocket |
 | [voice_session.py](./voice_session.py) | Stable compatibility wrapper for the server-side voice-session import surface |
 | [voice_session_impl/](./voice_session_impl/) | Internal package split across runtime-state handling, observability, backend requests, and utterance scanning |
+| [probe_turn.py](./probe_turn.py) | Lightweight text-probe bootstrap for `--orchestrator-probe-turn` with stage timings and no full hardware-loop startup |
 | [acks.py](./acks.py) | Ack phrase ID map |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
@@ -73,6 +74,13 @@ from twinr.orchestrator import create_app
 
 app = create_app(".env")
 ```
+
+Twinr's operator `--orchestrator-probe-turn` path now uses the lightweight
+bootstrap in [`probe_turn.py`](./probe_turn.py): it still builds runtime
+conversation context and the local realtime tool surface, but it deliberately
+skips GPIO/audio/proactive/live-voice startup that belongs to the full hardware
+loop instead of a text websocket probe. That keeps the probe bounded and makes
+its stage timings actionable when Pi acceptance stalls.
 
 Twinr's live voice gateway now has one supported activation path only:
 `TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` must point at the thh1986 ASR service.

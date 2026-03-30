@@ -15,6 +15,14 @@ from twinr.ops import health as health_mod
 
 
 class OpsHealthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        health_mod._PROCESS_CACHE = None
+        health_mod._PI_STATE_CACHE = None
+
+    def tearDown(self) -> None:
+        health_mod._PROCESS_CACHE = None
+        health_mod._PI_STATE_CACHE = None
+
     def collect_health_with_services(
         self,
         config: TwinrConfig,
@@ -33,14 +41,27 @@ class OpsHealthTests(unittest.TestCase):
                         with mock.patch.object(
                             health_mod,
                             "_read_memory",
-                            return_value=(memory_total_mb, memory_available_mb, memory_used_percent),
+                            return_value=(
+                                memory_total_mb,
+                                memory_available_mb,
+                                memory_used_percent,
+                                None,
+                                None,
+                                None,
+                            ),
                         ):
                             with mock.patch.object(health_mod, "_read_disk", return_value=(64.0, 40.0, 22.0)):
-                                with mock.patch.object(health_mod, "_collect_service_health", return_value=(services, True)):
-                                    with mock.patch.object(health_mod, "_read_cpu_temperature_c", return_value=45.0):
-                                        with mock.patch.object(health_mod, "_read_hostname", return_value="picarx"):
-                                            with mock.patch.object(health_mod, "_read_uptime_seconds", return_value=123.0):
-                                                return health_mod.collect_system_health(config, snapshot=snapshot)
+                                with mock.patch.object(health_mod, "_read_pressure", return_value=(None, None, None, None, None)):
+                                    with mock.patch.object(health_mod, "_collect_service_health", return_value=(services, True)):
+                                        with mock.patch.object(
+                                            health_mod,
+                                            "_read_pi_throttled_state",
+                                            return_value=health_mod._PiThrottledState(raw_hex="0x0"),
+                                        ):
+                                            with mock.patch.object(health_mod, "_read_cpu_temperature_c", return_value=45.0):
+                                                with mock.patch.object(health_mod, "_read_hostname", return_value="picarx"):
+                                                    with mock.patch.object(health_mod, "_read_uptime_seconds", return_value=123.0):
+                                                        return health_mod.collect_system_health(config, snapshot=snapshot)
 
     def test_collect_service_health_treats_streaming_loop_as_conversation_loop(self) -> None:
         entries = (

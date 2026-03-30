@@ -3,12 +3,13 @@ name: conversation
 path: src/twinr/agent/base_agent/conversation
 kind: python-package
 visibility: internal
-summary: Conversation timing, language, turn-boundary, and closure helpers for the base agent.
+summary: Conversation timing, language, turn-boundary, closure, and recent-thread text resolution helpers for the base agent.
 owned_concerns:
   - Adaptive listening-window state, learning, and persistence
   - Language-normalized prompt contracts for user replies and memory text
   - Tool-called streaming turn-boundary decisions
   - Post-response closure decisions, including an explicit structured continue/end follow-up contract, question-style fast paths, a fast structured-decision path, and matched turn-steering topics for workflow follow-up policy
+  - Recent-thread text-turn carryover and bounded prompt rewriting for short repairs or clarifications that must stay grounded in the immediate thread
 out_of_scope:
   - Audio capture or playback orchestration
   - Workflow orchestration in src/twinr/agent/workflows
@@ -59,6 +60,21 @@ files:
       - StructuredConversationClosureEvaluator
       - ToolCallingConversationClosureEvaluator
       - assistant_expects_immediate_reply
+  - path: follow_up_context.py
+    role: Build bounded carryover hints and privacy-safe observability payloads for follow-up and recent-thread continuity
+    exports:
+      - build_follow_up_context_hint
+      - pending_conversation_follow_up_system_message
+      - recent_thread_carryover_system_message
+      - trace_follow_up_context_hint_payload
+      - trace_recent_thread_payload
+  - path: thread_resolution.py
+    role: Focus text turns on the immediate thread and optionally rewrite short repairs into standalone requests
+    exports:
+      - RecentThreadPromptResolution
+      - focus_recent_thread_conversation
+      - maybe_rewrite_prompt_against_recent_thread
+      - recent_thread_turns
 root_exports:
   path: src/twinr/agent/base_agent/__init__.py
   names:
@@ -73,9 +89,13 @@ tests:
   - path: test/test_adaptive_timing.py
   - path: test/test_turn_controller.py
   - path: test/test_conversation_closure.py
+  - path: test/test_thread_resolution.py
 consumers:
   - path: src/twinr/agent/base_agent/runtime/base.py
   - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/channels/runtime.py
+  - path: src/twinr/channels/tool_runtime.py
+  - path: src/twinr/web/conversation_lab.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_speculation.py
   - path: src/twinr/agent/workflows/streaming_runner.py

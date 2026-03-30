@@ -60,7 +60,7 @@ class StructuredStoreRetrievalMixin:
             return remote_selected
         with self._lock:
             return self._select_relevant_objects_from_loaded(
-                objects=self.load_objects(),
+                objects=self.load_objects_fine_grained(),
                 query_text=query_text,
                 include_episodes=False,
                 limit=limit,
@@ -151,7 +151,7 @@ class StructuredStoreRetrievalMixin:
         with self._lock:
             return self._select_fast_topic_objects_from_objects(
                 clean_query=clean_query,
-                objects=self.load_objects(),
+                objects=self.load_objects_fine_grained(),
                 limit=limit,
             )
 
@@ -163,6 +163,35 @@ class StructuredStoreRetrievalMixin:
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         """Select unresolved conflicts relevant to a query."""
 
+        bridge_conflicts = self._same_process_snapshot_bridge_conflicts()
+        if bridge_conflicts is not None:
+            bounded_limit = max(1, limit)
+            clean_query = _normalize_text(query_text)
+            workflow_event(
+                kind="branch",
+                msg="longterm_conflicts_same_process_snapshot_bridge",
+                details={
+                    "query_present": bool(clean_query),
+                    "limit": bounded_limit,
+                },
+            )
+            if not clean_query:
+                return bridge_conflicts[:bounded_limit]
+            bridge_objects = self._same_process_snapshot_bridge_objects() or ()
+            objects_by_id = {item.memory_id: item for item in bridge_objects}
+            filtered = self._filter_query_relevant_conflicts(
+                clean_query,
+                selected=bridge_conflicts,
+                limit=bounded_limit,
+                objects_by_id=objects_by_id,
+            )
+            if filtered or not bridge_conflicts:
+                return filtered
+            return self._filter_query_relevant_conflicts(
+                clean_query,
+                selected=bridge_conflicts,
+                limit=bounded_limit,
+            )
         remote_selected = self._remote_select_conflicts(
             query_text=query_text,
             limit=limit,
@@ -170,14 +199,28 @@ class StructuredStoreRetrievalMixin:
         if remote_selected is not None:
             return remote_selected
         with self._lock:
-            conflicts = self.load_conflicts()
+            conflicts = self.load_conflicts_fine_grained()
             if not conflicts:
                 return ()
             bounded_limit = max(1, limit)
             clean_query = _normalize_text(query_text)
             if not clean_query:
                 return conflicts[:bounded_limit]
-            objects_by_id = {item.memory_id: item for item in self.load_objects()}
+            related_memory_ids = tuple(
+                dict.fromkeys(
+                    memory_id
+                    for conflict in conflicts
+                    for memory_id in (conflict.candidate_memory_id, *conflict.existing_memory_ids)
+                    if isinstance(memory_id, str) and memory_id
+                )
+            )
+            objects_by_id = {
+                item.memory_id: item
+                for item in self.select_query_time_objects_by_ids(
+                    query_text=clean_query,
+                    memory_ids=related_memory_ids,
+                )
+            }
             selector = FullTextSelector(
                 tuple(
                     FullTextDocument(
@@ -496,7 +539,7 @@ class StructuredStoreRetrievalMixin:
                 sorted(
                     (
                         item
-                        for item in self.load_objects()
+                        for item in self.load_objects_fine_grained()
                         if item.status in {"active", "candidate", "uncertain"}
                     ),
                     key=lambda item: (

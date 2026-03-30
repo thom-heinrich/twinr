@@ -641,46 +641,202 @@ class MainCliTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            fake_runtime = _FakeTurnRuntime()
+            backend_calls: list[dict[str, object]] = []
             fake_backend = SimpleNamespace(
-                respond_with_metadata=lambda *_args, **_kwargs: SimpleNamespace(
-                    text="ok",
-                    response_id=None,
-                    request_id=None,
-                    used_web_search=False,
-                )
+                respond_with_metadata=lambda prompt, **kwargs: (
+                    backend_calls.append({"prompt": prompt, **kwargs}),
+                    SimpleNamespace(
+                        text="ok",
+                        response_id=None,
+                        request_id=None,
+                        used_web_search=False,
+                    ),
+                )[1]
             )
-            built_runtime_config = None
             original_argv = list(sys.argv)
+            stdout = StringIO()
 
             try:
                 sys.modules.pop("twinr.__main__", None)
                 main_mod = importlib.import_module("twinr.__main__")
-
-                def _build_runtime(config):
-                    nonlocal built_runtime_config
-                    built_runtime_config = config
-                    return fake_runtime
-
-                with patch.object(main_mod, "_build_runtime", side_effect=_build_runtime):
+                with patch.object(
+                    main_mod,
+                    "_build_runtime",
+                    side_effect=AssertionError("openai-prompt must not bootstrap the runtime"),
+                ):
                     with patch("twinr.providers.openai.OpenAIBackend", return_value=fake_backend):
-                        sys.argv = [
-                            "twinr",
-                            "--env-file",
-                            str(env_path),
-                            "--openai-prompt",
-                            "Sag nur: ok.",
-                        ]
-                        exit_code = main_mod.main()
+                        with patch("sys.stdout", stdout):
+                            sys.argv = [
+                                "twinr",
+                                "--env-file",
+                                str(env_path),
+                                "--openai-prompt",
+                                "Sag nur: ok.",
+                            ]
+                            exit_code = main_mod.main()
             finally:
                 sys.argv = original_argv
                 sys.modules.pop("twinr.__main__", None)
 
         self.assertEqual(exit_code, 0)
-        self.assertIsNotNone(built_runtime_config)
-        self.assertIn("runtime-scopes/openai-prompt", str(built_runtime_config.runtime_state_path))
-        self.assertFalse(built_runtime_config.restore_runtime_state_on_startup)
-        self.assertEqual(fake_runtime.submitted_transcript, "Sag nur: ok.")
+        self.assertEqual(len(backend_calls), 1)
+        self.assertEqual(backend_calls[0]["prompt"], "Sag nur: ok.")
+        self.assertEqual(backend_calls[0]["conversation"], ())
+        self.assertIn("status=waiting", stdout.getvalue())
+        self.assertIn("response=ok", stdout.getvalue())
+
+    def test_vision_prompt_uses_scoped_runtime_snapshot_without_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                        "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            backend_calls: list[dict[str, object]] = []
+            fake_backend = SimpleNamespace(
+                respond_to_images_with_metadata=lambda prompt, **kwargs: (
+                    backend_calls.append({"prompt": prompt, **kwargs}),
+                    SimpleNamespace(
+                        text="rot",
+                        response_id=None,
+                        request_id=None,
+                        used_web_search=False,
+                    ),
+                )[1]
+            )
+            fake_openai_module = ModuleType("twinr.providers.openai")
+            fake_openai_module.OpenAIBackend = lambda config: fake_backend
+            _attach_fake_openai_image_input(fake_openai_module)
+            original_argv = list(sys.argv)
+            stdout = StringIO()
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.providers.openai": fake_openai_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(
+                        main_mod,
+                        "_build_runtime",
+                        side_effect=AssertionError("vision-prompt must not bootstrap the runtime"),
+                    ):
+                        with patch("sys.stdout", stdout):
+                            sys.argv = [
+                                "twinr",
+                                "--env-file",
+                                str(env_path),
+                                "--vision-image",
+                                "/tmp/reference.png",
+                                "--vision-prompt",
+                                "Nenne die dominante Farbe in genau einem Wort.",
+                            ]
+                            exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(backend_calls), 1)
+        self.assertEqual(backend_calls[0]["prompt"], "Nenne die dominante Farbe in genau einem Wort.")
+        self.assertEqual(len(backend_calls[0]["images"]), 1)
+        self.assertEqual(backend_calls[0]["conversation"], ())
+        self.assertIn("status=waiting", stdout.getvalue())
+        self.assertIn("vision_image_count=1", stdout.getvalue())
+        self.assertIn("response=rot", stdout.getvalue())
+
+    def test_orchestrator_probe_turn_dispatches_to_lightweight_probe_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                        "TWINR_ORCHESTRATOR_WS_URL=ws://127.0.0.1:8797/ws/orchestrator",
+                        "TWINR_ORCHESTRATOR_SHARED_SECRET=test-secret",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+            fake_backend = object()
+            probe_calls: list[dict[str, object]] = []
+            fake_probe_module = ModuleType("twinr.orchestrator.probe_turn")
+
+            def _run_probe_turn(*, config, runtime, backend, prompt, emit_line):
+                probe_calls.append(
+                    {
+                        "config": config,
+                        "runtime": runtime,
+                        "backend": backend,
+                        "prompt": prompt,
+                    }
+                )
+                emit_line("probe_tool_handler_count=7")
+                return SimpleNamespace(
+                    deltas=("Teil ", "Antwort"),
+                    result=SimpleNamespace(
+                        text="Teil Antwort",
+                        rounds=2,
+                        used_web_search=True,
+                        response_id="resp-1",
+                        request_id="req-1",
+                        model="gpt-5.4-mini",
+                    ),
+                    tool_handler_count=7,
+                )
+
+            fake_probe_module.run_orchestrator_probe_turn = _run_probe_turn
+            fake_streaming_module = ModuleType("twinr.agent.workflows.streaming_runner")
+            fake_streaming_module.TwinrStreamingHardwareLoop = lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("orchestrator-probe-turn must not bootstrap the streaming hardware loop")
+            )
+            original_argv = list(sys.argv)
+            stdout = StringIO()
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.orchestrator.probe_turn": fake_probe_module,
+                        "twinr.agent.workflows.streaming_runner": fake_streaming_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", return_value=fake_runtime):
+                        with patch("twinr.providers.openai.OpenAIBackend", return_value=fake_backend):
+                            with patch("sys.stdout", stdout):
+                                sys.argv = [
+                                    "twinr",
+                                    "--env-file",
+                                    str(env_path),
+                                    "--orchestrator-probe-turn",
+                                    "Wie gehts dir denn",
+                                ]
+                                exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(probe_calls), 1)
+        self.assertIs(probe_calls[0]["runtime"], fake_runtime)
+        self.assertIs(probe_calls[0]["backend"], fake_backend)
+        self.assertEqual(probe_calls[0]["prompt"], "Wie gehts dir denn")
+        self.assertIn("probe_tool_handler_count=7", stdout.getvalue())
+        self.assertIn("streamed=Teil Antwort", stdout.getvalue())
+        self.assertIn("response=Teil Antwort", stdout.getvalue())
+        self.assertIn("used_web_search=true", stdout.getvalue())
 
     def test_run_whatsapp_channel_ensures_remote_watchdog_before_runtime_boot_on_pi(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
 
 from .shared import _LOG, _coerce_aware_utc, _normalize_text
+
+_LIVE_OBJECT_STATUSES = frozenset({"active", "candidate", "uncertain"})
 
 
 class StructuredStoreRemoteSelectionMixin:
@@ -28,7 +30,7 @@ class StructuredStoreRemoteSelectionMixin:
             for entry in entries
             if hasattr(entry, "item_id") and isinstance(getattr(entry, "item_id"), str)
         ]
-        payloads = remote_catalog.load_item_payloads(snapshot_kind=snapshot_kind, item_ids=item_ids)
+        payloads = remote_catalog.load_selection_item_payloads(snapshot_kind=snapshot_kind, item_ids=item_ids)
         loaded: list[LongTermMemoryObjectV1] = []
         for payload in payloads:
             try:
@@ -52,6 +54,492 @@ class StructuredStoreRemoteSelectionMixin:
             except Exception:
                 _LOG.warning("Skipping invalid remote long-term object payload during direct scope search.", exc_info=True)
         return tuple(loaded)
+
+    def _load_remote_objects_from_item_ids(
+        self,
+        *,
+        item_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load query-time object payloads by item id without item-document fallback."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        payloads = remote_catalog.load_selection_item_payloads(
+            snapshot_kind="objects",
+            item_ids=item_ids,
+        )
+        return self._load_remote_objects_from_payloads(payloads=payloads)
+
+    def _load_remote_conflicts_from_payloads(
+        self,
+        *,
+        payloads: Iterable[Mapping[str, object]],
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Parse already-materialized remote conflict payloads."""
+
+        loaded: list[LongTermMemoryConflictV1] = []
+        for payload in payloads:
+            try:
+                loaded.append(LongTermMemoryConflictV1.from_payload(dict(payload)))
+            except Exception:
+                _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
+        return tuple(loaded)
+
+    def _load_remote_conflicts_from_item_ids(
+        self,
+        *,
+        item_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Load current conflict payloads by item id from the fine-grained catalog."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        payloads = remote_catalog.load_selection_item_payloads(
+            snapshot_kind="conflicts",
+            item_ids=item_ids,
+        )
+        return self._load_remote_conflicts_from_payloads(payloads=payloads)
+
+    def _catalog_entry_projection(
+        self,
+        entry: object,
+    ) -> Mapping[str, object]:
+        metadata = getattr(entry, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return {}
+        projection = metadata.get("selection_projection")
+        if isinstance(projection, Mapping):
+            return projection
+        return metadata
+
+    def _catalog_entry_text(self, entry: object, field: str) -> str:
+        projection = self._catalog_entry_projection(entry)
+        value = projection.get(field)
+        return _normalize_text(value) if isinstance(value, str) else ""
+
+    def _catalog_entry_list(self, entry: object, field: str) -> tuple[str, ...]:
+        projection = self._catalog_entry_projection(entry)
+        values = projection.get(field)
+        if not isinstance(values, list):
+            return ()
+        return tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in values if isinstance(value, str))
+            if normalized
+        )
+
+    def _review_entry_eligible(
+        self,
+        entry: object,
+        *,
+        status: str | None,
+        kind: str | None,
+        include_episodes: bool,
+    ) -> bool:
+        entry_kind = self._catalog_entry_text(entry, "kind")
+        entry_status = self._catalog_entry_text(entry, "status")
+        if not include_episodes and entry_kind == "episode":
+            return False
+        if status is not None and entry_status != _normalize_text(status):
+            return False
+        if kind is not None and entry_kind != _normalize_text(kind):
+            return False
+        return bool(entry_kind)
+
+    def select_review_objects_query_first(
+        self,
+        *,
+        query_text: str | None,
+        status: str | None,
+        kind: str | None,
+        include_episodes: bool,
+        limit: int,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], int] | None:
+        """Select review objects from catalog metadata before exact hydration."""
+
+        remote_catalog = self._remote_catalog
+        if not self._remote_catalog_enabled() or remote_catalog is None:
+            return None
+        bounded_limit = max(1, int(limit))
+        clean_query = _normalize_text(query_text)
+
+        def eligible(entry: object) -> bool:
+            return self._review_entry_eligible(
+                entry,
+                status=status,
+                kind=kind,
+                include_episodes=include_episodes,
+            )
+
+        entries = tuple(
+            entry
+            for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+            if eligible(entry)
+        )
+        if not entries:
+            return (), 0
+        if not clean_query:
+            selected_entries = remote_catalog.top_catalog_entries(
+                snapshot_kind="objects",
+                limit=bounded_limit,
+                eligible=eligible,
+            )
+            return self._load_remote_objects_from_entries(entries=selected_entries, snapshot_kind="objects"), len(entries)
+        matched_entries = remote_catalog.search_catalog_entries(
+            snapshot_kind="objects",
+            query_text=clean_query,
+            limit=max(bounded_limit, len(entries)),
+            eligible=eligible,
+        )
+        return (
+            self._load_remote_objects_from_entries(entries=matched_entries[:bounded_limit], snapshot_kind="objects"),
+            len(matched_entries),
+        )
+
+    def load_conflicts_by_slot_keys(
+        self,
+        slot_keys: Iterable[str],
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Load only conflicts for the requested slot keys."""
+
+        normalized_keys = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in slot_keys)
+            if normalized
+        )
+        if not normalized_keys:
+            return ()
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                entries = tuple(
+                    entry
+                    for entry in remote_catalog.load_catalog_entries(snapshot_kind="conflicts")
+                    if self._catalog_entry_text(entry, "slot_key") in normalized_keys
+                )
+                item_ids = tuple(
+                    entry.item_id
+                    for entry in entries
+                    if isinstance(getattr(entry, "item_id", None), str)
+                )
+                if item_ids:
+                    return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term conflicts by slot key.", exc_info=True)
+        conflicts = self.load_conflicts_fine_grained()
+        return tuple(conflict for conflict in conflicts if conflict.slot_key in normalized_keys)
+
+    def load_objects_by_slot_keys(
+        self,
+        slot_keys: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load only current objects for the requested slot keys."""
+
+        normalized_keys = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in slot_keys)
+            if normalized
+        )
+        if not normalized_keys:
+            return ()
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                selected_ids = tuple(
+                    dict.fromkeys(
+                        entry.item_id
+                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+                        if isinstance(getattr(entry, "item_id", None), str)
+                        and self._catalog_entry_text(entry, "slot_key") in normalized_keys
+                    )
+                )
+                if selected_ids:
+                    return self.load_objects_by_ids(selected_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term objects by slot key.", exc_info=True)
+        objects = self.load_objects_fine_grained()
+        return tuple(item for item in objects if item.slot_key in normalized_keys)
+
+    def load_objects_by_event_ids(
+        self,
+        event_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load only current objects whose source provenance mentions one of the event ids."""
+
+        normalized_ids = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in event_ids)
+            if normalized
+        )
+        if not normalized_ids:
+            return ()
+        target_ids = set(normalized_ids)
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                selected_ids = tuple(
+                    dict.fromkeys(
+                        entry.item_id
+                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+                        if isinstance(getattr(entry, "item_id", None), str)
+                        and bool(target_ids.intersection(self._catalog_entry_list(entry, "source_event_ids")))
+                    )
+                )
+                if selected_ids:
+                    return self.load_objects_by_ids(selected_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term objects by source event id.", exc_info=True)
+        objects = self.load_objects_fine_grained()
+        return tuple(
+            item
+            for item in objects
+            if bool(target_ids.intersection(item.source.event_ids))
+        )
+
+    def load_objects_by_projection_filter(
+        self,
+        *,
+        predicate: Callable[[Mapping[str, object]], bool],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load only current objects whose catalog projection matches ``predicate``."""
+
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                selected_ids = tuple(
+                    dict.fromkeys(
+                        entry.item_id
+                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+                        if isinstance(getattr(entry, "item_id", None), str)
+                        and predicate(self._catalog_entry_projection(entry))
+                    )
+                )
+                if selected_ids:
+                    return self.load_objects_by_ids(selected_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term objects by projection filter.", exc_info=True)
+        objects = self.load_objects_fine_grained()
+        return tuple(
+            item
+            for item in objects
+            if predicate(self._remote_object_selection_projection(snapshot_kind="objects", payload=item.to_payload()))
+        )
+
+    def load_conflicts_for_memory_ids(
+        self,
+        memory_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Load only conflicts that reference one of the requested memory ids."""
+
+        normalized_ids = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in memory_ids)
+            if normalized
+        )
+        if not normalized_ids:
+            return ()
+        target_ids = set(normalized_ids)
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                entries = tuple(
+                    entry
+                    for entry in remote_catalog.load_catalog_entries(snapshot_kind="conflicts")
+                    if self._catalog_entry_text(entry, "candidate_memory_id") in target_ids
+                    or bool(target_ids.intersection(self._catalog_entry_list(entry, "existing_memory_ids")))
+                )
+                item_ids = tuple(
+                    entry.item_id
+                    for entry in entries
+                    if isinstance(getattr(entry, "item_id", None), str)
+                )
+                if item_ids:
+                    return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term conflicts by memory id.", exc_info=True)
+        conflicts = self.load_conflicts_fine_grained()
+        return tuple(
+            conflict
+            for conflict in conflicts
+            if conflict.candidate_memory_id in target_ids
+            or bool(target_ids.intersection(conflict.existing_memory_ids))
+        )
+
+    def load_objects_for_conflict(
+        self,
+        conflict: LongTermMemoryConflictV1,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load the exact object set needed to resolve one conflict."""
+
+        explicit_ids = tuple(
+            normalized
+            for normalized in (
+                _normalize_text(value)
+                for value in (*conflict.existing_memory_ids, conflict.candidate_memory_id)
+            )
+            if normalized
+        )
+        slot_key = _normalize_text(conflict.slot_key)
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                selected_ids = tuple(
+                    dict.fromkeys(
+                        entry.item_id
+                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+                        if isinstance(getattr(entry, "item_id", None), str)
+                        and (
+                            entry.item_id in explicit_ids
+                            or (
+                                slot_key
+                                and self._catalog_entry_text(entry, "slot_key") == slot_key
+                                and self._catalog_entry_text(entry, "status") in _LIVE_OBJECT_STATUSES
+                            )
+                        )
+                    )
+                )
+                if selected_ids:
+                    return self.load_objects_by_ids(selected_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term conflict objects.", exc_info=True)
+        objects = self.load_objects_fine_grained()
+        return tuple(
+            item
+            for item in objects
+            if item.memory_id in explicit_ids
+            or (slot_key and item.slot_key == slot_key and item.status in _LIVE_OBJECT_STATUSES)
+        )
+
+    def load_objects_referencing_memory_ids(
+        self,
+        memory_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load only objects whose reference fields mention one of the requested ids."""
+
+        normalized_ids = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in memory_ids)
+            if normalized
+        )
+        if not normalized_ids:
+            return ()
+        target_ids = set(normalized_ids)
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                selected_ids = tuple(
+                    dict.fromkeys(
+                        entry.item_id
+                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
+                        if isinstance(getattr(entry, "item_id", None), str)
+                        and (
+                            bool(target_ids.intersection(self._catalog_entry_list(entry, "conflicts_with")))
+                            or bool(target_ids.intersection(self._catalog_entry_list(entry, "supersedes")))
+                        )
+                    )
+                )
+                if selected_ids:
+                    return self.load_objects_by_ids(selected_ids)
+                if self._remote_is_required():
+                    return ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term related objects.", exc_info=True)
+        objects = self.load_objects_fine_grained()
+        return tuple(
+            item
+            for item in objects
+            if target_ids.intersection(item.conflicts_with) or target_ids.intersection(item.supersedes)
+        )
+
+    def select_query_time_objects_by_ids(
+        self,
+        *,
+        query_text: str | None,
+        memory_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load supporting objects for one retrieval section on the bounded query-time path.
+
+        Retrieval callers such as conflict-queue assembly already know the
+        target object ids from an upstream query-first selector. On required
+        remote memory paths this helper must stay on that same bounded
+        contract instead of escalating into exact item `documents/full` reads.
+        Cold current-head and segment resolution is now acceptable here
+        because it stays on the same current-head + retrieve-batch contract as
+        the rest of query-time structured memory retrieval.
+        """
+
+        normalized_ids = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in memory_ids)
+            if normalized
+        )
+        if not normalized_ids:
+            return ()
+        bridge_objects = self._same_process_snapshot_bridge_objects()
+        if bridge_objects is not None:
+            by_id = {item.memory_id: item for item in bridge_objects}
+            return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
+        remote_catalog = self._remote_catalog
+        clean_query = _normalize_text(query_text)
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            if clean_query:
+                try:
+                    payloads = remote_catalog.search_current_item_payloads(
+                        snapshot_kind="objects",
+                        query_text=clean_query,
+                        limit=max(1, len(normalized_ids)),
+                        eligible=lambda entry: entry.item_id in normalized_ids,
+                        allow_catalog_fallback=False,
+                    )
+                except Exception:
+                    if self._remote_is_required():
+                        raise
+                    payloads = None
+                if payloads is not None:
+                    by_id = {
+                        item.memory_id: item
+                        for item in self._load_remote_objects_from_payloads(payloads=payloads)
+                    }
+                    return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
+            by_id = {
+                item.memory_id: item
+                for item in self._load_remote_objects_from_item_ids(item_ids=normalized_ids)
+            }
+            if by_id:
+                return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
+            if self._remote_is_required():
+                return ()
+        with self._lock:
+            objects_by_id = {item.memory_id: item for item in self.load_objects_fine_grained()}
+            return tuple(objects_by_id[memory_id] for memory_id in normalized_ids if memory_id in objects_by_id)
 
     def _remote_select_objects(
         self,
@@ -226,7 +714,7 @@ class StructuredStoreRemoteSelectionMixin:
                 limit=bounded_limit,
                 preserve_order=True,
             )
-            payloads = remote_catalog.load_item_payloads(
+            payloads = remote_catalog.load_selection_item_payloads(
                 snapshot_kind="conflicts",
                 item_ids=(entry.item_id for entry in entries),
             )
@@ -257,16 +745,11 @@ class StructuredStoreRemoteSelectionMixin:
                     query_text=clean_query,
                     limit=bounded_limit,
                 )
-                payloads = remote_catalog.load_item_payloads(
+                payloads = remote_catalog.load_selection_item_payloads(
                     snapshot_kind="conflicts",
                     item_ids=(entry.item_id for entry in entries),
                 )
-        conflicts: list[LongTermMemoryConflictV1] = []
-        for payload in payloads:
-            try:
-                conflicts.append(LongTermMemoryConflictV1.from_payload(payload))
-            except Exception:
-                _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
+        conflicts = list(self._load_remote_conflicts_from_payloads(payloads=payloads))
         if not clean_query:
             return tuple(conflicts[:bounded_limit])
         filtered_without_objects = self._filter_query_relevant_conflicts(
@@ -287,7 +770,10 @@ class StructuredStoreRemoteSelectionMixin:
         objects_by_id: dict[str, LongTermMemoryObjectV1] = {}
         if related_ids:
             try:
-                objects_by_id = {item.memory_id: item for item in self.load_objects_by_ids(related_ids)}
+                objects_by_id = {
+                    item.memory_id: item
+                    for item in self._load_remote_objects_from_item_ids(item_ids=related_ids)
+                }
             except Exception:
                 if self._remote_is_required():
                     raise
@@ -323,7 +809,7 @@ class StructuredStoreRemoteSelectionMixin:
                 sorted(
                     (
                         item
-                        for item in self.load_objects()
+                        for item in self.load_objects_fine_grained()
                         if item.kind == "episode" and item.status in {"active", "candidate", "uncertain"}
                     ),
                     key=lambda item: (

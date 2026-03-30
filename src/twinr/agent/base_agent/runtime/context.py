@@ -17,7 +17,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import cast
@@ -602,12 +602,18 @@ class TwinrRuntimeContextMixin:
             raise ValueError(f"{field_name} must be >= {minimum}")
         return parsed
 
-    def _conversation_context_unlocked(self) -> tuple[tuple[str, str], ...]:
+    def _conversation_context_unlocked(
+        self,
+        *,
+        include_system_turns: bool = True,
+    ) -> tuple[tuple[str, str], ...]:
         turns = tuple(getattr(getattr(self, "memory", None), "turns", ()) or ())
         messages: list[tuple[str, str]] = []
         for turn in turns:
             role = getattr(turn, "role", None)
             if role is None:
+                continue
+            if not include_system_turns and role == "system":
                 continue
             content = getattr(turn, "content", "")
             if content is None:
@@ -747,6 +753,7 @@ class TwinrRuntimeContextMixin:
         *,
         tool_context: bool,
         query_text: str | None = None,
+        include_conversation_system_turns: bool = True,
     ) -> tuple[tuple[str, str], ...]:
         with self._runtime_context_lock():
             language = getattr(self.config, "openai_realtime_language", None)
@@ -758,7 +765,9 @@ class TwinrRuntimeContextMixin:
             retrieval_query = self._normalized_retrieval_query(
                 query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
             )
-            conversation_context = self._conversation_context_unlocked()
+            conversation_context = self._conversation_context_unlocked(
+                include_system_turns=include_conversation_system_turns,
+            )
             long_term_memory = getattr(self, "long_term_memory", None)
             graph_memory = getattr(self, "graph_memory", None)
             fatal_remote = self._remote_long_term_failure_is_fatal()
@@ -990,6 +999,22 @@ class TwinrRuntimeContextMixin:
 
         return self._provider_context_messages(tool_context=True)
 
+    def provider_text_surface_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        """Return provider context for text turns without synthetic summary turns."""
+
+        return self._provider_context_messages(
+            tool_context=False,
+            include_conversation_system_turns=False,
+        )
+
+    def tool_provider_text_surface_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        """Return tool context for text turns without synthetic summary turns."""
+
+        return self._provider_context_messages(
+            tool_context=True,
+            include_conversation_system_turns=False,
+        )
+
     def tool_provider_tiny_recent_conversation_context(self) -> tuple[tuple[str, str], ...]:
         """Return bounded tool context without synchronous remote retrieval.
 
@@ -1159,6 +1184,36 @@ class TwinrRuntimeContextMixin:
         )
         self._append_optional_system_message(messages, display_grounding)
         messages.extend(local_summary)
+        messages.extend(raw_tail)
+        return tuple(messages)
+
+    def supervisor_provider_text_surface_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        """Return supervisor text-turn context without local summary turns."""
+
+        with self._runtime_context_lock():
+            language = getattr(self.config, "openai_realtime_language", None)
+            guidance = self._voice_guidance_message()
+            follow_up_carryover = pending_conversation_follow_up_system_message(self)
+            display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="supervisor_context")
+            raw_tail = self._raw_tail_context_unlocked(
+                limit=self._streaming_context_turn_limit(attr_name="streaming_supervisor_context_turns", default=3)
+            )
+
+        messages: list[tuple[str, str]] = []
+        self._append_contract_message(
+            messages,
+            language=language,
+            event="supervisor_context_contract_failed",
+            failure_message="Twinr could not build the fast-lane language contract and continued with reduced context.",
+        )
+        self._append_optional_system_message(messages, guidance)
+        self._append_follow_up_carryover_message(
+            messages,
+            follow_up_carryover,
+            context_builder="supervisor_provider_text_surface_conversation_context",
+            tool_context=False,
+        )
+        self._append_optional_system_message(messages, display_grounding)
         messages.extend(raw_tail)
         return tuple(messages)
 

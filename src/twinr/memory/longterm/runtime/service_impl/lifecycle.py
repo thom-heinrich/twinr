@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 
+from twinr.memory.longterm.runtime.live_object_selectors import select_restart_recall_source_objects
 from twinr.memory.longterm.runtime.flush_budget import build_flush_budget_plan
 from twinr.memory.longterm.runtime.worker import AsyncLongTermWriterState
 
@@ -57,13 +58,27 @@ class LongTermMemoryServiceLifecycleMixin(ServiceMixinBase):
         if self.restart_recall_policy_compiler is None:
             return
         packets = self.restart_recall_policy_compiler.build_packets(
-            objects=self.object_store.load_objects(),
+            objects=self._restart_recall_source_objects_locked(),
         )
         self.midterm_store.replace_packets_with_attribute(
             packets=packets,
             attribute_key="persistence_scope",
             attribute_value="restart_recall",
         )
+
+    def _restart_recall_source_objects_locked(self):
+        """Return restart-recall source objects without remote blob hydration.
+
+        Required-remote runtime paths should stay on the shared query-first
+        selector or the fresher same-process bridge snapshot.
+        """
+
+        bridge_loader = getattr(self.object_store, "_same_process_snapshot_bridge_objects", None)
+        if callable(bridge_loader):
+            bridge_objects = bridge_loader()
+            if bridge_objects is not None:
+                return tuple(bridge_objects)
+        return tuple(select_restart_recall_source_objects(self.object_store))
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         """Request bounded shutdown for all configured background writers."""

@@ -17,6 +17,10 @@ from typing import cast
 from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.thread_resolution import (
+    focus_recent_thread_conversation,
+    maybe_rewrite_prompt_against_recent_thread,
+)
 from twinr.agent.base_agent.contracts import AgentTextProvider, ToolCallingAgentProvider
 from twinr.agent.base_agent.runtime.runtime import TwinrRuntime  # pylint: disable=no-name-in-module
 from twinr.agent.base_agent.state.machine import TwinrStatus
@@ -269,7 +273,10 @@ class TwinrToolTextChannelTurnService:
                                 kind="retrieval",
                                 details={"query_chars": len((message.text or "").strip())},
                             ):
-                                conversation = self.runtime.tool_provider_conversation_context()
+                                conversation = focus_recent_thread_conversation(
+                                    self.runtime.tool_provider_text_surface_conversation_context(),
+                                    user_transcript=message.text,
+                                )
                                 conversation, effective_prompt = self._apply_pending_action_context(
                                     conversation,
                                     message.text,
@@ -301,10 +308,18 @@ class TwinrToolTextChannelTurnService:
                                 kind="retrieval",
                                 details={"query_chars": len((message.text or "").strip())},
                             ):
-                                conversation = self.runtime.tool_provider_conversation_context()
+                                conversation = focus_recent_thread_conversation(
+                                    self.runtime.tool_provider_text_surface_conversation_context(),
+                                    user_transcript=message.text,
+                                )
+                                resolution = maybe_rewrite_prompt_against_recent_thread(
+                                    getattr(self.tool_agent_provider, "backend", None),
+                                    conversation=conversation,
+                                    user_transcript=message.text,
+                                )
                                 conversation, effective_prompt = self._apply_pending_action_context(
                                     conversation,
-                                    message.text,
+                                    resolution.effective_prompt,
                                     pending_action=pending_action,
                                 )
                         available_tool_names, loop = self._build_turn_loop()

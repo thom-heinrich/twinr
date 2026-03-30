@@ -224,6 +224,26 @@ class AutomationStoreTests(unittest.TestCase):
         self.assertIn("Daily weather", context)
         self.assertIn("spoken llm prompt with web search", context)
 
+    def test_store_files_use_owner_only_runtime_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = AutomationStore(Path(temp_dir) / "automations.json", timezone_name="Europe/Berlin")
+            due_at = (now_in_timezone("Europe/Berlin") + timedelta(hours=1)).isoformat()
+            store.create_time_automation(
+                name="Shared state check",
+                schedule="once",
+                due_at=due_at,
+                actions=(AutomationAction(kind="say", text="Hallo."),),
+            )
+            store.load_entries()
+
+            store_mode = store.path.stat().st_mode & 0o777
+            backup_mode = store.backup_path.stat().st_mode & 0o777
+            lock_mode = store.lock_path.stat().st_mode & 0o777
+
+        self.assertEqual(store_mode, 0o600)
+        self.assertEqual(backup_mode, 0o600)
+        self.assertEqual(lock_mode, 0o600)
+
     def test_sensor_trigger_helpers_build_and_describe_supported_kinds(self) -> None:
         immediate = build_sensor_trigger("camera_person_visible", cooldown_seconds=90)
         delayed = build_sensor_trigger("vad_quiet", hold_seconds=30, cooldown_seconds=120)

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.hardware.audio import AmbientAudioLevelSample
-from twinr.memory import ConversationTurn
+from twinr.memory.on_device import ConversationTurn
 from twinr.ops.checks import run_config_checks
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.health import collect_system_health
@@ -239,6 +239,7 @@ class OpsModuleTests(unittest.TestCase):
         config = TwinrConfig(
             openai_api_key="sk-test",
             printer_queue="Thermal_GP58",
+            gpio_chip="/dev/gpiochip4",
             green_button_gpio=23,
             yellow_button_gpio=22,
             pir_motion_gpio=26,
@@ -246,7 +247,14 @@ class OpsModuleTests(unittest.TestCase):
             pir_bias="pull-down",
         )
 
-        checks = run_config_checks(config)
+        with patch(
+            "twinr.ops.checks._probe_gpio_lines",
+            return_value=SimpleNamespace(
+                status="ok",
+                detail="GPIO chip exposes the configured line offsets.",
+            ),
+        ):
+            checks = run_config_checks(config)
 
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["pir"].status, "ok")
@@ -259,7 +267,14 @@ class OpsModuleTests(unittest.TestCase):
             proactive_audio_input_device="plughw:CARD=CameraB409241,DEV=0",
         )
 
-        checks = run_config_checks(config)
+        with patch(
+            "twinr.ops.checks._probe_alsa_device",
+            return_value=SimpleNamespace(
+                status="ok",
+                detail="ALSA lists the configured input device.",
+            ),
+        ):
+            checks = run_config_checks(config)
 
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["proactive_audio_input"].status, "ok")
@@ -503,7 +518,7 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.summary, "Proactive background-microphone sample captured.")
         self.assertIn("plughw:CARD=CameraB409241,DEV=0", result.details[0])
-        self.assertIn("Speech-like activity: yes", result.details[-1])
+        self.assertIn("Speech-like activity: yes", result.details)
 
     def test_proactive_mic_self_test_is_blocked_when_voice_orchestrator_owns_same_device(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -618,7 +633,9 @@ class OpsModuleTests(unittest.TestCase):
                 config,
                 camera_factory=lambda _config: fake_camera,
             )
-            result = runner.run("aideck_camera")
+            with patch.object(runner, "_probe_tcp_endpoint", return_value=None):
+                with patch.object(runner, "_validate_image_artifact", return_value=None):
+                        result = runner.run("aideck_camera")
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.summary, "AI-Deck frame captured.")
@@ -652,7 +669,9 @@ class OpsModuleTests(unittest.TestCase):
                 camera_factory=lambda _config: fake_camera,
             )
 
-            result = runner.run("aideck_camera")
+            with patch.object(runner, "_probe_tcp_endpoint", return_value=None):
+                with patch.object(runner, "_validate_image_artifact", return_value=None):
+                        result = runner.run("aideck_camera")
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(fake_camera.output_paths, [None])

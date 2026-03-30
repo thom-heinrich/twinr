@@ -14,6 +14,7 @@ Out of scope:
 ## Key files
 
 - `service.py` — compatibility shim that preserves the historic import path and delegates to `service_impl/`
+- `live_object_selectors.py` — shared query-first selector layer for live-near reserve/proactive/maintenance object reads
 - `service_impl/compat.py` — shared helper functions, limits, logger, and readiness dataclasses extracted from the old monolith
 - `service_impl/main.py` — `LongTermMemoryService` dataclass and inherited method surface
 - `service_impl/builder.py` — service assembly and bounded writer construction
@@ -39,9 +40,13 @@ Out of scope:
 - Foreground runtime turn-finalization paths must only queue tool-history learning and must not reacquire the shared long-term store lock for that queue step; any expensive remote-primary personality commit belongs to the later bounded persistence/flush path, not the answer-finalization hot path.
 - When runtime reflection creates summaries or promotes objects inline, the downstream personality-learning handoff must see that enriched batch instead of only the pre-reflection consolidator result.
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
+- `health.py` must attest graph and midterm readiness through the stores' current-view/current-head helpers, not by reintroducing generic `load_snapshot("graph"|"midterm")` checks.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
 - Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
 - Runtime restart-recall persistence stays orchestration-only here: `service.py` may trigger packet refreshes, but packet compilation logic belongs in retrieval and packet storage semantics belong in storage.
+- Live-near reserve/proactive/runtime maintenance callers must get object slices through `live_object_selectors.py`; do not add new direct `load_objects()` calls in runtime orchestration for those paths.
+- Full-state runtime persistence and maintenance reads must come through the storage layer's shared fine-grained current-state loader; do not reintroduce direct snapshot blob hydration for required remote object/conflict/archive state in runtime orchestration.
+- Conversation and multimodal dry-run analysis must use fine-grained object reads; do not add new `load_objects()` blob hydration to those runtime entry points.
 - Runtime may persist a deterministic immediate turn-continuity packet before slower durable enrichment drains, but the packet-compilation logic belongs in reasoning and must not grow ad-hoc inside `service.py`.
 - Multimodal evidence and episodic fallback payloads must remain bounded and sanitized before persistence.
 
@@ -51,7 +56,7 @@ After any edit in this directory, run:
 
 ```bash
 python3 -m compileall src/twinr/memory/longterm/runtime
-PYTHONPATH=src pytest test/test_longterm_worker.py test/test_longterm_runtime_health.py -q
+PYTHONPATH=src pytest test/test_longterm_worker.py test/test_longterm_runtime_health.py test/test_longterm_runtime_query_selectors.py -q
 ```
 
 If `service.py` changed, also run:
@@ -88,6 +93,17 @@ PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal
 - `src/twinr/agent/base_agent/runtime/base.py`
 - `test/test_longterm_runtime_health.py`
 - `test/test_longterm_remote_state.py`
+
+`live_object_selectors.py` changes -> also check:
+- `service_impl/proactive.py`
+- `service_impl/maintenance.py`
+- `service_impl/lifecycle.py`
+- `src/twinr/memory/user_discovery_authoritative_profile.py`
+- `src/twinr/proactive/runtime/display_reserve_reflection.py`
+- `test/test_longterm_proactive.py`
+- `test/test_user_discovery.py`
+- `test/test_display_reserve_reflection.py`
+- `test/test_longterm_runtime_query_selectors.py`
 
 ## Security
 

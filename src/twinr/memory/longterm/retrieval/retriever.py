@@ -20,12 +20,17 @@ from itertools import islice
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_event, workflow_span
-from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.chonkydb.personal_graph import TwinrGraphContextSelection, TwinrPersonalGraphStore
 from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.core.models import LongTermConflictQueueItemV1, LongTermMemoryContext
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.retrieval.unified_plan import (
+    UnifiedGraphSelectionInput,
+    UnifiedRetrievalSelection,
+    build_unified_retrieval_selection,
+)
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
@@ -67,7 +72,17 @@ class _LongTermContextInputs:
     midterm_packets: tuple[object, ...]
     durable_objects: tuple[object, ...]
     conflict_queue: tuple[LongTermConflictQueueItemV1, ...]
+    graph_selection: UnifiedGraphSelectionInput | None
     graph_context: str | None
+    unified_query_plan: dict[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConflictQueueSelection:
+    """Carry queued conflicts plus the supporting objects used to build them."""
+
+    queue: tuple[LongTermConflictQueueItemV1, ...]
+    supporting_objects: tuple[object, ...]
 
 
 def _query_trace_details(query_texts: tuple[str, ...], *, retrieval_text: str | None = None) -> dict[str, object]:
@@ -169,6 +184,7 @@ class LongTermRetriever:
                     )
                 conflict_queue = context_inputs.conflict_queue
                 graph_context = context_inputs.graph_context
+                unified_query_plan = context_inputs.unified_query_plan
                 with workflow_span(name="longterm_retriever_render_durable_context", kind="retrieval"):
                     durable_context = self._render_durable_context(durable_objects)
                 with workflow_span(name="longterm_retriever_render_episodic_context", kind="retrieval"):
@@ -183,6 +199,8 @@ class LongTermRetriever:
                         query_text=original_query_text,
                         retrieval_query_text=retrieval_text,
                         episodic_entries=episodic_entries,
+                        graph_selection=context_inputs.graph_selection,
+                        unified_query_plan=unified_query_plan,
                     )
                 with workflow_span(name="longterm_retriever_render_midterm_context", kind="retrieval"):
                     midterm_context = self._render_midterm_context(tuple((*adaptive_packets, *midterm_packets)))
@@ -197,6 +215,7 @@ class LongTermRetriever:
                         "conflict_queue": len(conflict_queue),
                         "has_graph_context": bool(graph_context),
                         "has_subtext_context": bool(subtext_context),
+                        "has_unified_query_plan": bool(unified_query_plan),
                     },
                 )
                 return LongTermMemoryContext(
@@ -227,11 +246,11 @@ class LongTermRetriever:
     ) -> _LongTermContextInputs:
         """Load independent retrieval sections in parallel for one turn.
 
-        Mid-term and graph context are local and cheap enough to overlap.
-        The remote object/conflict selectors, however, all hit the same
-        ChonkyDB truth store. Serializing those three searches avoids the
-        intermittent Pi-side timeout burst where one scope top-k stalls and
-        the whole turn degrades into slower fallback paths.
+        Mid-term packet selection and bounded graph selection can overlap.
+        The structured object and conflict selectors, however, all hit the
+        same ChonkyDB truth store. Serializing those structured searches keeps
+        the hot path on one query-first catalog contract instead of creating
+        avoidable contention bursts on the Pi.
         """
 
         with ThreadPoolExecutor(
@@ -248,20 +267,37 @@ class LongTermRetriever:
             graph_future = executor.submit(
                 copy_context().run,
                 _run_traced_call,
-                "longterm_retriever_build_graph_context",
-                self._build_graph_context,
+                "longterm_retriever_select_graph_context",
+                self._select_graph_context_selection,
                 retrieval_text,
             )
             with workflow_span(name="longterm_retriever_select_context_objects", kind="retrieval"):
                 episodic_entries, durable_objects = self._select_context_object_sections(query_texts)
             with workflow_span(name="longterm_retriever_select_conflict_queue", kind="retrieval"):
-                conflict_queue = self._select_conflict_queue_for_texts(query_texts)
+                conflict_selection = self._select_conflict_queue_selection_for_texts(query_texts)
+            graph_selection = graph_future.result()
+            midterm_packets = midterm_future.result()
+            with workflow_span(name="longterm_retriever_build_unified_query_plan", kind="retrieval"):
+                unified_selection = self._build_unified_selection(
+                    query_texts=query_texts,
+                    durable_objects=durable_objects,
+                    conflict_selection=conflict_selection,
+                    midterm_packets=midterm_packets,
+                    graph_selection=graph_selection,
+                )
+            with workflow_span(name="longterm_retriever_render_graph_context", kind="retrieval"):
+                graph_context = self._render_graph_context_selection(
+                    graph_selection=unified_selection.graph_selection,
+                    retrieval_text=retrieval_text,
+                )
             return _LongTermContextInputs(
                 episodic_entries=episodic_entries,
-                midterm_packets=midterm_future.result(),
-                durable_objects=durable_objects,
-                conflict_queue=conflict_queue,
-                graph_context=graph_future.result(),
+                midterm_packets=unified_selection.midterm_packets,
+                durable_objects=unified_selection.durable_objects,
+                conflict_queue=unified_selection.conflict_queue,
+                graph_selection=unified_selection.graph_selection,
+                graph_context=graph_context,
+                unified_query_plan=unified_selection.query_plan,
             )
 
     def _select_context_object_sections(
@@ -386,10 +422,23 @@ class LongTermRetriever:
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
         """Load conflict queue items for one or more normalized retrieval texts."""
 
+        return self._select_conflict_queue_selection_for_texts(
+            query_texts,
+            limit=limit,
+        ).queue
+
+    def _select_conflict_queue_selection_for_texts(
+        self,
+        query_texts: tuple[str, ...],
+        *,
+        limit: int | None = None,
+    ) -> _ConflictQueueSelection:
+        """Load conflict queue items plus the supporting objects that justify them."""
+
         if not query_texts:
-            return ()
+            return _ConflictQueueSelection(queue=(), supporting_objects=())
         if limit is not None and self._coerce_limit(limit, default=0, minimum=0) == 0:
-            return ()  # AUDIT-FIX(#7): Respect explicit zero-limit requests instead of silently widening recall.
+            return _ConflictQueueSelection(queue=(), supporting_objects=())  # AUDIT-FIX(#7): Respect explicit zero-limit requests instead of silently widening recall.
         resolved_limit = self._coerce_limit(
             self.config.long_term_memory_recall_limit if limit is None else limit,
             default=1,
@@ -409,7 +458,7 @@ class LongTermRetriever:
             raise
         except Exception:
             logger.exception("Long-term conflict retrieval failed; continuing without conflict context.")
-            return ()
+            return _ConflictQueueSelection(queue=(), supporting_objects=())
 
         try:  # AUDIT-FIX(#1): A failure to load supporting objects must not abort the whole memory path.
             related_memory_ids = tuple(
@@ -420,8 +469,22 @@ class LongTermRetriever:
                     if isinstance(memory_id, str) and memory_id
                 )
             )
+            query_time_object_loader = getattr(self.object_store, "select_query_time_objects_by_ids", None)
             objects = (
-                self.object_store.load_objects_by_ids(related_memory_ids)
+                self._merge_unique_results(
+                    query_texts=query_texts,
+                    load_results=lambda query_text: query_time_object_loader(
+                        query_text=query_text,
+                        memory_ids=related_memory_ids,
+                    ),
+                    result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
+                    limit=max(1, len(related_memory_ids)),
+                )
+                if related_memory_ids and callable(query_time_object_loader)
+                else self.object_store.load_objects_by_ids(
+                    related_memory_ids,
+                    selection_only=True,
+                )
                 if related_memory_ids
                 else ()
             )
@@ -438,8 +501,11 @@ class LongTermRetriever:
             )
         except Exception:
             logger.exception("Long-term conflict queue build failed; continuing without conflict context.")
-            return ()
-        return tuple(self._coerce_iterable(queue))
+            return _ConflictQueueSelection(queue=(), supporting_objects=tuple(self._coerce_iterable(objects)))
+        return _ConflictQueueSelection(
+            queue=tuple(self._coerce_iterable(queue)),
+            supporting_objects=tuple(self._coerce_iterable(objects)),
+        )
 
     def _select_episodic_entries(
         self,
@@ -566,21 +632,84 @@ class LongTermRetriever:
             limit=resolved_limit,
         )
 
-    def _build_graph_context(self, retrieval_text: str) -> str | None:
-        """Render graph-derived prompt context for normalized retrieval text."""
+    def _select_graph_context_selection(self, retrieval_text: str) -> UnifiedGraphSelectionInput | None:
+        """Select the graph document and query-plan fragment for this retrieval text."""
 
         if not retrieval_text:
             return None
         try:  # AUDIT-FIX(#1): Graph retrieval failures should degrade to no graph context, not a failed turn.
-            graph_context = self.graph_store.build_prompt_context(retrieval_text)
+            selection = self.graph_store.select_context_selection(retrieval_text)
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
-            logger.exception("Long-term graph retrieval failed; continuing without graph context.")
+            logger.exception("Long-term graph selection failed; continuing without graph context.")
+            return None
+        return UnifiedGraphSelectionInput(
+            document=selection.document,
+            query_plan=selection.query_plan,
+        )
+
+    def _render_graph_context_selection(
+        self,
+        *,
+        graph_selection: UnifiedGraphSelectionInput | None,
+        retrieval_text: str,
+    ) -> str | None:
+        """Render graph-derived prompt context from an already selected graph document."""
+
+        if graph_selection is None or not retrieval_text:
+            return None
+        try:
+            graph_context = self.graph_store.render_prompt_context_selection(
+                TwinrGraphContextSelection(
+                    document=graph_selection.document,
+                    query_plan=graph_selection.query_plan,
+                ),
+                query_text=retrieval_text,
+            )
+        except LongTermRemoteUnavailableError:
+            raise
+        except Exception:
+            logger.exception("Long-term graph rendering failed; continuing without graph context.")
             return None
         if graph_context is None:
             return None
         return str(graph_context)
+
+    def _build_graph_context(self, retrieval_text: str) -> str | None:
+        """Compatibility wrapper that still builds graph context from a retrieval text."""
+
+        graph_selection = self._select_graph_context_selection(retrieval_text)
+        return self._render_graph_context_selection(
+            graph_selection=graph_selection,
+            retrieval_text=retrieval_text,
+        )
+
+    def _build_unified_selection(
+        self,
+        *,
+        query_texts: tuple[str, ...],
+        durable_objects: tuple[object, ...],
+        conflict_selection: _ConflictQueueSelection,
+        midterm_packets: tuple[object, ...],
+        graph_selection: UnifiedGraphSelectionInput | None,
+    ) -> UnifiedRetrievalSelection:
+        """Build one explainable selection plan across structured and graph candidates."""
+
+        unified_selection = build_unified_retrieval_selection(
+            query_texts=query_texts,
+            durable_objects=durable_objects,
+            conflict_queue=conflict_selection.queue,
+            conflict_supporting_objects=conflict_selection.supporting_objects,
+            midterm_packets=midterm_packets,
+            graph_selection=graph_selection,
+        )
+        workflow_event(
+            kind="retrieval",
+            msg="longterm_retriever_unified_query_plan",
+            details={"query_plan": dict(unified_selection.query_plan)},
+        )
+        return unified_selection
 
     def _build_subtext_context(
         self,
@@ -588,18 +717,81 @@ class LongTermRetriever:
         query_text: str | None,
         retrieval_query_text: str,
         episodic_entries: list[PersistentMemoryEntry],
+        graph_selection: UnifiedGraphSelectionInput | None = None,
+        unified_query_plan: dict[str, object] | None = None,
     ) -> str | None:
         """Build silent personalization context from retrieved memory cues."""
 
+        graph_payload: dict[str, object] | None = None
+        if graph_selection is not None:
+            try:
+                graph_payload = self.graph_store.build_subtext_payload_from_selection(
+                    TwinrGraphContextSelection(
+                        document=graph_selection.document,
+                        query_plan=graph_selection.query_plan,
+                    ),
+                    query_text=retrieval_query_text,
+                )
+            except LongTermRemoteUnavailableError:
+                raise
+            except Exception:
+                logger.exception("Long-term graph subtext payload build failed; continuing without graph cues.")
         try:  # AUDIT-FIX(#1): Subtext generation is optional and must fail closed.
-            return self.subtext_builder.build(
+            subtext_context = self.subtext_builder.build(
                 query_text=query_text,
                 retrieval_query_text=retrieval_query_text,
                 episodic_entries=episodic_entries,
+                graph_payload=graph_payload,
             )
         except Exception:
             logger.exception("Long-term subtext build failed; continuing without subtext context.")
             return None
+        self._update_unified_query_plan_subtext(
+            unified_query_plan=unified_query_plan,
+            graph_payload=graph_payload,
+            episodic_entries=episodic_entries,
+            rendered=bool(subtext_context),
+        )
+        if isinstance(unified_query_plan, Mapping):
+            workflow_event(
+                kind="retrieval",
+                msg="longterm_retriever_unified_query_plan_final",
+                details={"query_plan": dict(unified_query_plan)},
+            )
+        return subtext_context
+
+    def _update_unified_query_plan_subtext(
+        self,
+        *,
+        unified_query_plan: dict[str, object] | None,
+        graph_payload: Mapping[str, object] | None,
+        episodic_entries: list[PersistentMemoryEntry],
+        rendered: bool,
+    ) -> None:
+        """Attach subtext-planning metadata to the internal unified query plan."""
+
+        if not isinstance(unified_query_plan, dict):
+            return
+        sources = unified_query_plan.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+            unified_query_plan["sources"] = sources
+        sources["subtext_rendered"] = bool(rendered)
+        sources["episodic_count"] = len(episodic_entries)
+        graph_payload_sections = [
+            key
+            for key in sorted(graph_payload.keys())
+            if key != "query_plan"
+        ] if isinstance(graph_payload, Mapping) else []
+        recent_thread_count = len(self.subtext_builder._episodic_threads(episodic_entries))  # pylint: disable=protected-access
+        unified_query_plan["subtext"] = {
+            "schema": "twinr_unified_subtext_plan_v1",
+            "graph_payload_source": "unified_graph_selection" if isinstance(graph_payload, Mapping) else "none",
+            "graph_payload_sections": graph_payload_sections,
+            "recent_thread_count": recent_thread_count,
+            "compiler_enabled": bool(self.subtext_builder.compiler is not None),
+            "rendered": bool(rendered),
+        }
 
     def _build_adaptive_packets(
         self,

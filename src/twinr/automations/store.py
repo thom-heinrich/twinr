@@ -52,6 +52,8 @@ _DEFAULT_MAX_STORE_BYTES = 2 * 1024 * 1024
 _MAX_PENDING_OCCURRENCES = 512
 _PAYLOAD_SCHEMA_VERSION = 2
 _UTC = timezone.utc
+_CROSS_SERVICE_STORE_FILE_MODE = 0o600
+_CROSS_SERVICE_LOCK_FILE_MODE = 0o600
 
 
 def _normalize_text(value: Any, *, limit: int) -> str:
@@ -863,10 +865,11 @@ class AutomationStore:
     def _interprocess_lock(self) -> Iterator[None]:
         self._assert_safe_store_path(self.lock_path)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, _CROSS_SERVICE_LOCK_FILE_MODE)
         try:
             try:
-                os.fchmod(fd, 0o600)
+                # The Pi runtime and operator tools can touch the same store under different users.
+                os.fchmod(fd, _CROSS_SERVICE_LOCK_FILE_MODE)
             except OSError:
                 pass
             if fcntl is not None:
@@ -1198,7 +1201,7 @@ class AutomationStore:
         temporary_path = Path(temporary_name)
         try:
             try:
-                os.fchmod(fd, 0o600)
+                os.fchmod(fd, _CROSS_SERVICE_STORE_FILE_MODE)
             except OSError:
                 pass
             with os.fdopen(fd, "wb") as handle:

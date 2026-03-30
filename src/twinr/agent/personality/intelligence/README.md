@@ -11,7 +11,8 @@ threads.
 
 `intelligence` owns:
 - define typed subscription, calibration-state, situational-awareness, and refresh-result models for RSS/world intelligence
-- persist subscriptions and refresh/discovery timing through remote-primary snapshots
+- persist subscriptions and refresh/discovery timing through remote-primary current-head/state records instead of monolithic snapshots
+- keep prompt-time state reads read-only so first-turn world-intelligence loads do not stall on legacy current-head promotion
 - reuse the parent package's shared payload-normalization and remote-state adapter helpers so RSS state decoding stays aligned with the rest of the personality package
 - derive slow-changing topic/region interest signals from structured conversation or tool evidence
 - keep live-search tool interests as situational evidence only; only conversation-derived or explicit world-intelligence interests may seed durable feed discovery during recalibration
@@ -43,7 +44,7 @@ threads.
 |---|---|
 | [models.py](./models.py) | Typed feed subscriptions, timing state, and refresh/config result models |
 | [calibration.py](./calibration.py) | Convert structured personality/tool evidence into world-intelligence calibration signals |
-| [store.py](./store.py) | Remote-primary snapshot seam for subscriptions and refresh/discovery timing |
+| [store.py](./store.py) | Remote-primary current-head/item seam for subscriptions plus refresh/discovery timing state; prompt-time state loads stay read-only while compatibility promotion remains on write/migration paths |
 | [service.py](./service.py) | Feed discovery, reflection-phase recalibration, due refresh, and conversion into world/continuity/awareness context |
 | [../_payload_utils.py](../_payload_utils.py) | Shared payload normalization helpers reused by both personality and intelligence model decoding |
 | [../_remote_state_utils.py](../_remote_state_utils.py) | Shared remote-primary adapter resolution reused by both snapshot-store seams |

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 from threading import Lock
+from time import monotonic
 from typing import Any, Callable, cast
 
 from twinr.runtime_paths import prime_raspberry_pi_system_site_packages
@@ -366,6 +367,64 @@ def _print_runtime_banner(runtime: Any, config: TwinrConfig, env_path: Path) -> 
     print(f"runtime_env_file={env_path}")
 
 
+def _print_direct_cli_banner(config: TwinrConfig, env_path: Path) -> None:
+    """Emit the same bootstrap facts for direct CLI turns without runtime boot.
+
+    One-shot operator commands such as `--openai-prompt` only need the OpenAI
+    backend boundary, not the full Twinr runtime bootstrap. Keeping the banner
+    shape stable preserves operator context while avoiding an unnecessary
+    required-remote startup path.
+    """
+
+    print("status=waiting")
+    print(f"web_port={config.web_port}")
+    print(f"model={config.default_model}")
+    print(f"openai_reasoning_effort={config.openai_reasoning_effort}")
+    print(f"runtime_cwd={Path.cwd().resolve()}")
+    print(f"runtime_source_root={Path(sys.path[0] or '.').resolve()}")
+    try:
+        import twinr as twinr_package
+
+        print(f"runtime_package_root={Path(getattr(twinr_package, '__file__', '.')).resolve().parent.parent}")
+    except Exception:
+        print("runtime_package_root=unknown")
+    print(f"runtime_env_file={env_path}")
+
+
+def _safe_probe_detail(value: object, *, max_len: int = 240) -> str:
+    """Render one bounded single-line detail string for probe-stage output."""
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _print_orchestrator_probe_stage(
+    stage: str,
+    *,
+    started_at: float,
+    status: str,
+    error: BaseException | None = None,
+) -> None:
+    """Emit one bounded stage-timing line for --orchestrator-probe-turn."""
+
+    elapsed_ms = max(0, int(round((monotonic() - started_at) * 1000.0)))
+    parts = [
+        f"probe_stage={stage}",
+        f"status={status}",
+        f"elapsed_ms={elapsed_ms}",
+    ]
+    if error is not None:
+        parts.append(f"error_type={type(error).__name__}")
+        safe_error = _safe_probe_detail(error)
+        if safe_error:
+            parts.append(f"error={safe_error}")
+    print(" ".join(parts))
+
+
 def _print_self_coding_codex_report(report: Any) -> None:
     """Emit the bounded self_coding Codex preflight result as key/value lines."""
 
@@ -715,9 +774,50 @@ def main() -> int:
                                 duration_s=args.loop_duration,
                             )
 
-        _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
-        runtime = _build_runtime(runtime_config)
-        _print_runtime_banner(runtime, runtime_config, env_path)
+        if args.demo_transcript or args.orchestrator_probe_turn:
+            if args.orchestrator_probe_turn:
+                watchdog_started = monotonic()
+                try:
+                    _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
+                except Exception as exc:
+                    _print_orchestrator_probe_stage(
+                        "watchdog_gate",
+                        started_at=watchdog_started,
+                        status="error",
+                        error=exc,
+                    )
+                    raise
+                _print_orchestrator_probe_stage(
+                    "watchdog_gate",
+                    started_at=watchdog_started,
+                    status="ok",
+                )
+
+                runtime_started = monotonic()
+                try:
+                    runtime = _build_runtime(runtime_config)
+                except Exception as exc:
+                    _print_orchestrator_probe_stage(
+                        "runtime_bootstrap",
+                        started_at=runtime_started,
+                        status="error",
+                        error=exc,
+                    )
+                    raise
+                _print_runtime_banner(runtime, runtime_config, env_path)
+                _print_orchestrator_probe_stage(
+                    "runtime_bootstrap",
+                    started_at=runtime_started,
+                    status="ok",
+                )
+            else:
+                _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
+                runtime = _build_runtime(runtime_config)
+                _print_runtime_banner(runtime, runtime_config, env_path)
+        elif not (args.openai_prompt or args.vision_prompt):
+            _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
+            runtime = _build_runtime(runtime_config)
+            _print_runtime_banner(runtime, runtime_config, env_path)
 
         if args.demo_transcript:
             runtime.press_green_button()
@@ -783,43 +883,20 @@ def main() -> int:
 
         if args.orchestrator_probe_turn:
             _assert_pi_runtime_root(args.env_file, command_name="orchestrator-probe-turn")
-            from twinr.agent.tools import bind_realtime_tool_handlers
-            from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
-            from twinr.orchestrator import OrchestratorTurnRequest, OrchestratorWebSocketClient
-            from twinr.providers import build_streaming_provider_bundle
+            from twinr.orchestrator.probe_turn import run_orchestrator_probe_turn
 
             if backend is None:
                 raise RuntimeError("Orchestrator probe requires configured providers")
-            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
-            loop = TwinrStreamingHardwareLoop(
-                config=config,
+            outcome = run_orchestrator_probe_turn(
+                config=runtime_config,
                 runtime=runtime,
-                print_backend=provider_bundle.print_backend,
-                stt_provider=provider_bundle.stt,
-                verification_stt_provider=getattr(provider_bundle, "verification_stt", None),
-                agent_provider=provider_bundle.agent,
-                tts_provider=provider_bundle.tts,
-                tool_agent_provider=provider_bundle.tool_agent,
+                backend=backend,
+                prompt=args.orchestrator_probe_turn,
+                emit_line=print,
             )
-            client_factory = cast(Callable[..., Any], OrchestratorWebSocketClient)
-            request_factory = cast(Callable[..., Any], OrchestratorTurnRequest)
-            client = client_factory(
-                config.orchestrator_ws_url,
-                shared_secret=config.orchestrator_shared_secret,
-            )
-            deltas: list[str] = []
-            result = client.run_turn(
-                request_factory(
-                    prompt=args.orchestrator_probe_turn,
-                    conversation=runtime.tool_provider_conversation_context(),
-                    supervisor_conversation=runtime.supervisor_provider_conversation_context(),
-                ),
-                tool_handlers=bind_realtime_tool_handlers(loop.tool_executor),
-                on_ack=lambda event: print(f"ack={event.ack_id}:{event.text}"),
-                on_text_delta=lambda delta: deltas.append(delta),
-            )
-            if deltas:
-                print(f"streamed={''.join(deltas)}")
+            if outcome.deltas:
+                print(f"streamed={''.join(outcome.deltas)}")
+            result = outcome.result
             print(f"response={result.text}")
             print(f"rounds={result.rounds}")
             print(f"used_web_search={str(result.used_web_search).lower()}")
@@ -935,18 +1012,19 @@ def main() -> int:
                     "Vision requests need at least one image. Use --vision-camera-capture and/or --vision-image."
                 )
 
-            runtime.press_green_button()
-            print(f"status={runtime.status.value}")
-            runtime.submit_transcript(args.vision_prompt)
-            print(f"status={runtime.status.value}")
+            _print_direct_cli_banner(runtime_config, env_path)
+            print("status=listening")
+            print("status=processing")
             response = backend.respond_to_images_with_metadata(
                 args.vision_prompt,
                 images=images,
-                conversation=runtime.conversation_context(),
+                conversation=(),
                 allow_web_search=args.openai_web_search,
             )
-            answer = runtime.complete_agent_turn(response.text)
-            print(f"status={runtime.status.value}")
+            answer = str(getattr(response, "text", "") or "").strip()
+            if not answer:
+                raise RuntimeError("Vision request returned an empty response.")
+            print("status=answering")
             print(f"vision_image_count={len(images)}")
             print(f"response={answer}")
             if response.response_id:
@@ -954,29 +1032,28 @@ def main() -> int:
             if response.request_id:
                 print(f"openai_request_id={response.request_id}")
             print(f"openai_used_web_search={str(response.used_web_search).lower()}")
-            runtime.finish_speaking()
-            print(f"status={runtime.status.value}")
+            print("status=waiting")
 
         if args.openai_prompt and backend is not None:
-            runtime.press_green_button()
-            print(f"status={runtime.status.value}")
-            runtime.submit_transcript(args.openai_prompt)
-            print(f"status={runtime.status.value}")
+            _print_direct_cli_banner(runtime_config, env_path)
+            print("status=listening")
+            print("status=processing")
             response = backend.respond_with_metadata(
                 args.openai_prompt,
-                conversation=runtime.conversation_context(),
+                conversation=(),
                 allow_web_search=args.openai_web_search,
             )
-            answer = runtime.complete_agent_turn(response.text)
-            print(f"status={runtime.status.value}")
+            answer = str(getattr(response, "text", "") or "").strip()
+            if not answer:
+                raise RuntimeError("OpenAI prompt returned an empty response.")
+            print("status=answering")
             print(f"response={answer}")
             if response.response_id:
                 print(f"openai_response_id={response.response_id}")
             if response.request_id:
                 print(f"openai_request_id={response.request_id}")
             print(f"openai_used_web_search={str(response.used_web_search).lower()}")
-            runtime.finish_speaking()
-            print(f"status={runtime.status.value}")
+            print("status=waiting")
 
         if args.tts_text and backend is not None:
             audio_bytes = backend.synthesize(args.tts_text)

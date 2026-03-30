@@ -6,6 +6,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.conversation.follow_up_context import (
+    append_recent_thread_carryover_message,
+    build_recent_thread_carryover_hint,
     build_follow_up_context_hint,
     follow_up_context_hint_trace_details,
     pending_conversation_follow_up_hint_trace_details,
@@ -33,6 +35,42 @@ class FollowUpContextTests(unittest.TestCase):
         self.assertIn("New York", hint)
         self.assertIn("Meinst du etwas Bestimmtes?", hint)
         self.assertIn("Continue this thread", hint)
+
+    def test_build_recent_thread_carryover_hint_keeps_recent_anchor_turns(self) -> None:
+        hint = build_recent_thread_carryover_hint(
+            conversation=(
+                ("user", "wie spaet ist es in New York"),
+                ("assistant", "In New York ist es gerade 10:53 Uhr."),
+                ("user", "mich"),
+                ("assistant", "Meinst du etwas Bestimmtes?"),
+            ),
+            user_transcript="Ich meinte, wie spaet es ist.",
+        )
+
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertIn("New York", hint)
+        self.assertIn("Ich meinte, wie spaet es ist.", hint)
+        self.assertIn("repair, clarification, or continuation", hint)
+
+    def test_append_recent_thread_carryover_message_adds_system_guidance(self) -> None:
+        conversation = append_recent_thread_carryover_message(
+            (
+                ("system", "memory summary"),
+                ("user", "wie spaet ist es in New York"),
+                ("assistant", "In New York ist es gerade 10:53 Uhr."),
+            ),
+            user_transcript="Ich meinte, wie spaet es ist.",
+        )
+
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Recent thread carryover for this turn." in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
 
     def test_pending_system_message_is_only_injected_while_scope_is_active(self) -> None:
         runtime = SimpleNamespace()

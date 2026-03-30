@@ -286,6 +286,77 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             self.assertTrue(second_entered.wait(timeout=1.0))
             keepalive.close()
 
+    def test_direct_guard_keepalive_waits_before_reopening_after_foreground_playback(self) -> None:
+        first_entered = Event()
+        first_exited = Event()
+        second_entered = Event()
+        enter_count = 0
+        exit_count = 0
+        count_lock = Lock()
+
+        class _Guard:
+            active = True
+
+            def __enter__(self):
+                nonlocal enter_count
+                with count_lock:
+                    enter_count += 1
+                    current = enter_count
+                if current == 1:
+                    first_entered.set()
+                elif current == 2:
+                    second_entered.set()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                nonlocal exit_count
+                del exc_type, exc, traceback
+                with count_lock:
+                    exit_count += 1
+                    current = exit_count
+                if current == 1:
+                    first_exited.set()
+                return False
+
+        keepalive = build_respeaker_duplex_keepalive(
+            config=TwinrConfig(audio_output_device="twinr_playback_softvol"),
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_coordinator=None,
+        )
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+
+        with mock.patch(
+            "twinr.agent.workflows.respeaker_duplex_keepalive.maybe_open_respeaker_duplex_playback_guard",
+            side_effect=lambda **_kwargs: _Guard(),
+        ), mock.patch(
+            "twinr.agent.workflows.respeaker_duplex_keepalive._DIRECT_GUARD_RESUME_GRACE_S",
+            0.20,
+        ):
+            keepalive.open()
+            self.assertTrue(first_entered.wait(timeout=1.0))
+            keepalive.handle_playback_activity(
+                PlaybackActivityEvent(
+                    phase="starting",
+                    owner="streaming_tts",
+                    priority=20,
+                    category="wav_chunks",
+                )
+            )
+            self.assertTrue(first_exited.wait(timeout=1.0))
+            keepalive.handle_playback_activity(
+                PlaybackActivityEvent(
+                    phase="finished",
+                    owner="streaming_tts",
+                    priority=20,
+                    category="wav_chunks",
+                )
+            )
+            time.sleep(0.08)
+            self.assertFalse(second_entered.is_set())
+            self.assertTrue(second_entered.wait(timeout=0.5))
+            keepalive.close()
+
     def test_orchestrator_registers_duplex_keepalive_with_playback_coordinator(self) -> None:
         class _FakePlaybackCoordinator:
             def __init__(self) -> None:

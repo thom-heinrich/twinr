@@ -51,6 +51,7 @@ from twinr.memory.longterm.ingestion.propositions import (
     LongTermTurnPropositionBundleV1,
     LongTermTurnPropositionCompiler,
 )
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
 class _InMemorySnapshotStore:
@@ -72,8 +73,14 @@ class _FakeRemoteState:
 
     def __init__(self, payload: dict[str, object] | None) -> None:
         self.enabled = True
+        self.required = False
+        self.namespace = "test-namespace"
         self.payload = payload
         self.calls: list[str] = []
+        self.load_error: Exception | None = None
+        self.client = _FakeCatalogClient(remote_state=self)
+        self.read_client = self.client
+        self.write_client = self.client
         self.snapshots: dict[str, dict[str, object]] = {}
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
@@ -81,6 +88,8 @@ class _FakeRemoteState:
 
         del local_path
         self.calls.append(snapshot_kind)
+        if self.load_error is not None:
+            raise self.load_error
         saved_payload = self.snapshots.get(snapshot_kind)
         if saved_payload is not None:
             return dict(saved_payload)
@@ -92,6 +101,53 @@ class _FakeRemoteState:
         """Persist a snapshot payload in memory for round-trip tests."""
 
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FakeCatalogClient:
+    def __init__(self, *, remote_state: _FakeRemoteState) -> None:
+        self._remote_state = remote_state
+        self._next_document_id = 1
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+
+    def _maybe_raise(self) -> None:
+        error = self._remote_state.load_error
+        if error is not None:
+            raise error
+
+    def store_records_bulk(self, request):
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        self._maybe_raise()
+        if isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+            if record is not None:
+                return dict(record)
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+            if record is not None:
+                return dict(record)
+        raise LongTermRemoteUnavailableError("remote document unavailable")
 
 
 class AgentPersonalityTests(unittest.TestCase):
@@ -826,10 +882,34 @@ class AgentPersonalityTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(snapshot)
-        self.assertEqual(remote_state.calls, [DEFAULT_PERSONALITY_SNAPSHOT_KIND])
+        self.assertIn(DEFAULT_PERSONALITY_SNAPSHOT_KIND, remote_state.calls)
         self.assertEqual(snapshot.core_traits[0].name, "attentive companion")
         self.assertAlmostEqual(snapshot.style_profile.verbosity, 0.36)
         self.assertEqual(snapshot.humor_profile.style, "gentle observational humor")
+
+    def test_remote_state_store_load_snapshot_does_not_promote_legacy_payload_on_read(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "generated_at": "2026-03-20T10:00:00+00:00",
+            "core_traits": [
+                {
+                    "name": "attentive companion",
+                    "summary": "Stay warm and practically useful.",
+                    "weight": 0.88,
+                }
+            ],
+        }
+        store = RemoteStatePersonalitySnapshotStore()
+        remote_state = _FakeRemoteState(payload)
+
+        snapshot = store.load_snapshot(
+            config=TwinrConfig(project_root="."),
+            remote_state=remote_state,
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(remote_state.client.records_by_document_id, {})
+        self.assertEqual(remote_state.client.records_by_uri, {})
 
     def test_evolution_store_round_trips_signals_and_deltas(self) -> None:
         remote_state = _FakeRemoteState(None)

@@ -373,6 +373,17 @@ class LongTermSubtextCompiler:
                 max_workers=1,
                 thread_name_prefix="twinr-ltm-subtext",
             )
+            self._prewarm_compiler_executor()
+
+    def _prewarm_compiler_executor(self) -> None:
+        """Start the single compiler worker eagerly so first-use latency stays Pi-stable."""
+
+        if self._compiler_executor is None:
+            return
+        try:
+            self._compiler_executor.submit(lambda: None).result(timeout=0.5)
+        except Exception:
+            _LOGGER.warning("Long-term subtext compiler worker prewarm failed; continuing cold.", exc_info=True)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermSubtextCompiler":
@@ -749,6 +760,7 @@ class LongTermSubtextBuilder:
         query_text: str | None,
         retrieval_query_text: str | None,
         episodic_entries: Sequence[PersistentMemoryEntry],
+        graph_payload: dict[str, object] | None = None,
     ) -> str | None:
         """Build the subtext prompt section for a single user turn.
 
@@ -769,6 +781,7 @@ class LongTermSubtextBuilder:
             details={
                 "episodic_entries": len(episodic_entries),
                 "compiler_enabled": self.compiler is not None,
+                "preselected_graph_payload": graph_payload is not None,
             },
         ):
             safe_query_text = _normalize_query_text(query_text)
@@ -789,23 +802,24 @@ class LongTermSubtextBuilder:
                 maximum=256,
             )
 
-            graph_payload: dict[str, object] | None = None
+            selected_graph_payload: dict[str, object] | None = None
             with workflow_span(name="longterm_subtext_graph_payload", kind="retrieval"):
-                try:
-                    # AUDIT-FIX(#6): Use a normalized effective retrieval query and degrade cleanly if the graph store is unavailable or corrupted.
-                    raw_graph_payload = self.graph_store.build_subtext_payload(effective_retrieval_query)
-                except Exception:
-                    _LOGGER.exception("Long-term graph subtext payload build failed; continuing without graph cues.")
-                else:
-                    graph_payload = _sanitize_structured_dict(
-                        raw_graph_payload,
-                        string_max_chars=payload_string_max_chars,
-                        collection_max_items=payload_collection_max_items,
-                    )
-
+                raw_graph_payload = graph_payload
+                if raw_graph_payload is None:
+                    try:
+                        # AUDIT-FIX(#6): Use a normalized effective retrieval query and degrade cleanly if the graph store is unavailable or corrupted.
+                        raw_graph_payload = self.graph_store.build_subtext_payload(effective_retrieval_query)
+                    except Exception:
+                        _LOGGER.exception("Long-term graph subtext payload build failed; continuing without graph cues.")
+                        raw_graph_payload = None
+                selected_graph_payload = _sanitize_structured_dict(
+                    raw_graph_payload,
+                    string_max_chars=payload_string_max_chars,
+                    collection_max_items=payload_collection_max_items,
+                )
             with workflow_span(name="longterm_subtext_recent_threads", kind="retrieval"):
                 recent_threads = self._episodic_threads(episodic_entries)
-            if not graph_payload and not recent_threads:
+            if not selected_graph_payload and not recent_threads:
                 workflow_event(
                     kind="branch",
                     msg="longterm_subtext_no_payload",
@@ -818,7 +832,7 @@ class LongTermSubtextBuilder:
                 compiled_program = self.compiler.compile(
                     query_text=safe_query_text,
                     retrieval_query_text=effective_retrieval_query,
-                    graph_payload=graph_payload,
+                    graph_payload=selected_graph_payload,
                     recent_threads=recent_threads,
                 )
             if compiled_program is not None:
@@ -869,8 +883,8 @@ class LongTermSubtextBuilder:
                     "Do not say earlier, before, last time, neulich, or similar unless the user explicitly asks about past conversation.",
                 ],
             }
-            if graph_payload:
-                payload["graph_cues"] = graph_payload
+            if selected_graph_payload:
+                payload["graph_cues"] = selected_graph_payload
             if recent_threads:
                 payload["recent_threads"] = recent_threads
             return (

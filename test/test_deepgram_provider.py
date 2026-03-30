@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 import sys
 import json
 import time
@@ -14,12 +15,19 @@ from twinr.providers.deepgram import DeepgramSpeechToTextProvider
 class FakeDeepgramResponse:
     def __init__(self, payload: dict[str, object]) -> None:
         self._payload = payload
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+        self.text = ""
+        self.closed = False
 
     def raise_for_status(self) -> None:
         return None
 
     def json(self) -> dict[str, object]:
         return dict(self._payload)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeDeepgramClient:
@@ -94,6 +102,41 @@ class DelayedFinalizeResultWebSocketConnection(FakeWebSocketConnection):
         yield self._final_message
 
 
+class DelayedFluxCloseStreamWebSocketConnection(FakeWebSocketConnection):
+    def __init__(
+        self,
+        *,
+        update_message: str,
+        end_of_turn_message: str,
+        close_delay_s: float = 0.15,
+    ) -> None:
+        super().__init__([])
+        self._update_message = update_message
+        self._end_of_turn_message = end_of_turn_message
+        self._close_delay_s = max(0.0, float(close_delay_s))
+        self._close_stream_sent = False
+        self.response = type(
+            "Response",
+            (),
+            {"headers": {"dg-request-id": "dg-flux-123"}},
+        )()
+
+    def send(self, payload) -> None:
+        super().send(payload)
+        if payload == json.dumps({"type": "CloseStream"}):
+            self._close_stream_sent = True
+
+    def __iter__(self):
+        yield self._update_message
+        deadline = time.monotonic() + 1.0
+        while not self._close_stream_sent and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self._close_stream_sent:
+            raise AssertionError("CloseStream was not sent before the delayed Flux final result.")
+        time.sleep(self._close_delay_s)
+        yield self._end_of_turn_message
+
+
 class DeepgramSpeechToTextProviderTests(unittest.TestCase):
     def test_transcribe_posts_audio_bytes_and_extracts_transcript(self) -> None:
         client = FakeDeepgramClient()
@@ -116,10 +159,16 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
 
         self.assertEqual(transcript, "Guten Morgen aus Schwarzenbek.")
         call = client.calls[0]
-        self.assertEqual(call["url"], "https://api.deepgram.example/v1/listen")
-        self.assertIn(("model", "nova-3"), call["params"])
-        self.assertIn(("language", "de"), call["params"])
-        self.assertIn(("smart_format", "true"), call["params"])
+        split = urlsplit(call["url"])
+        params = parse_qs(split.query)
+        self.assertEqual(
+            f"{split.scheme}://{split.netloc}{split.path}",
+            "https://api.deepgram.example/v1/listen",
+        )
+        self.assertEqual(params["model"], ["nova-3"])
+        self.assertEqual(params["language"], ["de"])
+        self.assertEqual(params["smart_format"], ["true"])
+        self.assertEqual(params["mip_opt_out"], ["true"])
         self.assertEqual(call["headers"]["Authorization"], "Token deepgram-key")
         self.assertEqual(call["content"], b"WAVDATA")
 
@@ -143,10 +192,8 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
             prompt="Twinr, Twinna, Twinner.",
         )
 
-        params = client.calls[0]["params"]
-        self.assertIn(("keyterm", "Twinr"), params)
-        self.assertIn(("keyterm", "Twinna"), params)
-        self.assertIn(("keyterm", "Twinner"), params)
+        params = parse_qs(urlsplit(client.calls[0]["url"]).query)
+        self.assertEqual(params["keyterm"], ["Twinr", "Twinna", "Twinner"])
 
     def test_start_streaming_session_uses_websocket_and_returns_final_transcript(self) -> None:
         captured = {}
@@ -320,6 +367,73 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
         self.assertEqual(endpoints[0].transcript, "Heute schon geredet.")
         self.assertEqual(result.transcript, "Worüber haben wir heute schon geredet?")
         self.assertEqual(result.request_id, "dg-req-123")
+        self.assertTrue(result.saw_speech_final)
+
+    def test_flux_streaming_session_waits_for_end_of_turn_after_close_stream(self) -> None:
+        captured = {}
+
+        def fake_connector(url: str, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return DelayedFluxCloseStreamWebSocketConnection(
+                update_message=json.dumps(
+                    {
+                        "type": "TurnInfo",
+                        "event": "Update",
+                        "transcript": "Good mor",
+                    }
+                ),
+                end_of_turn_message=json.dumps(
+                    {
+                        "type": "TurnInfo",
+                        "event": "EndOfTurn",
+                        "transcript": "Good morning",
+                        "request_id": "dg-flux-123",
+                        "end_of_turn_confidence": 0.91,
+                    }
+                ),
+            )
+
+        provider = DeepgramSpeechToTextProvider(
+            config=TwinrConfig(
+                deepgram_api_key="deepgram-key",
+                deepgram_base_url="https://api.deepgram.example/v1",
+                deepgram_stt_model="flux-general-en",
+                deepgram_stt_language="de",
+                deepgram_stt_smart_format=True,
+                deepgram_streaming_finalize_timeout_s=1.0,
+            ),
+            websocket_connector=fake_connector,
+        )
+        partials: list[str] = []
+        endpoints: list[StreamingSpeechEndpointEvent] = []
+        session = provider.start_streaming_session(
+            sample_rate=16000,
+            channels=1,
+            prompt="Twinr, Twinna",
+            on_interim=partials.append,
+            on_endpoint=endpoints.append,
+        )
+
+        session.send_pcm(b"PCM" * 2000)
+        result = session.finalize()
+
+        self.assertIn("wss://api.deepgram.example/v2/listen", captured["url"])
+        self.assertIn("model=flux-general-en", captured["url"])
+        self.assertNotIn("language=", captured["url"])
+        self.assertIn("keyterm=Twinr", captured["url"])
+        self.assertIn("keyterm=Twinna", captured["url"])
+        self.assertEqual(
+            captured["kwargs"]["additional_headers"]["Authorization"],
+            "Token deepgram-key",
+        )
+        self.assertEqual(partials, ["Good mor"])
+        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(endpoints[0].event_type, "end_of_turn")
+        self.assertEqual(endpoints[0].transcript, "Good morning")
+        self.assertEqual(result.transcript, "Good morning")
+        self.assertEqual(result.request_id, "dg-flux-123")
+        self.assertTrue(result.saw_interim)
         self.assertTrue(result.saw_speech_final)
 
 

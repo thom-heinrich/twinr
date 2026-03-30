@@ -257,20 +257,6 @@ def derive_ambiguous_room_guard(
         "minimum_clear_confidence",
         default=_MINIMUM_CLEAR_CONFIDENCE,
     )
-    # BREAKING: clear decisions now require a camera timestamp by default.
-    # Set guard_policy['require_camera_timestamp_for_clear']=False to recover the legacy behavior.
-    require_camera_timestamp_for_clear = _policy_bool(
-        guard_policy,
-        "require_camera_timestamp_for_clear",
-        default=True,
-    )
-    # BREAKING: if audio context is active, clear decisions now require fresh audio timestamps by default.
-    require_audio_timestamp_when_audio_active = _policy_bool(
-        guard_policy,
-        "require_audio_timestamp_when_audio_active",
-        default=True,
-    )
-
     person_count = coerce_optional_int(camera.get("person_count"))
     explicit_person_visible = coerce_optional_bool(camera.get("person_visible"))
     person_count_unknown_flag = coerce_optional_bool(camera.get("person_count_unknown")) is True
@@ -349,6 +335,18 @@ def derive_ambiguous_room_guard(
     )
     audio_age_seconds = _age_seconds(reference_observed_at, audio_observed_at)
     audio_stale = _is_stale(audio_age_seconds, max_audio_age_seconds)
+    require_camera_timestamp_for_clear = _policy_optional_bool(
+        guard_policy,
+        "require_camera_timestamp_for_clear",
+    )
+    if require_camera_timestamp_for_clear is None:
+        require_camera_timestamp_for_clear = camera_observed_at is not None
+    require_audio_timestamp_when_audio_active = _policy_optional_bool(
+        guard_policy,
+        "require_audio_timestamp_when_audio_active",
+    )
+    if require_audio_timestamp_when_audio_active is None:
+        require_audio_timestamp_when_audio_active = audio_observed_at is not None
 
     has_camera_clear_evidence = (
         person_visible
@@ -694,6 +692,10 @@ def _first_int(mapping: dict[str, object], *keys: str) -> int | None:
 def _policy_bool(mapping: dict[str, object], key: str, *, default: bool) -> bool:
     parsed = coerce_optional_bool(mapping.get(key))
     return default if parsed is None else parsed
+
+
+def _policy_optional_bool(mapping: dict[str, object], key: str) -> bool | None:
+    return coerce_optional_bool(mapping.get(key))
 
 
 def _policy_ratio(mapping: dict[str, object], key: str, *, default: float) -> float:

@@ -15,7 +15,7 @@ owned_concerns:
   - Seed detached Pi runtime processes with the minimum user-session audio environment required for Pulse/ALSA default playback
   - Build scoped runtime configs so auxiliary loops cannot overwrite the primary display/runtime snapshot
   - Mirror the authoritative leading repo into the Pi acceptance checkout while preserving Pi-local runtime-only paths
-  - Deploy the authoritative leading repo plus runtime `.env` to the Pi acceptance host, replace the old manual mirror rollout path, refresh the editable install, and verify the productive Pi service set after restart
+  - Deploy the authoritative leading repo plus runtime `.env` to the Pi acceptance host, replace the old manual mirror rollout path, independently attest mirrored repo contents before restart, refresh the editable install, heal stale venv duplicates of bridged Pi system packages before dependency verification, and verify the productive Pi service set after restart
   - Supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner
   - Keep display-companion degradation visible through ops health without letting it tear down the productive speech runtime
   - Coordinate singleton loop ownership through secure per-loop lock files
@@ -103,7 +103,9 @@ files:
   - path: pi_repo_mirror.py
     role: One-way repo mirror watchdog that keeps /twinr aligned with the authoritative leading repo while preserving Pi-local runtime-only paths and excluding gitignored browser-automation capture artefacts from deploy convergence checks
   - path: pi_runtime_deploy.py
-    role: Operator-facing Pi deploy orchestration that mirrors code, syncs the authoritative runtime env, refreshes the editable install, restarts the base services plus any already-enabled repo-backed Pi runtime units, supports first rollout of disabled optional Pi units, and verifies restart health
+    role: Operator-facing Pi deploy orchestration that mirrors code, syncs the authoritative runtime env, independently attests mirrored repo contents, refreshes the editable install, heals stale venv duplicates of bridged Pi system packages before dependency verification, attests critical runtime imports including the memory bootstrap path, restarts the base services plus any already-enabled repo-backed Pi runtime units, supports first rollout of disabled optional Pi units, and verifies restart health
+  - path: venv_bridged_system_cleanup.py
+    role: Detect direct dependencies whose preserved venv copy should yield to an acceptable bridged Pi system distribution during deploy healing
   - path: health.py
     role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract
     exports:
@@ -139,7 +141,7 @@ files:
       - DeviceStatus
       - collect_device_overview
   - path: pi_runtime_deploy_remote.py
-    role: Internal SSH, SCP, sync, and systemd verification helpers used by the Pi deploy orchestrator
+    role: Internal SSH, SCP, sync, repo-attestation, and systemd verification helpers used by the Pi deploy orchestrator
   - path: self_test.py
     role: Bounded hardware self-test execution and artifact capture, including AI-Deck WiFi handover, frame capture, image-sanity probes, and proactive-mic ownership guards that only block while an active Twinr voice runtime already owns the same capture device
     exports:

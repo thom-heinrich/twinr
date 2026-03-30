@@ -11,7 +11,11 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.ops.pi_repo_mirror import PiRepoMirrorWatchdog
+from twinr.ops.pi_repo_mirror import (
+    PiRepoMirrorCapabilities,
+    PiRepoMirrorWatchdog,
+    build_authoritative_repo_entry_digests,
+)
 from twinr.ops.self_coding_pi import PiConnectionSettings
 
 
@@ -42,9 +46,59 @@ class _FakeClock:
 
 
 class PiRepoMirrorWatchdogTests(unittest.TestCase):
+    @staticmethod
+    def _seed_capabilities(watchdog: PiRepoMirrorWatchdog) -> None:
+        watchdog._capabilities = PiRepoMirrorCapabilities(
+            local_rsync_version="3.2.7",
+            remote_rsync_version="3.2.7",
+            supports_delete_delay=False,
+            supports_delay_updates=False,
+            supports_mkpath=False,
+            supports_checksum_choice=False,
+            supports_compress_choice=False,
+            supports_xxh128=False,
+            supports_zstd=False,
+            supports_fsync=False,
+        )
+
+    def test_build_authoritative_repo_entry_digests_uses_mirror_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (root / "state").mkdir()
+            (root / "state" / "runtime-state.json").write_text("{}", encoding="utf-8")
+            (root / "pkg.egg-info").mkdir()
+            (root / "pkg.egg-info" / "PKG-INFO").write_text("ignored\n", encoding="utf-8")
+            (root / "browser_automation" / "artifacts").mkdir(parents=True, exist_ok=True)
+            (root / "browser_automation" / "artifacts" / "trace.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "index.js").write_text("console.log('x')\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "link-to-app").symlink_to("src/app.py")
+
+            entries = build_authoritative_repo_entry_digests(root)
+
+        entries_by_path = {entry.relative_path: entry for entry in entries}
+        self.assertIn("README.md", entries_by_path)
+        self.assertIn("src/app.py", entries_by_path)
+        self.assertIn("link-to-app", entries_by_path)
+        self.assertEqual(entries_by_path["link-to-app"].kind, "symlink")
+        self.assertEqual(entries_by_path["link-to-app"].link_target, "src/app.py")
+        self.assertNotIn(".env", entries_by_path)
+        self.assertNotIn("state/runtime-state.json", entries_by_path)
+        self.assertNotIn("pkg.egg-info/PKG-INFO", entries_by_path)
+        self.assertNotIn("browser_automation/artifacts/trace.json", entries_by_path)
+        self.assertNotIn("node_modules/index.js", entries_by_path)
+
     def test_probe_once_reports_clean_repo_when_rsync_finds_no_changes(self) -> None:
         commands: list[list[str]] = []
         envs: list[dict[str, str] | None] = []
+        inputs: list[str | None] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -54,6 +108,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 command = [str(part) for part in args]
                 commands.append(command)
                 envs.append(kwargs.get("env"))
+                inputs.append(kwargs.get("input"))
                 return _completed(command, stdout="")
 
             watchdog = PiRepoMirrorWatchdog(
@@ -65,6 +120,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.probe_once()
 
@@ -75,7 +131,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertEqual(result.change_count, 0)
         self.assertEqual(len(commands), 1)
         joined = " ".join(commands[0])
-        self.assertIn("sshpass -e rsync", joined)
+        self.assertIn("sshpass -d 0 rsync", joined)
         self.assertIn("--checksum", joined)
         self.assertIn("--delete", joined)
         self.assertIn("--itemize-changes", joined)
@@ -92,9 +148,8 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("--filter=-p /.env", joined)
         self.assertNotIn("--dry-run", commands[0])
         env = envs[0]
-        self.assertIsNotNone(env)
-        assert env is not None
-        self.assertEqual(env["SSHPASS"], _TEST_PI_SSH_PASSWORD)
+        self.assertFalse(env and "SSHPASS" in env)
+        self.assertEqual(inputs[0], _TEST_PI_SSH_PASSWORD + "\n")
 
     def test_probe_once_excludes_local_special_files_from_rsync_args(self) -> None:
         commands: list[list[str]] = []
@@ -118,6 +173,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             watchdog.probe_once()
 
@@ -155,6 +211,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.probe_once()
 
@@ -195,6 +252,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.probe_once(apply_sync=False, checksum=True, max_change_lines=1)
 
@@ -238,6 +296,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.probe_once()
 
@@ -246,7 +305,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertTrue(result.verified_clean)
         self.assertEqual(len(commands), 5)
         self.assertIn("sshpass", commands[2][0])
-        self.assertIn("ssh", commands[2][2])
+        self.assertIn("ssh", commands[2])
         rendered_prune = " ".join(commands[2])
         self.assertIn("common/links", rendered_prune)
         self.assertIn("__pycache__", rendered_prune)
@@ -284,6 +343,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 ),
                 subprocess_runner=_runner,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.probe_once()
 
@@ -330,6 +390,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
                 sleep_fn=clock.sleep,
                 monotonic_fn=clock.monotonic,
             )
+            self._seed_capabilities(watchdog)
 
             result = watchdog.run(
                 interval_s=1.0,
@@ -343,10 +404,10 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertEqual(result.syncs_applied, 0)
         self.assertEqual(len(cycles), 1)
         self.assertEqual(errors, [("ssh timeout", 1)])
-        self.assertTrue(cycles[0].checksum_used)
+        self.assertFalse(cycles[0].checksum_used)
         self.assertEqual(len(commands), 2)
         self.assertIn("--checksum", commands[0])
-        self.assertIn("--checksum", commands[1])
+        self.assertNotIn("--checksum", commands[1])
 
     @unittest.skipUnless(shutil.which("rsync"), "rsync required")
     def test_perishable_filters_preserve_root_env_but_allow_nested_tree_deletion(self) -> None:

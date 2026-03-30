@@ -44,7 +44,7 @@ instead of treating them as supported operating modes.
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
-| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: mirror the repo, sync the authoritative runtime `.env`, reinstall Twinr into the Pi venv, restart the base services plus any already-enabled repo-backed Pi runtime units, optionally first-rollout a disabled Pi unit, and verify post-restart health |
+| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: mirror the repo, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
 
@@ -232,6 +232,7 @@ By default the deploy command:
 - mirrors `/home/thh/twinr` into `/twinr`
 - treats the local `.env` as authoritative and overwrites `/twinr/.env` with a backup
 - refreshes `/twinr/.venv` via `pip install --no-deps -e /twinr`
+- activates the bridged Pi `dist-packages` view inside `/twinr/.venv` before dependency checks and drops stale venv duplicates when the bridged system package already satisfies the direct repo requirement, which prevents preserved overlays such as `PyQt5` from poisoning `pip check`
 - compares the mirrored `pyproject.toml` runtime dependencies against the Pi venv and installs only missing or out-of-spec packages, so new lightweight dependencies can roll out without a full resolver pass
 - installs mirrored Pi-only runtime supplement packages from `hardware/ops/pi_runtime_requirements.txt` when that manifest exists locally, so optional direct-import extras such as `RapidFuzz`, `wcwidth`, `onnx`, `msgspec`, `orjson`, `portalocker`, `zstandard`, `h2`, and `opentelemetry-api` stay present on the acceptance Pi without forcing every local environment to carry them
 - treats `hardware/ops/pi_runtime_requirements.txt` as the Pi copy of `project.optional-dependencies.pi-runtime` from `pyproject.toml`; the repo tests fail if those two lists drift apart
@@ -239,6 +240,7 @@ By default the deploy command:
 - hands any root-owned mirrored `__pycache__/` trees back to the runtime user before rebuilding checked-hash bytecode, so old productive imports cannot block later deploys
 - runs a fixed `/twinr/.venv/bin/python` import contract before restart, so critical direct-import modules must still import successfully after the deploy instead of failing only later in live runtime
 - explicitly syncs local browser-automation runtime manifests from `browser_automation/runtime_requirements.txt` and `browser_automation/playwright_browsers.txt`, then installs those requirements and Playwright browsers on the Pi when they exist locally
+- uploads an authoritative local manifest and independently attests the mirrored `/twinr` repo contents by SHA256/link target before any productive restart, so stale source files cannot still yield a green deploy
 - installs the mirrored productive systemd unit files into `/etc/systemd/system/`
 - restarts `twinr-remote-memory-watchdog.service`, `twinr-runtime-supervisor.service`, and `twinr-web.service`
 - also picks up any additional repo-backed Pi runtime unit that is already enabled on the Pi, such as `twinr-whatsapp-channel.service`
@@ -264,8 +266,8 @@ deploy target set with a narrower or different one.
 Use `--install-with-deps` only when you intentionally want the Pi deploy to
 re-resolve the full runtime dependency graph; the default no-deps editable
 refresh now still backfills only missing or out-of-spec mirrored project
-dependencies and avoids rebuilding Pi-host packages such as `PyQt5` on every
-deploy.
+dependencies, heals stale venv copies that shadow bridged Pi system packages,
+and avoids rebuilding Pi-host packages such as `PyQt5` on every deploy.
 
 ## Current camera flow
 

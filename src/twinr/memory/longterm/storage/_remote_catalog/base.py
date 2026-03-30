@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
+import logging
 import math
 from threading import RLock
+import time
 from urllib.parse import quote
 
+from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteReadContext,
+    record_remote_read_diagnostic,
+)
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 
 from .catalog import RemoteCatalogCatalogMixin
@@ -37,6 +49,19 @@ from .shared import (
 )
 from .writes import RemoteCatalogWriteMixin
 
+_LOG = logging.getLogger("twinr.memory.longterm.storage.remote_catalog")
+_RECENT_CATALOG_HEAD_TTL_S = 120.0
+_RECENT_CATALOG_ENTRIES_TTL_S = 120.0
+_MUTABLE_CURRENT_HEAD_SNAPSHOT_KINDS = frozenset({"objects", "conflicts", "archive"})
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogHeadLoadResult:
+    """Describe one current-head read without forcing snapshot compat."""
+
+    status: str
+    payload: dict[str, object] | None = None
+
 
 class LongTermRemoteCatalogStoreBase(
     RemoteCatalogCatalogMixin,
@@ -53,6 +78,8 @@ class LongTermRemoteCatalogStoreBase(
         self._item_payload_cache: dict[tuple[str, str], _CachedItemPayload] = {}
         self._search_result_cache: dict[tuple[str, str, int, tuple[str, ...]], _CachedSearchResult] = {}
         self._local_search_selector_cache: dict[str, _CachedLocalSearchSelector] = {}
+        self._recent_catalog_head_cache: dict[str, _CachedItemPayload] = {}
+        self._recent_catalog_entries_cache: dict[str, _CachedCatalogEntries] = {}
 
     def enabled(self) -> bool:
         """Return whether fine-grained remote storage is available."""
@@ -67,6 +94,16 @@ class LongTermRemoteCatalogStoreBase(
         except (TypeError, ValueError):
             return 0.0
         return ttl_s if ttl_s > 0.0 else 0.0
+
+    def _recent_catalog_head_ttl_s(self) -> float:
+        """Return the bounded same-process bridge window for current-head writes."""
+
+        return _RECENT_CATALOG_HEAD_TTL_S
+
+    def _recent_catalog_entries_ttl_s(self) -> float:
+        """Return the bounded same-process bridge window for current catalog entries."""
+
+        return _RECENT_CATALOG_ENTRIES_TTL_S
 
     def _payload_sha256(self, payload) -> str:
         serialized = json.dumps(
@@ -92,10 +129,239 @@ class LongTermRemoteCatalogStoreBase(
         namespace = quote(str(getattr(remote_state, "namespace", "") or "twinr_longterm_v1"), safe="")
         return f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/segment/{segment_index:04d}"
 
-    def _load_catalog_payload(self, *, snapshot_kind: str):
+    def _catalog_head_uri(self, *, snapshot_kind: str) -> str:
+        """Return the canonical URI for the current catalog head document."""
+
         remote_state = self._require_remote_state()
-        payload = remote_state.load_snapshot(snapshot_kind=snapshot_kind)
-        return payload if isinstance(payload, dict) else None
+        definition = self._require_definition(snapshot_kind)
+        namespace = quote(str(getattr(remote_state, "namespace", "") or "twinr_longterm_v1"), safe="")
+        return f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/current"
+
+    def _load_catalog_payload(self, *, snapshot_kind: str):
+        direct_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind)
+        direct_payload = direct_result.payload
+        if isinstance(direct_payload, dict):
+            return direct_payload
+        payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
+        if not isinstance(payload, Mapping):
+            return None
+        payload_dict = dict(payload)
+        if not self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload_dict):
+            return None
+        self._maybe_promote_legacy_catalog_head(snapshot_kind=snapshot_kind, payload=payload_dict)
+        return payload_dict
+
+    def _load_remote_state_snapshot_fallback(
+        self,
+        *,
+        snapshot_kind: str,
+    ) -> object:
+        """Load one mutable current head without pinning reads to a stale document id.
+
+        Structured-memory current heads mutate behind a stable URI. Reusing an
+        older exact document id for those heads can pin a fresh reader to an
+        already superseded empty/current catalog document after another process
+        writes a new head. For these mutable heads we therefore force the
+        fallback snapshot loader through pointer/origin resolution instead of a
+        remembered exact-document shortcut.
+        """
+
+        remote_state = self._require_remote_state()
+        load_snapshot = getattr(remote_state, "load_snapshot")
+        try:
+            parameters = inspect.signature(load_snapshot).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
+        if "prefer_cached_document_id" in parameters:
+            kwargs["prefer_cached_document_id"] = snapshot_kind not in _MUTABLE_CURRENT_HEAD_SNAPSHOT_KINDS
+        return load_snapshot(**kwargs)
+
+    def _load_catalog_head_payload(self, *, snapshot_kind: str, metadata_only: bool = False) -> dict[str, object] | None:
+        """Load the fixed-URI current catalog head without going through snapshot pointers."""
+
+        result = self._load_catalog_head_result(snapshot_kind=snapshot_kind, metadata_only=metadata_only)
+        return dict(result.payload) if isinstance(result.payload, Mapping) else None
+
+    def _load_catalog_head_result(
+        self,
+        *,
+        snapshot_kind: str,
+        metadata_only: bool = False,
+    ) -> _CatalogHeadLoadResult:
+        """Read one current-head document while preserving not-found semantics."""
+
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        context = LongTermRemoteReadContext(
+            snapshot_kind=snapshot_kind,
+            operation="load_catalog_current_head",
+            request_method="GET",
+            request_payload_kind="catalog_current_head_document",
+            uri_hint=self._catalog_head_uri(snapshot_kind=snapshot_kind),
+            request_path="/v1/external/documents/full",
+            namespace=self._normalize_text(getattr(remote_state, "namespace", None)),
+            access_classification="catalog_current_head",
+        )
+        started_monotonic = time.monotonic()
+        try:
+            envelope = self._fetch_catalog_head_envelope(
+                read_client=read_client,
+                snapshot_kind=snapshot_kind,
+                metadata_only=metadata_only,
+            )
+        except Exception as exc:
+            if self._status_code_from_exception(exc) == 404:
+                record_remote_read_observation(
+                    remote_state=remote_state,
+                    context=context,
+                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                    outcome="missing",
+                    classification="not_found",
+                )
+                return _CatalogHeadLoadResult(status="not_found")
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=context,
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="fallback",
+            )
+            return _CatalogHeadLoadResult(status="unavailable")
+        payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
+        if payload is None:
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=context,
+                exc=ValueError(
+                    f"Remote long-term {snapshot_kind!r} current-head document did not contain a supported catalog payload."
+                ),
+                started_monotonic=started_monotonic,
+                outcome="fallback",
+            )
+            return _CatalogHeadLoadResult(status="invalid")
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=context,
+            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+            outcome="ok",
+            classification="ok",
+        )
+        return _CatalogHeadLoadResult(status="found", payload=payload)
+
+    def _fetch_catalog_head_envelope(
+        self,
+        *,
+        read_client: object,
+        snapshot_kind: str,
+        metadata_only: bool,
+    ) -> object:
+        """Read one fixed current head, retrying metadata-only contract rejects once.
+
+        Some live ChonkyDB builds reject metadata-only ``documents/full``
+        current-head reads with a 400 validation response even though the same
+        fixed URI is otherwise readable. Snapshot probes already treat that as
+        a backend contract quirk and retry with a content-bearing read; keep
+        catalog current-head probes on the same contract so Graph/Object/Prompt
+        readers do not degrade into the legacy fallback path for a readable
+        head.
+        """
+
+        origin_uri = self._catalog_head_uri(snapshot_kind=snapshot_kind)
+        try:
+            return read_client.fetch_full_document(
+                origin_uri=origin_uri,
+                include_content=not metadata_only,
+                max_content_chars=self._metadata_only_max_content_chars() if metadata_only else self._max_content_chars(),
+            )
+        except ChonkyDBError as exc:
+            if not metadata_only or int(exc.status_code or 0) != 400:
+                raise
+        return read_client.fetch_full_document(
+            origin_uri=origin_uri,
+            include_content=True,
+            max_content_chars=self._max_content_chars(),
+        )
+
+    def _load_catalog_entries_for_write(
+        self,
+        *,
+        snapshot_kind: str,
+    ) -> tuple[object, ...]:
+        """Return reusable current entries without reviving legacy snapshot heads.
+
+        Write paths may reuse the fixed-URI current head and same-process
+        bridges, but they must not silently revive pointer-era snapshot reads.
+        A missing current head is a legitimate empty starting point; an
+        unavailable current head remains a hard remote-memory failure.
+        """
+
+        cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
+        if cached_entries is not None:
+            return cached_entries
+        recent_entries = self._recent_catalog_entries(snapshot_kind=snapshot_kind)
+        if recent_entries is not None:
+            return recent_entries
+        recent_head = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+        if self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
+            return self.load_catalog_entries(snapshot_kind=snapshot_kind, payload=recent_head)
+        head_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind)
+        if head_result.status == "found" and isinstance(head_result.payload, Mapping):
+            return self.load_catalog_entries(snapshot_kind=snapshot_kind, payload=head_result.payload)
+        if head_result.status == "not_found":
+            return ()
+        if head_result.status == "invalid":
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {snapshot_kind!r} current catalog head is invalid."
+            )
+        if self._remote_is_required():
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {snapshot_kind!r} current catalog head is unavailable."
+            )
+        return ()
+
+    def _extract_catalog_payload_from_document(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return the catalog payload embedded in one current-head document envelope."""
+
+        newest_payload: dict[str, object] | None = None
+        newest_rank: tuple[datetime, int] | None = None
+        for position, candidate in enumerate(self._iter_record_candidates(payload)):
+            candidate_payload = self._catalog_payload_candidate(
+                snapshot_kind=snapshot_kind,
+                candidate=candidate,
+            )
+            if candidate_payload is None:
+                continue
+            candidate_rank = (
+                self._catalog_payload_written_at(candidate_payload),
+                position,
+            )
+            if newest_rank is None or candidate_rank > newest_rank:
+                newest_rank = candidate_rank
+                newest_payload = candidate_payload
+        return newest_payload
+
+    def _maybe_promote_legacy_catalog_head(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        """Write the fixed-URI head document when legacy snapshot heads are still in use."""
+
+        try:
+            self.persist_catalog_payload(snapshot_kind=snapshot_kind, payload=payload)
+        except Exception:
+            _LOG.warning(
+                "Failed promoting legacy remote %s catalog snapshot into the fixed current-head document.",
+                snapshot_kind,
+                exc_info=True,
+            )
 
     def _remote_write_timeout_s(self) -> float | None:
         """Return the HTTP transport timeout for write-bound ChonkyDB calls."""
@@ -241,6 +507,22 @@ class LongTermRemoteCatalogStoreBase(
             raise LongTermRemoteUnavailableError("Required remote long-term memory state is not configured.")
         return remote_state
 
+    def _remote_is_required(self) -> bool:
+        """Return whether this store must fail closed on remote-memory errors."""
+
+        remote_state = self.remote_state
+        if remote_state is None or not getattr(remote_state, "enabled", False):
+            return False
+        required = getattr(remote_state, "required", None)
+        if callable(required):
+            try:
+                return bool(required())
+            except Exception:
+                return True
+        if required is None:
+            return True
+        return bool(required)
+
     def _require_client(self, client: object | None, *, operation: str) -> object:
         if client is not None:
             return client
@@ -277,6 +559,10 @@ class LongTermRemoteCatalogStoreBase(
             values = self._normalize_text_list(payload.get(field_name))
             if values:
                 metadata[field_name] = list(values)
+        for field_name in self._catalog_entry_object_fields():
+            value = payload.get(field_name)
+            if isinstance(value, Mapping):
+                metadata[field_name] = dict(value)
         return metadata
 
     def _current_scope_request_context(self, *, snapshot_kind: str) -> tuple[str | None, str | None]:
@@ -291,6 +577,60 @@ class LongTermRemoteCatalogStoreBase(
             return None, None
         return f"longterm:{definition.snapshot_kind}:current", namespace
 
+    def _catalog_payload_candidate(
+        self,
+        *,
+        snapshot_kind: str,
+        candidate: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return one usable catalog payload from a live current-head candidate shape."""
+
+        if self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=candidate):
+            return dict(candidate)
+        definition = self._definition(snapshot_kind)
+        if definition is None:
+            return None
+        if candidate.get("twinr_catalog_current_head") is not True:
+            return None
+        if self._normalize_text(candidate.get("twinr_catalog_schema")) != definition.catalog_schema:
+            return None
+        try:
+            items_count = int(candidate.get("twinr_catalog_items_count") or 0)
+        except (TypeError, ValueError):
+            items_count = 0
+        payload: dict[str, object] = {
+            "schema": definition.catalog_schema,
+            "version": 3,
+            "items_count": max(0, items_count),
+            "segments": [],
+        }
+        written_at = self._normalize_text(candidate.get("twinr_catalog_written_at"))
+        if written_at:
+            payload["written_at"] = written_at
+        return payload
+
+    @staticmethod
+    def _catalog_payload_written_at(payload: Mapping[str, object]) -> datetime:
+        """Return one sortable written_at timestamp for current-head disambiguation."""
+
+        raw_written_at = " ".join(str(payload.get("written_at") or "").split()).strip()
+        if not raw_written_at:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        normalized = raw_written_at.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _metadata_only_max_content_chars() -> int:
+        """Return the backend-compatible floor for metadata-only head probes."""
+
+        return 100
+
     @staticmethod
     def _catalog_entry_text_fields() -> tuple[str, ...]:
         from .shared import _CATALOG_ENTRY_TEXT_FIELDS
@@ -302,6 +642,12 @@ class LongTermRemoteCatalogStoreBase(
         from .shared import _CATALOG_ENTRY_LIST_FIELDS
 
         return _CATALOG_ENTRY_LIST_FIELDS
+
+    @staticmethod
+    def _catalog_entry_object_fields() -> tuple[str, ...]:
+        from .shared import _CATALOG_ENTRY_OBJECT_FIELDS
+
+        return _CATALOG_ENTRY_OBJECT_FIELDS
 
     @staticmethod
     def _normalize_text(value: object) -> str | None:
@@ -334,6 +680,21 @@ class LongTermRemoteCatalogStoreBase(
         except (TypeError, ValueError):
             return None
         return resolved if resolved >= 0 else None
+
+    def _status_code_from_exception(self, exc: BaseException) -> int | None:
+        """Extract one ChonkyDB HTTP status code from an exception chain."""
+
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ChonkyDBError) and current.status_code is not None:
+                try:
+                    return int(current.status_code)
+                except (TypeError, ValueError):
+                    return None
+            current = current.__cause__ or current.__context__
+        return None
 
 
 __all__ = [

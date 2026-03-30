@@ -112,52 +112,107 @@ class LongTermRemoteHealthProbe:
         checks: list[LongTermRemoteWarmCheck] = []
         try:
             prompt_remote_state = self._require_remote_state(self.prompt_context_store.memory_store.remote_state)
-            result = self._probe_snapshot(
-                store="prompt_context",
-                remote_state=prompt_remote_state,
-                snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
-                checked=checked,
-                checks=checks,
-                include_archive=include_archive,
-            )
+            prompt_memory_probe = getattr(self.prompt_context_store.memory_store, "probe_remote_current_head", None)
+            prompt_memory_load = getattr(self.prompt_context_store.memory_store, "load_remote_current_head", None)
+            if callable(prompt_memory_probe) or callable(prompt_memory_load):
+                payload, selected_source = self._resolve_store_payload(
+                    probe_getter=prompt_memory_probe,
+                    load_getter=prompt_memory_load,
+                    probe_selected_source="catalog_current_head",
+                    load_selected_source="catalog_current_head_load",
+                )
+                result = self._probe_store_payload(
+                    store="prompt_context",
+                    snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
+                    payload=payload,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                    selected_source=selected_source,
+                )
+            else:
+                result = self._probe_snapshot(
+                    store="prompt_context",
+                    remote_state=prompt_remote_state,
+                    snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                )
             if not result.ready:
                 return result
-            result = self._probe_snapshot(
-                store="prompt_context",
-                remote_state=prompt_remote_state,
-                snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
-                checked=checked,
-                checks=checks,
-                include_archive=include_archive,
-            )
+            prompt_user_probe = getattr(self.prompt_context_store.user_store, "probe_remote_current_head", None)
+            prompt_user_load = getattr(self.prompt_context_store.user_store, "load_remote_current_head", None)
+            if callable(prompt_user_probe) or callable(prompt_user_load):
+                payload, selected_source = self._resolve_store_payload(
+                    probe_getter=prompt_user_probe,
+                    load_getter=prompt_user_load,
+                    probe_selected_source="catalog_current_head",
+                    load_selected_source="catalog_current_head_load",
+                )
+                result = self._probe_store_payload(
+                    store="prompt_context",
+                    snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
+                    payload=payload,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                    selected_source=selected_source,
+                )
+            else:
+                result = self._probe_snapshot(
+                    store="prompt_context",
+                    remote_state=prompt_remote_state,
+                    snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                )
             if not result.ready:
                 return result
-            result = self._probe_snapshot(
-                store="prompt_context",
-                remote_state=prompt_remote_state,
-                snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
-                checked=checked,
-                checks=checks,
-                include_archive=include_archive,
-            )
+            prompt_personality_probe = getattr(self.prompt_context_store.personality_store, "probe_remote_current_head", None)
+            prompt_personality_load = getattr(self.prompt_context_store.personality_store, "load_remote_current_head", None)
+            if callable(prompt_personality_probe) or callable(prompt_personality_load):
+                payload, selected_source = self._resolve_store_payload(
+                    probe_getter=prompt_personality_probe,
+                    load_getter=prompt_personality_load,
+                    probe_selected_source="catalog_current_head",
+                    load_selected_source="catalog_current_head_load",
+                )
+                result = self._probe_store_payload(
+                    store="prompt_context",
+                    snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
+                    payload=payload,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                    selected_source=selected_source,
+                )
+            else:
+                result = self._probe_snapshot(
+                    store="prompt_context",
+                    remote_state=prompt_remote_state,
+                    snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                )
             if not result.ready:
                 return result
 
             object_remote_state = self._require_remote_state(self.object_store.remote_state)
-            result = self._probe_snapshot(
-                store="object_store",
-                remote_state=object_remote_state,
+            result = self._probe_object_store_snapshot(
                 snapshot_kind="objects",
+                object_remote_state=object_remote_state,
                 checked=checked,
                 checks=checks,
                 include_archive=include_archive,
             )
             if not result.ready:
                 return result
-            result = self._probe_snapshot(
-                store="object_store",
-                remote_state=object_remote_state,
+            result = self._probe_object_store_snapshot(
                 snapshot_kind="conflicts",
+                object_remote_state=object_remote_state,
                 checked=checked,
                 checks=checks,
                 include_archive=include_archive,
@@ -165,10 +220,9 @@ class LongTermRemoteHealthProbe:
             if not result.ready:
                 return result
             if include_archive:
-                result = self._probe_snapshot(
-                    store="object_store",
-                    remote_state=object_remote_state,
+                result = self._probe_object_store_snapshot(
                     snapshot_kind="archive",
+                    object_remote_state=object_remote_state,
                     checked=checked,
                     checks=checks,
                     include_archive=include_archive,
@@ -176,27 +230,65 @@ class LongTermRemoteHealthProbe:
                 if not result.ready:
                     return result
 
-            graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
-            result = self._probe_snapshot(
-                store="graph_store",
-                remote_state=graph_remote_state,
-                snapshot_kind="graph",
-                checked=checked,
-                checks=checks,
-                include_archive=include_archive,
+            graph_probe = getattr(self.graph_store, "probe_remote_current_view", None)
+            graph_load = getattr(self.graph_store, "load_remote_current_view", None)
+            graph_payload, graph_selected_source = self._resolve_store_payload(
+                probe_getter=graph_probe,
+                load_getter=graph_load,
+                probe_selected_source="graph_current_view",
+                load_selected_source="graph_current_view_load_contract",
             )
+            if callable(graph_probe) or callable(graph_load):
+                result = self._probe_store_payload(
+                    store="graph_store",
+                    snapshot_kind="graph",
+                    payload=graph_payload,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                    selected_source=graph_selected_source,
+                )
+            else:
+                graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
+                result = self._probe_snapshot(
+                    store="graph_store",
+                    remote_state=graph_remote_state,
+                    snapshot_kind="graph",
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                )
             if not result.ready:
                 return result
 
-            midterm_remote_state = self._require_remote_state(self.midterm_store.remote_state)
-            result = self._probe_snapshot(
-                store="midterm_store",
-                remote_state=midterm_remote_state,
-                snapshot_kind="midterm",
-                checked=checked,
-                checks=checks,
-                include_archive=include_archive,
+            midterm_probe = getattr(self.midterm_store, "probe_remote_current_head", None)
+            midterm_load = getattr(self.midterm_store, "load_remote_current_head", None)
+            midterm_payload, midterm_selected_source = self._resolve_store_payload(
+                probe_getter=midterm_probe,
+                load_getter=midterm_load,
+                probe_selected_source="catalog_current_head",
+                load_selected_source="catalog_current_head_load_contract",
             )
+            if callable(midterm_probe) or callable(midterm_load):
+                result = self._probe_store_payload(
+                    store="midterm_store",
+                    snapshot_kind="midterm",
+                    payload=midterm_payload,
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                    selected_source=midterm_selected_source,
+                )
+            else:
+                midterm_remote_state = self._require_remote_state(self.midterm_store.remote_state)
+                result = self._probe_snapshot(
+                    store="midterm_store",
+                    remote_state=midterm_remote_state,
+                    snapshot_kind="midterm",
+                    checked=checked,
+                    checks=checks,
+                    include_archive=include_archive,
+                )
             if not result.ready:
                 return result
         except LongTermRemoteUnavailableError as exc:
@@ -208,6 +300,117 @@ class LongTermRemoteHealthProbe:
                 include_archive=include_archive,
             )
 
+        return self._build_result(
+            checked_snapshots=tuple(checked),
+            ready=True,
+            checks=tuple(checks),
+            include_archive=include_archive,
+        )
+
+    def _probe_object_store_snapshot(
+        self,
+        *,
+        snapshot_kind: str,
+        object_remote_state: LongTermRemoteStateStore,
+        checked: list[str],
+        checks: list[LongTermRemoteWarmCheck],
+        include_archive: bool,
+    ) -> LongTermRemoteWarmResult:
+        """Probe the object store through its current catalog contract when available."""
+
+        object_probe = getattr(self.object_store, "probe_remote_current_snapshot", None)
+        if callable(object_probe):
+            return self._probe_store_payload(
+                store="object_store",
+                snapshot_kind=snapshot_kind,
+                payload=object_probe(snapshot_kind=snapshot_kind),
+                checked=checked,
+                checks=checks,
+                include_archive=include_archive,
+                selected_source="object_store_current_contract",
+            )
+        return self._probe_snapshot(
+            store="object_store",
+            remote_state=object_remote_state,
+            snapshot_kind=snapshot_kind,
+            checked=checked,
+            checks=checks,
+            include_archive=include_archive,
+        )
+
+    def _resolve_store_payload(
+        self,
+        *,
+        probe_getter,
+        load_getter,
+        probe_selected_source: str,
+        load_selected_source: str,
+    ) -> tuple[dict[str, object] | None, str]:
+        """Resolve one store-owned current-head contract with a load fallback."""
+
+        probe_error: LongTermRemoteUnavailableError | None = None
+        payload = None
+        if callable(probe_getter):
+            try:
+                payload = probe_getter()
+            except LongTermRemoteUnavailableError as exc:
+                probe_error = exc
+        if isinstance(payload, dict):
+            return dict(payload), probe_selected_source
+        if callable(load_getter):
+            try:
+                loaded_payload = load_getter()
+            except LongTermRemoteUnavailableError:
+                if probe_error is not None:
+                    raise probe_error
+                raise
+            if isinstance(loaded_payload, dict):
+                return dict(loaded_payload), load_selected_source
+        if probe_error is not None:
+            raise probe_error
+        return None, probe_selected_source
+
+    def _probe_store_payload(
+        self,
+        *,
+        store: str,
+        snapshot_kind: str,
+        payload: dict[str, object] | None,
+        checked: list[str],
+        checks: list[LongTermRemoteWarmCheck],
+        include_archive: bool,
+        selected_source: str,
+    ) -> LongTermRemoteWarmResult:
+        """Probe one store-owned current-view/current-head contract directly."""
+
+        normalized_kind = str(snapshot_kind or "").strip()
+        detail = None
+        if not normalized_kind:
+            detail = "Required remote long-term snapshot kind is missing."
+        elif not isinstance(payload, dict):
+            detail = f"Required remote long-term snapshot {normalized_kind!r} is unavailable."
+        checks.append(
+            LongTermRemoteWarmCheck(
+                store=store,
+                snapshot_kind=normalized_kind,
+                status="found" if isinstance(payload, dict) else "unavailable",
+                latency_ms=0.0,
+                detail=detail,
+                selected_source=selected_source,
+                payload=dict(payload) if isinstance(payload, dict) else None,
+            )
+        )
+        if not isinstance(payload, dict):
+            return self._build_result(
+                checked_snapshots=tuple(checked),
+                ready=False,
+                detail=detail,
+                failed_store=store,
+                failed_snapshot_kind=normalized_kind or None,
+                checks=tuple(checks),
+                include_archive=include_archive,
+            )
+        checked.append(normalized_kind)
         return self._build_result(
             checked_snapshots=tuple(checked),
             ready=True,

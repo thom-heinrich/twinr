@@ -72,6 +72,35 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_text_surface_contexts_drop_synthetic_summary_turns_but_keep_recent_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Erster Turn")
+                runtime.memory.remember("assistant", "Zweiter Turn")
+                runtime.memory.remember("user", "Wie spaet ist es in New York?")
+                runtime.memory.remember("assistant", "In New York ist es gerade 10:53 Uhr.")
+
+                full_context = runtime.tool_provider_conversation_context()
+                text_context = runtime.tool_provider_text_surface_conversation_context()
+                supervisor_text_context = runtime.supervisor_provider_text_surface_conversation_context()
+
+                self.assertTrue(
+                    any(role == "system" and "Twinr memory summary" in content for role, content in full_context)
+                )
+                self.assertFalse(
+                    any(role == "system" and "Twinr memory summary" in content for role, content in text_context)
+                )
+                self.assertFalse(
+                    any(role == "system" and "Twinr memory summary" in content for role, content in supervisor_text_context)
+                )
+                self.assertIn(("user", "Wie spaet ist es in New York?"), text_context)
+                self.assertIn(("assistant", "In New York ist es gerade 10:53 Uhr."), text_context)
+                self.assertIn(("user", "Wie spaet ist es in New York?"), supervisor_text_context)
+                self.assertIn(("assistant", "In New York ist es gerade 10:53 Uhr."), supervisor_text_context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_identified_voice_guidance_allows_low_risk_discovery_without_identity_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -966,6 +995,51 @@ class RuntimeContextTests(unittest.TestCase):
             runtime.check_required_remote_dependency()
 
         guard_mock.assert_called_once_with(runtime.config)
+
+    def test_runtime_startup_uses_watchdog_artifact_instead_of_forcing_deep_remote_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                long_term_memory_path=str(root / "state" / "chonkydb"),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+
+            class _GuardedLongTermMemory:
+                def remote_required(self):
+                    return True
+
+                def ensure_remote_ready(self):
+                    raise AssertionError("deep remote check must not run during watchdog_artifact startup")
+
+                def shutdown(self, *, timeout_s: float = 2.0) -> None:
+                    del timeout_s
+
+            with (
+                patch(
+                    "twinr.agent.base_agent.runtime.base.LongTermMemoryService.from_config",
+                    return_value=_GuardedLongTermMemory(),
+                ),
+                patch(
+                    "twinr.agent.workflows.required_remote_snapshot.ensure_required_remote_watchdog_snapshot_ready"
+                ) as guard_mock,
+            ):
+                runtime = TwinrRuntime(config=config)
+            try:
+                self.assertEqual(runtime.status, TwinrStatus.WAITING)
+                snapshot = RuntimeSnapshotStore(config.runtime_state_path).load()
+                self.assertIsNotNone(snapshot)
+                assert snapshot is not None
+                self.assertEqual(snapshot.status, "waiting")
+                self.assertIsNone(snapshot.error_message)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+        guard_mock.assert_called_once_with(config)
 
 
 if __name__ == "__main__":

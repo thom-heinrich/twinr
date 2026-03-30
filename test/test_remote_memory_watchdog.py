@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
-from twinr.ops import TwinrOpsEventStore
+from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdog,
     RemoteMemoryWatchdogSample,
@@ -428,7 +429,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
 
             mode = store.path.stat().st_mode & 0o777
 
-        self.assertEqual(mode, 0o644)
+        self.assertEqual(mode, 0o600)
 
     def test_snapshot_round_trips_through_json_payload_after_state_helper_extraction(self) -> None:
         sample = RemoteMemoryWatchdogSample(
@@ -473,7 +474,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         reloaded = RemoteMemoryWatchdogSnapshot.from_dict(json.loads(json.dumps(snapshot.to_dict())))
 
         self.assertEqual(reloaded.current.probe, sample.probe)
-        self.assertEqual(reloaded.recent_samples[0].probe, sample.probe)
+        self.assertIsNone(reloaded.recent_samples[0].probe)
         self.assertEqual(reloaded.failure_count, 2)
 
     def test_bootstrap_snapshot_builder_stays_reexported_from_main_watchdog_module(self) -> None:
@@ -640,6 +641,148 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(snapshot.current.seq, 0)
         self.assertIsNotNone(snapshot.heartbeat_at)
 
+    def test_stalled_probe_uses_startup_timeout_before_first_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+                long_term_memory_remote_watchdog_probe_timeout_s=15.0,
+                long_term_memory_remote_watchdog_startup_probe_timeout_s=45.0,
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+            watchdog._probe_thread = mock.Mock()
+            watchdog._probe_thread.is_alive.return_value = True
+            watchdog._probe_started_at = "2026-03-30T14:31:44Z"
+            watchdog._probe_started_monotonic = 0.0
+
+            watchdog._mark_stalled_probe_if_needed(now_monotonic=36.9)
+            self.assertFalse(watchdog._probe_timeout_reported)
+            self.assertIsNone(store.load())
+            self.assertEqual(watchdog._effective_probe_timeout_s(), 45.0)
+
+    def test_stalled_probe_fails_once_startup_timeout_is_exceeded_before_first_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+                long_term_memory_remote_watchdog_probe_timeout_s=15.0,
+                long_term_memory_remote_watchdog_startup_probe_timeout_s=45.0,
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+            watchdog._probe_thread = mock.Mock()
+            watchdog._probe_thread.is_alive.return_value = True
+            watchdog._probe_started_at = "2026-03-30T14:31:44Z"
+            watchdog._probe_started_monotonic = 0.0
+
+            watchdog._mark_stalled_probe_if_needed(now_monotonic=45.2)
+            snapshot = store.load()
+            self.assertTrue(watchdog._probe_timeout_reported)
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(snapshot.current.status, "fail")
+            self.assertFalse(snapshot.current.ready)
+            self.assertIn("45.0s", snapshot.current.detail or "")
+
+    def test_stalled_probe_uses_recent_success_latency_headroom_before_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+            watchdog._build_sample(
+                captured_at="2026-03-30T13:57:39Z",
+                status="ok",
+                ready=True,
+                mode="remote_primary",
+                required=True,
+                latency_ms=12054.8,
+                detail=None,
+            )
+            watchdog._probe_thread = mock.Mock()
+            watchdog._probe_thread.is_alive.return_value = True
+            watchdog._probe_started_at = "2026-03-30T13:57:52Z"
+            watchdog._probe_started_monotonic = 0.0
+
+            watchdog._mark_stalled_probe_if_needed(now_monotonic=16.7)
+            self.assertFalse(watchdog._probe_timeout_reported)
+            self.assertIsNone(store.load())
+            self.assertGreater(watchdog._effective_probe_timeout_s(), 16.7)
+
+    def test_stalled_probe_fails_once_recent_success_headroom_is_exceeded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+            watchdog._build_sample(
+                captured_at="2026-03-30T13:57:39Z",
+                status="ok",
+                ready=True,
+                mode="remote_primary",
+                required=True,
+                latency_ms=12054.8,
+                detail=None,
+            )
+            watchdog._probe_thread = mock.Mock()
+            watchdog._probe_thread.is_alive.return_value = True
+            watchdog._probe_started_at = "2026-03-30T13:57:52Z"
+            watchdog._probe_started_monotonic = 0.0
+
+            watchdog._mark_stalled_probe_if_needed(now_monotonic=18.2)
+            snapshot = store.load()
+            self.assertTrue(watchdog._probe_timeout_reported)
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(snapshot.current.status, "fail")
+            self.assertFalse(snapshot.current.ready)
+            self.assertIn("18.1s", snapshot.current.detail or "")
+
     def test_probe_once_preserves_cached_service_after_expected_remote_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -748,10 +891,9 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         assert snapshot.current.probe is not None
         steps = cast(list[dict[str, object]], snapshot.current.probe["steps"])
         warm_result = _object_dict(steps[0]["warm_result"])
-        checks = cast(list[dict[str, object]], warm_result["checks"])
-        attempts = cast(list[dict[str, object]], checks[0]["attempts"])
-        self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
-        self.assertEqual(attempts[0]["status_code"], 503)
+        self.assertEqual(steps[0]["status"], "fail")
+        self.assertEqual(warm_result["failed_snapshot_kind"], "[TRUNCATED]")
+        self.assertEqual(warm_result["checks"], "[TRUNCATED]")
 
     def test_heartbeat_snapshot_compacts_historical_probe_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -907,7 +1049,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 long_term_memory_enabled=True,
                 long_term_memory_mode="remote_primary",
             )
-            monotonic_values = iter((100.0, 104.2))
+            monotonic_values = itertools.chain((0.0, 100.0, 104.2, 104.2), itertools.repeat(104.2))
             with mock.patch(
                 "twinr.ops.remote_memory_watchdog._utc_now_iso",
                 side_effect=("2026-03-16T18:00:00Z", "2026-03-16T18:00:04Z"),
@@ -955,8 +1097,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(remote_write_context["request_correlation_id"], "ltw-test123")
         transition_event = next(event for event in events if event["event"] == "remote_memory_watchdog_status_changed")
         transition_data = _object_dict(transition_event["data"])
-        event_remote_write_context = _object_dict(transition_data["remote_write_context"])
-        self.assertEqual(event_remote_write_context["request_correlation_id"], "ltw-test123")
+        self.assertEqual(transition_data["remote_write_context"], "[REDACTED]")
 
 
 if __name__ == "__main__":

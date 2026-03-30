@@ -18,6 +18,7 @@ from twinr.memory.longterm import (
     LongTermMemoryService,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.runtime.service_impl.proactive import _select_proactive_planner_objects
 from twinr.memory.longterm.proactive.state import _write_json_atomic
 
 
@@ -48,6 +49,59 @@ def _config(root: str, **overrides) -> TwinrConfig:
 
 
 class LongTermProactiveIntegrationTests(unittest.TestCase):
+    def test_proactive_planner_selection_uses_targeted_queries_without_full_snapshot_reads(self) -> None:
+        event_object = LongTermMemoryObjectV1(
+            memory_id="event:doctor",
+            kind="event",
+            summary="Doctor appointment tomorrow.",
+            source=_source("turn:event"),
+            status="active",
+        )
+        summary_object = LongTermMemoryObjectV1(
+            memory_id="thread:walk_weather",
+            kind="thread_summary",
+            summary="Ongoing thread about the user's walk plans.",
+            source=_source("turn:thread"),
+            status="active",
+            attributes={"support_count": 3},
+        )
+        routine_object = LongTermMemoryObjectV1(
+            memory_id="routine:print_offer",
+            kind="fact",
+            summary="The user often wants a printed agenda after breakfast.",
+            source=_source("turn:routine"),
+            status="active",
+            attributes={"memory_domain": "sensor_routine", "routine_type": "interaction"},
+        )
+
+        class QueryOnlyObjectStore:
+            def __init__(self) -> None:
+                self.queries: list[tuple[str | None, int]] = []
+
+            def select_fast_topic_objects(self, *, query_text=None, limit=0):
+                self.queries.append((query_text, limit))
+                normalized_query = str(query_text or "")
+                if "event" in normalized_query and "plan" in normalized_query:
+                    return (event_object,)
+                if "thread_summary" in normalized_query and "summary_type" in normalized_query:
+                    return (summary_object,)
+                if "sensor_routine" in normalized_query and "interaction" in normalized_query:
+                    return (routine_object,)
+                return ()
+
+            def load_objects(self):
+                raise AssertionError("Proactive planning must not hydrate the full object snapshot.")
+
+        object_store = QueryOnlyObjectStore()
+
+        selected = _select_proactive_planner_objects(object_store)
+
+        self.assertEqual(
+            {item.memory_id for item in selected},
+            {"event:doctor", "thread:walk_weather", "routine:print_offer"},
+        )
+        self.assertEqual(len(object_store.queries), 3)
+
     def test_proactive_state_atomic_write_survives_concurrent_writers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "proactive.json"

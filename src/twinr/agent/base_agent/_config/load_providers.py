@@ -10,6 +10,9 @@ from .parsing import (
     _parse_bool,
     _parse_float,
     _parse_optional_bool,
+    _parse_optional_float,
+    _parse_optional_int,
+    _parse_optional_text,
 )
 
 
@@ -86,6 +89,54 @@ def load_provider_config(context: ConfigLoadContext) -> dict[str, object]:
         "groq_model": get_value("GROQ_MODEL", "llama-3.3-70b-versatile")
         or "llama-3.3-70b-versatile",
         "groq_timeout_s": _parse_float(get_value("GROQ_TIMEOUT_S"), 45.0),
+        "groq_request_timeout_seconds": _parse_optional_float(
+            get_value("GROQ_REQUEST_TIMEOUT_SECONDS")
+        ),
+        "groq_max_retries": _parse_optional_int(get_value("GROQ_MAX_RETRIES")),
+        "groq_connect_timeout_s": _parse_optional_float(
+            get_value("GROQ_CONNECT_TIMEOUT_S")
+        ),
+        "groq_write_timeout_s": _parse_optional_float(get_value("GROQ_WRITE_TIMEOUT_S")),
+        "groq_pool_timeout_s": _parse_optional_float(get_value("GROQ_POOL_TIMEOUT_S")),
+        "groq_max_connections": _parse_optional_int(get_value("GROQ_MAX_CONNECTIONS")),
+        "groq_max_keepalive_connections": _parse_optional_int(
+            get_value("GROQ_MAX_KEEPALIVE_CONNECTIONS")
+        ),
+        "groq_keepalive_expiry_s": _parse_optional_float(
+            get_value("GROQ_KEEPALIVE_EXPIRY_S")
+        ),
+        "groq_http2": _parse_optional_bool(get_value("GROQ_HTTP2")),
+        "groq_trust_env": _parse_optional_bool(
+            get_value("GROQ_TRUST_ENV", get_value("TWINR_GROQ_TRUST_ENV"))
+        ),
+        "groq_follow_redirects": _parse_optional_bool(
+            get_value("GROQ_FOLLOW_REDIRECTS")
+        ),
+        "groq_sdk_backend": _parse_optional_text(
+            get_value("GROQ_SDK_BACKEND", get_value("TWINR_GROQ_SDK_BACKEND"))
+        ),
+        "groq_tool_continuation_ttl_seconds": _parse_optional_float(
+            get_value("GROQ_TOOL_CONTINUATION_TTL_SECONDS")
+        ),
+        "groq_tool_max_continuations": _parse_optional_int(
+            get_value("GROQ_TOOL_MAX_CONTINUATIONS")
+        ),
+        "groq_max_tool_result_chars": _parse_optional_int(
+            get_value("GROQ_MAX_TOOL_RESULT_CHARS")
+        ),
+        "groq_service_tier": _parse_optional_text(get_value("GROQ_SERVICE_TIER")),
+        "groq_reasoning_format": get_value("GROQ_REASONING_FORMAT", "") or "",
+        "groq_reasoning_effort": get_value("GROQ_REASONING_EFFORT", "") or "",
+        "groq_text_search_model": _parse_optional_text(
+            get_value("GROQ_TEXT_SEARCH_MODEL")
+        ),
+        "groq_vision_model": _parse_optional_text(get_value("GROQ_VISION_MODEL")),
+        "groq_allow_search_fallback": _parse_bool(
+            get_value("GROQ_ALLOW_SEARCH_FALLBACK"), False
+        ),
+        "groq_allow_vision_fallback": _parse_bool(
+            get_value("GROQ_ALLOW_VISION_FALLBACK"), False
+        ),
         "openai_realtime_model": get_value("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
         or "gpt-realtime-1.5",
         "openai_realtime_voice": get_value("OPENAI_REALTIME_VOICE", "sage") or "sage",

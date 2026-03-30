@@ -70,6 +70,7 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
             bridge_root = root / "src" / "twinr" / "agent" / "self_coding" / "codex_driver" / "sdk_bridge"
             bridge_root.mkdir(parents=True)
             (bridge_root / "package.json").write_text('{"name":"bridge"}\n', encoding="utf-8")
+            (bridge_root / "package-lock.json").write_text('{"name":"bridge","lockfileVersion":3}\n', encoding="utf-8")
 
             pi_env_path = root / ".env.pi"
             pi_env_path.write_text(
@@ -102,12 +103,13 @@ class SelfCodingPiBootstrapTests(unittest.TestCase):
         self.assertTrue(result.ready)
         self.assertEqual(result.codex_cli_version, "0.114.0")
         joined = "\n".join(" ".join(command) for command in commands)
-        self.assertIn("sshpass -e ssh", joined)
-        self.assertIn("sshpass -e scp", joined)
-        self.assertIn("sshpass -e rsync", joined)
-        self.assertIn("npm install -g @openai/codex@0.114.0", joined)
+        self.assertIn("sshpass -d", joined)
+        self.assertIn("sshpass -d 11 ssh", joined)
+        self.assertIn("sshpass -d 11 rsync", joined)
+        self.assertIn("npm install --global --prefix", joined)
+        self.assertIn("@openai/codex@$CODEX_VERSION", joined)
         self.assertIn("--self-coding-codex-self-test", joined)
-        self.assertTrue(any(env and env.get("SSHPASS") == _TEST_PI_SSH_PASSWORD for env in env_overrides))
+        self.assertFalse(any(env and "SSHPASS" in env for env in env_overrides))
 
 
 if __name__ == "__main__":

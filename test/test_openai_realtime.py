@@ -127,7 +127,17 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(self.config, client=client)
         return session, connection, manager
 
-    def test_open_configures_realtime_session(self) -> None:
+    def _config_turn_events(self) -> tuple[object, object]:
+        return (
+            SimpleNamespace(type="response.output_text.delta", delta="Hallo"),
+            SimpleNamespace(type="response.done", response=SimpleNamespace(id="resp_cfg")),
+        )
+
+    def _drive_config_turn(self, session: OpenAIRealtimeSession) -> None:
+        with session:
+            session.run_text_turn("Sag hallo")
+
+    def test_open_does_not_configure_realtime_session_until_first_turn(self) -> None:
         session, connection, manager = self.make_session()
 
         with session:
@@ -135,8 +145,17 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
         self.assertTrue(manager.entered)
         self.assertTrue(manager.exited)
+        self.assertEqual(connection.session.calls, [])
+
+    def test_first_turn_configures_realtime_session(self) -> None:
+        session, connection, manager = self.make_session(*self._config_turn_events())
+
+        self._drive_config_turn(session)
+
+        self.assertTrue(manager.entered)
+        self.assertTrue(manager.exited)
         self.assertEqual(connection.session.calls[0]["type"], "realtime")
-        self.assertEqual(connection.session.calls[0]["output_modalities"], ["audio"])
+        self.assertEqual(connection.session.calls[0]["output_modalities"], ["text"])
         self.assertEqual(connection.session.calls[0]["audio"]["output"]["voice"], "sage")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["type"], "audio/pcm")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["rate"], 24000)
@@ -146,7 +165,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIsNone(connection.session.calls[0]["audio"]["input"]["turn_detection"])
 
     def test_open_merges_session_defaults_into_provider_update(self) -> None:
-        connection = FakeRealtimeConnection([])
+        connection = FakeRealtimeConnection(list(self._config_turn_events()))
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
@@ -175,8 +194,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             },
         )
 
-        with session:
-            pass
+        self._drive_config_turn(session)
 
         configured = connection.session.calls[0]
         self.assertEqual(configured["audio"]["input"]["turn_detection"]["type"], "semantic_vad")
@@ -194,15 +212,14 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(configured["tool_choice"], "required")
 
     def test_open_merges_base_and_realtime_instructions(self) -> None:
-        session, connection, _manager = self.make_session()
+        _session, connection, _manager = self.make_session(*self._config_turn_events())
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
             base_instructions="Base context",
         )
 
-        with session:
-            pass
+        self._drive_config_turn(session)
 
         instructions = connection.session.calls[0]["instructions"]
         self.assertTrue(instructions.startswith("Base context\n\n"))
@@ -322,15 +339,14 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 openai_realtime_model="gpt-4o-realtime-preview",
                 openai_realtime_voice="sage",
             )
-            connection = FakeRealtimeConnection([])
+            connection = FakeRealtimeConnection(list(self._config_turn_events()))
             session = OpenAIRealtimeSession(
                 config,
                 client=FakeRealtimeClient(FakeConnectionManager(connection)),
             )
             (personality_dir / "PERSONALITY.md").write_text("Updated style context", encoding="utf-8")
 
-            with session:
-                pass
+            self._drive_config_turn(session)
 
         instructions = connection.session.calls[0]["instructions"]
         self.assertIn('<section title="SYSTEM" authority="configuration" encoding="verbatim_text">', instructions)
@@ -348,7 +364,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("Morning weather", instructions)
 
     def test_open_includes_expected_tools_when_handlers_exist(self) -> None:
-        session, connection, _manager = self.make_session()
+        _session, connection, _manager = self.make_session(*self._config_turn_events())
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
@@ -394,8 +410,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             },
         )
 
-        with session:
-            pass
+        self._drive_config_turn(session)
 
         self.assertEqual(connection.session.calls[0]["tool_choice"], "auto")
         self.assertEqual(
@@ -576,7 +591,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("Do not answer a quiet-mode status question from conversational memory", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:
-        session, connection, _manager = self.make_session()
+        _session, connection, _manager = self.make_session(*self._config_turn_events())
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
@@ -590,8 +605,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             },
         )
 
-        with session:
-            pass
+        self._drive_config_turn(session)
 
         tools_by_name = {tool["name"]: tool for tool in connection.session.calls[0]["tools"]}
         for tool_name in (
@@ -661,7 +675,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(connection.conversation.item.calls[1]["content"][0]["type"], "output_text")
         self.assertEqual(connection.input_audio_buffer.commit_calls, 1)
         self.assertGreater(len(connection.input_audio_buffer.append_calls), 1)
-        self.assertEqual(connection.response.calls[0], {})
+        self.assertEqual(connection.response.calls[0], {"output_modalities": ["audio"]})
 
     def test_run_audio_turn_handles_function_call_and_continues_response(self) -> None:
         tool_calls: list[dict] = []
@@ -710,7 +724,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(turn.response_text, "Ist gedruckt.")
         self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
         self.assertEqual(connection.conversation.item.calls[0]["call_id"], "call_print_1")
-        self.assertEqual(connection.response.calls, [{}, {}])
+        self.assertEqual(
+            connection.response.calls,
+            [{"output_modalities": ["text"]}, {"output_modalities": ["text"]}],
+        )
 
     def test_run_audio_turn_uses_end_conversation_spoken_reply_without_second_response(self) -> None:
         end_calls: list[dict] = []
@@ -748,7 +765,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         )
         self.assertTrue(turn.end_conversation)
         self.assertEqual(turn.response_text, "Bis bald.")
-        self.assertEqual(connection.response.calls, [{}])
+        self.assertEqual(connection.response.calls, [{"output_modalities": ["text"]}])
 
     def test_run_audio_turn_continues_after_end_conversation_tool_without_spoken_reply(self) -> None:
         end_calls: list[dict] = []
@@ -796,7 +813,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(end_calls, [{"reason": "user said stop"}])
         self.assertTrue(turn.end_conversation)
         self.assertEqual(turn.response_text, "Bis bald.")
-        self.assertEqual(connection.response.calls, [{}, {}])
+        self.assertEqual(
+            connection.response.calls,
+            [{"output_modalities": ["text"]}, {"output_modalities": ["text"]}],
+        )
 
     def test_run_audio_turn_handles_search_function_call_and_continues_response(self) -> None:
         search_calls: list[dict] = []
@@ -847,7 +867,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         )
         self.assertEqual(turn.response_text, "Morgen wird es kuehl und nass.")
         self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
-        self.assertEqual(connection.response.calls, [{}, {}])
+        self.assertEqual(
+            connection.response.calls,
+            [{"output_modalities": ["text"]}, {"output_modalities": ["text"]}],
+        )
 
     def test_run_audio_turn_handles_schedule_reminder_tool_call(self) -> None:
         reminder_calls: list[dict] = []
@@ -902,6 +925,18 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         )
         self.assertEqual(turn.response_text, "Alles klar, ich erinnere dich.")
         self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
+
+    def test_cancel_active_response_ignores_non_callable_cancel_attribute(self) -> None:
+        session, connection, _manager = self.make_session()
+        connection.response.cancel = "not-callable"
+
+        with session:
+            with self.assertNoLogs("twinr.providers.openai.realtime.session", level="DEBUG"):
+                session._run_on_session_loop_locked(
+                    session._cancel_active_response(),
+                    stage="cancelling realtime response",
+                    timeout=1.0,
+                )
 
     def test_run_text_turn_creates_user_message(self) -> None:
         session, connection, _manager = self.make_session(

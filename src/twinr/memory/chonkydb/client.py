@@ -8,6 +8,8 @@ remote long-term memory code.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import math
 from pathlib import Path
@@ -30,6 +32,7 @@ from twinr.memory.chonkydb.models import (
     ChonkyDBGraphNeighborsRequest,
     ChonkyDBGraphPathRequest,
     ChonkyDBGraphPatternsRequest,
+    ChonkyDBGraphStoreManyRequest,
     ChonkyDBInstanceInfo,
     ChonkyDBRecordListResponse,
     ChonkyDBRecordRequest,
@@ -140,11 +143,19 @@ class ChonkyDBError(RuntimeError):
     status_code: int | None = None
     response_text: str | None = None
     response_json: JsonDict | None = None
+    response_headers: Mapping[str, str] | None = None
 
     def __str__(self) -> str:
         if self.status_code is None:
             return self.message
         return f"{self.message} (status={self.status_code})"
+
+    def retry_after_seconds(self) -> float | None:
+        """Return the server-advertised retry delay when present."""
+
+        headers = self.response_headers or {}
+        raw_value = headers.get("Retry-After") or headers.get("retry-after")
+        return _parse_retry_after_seconds(raw_value)
 
 class ChonkyDBClient:
     """Wrap the ChonkyDB external API with Twinr-specific validation."""
@@ -377,6 +388,12 @@ class ChonkyDBClient:
         body = request.to_payload() if isinstance(request, ChonkyDBGraphAddEdgeSmartRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/edges/smart", body=body)
 
+    def graph_store_many(self, request: ChonkyDBGraphStoreManyRequest | Mapping[str, object]) -> JsonDict:
+        """Store a batch of graph nodes and edges for one graph generation."""
+
+        body = request.to_payload() if isinstance(request, ChonkyDBGraphStoreManyRequest) else dict(request)
+        return self._request_json("POST", "/v1/graph/store_many", body=body)
+
     def graph_neighbors(self, request: ChonkyDBGraphNeighborsRequest | Mapping[str, object]) -> JsonDict:
         """Query neighboring graph nodes for a label or identifier."""
 
@@ -449,23 +466,29 @@ class ChonkyDBClient:
                             status_code=status_code,
                             response_text=response_text or None,
                             response_json=response_json,
+                            response_headers=_response_headers(headers),
                         )
                     raise ChonkyDBError(
                         f"ChonkyDB request failed for {normalized_method} {normalized_path}",
                         status_code=status_code,
                         response_text=response_text or None,
                         response_json=response_json,
+                        response_headers=_response_headers(getattr(response, "headers", None)),
                     )
                 # AUDIT-FIX(#6): Bound response size to protect the RPi process from memory exhaustion.
                 raw = _read_response_bytes(response, max_response_bytes=response_limit)
         except HTTPError as exc:
             # AUDIT-FIX(#6): Bound error-body reads as well, otherwise large error pages can still exhaust memory.
-            response_text, response_json = _read_http_error_details(exc, max_response_bytes=response_limit)
+            response_text, response_json, response_headers = _read_http_error_details(
+                exc,
+                max_response_bytes=response_limit,
+            )
             raise ChonkyDBError(
                 f"ChonkyDB request failed for {normalized_method} {normalized_path}",
                 status_code=exc.code,
                 response_text=response_text,
                 response_json=response_json,
+                response_headers=response_headers,
             ) from exc
         except URLError as exc:
             raise ChonkyDBError(
@@ -667,9 +690,14 @@ def _read_response_bytes(response: _ResponseLike, *, max_response_bytes: int) ->
 
     return bytes(buffer)
 
-def _read_http_error_details(exc: HTTPError, *, max_response_bytes: int) -> tuple[str | None, JsonDict | None]:
+def _read_http_error_details(
+    exc: HTTPError,
+    *,
+    max_response_bytes: int,
+) -> tuple[str | None, JsonDict | None, dict[str, str] | None]:
     response_text: str | None = None
     response_json: JsonDict | None = None
+    response_headers = _response_headers(getattr(exc, "headers", None) or getattr(exc, "hdrs", None))
     try:
         raw = _read_response_bytes(exc, max_response_bytes=max_response_bytes)
     except ChonkyDBError as read_exc:
@@ -684,7 +712,42 @@ def _read_http_error_details(exc: HTTPError, *, max_response_bytes: int) -> tupl
         if callable(close):
             close()
 
-    return response_text, response_json
+    return response_text, response_json, response_headers
 
 def _decode_response_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
+
+
+def _response_headers(headers: object) -> dict[str, str] | None:
+    if not isinstance(headers, Mapping):
+        return None
+    normalized = {
+        str(key): str(value)
+        for key, value in headers.items()
+        if str(key).strip()
+    }
+    return normalized or None
+
+
+def _parse_retry_after_seconds(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None:
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    delta = (retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(delta):
+        return None
+    return max(0.0, delta)

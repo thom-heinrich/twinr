@@ -11,6 +11,7 @@ agent.
 - generic inbound/outbound contracts for text-based messaging channels
 - transport-facing runtime services that convert a text message into one Twinr turn, including both a plain text-completion bridge and a shared tool-capable turn bridge
 - channel-aware hidden instruction helpers so external text transports can reuse one bounded response-style policy while staying on Twinr's shared memory and tool surface
+- bounded recent-thread carryover injection for external text turns so short repairs or clarifications can keep anchors from the immediate thread without bespoke transport logic
 - bounded pending-action tracking for external text turns that need a structured follow-up answer on the next message, including file-backed draft persistence so a channel-service restart does not erase an open WhatsApp send flow
 - bounded model-guided follow-up resolution for active WhatsApp send drafts so later turns keep using the structured draft instead of falling back to free-form chat
 - channel-owned direct-send hooks for cases where the active messaging loop itself must complete a send tool call without enqueueing work and waiting on its own thread

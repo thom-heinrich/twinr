@@ -19,7 +19,7 @@ streaming APIs.
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - route the temporary voice-quiet tool through the same thin executor surface as the other live-turn tools so users can suppress transcript-first wake for a bounded runtime window
-- allow the streaming fast lane to execute a supervisor-resolved one-shot runtime-local tool directly when the structured decision already carries an exact `runtime_tool_name` plus arguments, so bounded control turns like temporary voice quiet do not pay an avoidable second specialist-model hop
+- allow the streaming fast lane to execute a supervisor-resolved one-shot runtime-local tool directly only when the structured decision carries an actually executable `runtime_tool_name` plus complete arguments; incomplete direct payloads must fall back to the normal specialist handoff instead of surfacing a live turn error
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - record one generic success/failure observability event per realtime tool call so operator readback can see which tool ran, how long it took, and whether model fallback metadata was involved
 - convert shared sensitive-confirmation guards into structured `confirmation_required` tool results so live turns can ask for explicit approval instead of collapsing into generic technical-error speech

@@ -220,9 +220,23 @@ def _sentence_list(facts: Sequence[str]) -> str:
     return _compact_text(" ".join(parts), max_len=1200)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Flush a directory entry after replacing a user-discovery state file."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
+    cross_service_read_mode = 0o644
     parent = path.parent.resolve(strict=False)
     parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_dir():
+        raise IsADirectoryError(f"User-discovery state path points to a directory: {path}")
     file_descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -234,8 +248,11 @@ def _atomic_write_text(path: Path, text: str) -> None:
         with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
+            os.fchmod(handle.fileno(), cross_service_read_mode)
             os.fsync(handle.fileno())
         os.replace(str(temp_path), str(path))
+        os.chmod(path, cross_service_read_mode)
+        _fsync_directory(parent)
     except Exception:
         try:
             temp_path.unlink()

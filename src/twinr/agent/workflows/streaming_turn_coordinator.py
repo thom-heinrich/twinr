@@ -535,6 +535,7 @@ class _DeferredFollowUpClosureEvaluation:
     _evaluation: ConversationClosureEvaluation | None = None
     _started: bool = False
     _slot_acquired: bool = False
+    _started_at_monotonic: float | None = None
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def start(self) -> None:
@@ -544,6 +545,7 @@ class _DeferredFollowUpClosureEvaluation:
             if self._started:
                 return
             self._started = True
+            self._started_at_monotonic = time.monotonic()
         self.trace_event(
             "streaming_follow_up_closure_eval_started",
             kind="span_start",
@@ -634,10 +636,30 @@ class _DeferredFollowUpClosureEvaluation:
         """Return the finished closure evaluation without waiting indefinitely."""
 
         wait_started = time.monotonic()
-        deadline_at = None if timeout_s is None else wait_started + max(0.0, timeout_s)
+        start_budget_at = self._started_at_monotonic or wait_started
+        deadline_at = None if timeout_s is None else start_budget_at + max(0.0, timeout_s)
         interval_s = max(0.01, float(poll_interval_s))
         while True:
-            remaining_s = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+            now = time.monotonic()
+            remaining_s = None if deadline_at is None else deadline_at - now
+            if remaining_s is not None and remaining_s <= 0:
+                wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
+                self.trace_event(
+                    "streaming_follow_up_closure_eval_join_timeout",
+                    kind="warning",
+                    level="WARN",
+                    details={
+                        "timeout_s": timeout_s,
+                        "elapsed_since_start_ms": round((now - start_budget_at) * 1000.0, 3),
+                    },
+                    kpi={"wait_ms": wait_ms},
+                )
+                return ConversationClosureEvaluation(
+                    error_type="closure_eval_timeout",
+                    assistant_expects_reply=assistant_expects_immediate_reply(
+                        self.assistant_response
+                    ),
+                )
             wait_s = interval_s if remaining_s is None else min(interval_s, remaining_s)
             if self._ready.wait(timeout=wait_s):
                 break
@@ -651,21 +673,6 @@ class _DeferredFollowUpClosureEvaluation:
                 )
                 return ConversationClosureEvaluation(
                     error_type="closure_eval_interrupted",
-                    assistant_expects_reply=assistant_expects_immediate_reply(
-                        self.assistant_response
-                    ),
-                )
-            if deadline_at is not None and time.monotonic() >= deadline_at:
-                wait_ms = round((time.monotonic() - wait_started) * 1000.0, 3)
-                self.trace_event(
-                    "streaming_follow_up_closure_eval_join_timeout",
-                    kind="warning",
-                    level="WARN",
-                    details={"timeout_s": timeout_s},
-                    kpi={"wait_ms": wait_ms},
-                )
-                return ConversationClosureEvaluation(
-                    error_type="closure_eval_timeout",
                     assistant_expects_reply=assistant_expects_immediate_reply(
                         self.assistant_response
                     ),

@@ -18,6 +18,7 @@ from twinr.proactive.social.engine import (
     SocialPersonZone,
     SocialSpatialBox,
     SocialTriggerEngine,
+    SocialVisiblePerson,
     SocialVisionObservation,
 )
 from twinr.proactive.social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
@@ -104,6 +105,37 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertIn("camera.fine_hand_gesture_detected", update.event_names)
         self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
         self.assertAlmostEqual(update.snapshot.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
+
+    def test_surface_falls_back_to_visible_persons_when_person_count_is_invalid(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                person_visible_event_cooldown_s=0.0,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=2.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count="many",
+                visible_persons=(
+                    SocialVisiblePerson(
+                        zone=SocialPersonZone.LEFT,
+                        confidence=0.71,
+                        box=SocialSpatialBox(top=0.1, left=0.08, bottom=0.9, right=0.4),
+                    ),
+                    SocialVisiblePerson(
+                        zone=SocialPersonZone.RIGHT,
+                        confidence=0.74,
+                        box=SocialSpatialBox(top=0.12, left=0.58, bottom=0.88, right=0.92),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(update.snapshot.person_count, 2)
+        self.assertFalse(update.snapshot.person_count_unknown)
 
     def test_surface_uses_authoritative_attention_stream_without_local_looking_debounce(self) -> None:
         surface = ProactiveCameraSurface(

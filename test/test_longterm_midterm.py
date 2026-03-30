@@ -6,6 +6,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,7 @@ from twinr.memory.context_store import PromptContextStore
 from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 
 
@@ -133,15 +135,105 @@ class _EnglishPacketFromGermanSourceProgram:
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
+        self.required = False
+        self.namespace = "test-namespace"
+        self.client = _FakeMidtermChonkyClient()
+        self.read_client = self.client
+        self.write_client = self.client
+        self.config = SimpleNamespace(
+            long_term_memory_migration_enabled=False,
+            long_term_memory_migration_batch_size=64,
+            long_term_memory_remote_read_timeout_s=8.0,
+            long_term_memory_remote_write_timeout_s=15.0,
+            long_term_memory_remote_flush_timeout_s=60.0,
+            long_term_memory_remote_bulk_request_max_bytes=512 * 1024,
+            long_term_memory_remote_shard_max_content_chars=1000,
+            long_term_memory_remote_max_content_chars=2_000_000,
+            long_term_memory_remote_read_cache_ttl_s=0.0,
+        )
         self.snapshots: dict[str, dict[str, object]] = {}
+        self.load_calls: list[dict[str, object]] = []
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        self.load_calls.append({"snapshot_kind": snapshot_kind, "local_path": local_path})
         del local_path
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FakeMidtermChonkyClient:
+    def __init__(self) -> None:
+        self._next_document_id = 1
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+
+    def store_records_bulk(self, request):
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+            if record is not None:
+                return dict(record)
+        if isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+            if record is not None:
+                return dict(record)
+        raise LongTermRemoteUnavailableError("remote document unavailable")
+
+    def retrieve(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        query_text = str(payload.get("query_text") or "").lower()
+        allowed = {str(value) for value in payload.get("allowed_doc_ids", ()) if str(value)}
+        ranked: list[dict[str, object]] = []
+        for document_id, record in self.records_by_document_id.items():
+            if allowed and document_id not in allowed:
+                continue
+            content = str(record.get("content") or "").lower()
+            if query_text == "__allowed_doc_ids__" and allowed:
+                pass
+            elif query_text and query_text not in content:
+                continue
+            ranked.append(
+                {
+                    "payload_id": document_id,
+                    "document_id": document_id,
+                    "relevance_score": 1.0,
+                    "metadata": dict(record.get("metadata") or {}),
+                    "payload": dict(record.get("payload") or {}),
+                    "content": record.get("content"),
+                    "source_index": "fulltext",
+                    "candidate_origin": "fulltext",
+                }
+            )
+        return SimpleNamespace(
+            success=True,
+            mode="advanced",
+            results=tuple(SimpleNamespace(**item) for item in ranked),
+            indexes_used=("fulltext",),
+            raw={"results": [dict(item) for item in ranked]},
+        )
 
 
 class LongTermMidtermTests(unittest.TestCase):
@@ -348,12 +440,115 @@ class LongTermMidtermTests(unittest.TestCase):
 
             with self.assertNoLogs("twinr.memory.longterm.storage.midterm_store", level=logging.WARNING):
                 created = store.ensure_remote_snapshot()
+                remote_head = store.load_remote_current_head()
 
         self.assertTrue(created)
-        self.assertEqual(
-            remote_state.snapshots["midterm"],
-            {"schema": "twinr_memory_midterm_store", "version": 1, "packets": []},
+        self.assertIsNotNone(remote_head)
+        assert remote_head is not None
+        self.assertEqual(remote_head["schema"], "twinr_memory_midterm_catalog_v3")
+        self.assertEqual(remote_head["items_count"], 0)
+        self.assertEqual(store.remote_current_packet_ids(), ())
+        self.assertIn("midterm", remote_state.snapshots)
+        self.assertEqual(remote_state.snapshots["midterm"]["schema"], "twinr_memory_midterm_catalog_v3")
+        self.assertTrue(
+            any(uri.endswith("/midterm/catalog/current") for uri in remote_state.client.records_by_uri),
+            remote_state.client.records_by_uri,
         )
+
+    def test_ensure_remote_snapshot_uses_compatible_current_head_when_direct_head_lags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            lagging_uris = tuple(
+                uri for uri in remote_state.client.records_by_uri if uri.endswith("/midterm/catalog/current")
+            )
+            for uri in lagging_uris:
+                remote_state.client.records_by_uri.pop(uri, None)
+
+            fresh_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "fresh" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            created = fresh_store.ensure_remote_snapshot()
+            remote_head = fresh_store.load_remote_current_head()
+
+        self.assertFalse(created)
+        self.assertIsNotNone(remote_head)
+        assert remote_head is not None
+        self.assertEqual(remote_head["schema"], "twinr_memory_midterm_catalog_v3")
+        self.assertEqual(remote_head["items_count"], 0)
+        self.assertTrue(remote_state.load_calls)
+        self.assertTrue(all(call["snapshot_kind"] == "midterm" for call in remote_state.load_calls))
+        self.assertIn("midterm", remote_state.snapshots)
+
+    def test_probe_remote_current_head_uses_compatible_current_head_when_direct_head_lags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            lagging_uris = tuple(
+                uri for uri in remote_state.client.records_by_uri if uri.endswith("/midterm/catalog/current")
+            )
+            for uri in lagging_uris:
+                remote_state.client.records_by_uri.pop(uri, None)
+
+            fresh_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "fresh" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            remote_head = fresh_store.probe_remote_current_head()
+
+        self.assertIsNotNone(remote_head)
+        assert remote_head is not None
+        self.assertEqual(remote_head["schema"], "twinr_memory_midterm_catalog_v3")
+        self.assertTrue(remote_state.load_calls)
+        self.assertTrue(all(call["snapshot_kind"] == "midterm" for call in remote_state.load_calls))
+
+    def test_load_packets_uses_catalog_entry_projection_when_midterm_item_documents_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            packet = primary_store.packet_type(
+                packet_id="midterm:corinna_today",
+                kind="recent_contact_bundle",
+                summary="Corinna Maier is a recent practical contact.",
+                details="Useful when the user asks for the Corinna number.",
+                source_memory_ids=("fact:corinna_phone_old",),
+                query_hints=("corinna", "phone", "number"),
+                sensitivity="normal",
+                attributes={"person_ref": "person:corinna_maier"},
+            )
+            primary_store.save_packets(packets=(packet,))
+            item_uri = primary_store._remote_midterm._catalog.item_uri(
+                snapshot_kind="midterm",
+                item_id="midterm:corinna_today",
+            )
+            item_record = remote_state.client.records_by_uri.pop(item_uri, None)
+            if isinstance(item_record, dict):
+                remote_state.client.records_by_document_id.pop(str(item_record.get("document_id") or ""), None)
+
+            fresh_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "fresh" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            packets = fresh_store.load_packets()
+            selected = fresh_store.select_relevant_packets("Corinna phone number", limit=2)
+
+        self.assertEqual([item.packet_id for item in packets], ["midterm:corinna_today"])
+        self.assertEqual([item.packet_id for item in selected], ["midterm:corinna_today"])
 
     def test_save_packets_writes_world_readable_midterm_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -385,28 +580,27 @@ class LongTermMidtermTests(unittest.TestCase):
 
         self.assertEqual(packets, ())
 
-    def test_load_packets_uses_remote_snapshot_without_warning_when_local_cache_is_missing(self) -> None:
+    def test_load_packets_uses_remote_current_head_without_warning_when_local_cache_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
-            remote_state.snapshots["midterm"] = {
-                "schema": "twinr_memory_midterm_store",
-                "version": 1,
-                "packets": [
-                    {
-                        "packet_id": "midterm:tea_preference",
-                        "kind": "preference_bundle",
-                        "summary": "The user prefers Oolong tea in the afternoon.",
-                        "details": "Useful for drink recommendations and recall questions.",
-                        "source_memory_ids": ["fact:drink_preference"],
-                        "query_hints": ["oolong", "tea", "afternoon"],
-                        "sensitivity": "normal",
-                    }
-                ],
-            }
             store = LongTermMidtermStore(
                 base_path=Path(temp_dir) / "state" / "chonkydb",
                 remote_state=remote_state,
             )
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:tea_preference",
+                        kind="preference_bundle",
+                        summary="The user prefers Oolong tea in the afternoon.",
+                        details="Useful for drink recommendations and recall questions.",
+                        source_memory_ids=("fact:drink_preference",),
+                        query_hints=("oolong", "tea", "afternoon"),
+                        sensitivity="normal",
+                    ),
+                )
+            )
+            store.packets_path.unlink()
 
             with self.assertNoLogs("twinr.memory.longterm.storage.midterm_store", level=logging.WARNING):
                 packets = store.load_packets()

@@ -15,6 +15,10 @@ import time
 from uuid import uuid4
 
 from twinr.agent.base_agent.contracts import AgentTextProvider
+from twinr.agent.base_agent.conversation.thread_resolution import (
+    focus_recent_thread_conversation,
+    maybe_rewrite_prompt_against_recent_thread,
+)
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.agent.base_agent.state.machine import TwinrStatus
 from twinr.agent.workflows.forensics import (
@@ -128,7 +132,15 @@ class TwinrTextChannelTurnService:
                             kind="retrieval",
                             details={"query_chars": len((message.text or "").strip())},
                         ):
-                            conversation = self.runtime.provider_conversation_context()
+                            conversation = focus_recent_thread_conversation(
+                                self.runtime.provider_text_surface_conversation_context(),
+                                user_transcript=message.text,
+                            )
+                            resolution = maybe_rewrite_prompt_against_recent_thread(
+                                self.backend,
+                                conversation=conversation,
+                                user_transcript=message.text,
+                            )
                         with workflow_span(
                             name="text_channel_backend_respond",
                             kind="llm_call",
@@ -138,7 +150,7 @@ class TwinrTextChannelTurnService:
                             },
                         ):
                             response = self.backend.respond_with_metadata(
-                                message.text,
+                                resolution.effective_prompt,
                                 conversation=conversation,
                                 allow_web_search=self.allow_web_search,
                             )

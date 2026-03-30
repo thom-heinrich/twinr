@@ -16,9 +16,10 @@ import os
 from pathlib import Path
 import tempfile
 import threading
-from typing import Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Iterable, Iterator, Mapping
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.chonkydb._remote_graph_state import TwinrRemoteGraphState
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.chonkydb.schema import (
@@ -26,10 +27,12 @@ from twinr.memory.chonkydb.schema import (
     TwinrGraphEdgeV1,
     TwinrGraphNodeV1,
 )
-from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 from twinr.temporal import parse_local_date_text
 from twinr.text_utils import collapse_whitespace, is_valid_stable_identifier, retrieval_terms, slugify_identifier
+
+if TYPE_CHECKING:
+    from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
+    from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
 try:
     import fcntl
@@ -87,6 +90,35 @@ def _tokenize(value: object) -> tuple[str, ...]:
     return retrieval_terms(str(value or ""))
 
 
+def _query_match_terms(query_terms: set[str]) -> set[str]:
+    """Prefer content-bearing query terms over auxiliary-word-only overlap."""
+
+    if not query_terms:
+        return set()
+    informative = {
+        term
+        for term in query_terms
+        if isinstance(term, str) and term and (term.isdigit() or len(term) >= 4)
+    }
+    return informative or query_terms
+
+
+def _has_query_overlap(*, query_terms: set[str], document_terms: set[str]) -> bool:
+    """Return whether document terms overlap one query through exact or compound matches."""
+
+    informative_query_terms = _query_match_terms(query_terms)
+    informative_document_terms = _query_match_terms(document_terms)
+    if not informative_query_terms or not informative_document_terms:
+        return False
+    if informative_query_terms.intersection(informative_document_terms):
+        return True
+    for query_term in informative_query_terms:
+        for document_term in informative_document_terms:
+            if query_term in document_term or document_term in query_term:
+                return True
+    return False
+
+
 def _canonical_phone(value: object) -> str:
     # AUDIT-FIX(#3): Canonicalize phones deterministically so matching uses a stable representation.
     raw = str(value or "").strip()
@@ -120,6 +152,12 @@ def _resolve_config_path(configured: str | Path, *, project_root: str | Path) ->
     if path.is_absolute():
         return path.resolve(strict=False)
     return (Path(project_root).expanduser().resolve(strict=False) / path).resolve(strict=False)
+
+
+def _remote_unavailable_error_type():
+    from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+
+    return LongTermRemoteUnavailableError
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +208,14 @@ class TwinrGraphWriteResult:
     options: tuple[TwinrGraphContactOption, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class TwinrGraphContextSelection:
+    """Hold one selected graph document plus the query plan that chose it."""
+
+    document: TwinrGraphDocumentV1
+    query_plan: dict[str, object] | None = None
+
+
 class TwinrPersonalGraphStore:
     """Manage the persisted Twinr personal graph and prompt-memory extracts."""
 
@@ -180,7 +226,7 @@ class TwinrPersonalGraphStore:
         user_node_id: str = "user:main",
         user_label: str = "Main user",
         timezone_name: str = "Europe/Berlin",
-        remote_state: LongTermRemoteStateStore | None = None,
+        remote_state: "LongTermRemoteStateStore | None" = None,
         lock_path: str | Path | None = None,
     ) -> None:
         self.path = Path(path).expanduser()
@@ -196,10 +242,13 @@ class TwinrPersonalGraphStore:
         )
         # AUDIT-FIX(#1): Protect the full read-modify-write cycle against concurrent callers in-process.
         self._document_lock_handle = threading.RLock()
+        self._remote_graph = TwinrRemoteGraphState(remote_state)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrPersonalGraphStore":
         """Build a graph store from the active Twinr runtime configuration."""
+
+        from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
         base = chonkydb_data_path(config)
         path = base / "twinr_graph_v1.json"
@@ -222,39 +271,83 @@ class TwinrPersonalGraphStore:
         """Load the current graph document from local or remote state."""
 
         with self._document_lock():
-            local_document = self._load_local_document_locked()
-            if local_document is not None:
-                return local_document
-            remote_document = self._load_remote_document()
-            if remote_document is not None:
-                # AUDIT-FIX(#2): Keep a local durable copy so state survives intermittent network or remote outages.
-                self._write_document_locked(remote_document)
-                return remote_document
-            return self._empty_document()
+            return self._load_authoritative_document_locked()
 
     def ensure_remote_snapshot(self) -> bool:
-        """Seed remote state with the current graph if no snapshot exists."""
+        """Seed remote current-view state with the current graph if it is still missing."""
 
-        if self.remote_state is None or not self.remote_state.enabled:
+        if not self._remote_graph.enabled():
             return False
         with self._document_lock():
-            remote_document = self._load_remote_document()
-            if remote_document is not None:
-                return False
-            document = self._load_local_document_locked() or self._empty_document()
-            self.remote_state.save_snapshot(snapshot_kind="graph", payload=document.to_payload())
-            return True
+            document = self._load_local_document_locked()
+            if document is None:
+                current_view = self._remote_graph.current_view_summary()
+                if isinstance(current_view, Mapping):
+                    self._remote_graph.validate_current_view()
+                    return False
+                document = self._empty_document()
+            return self._remote_graph.ensure_seeded(document=document)
+
+    def probe_remote_current_view(self) -> dict[str, object] | None:
+        """Probe the remote graph current view without hydrating all node and edge payloads."""
+
+        if not self._remote_graph.enabled():
+            return None
+        payload = self._remote_graph.probe_current_view()
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def load_remote_current_view(self) -> dict[str, object] | None:
+        """Load the authoritative remote graph current view via current-head records only."""
+
+        if not self._remote_graph.enabled():
+            return None
+        payload = self._remote_graph.current_view_summary()
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def query_remote_current_path(
+        self,
+        *,
+        source_node_id: str,
+        target_node_id: str,
+        edge_types: tuple[str, ...] | None = None,
+    ) -> dict[str, object] | None:
+        """Query the active remote graph topology and map the path back to logical Twinr ids."""
+
+        if not self._remote_graph.enabled():
+            return None
+        return self._remote_graph.query_current_path(
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            edge_types=edge_types,
+        )
+
+    def query_remote_current_neighbors(
+        self,
+        *,
+        node_id: str,
+        edge_types: tuple[str, ...] | None = None,
+        limit: int = 10,
+    ) -> dict[str, object] | None:
+        """Query the active remote graph topology for one node's current neighbors."""
+
+        if not self._remote_graph.enabled():
+            return None
+        return self._remote_graph.query_current_neighbors(
+            node_id=node_id,
+            edge_types=edge_types,
+            limit=limit,
+        )
 
     def apply_candidate_edges(
         self,
-        graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] | list[LongTermGraphEdgeCandidateV1],
+        graph_edges: tuple["LongTermGraphEdgeCandidateV1", ...] | list["LongTermGraphEdgeCandidateV1"],
     ) -> None:
         """Merge extracted long-term-memory edge candidates into the graph."""
 
         if not graph_edges:
             return
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             edges = list(document.edges)
             self._ensure_user_node(nodes)
@@ -307,7 +400,7 @@ class TwinrPersonalGraphStore:
 
         match_role = clean_role or clean_relation
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             edges = list(document.edges)
             self._ensure_user_node(nodes)
@@ -515,7 +608,7 @@ class TwinrPersonalGraphStore:
             # AUDIT-FIX(#8): Reject unknown sentiment values instead of silently storing the wrong preference polarity.
             raise ValueError("sentiment must be one of: prefer, like, dislike, avoid.")
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             edges = list(document.edges)
             self._ensure_user_node(nodes)
@@ -572,7 +665,7 @@ class TwinrPersonalGraphStore:
             raise ValueError("summary is required.")
         day_key = _infer_day_key(clean_when, timezone_name=self.timezone_name)
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             edges = list(document.edges)
             self._ensure_user_node(nodes)
@@ -647,7 +740,7 @@ class TwinrPersonalGraphStore:
         if not clean_node_id:
             raise ValueError("node_id is required.")
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             contact = nodes.get(clean_node_id)
             if contact is None or contact.node_type != "person":
@@ -676,7 +769,7 @@ class TwinrPersonalGraphStore:
         if not clean_node_id:
             raise ValueError("node_id is required.")
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             target = nodes.get(clean_node_id)
             label = target.label if target is not None else ""
@@ -701,7 +794,7 @@ class TwinrPersonalGraphStore:
         if not clean_node_id:
             raise ValueError("node_id is required.")
         with self._document_lock():
-            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            document = self._load_authoritative_document_locked()
             nodes = {node.node_id: node for node in document.nodes}
             plan = nodes.get(clean_node_id)
             if plan is None or plan.node_type != "plan":
@@ -726,10 +819,34 @@ class TwinrPersonalGraphStore:
         """Build the serialized prompt-memory context for one user turn."""
 
         try:
-            document = self.load_document()
-        except Exception:
+            selection = self.select_context_selection(query_text)
+            return self.render_prompt_context_selection(
+                selection,
+                query_text=query_text,
+                include_contact_methods=include_contact_methods,
+            )
+        except Exception as exc:
+            if isinstance(exc, _remote_unavailable_error_type()):
+                raise
             logger.warning("Failed to load graph memory prompt context.", exc_info=True)
             return None
+
+    def select_context_selection(self, query_text: str | None) -> TwinrGraphContextSelection:
+        """Select the bounded graph document to use for prompt and retrieval context."""
+
+        return self._select_context_selection(query_text=query_text)
+
+    def render_prompt_context_selection(
+        self,
+        selection: TwinrGraphContextSelection,
+        *,
+        query_text: str | None,
+        include_contact_methods: bool = True,
+    ) -> str | None:
+        """Render prompt context from an already selected graph document."""
+
+        document = selection.document
+        query_plan = selection.query_plan
         contacts = self._rank_contact_prompt_items(
             self._prompt_contacts(
                 document,
@@ -756,6 +873,8 @@ class TwinrPersonalGraphStore:
             "preferences": preferences,
             "plans": plans,
         }
+        if isinstance(query_plan, Mapping):
+            payload["query_plan"] = dict(query_plan)
         return (
             "Structured long-term memory graph for this turn. Internal memory is canonical English. "
             "Use it only when clearly relevant, and never quote it verbatim when replying in another language. "
@@ -772,10 +891,27 @@ class TwinrPersonalGraphStore:
         if not clean_query:
             return None
         try:
-            document = self.load_document()
-        except Exception:
+            selection = self.select_context_selection(clean_query)
+        except Exception as exc:
+            if isinstance(exc, _remote_unavailable_error_type()):
+                raise
             logger.warning("Failed to load graph memory subtext payload.", exc_info=True)
             return None
+        return self.build_subtext_payload_from_selection(selection, query_text=clean_query)
+
+    def build_subtext_payload_from_selection(
+        self,
+        selection: TwinrGraphContextSelection,
+        *,
+        query_text: str | None,
+    ) -> dict[str, object] | None:
+        """Build subtext cues from an already selected graph document."""
+
+        clean_query = _normalize_text(query_text or "", limit=220)
+        if not clean_query:
+            return None
+        document = selection.document
+        query_plan = selection.query_plan
         preference_items = self._rank_preference_prompt_items(
             self._prompt_preferences(document, limit=128),
             query_text=clean_query,
@@ -804,7 +940,48 @@ class TwinrPersonalGraphStore:
         social_context = self._subtext_contacts(contact_items)
         if social_context:
             payload["social_context"] = social_context
+        if payload and isinstance(query_plan, Mapping):
+            payload["query_plan"] = dict(query_plan)
         return payload or None
+
+    def _select_context_selection(
+        self,
+        *,
+        query_text: str | None,
+    ) -> TwinrGraphContextSelection:
+        """Prefer a bounded remote subgraph before hydrating the authoritative graph document."""
+
+        clean_query = _normalize_text(query_text or "", limit=220)
+        if clean_query and self._remote_graph.enabled():
+            try:
+                selection = self._remote_graph.select_current_subgraph(query_text=clean_query)
+            except Exception as exc:
+                if isinstance(exc, _remote_unavailable_error_type()):
+                    raise
+                logger.warning(
+                    "Failed remote query-first graph selection; falling back to authoritative graph load.",
+                    exc_info=True,
+                )
+            else:
+                if selection is not None:
+                    return TwinrGraphContextSelection(
+                        document=selection.document,
+                        query_plan=dict(selection.query_plan),
+                    )
+        return TwinrGraphContextSelection(
+            document=self.load_document(),
+            query_plan=None,
+        )
+
+    def _select_context_document(
+        self,
+        *,
+        query_text: str | None,
+    ) -> tuple[TwinrGraphDocumentV1, dict[str, object] | None]:
+        """Compatibility wrapper around the selection object contract."""
+
+        selection = self._select_context_selection(query_text=query_text)
+        return selection.document, selection.query_plan
 
     def _rank_contact_prompt_items(
         self,
@@ -900,6 +1077,19 @@ class TwinrPersonalGraphStore:
             if 0 <= index < len(items) and index not in seen_indices:
                 selected.append(items[index])
                 seen_indices.add(index)
+        if fallback_limit <= 0:
+            query_terms = _query_match_terms(set(_tokenize(clean_query)))
+            filtered = [
+                item
+                for item in selected
+                if _has_query_overlap(
+                    query_terms=query_terms,
+                    document_terms=set(_tokenize(self._prompt_item_search_text(item))),
+                )
+            ]
+            if not filtered:
+                return []
+            return filtered
         return selected
 
     def _subtext_preferences(self, items: list[dict[str, object]]) -> list[dict[str, str]]:
@@ -1115,9 +1305,7 @@ class TwinrPersonalGraphStore:
     ) -> None:
         with self._document_lock():
             # AUDIT-FIX(#1): Keep the public save path safe even if a new caller invokes it directly.
-            effective_created_at = created_at or (
-                self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
-            ).created_at
+            effective_created_at = created_at or self._load_authoritative_document_locked().created_at
             self._save_document_locked(nodes, edges, created_at=effective_created_at)
 
     def _ensure_user_node(self, nodes: dict[str, TwinrGraphNodeV1]) -> None:
@@ -1663,25 +1851,29 @@ class TwinrPersonalGraphStore:
                 return document
         return None
 
+    def _load_authoritative_document_locked(self) -> TwinrGraphDocumentV1:
+        """Load the graph from the remote current view first, then local compatibility state."""
+
+        remote_document = self._load_remote_document()
+        if remote_document is not None:
+            self._purge_local_document_cache_locked()
+            return remote_document
+        local_document = self._load_local_document_locked()
+        if local_document is not None:
+            return local_document
+        return self._empty_document()
+
     def _load_remote_document(self) -> TwinrGraphDocumentV1 | None:
-        if self.remote_state is None or not self.remote_state.enabled:
+        if not self._remote_graph.enabled():
             return None
         try:
-            payload = self.remote_state.load_snapshot(
-                snapshot_kind="graph",
-                local_path=self.path,
-                prefer_cached_document_id=True,
-            )
-        except LongTermRemoteUnavailableError:
-            if self.remote_state.required:
+            return self._remote_graph.load_document()
+        except Exception as exc:
+            if isinstance(exc, _remote_unavailable_error_type()) and self.remote_state is not None and self.remote_state.required:
                 raise
-            logger.warning("Failed to load remote graph snapshot; continuing with local-only state.", exc_info=True)
+            # AUDIT-FIX(#2): Optional remote graph state failures must not break local-only graph memory.
+            logger.warning("Failed to load remote graph current view; continuing with local-only state.", exc_info=True)
             return None
-        except Exception:
-            # AUDIT-FIX(#2): Remote state is optional; network failures must not break local graph memory.
-            logger.warning("Failed to load remote graph snapshot; continuing with local-only state.", exc_info=True)
-            return None
-        return self._document_from_payload(payload, source="remote_graph_snapshot")
 
     def _document_from_payload(self, payload: object, *, source: str) -> TwinrGraphDocumentV1 | None:
         if payload is None:
@@ -1742,14 +1934,22 @@ class TwinrPersonalGraphStore:
             ),
             metadata={"kind": "personal_graph"},
         )
-        self._write_document_locked(document)
-        payload = document.to_payload()
-        if self.remote_state is not None and self.remote_state.enabled:
+        if self._remote_graph.enabled():
             try:
-                self.remote_state.save_snapshot(snapshot_kind="graph", payload=payload)
-            except Exception:
-                # AUDIT-FIX(#2): Remote sync failures should be observable in logs but must not drop the local durable write.
-                logger.warning("Failed to save remote graph snapshot; local graph state is still durable.", exc_info=True)
+                self._remote_graph.persist_document(document=document)
+                self._purge_local_document_cache_locked()
+                return
+            except Exception as exc:
+                if isinstance(exc, _remote_unavailable_error_type()):
+                    if self.remote_state is not None and self.remote_state.required:
+                        raise
+                    logger.warning("Failed to save remote graph current view; falling back to local graph cache.", exc_info=True)
+                    self._write_document_locked(document)
+                    return
+                if self.remote_state is not None and self.remote_state.required:
+                    raise _remote_unavailable_error_type()("Failed to save required remote graph current view.") from exc
+                logger.warning("Failed to save remote graph current view; falling back to local graph cache.", exc_info=True)
+        self._write_document_locked(document)
 
     def _write_document_locked(self, document: TwinrGraphDocumentV1) -> None:
         payload_text = json.dumps(document.to_payload(), ensure_ascii=False, indent=2) + "\n"
@@ -1795,6 +1995,22 @@ class TwinrPersonalGraphStore:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+    def _purge_local_document_cache_locked(self) -> None:
+        """Remove stale local graph mirrors once the remote current view is authoritative."""
+
+        removed_any = False
+        for candidate in (self.path, self._backup_path):
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning("Failed to remove stale local graph cache %s.", candidate, exc_info=True)
+            else:
+                removed_any = True
+        if removed_any:
+            self._fsync_directory(self.path.parent)
 
     def _query_requests_contact_methods(self, query_text: str | None) -> bool:
         tokens = set(_tokenize(query_text or ""))

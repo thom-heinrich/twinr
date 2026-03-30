@@ -10,6 +10,7 @@ and runtime snapshot durability.
 `runtime` owns:
 - compose `TwinrRuntime` from focused mixins
 - bootstrap and shut down runtime-owned stores and services
+- honor the configured required-remote readiness contract during bootstrap, including trusting the external watchdog artifact in Pi `watchdog_artifact` mode instead of forcing a second deep remote probe
 - drive state transitions for listening, answering, printing, and failures
 - rearm follow-up listening directly from `answering` when a conversation stays open after a spoken reply
 - assemble provider-facing context, adaptive timing, voice guidance, and active guided-discovery state hints for tool-capable turns

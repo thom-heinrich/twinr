@@ -1,3 +1,13 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: Fixed quiet-state computation so room_quiet/recent_speech_age_s contribute and self-TTS / speech overlap no longer fabricate "quiet" holds.
+# BUG-2: Fixed stale/outage handling by rejecting regressing timestamps and treating stale/failed
+#        camera frames as non-authoritative instead of generic positive presence.
+# BUG-3: Fixed person-visible normalization so redundant evidence (count/box/visible_persons) is used when upstream booleans drift.
+# BUG-4: Fixed fall / slumped logic to reject low-confidence pose and motion states instead of trusting weak vision classifications.
+# SEC-1: Bounded user-facing names and per-tick object/person lists to reduce prompt-injection surface and resource-exhaustion risk on Pi-class hardware.
+# IMP-1: Added sensor-health / freshness-aware multimodal fusion gates aligned with 2025/2026 missing-modality and uncertainty-aware fusion patterns.
+# IMP-2: Added configurable freshness / confidence thresholds and cooldown overrides from TwinrConfig for frontier-grade runtime tuning.
+
 """Evaluate proactive social triggers from normalized sensor observations.
 
 This module defines the social-trigger domain model, bounded threshold config,
@@ -7,7 +17,8 @@ one candidate proactive prompt.
 
 from __future__ import annotations
 
-import math  # AUDIT-FIX(#2,#4): Finite/monotonic timestamp checks and numeric threshold sanitisation require explicit numeric validation.
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING, SupportsFloat, SupportsIndex, TypeAlias, cast
@@ -27,8 +38,41 @@ if TYPE_CHECKING:
 
 _FloatLike: TypeAlias = str | bytes | bytearray | SupportsFloat | SupportsIndex
 
+_MAX_DETECTED_OBJECTS = 16
+_MAX_VISIBLE_PERSONS = 4
+_MAX_DISPLAY_NAME_LENGTH = 48
+_MIN_ZONE_LEFT_EDGE = 1.0 / 3.0
+_MIN_ZONE_RIGHT_EDGE = 2.0 / 3.0
 
-# AUDIT-FIX(#2,#4,#5): Normalize permissive upstream sensor/config payloads before they can corrupt state, crash enum access, or break scoring math.
+_DEFAULT_COOLDOWNS: dict[str, float] = {
+    "person_returned": 30.0 * 60.0,
+    "attention_window": 10.0 * 60.0,
+    "slumped_quiet": 20.0 * 60.0,
+    "possible_fall": 60.0,
+    "floor_stillness": 60.0,
+    "showing_intent": 5.0 * 60.0,
+    "distress_possible": 15.0 * 60.0,
+    "positive_contact": 20.0 * 60.0,
+}
+
+_SOCIAL_TRIGGERS = frozenset(
+    {
+        "person_returned",
+        "attention_window",
+        "showing_intent",
+        "positive_contact",
+    }
+)
+_SAFETY_TRIGGERS = frozenset(
+    {
+        "slumped_quiet",
+        "distress_possible",
+        "possible_fall",
+        "floor_stillness",
+    }
+)
+
+
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
     """Coerce one value to a boolean with fallback."""
 
@@ -114,14 +158,18 @@ def _coerce_recent_age(value: object) -> float | None:
 
 
 def _coerce_optional_text(value: object, *, limit: int) -> str | None:
-    """Coerce one optional text field into bounded ASCII-safe text."""
+    """Coerce one optional text field into bounded printable text."""
 
     if value is None:
         return None
-    text = " ".join(str(value).split()).strip()
+    text = " ".join(str(value).split())
     if not text:
         return None
-    return text[:limit]
+    printable = "".join(character for character in text if character.isprintable())
+    printable = printable.strip()
+    if not printable:
+        return None
+    return printable[:limit]
 
 
 def _coerce_optional_azimuth(value: object) -> int | None:
@@ -150,6 +198,15 @@ def _normalize_unit_interval(value: object, *, default: float) -> float:
     if number > 1.0:
         return 1.0
     return number
+
+
+def _coerce_display_name(value: object) -> str | None:
+    """Coerce one display name into a short one-line printable value."""
+
+    text = _coerce_optional_text(value, limit=_MAX_DISPLAY_NAME_LENGTH)
+    if text is None:
+        return None
+    return text.strip(" ,.;:-") or None
 
 
 class SocialBodyPose(StrEnum):
@@ -289,7 +346,11 @@ class SocialVisiblePerson:
         """Normalize person-anchor metadata into bounded values."""
 
         object.__setattr__(self, "box", _coerce_spatial_box(self.box))
-        object.__setattr__(self, "zone", _coerce_person_zone(self.zone))
+        zone = _coerce_person_zone(self.zone)
+        box = cast(SocialSpatialBox | None, getattr(self, "box"))
+        if zone == SocialPersonZone.UNKNOWN and box is not None:
+            zone = _zone_from_center_x(box.center_x)
+        object.__setattr__(self, "zone", zone)
         object.__setattr__(self, "confidence", _normalize_unit_interval(self.confidence, default=0.0))
 
 
@@ -343,6 +404,18 @@ def _coerce_person_zone(value: object) -> SocialPersonZone:
     )
 
 
+def _zone_from_center_x(center_x: float | None) -> SocialPersonZone:
+    """Derive one coarse horizontal zone from a normalized horizontal center."""
+
+    if center_x is None:
+        return SocialPersonZone.UNKNOWN
+    if center_x < _MIN_ZONE_LEFT_EDGE:
+        return SocialPersonZone.LEFT
+    if center_x > _MIN_ZONE_RIGHT_EDGE:
+        return SocialPersonZone.RIGHT
+    return SocialPersonZone.CENTER
+
+
 def _coerce_non_negative_int(value: object, *, default: int) -> int:
     """Coerce one value to a non-negative integer with fallback."""
 
@@ -352,12 +425,7 @@ def _coerce_non_negative_int(value: object, *, default: int) -> int:
 def _coerce_bounded_text(value: object, *, max_length: int = 160) -> str | None:
     """Coerce one value to bounded operator-safe text."""
 
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return text[:max_length]
+    return _coerce_optional_text(value, limit=max_length)
 
 
 def _coerce_spatial_box(value: object) -> SocialSpatialBox | None:
@@ -396,17 +464,21 @@ def _coerce_detected_object(value: object) -> SocialDetectedObject | None:
     return None
 
 
-def _coerce_detected_objects(value: object) -> tuple[SocialDetectedObject, ...]:
+def _coerce_detected_objects(
+    value: object,
+    *,
+    limit: int = _MAX_DETECTED_OBJECTS,
+) -> tuple[SocialDetectedObject, ...]:
     """Coerce one iterable payload to a tuple of detected objects."""
 
     if value is None:
         return ()
     if isinstance(value, tuple) and all(isinstance(item, SocialDetectedObject) for item in value):
-        return value
+        return value[:limit]
     if not isinstance(value, (tuple, list)):
         return ()
     items: list[SocialDetectedObject] = []
-    for item in value:
+    for item in value[:limit]:
         detected = _coerce_detected_object(item)
         if detected is not None:
             items.append(detected)
@@ -427,17 +499,21 @@ def _coerce_visible_person(value: object) -> SocialVisiblePerson | None:
     return None
 
 
-def _coerce_visible_persons(value: object) -> tuple[SocialVisiblePerson, ...]:
+def _coerce_visible_persons(
+    value: object,
+    *,
+    limit: int = _MAX_VISIBLE_PERSONS,
+) -> tuple[SocialVisiblePerson, ...]:
     """Coerce one iterable payload to a tuple of visible-person anchors."""
 
     if value is None:
         return ()
     if isinstance(value, tuple) and all(isinstance(item, SocialVisiblePerson) for item in value):
-        return value
+        return value[:limit]
     if not isinstance(value, (tuple, list)):
         return ()
     items: list[SocialVisiblePerson] = []
-    for item in value:
+    for item in value[:limit]:
         person = _coerce_visible_person(item)
         if person is not None:
             items.append(person)
@@ -541,7 +617,7 @@ class SocialObservation:
     """Combine normalized sensor observations for one trigger-engine tick."""
 
     observed_at: float
-    inspected: bool = False  # AUDIT-FIX(#1): Absent vision data must default to "unknown", not to an authoritative "no person visible".
+    inspected: bool = False
     pir_motion_detected: bool = False
     low_motion: bool = False
     vision: SocialVisionObservation = field(default_factory=SocialVisionObservation)
@@ -580,7 +656,7 @@ class SocialTriggerEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class SocialTriggerThresholds:
-    """Store hold windows and score thresholds for social triggers."""
+    """Store hold windows, freshness gates, and score thresholds for social triggers."""
 
     person_returned_absence_s: float = 20.0 * 60.0
     person_returned_recent_motion_s: float = 30.0
@@ -595,6 +671,11 @@ class SocialTriggerThresholds:
     positive_contact_hold_s: float = 1.5
     distress_hold_s: float = 3.0
     fall_transition_window_s: float = 8.0
+    quiet_after_speech_age_s: float = 2.5
+    vision_stale_after_s: float = 2.0
+    min_pose_confidence: float = 0.45
+    min_motion_confidence: float = 0.35
+    min_visual_attention_score: float = 0.45
     person_returned_score_threshold: float = 0.9
     attention_window_score_threshold: float = 0.86
     slumped_quiet_score_threshold: float = 0.9
@@ -607,7 +688,6 @@ class SocialTriggerThresholds:
     def __post_init__(self) -> None:
         """Normalize duration and score thresholds after construction."""
 
-        # AUDIT-FIX(#4): Reject non-finite/zero/negative timing inputs and clamp score thresholds to a valid unit interval before any scoring math runs.
         duration_defaults = {
             "person_returned_absence_s": 20.0 * 60.0,
             "person_returned_recent_motion_s": 30.0,
@@ -622,8 +702,13 @@ class SocialTriggerThresholds:
             "positive_contact_hold_s": 1.5,
             "distress_hold_s": 3.0,
             "fall_transition_window_s": 8.0,
+            "quiet_after_speech_age_s": 2.5,
+            "vision_stale_after_s": 2.0,
         }
-        score_defaults = {
+        ratio_defaults = {
+            "min_pose_confidence": 0.45,
+            "min_motion_confidence": 0.35,
+            "min_visual_attention_score": 0.45,
             "person_returned_score_threshold": 0.9,
             "attention_window_score_threshold": 0.86,
             "slumped_quiet_score_threshold": 0.9,
@@ -635,7 +720,7 @@ class SocialTriggerThresholds:
         }
         for name, default in duration_defaults.items():
             object.__setattr__(self, name, _normalize_positive_float(getattr(self, name), default=default))
-        for name, default in score_defaults.items():
+        for name, default in ratio_defaults.items():
             object.__setattr__(self, name, _normalize_unit_interval(getattr(self, name), default=default))
 
     @classmethod
@@ -643,13 +728,20 @@ class SocialTriggerThresholds:
         """Build thresholds from ``TwinrConfig`` with safe defaults."""
 
         defaults = cls()
-        # AUDIT-FIX(#3,#4): Fall back to baked-in defaults when older TwinrConfig objects or partial .env payloads lack new fields or provide malformed values.
         return cls(
             person_returned_absence_s=getattr(config, "proactive_person_returned_absence_s", defaults.person_returned_absence_s),
-            person_returned_recent_motion_s=getattr(config, "proactive_person_returned_recent_motion_s", defaults.person_returned_recent_motion_s),
+            person_returned_recent_motion_s=getattr(
+                config,
+                "proactive_person_returned_recent_motion_s",
+                defaults.person_returned_recent_motion_s,
+            ),
             attention_window_s=getattr(config, "proactive_attention_window_s", defaults.attention_window_s),
             slumped_quiet_s=getattr(config, "proactive_slumped_quiet_s", defaults.slumped_quiet_s),
-            possible_fall_stillness_s=getattr(config, "proactive_possible_fall_stillness_s", defaults.possible_fall_stillness_s),
+            possible_fall_stillness_s=getattr(
+                config,
+                "proactive_possible_fall_stillness_s",
+                defaults.possible_fall_stillness_s,
+            ),
             possible_fall_visibility_loss_hold_s=getattr(
                 config,
                 "proactive_possible_fall_visibility_loss_hold_s",
@@ -669,7 +761,36 @@ class SocialTriggerThresholds:
             showing_intent_hold_s=getattr(config, "proactive_showing_intent_hold_s", defaults.showing_intent_hold_s),
             positive_contact_hold_s=getattr(config, "proactive_positive_contact_hold_s", defaults.positive_contact_hold_s),
             distress_hold_s=getattr(config, "proactive_distress_hold_s", defaults.distress_hold_s),
-            fall_transition_window_s=getattr(config, "proactive_fall_transition_window_s", defaults.fall_transition_window_s),
+            fall_transition_window_s=getattr(
+                config,
+                "proactive_fall_transition_window_s",
+                defaults.fall_transition_window_s,
+            ),
+            quiet_after_speech_age_s=getattr(
+                config,
+                "proactive_quiet_after_speech_age_s",
+                defaults.quiet_after_speech_age_s,
+            ),
+            vision_stale_after_s=getattr(
+                config,
+                "proactive_vision_stale_after_s",
+                defaults.vision_stale_after_s,
+            ),
+            min_pose_confidence=getattr(
+                config,
+                "proactive_min_pose_confidence",
+                defaults.min_pose_confidence,
+            ),
+            min_motion_confidence=getattr(
+                config,
+                "proactive_min_motion_confidence",
+                defaults.min_motion_confidence,
+            ),
+            min_visual_attention_score=getattr(
+                config,
+                "proactive_min_visual_attention_score",
+                defaults.min_visual_attention_score,
+            ),
             person_returned_score_threshold=getattr(
                 config,
                 "proactive_person_returned_score_threshold",
@@ -726,22 +847,13 @@ class SocialTriggerEngine:
         *,
         user_name: str | None = None,
         thresholds: SocialTriggerThresholds | None = None,
+        cooldowns: Mapping[str, object] | None = None,
     ) -> None:
         """Initialize one stateful trigger engine."""
 
-        # AUDIT-FIX(#5): Normalise potentially non-string display names coming from config instead of assuming .strip() exists.
-        self.user_name = None if user_name is None else (str(user_name).strip() or None)
+        self.user_name = _coerce_display_name(user_name)
         self.thresholds = thresholds or SocialTriggerThresholds()
-        self._cooldowns: dict[str, float] = {
-            "person_returned": 30.0 * 60.0,
-            "attention_window": 10.0 * 60.0,
-            "slumped_quiet": 20.0 * 60.0,
-            "possible_fall": 60.0,
-            "floor_stillness": 60.0,
-            "showing_intent": 5.0 * 60.0,
-            "distress_possible": 15.0 * 60.0,
-            "positive_contact": 20.0 * 60.0,
-        }
+        self._cooldowns = self._build_cooldowns(cooldowns)
         self._last_triggered_at: dict[str, float] = {}
         self._last_pir_motion_at: float | None = None
         self._absence_started_at: float | None = None
@@ -764,15 +876,23 @@ class SocialTriggerEngine:
         self._smile_since: float | None = None
         self._distress_since: float | None = None
         self._last_evaluations: tuple[SocialTriggerEvaluation, ...] = ()
-        self._last_observed_at: float | None = None  # AUDIT-FIX(#2): Guard against backwards/non-finite clocks corrupting duration state.
+        self._last_observed_at: float | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SocialTriggerEngine":
         """Build one trigger engine from the canonical Twinr config."""
 
         return cls(
-            user_name=getattr(config, "user_display_name", None),  # AUDIT-FIX(#3,#5): Preserve startup compatibility with older config objects.
+            user_name=getattr(config, "user_display_name", None),
             thresholds=SocialTriggerThresholds.from_config(config),
+            cooldowns={
+                trigger_id: getattr(
+                    config,
+                    f"proactive_{trigger_id}_cooldown_s",
+                    default,
+                )
+                for trigger_id, default in _DEFAULT_COOLDOWNS.items()
+            },
         )
 
     @property
@@ -791,11 +911,11 @@ class SocialTriggerEngine:
         if passed_candidates:
             return max(
                 passed_candidates,
-                key=lambda item: (int(item.priority), item.score),  # AUDIT-FIX(#7): Keep diagnostics aligned with actual trigger selection order.
+                key=lambda item: (int(item.priority), item.score),
             )
         return max(
             self._last_evaluations,
-            key=lambda item: (item.score, int(item.priority)),  # AUDIT-FIX(#9): Surface the strongest near miss when no trigger passed.
+            key=lambda item: (item.score, int(item.priority)),
         )
 
     def observe(self, observation: SocialObservation) -> SocialTriggerDecision | None:
@@ -809,26 +929,36 @@ class SocialTriggerEngine:
             candidate passes validation, scoring, and cooldown checks.
         """
 
-        # AUDIT-FIX(#2,#5): Reject malformed or stale observations before mutating internal state; this prevents crashes and time-warped cooldown logic.
         if not isinstance(observation, SocialObservation):
             self._last_evaluations = ()
             return None
+
         now = _coerce_timestamp(observation.observed_at)
         if now is None:
             self._last_evaluations = ()
             return None
+
         if self._last_observed_at is not None and now < self._last_observed_at:
             self._last_evaluations = ()
             return None
-        self._last_observed_at = now
 
         inspected = _coerce_bool(observation.inspected)
         pir_motion_detected = _coerce_bool(observation.pir_motion_detected)
-        low_motion = _coerce_bool(observation.low_motion)
         raw_vision = observation.vision
-        vision = self._normalize_vision(observation.vision, inspected=inspected)
+        vision = self._normalize_vision(observation.vision, inspected=inspected, now=now)
         audio = self._normalize_audio(observation.audio)
+
+        low_motion = (
+            _coerce_bool(observation.low_motion)
+            or (
+                inspected
+                and vision.person_visible
+                and vision.motion_state == SocialMotionState.STILL
+            )
+        )
+
         sensor_absence_signal = self._should_treat_as_sensor_absence_signal(
+            now=now,
             inspected=inspected,
             pir_motion_detected=pir_motion_detected,
             vision=raw_vision,
@@ -853,59 +983,62 @@ class SocialTriggerEngine:
             person_visible=vision.person_visible,
             body_pose=vision.body_pose,
         )
-        self._quiet_since = self._next_since(audio.speech_detected is False, self._quiet_since, now)
-        self._looking_since = self._next_since(
-            inspected and vision.person_visible and vision.looking_toward_device,
-            self._looking_since,
-            now,
-        )
-        self._slumped_since = self._next_since(
-            inspected and vision.person_visible and vision.body_pose == SocialBodyPose.SLUMPED,
-            self._slumped_since,
-            now,
-        )
-        self._floor_since = self._next_since(
-            inspected and vision.person_visible and _is_floor_like_pose(vision.body_pose),
-            self._floor_since,
-            now,
-        )
-        self._low_motion_since = self._next_since(low_motion, self._low_motion_since, now)
-        self._showing_since = self._next_since(
+
+        quiet_active = self._quiet_signal_active(audio)
+        looking_active = inspected and vision.person_visible and vision.looking_toward_device
+        slumped_active = inspected and vision.person_visible and vision.body_pose == SocialBodyPose.SLUMPED
+        floor_active = inspected and vision.person_visible and _is_floor_like_pose(vision.body_pose)
+        showing_active = (
             inspected
             and vision.person_visible
             and (
                 vision.showing_intent_likely is True
                 or (vision.looking_toward_device and vision.hand_or_object_near_camera)
-            ),
-            self._showing_since,
-            now,
+            )
         )
-        self._smile_since = self._next_since(
-            inspected and vision.person_visible and vision.looking_toward_device and vision.smiling,
-            self._smile_since,
-            now,
+        smiling_active = (
+            inspected
+            and vision.person_visible
+            and vision.looking_toward_device
+            and vision.smiling
         )
-        self._distress_since = self._next_since(audio.distress_detected is True, self._distress_since, now)
+        distress_active = (
+            audio.distress_detected is True
+            and audio.background_media_likely is not True
+            and audio.non_speech_audio_likely is not True
+        )
+
+        self._quiet_since = self._next_since(quiet_active, self._quiet_since, now)
+        self._looking_since = self._next_since(looking_active, self._looking_since, now)
+        self._slumped_since = self._next_since(slumped_active, self._slumped_since, now)
+        self._floor_since = self._next_since(floor_active, self._floor_since, now)
+        self._low_motion_since = self._next_since(low_motion, self._low_motion_since, now)
+        self._showing_since = self._next_since(showing_active, self._showing_since, now)
+        self._smile_since = self._next_since(smiling_active, self._smile_since, now)
+        self._distress_since = self._next_since(distress_active, self._distress_since, now)
 
         evaluations = (
-            self._candidate_floor_stillness(now),
-            self._candidate_possible_fall(now),
-            self._candidate_distress_possible(now, vision),
-            self._candidate_slumped_quiet(now),
-            self._candidate_attention_window(now),
-            self._candidate_showing_intent(now, vision),
-            self._candidate_positive_contact(now, vision),
+            self._candidate_floor_stillness(now, vision),
+            self._candidate_possible_fall(now, vision),
+            self._candidate_distress_possible(now, vision, audio),
+            self._candidate_slumped_quiet(now, vision),
+            self._candidate_attention_window(now, vision, audio),
+            self._candidate_showing_intent(now, vision, audio),
+            self._candidate_positive_contact(now, vision, audio),
             self._candidate_person_returned(
                 now,
                 absence_duration=absence_duration,
                 person_visible=vision.person_visible,
+                audio=audio,
             ),
         )
         self._last_evaluations = evaluations
+        self._last_observed_at = now
 
         ready = [candidate for candidate in evaluations if candidate.passed]
         if not ready:
             return None
+
         selected = max(
             ready,
             key=lambda item: (int(item.priority), item.score),
@@ -923,14 +1056,7 @@ class SocialTriggerEngine:
         )
 
     def note_trigger_dispatched(self, trigger_id: str, *, observed_at: float) -> None:
-        """Record that one trigger was dispatched outside normal selection flow.
-
-        Runtime-side fusion can legitimately choose a fused safety trigger
-        instead of the engine's own decision while still depending on the
-        engine for cooldowns and fall-transition state. This hook keeps those
-        internal guards aligned without forcing runtime code to mutate private
-        engine state directly.
-        """
+        """Record that one trigger was dispatched outside normal selection flow."""
 
         trigger_key = _coerce_bounded_text(trigger_id, max_length=64)
         observed_at_value = _coerce_timestamp(observed_at)
@@ -949,6 +1075,7 @@ class SocialTriggerEngine:
         *,
         absence_duration: float | None,
         person_visible: bool,
+        audio: SocialAudioObservation,
     ) -> SocialTriggerEvaluation:
         """Score whether a person recently returned after tracked absence."""
 
@@ -966,30 +1093,38 @@ class SocialTriggerEngine:
             TriggerScoreEvidence(
                 key="recent_pir_motion",
                 value=recent_progress(now, self._last_pir_motion_at, self.thresholds.person_returned_recent_motion_s),
-                weight=0.4,
-                detail=(
-                    f"last_motion_age={self._seconds(None if self._last_pir_motion_at is None else now - self._last_pir_motion_at)}"
-                ),
+                weight=0.35,
+                detail=f"last_motion_age={self._seconds(None if self._last_pir_motion_at is None else now - self._last_pir_motion_at)}",
             ),
             TriggerScoreEvidence(
                 key="person_visible",
                 value=bool_score(person_visible),
-                weight=0.2,
+                weight=0.15,
                 detail=f"person_visible={person_visible}",
             ),
+            TriggerScoreEvidence(
+                key="social_channel_clear",
+                value=bool_score(self._social_prompt_channel_available(audio)),
+                weight=0.1,
+                detail=self._social_channel_detail(audio),
+            ),
         )
+
         blocked_reason = None
         if absence_duration is None:
             blocked_reason = "no_completed_absence_window"
         elif self._cooldown_active("person_returned", now):
             blocked_reason = "cooldown_active"
+        else:
+            blocked_reason = self._social_trigger_block_reason("person_returned", audio)
+
         return self._evaluate_candidate(
             trigger_id="person_returned",
             observed_at=now,
             priority=SocialTriggerPriority.PERSON_RETURNED,
             threshold=self.thresholds.person_returned_score_threshold,
             reason=(
-                f"Person visible again after {int(absence_duration)} seconds without presence."
+                f"Person visible again after {int(absence_duration)} seconds without tracked presence."
                 if absence_duration is not None
                 else "Person has not yet completed a tracked absence window."
             ),
@@ -1001,20 +1136,25 @@ class SocialTriggerEngine:
             blocked_reason=blocked_reason,
         )
 
-    def _candidate_attention_window(self, now: float) -> SocialTriggerEvaluation:
+    def _candidate_attention_window(
+        self,
+        now: float,
+        vision: SocialVisionObservation,
+        audio: SocialAudioObservation,
+    ) -> SocialTriggerEvaluation:
         """Score whether the device has a short quiet attention window."""
 
         evidence = (
             TriggerScoreEvidence(
                 key="looking_hold",
                 value=hold_progress(now, self._looking_since, self.thresholds.attention_window_s),
-                weight=0.45,
+                weight=0.36,
                 detail=self._hold_detail(self._looking_since, now, self.thresholds.attention_window_s),
             ),
             TriggerScoreEvidence(
                 key="quiet_hold",
                 value=hold_progress(now, self._quiet_since, self.thresholds.attention_window_s),
-                weight=0.45,
+                weight=0.36,
                 detail=self._hold_detail(self._quiet_since, now, self.thresholds.attention_window_s),
             ),
             TriggerScoreEvidence(
@@ -1023,8 +1163,20 @@ class SocialTriggerEngine:
                 weight=0.1,
                 detail="looking and quiet overlap",
             ),
+            TriggerScoreEvidence(
+                key="visual_attention_confidence",
+                value=self._attention_signal_score(vision),
+                weight=0.18,
+                detail=f"visual_attention={self._ratio_or_na(vision.visual_attention_score)} looking={vision.looking_toward_device}",
+            ),
         )
-        blocked_reason = "cooldown_active" if self._cooldown_active("attention_window", now) else None
+
+        blocked_reason = None
+        if self._cooldown_active("attention_window", now):
+            blocked_reason = "cooldown_active"
+        else:
+            blocked_reason = self._social_trigger_block_reason("attention_window", audio)
+
         return self._evaluate_candidate(
             trigger_id="attention_window",
             observed_at=now,
@@ -1036,26 +1188,30 @@ class SocialTriggerEngine:
             blocked_reason=blocked_reason,
         )
 
-    def _candidate_slumped_quiet(self, now: float) -> SocialTriggerEvaluation:
+    def _candidate_slumped_quiet(
+        self,
+        now: float,
+        vision: SocialVisionObservation,
+    ) -> SocialTriggerEvaluation:
         """Score whether a visible person remains slumped, quiet, and still."""
 
         evidence = (
             TriggerScoreEvidence(
                 key="slumped_hold",
                 value=hold_progress(now, self._slumped_since, self.thresholds.slumped_quiet_s),
-                weight=0.35,
+                weight=0.32,
                 detail=self._hold_detail(self._slumped_since, now, self.thresholds.slumped_quiet_s),
             ),
             TriggerScoreEvidence(
                 key="quiet_hold",
                 value=hold_progress(now, self._quiet_since, self.thresholds.slumped_quiet_s),
-                weight=0.3,
+                weight=0.28,
                 detail=self._hold_detail(self._quiet_since, now, self.thresholds.slumped_quiet_s),
             ),
             TriggerScoreEvidence(
                 key="low_motion_hold",
                 value=hold_progress(now, self._low_motion_since, self.thresholds.slumped_quiet_s),
-                weight=0.25,
+                weight=0.22,
                 detail=self._hold_detail(self._low_motion_since, now, self.thresholds.slumped_quiet_s),
             ),
             TriggerScoreEvidence(
@@ -1068,10 +1224,17 @@ class SocialTriggerEngine:
                     )
                     is not None
                 ),
-                weight=0.1,
+                weight=0.08,
                 detail="slumped, quiet, and low-motion overlap",
             ),
+            TriggerScoreEvidence(
+                key="pose_confidence",
+                value=self._pose_reliability_score(vision, expected=SocialBodyPose.SLUMPED),
+                weight=0.10,
+                detail=f"pose={vision.body_pose.value} pose_confidence={self._ratio_or_na(vision.pose_confidence)}",
+            ),
         )
+
         blocked_reason = "cooldown_active" if self._cooldown_active("slumped_quiet", now) else None
         return self._evaluate_candidate(
             trigger_id="slumped_quiet",
@@ -1087,7 +1250,11 @@ class SocialTriggerEngine:
             blocked_reason=blocked_reason,
         )
 
-    def _candidate_possible_fall(self, now: float) -> SocialTriggerEvaluation:
+    def _candidate_possible_fall(
+        self,
+        now: float,
+        vision: SocialVisionObservation,
+    ) -> SocialTriggerEvaluation:
         """Score whether recent state suggests a possible fall."""
 
         low_motion_since = self._possible_fall_post_transition_since(now, self._low_motion_since)
@@ -1096,33 +1263,41 @@ class SocialTriggerEngine:
             TriggerScoreEvidence(
                 key="fall_transition_signal",
                 value=self._possible_fall_transition_signal(),
-                weight=0.41,
+                weight=0.34,
                 detail=self._possible_fall_transition_detail(now),
             ),
             TriggerScoreEvidence(
                 key="low_or_missing_hold",
                 value=self._possible_fall_low_or_missing_hold(now),
-                weight=0.28,
+                weight=0.22,
                 detail=self._possible_fall_low_or_missing_detail(now),
             ),
             TriggerScoreEvidence(
                 key="low_motion_hold",
                 value=hold_progress(now, low_motion_since, self.thresholds.possible_fall_stillness_s),
-                weight=0.28,
+                weight=0.18,
                 detail=self._hold_detail(low_motion_since, now, self.thresholds.possible_fall_stillness_s),
             ),
             TriggerScoreEvidence(
                 key="quiet_hold",
                 value=hold_progress(now, quiet_since, self.thresholds.possible_fall_stillness_s),
-                weight=0.15,
+                weight=0.12,
                 detail=self._hold_detail(quiet_since, now, self.thresholds.possible_fall_stillness_s),
             ),
+            TriggerScoreEvidence(
+                key="sensor_reliability",
+                value=self._safety_reliability_score(vision),
+                weight=0.14,
+                detail=self._safety_reliability_detail(vision),
+            ),
         )
+
         blocked_reason = None
         if self._cooldown_active("possible_fall", now):
             blocked_reason = "cooldown_active"
         elif self._possible_fall_loss_candidate_at is not None and not self._possible_fall_visibility_loss_hold_complete(now):
             blocked_reason = "visibility_loss_hold_incomplete"
+
         return self._evaluate_candidate(
             trigger_id="possible_fall",
             observed_at=now,
@@ -1134,26 +1309,30 @@ class SocialTriggerEngine:
             blocked_reason=blocked_reason,
         )
 
-    def _candidate_floor_stillness(self, now: float) -> SocialTriggerEvaluation:
+    def _candidate_floor_stillness(
+        self,
+        now: float,
+        vision: SocialVisionObservation,
+    ) -> SocialTriggerEvaluation:
         """Score whether a person remains low to the floor and still."""
 
         evidence = (
             TriggerScoreEvidence(
                 key="floor_hold",
                 value=hold_progress(now, self._floor_since, self.thresholds.floor_stillness_s),
-                weight=0.38,
+                weight=0.34,
                 detail=self._hold_detail(self._floor_since, now, self.thresholds.floor_stillness_s),
             ),
             TriggerScoreEvidence(
                 key="quiet_hold",
                 value=hold_progress(now, self._quiet_since, self.thresholds.floor_stillness_s),
-                weight=0.32,
+                weight=0.28,
                 detail=self._hold_detail(self._quiet_since, now, self.thresholds.floor_stillness_s),
             ),
             TriggerScoreEvidence(
                 key="low_motion_hold",
                 value=hold_progress(now, self._low_motion_since, self.thresholds.floor_stillness_s),
-                weight=0.2,
+                weight=0.18,
                 detail=self._hold_detail(self._low_motion_since, now, self.thresholds.floor_stillness_s),
             ),
             TriggerScoreEvidence(
@@ -1166,10 +1345,17 @@ class SocialTriggerEngine:
                     )
                     is not None
                 ),
-                weight=0.1,
+                weight=0.08,
                 detail="floor, quiet, and low-motion overlap",
             ),
+            TriggerScoreEvidence(
+                key="pose_confidence",
+                value=self._pose_reliability_score(vision, expected_floor_like=True),
+                weight=0.12,
+                detail=f"pose={vision.body_pose.value} pose_confidence={self._ratio_or_na(vision.pose_confidence)}",
+            ),
         )
+
         blocked_reason = "cooldown_active" if self._cooldown_active("floor_stillness", now) else None
         return self._evaluate_candidate(
             trigger_id="floor_stillness",
@@ -1189,6 +1375,7 @@ class SocialTriggerEngine:
         self,
         now: float,
         vision: SocialVisionObservation,
+        audio: SocialAudioObservation,
     ) -> SocialTriggerEvaluation:
         """Score whether the person seems to be showing something to the device."""
 
@@ -1196,23 +1383,41 @@ class SocialTriggerEngine:
             TriggerScoreEvidence(
                 key="showing_hold",
                 value=hold_progress(now, self._showing_since, self.thresholds.showing_intent_hold_s),
-                weight=0.55,
+                weight=0.46,
                 detail=self._hold_detail(self._showing_since, now, self.thresholds.showing_intent_hold_s),
             ),
             TriggerScoreEvidence(
                 key="hand_or_object_near_camera",
                 value=bool_score(vision.hand_or_object_near_camera),
-                weight=0.25,
+                weight=0.2,
                 detail=f"hand_or_object_near_camera={vision.hand_or_object_near_camera}",
             ),
             TriggerScoreEvidence(
                 key="looking_toward_device",
                 value=bool_score(vision.looking_toward_device),
-                weight=0.2,
+                weight=0.14,
                 detail=f"looking_toward_device={vision.looking_toward_device}",
             ),
+            TriggerScoreEvidence(
+                key="visual_attention_confidence",
+                value=self._attention_signal_score(vision),
+                weight=0.1,
+                detail=f"visual_attention={self._ratio_or_na(vision.visual_attention_score)}",
+            ),
+            TriggerScoreEvidence(
+                key="social_channel_clear",
+                value=bool_score(self._social_prompt_channel_available(audio)),
+                weight=0.1,
+                detail=self._social_channel_detail(audio),
+            ),
         )
-        blocked_reason = "cooldown_active" if self._cooldown_active("showing_intent", now) else None
+
+        blocked_reason = None
+        if self._cooldown_active("showing_intent", now):
+            blocked_reason = "cooldown_active"
+        else:
+            blocked_reason = self._social_trigger_block_reason("showing_intent", audio)
+
         return self._evaluate_candidate(
             trigger_id="showing_intent",
             observed_at=now,
@@ -1228,6 +1433,7 @@ class SocialTriggerEngine:
         self,
         now: float,
         vision: SocialVisionObservation,
+        audio: SocialAudioObservation,
     ) -> SocialTriggerEvaluation:
         """Score whether distress-like audio aligns with concerning posture."""
 
@@ -1235,16 +1441,36 @@ class SocialTriggerEngine:
             TriggerScoreEvidence(
                 key="distress_hold",
                 value=hold_progress(now, self._distress_since, self.thresholds.distress_hold_s),
-                weight=0.65,
+                weight=0.54,
                 detail=self._hold_detail(self._distress_since, now, self.thresholds.distress_hold_s),
             ),
             TriggerScoreEvidence(
                 key="visible_or_slumped_person",
                 value=bool_score(vision.person_visible or vision.body_pose == SocialBodyPose.SLUMPED),
-                weight=0.35,
+                weight=0.22,
                 detail=f"person_visible={vision.person_visible} body_pose={vision.body_pose.value}",
             ),
+            TriggerScoreEvidence(
+                key="audio_channel_clean",
+                value=bool_score(
+                    audio.background_media_likely is not True
+                    and audio.non_speech_audio_likely is not True
+                    and audio.speech_overlap_likely is not True
+                ),
+                weight=0.14,
+                detail=(
+                    f"media={audio.background_media_likely} non_speech={audio.non_speech_audio_likely} "
+                    f"overlap={audio.speech_overlap_likely}"
+                ),
+            ),
+            TriggerScoreEvidence(
+                key="safety_reliability",
+                value=self._safety_reliability_score(vision),
+                weight=0.10,
+                detail=self._safety_reliability_detail(vision),
+            ),
         )
+
         blocked_reason = "cooldown_active" if self._cooldown_active("distress_possible", now) else None
         return self._evaluate_candidate(
             trigger_id="distress_possible",
@@ -1264,6 +1490,7 @@ class SocialTriggerEngine:
         self,
         now: float,
         vision: SocialVisionObservation,
+        audio: SocialAudioObservation,
     ) -> SocialTriggerEvaluation:
         """Score whether the person is positively engaged with the device."""
 
@@ -1271,29 +1498,47 @@ class SocialTriggerEngine:
             TriggerScoreEvidence(
                 key="smile_hold",
                 value=hold_progress(now, self._smile_since, self.thresholds.positive_contact_hold_s),
-                weight=0.55,
+                weight=0.44,
                 detail=self._hold_detail(self._smile_since, now, self.thresholds.positive_contact_hold_s),
             ),
             TriggerScoreEvidence(
                 key="person_visible",
                 value=bool_score(vision.person_visible),
-                weight=0.15,
+                weight=0.12,
                 detail=f"person_visible={vision.person_visible}",
             ),
             TriggerScoreEvidence(
                 key="looking_toward_device",
                 value=bool_score(vision.looking_toward_device),
-                weight=0.15,
+                weight=0.12,
                 detail=f"looking_toward_device={vision.looking_toward_device}",
             ),
             TriggerScoreEvidence(
                 key="smiling_now",
                 value=bool_score(vision.smiling),
-                weight=0.15,
+                weight=0.12,
                 detail=f"smiling={vision.smiling}",
             ),
+            TriggerScoreEvidence(
+                key="visual_attention_confidence",
+                value=self._attention_signal_score(vision),
+                weight=0.10,
+                detail=f"visual_attention={self._ratio_or_na(vision.visual_attention_score)}",
+            ),
+            TriggerScoreEvidence(
+                key="social_channel_clear",
+                value=bool_score(self._social_prompt_channel_available(audio)),
+                weight=0.10,
+                detail=self._social_channel_detail(audio),
+            ),
         )
-        blocked_reason = "cooldown_active" if self._cooldown_active("positive_contact", now) else None
+
+        blocked_reason = None
+        if self._cooldown_active("positive_contact", now):
+            blocked_reason = "cooldown_active"
+        else:
+            blocked_reason = self._social_trigger_block_reason("positive_contact", audio)
+
         return self._evaluate_candidate(
             trigger_id="positive_contact",
             observed_at=now,
@@ -1318,7 +1563,6 @@ class SocialTriggerEngine:
     ) -> float | None:
         """Update tracked presence and return any completed absence duration."""
 
-        # AUDIT-FIX(#1,#10): Uninspected ticks normally freeze presence state, except for the coordinator's explicit sensor-only absence path.
         if not inspected and not sensor_absence_signal:
             return None
 
@@ -1342,23 +1586,39 @@ class SocialTriggerEngine:
                 self._visible_since = None
             if self._absence_started_at is None:
                 self._absence_started_at = now
+
         self._person_visible = person_visible
         return absence_duration
 
     def _should_treat_as_sensor_absence_signal(
         self,
         *,
+        now: float,
         inspected: bool,
         pir_motion_detected: bool,
         vision: object,
     ) -> bool:
         """Return whether sensor-only input should extend the absence state."""
 
+        # BREAKING: Generic "uninspected + no PIR" no longer counts as absence. We require
+        # explicit camera-health metadata so blind or stalled ticks cannot fabricate long
+        # absence windows and later fire false "person_returned" prompts.
         if inspected or pir_motion_detected:
             return False
         if not isinstance(vision, SocialVisionObservation):
             return False
         if _coerce_bool(vision.person_visible):
+            return False
+        last_camera_frame_at = _coerce_timestamp(getattr(vision, "last_camera_frame_at", None))
+        last_camera_health_change_at = _coerce_timestamp(getattr(vision, "last_camera_health_change_at", None))
+        explicit_health_metadata = (
+            vision.camera_error is not None
+            or last_camera_frame_at is not None
+            or last_camera_health_change_at is not None
+        )
+        if not explicit_health_metadata:
+            return False
+        if last_camera_frame_at is not None and (now - last_camera_frame_at) <= self.thresholds.vision_stale_after_s:
             return False
         return self._person_visible or self._absence_started_at is not None
 
@@ -1372,7 +1632,6 @@ class SocialTriggerEngine:
     ) -> None:
         """Update tracked pose and fall-transition state."""
 
-        # AUDIT-FIX(#1): Only inspected, person-present frames may mutate pose state; otherwise stale/unknown vision drops can fabricate transitions.
         if not inspected or not person_visible:
             return
         if _is_upright_like_pose(body_pose):
@@ -1413,7 +1672,6 @@ class SocialTriggerEngine:
     ) -> SocialTriggerEvaluation:
         """Build one scored trigger evaluation from evidence."""
 
-        # AUDIT-FIX(#4,#6): Clamp thresholds and renormalise evidence so bad config or overweighted evidence cannot skew or explode scoring.
         score_card = weighted_trigger_score(
             threshold=_normalize_unit_interval(threshold, default=1.0),
             evidence=self._normalize_evidence(evidence),
@@ -1460,7 +1718,123 @@ class SocialTriggerEngine:
 
         if since is None:
             return f"active_for=0.0s target={target_s:.1f}s"
-        return f"active_for={max(0.0, now - since):.1f}s target={target_s:.1f}s"  # AUDIT-FIX(#2): Never emit negative durations after rejected/stale time inputs.
+        return f"active_for={max(0.0, now - since):.1f}s target={target_s:.1f}s"
+
+    def _quiet_signal_active(self, audio: SocialAudioObservation) -> bool:
+        """Return whether current audio conditions should count as quiet."""
+
+        if audio.assistant_output_active is True:
+            return False
+        if audio.speech_overlap_likely is True:
+            return False
+        if audio.barge_in_detected is True:
+            return False
+        if audio.speech_detected is True:
+            return False
+        if audio.room_quiet is True and audio.background_media_likely is not True:
+            return True
+        if (
+            audio.speech_detected is False
+            and audio.background_media_likely is not True
+            and audio.non_speech_audio_likely is not True
+        ):
+            return True
+        if (
+            audio.recent_speech_age_s is not None
+            and audio.recent_speech_age_s >= self.thresholds.quiet_after_speech_age_s
+            and audio.background_media_likely is not True
+            and audio.non_speech_audio_likely is not True
+        ):
+            return True
+        return False
+
+    def _social_prompt_channel_available(self, audio: SocialAudioObservation) -> bool:
+        """Return whether non-urgent social prompting should currently be allowed."""
+
+        return (
+            audio.mute_active is not True
+            and audio.assistant_output_active is not True
+            and audio.speech_overlap_likely is not True
+            and audio.barge_in_detected is not True
+        )
+
+    def _social_channel_detail(self, audio: SocialAudioObservation) -> str:
+        """Render current non-urgent social channel conditions."""
+
+        return (
+            f"mute={audio.mute_active} assistant_output={audio.assistant_output_active} "
+            f"overlap={audio.speech_overlap_likely} barge_in={audio.barge_in_detected}"
+        )
+
+    def _social_trigger_block_reason(
+        self,
+        trigger_id: str,
+        audio: SocialAudioObservation,
+    ) -> str | None:
+        """Return a runtime block reason for non-urgent social triggers."""
+
+        if trigger_id not in _SOCIAL_TRIGGERS:
+            return None
+        if audio.mute_active is True:
+            return "mute_active"
+        if audio.assistant_output_active is True:
+            return "assistant_output_active"
+        if audio.speech_overlap_likely is True:
+            return "speech_overlap_likely"
+        if audio.barge_in_detected is True:
+            return "barge_in_detected"
+        return None
+
+    def _attention_signal_score(self, vision: SocialVisionObservation) -> float:
+        """Return one bounded score for visual attention reliability."""
+
+        if vision.visual_attention_score is not None:
+            return vision.visual_attention_score
+        return 1.0 if vision.looking_toward_device else 0.0
+
+    def _pose_reliability_score(
+        self,
+        vision: SocialVisionObservation,
+        *,
+        expected: SocialBodyPose | None = None,
+        expected_floor_like: bool = False,
+    ) -> float:
+        """Return one pose-confidence score for the relevant expected state."""
+
+        pose_confidence = vision.pose_confidence
+        if expected is not None and vision.body_pose != expected:
+            return 0.0
+        if expected_floor_like and not _is_floor_like_pose(vision.body_pose):
+            return 0.0
+        if pose_confidence is None:
+            return 1.0 if vision.person_visible else 0.0
+        return pose_confidence
+
+    def _safety_reliability_score(self, vision: SocialVisionObservation) -> float:
+        """Return one bounded reliability score for safety-relevant vision usage."""
+
+        if vision.person_visible:
+            pose_score = 1.0 if vision.pose_confidence is None else vision.pose_confidence
+            motion_score = 1.0 if vision.motion_confidence is None else vision.motion_confidence
+            return (pose_score + motion_score) / 2.0
+        if self._possible_fall_loss_candidate_at is not None:
+            return 1.0
+        return 0.0
+
+    def _safety_reliability_detail(self, vision: SocialVisionObservation) -> str:
+        """Render one reliability detail string for safety-relevant candidates."""
+
+        return (
+            f"person_visible={vision.person_visible} pose_confidence={self._ratio_or_na(vision.pose_confidence)} "
+            f"motion_confidence={self._ratio_or_na(vision.motion_confidence)}"
+        )
+
+    def _ratio_or_na(self, value: float | None) -> str:
+        """Format one optional ratio."""
+
+        if value is None:
+            return "n/a"
+        return f"{value:.2f}"
 
     def _fell_out_of_view_after_fall_like_presence(self, now: float, *, visible_duration: float | None) -> bool:
         """Return whether recent visibility loss looks fall-like."""
@@ -1600,7 +1974,7 @@ class SocialTriggerEngine:
             self._consecutive_visible_inspected_count = min(
                 2,
                 self._consecutive_visible_inspected_count + 1,
-            )  # AUDIT-FIX(#1): Only "0, 1, 2+" matters; cap the counter instead of growing forever during long uptimes.
+            )
             return
         self._consecutive_visible_inspected_count = 0
 
@@ -1609,12 +1983,11 @@ class SocialTriggerEngine:
 
         if value is None:
             return "n/a"
-        return f"{max(0.0, value):.1f}s"  # AUDIT-FIX(#2): Defensive formatting if upstream clocks jitter backward and the observation gets dropped.
+        return f"{max(0.0, value):.1f}s"
 
     def _normalize_audio(self, audio: object) -> SocialAudioObservation:
         """Normalize one audio payload to the strict internal type."""
 
-        # AUDIT-FIX(#5): Coerce permissive payloads into the strict internal type expected by trigger logic.
         if not isinstance(audio, SocialAudioObservation):
             return SocialAudioObservation()
         return SocialAudioObservation(
@@ -1641,19 +2014,90 @@ class SocialTriggerEngine:
         vision: object,
         *,
         inspected: bool,
+        now: float,
     ) -> SocialVisionObservation:
         """Normalize one vision payload to the strict internal type."""
 
-        # AUDIT-FIX(#1,#5): Treat "not inspected" as unknown vision and normalise malformed pose/bool payloads before they reach safety logic.
         if not inspected or not isinstance(vision, SocialVisionObservation):
             return SocialVisionObservation()
 
-        person_visible = _coerce_bool(vision.person_visible)
-        primary_person_box = (
-            _coerce_spatial_box(getattr(vision, "primary_person_box", None))
-            if person_visible
-            else None
+        camera_online = _coerce_bool(getattr(vision, "camera_online", False))
+        camera_ready = _coerce_bool(getattr(vision, "camera_ready", False))
+        camera_ai_ready = _coerce_bool(getattr(vision, "camera_ai_ready", False))
+        camera_error = _coerce_bounded_text(getattr(vision, "camera_error", None))
+        last_camera_frame_at = _coerce_timestamp(getattr(vision, "last_camera_frame_at", None))
+        last_camera_health_change_at = _coerce_timestamp(getattr(vision, "last_camera_health_change_at", None))
+
+        vision_fresh = (
+            last_camera_frame_at is None
+            or 0.0 <= (now - last_camera_frame_at) <= self.thresholds.vision_stale_after_s
         )
+        explicit_camera_outage = (
+            camera_error is not None
+            or (
+                last_camera_health_change_at is not None
+                and (not camera_online or not camera_ready or not camera_ai_ready)
+            )
+            or (
+                last_camera_frame_at is not None
+                and (now - last_camera_frame_at) > self.thresholds.vision_stale_after_s
+            )
+        )
+        camera_usable = vision_fresh and not explicit_camera_outage
+
+        visible_persons = _coerce_visible_persons(getattr(vision, "visible_persons", ()))
+        primary_person_box = _coerce_spatial_box(getattr(vision, "primary_person_box", None))
+        if primary_person_box is None and visible_persons:
+            primary_person_box = visible_persons[0].box
+
+        raw_person_count = _coerce_non_negative_int(getattr(vision, "person_count", 0), default=0)
+        redundant_visibility = (
+            raw_person_count > 0
+            or primary_person_box is not None
+            or len(visible_persons) > 0
+        )
+        person_visible = camera_usable and (
+            _coerce_bool(vision.person_visible) or redundant_visibility
+        )
+
+        person_count = 0
+        if person_visible:
+            person_count = max(1, raw_person_count, len(visible_persons), 1)
+
+        visual_attention_score = _coerce_optional_ratio(getattr(vision, "visual_attention_score", None))
+        explicit_looking = _coerce_bool(getattr(vision, "looking_toward_device", False))
+        looking_toward_device = person_visible and (
+            explicit_looking
+            or (
+                visual_attention_score is not None
+                and visual_attention_score >= self.thresholds.min_visual_attention_score
+            )
+        )
+
+        pose_confidence = _coerce_optional_ratio(getattr(vision, "pose_confidence", None))
+        body_pose = _coerce_body_pose(getattr(vision, "body_pose", SocialBodyPose.UNKNOWN))
+        if (
+            not person_visible
+            or (
+                body_pose != SocialBodyPose.UNKNOWN
+                and pose_confidence is not None
+                and pose_confidence < self.thresholds.min_pose_confidence
+            )
+        ):
+            body_pose = SocialBodyPose.UNKNOWN
+
+        motion_confidence = _coerce_optional_ratio(getattr(vision, "motion_confidence", None))
+        motion_state = _coerce_motion_state(getattr(vision, "motion_state", SocialMotionState.UNKNOWN))
+        if (
+            not person_visible
+            or (
+                motion_state != SocialMotionState.UNKNOWN
+                and motion_confidence is not None
+                and motion_confidence < self.thresholds.min_motion_confidence
+            )
+        ):
+            motion_state = SocialMotionState.UNKNOWN
+
         primary_person_center_x = (
             primary_person_box.center_x
             if primary_person_box is not None
@@ -1664,49 +2108,66 @@ class SocialTriggerEngine:
             if primary_person_box is not None
             else _coerce_optional_ratio(getattr(vision, "primary_person_center_y", None))
         )
+
+        primary_person_zone = _coerce_person_zone(getattr(vision, "primary_person_zone", SocialPersonZone.UNKNOWN))
+        if primary_person_zone == SocialPersonZone.UNKNOWN:
+            if primary_person_box is not None:
+                primary_person_zone = _zone_from_center_x(primary_person_box.center_x)
+            elif visible_persons:
+                primary_person_zone = visible_persons[0].zone
+
         raw_coarse_arm_gesture = getattr(
             vision,
             "coarse_arm_gesture",
-            getattr(vision, "gesture_event", SocialGestureEvent.NONE),
+            SocialGestureEvent.NONE,
         )
+        raw_gesture_event = getattr(
+            vision,
+            "gesture_event",
+            raw_coarse_arm_gesture,
+        )
+
+        if not camera_usable:
+            person_visible = False
+            person_count = 0
+            primary_person_box = None
+            primary_person_center_x = None
+            primary_person_center_y = None
+            primary_person_zone = SocialPersonZone.UNKNOWN
+            visible_persons = ()
+            looking_toward_device = False
+            body_pose = SocialBodyPose.UNKNOWN
+            motion_state = SocialMotionState.UNKNOWN
+
         return SocialVisionObservation(
             person_visible=person_visible,
-            person_count=(
-                max(1, _coerce_non_negative_int(getattr(vision, "person_count", 1), default=1))
-                if person_visible
-                else 0
-            ),
+            person_count=person_count,
             person_recently_visible=_coerce_optional_bool(getattr(vision, "person_recently_visible", None)),
             person_appeared_at=_coerce_timestamp(getattr(vision, "person_appeared_at", None)),
             person_disappeared_at=_coerce_timestamp(getattr(vision, "person_disappeared_at", None)),
-            primary_person_zone=(
-                _coerce_person_zone(getattr(vision, "primary_person_zone", SocialPersonZone.UNKNOWN))
-                if person_visible
-                else SocialPersonZone.UNKNOWN
-            ),
+            primary_person_zone=primary_person_zone if person_visible else SocialPersonZone.UNKNOWN,
             primary_person_box=primary_person_box,
-            primary_person_center_x=(primary_person_center_x if person_visible else None),
-            primary_person_center_y=(primary_person_center_y if person_visible else None),
-            looking_toward_device=person_visible and _coerce_bool(vision.looking_toward_device),
+            visible_persons=visible_persons if person_visible else (),
+            primary_person_center_x=primary_person_center_x if person_visible else None,
+            primary_person_center_y=primary_person_center_y if person_visible else None,
+            looking_toward_device=looking_toward_device,
+            looking_signal_state=_coerce_optional_text(getattr(vision, "looking_signal_state", None), limit=32),
+            looking_signal_source=_coerce_optional_text(getattr(vision, "looking_signal_source", None), limit=32),
             person_near_device=_coerce_optional_bool(getattr(vision, "person_near_device", None)),
             engaged_with_device=_coerce_optional_bool(getattr(vision, "engaged_with_device", None)),
-            visual_attention_score=_coerce_optional_ratio(getattr(vision, "visual_attention_score", None)),
-            body_pose=(_coerce_body_pose(vision.body_pose) if person_visible else SocialBodyPose.UNKNOWN),
-            pose_confidence=_coerce_optional_ratio(getattr(vision, "pose_confidence", None)),
+            visual_attention_score=visual_attention_score,
+            body_pose=body_pose,
+            pose_confidence=pose_confidence,
             body_state_changed_at=_coerce_timestamp(getattr(vision, "body_state_changed_at", None)),
-            motion_state=(
-                _coerce_motion_state(getattr(vision, "motion_state", SocialMotionState.UNKNOWN))
-                if person_visible
-                else SocialMotionState.UNKNOWN
-            ),
-            motion_confidence=_coerce_optional_ratio(getattr(vision, "motion_confidence", None)),
+            motion_state=motion_state,
+            motion_confidence=motion_confidence,
             motion_state_changed_at=_coerce_timestamp(getattr(vision, "motion_state_changed_at", None)),
-            smiling=person_visible and _coerce_bool(vision.smiling),
-            hand_or_object_near_camera=_coerce_bool(vision.hand_or_object_near_camera),
+            smiling=person_visible and _coerce_bool(getattr(vision, "smiling", False)),
+            hand_or_object_near_camera=person_visible and _coerce_bool(getattr(vision, "hand_or_object_near_camera", False)),
             showing_intent_likely=_coerce_optional_bool(getattr(vision, "showing_intent_likely", None)),
             showing_intent_started_at=_coerce_timestamp(getattr(vision, "showing_intent_started_at", None)),
             coarse_arm_gesture=_coerce_gesture_event(raw_coarse_arm_gesture),
-            gesture_event=_coerce_gesture_event(raw_coarse_arm_gesture),
+            gesture_event=_coerce_gesture_event(raw_gesture_event),
             gesture_confidence=_coerce_optional_ratio(getattr(vision, "gesture_confidence", None)),
             fine_hand_gesture=_coerce_fine_hand_gesture(
                 getattr(vision, "fine_hand_gesture", SocialFineHandGesture.NONE)
@@ -1715,14 +2176,13 @@ class SocialTriggerEngine:
                 getattr(vision, "fine_hand_gesture_confidence", None)
             ),
             objects=_coerce_detected_objects(getattr(vision, "objects", ())),
-            camera_online=_coerce_bool(getattr(vision, "camera_online", False)),
-            camera_ready=_coerce_bool(getattr(vision, "camera_ready", False)),
-            camera_ai_ready=_coerce_bool(getattr(vision, "camera_ai_ready", False)),
-            camera_error=_coerce_bounded_text(getattr(vision, "camera_error", None)),
-            last_camera_frame_at=_coerce_timestamp(getattr(vision, "last_camera_frame_at", None)),
-            last_camera_health_change_at=_coerce_timestamp(
-                getattr(vision, "last_camera_health_change_at", None)
-            ),
+            camera_online=camera_online,
+            camera_ready=camera_ready,
+            camera_ai_ready=camera_ai_ready,
+            camera_error=camera_error,
+            last_camera_frame_at=last_camera_frame_at,
+            last_camera_health_change_at=last_camera_health_change_at,
+            perception_stream=getattr(vision, "perception_stream", None),
         )
 
     def _normalize_evidence(
@@ -1737,7 +2197,7 @@ class SocialTriggerEngine:
             key = str(getattr(item, "key", ""))
             value = _normalize_unit_interval(getattr(item, "value", 0.0), default=0.0)
             weight = _normalize_non_negative_float(getattr(item, "weight", 0.0), default=0.0)
-            detail = str(getattr(item, "detail", ""))
+            detail = _coerce_bounded_text(getattr(item, "detail", ""), max_length=240) or ""
             sanitized.append((key, value, weight, detail))
             total_weight += weight
 
@@ -1755,6 +2215,16 @@ class SocialTriggerEngine:
             for key, value, weight, detail in sanitized
         )
 
+    def _build_cooldowns(self, overrides: Mapping[str, object] | None) -> dict[str, float]:
+        """Build one normalized cooldown dictionary."""
+
+        cooldowns = dict(_DEFAULT_COOLDOWNS)
+        if overrides is None:
+            return cooldowns
+        for trigger_id, default in cooldowns.items():
+            if trigger_id in overrides:
+                cooldowns[trigger_id] = _normalize_positive_float(overrides[trigger_id], default=default)
+        return cooldowns
 
 __all__ = [
     "SocialAudioObservation",
@@ -1772,4 +2242,5 @@ __all__ = [
     "SocialTriggerPriority",
     "SocialTriggerThresholds",
     "SocialVisionObservation",
+    "SocialVisiblePerson",
 ]

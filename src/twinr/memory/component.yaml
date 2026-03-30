@@ -16,7 +16,7 @@ out_of_scope:
   - Hardware capture, playback, display, or printer orchestration
 files:
   - path: __init__.py
-    role: Public memory package export surface
+    role: Public memory package export surface with lazy export resolution
     exports:
       - ConversationTurn
       - ChonkyDBAuthInfo

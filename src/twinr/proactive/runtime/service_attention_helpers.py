@@ -1,3 +1,13 @@
+# CHANGELOG: 2026-03-29
+# BUG-1: Contained perception/callback failures so HDMI and servo refresh no longer crash on transient attention-runtime faults.
+# BUG-2: Fixed changed-only HDMI trace churn by rounding jitter-prone float fields and tracking head_dy/publish_owner changes.
+# BUG-3: Isolated ops/debug emission from the control path; telemetry serialization failures can no longer break actuation.
+# SEC-1: Added bounded telemetry sanitization/redaction to reduce PII leakage and log-amplification / disk-pressure risk on Pi deployments.
+# IMP-1: Added fail-closed stale-camera gating and freshness metadata for availability-aware multimodal attention handling.
+# IMP-2: Added resilient live-facts normalization and safe fallback publishing aligned with 2026 edge-robotics / observability practices.
+# BREAKING: Debug and forensic payloads are now truncated/redacted/hash-pseudonymized for sensitive/high-cardinality fields.
+# BREAKING: Attention-follow now suppresses servo motion when camera data is stale/unavailable; set a matching *camera_stale_after_s config <= 0 to disable.
+
 """Focused attention/runtime helper functions for the proactive coordinator.
 
 This module keeps HDMI attention-follow, servo tracing, and live-context
@@ -9,7 +19,9 @@ consume the same truth.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import hashlib
+import math
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from twinr.hardware.servo_follow import AttentionServoDecision
@@ -19,6 +31,49 @@ from ..social.engine import SocialAudioObservation, SocialObservation, SocialVis
 from .attention_targeting import MultimodalAttentionTargetSnapshot
 from .audio_policy import ReSpeakerAudioPolicySnapshot
 from .display_attention import DisplayAttentionCuePublishResult, display_attention_refresh_supported
+
+
+_MISSING = object()
+
+_DEFAULT_CAMERA_STALE_AFTER_S = 1.0
+_MAX_DEBUG_DEPTH = 4
+_MAX_DEBUG_ITEMS = 16
+_MAX_DEBUG_STRING_LENGTH = 160
+_MAX_DEBUG_KEY_LENGTH = 64
+_MAX_KV_STRING_LENGTH = 96
+_MAX_VISIBLE_PERSON_SUMMARY = 4
+
+_HASH_KEY_HINTS = (
+    "track_id",
+    "speaker_id",
+    "session_id",
+    "presence_session_id",
+    "identity_id",
+    "person_id",
+    "user_id",
+    "profile_id",
+)
+_REDACT_KEY_HINTS = (
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "cookie",
+    "credential",
+    "private_key",
+    "api_key",
+    "raw_audio",
+    "audio_bytes",
+    "audio_blob",
+    "frame_bytes",
+    "image_bytes",
+    "image_blob",
+    "embedding",
+    "vector",
+    "tensor",
+    "file_path",
+    "path",
+)
 
 
 def _round_optional_ratio(value: float | None) -> float | None:
@@ -33,10 +88,39 @@ def _round_optional_seconds(value: float | None) -> float | None:
     return service_module._round_optional_seconds(value)
 
 
+def _round_optional_float(value: object, digits: int = 4) -> float | None:
+    coerced = _coerce_float(value)
+    if coerced is None or not math.isfinite(coerced):
+        return None
+    return round(coerced, digits)
+
+
 def _emit_key_value_line(prefix: str, /, **fields: object) -> str:
     from . import service as service_module
 
-    return service_module._emit_key_value_line(prefix, **fields)
+    sanitized_fields = {str(key): _sanitize_key_value_field(value) for key, value in fields.items()}
+    sanitized_prefix = _single_line_text(prefix, max_len=48) or "event"
+    return service_module._emit_key_value_line(sanitized_prefix, **sanitized_fields)
+
+
+def _sanitize_key_value_field(value: object) -> object:
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return round(value, 4)
+    if isinstance(value, str):
+        return _single_line_text(value, max_len=_MAX_KV_STRING_LENGTH)
+    return _single_line_text(repr(value), max_len=_MAX_KV_STRING_LENGTH)
+
+
+def _single_line_text(value: object, *, max_len: int) -> str:
+    text = str(value)
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) > max_len:
+        return f"{text[: max(0, max_len - 3)]}..."
+    return text
 
 
 def _coerce_mapping(value: object) -> dict[str, object]:
@@ -55,15 +139,329 @@ def _coerce_float(value: object) -> float | None:
     if isinstance(value, bool):
         return float(value)
     if isinstance(value, (int, float)):
-        return float(value)
+        coerced = float(value)
+        if math.isfinite(coerced):
+            return coerced
+        return None
     if isinstance(value, str):
         try:
-            return float(value)
+            coerced = float(value)
         except ValueError:
             return None
+        return coerced if math.isfinite(coerced) else None
     try:
-        return float(str(value))
+        coerced = float(str(value))
     except (TypeError, ValueError):
+        return None
+    return coerced if math.isfinite(coerced) else None
+
+
+def _lookup_config_path(root: object, dotted_path: str) -> object:
+    value = root
+    for part in dotted_path.split("."):
+        if value is None:
+            return _MISSING
+        if isinstance(value, Mapping):
+            if part not in value:
+                return _MISSING
+            value = value[part]
+            continue
+        value = getattr(value, part, _MISSING)
+        if value is _MISSING:
+            return _MISSING
+    return value
+
+
+def _first_config_value(root: object, *paths: str) -> object:
+    for path in paths:
+        value = _lookup_config_path(root, path)
+        if value is not _MISSING and value is not None:
+            return value
+    return _MISSING
+
+
+def _camera_frame_age_s(observed_at: float, camera_snapshot: ProactiveCameraSnapshot) -> float | None:
+    last_camera_frame_at = getattr(camera_snapshot, "last_camera_frame_at", None)
+    if last_camera_frame_at is None:
+        return None
+    try:
+        frame_age_s = max(0.0, float(observed_at) - float(last_camera_frame_at))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(frame_age_s):
+        return None
+    return frame_age_s
+
+
+def _camera_stale_after_s(coordinator: Any) -> float:
+    configured_value = _first_config_value(
+        getattr(coordinator, "config", None),
+        "display_attention.camera_stale_after_s",
+        "display_attention.stale_after_s",
+        "attention.camera_stale_after_s",
+        "attention.stale_after_s",
+        "proactive.camera_stale_after_s",
+        "proactive.display_attention.camera_stale_after_s",
+        "camera_stale_after_s",
+    )
+    threshold = _coerce_float(None if configured_value is _MISSING else configured_value)
+    if threshold is None:
+        return _DEFAULT_CAMERA_STALE_AFTER_S
+    if threshold <= 0.0:
+        return math.inf
+    return threshold
+
+
+def _camera_attention_block_reason(
+    coordinator: Any,
+    *,
+    observed_at: float,
+    camera_snapshot: ProactiveCameraSnapshot,
+) -> str | None:
+    camera_online = getattr(camera_snapshot, "camera_online", None)
+    if camera_online is False:
+        return "camera_offline"
+    camera_ready = getattr(camera_snapshot, "camera_ready", None)
+    if camera_ready is False:
+        return "camera_not_ready"
+    camera_ai_ready = getattr(camera_snapshot, "camera_ai_ready", None)
+    if camera_ai_ready is False:
+        return "camera_ai_not_ready"
+    camera_error = getattr(camera_snapshot, "camera_error", None)
+    if camera_error:
+        return "camera_error"
+    frame_age_s = _camera_frame_age_s(observed_at, camera_snapshot)
+    if frame_age_s is None and getattr(camera_snapshot, "last_camera_frame_at", None) is None:
+        return "camera_frame_missing"
+    if frame_age_s is not None and frame_age_s > _camera_stale_after_s(coordinator):
+        return "stale_camera_frame"
+    return None
+
+
+def _build_attention_suppressed_live_facts(
+    coordinator: Any,
+    *,
+    observed_at: float,
+    camera_snapshot: ProactiveCameraSnapshot,
+    reason: str,
+) -> dict[str, object]:
+    frame_age_s = _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot))
+    facts: dict[str, object] = {
+        "attention_target_active": False,
+        "attention_target_state": reason,
+        "attention_target_confidence": 0.0,
+        "camera_frame_age_s": frame_age_s,
+        "camera_frame_stale": reason == "stale_camera_frame",
+        "runtime_attention_suppressed": True,
+        "runtime_attention_suppressed_reason": reason,
+        "twinr.attention.suppressed": True,
+        "twinr.attention.suppressed_reason": reason,
+        "twinr.attention.camera_frame_age_s": frame_age_s,
+    }
+    stale_after_s = _camera_stale_after_s(coordinator)
+    if math.isfinite(stale_after_s):
+        facts["twinr.attention.camera_stale_after_s"] = _round_optional_seconds(stale_after_s)
+    return facts
+
+
+def _copy_live_facts(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        return dict(value)  # type: ignore[arg-type]
+    except Exception:
+        return {}
+
+
+def _augment_live_facts_with_freshness(
+    coordinator: Any,
+    *,
+    observed_at: float,
+    camera_snapshot: ProactiveCameraSnapshot,
+    live_facts: Mapping[str, object] | None,
+) -> dict[str, object]:
+    facts = _copy_live_facts(live_facts)
+    frame_age_raw_s = _camera_frame_age_s(observed_at, camera_snapshot)
+    frame_age_s = _round_optional_seconds(frame_age_raw_s)
+    facts["twinr.attention.camera_frame_age_s"] = frame_age_s
+    stale_after_s = _camera_stale_after_s(coordinator)
+    if math.isfinite(stale_after_s):
+        facts["twinr.attention.camera_stale_after_s"] = _round_optional_seconds(stale_after_s)
+        facts["twinr.attention.camera_frame_stale"] = (
+            frame_age_raw_s is not None and frame_age_raw_s > stale_after_s
+        )
+    else:
+        facts["twinr.attention.camera_frame_stale"] = False
+    return facts
+
+
+def _stable_hash_text(value: object) -> str:
+    digest = hashlib.blake2s(str(value).encode("utf-8"), digest_size=6, person=b"twinrdbg").hexdigest()
+    return f"h:{digest}"
+
+
+def _should_hash_key(key_hint: str) -> bool:
+    lowered = key_hint.lower()
+    return any(hint in lowered for hint in _HASH_KEY_HINTS)
+
+
+def _should_redact_key(key_hint: str) -> bool:
+    lowered = key_hint.lower()
+    return any(hint in lowered for hint in _REDACT_KEY_HINTS)
+
+
+def _sanitize_debug_value(value: object, *, depth: int = 0, key_hint: str = "") -> object:
+    if _should_redact_key(key_hint):
+        return "<redacted>"
+    if _should_hash_key(key_hint) and value is not None:
+        return _stable_hash_text(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return round(value, 6)
+    if isinstance(value, str):
+        return _single_line_text(value, max_len=_MAX_DEBUG_STRING_LENGTH)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, BaseException):
+        return {
+            "type": type(value).__name__,
+            "message": _single_line_text(str(value), max_len=_MAX_DEBUG_STRING_LENGTH),
+        }
+    if depth >= _MAX_DEBUG_DEPTH:
+        return _single_line_text(repr(value), max_len=_MAX_DEBUG_STRING_LENGTH)
+    if isinstance(value, Mapping):
+        items: dict[str, object] = {}
+        for index, (raw_key, raw_value) in enumerate(value.items()):
+            if index >= _MAX_DEBUG_ITEMS:
+                items["...truncated_items"] = max(0, len(value) - _MAX_DEBUG_ITEMS)
+                break
+            key = _single_line_text(raw_key, max_len=_MAX_DEBUG_KEY_LENGTH)
+            items[key] = _sanitize_debug_value(raw_value, depth=depth + 1, key_hint=key)
+        return items
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
+        items_list = [
+            _sanitize_debug_value(item, depth=depth + 1, key_hint=key_hint)
+            for item in list(value)[:_MAX_DEBUG_ITEMS]
+        ]
+        if len(value) > _MAX_DEBUG_ITEMS:
+            items_list.append(f"...truncated_items:{len(value) - _MAX_DEBUG_ITEMS}")
+        return items_list
+    if isinstance(value, (set, frozenset)):
+        items_seq = sorted((_single_line_text(repr(item), max_len=48) for item in value))
+        items_list = items_seq[:_MAX_DEBUG_ITEMS]
+        if len(items_seq) > _MAX_DEBUG_ITEMS:
+            items_list.append(f"...truncated_items:{len(items_seq) - _MAX_DEBUG_ITEMS}")
+        return items_list
+    return _single_line_text(repr(value), max_len=_MAX_DEBUG_STRING_LENGTH)
+
+
+def _sanitize_debug_mapping(value: object) -> dict[str, object]:
+    sanitized = _sanitize_debug_value(value)
+    if isinstance(sanitized, dict):
+        return sanitized
+    return {"value": sanitized}
+
+
+def _record_fault_safe(
+    coordinator: Any,
+    *,
+    event: str,
+    message: str,
+    error: Exception,
+    data: object | None = None,
+    level: str = "warning",
+) -> None:
+    recorder = getattr(coordinator, "_record_fault", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(
+            event=event,
+            message=message,
+            error=error,
+            data=None if data is None else _sanitize_debug_mapping(data),
+            level=level,
+        )
+    except Exception:
+        return
+
+
+def _append_ops_event_safe(
+    coordinator: Any,
+    *,
+    event: str,
+    message: str,
+    data: object,
+) -> None:
+    append_event = getattr(coordinator, "_append_ops_event", None)
+    if not callable(append_event):
+        return
+    try:
+        append_event(
+            event=event,
+            message=message,
+            data=_sanitize_debug_mapping(data),
+        )
+    except Exception as exc:
+        _record_fault_safe(
+            coordinator,
+            event="proactive_ops_event_append_failed",
+            message="Failed to append one bounded proactive attention ops event.",
+            error=exc,
+            data={"failed_event": event},
+        )
+
+
+def _emit_safe(
+    coordinator: Any,
+    *,
+    line: str,
+    fault_event: str,
+    fault_message: str,
+) -> None:
+    emitter = getattr(coordinator, "_emit", None)
+    if not callable(emitter):
+        return
+    try:
+        emitter(line)
+    except Exception as exc:
+        _record_fault_safe(
+            coordinator,
+            event=fault_event,
+            message=fault_message,
+            error=exc,
+        )
+
+
+def _publish_display_attention_from_facts(
+    coordinator: Any,
+    *,
+    observed_at: float,
+    live_facts: Mapping[str, object],
+) -> DisplayAttentionCuePublishResult | None:
+    publisher = coordinator.display_attention_publisher
+    if publisher is None:
+        return None
+    try:
+        return publisher.publish_from_facts(
+            config=coordinator.config,
+            live_facts=dict(live_facts),
+        )
+    except Exception as exc:
+        _record_fault_safe(
+            coordinator,
+            event="proactive_display_attention_follow_failed",
+            message="Failed to update the HDMI face attention-follow cue.",
+            error=exc,
+            data={"observed_at": observed_at},
+        )
         return None
 
 
@@ -80,33 +478,61 @@ def publish_display_attention_live_context(
 
     if coordinator.live_context_handler is None:
         return
-    observation = SocialObservation(
-        observed_at=observed_at,
-        inspected=True,
-        pir_motion_detected=False,
-        low_motion=False,
-        vision=vision_observation,
-        audio=audio_snapshot.observation,
-    )
-    presence_snapshot = coordinator._observe_presence(
-        now=observed_at,
-        person_visible=camera_snapshot.person_visible,
-        motion_active=False,
-        audio_observation=audio_snapshot.observation,
-        audio_policy_snapshot=audio_policy_snapshot,
-    )
-    facts = coordinator._build_automation_facts(
-        observation,
-        inspected=True,
-        audio_snapshot=audio_snapshot,
-        camera_snapshot=camera_snapshot,
-        audio_policy_snapshot=audio_policy_snapshot,
-        presence_snapshot=presence_snapshot,
-    )
+    try:
+        observation = SocialObservation(
+            observed_at=observed_at,
+            inspected=True,
+            pir_motion_detected=False,
+            low_motion=False,
+            vision=vision_observation,
+            audio=audio_snapshot.observation,
+        )
+        presence_snapshot = coordinator._observe_presence(
+            now=observed_at,
+            person_visible=camera_snapshot.person_visible,
+            motion_active=False,
+            audio_observation=audio_snapshot.observation,
+            audio_policy_snapshot=audio_policy_snapshot,
+        )
+        facts = coordinator._build_automation_facts(
+            observation,
+            inspected=True,
+            audio_snapshot=audio_snapshot,
+            camera_snapshot=camera_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
+            presence_snapshot=presence_snapshot,
+        )
+    except Exception as exc:
+        _record_fault_safe(
+            coordinator,
+            event="proactive_live_context_build_failed",
+            message="Failed to build live sensor context for HDMI attention refresh.",
+            error=exc,
+            data={"observed_at": observed_at},
+        )
+        return
+    if isinstance(facts, Mapping):
+        facts = dict(facts)
+        block_reason = _camera_attention_block_reason(
+            coordinator,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+        )
+        if block_reason is not None:
+            facts.update(
+                {
+                    "twinr.attention.suppressed": True,
+                    "twinr.attention.suppressed_reason": block_reason,
+                    "twinr.attention.camera_frame_age_s": _round_optional_seconds(
+                        _camera_frame_age_s(observed_at, camera_snapshot)
+                    ),
+                }
+            )
     try:
         coordinator.live_context_handler(facts)
     except Exception as exc:
-        coordinator._record_fault(
+        _record_fault_safe(
+            coordinator,
             event="proactive_live_context_handler_failed",
             message="HDMI attention refresh failed to publish live sensor context.",
             error=exc,
@@ -131,7 +557,8 @@ def update_display_debug_signals(
             trigger_ids=detected_trigger_ids,
         )
     except Exception as exc:
-        coordinator._record_fault(
+        _record_fault_safe(
+            coordinator,
             event="proactive_display_debug_signals_publish_failed",
             message="Failed to publish HDMI debug-signal state.",
             error=exc,
@@ -154,27 +581,139 @@ def update_display_attention_follow(
 ) -> DisplayAttentionCuePublishResult | None:
     """Update the HDMI face and body-follow servo from the current attention target."""
 
+    block_reason = _camera_attention_block_reason(
+        coordinator,
+        observed_at=observed_at,
+        camera_snapshot=camera_snapshot,
+    )
+    if block_reason is not None:
+        coordinator.latest_perception_runtime_snapshot = None
+        coordinator.latest_speaker_association_snapshot = None
+        coordinator.latest_attention_target_snapshot = None
+        record_attention_follow_pipeline_if_changed(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+        )
+        update_attention_servo_follow(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+            attention_target_debug={
+                "suppressed_reason": block_reason,
+                "camera_frame_age_s": _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
+            },
+        )
+        return _publish_display_attention_from_facts(
+            coordinator,
+            observed_at=observed_at,
+            live_facts=_build_attention_suppressed_live_facts(
+                coordinator,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                reason=block_reason,
+            ),
+        )
+
     presence_snapshot = coordinator.latest_presence_snapshot
     presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
-    perception_runtime = coordinator.perception_orchestrator.observe_attention(
-        observed_at=observed_at,
-        source=source,
-        captured_at=camera_snapshot.last_camera_frame_at,
-        camera_snapshot=camera_snapshot,
-        audio_observation=audio_observation,
-        audio_policy_snapshot=audio_policy_snapshot,
-        runtime_status=getattr(getattr(coordinator.runtime, "status", None), "value", None),
-        presence_session_id=presence_session_id,
-        identity_fusion=coordinator.latest_identity_fusion_snapshot,
-    )
-    assert perception_runtime.attention is not None
-    attention_runtime = perception_runtime.attention
-    live_facts = dict(attention_runtime.live_facts)
+    try:
+        perception_runtime = coordinator.perception_orchestrator.observe_attention(
+            observed_at=observed_at,
+            source=source,
+            captured_at=camera_snapshot.last_camera_frame_at,
+            camera_snapshot=camera_snapshot,
+            audio_observation=audio_observation,
+            audio_policy_snapshot=audio_policy_snapshot,
+            runtime_status=getattr(getattr(coordinator.runtime, "status", None), "value", None),
+            presence_session_id=presence_session_id,
+            identity_fusion=coordinator.latest_identity_fusion_snapshot,
+        )
+    except Exception as exc:
+        coordinator.latest_perception_runtime_snapshot = None
+        coordinator.latest_attention_target_snapshot = None
+        coordinator.latest_speaker_association_snapshot = None
+        _record_fault_safe(
+            coordinator,
+            event="proactive_attention_observe_failed",
+            message="Failed to derive a multimodal attention target from the perception orchestrator.",
+            error=exc,
+            data={"observed_at": observed_at, "source": source},
+        )
+        record_attention_follow_pipeline_if_changed(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+        )
+        update_attention_servo_follow(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+            attention_target_debug={"suppressed_reason": "perception_failure"},
+        )
+        return _publish_display_attention_from_facts(
+            coordinator,
+            observed_at=observed_at,
+            live_facts=_build_attention_suppressed_live_facts(
+                coordinator,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                reason="perception_failure",
+            ),
+        )
+
+    attention_runtime = getattr(perception_runtime, "attention", None)
+    if attention_runtime is None:
+        coordinator.latest_perception_runtime_snapshot = perception_runtime
+        coordinator.latest_attention_target_snapshot = None
+        coordinator.latest_speaker_association_snapshot = None
+        _record_fault_safe(
+            coordinator,
+            event="proactive_attention_runtime_missing",
+            message="Perception returned without an attention runtime snapshot; suppressing follow outputs safely.",
+            error=RuntimeError("perception_runtime.attention is None"),
+            data={"observed_at": observed_at, "source": source},
+        )
+        record_attention_follow_pipeline_if_changed(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+        )
+        update_attention_servo_follow(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=None,
+            attention_target_debug={"suppressed_reason": "missing_attention_runtime"},
+        )
+        return _publish_display_attention_from_facts(
+            coordinator,
+            observed_at=observed_at,
+            live_facts=_build_attention_suppressed_live_facts(
+                coordinator,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                reason="missing_attention_runtime",
+            ),
+        )
+
     coordinator.latest_perception_runtime_snapshot = perception_runtime
     coordinator.latest_speaker_association_snapshot = attention_runtime.speaker_association
     attention_target = attention_runtime.attention_target
     attention_target_debug = attention_runtime.attention_target_debug
     coordinator.latest_attention_target_snapshot = attention_target
+
     record_attention_follow_pipeline_if_changed(
         coordinator,
         source=source,
@@ -190,22 +729,16 @@ def update_display_attention_follow(
         attention_target=attention_target,
         attention_target_debug=attention_target_debug,
     )
-    publisher = coordinator.display_attention_publisher
-    if publisher is None:
-        return None
-    try:
-        return publisher.publish_from_facts(
-            config=coordinator.config,
-            live_facts=live_facts,
-        )
-    except Exception as exc:
-        coordinator._record_fault(
-            event="proactive_display_attention_follow_failed",
-            message="Failed to update the HDMI face attention-follow cue.",
-            error=exc,
-            data={"observed_at": observed_at},
-        )
-        return None
+    return _publish_display_attention_from_facts(
+        coordinator,
+        observed_at=observed_at,
+        live_facts=_augment_live_facts_with_freshness(
+            coordinator,
+            observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            live_facts=getattr(attention_runtime, "live_facts", None),
+        ),
+    )
 
 
 def update_attention_servo_follow(
@@ -222,6 +755,50 @@ def update_attention_servo_follow(
     controller = coordinator.attention_servo_controller
     if controller is None:
         return
+
+    block_reason = _camera_attention_block_reason(
+        coordinator,
+        observed_at=observed_at,
+        camera_snapshot=camera_snapshot,
+    )
+    if block_reason is not None:
+        inactive_decision = AttentionServoDecision(
+            observed_at=observed_at,
+            active=False,
+            reason=block_reason,
+            confidence=0.0,
+            target_center_x=None,
+        )
+        record_attention_servo_follow_if_changed(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            attention_target=None,
+            decision=inactive_decision,
+        )
+        try:
+            record_attention_servo_forensic_tick(
+                coordinator,
+                source=source,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                attention_target=None,
+                attention_target_debug={
+                    "suppressed_reason": block_reason,
+                    "upstream": attention_target_debug,
+                },
+                decision=inactive_decision,
+            )
+        except Exception as exc:
+            _record_fault_safe(
+                coordinator,
+                event="proactive_attention_servo_forensic_tick_failed",
+                message="Failed to record one forensic attention-servo tick for a suppressed camera frame.",
+                error=exc,
+                data={"observed_at": observed_at, "reason": block_reason},
+            )
+        return
+
     inactive_decision = AttentionServoDecision(
         observed_at=observed_at,
         active=False,
@@ -237,15 +814,24 @@ def update_attention_servo_follow(
             attention_target=attention_target,
             decision=inactive_decision,
         )
-        record_attention_servo_forensic_tick(
-            coordinator,
-            source=source,
-            observed_at=observed_at,
-            camera_snapshot=camera_snapshot,
-            attention_target=attention_target,
-            attention_target_debug=attention_target_debug,
-            decision=inactive_decision,
-        )
+        try:
+            record_attention_servo_forensic_tick(
+                coordinator,
+                source=source,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                attention_target=attention_target,
+                attention_target_debug=attention_target_debug,
+                decision=inactive_decision,
+            )
+        except Exception as exc:
+            _record_fault_safe(
+                coordinator,
+                event="proactive_attention_servo_forensic_tick_failed",
+                message="Failed to record one forensic attention-servo tick for a non-authoritative source.",
+                error=exc,
+                data={"observed_at": observed_at, "source": source},
+            )
         return
     try:
         decision = controller.update(
@@ -278,7 +864,8 @@ def update_attention_servo_follow(
             decision=decision,
         )
     except Exception as exc:
-        coordinator._record_fault(
+        _record_fault_safe(
+            coordinator,
             event="proactive_attention_servo_follow_failed",
             message="Failed to update the attention-follow servo output.",
             error=exc,
@@ -303,9 +890,20 @@ def record_attention_servo_forensic_tick(
     controller = coordinator.attention_servo_controller
     controller_debug = None
     if controller is not None and hasattr(controller, "debug_snapshot"):
-        controller_debug = controller.debug_snapshot(observed_at=observed_at)
+        try:
+            controller_debug = controller.debug_snapshot(observed_at=observed_at)
+        except Exception as exc:
+            _record_fault_safe(
+                coordinator,
+                event="proactive_attention_servo_debug_snapshot_failed",
+                message="Failed to snapshot servo-controller debug state for forensic tracing.",
+                error=exc,
+                data={"observed_at": observed_at},
+            )
+            controller_debug = None
     coordinator._attention_servo_forensic_tick_index += 1
-    coordinator._append_ops_event(
+    _append_ops_event_safe(
+        coordinator,
         event="proactive_attention_servo_forensic_tick",
         message="Recorded one forensic attention-servo tick for end-to-end exit-follow debugging.",
         data={
@@ -331,6 +929,7 @@ def record_attention_servo_forensic_tick(
                 ),
                 "primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
                 "primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
+                "camera_frame_age_s": _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
                 "visible_persons": summarize_visible_persons(camera_snapshot),
             },
             "attention_target": {
@@ -365,7 +964,7 @@ def record_attention_servo_forensic_tick(
                 source=source,
                 camera_snapshot=camera_snapshot,
                 attention_target=attention_target,
-                controller_debug=controller_debug,
+                controller_debug=_coerce_mapping(controller_debug),
                 decision=decision,
             ),
         },
@@ -376,7 +975,7 @@ def summarize_visible_persons(camera_snapshot: ProactiveCameraSnapshot) -> list[
     """Return one bounded summary of current visible-person anchors."""
 
     summaries: list[dict[str, object]] = []
-    for person in camera_snapshot.visible_persons[:4]:
+    for person in camera_snapshot.visible_persons[:_MAX_VISIBLE_PERSON_SUMMARY]:
         box = getattr(person, "box", None)
         summaries.append(
             {
@@ -459,6 +1058,12 @@ def build_attention_servo_decision_ledger(
         "holding_exit_limit": "The exit limit was reached and released, so the controller is intentionally holding still at the limit.",
         "disabled": "The servo controller is disabled by configuration, so no physical motion is allowed.",
         "ignored_non_authoritative_source": "The current source is not authoritative for physical servo control, so this tick is intentionally ignored.",
+        "camera_offline": "The camera is offline, so the servo controller is fail-closed rather than acting on stale perception.",
+        "camera_not_ready": "The camera pipeline is not ready yet, so the servo controller is intentionally holding still.",
+        "camera_ai_not_ready": "The camera AI path is not ready yet, so the servo controller is intentionally holding still.",
+        "camera_error": "The camera reported an error, so the servo controller is fail-closed rather than acting on stale perception.",
+        "camera_frame_missing": "No camera frame timestamp is available, so the servo controller is intentionally holding still.",
+        "stale_camera_frame": "The latest camera frame is stale, so the servo controller is fail-closed rather than acting on old perception.",
     }
     return {
         "decision_id": f"{coordinator._attention_servo_forensic_run_id}:{coordinator._attention_servo_forensic_tick_index}",
@@ -573,12 +1178,21 @@ def record_attention_follow_pipeline_if_changed(
 
     controller = coordinator.attention_servo_controller
     controller_config = None if controller is None else getattr(controller, "config", None)
+    block_reason = _camera_attention_block_reason(
+        coordinator,
+        observed_at=observed_at,
+        camera_snapshot=camera_snapshot,
+    )
     key = (
         source,
         camera_snapshot.person_visible,
         camera_snapshot.person_count,
         camera_snapshot.camera_ready,
         camera_snapshot.camera_ai_ready,
+        camera_snapshot.camera_online,
+        camera_snapshot.camera_error,
+        _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
+        block_reason,
         _round_optional_ratio(camera_snapshot.primary_person_center_x),
         None if attention_target is None else attention_target.state,
         None if attention_target is None else attention_target.active,
@@ -599,11 +1213,15 @@ def record_attention_follow_pipeline_if_changed(
     data = {
         "observed_at": observed_at,
         "follow_source": source,
+        "camera_online": camera_snapshot.camera_online,
+        "camera_error": camera_snapshot.camera_error,
         "camera_person_visible": camera_snapshot.person_visible,
         "camera_person_count": camera_snapshot.person_count,
         "camera_visible_person_count": len(camera_snapshot.visible_persons),
         "camera_ready": camera_snapshot.camera_ready,
         "camera_ai_ready": camera_snapshot.camera_ai_ready,
+        "camera_frame_age_s": _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
+        "camera_attention_block_reason": block_reason,
         "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
         "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
         "attention_target_state": None if attention_target is None else attention_target.state,
@@ -627,19 +1245,23 @@ def record_attention_follow_pipeline_if_changed(
         "servo_driver": None if controller_config is None else getattr(controller_config, "driver", None),
         "servo_gpio": None if controller_config is None else getattr(controller_config, "gpio", None),
     }
-    coordinator._append_ops_event(
+    _append_ops_event_safe(
+        coordinator,
         event="proactive_attention_follow_pipeline",
         message="Recorded one changed attention-follow pipeline state before servo gating.",
         data=data,
     )
-    coordinator._emit(
-        _emit_key_value_line(
+    _emit_safe(
+        coordinator,
+        line=_emit_key_value_line(
             "attention_follow_pipeline",
             source=source,
             person_visible=camera_snapshot.person_visible,
             person_count=camera_snapshot.person_count,
             camera_ready=camera_snapshot.camera_ready,
             camera_ai_ready=camera_snapshot.camera_ai_ready,
+            camera_frame_age_s=_round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
+            block_reason=block_reason,
             target_state=None if attention_target is None else attention_target.state,
             target_active=None if attention_target is None else attention_target.active,
             target_center_x=_round_optional_ratio(
@@ -651,7 +1273,9 @@ def record_attention_follow_pipeline_if_changed(
             servo_enabled=None if controller_config is None else getattr(controller_config, "enabled", None),
             follow_exit_only=None if controller_config is None else getattr(controller_config, "follow_exit_only", None),
             servo_driver=None if controller_config is None else getattr(controller_config, "driver", None),
-        )
+        ),
+        fault_event="proactive_attention_follow_pipeline_emit_failed",
+        fault_message="Failed to emit the one-line attention-follow pipeline trace.",
     )
 
 
@@ -681,7 +1305,8 @@ def record_attention_servo_follow_if_changed(
     if key == coordinator._last_attention_servo_follow_key:
         return
     coordinator._last_attention_servo_follow_key = key
-    coordinator._append_ops_event(
+    _append_ops_event_safe(
+        coordinator,
         event="proactive_attention_servo_follow",
         message="Updated the bounded body-orientation servo trace.",
         data={
@@ -703,8 +1328,9 @@ def record_attention_servo_follow_if_changed(
             "decision_commanded_pulse_width_us": decision.commanded_pulse_width_us,
         },
     )
-    coordinator._emit(
-        _emit_key_value_line(
+    _emit_safe(
+        coordinator,
+        line=_emit_key_value_line(
             "attention_servo_decision",
             source=source,
             reason=decision.reason,
@@ -713,7 +1339,9 @@ def record_attention_servo_follow_if_changed(
             applied_center_x=_round_optional_ratio(decision.applied_center_x),
             target_pulse_us=decision.target_pulse_width_us,
             commanded_pulse_us=decision.commanded_pulse_width_us,
-        )
+        ),
+        fault_event="proactive_attention_servo_emit_failed",
+        fault_message="Failed to emit the one-line attention-servo decision trace.",
     )
 
 
@@ -754,17 +1382,20 @@ def record_display_attention_follow_if_changed(
             else coordinator.latest_attention_target_snapshot.target_center_x
         ),
         None if publish_result is None else publish_result.action,
+        None if publish_result is None else publish_result.owner,
         None if decision is None else decision.reason,
         None if decision is None else decision.gaze.value,
-        None if decision is None else decision.cue_gaze_x,
-        None if decision is None else decision.cue_gaze_y,
-        None if decision is None else decision.head_dx,
+        _round_optional_float(None if decision is None else decision.cue_gaze_x),
+        _round_optional_float(None if decision is None else decision.cue_gaze_y),
+        _round_optional_float(None if decision is None else decision.head_dx),
+        _round_optional_float(None if decision is None else decision.head_dy),
         None if decision is None else decision.speaker_locked,
     )
     if key == coordinator._last_display_attention_follow_key:
         return
     coordinator._last_display_attention_follow_key = key
-    coordinator._append_ops_event(
+    _append_ops_event_safe(
+        coordinator,
         event="proactive_display_attention_follow",
         message="Updated the bounded HDMI attention-follow trace.",
         data={
@@ -783,11 +1414,7 @@ def record_display_attention_follow_if_changed(
             "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
             "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
             "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
-            "camera_frame_age_s": _round_optional_seconds(
-                None
-                if camera_snapshot.last_camera_frame_at is None
-                else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
-            ),
+            "camera_frame_age_s": _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
             "attention_target_state": (
                 None if coordinator.latest_attention_target_snapshot is None else coordinator.latest_attention_target_snapshot.state
             ),
@@ -823,10 +1450,10 @@ def record_display_attention_follow_if_changed(
             "publish_owner": None if publish_result is None else publish_result.owner,
             "decision_reason": None if decision is None else decision.reason,
             "decision_gaze": None if decision is None else decision.gaze.value,
-            "decision_cue_gaze_x": None if decision is None else decision.cue_gaze_x,
-            "decision_cue_gaze_y": None if decision is None else decision.cue_gaze_y,
-            "decision_head_dx": None if decision is None else decision.head_dx,
-            "decision_head_dy": None if decision is None else decision.head_dy,
+            "decision_cue_gaze_x": _round_optional_float(None if decision is None else decision.cue_gaze_x),
+            "decision_cue_gaze_y": _round_optional_float(None if decision is None else decision.cue_gaze_y),
+            "decision_head_dx": _round_optional_float(None if decision is None else decision.head_dx),
+            "decision_head_dy": _round_optional_float(None if decision is None else decision.head_dy),
             "decision_speaker_locked": None if decision is None else decision.speaker_locked,
         },
     )
@@ -871,10 +1498,11 @@ def record_attention_debug_tick(
                 "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
                 "camera_looking_signal_state": camera_snapshot.looking_signal_state,
                 "camera_looking_signal_source": camera_snapshot.looking_signal_source,
-                "camera_frame_age_s": _round_optional_seconds(
-                    None
-                    if camera_snapshot.last_camera_frame_at is None
-                    else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
+                "camera_frame_age_s": _round_optional_seconds(_camera_frame_age_s(observed_at, camera_snapshot)),
+                "camera_attention_block_reason": _camera_attention_block_reason(
+                    coordinator,
+                    observed_at=observed_at,
+                    camera_snapshot=camera_snapshot,
                 ),
             }
         )
@@ -917,10 +1545,10 @@ def record_attention_debug_tick(
             {
                 "decision_reason": decision.reason,
                 "decision_gaze": decision.gaze.value,
-                "decision_cue_gaze_x": decision.cue_gaze_x,
-                "decision_cue_gaze_y": decision.cue_gaze_y,
-                "decision_head_dx": decision.head_dx,
-                "decision_head_dy": decision.head_dy,
+                "decision_cue_gaze_x": _round_optional_float(decision.cue_gaze_x),
+                "decision_cue_gaze_y": _round_optional_float(decision.cue_gaze_y),
+                "decision_head_dx": _round_optional_float(decision.head_dx),
+                "decision_head_dy": _round_optional_float(decision.head_dy),
                 "decision_speaker_locked": decision.speaker_locked,
             }
         )
@@ -938,10 +1566,11 @@ def record_attention_debug_tick(
         stream.append_tick(
             outcome=outcome,
             observed_at=observed_at,
-            data=payload,
+            data=_sanitize_debug_mapping(payload),
         )
     except Exception as exc:
-        coordinator._record_fault(
+        _record_fault_safe(
+            coordinator,
             event="proactive_attention_debug_stream_failed",
             message="Failed to append the bounded attention debug tick.",
             error=exc,

@@ -285,6 +285,135 @@ class PersistentMemoryEntry:
     updated_at: datetime = field(default_factory=_utcnow)
 
 
+def _managed_context_entry_to_payload(entry: ManagedContextEntry) -> dict[str, object]:
+    return {
+        "key": entry.key,
+        "instruction": entry.instruction,
+        "updated_at": _coerce_utc(entry.updated_at).isoformat(),
+    }
+
+
+def _managed_context_entry_from_payload(payload: Mapping[str, object]) -> ManagedContextEntry | None:
+    key = _slugify(str(payload.get("key", "")), fallback="update")
+    instruction = _normalize_text(str(payload.get("instruction", "")), limit=220)
+    if not key or not instruction:
+        return None
+    return ManagedContextEntry(
+        key=key,
+        instruction=instruction,
+        updated_at=_parse_datetime(str(payload.get("updated_at", ""))),
+    )
+
+
+def _managed_context_entry_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "kind": "managed_context_entry",
+        "slot_key": _slugify(str(payload.get("key", "")), fallback="update"),
+        "summary": _normalize_text(str(payload.get("instruction", "")), limit=220),
+        "updated_at": _normalize_text(str(payload.get("updated_at", "")), limit=80),
+    }
+
+
+def _managed_context_entry_content(payload: Mapping[str, object]) -> str:
+    parts = (
+        _slugify(str(payload.get("key", "")), fallback="update"),
+        _normalize_text(str(payload.get("instruction", "")), limit=220),
+    )
+    return " ".join(part for part in parts if part)
+
+
+def _persistent_memory_entry_to_payload(entry: PersistentMemoryEntry) -> dict[str, object]:
+    return {
+        "entry_id": entry.entry_id,
+        "kind": entry.kind,
+        "summary": entry.summary,
+        "details": entry.details,
+        "created_at": _coerce_utc(entry.created_at).isoformat(),
+        "updated_at": _coerce_utc(entry.updated_at).isoformat(),
+    }
+
+
+def _persistent_memory_entry_from_payload(payload: Mapping[str, object]) -> PersistentMemoryEntry | None:
+    summary = _normalize_text(str(payload.get("summary", "")), limit=220)
+    if not summary:
+        return None
+    details_value = payload.get("details")
+    return PersistentMemoryEntry(
+        entry_id=_normalize_entry_id(str(payload.get("entry_id", ""))),
+        kind=_slugify(str(payload.get("kind", "memory")), fallback="memory"),
+        summary=summary,
+        details=_normalize_text(str(details_value), limit=420) or None if details_value is not None else None,
+        created_at=_parse_datetime(str(payload.get("created_at", ""))),
+        updated_at=_parse_datetime(str(payload.get("updated_at", payload.get("created_at", "")))),
+    )
+
+
+def _persistent_memory_entry_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    details_value = payload.get("details")
+    return {
+        "kind": _slugify(str(payload.get("kind", "memory")), fallback="memory"),
+        "summary": _normalize_text(str(payload.get("summary", "")), limit=220),
+        "created_at": _normalize_text(str(payload.get("created_at", "")), limit=80),
+        "updated_at": _normalize_text(str(payload.get("updated_at", "")), limit=80),
+        "status": "active",
+        "value_key": _normalize_entry_id(str(payload.get("entry_id", ""))),
+        "slot_key": _slugify(str(payload.get("kind", "memory")), fallback="memory"),
+        "question": _normalize_text(str(details_value), limit=220) if details_value is not None else "",
+    }
+
+
+def _persistent_memory_entry_content(payload: Mapping[str, object]) -> str:
+    details_value = payload.get("details")
+    parts = (
+        _slugify(str(payload.get("kind", "memory")), fallback="memory"),
+        _normalize_text(str(payload.get("summary", "")), limit=220),
+        _normalize_text(str(details_value), limit=420) if details_value is not None else "",
+    )
+    return " ".join(part for part in parts if part)
+
+
+def _resolve_remote_collection_head(
+    *,
+    remote_records: object,
+    remote_snapshot_kind: str | None,
+    local_entries: tuple[object, ...],
+) -> dict[str, object] | None:
+    """Resolve one prompt/managed current head without forcing a bootstrap write.
+
+    The fixed `.../catalog/current` document is authoritative when present.
+    When it is missing, readiness/render paths first reuse the read-only legacy
+    snapshot probe. Only when both remote heads are absent and the local
+    collection is empty do we synthesize the canonical empty catalog head
+    locally, because writing an empty current head during watchdog bootstrap
+    has proven slow enough to strand the Pi display on ERROR despite a healthy
+    backend.
+    """
+
+    if remote_snapshot_kind is None:
+        return None
+    probe_current_head = getattr(remote_records, "probe_current_head", None)
+    if callable(probe_current_head):
+        direct_head = probe_current_head(snapshot_kind=remote_snapshot_kind)
+        if isinstance(direct_head, Mapping):
+            return dict(direct_head)
+    probe_legacy_collection_head = getattr(remote_records, "probe_legacy_collection_head", None)
+    if callable(probe_legacy_collection_head):
+        legacy_head = probe_legacy_collection_head(
+            snapshot_kind=remote_snapshot_kind,
+            prefer_metadata_only=True,
+        )
+        if isinstance(legacy_head, Mapping):
+            return dict(legacy_head)
+    if local_entries:
+        return None
+    empty_collection_head = getattr(remote_records, "empty_collection_head", None)
+    if callable(empty_collection_head):
+        empty_head = empty_collection_head(snapshot_kind=remote_snapshot_kind)
+        if isinstance(empty_head, Mapping):
+            return dict(empty_head)
+    return None
+
+
 class ManagedContextFileStore:
     """Manage a markdown-backed prompt-context section with optional remote sync.
 
@@ -306,6 +435,9 @@ class ManagedContextFileStore:
         self.path = _resolve_storage_path(path, root_dir=root_dir)
         self.section_title = section_title
         self.remote_state = remote_state
+        from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
+
+        self._remote_records = LongTermRemoteCurrentRecordStore(remote_state)
         self.remote_snapshot_kind = _normalize_text(remote_snapshot_kind or "", limit=80) or None
         # AUDIT-FIX(#5): Share locks across instances that target the same file or snapshot kind.
         self._lock_names = [f"path::{self.path}"]
@@ -318,7 +450,7 @@ class ManagedContextFileStore:
             yield
 
     def _remote_enabled(self) -> bool:
-        return bool(self.remote_state is not None and self.remote_state.enabled and self.remote_snapshot_kind)
+        return bool(self._remote_records.enabled() and self.remote_snapshot_kind)
 
     def _migration_enabled(self) -> bool:
         config = getattr(self.remote_state, "config", None)
@@ -340,7 +472,6 @@ class ManagedContextFileStore:
 
         with self._locked():
             if self._remote_enabled():
-                # AUDIT-FIX(#2): Treat valid-empty, missing, invalid, and unavailable remote snapshots as different states.
                 status, remote_entries = self._try_load_remote_entries()
                 if status == "ok":
                     return remote_entries
@@ -348,7 +479,8 @@ class ManagedContextFileStore:
                 local_entries = self._load_local_entries()
                 if local_entries and status in {"missing", "invalid"} and self._migration_enabled():
                     self._try_save_remote_entries(local_entries)
-                return local_entries
+                    return local_entries
+                return ()
             return self._load_local_entries()
 
     def upsert(self, *, category: str, instruction: str) -> ManagedContextEntry:
@@ -441,33 +573,50 @@ class ManagedContextFileStore:
         with self._locked():
             if not self._remote_enabled():
                 return False
+            local_entries = self._load_local_entries()
 
             try:
-                probe = self.remote_state.probe_snapshot_load(
-                    snapshot_kind=self.remote_snapshot_kind,
-                    prefer_cached_document_id=True,
-                    prefer_metadata_only=True,
+                probe_payload = _resolve_remote_collection_head(
+                    remote_records=self._remote_records,
+                    remote_snapshot_kind=self.remote_snapshot_kind,
+                    local_entries=local_entries,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
                     raise
-                # AUDIT-FIX(#4): Network or backend outages should not crash startup-time snapshot checks.
                 LOGGER.warning(
-                    "Failed to probe managed-context snapshot %r: %s",
+                    "Failed to probe managed-context current head %r: %s",
                     self.remote_snapshot_kind,
                     exc,
                 )
                 return False
-            if isinstance(probe.payload, dict) and self._is_managed_context_payload(probe.payload):
+            if isinstance(probe_payload, Mapping):
                 return False
-            if probe.status == "unavailable":
-                from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+            if not local_entries:
+                return False
+            return self._try_save_remote_entries(local_entries)
 
-                raise LongTermRemoteUnavailableError(
-                    probe.detail
-                    or f"Failed to read remote long-term snapshot {self.remote_snapshot_kind!r}."
-                )
-            return self._try_save_remote_entries(self._load_local_entries())
+    def probe_remote_current_head(self) -> dict[str, object] | None:
+        """Expose the current-head probe used by runtime readiness checks."""
+
+        if not self._remote_enabled() or self.remote_snapshot_kind is None:
+            return None
+        return _resolve_remote_collection_head(
+            remote_records=self._remote_records,
+            remote_snapshot_kind=self.remote_snapshot_kind,
+            local_entries=self._load_local_entries(),
+        )
+
+    def load_remote_current_head(self) -> dict[str, object] | None:
+        """Expose the authoritative current-head payload for runtime health checks."""
+
+        if not self._remote_enabled() or self.remote_snapshot_kind is None:
+            return None
+        return _resolve_remote_collection_head(
+            remote_records=self._remote_records,
+            remote_snapshot_kind=self.remote_snapshot_kind,
+            local_entries=self._load_local_entries(),
+        )
 
     def _split_document(self) -> tuple[str, tuple[ManagedContextEntry, ...], str]:
         text = _read_text_file(self.path)
@@ -518,65 +667,36 @@ class ManagedContextFileStore:
         _prefix, managed_entries, _suffix = self._split_document()
         return managed_entries
 
-    def _entries_from_payload(self, payload: dict[str, object]) -> tuple[ManagedContextEntry, ...]:
-        if payload.get("schema") != _MANAGED_CONTEXT_SCHEMA:
-            return ()
-        if payload.get("version") != _MANAGED_CONTEXT_VERSION:
-            return ()
-        items = payload.get("entries")
-        if not isinstance(items, list):
-            return ()
-        entries: list[ManagedContextEntry] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            key = _slugify(str(item.get("key", "")), fallback="update")
-            instruction = _normalize_text(str(item.get("instruction", "")), limit=220)
-            if not instruction:
-                continue
-            entries.append(
-                ManagedContextEntry(
-                    key=key,
-                    instruction=instruction,
-                    updated_at=_parse_datetime(str(item.get("updated_at", ""))),
-                )
-            )
-        return tuple(entries)
-
-    def _is_managed_context_payload(self, payload: Mapping[str, object]) -> bool:
-        if payload.get("schema") != _MANAGED_CONTEXT_SCHEMA:
-            return False
-        if payload.get("version") != _MANAGED_CONTEXT_VERSION:
-            return False
-        return isinstance(payload.get("entries"), list)
-
     def _try_load_remote_entries(self) -> tuple[str, tuple[ManagedContextEntry, ...]]:
         if not self._remote_enabled():
             return "disabled", ()
         if self.remote_state is None or self.remote_snapshot_kind is None:
             return "disabled", ()
         try:
-            payload = self.remote_state.load_snapshot(snapshot_kind=self.remote_snapshot_kind)
+            head = self.load_remote_current_head()
+            if not isinstance(head, Mapping):
+                return "missing", ()
+            payloads = self._remote_records.load_collection_payloads(
+                snapshot_kind=self.remote_snapshot_kind,
+                head_payload=head,
+            )
         except Exception as exc:
             if _is_remote_unavailable_error(exc):
                 raise
-            # AUDIT-FIX(#4): Remote state is optional at runtime; backend failures must degrade to local state.
             LOGGER.warning(
-                "Failed to load managed-context snapshot %r: %s",
+                "Failed to load managed-context current head %r: %s",
                 self.remote_snapshot_kind,
                 exc,
             )
             return "error", ()
-
-        if payload is None:
-            return "missing", ()
-        if not isinstance(payload, dict):
-            LOGGER.warning("Managed-context snapshot %r has a non-dict payload.", self.remote_snapshot_kind)
-            return "invalid", ()
-        if not self._is_managed_context_payload(payload):
-            LOGGER.warning("Managed-context snapshot %r has an invalid schema.", self.remote_snapshot_kind)
-            return "invalid", ()
-        return "ok", self._entries_from_payload(payload)
+        entries: list[ManagedContextEntry] = []
+        for payload in payloads:
+            entry = _managed_context_entry_from_payload(payload)
+            if entry is None:
+                LOGGER.warning("Managed-context item in %r is invalid.", self.remote_snapshot_kind)
+                continue
+            entries.append(entry)
+        return "ok", tuple(entries)
 
     def _try_save_remote_entries(self, entries: tuple[ManagedContextEntry, ...]) -> bool:
         if not self._remote_enabled():
@@ -609,19 +729,15 @@ class ManagedContextFileStore:
     def _save_remote_entries(self, entries: tuple[ManagedContextEntry, ...]) -> None:
         if self.remote_state is None or self.remote_snapshot_kind is None:
             raise RuntimeError("Remote managed-context storage is not configured.")
-        payload = {
-            "schema": _MANAGED_CONTEXT_SCHEMA,
-            "version": _MANAGED_CONTEXT_VERSION,
-            "entries": [
-                {
-                    "key": entry.key,
-                    "instruction": entry.instruction,
-                    "updated_at": _coerce_utc(entry.updated_at).isoformat(),
-                }
-                for entry in entries
-            ],
-        }
-        self.remote_state.save_snapshot(snapshot_kind=self.remote_snapshot_kind, payload=payload)
+        written_at = max((_coerce_utc(entry.updated_at).isoformat() for entry in entries), default=None)
+        self._remote_records.save_collection(
+            snapshot_kind=self.remote_snapshot_kind,
+            item_payloads=(_managed_context_entry_to_payload(entry) for entry in entries),
+            item_id_getter=lambda payload: payload.get("key"),
+            metadata_builder=_managed_context_entry_metadata,
+            content_builder=_managed_context_entry_content,
+            written_at=written_at,
+        )
 
     def _write_document(
         self,
@@ -670,6 +786,9 @@ class PersistentMemoryMarkdownStore:
         self.path = _resolve_storage_path(path, root_dir=root_dir)
         self.max_entries = _coerce_limit(max_entries, default=_DEFAULT_MAX_ENTRIES)
         self.remote_state = remote_state
+        from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
+
+        self._remote_records = LongTermRemoteCurrentRecordStore(remote_state)
         self.remote_snapshot_kind = _normalize_text(remote_snapshot_kind, limit=80) or "prompt_memory"
         # AUDIT-FIX(#5): Use shared named locks to prevent lost updates under concurrent access.
         self._lock_names = [f"path::{self.path}", f"snapshot::{self.remote_snapshot_kind}"]
@@ -680,7 +799,7 @@ class PersistentMemoryMarkdownStore:
             yield
 
     def _remote_enabled(self) -> bool:
-        return bool(self.remote_state is not None and self.remote_state.enabled)
+        return self._remote_records.enabled()
 
     def _migration_enabled(self) -> bool:
         config = getattr(self.remote_state, "config", None)
@@ -711,7 +830,6 @@ class PersistentMemoryMarkdownStore:
 
         with self._locked():
             if self._remote_enabled():
-                # AUDIT-FIX(#2): Valid empty remote memory snapshots must stay empty instead of silently rehydrating local data.
                 status, remote_entries = self._try_load_remote_entries()
                 if status == "ok":
                     return remote_entries
@@ -719,7 +837,8 @@ class PersistentMemoryMarkdownStore:
                 local_entries = self._load_local_entries()
                 if local_entries and status in {"missing", "invalid"} and self._migration_enabled():
                     self._try_save_remote_entries(local_entries)
-                return local_entries
+                    return local_entries
+                return ()
             return self._load_local_entries()
 
     def ensure_remote_snapshot(self) -> bool:
@@ -728,33 +847,50 @@ class PersistentMemoryMarkdownStore:
         with self._locked():
             if not self._remote_enabled():
                 return False
+            local_entries = self._load_local_entries()
 
             try:
-                probe = self.remote_state.probe_snapshot_load(
-                    snapshot_kind=self.remote_snapshot_kind,
-                    prefer_cached_document_id=True,
-                    prefer_metadata_only=True,
+                probe_payload = _resolve_remote_collection_head(
+                    remote_records=self._remote_records,
+                    remote_snapshot_kind=self.remote_snapshot_kind,
+                    local_entries=local_entries,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
                     raise
-                # AUDIT-FIX(#4): Avoid crashing the app when the remote backend is temporarily unavailable.
                 LOGGER.warning(
-                    "Failed to probe prompt-memory snapshot %r: %s",
+                    "Failed to probe prompt-memory current head %r: %s",
                     self.remote_snapshot_kind,
                     exc,
                 )
                 return False
-            if isinstance(probe.payload, dict) and self._is_prompt_memory_payload(probe.payload):
+            if isinstance(probe_payload, Mapping):
                 return False
-            if probe.status == "unavailable":
-                from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+            if not local_entries:
+                return False
+            return self._try_save_remote_entries(local_entries)
 
-                raise LongTermRemoteUnavailableError(
-                    probe.detail
-                    or f"Failed to read remote long-term snapshot {self.remote_snapshot_kind!r}."
-                )
-            return self._try_save_remote_entries(self._load_local_entries())
+    def probe_remote_current_head(self) -> dict[str, object] | None:
+        """Expose the prompt-memory current-head probe for readiness checks."""
+
+        if not self._remote_enabled():
+            return None
+        return _resolve_remote_collection_head(
+            remote_records=self._remote_records,
+            remote_snapshot_kind=self.remote_snapshot_kind,
+            local_entries=self._load_local_entries(),
+        )
+
+    def load_remote_current_head(self) -> dict[str, object] | None:
+        """Expose the prompt-memory current-head payload for runtime health checks."""
+
+        if not self._remote_enabled():
+            return None
+        return _resolve_remote_collection_head(
+            remote_records=self._remote_records,
+            remote_snapshot_kind=self.remote_snapshot_kind,
+            local_entries=self._load_local_entries(),
+        )
 
     def _load_local_entries(self) -> tuple[PersistentMemoryEntry, ...]:
         text = _read_text_file(self.path)
@@ -918,66 +1054,36 @@ class PersistentMemoryMarkdownStore:
         rendered = "\n".join(lines).rstrip() + "\n"
         _atomic_write_text(self.path, rendered)
 
-    def _entries_from_payload(self, payload: dict[str, object]) -> tuple[PersistentMemoryEntry, ...]:
-        if payload.get("schema") != _PROMPT_MEMORY_SCHEMA:
-            return ()
-        if payload.get("version") != _PROMPT_MEMORY_VERSION:
-            return ()
-        items = payload.get("entries")
-        if not isinstance(items, list):
-            return ()
-        entries: list[PersistentMemoryEntry] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            entry = self._entry_from_mapping(
-                {
-                    "entry_id": str(item.get("entry_id", "")),
-                    "kind": str(item.get("kind", "")),
-                    "summary": str(item.get("summary", "")),
-                    "details": str(item.get("details", "")) if item.get("details") is not None else "",
-                    "created_at": str(item.get("created_at", "")),
-                    "updated_at": str(item.get("updated_at", "")),
-                }
-            )
-            if entry is not None:
-                entries.append(entry)
-        return tuple(entries)
-
-    def _is_prompt_memory_payload(self, payload: Mapping[str, object]) -> bool:
-        if payload.get("schema") != _PROMPT_MEMORY_SCHEMA:
-            return False
-        if payload.get("version") != _PROMPT_MEMORY_VERSION:
-            return False
-        return isinstance(payload.get("entries"), list)
-
     def _try_load_remote_entries(self) -> tuple[str, tuple[PersistentMemoryEntry, ...]]:
         if not self._remote_enabled():
             return "disabled", ()
         if self.remote_state is None:
             return "disabled", ()
         try:
-            payload = self.remote_state.load_snapshot(snapshot_kind=self.remote_snapshot_kind)
+            head = self.load_remote_current_head()
+            if not isinstance(head, Mapping):
+                return "missing", ()
+            payloads = self._remote_records.load_collection_payloads(
+                snapshot_kind=self.remote_snapshot_kind,
+                head_payload=head,
+            )
         except Exception as exc:
             if _is_remote_unavailable_error(exc):
                 raise
-            # AUDIT-FIX(#4): Remote memory backends are optional at runtime; fall back locally on errors.
             LOGGER.warning(
-                "Failed to load prompt-memory snapshot %r: %s",
+                "Failed to load prompt-memory current head %r: %s",
                 self.remote_snapshot_kind,
                 exc,
             )
             return "error", ()
-
-        if payload is None:
-            return "missing", ()
-        if not isinstance(payload, dict):
-            LOGGER.warning("Prompt-memory snapshot %r has a non-dict payload.", self.remote_snapshot_kind)
-            return "invalid", ()
-        if not self._is_prompt_memory_payload(payload):
-            LOGGER.warning("Prompt-memory snapshot %r has an invalid schema.", self.remote_snapshot_kind)
-            return "invalid", ()
-        return "ok", self._entries_from_payload(payload)
+        entries: list[PersistentMemoryEntry] = []
+        for payload in payloads:
+            entry = _persistent_memory_entry_from_payload(payload)
+            if entry is None:
+                LOGGER.warning("Prompt-memory item in %r is invalid.", self.remote_snapshot_kind)
+                continue
+            entries.append(entry)
+        return "ok", tuple(entries)
 
     def _try_save_remote_entries(self, entries: tuple[PersistentMemoryEntry, ...]) -> bool:
         if not self._remote_enabled():
@@ -1010,22 +1116,15 @@ class PersistentMemoryMarkdownStore:
     def _save_remote_entries(self, entries: tuple[PersistentMemoryEntry, ...]) -> None:
         if self.remote_state is None:
             raise RuntimeError("Remote prompt-memory storage is not configured.")
-        payload = {
-            "schema": _PROMPT_MEMORY_SCHEMA,
-            "version": _PROMPT_MEMORY_VERSION,
-            "entries": [
-                {
-                    "entry_id": entry.entry_id,
-                    "kind": entry.kind,
-                    "summary": entry.summary,
-                    "details": entry.details,
-                    "created_at": _coerce_utc(entry.created_at).isoformat(),
-                    "updated_at": _coerce_utc(entry.updated_at).isoformat(),
-                }
-                for entry in entries
-            ],
-        }
-        self.remote_state.save_snapshot(snapshot_kind=self.remote_snapshot_kind, payload=payload)
+        written_at = max((_coerce_utc(entry.updated_at).isoformat() for entry in entries), default=None)
+        self._remote_records.save_collection(
+            snapshot_kind=self.remote_snapshot_kind,
+            item_payloads=(_persistent_memory_entry_to_payload(entry) for entry in entries),
+            item_id_getter=lambda payload: payload.get("entry_id"),
+            metadata_builder=_persistent_memory_entry_metadata,
+            content_builder=_persistent_memory_entry_content,
+            written_at=written_at,
+        )
 
     def _entry_from_mapping(self, data: dict[str, str]) -> PersistentMemoryEntry | None:
         summary = _normalize_text(data.get("summary", ""), limit=220)

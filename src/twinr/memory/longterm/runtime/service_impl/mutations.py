@@ -56,14 +56,14 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
         """Resolve one open conflict by selecting the surviving memory."""
 
         with self._store_lock:
-            conflicts = self.object_store.load_conflicts()
+            conflicts = self.object_store.load_conflicts_by_slot_keys((slot_key,))
             conflict = next((item for item in conflicts if item.slot_key == slot_key), None)
             if conflict is None:
                 raise ValueError(f"No open long-term memory conflict found for slot {slot_key!r}.")
             result = self.conflict_resolver.resolve(
                 conflict=conflict,
-                objects=self.object_store.load_objects(),
-                remaining_conflicts=conflicts,
+                objects=self.object_store.load_objects_for_conflict(conflict),
+                remaining_conflicts=self.object_store.load_conflicts_fine_grained(),
                 selected_memory_id=selected_memory_id,
             )
             self.object_store.apply_conflict_resolution(result)
@@ -95,7 +95,7 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
         """Confirm one memory, or resolve its conflict if it is disputed."""
 
         with self._store_lock:
-            conflicts = self.object_store.load_conflicts()
+            conflicts = self.object_store.load_conflicts_for_memory_ids((memory_id,))
             conflict = next(
                 (
                     item
@@ -107,8 +107,8 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
             if conflict is not None:
                 result = self.conflict_resolver.resolve(
                     conflict=conflict,
-                    objects=self.object_store.load_objects(),
-                    remaining_conflicts=conflicts,
+                    objects=self.object_store.load_objects_for_conflict(conflict),
+                    remaining_conflicts=self.object_store.load_conflicts_fine_grained(),
                     selected_memory_id=memory_id,
                 )
                 self.object_store.apply_conflict_resolution(result)

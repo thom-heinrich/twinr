@@ -159,6 +159,8 @@ The watchdog:
 - prints one JSON sample line per probe for journald/systemd capture
 - writes a rolling artifact to `artifacts/stores/ops/remote_memory_watchdog.json`
 - defaults to a `1.0s` cadence via `TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S`
+- accepts `TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_TIMEOUT_S` as the steady-state base timeout budget
+- accepts `TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_STARTUP_PROBE_TIMEOUT_S` as the pre-first-success startup budget; when unset, Twinr keeps the 15s steady-state base timeout, grants the first deep probe up to 45s, and then pads the effective in-flight cutoff from recent successful probe latencies so slow-but-healthy archive checks do not synthesize false fail snapshots
 
 For Pi deployment, install the provided systemd unit under [`hardware/ops`](../hardware/ops/README.md).
 

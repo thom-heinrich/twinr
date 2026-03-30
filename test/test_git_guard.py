@@ -245,6 +245,43 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("sensitive-assignment", rule_ids)
 
+    def test_scan_staged_allows_prefix_metadata_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                (
+                    '_CURSOR_TOKEN_PREFIX = "smarthome-route-cursor:"\n'
+                    'EVENT_NAMESPACE = "route-event:"\n'
+                ),
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_still_blocks_non_prefix_literals_for_prefix_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                'token_prefix = "live-real-secret-value"\n',
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            issues = cast(list[dict[str, Any]], payload["issues"])
+            rule_ids = {issue["rule_id"] for issue in issues}
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertIn("sensitive-assignment", rule_ids)
+
     def test_scan_staged_allows_blocked_term_policy_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -281,6 +318,42 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_allows_placeholder_secret_prefixes_in_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "test" / "test_openai_backend.py").parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / "test" / "test_openai_backend.py").write_text(
+                'openai_api_key = "sk-proj-example"\n',
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "test/test_openai_backend.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
+    def test_scan_staged_still_blocks_real_secret_prefixes_in_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            secret_token = "sk-" + "live-real-secret-value"
+            (repo_root / "test" / "test_openai_backend.py").parent.mkdir(parents=True, exist_ok=True)
+            (repo_root / "test" / "test_openai_backend.py").write_text(
+                f'openai_api_key = "{secret_token}"\n',
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "test/test_openai_backend.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            issues = cast(list[dict[str, Any]], payload["issues"])
+            self.assertEqual(issues[0]["rule_id"], "secret-prefix")
 
     def test_scan_staged_ignores_numeric_ranges_that_are_not_phone_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -88,6 +88,9 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         "streaming_transcript_verifier_enabled": _parse_bool(
             get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_ENABLED"), True
         ),
+        "streaming_transcript_verifier_lazy_init": _parse_bool(
+            get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_LAZY_INIT"), True
+        ),
         "streaming_transcript_verifier_model": get_value(
             "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MODEL", "gpt-4o-mini-transcribe"
         )

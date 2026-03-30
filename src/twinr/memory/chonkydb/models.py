@@ -277,6 +277,48 @@ def _coerce_record_item_tuple(
     return tuple(result)
 
 
+def _coerce_graph_store_many_node_tuple(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple["ChonkyDBGraphStoreManyNode", ...]:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ChonkyDBValidationError(
+            f"{field_name} must be an iterable of ChonkyDBGraphStoreManyNode instances, not a single string/bytes value"
+        )
+    if isinstance(value, Mapping) or not isinstance(value, Iterable):
+        raise ChonkyDBValidationError(f"{field_name} must be an iterable of ChonkyDBGraphStoreManyNode instances")
+    result: list[ChonkyDBGraphStoreManyNode] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, ChonkyDBGraphStoreManyNode):
+            raise ChonkyDBValidationError(
+                f"{field_name}[{index}] must be a ChonkyDBGraphStoreManyNode, got {type(item).__name__}"
+            )
+        result.append(item)
+    return tuple(result)
+
+
+def _coerce_graph_store_many_edge_tuple(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple["ChonkyDBGraphStoreManyEdge", ...]:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ChonkyDBValidationError(
+            f"{field_name} must be an iterable of ChonkyDBGraphStoreManyEdge instances, not a single string/bytes value"
+        )
+    if isinstance(value, Mapping) or not isinstance(value, Iterable):
+        raise ChonkyDBValidationError(f"{field_name} must be an iterable of ChonkyDBGraphStoreManyEdge instances")
+    result: list[ChonkyDBGraphStoreManyEdge] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, ChonkyDBGraphStoreManyEdge):
+            raise ChonkyDBValidationError(
+                f"{field_name}[{index}] must be a ChonkyDBGraphStoreManyEdge, got {type(item).__name__}"
+            )
+        result.append(item)
+    return tuple(result)
+
+
 def _normalize_extra_mapping(extra: Mapping[str, object]) -> JsonDict:
     if not isinstance(extra, Mapping):
         raise ChonkyDBValidationError(f"extra must be a mapping, got {type(extra).__name__}")
@@ -771,6 +813,101 @@ class ChonkyDBGraphAddEdgeSmartRequest:
                 "from_ref": self.from_ref,
                 "to_ref": self.to_ref,
                 "edge_type": self.edge_type,
+            }
+        )
+        return _merge_extra(payload, self.extra, reserved_keys=_reserved_payload_keys(self))
+
+
+@dataclass(frozen=True, slots=True)
+class ChonkyDBGraphStoreManyNode:
+    """Describe one graph node inside a store-many request."""
+
+    label: str
+    chonky_id: int | str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "label", _coerce_required_str(self.label, field_name="label"))  # AUDIT-FIX(#5)
+        normalized_id = self.chonky_id
+        if normalized_id is None:
+            object.__setattr__(self, "chonky_id", None)
+        elif isinstance(normalized_id, bool):
+            raise ChonkyDBValidationError("chonky_id must be an integer or string, got bool")
+        elif isinstance(normalized_id, int):
+            object.__setattr__(self, "chonky_id", _coerce_int(normalized_id, field_name="chonky_id", minimum=0))
+        elif isinstance(normalized_id, str):
+            object.__setattr__(self, "chonky_id", _coerce_required_str(normalized_id, field_name="chonky_id"))
+        else:
+            raise ChonkyDBValidationError(
+                f"chonky_id must be an integer or string, got {type(normalized_id).__name__}"
+            )
+
+    def to_payload(self) -> JsonDict:
+        """Serialize the graph node into the store-many payload shape."""
+
+        return _drop_none(
+            {
+                "label": self.label,
+                "chonky_id": self.chonky_id,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChonkyDBGraphStoreManyEdge:
+    """Describe one graph edge inside a store-many request."""
+
+    source_label: str
+    target_label: str
+    edge_type: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_label", _coerce_required_str(self.source_label, field_name="source_label"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "target_label", _coerce_required_str(self.target_label, field_name="target_label"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "edge_type", _coerce_required_str(self.edge_type, field_name="edge_type"))  # AUDIT-FIX(#5)
+
+    def to_payload(self) -> JsonDict:
+        """Serialize the graph edge into the store-many payload shape."""
+
+        return {
+            "source_label": self.source_label,
+            "target_label": self.target_label,
+            "edge_type": self.edge_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ChonkyDBGraphStoreManyRequest:
+    """Describe a batch graph topology write for the current graph generation."""
+
+    nodes: tuple[ChonkyDBGraphStoreManyNode, ...]
+    edges: tuple[ChonkyDBGraphStoreManyEdge, ...]
+    index_name: str | None = None
+    assume_new: bool = False
+    timeout_seconds: int | None = 20
+    extra: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "nodes", _coerce_graph_store_many_node_tuple(self.nodes, field_name="nodes"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "edges", _coerce_graph_store_many_edge_tuple(self.edges, field_name="edges"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "index_name", _coerce_optional_str(self.index_name, field_name="index_name"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "assume_new", _coerce_bool(self.assume_new, field_name="assume_new"))  # AUDIT-FIX(#4)
+        object.__setattr__(
+            self,
+            "timeout_seconds",
+            _coerce_optional_int(self.timeout_seconds, field_name="timeout_seconds", minimum=1),  # AUDIT-FIX(#3)
+        )
+        object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
+
+    def to_payload(self) -> JsonDict:
+        """Serialize the graph store-many request into ChonkyDB's payload shape."""
+
+        payload = _drop_none(
+            {
+                "index_name": self.index_name,
+                "nodes": [item.to_payload() for item in self.nodes],
+                "edges": [item.to_payload() for item in self.edges],
+                "assume_new": self.assume_new,
+                "timeout_seconds": self.timeout_seconds,
             }
         )
         return _merge_extra(payload, self.extra, reserved_keys=_reserved_payload_keys(self))

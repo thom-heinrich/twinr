@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import time
 
@@ -42,6 +42,23 @@ _CATALOG_ENTRY_TEXT_FIELDS = (
     "reason",
 )
 _CATALOG_ENTRY_LIST_FIELDS = ("existing_memory_ids",)
+_CATALOG_ENTRY_OBJECT_FIELDS = ("selection_projection",)
+_KNOWN_ITEM_ENVELOPE_KEYS = (
+    "object",
+    "conflict",
+    "packet",
+    "node",
+    "edge",
+    "memory_entry",
+    "managed_context_entry",
+    "personality_snapshot",
+    "interaction_signal",
+    "place_signal",
+    "world_signal",
+    "personality_delta",
+    "world_feed_subscription",
+    "world_intelligence_state",
+)
 
 
 def _run_timed_workflow_step(
@@ -179,6 +196,26 @@ class _CachedLocalSearchSelector:
     expires_at_monotonic: float
 
 
+def _iter_known_item_envelopes(candidate: object) -> tuple[Mapping[str, object], ...]:
+    """Return nested public item envelopes carried inside a record wrapper.
+
+    Remote catalog records wrap the first-class Twinr payload inside a typed
+    ChonkyDB record envelope. Some read paths surface that wrapper, while others
+    surface only a nested payload fragment. Keeping the known envelope keys in
+    one helper lets write attestation and live-document parsing accept either
+    shape without duplicating ad-hoc key checks.
+    """
+
+    if not isinstance(candidate, Mapping):
+        return ()
+    envelopes: list[Mapping[str, object]] = []
+    for field_name in _KNOWN_ITEM_ENVELOPE_KEYS:
+        value = candidate.get(field_name)
+        if isinstance(value, dict):
+            envelopes.append(dict(value))
+    return tuple(envelopes)
+
+
 _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {
     "objects": _RemoteCollectionDefinition(
         snapshot_kind="objects",
@@ -198,6 +235,15 @@ _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {
         envelope_key="conflict",
         uri_segment="conflicts",
     ),
+    "midterm": _RemoteCollectionDefinition(
+        snapshot_kind="midterm",
+        catalog_schema="twinr_memory_midterm_catalog_v3",
+        legacy_catalog_schema="twinr_memory_midterm_catalog_v2",
+        segment_schema="twinr_memory_midterm_catalog_segment_v1",
+        item_schema="twinr_memory_midterm_packet_record_v1",
+        envelope_key="packet",
+        uri_segment="midterm",
+    ),
     "archive": _RemoteCollectionDefinition(
         snapshot_kind="archive",
         catalog_schema="twinr_memory_archive_catalog_v3",
@@ -206,6 +252,114 @@ _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {
         item_schema="twinr_memory_archive_record_v2",
         envelope_key="object",
         uri_segment="archive",
+    ),
+    "graph_nodes": _RemoteCollectionDefinition(
+        snapshot_kind="graph_nodes",
+        catalog_schema="twinr_graph_node_catalog_v3",
+        legacy_catalog_schema="twinr_graph_node_catalog_v2",
+        segment_schema="twinr_graph_node_catalog_segment_v1",
+        item_schema="twinr_graph_node_record_v1",
+        envelope_key="node",
+        uri_segment="graph_nodes",
+    ),
+    "graph_edges": _RemoteCollectionDefinition(
+        snapshot_kind="graph_edges",
+        catalog_schema="twinr_graph_edge_catalog_v3",
+        legacy_catalog_schema="twinr_graph_edge_catalog_v2",
+        segment_schema="twinr_graph_edge_catalog_segment_v1",
+        item_schema="twinr_graph_edge_record_v1",
+        envelope_key="edge",
+        uri_segment="graph_edges",
+    ),
+    "prompt_memory": _RemoteCollectionDefinition(
+        snapshot_kind="prompt_memory",
+        catalog_schema="twinr_prompt_memory_catalog_v3",
+        legacy_catalog_schema="twinr_prompt_memory_catalog_v2",
+        segment_schema="twinr_prompt_memory_catalog_segment_v1",
+        item_schema="twinr_prompt_memory_record_v1",
+        envelope_key="memory_entry",
+        uri_segment="prompt_memory",
+    ),
+    "user_context": _RemoteCollectionDefinition(
+        snapshot_kind="user_context",
+        catalog_schema="twinr_user_context_catalog_v3",
+        legacy_catalog_schema="twinr_user_context_catalog_v2",
+        segment_schema="twinr_user_context_catalog_segment_v1",
+        item_schema="twinr_user_context_record_v1",
+        envelope_key="managed_context_entry",
+        uri_segment="user_context",
+    ),
+    "personality_context": _RemoteCollectionDefinition(
+        snapshot_kind="personality_context",
+        catalog_schema="twinr_personality_context_catalog_v3",
+        legacy_catalog_schema="twinr_personality_context_catalog_v2",
+        segment_schema="twinr_personality_context_catalog_segment_v1",
+        item_schema="twinr_personality_context_record_v1",
+        envelope_key="managed_context_entry",
+        uri_segment="personality_context",
+    ),
+    "agent_personality_context_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_personality_context_v1",
+        catalog_schema="twinr_agent_personality_snapshot_catalog_v3",
+        legacy_catalog_schema="twinr_agent_personality_snapshot_catalog_v2",
+        segment_schema="twinr_agent_personality_snapshot_catalog_segment_v1",
+        item_schema="twinr_agent_personality_snapshot_record_v1",
+        envelope_key="personality_snapshot",
+        uri_segment="agent_personality_context",
+    ),
+    "agent_personality_interaction_signals_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_personality_interaction_signals_v1",
+        catalog_schema="twinr_agent_personality_interaction_signal_catalog_v3",
+        legacy_catalog_schema="twinr_agent_personality_interaction_signal_catalog_v2",
+        segment_schema="twinr_agent_personality_interaction_signal_catalog_segment_v1",
+        item_schema="twinr_agent_personality_interaction_signal_record_v1",
+        envelope_key="interaction_signal",
+        uri_segment="agent_personality_interaction_signals",
+    ),
+    "agent_personality_place_signals_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_personality_place_signals_v1",
+        catalog_schema="twinr_agent_personality_place_signal_catalog_v3",
+        legacy_catalog_schema="twinr_agent_personality_place_signal_catalog_v2",
+        segment_schema="twinr_agent_personality_place_signal_catalog_segment_v1",
+        item_schema="twinr_agent_personality_place_signal_record_v1",
+        envelope_key="place_signal",
+        uri_segment="agent_personality_place_signals",
+    ),
+    "agent_personality_world_signals_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_personality_world_signals_v1",
+        catalog_schema="twinr_agent_personality_world_signal_catalog_v3",
+        legacy_catalog_schema="twinr_agent_personality_world_signal_catalog_v2",
+        segment_schema="twinr_agent_personality_world_signal_catalog_segment_v1",
+        item_schema="twinr_agent_personality_world_signal_record_v1",
+        envelope_key="world_signal",
+        uri_segment="agent_personality_world_signals",
+    ),
+    "agent_personality_deltas_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_personality_deltas_v1",
+        catalog_schema="twinr_agent_personality_delta_catalog_v3",
+        legacy_catalog_schema="twinr_agent_personality_delta_catalog_v2",
+        segment_schema="twinr_agent_personality_delta_catalog_segment_v1",
+        item_schema="twinr_agent_personality_delta_record_v1",
+        envelope_key="personality_delta",
+        uri_segment="agent_personality_deltas",
+    ),
+    "agent_world_intelligence_subscriptions_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_world_intelligence_subscriptions_v1",
+        catalog_schema="twinr_world_intelligence_subscription_catalog_v3",
+        legacy_catalog_schema="twinr_world_intelligence_subscription_catalog_v2",
+        segment_schema="twinr_world_intelligence_subscription_catalog_segment_v1",
+        item_schema="twinr_world_intelligence_subscription_record_v1",
+        envelope_key="world_feed_subscription",
+        uri_segment="agent_world_intelligence_subscriptions",
+    ),
+    "agent_world_intelligence_state_v1": _RemoteCollectionDefinition(
+        snapshot_kind="agent_world_intelligence_state_v1",
+        catalog_schema="twinr_world_intelligence_state_catalog_v3",
+        legacy_catalog_schema="twinr_world_intelligence_state_catalog_v2",
+        segment_schema="twinr_world_intelligence_state_catalog_segment_v1",
+        item_schema="twinr_world_intelligence_state_record_v1",
+        envelope_key="world_intelligence_state",
+        uri_segment="agent_world_intelligence_state",
     ),
 }
 

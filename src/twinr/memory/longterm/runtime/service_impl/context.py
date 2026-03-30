@@ -77,10 +77,21 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                         "multimodal_writer": multimodal_writer_details,
                     },
                 )
-                topic_context = self._build_quick_topic_context(
-                    query_text=query_text,
-                    workflow_event_name="longterm_provider_context_quick_memory_remote_read_failed",
-                )
+                try:
+                    topic_context = self._build_quick_topic_context(
+                        query_text=query_text,
+                        workflow_event_name="longterm_provider_context_quick_memory_remote_read_failed",
+                    )
+                except LongTermRemoteReadFailedError as exc:
+                    # Quick-topic hints are an auxiliary low-latency lane. When that
+                    # bounded read times out, still let the main remote retriever build
+                    # the authoritative provider context for the turn.
+                    workflow_event(
+                        kind="warning",
+                        msg="longterm_provider_context_quick_memory_skipped",
+                        details=dict(exc.details),
+                    )
+                    topic_context = None
                 with self._temporary_remote_probe_cache():
                     with workflow_span(
                         name="longterm_service_provider_context_retrieval",

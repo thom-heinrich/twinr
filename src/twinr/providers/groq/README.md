@@ -13,6 +13,13 @@ requests, and preserves continuation state across tool turns.
 - run streaming and non-streaming text turns against Groq
 - manage continuation state for Groq tool-calling turns
 
+When `allow_web_search=True`, Groq uses native server-side search first.
+Cross-provider fallback is opt-in via `groq_allow_search_fallback=True`, and
+vision fallback is opt-in via `groq_allow_vision_fallback=True`. Native search
+also enforces the configured `groq_request_timeout_seconds` as a wall-clock
+budget so Pi turns cannot wait indefinitely on search responses that keep the
+socket alive.
+
 `groq` does **not** own:
 - OpenAI support-provider behavior or live-search execution
 - provider bundle selection in `src/twinr/providers/factory.py`

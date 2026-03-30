@@ -181,6 +181,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
         return TwinrConfig(
             project_root=str(root),
             runtime_state_path=str(root / "runtime-state.json"),
+            display_wayland_runtime_dir="/run/user/1000",
         )
 
     def test_run_starts_watchdog_and_streaming_when_watchdog_is_ready(self) -> None:
@@ -253,7 +254,8 @@ class RuntimeSupervisorTests(unittest.TestCase):
             for key in original:
                 os.environ.pop(key, None)
 
-            def fake_prime() -> dict[str, str]:
+            def fake_prime(*, configured_runtime_dir=None) -> dict[str, str]:
+                self.assertEqual(configured_runtime_dir, "/run/user/1000")
                 os.environ["XDG_RUNTIME_DIR"] = "/run/user/1234"
                 os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1234/bus"
                 os.environ["PULSE_SERVER"] = "unix:/run/user/1234/pulse/native"
@@ -379,11 +381,21 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 loop_owner=lambda _config, name: external_pid if name == "streaming-loop" else None,
                 pid_alive=lambda pid: pid == external_pid,
                 pid_signal=lambda _pid, _sig: None,
-                pid_cmdline=lambda pid: ("python", "-m", "twinr", "--run-streaming-loop") if pid == external_pid else (),
+                pid_cmdline=lambda pid: (
+                    "python",
+                    "-m",
+                    "twinr",
+                    "--env-file",
+                    str(root / ".env"),
+                    "--run-streaming-loop",
+                )
+                if pid == external_pid
+                else (),
                 streaming_health_grace_s=999.0,
                 restart_backoff_s=0.0,
                 manage_watchdog=False,
             )
+            supervisor._pid_cwd = lambda pid: root if pid == external_pid else None  # type: ignore[method-assign]
 
             exit_code = supervisor.run(duration_s=0.0)
 
@@ -641,7 +653,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
 
-    def test_run_ignores_transient_conversation_service_miss_when_current_child_owns_lock(self) -> None:
+    def test_run_restarts_when_conversation_service_reports_not_running_even_if_child_owns_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -684,14 +696,33 @@ class RuntimeSupervisorTests(unittest.TestCase):
                     process.pid == pid and process.exit_code is None
                     for process in factory.processes
                 ),
+                pid_cmdline=lambda pid: next(
+                    (
+                        (
+                            "python",
+                            "-m",
+                            "twinr",
+                            "--env-file",
+                            str(root / ".env"),
+                            "--run-streaming-loop",
+                        )
+                        for process in factory.processes
+                        if process.pid == pid and process.key == "streaming"
+                    ),
+                    (),
+                ),
                 streaming_health_grace_s=0.0,
                 restart_backoff_s=0.0,
+            )
+            supervisor._pid_cwd = lambda pid: next(  # type: ignore[method-assign]
+                (root for process in factory.processes if process.pid == pid and process.key == "streaming"),
+                None,
             )
 
             supervisor.run(duration_s=3.0)
 
         self.assertGreaterEqual(health_call_count, 2)
-        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
+        self.assertGreater([call["key"] for call in factory.calls].count("streaming"), 1)
 
     def test_run_waits_for_streaming_startup_progress_before_enforcing_display_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

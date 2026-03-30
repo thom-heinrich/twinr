@@ -2,6 +2,7 @@
 # BUG-1: Respected check_required_remote_dependency(force_sync=True); startup no longer ignores the caller's explicit request for a direct required-remote readiness probe.
 # BUG-2: Made degraded-startup telemetry best-effort; a broken ops event sink no longer crashes an otherwise recoverable boot.
 # BUG-3: Serialized shutdown snapshot capture against the runtime flow lock when available; this closes a real race with in-flight turn/state mutations.
+# BUG-4: Required-remote bootstrap now honors `watchdog_artifact` mode instead of forcing a second deep remote probe that can outlive the Pi supervisor startup budget and strand Twinr on a stale ERROR snapshot.
 # SEC-1: Hardened file-backed state path preflight to reject symlinked parent chains and non-regular targets before bootstrap touches runtime-owned storage paths.
 # IMP-1: Added supervisor-grade lifecycle metadata plus a redacted health_snapshot() surface that separates conversation state from runtime readiness/degraded/stopping phases.
 # IMP-2: Added optional native systemd sd_notify READY/STATUS/STOPPING/WATCHDOG support for modern Raspberry Pi service deployments without introducing a new dependency.
@@ -28,7 +29,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.agent.base_agent.state.machine import TwinrStateMachine, TwinrStatus
 from twinr.automations import AutomationStore
-from twinr.memory import LongTermMemoryService, OnDeviceMemory, TwinrPersonalGraphStore
+from twinr.memory import LongTermMemoryService, OnDeviceMemory, TwinrPersonalGraphStore  # pylint: disable=no-name-in-module
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.reminders import ReminderStore
 from twinr.ops.events import TwinrOpsEventStore
@@ -147,7 +148,14 @@ class TwinrRuntimeBase:
                 graph_store=self.graph_memory,
             )
             try:
-                self.check_required_remote_dependency(force_sync=True)
+                # When the productive runtime is configured to trust the
+                # external watchdog artifact, startup must use that same
+                # readiness contract. Forcing a second deep direct probe here
+                # can block bootstrap longer than the supervisor startup budget
+                # even though the watchdog already proved readiness.
+                self.check_required_remote_dependency(
+                    force_sync=not self._required_remote_dependency_uses_watchdog_artifact()
+                )
             except LongTermRemoteUnavailableError as exc:
                 detail = self._sanitize_status_text(exc, default="Required remote long-term memory is unavailable.")
                 if self.remote_dependency_required():

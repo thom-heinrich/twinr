@@ -56,6 +56,19 @@ def _parse_optional_int(value: str | None) -> int | None:
     return int(value)
 
 
+def _parse_optional_float(value: str | float | int | None) -> float | None:
+    """Parse an optional float env value or return ``None``."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        return float(normalized)
+    return float(value)
+
+
 def _parse_optional_text(value: str | None) -> str | None:
     """Parse an optional text env value or return ``None``."""
 

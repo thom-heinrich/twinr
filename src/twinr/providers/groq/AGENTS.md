@@ -24,7 +24,8 @@ Out of scope:
 - `GroqAgentTextProvider` and `GroqToolCallingAgentProvider` remain the only public exports from this package.
 - `__init__.py` stays a thin lazy re-export surface; do not import the adapter stack there at package import time.
 - `client.py` must validate API key, timeout, and base URL policy before constructing the SDK client.
-- `allow_web_search=True` stays a delegated support-provider path; do not silently pretend native Groq live search exists here.
+- `allow_web_search=True` must use native Groq search first; cross-provider fallback stays opt-in via `groq_allow_search_fallback=True`.
+- Native Groq search must respect `groq_request_timeout_seconds` as a hard wall-clock budget, not only as an SDK transport timeout.
 - Tool continuations must stay bounded by TTL and item count, and continuation reuse must continue to enforce exact expected call IDs.
 - Malformed tool arguments or tool results must surface as controlled provider failures, not raw JSON or attribute exceptions.
 
@@ -34,7 +35,7 @@ After any edit in this directory, run:
 
 ```bash
 python3 -m compileall src/twinr/providers/groq
-PYTHONPATH=src pytest test/test_groq_providers.py test/test_provider_factory.py -q
+PYTHONPATH=src pytest test/test_groq_client.py test/test_groq_providers.py test/test_provider_factory.py -q
 ```
 
 If `adapters.py` changed in a way that affects streaming/tool-turn behavior, also run:

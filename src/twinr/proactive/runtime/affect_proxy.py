@@ -401,10 +401,25 @@ def derive_affect_proxy(
     ranked = sorted(state_scores.items(), key=lambda item: item[1], reverse=True)
     best_state, best_score = ranked[0]
     second_state, second_score = ranked[1]
+    somatic_concern_priority = False
+    if (
+        body_pose in {"floor", "lying_low", "slumped"}
+        and concern_score >= thresholds["concern_cue"]
+        and best_state == "low_engagement"
+    ):
+        somatic_concern_priority = True
+        best_state = "concern_cue"
+        best_score = _clamp01(concern_score + min(0.18, low_engagement_score * 0.24))
+        second_state = "low_engagement"
+        second_score = low_engagement_score
 
     if best_score >= thresholds[best_state]:
         second_threshold = thresholds[second_state]
-        if second_score >= max(0.50, second_threshold - 0.03) and (best_score - second_score) < _CONFLICT_MARGIN:
+        if (
+            not somatic_concern_priority
+            and second_score >= max(0.50, second_threshold - 0.03)
+            and (best_score - second_score) < _CONFLICT_MARGIN
+        ):
             flags = _dedupe([*uncertainty_flags, "conflicting_multimodal_cues"])
             return AffectProxySnapshot(
                 observed_at=observed_at,

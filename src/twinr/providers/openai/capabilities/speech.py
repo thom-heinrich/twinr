@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-30
+# BUG-1: Fixed TTS response_format handling; the helper no longer requires callers/config to set an explicit format and now defaults to the API defaults (`mp3` for buffered synthesis, `wav` for low-latency streaming).
+# BUG-2: Fixed transcribe_path() confinement when an audio input root is configured; relative paths are now resolved against that root instead of the process CWD.
+# BUG-3: Fixed late failure on oversized STT uploads by preflighting the 25 MB API limit and auto-chunking long plain-transcription inputs with PyDub when available.
+# SEC-1: Hardened path- and bytes-based transcription against practical file exfiltration by validating container signatures in addition to suffixes, bounding upload sizes, and preserving nofollow/regular-file checks on opened descriptors.
+# IMP-1: Added 2026 OpenAI speech features exposed by the current API: streamed transcription events, diarized transcription helpers, custom voice IDs, stream_format control, and current built-in voice validation.
+# IMP-2: Added Pi-friendly low-latency defaults and continuity-aware long-audio stitching for plain transcription, including chunk overlap and prompt carry-forward across chunks.
+
 """Provide OpenAI speech-to-text and text-to-speech helpers for Twinr.
 
 This module isolates audio request shaping, file-safety checks, model fallback,
@@ -6,13 +14,16 @@ and binary-stream cleanup for the OpenAI backend package.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import Event, Lock
 from typing import Any
+import base64
 import logging
 import mimetypes
 import os
+import re
 import stat
 
 from ..core.instructions import (
@@ -27,7 +38,17 @@ _DEFAULT_TTS_SPEED = 1.0
 _MIN_TTS_SPEED = 0.25
 _MAX_TTS_SPEED = 4.0
 _MAX_TTS_INPUT_CHARS = 4096
-_JSON_ONLY_TRANSCRIPTION_MODELS = frozenset(
+_MAX_TTS_INSTRUCTIONS_CHARS = 4096
+_MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+_DEFAULT_TTS_RESPONSE_FORMAT = "mp3"
+_DEFAULT_TTS_STREAM_RESPONSE_FORMAT = "wav"
+_DEFAULT_TTS_STREAM_FORMAT = "audio"
+_DEFAULT_TRANSCRIPTION_CHUNK_OVERLAP_MS = 750
+_DEFAULT_MAX_TRANSCRIPTION_CHUNK_DURATION_MS = 300_000
+_MIN_TRANSCRIPTION_CHUNK_DURATION_MS = 10_000
+_AUDIO_SIGNATURE_READ_BYTES = 64
+
+_JSON_DEFAULT_TRANSCRIPTION_MODELS = frozenset(
     {
         "gpt-4o-transcribe",
         "gpt-4o-transcribe-latest",
@@ -37,6 +58,7 @@ _JSON_ONLY_TRANSCRIPTION_MODELS = frozenset(
     }
 )
 _PROMPT_UNSUPPORTED_TRANSCRIPTION_MODELS = frozenset({"gpt-4o-transcribe-diarize"})
+_STREAM_UNSUPPORTED_TRANSCRIPTION_MODELS = frozenset({"whisper-1"})
 _LEGACY_TTS_MODELS = frozenset({"tts-1", "tts-1-hd"})
 _SUPPORTED_AUDIO_SUFFIXES = frozenset(
     {
@@ -47,42 +69,77 @@ _SUPPORTED_AUDIO_SUFFIXES = frozenset(
         ".mpeg",
         ".mpga",
         ".ogg",
+        ".oga",
         ".wav",
         ".webm",
     }
 )
+_SUPPORTED_TTS_RESPONSE_FORMATS = frozenset({"mp3", "opus", "aac", "flac", "wav", "pcm"})
+_SUPPORTED_TTS_STREAM_FORMATS = frozenset({"sse", "audio"})
+_BUILTIN_TTS_VOICES = frozenset(
+    {
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "verse",
+        "marin",
+        "cedar",
+    }
+)
+_NON_LEGACY_DEFAULT_TTS_VOICE = "marin"
+_CUSTOM_VOICE_PREFIX = "voice_"
+_AUDIO_FAMILY_TO_CONTENT_TYPE = {
+    "flac": "audio/flac",
+    "mpeg": "audio/mpeg",
+    "mp4": "audio/mp4",
+    "ogg": "audio/ogg",
+    "wav": "audio/wav",
+    "webm": "audio/webm",
+}
+_AUDIO_SUFFIX_FAMILIES = {
+    ".flac": "flac",
+    ".m4a": "mp4",
+    ".mp3": "mpeg",
+    ".mp4": "mp4",
+    ".mpeg": "mpeg",
+    ".mpga": "mpeg",
+    ".ogg": "ogg",
+    ".oga": "ogg",
+    ".wav": "wav",
+    ".webm": "webm",
+}
 
 logger = logging.getLogger(__name__)
 
+VoiceLike = str | Mapping[str, Any] | None
 
-class _ClosableIterator(Iterator[bytes]):
+
+class _ClosableIterator(Iterator[Any]):
     """Wrap an iterator so callers can close the underlying stream explicitly."""
 
-    # AUDIT-FIX(#6): Wrap the generator so consumers can close the stream explicitly and abandoned iterators do not keep sockets open until arbitrary GC.
     def __init__(
         self,
-        iterator: Iterator[bytes],
+        iterator: Iterator[Any],
         *,
-        close_callback: callable | None = None,
+        close_callback: Callable[[], None] | None = None,
     ) -> None:
-        """Store the wrapped byte iterator."""
-
         self._iterator = iterator
         self._close_callback = close_callback
 
     def __iter__(self) -> _ClosableIterator:
-        """Return the iterator itself."""
-
         return self
 
-    def __next__(self) -> bytes:
-        """Yield the next chunk from the wrapped iterator."""
-
+    def __next__(self) -> Any:
         return next(self._iterator)
 
     def close(self) -> None:
-        """Close the wrapped iterator when it exposes ``close()``."""
-
         if callable(self._close_callback):
             self._close_callback()
             return
@@ -91,20 +148,17 @@ class _ClosableIterator(Iterator[bytes]):
             close()
 
     def __del__(self) -> None:
-        """Attempt best-effort cleanup when the wrapper is garbage collected."""
-
         try:
             self.close()
         except Exception:
-            logger.warning("OpenAI speech iterator cleanup failed during garbage collection.", exc_info=True)
+            logger.warning(
+                "OpenAI speech iterator cleanup failed during garbage collection.",
+                exc_info=True,
+            )
 
 
 class OpenAISpeechMixin:
-    """Provide STT and TTS helpers for OpenAI-backed Twinr runtimes.
-
-    The mixin keeps audio requests bounded, validates local file access, and
-    applies model-aware request shaping for current OpenAI speech endpoints.
-    """
+    """Provide STT and TTS helpers for OpenAI-backed Twinr runtimes."""
 
     def transcribe(
         self,
@@ -115,46 +169,37 @@ class OpenAISpeechMixin:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
-        """Transcribe in-memory audio bytes into text.
-
-        Args:
-            audio_bytes: Audio payload to transcribe.
-            filename: Filename hint sent to the provider.
-            content_type: MIME type for the upload payload.
-            language: Optional language hint.
-            prompt: Optional transcription prompt when the model supports it.
-
-        Returns:
-            The normalized transcript text.
-
-        Raises:
-            ValueError: If ``audio_bytes`` is empty.
-            RuntimeError: If the provider returns an unsupported response shape.
-        """
-
         if not audio_bytes:
-            # AUDIT-FIX(#5): Fail fast on empty payloads instead of turning a local misuse into an opaque provider error.
             raise ValueError("audio_bytes must not be empty")
 
-        # AUDIT-FIX(#4): Bind STT/TTS calls to explicit per-request client options so voice requests do not inherit the SDK's long default timeout implicitly.
-        request_client = self._get_audio_client()
         safe_filename = self._sanitize_upload_filename(filename)
-        safe_content_type = self._normalize_content_type(content_type, safe_filename)
-
-        response, _model_used = self._call_with_model_fallback(
-            self.config.openai_stt_model,
-            STT_MODEL_FALLBACKS,
-            lambda model: request_client.audio.transcriptions.create(
-                # AUDIT-FIX(#2): Build the transcription request per resolved fallback model because response_format/prompt support differs across current STT models.
-                **self._build_transcription_request(
-                    model=model,
-                    file=(safe_filename, audio_bytes, safe_content_type),
-                    language=language,
-                    prompt=prompt,
-                )
-            ),
+        sniffed_family = self._sniff_audio_family(audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES])
+        self._validate_audio_signature(
+            filename=safe_filename,
+            content_type=content_type,
+            prefix=audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES],
+            sniffed_family=sniffed_family,
         )
-        # AUDIT-FIX(#5): Reject unknown response objects explicitly so SDK/API contract changes cannot masquerade as an empty transcript.
+        safe_content_type = self._normalize_content_type(
+            content_type,
+            safe_filename,
+            sniffed_family=sniffed_family,
+        )
+
+        if len(audio_bytes) > self._get_transcription_max_upload_bytes():
+            return self._transcribe_large_audio_bytes(
+                audio_bytes,
+                filename=safe_filename,
+                sniffed_family=sniffed_family,
+                language=language,
+                prompt=prompt,
+            )
+
+        response = self._transcribe_upload(
+            file=(safe_filename, audio_bytes, safe_content_type),
+            language=language,
+            prompt=prompt,
+        )
         return self._extract_transcription_text(response)
 
     def transcribe_path(
@@ -164,119 +209,250 @@ class OpenAISpeechMixin:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
-        """Transcribe a local audio file after path and file-safety checks.
-
-        Args:
-            path: Local path to the audio file.
-            language: Optional language hint.
-            prompt: Optional transcription prompt when the model supports it.
-
-        Returns:
-            The normalized transcript text.
-        """
-
-        # AUDIT-FIX(#1): Resolve and confine local file access before reading/transmitting audio so path traversal, symlink swaps, and non-audio file exfiltration are harder to exploit.
         file_path = self._resolve_transcription_path(path)
-        # AUDIT-FIX(#4): Bind STT/TTS calls to explicit per-request client options so voice requests do not inherit the SDK's long default timeout implicitly.
-        request_client = self._get_audio_client()
-
         with self._open_audio_file(file_path) as audio_file:
-            def call(model: str) -> Any:
-                audio_file.seek(0)
-                return request_client.audio.transcriptions.create(
-                    # AUDIT-FIX(#1): Stream the local file handle directly instead of read_bytes() to avoid avoidable memory spikes on the RPi and keep the nofollow-open file descriptor.
-                    **self._build_transcription_request(
-                        model=model,
-                        file=audio_file,
-                        language=language,
-                        prompt=prompt,
-                    )
+            file_size = self._get_file_size(audio_file)
+            prefix = self._read_file_prefix(audio_file)
+            sniffed_family = self._sniff_audio_family(prefix)
+            self._validate_audio_signature(
+                filename=file_path.name,
+                content_type=mimetypes.guess_type(file_path.name)[0],
+                prefix=prefix,
+                sniffed_family=sniffed_family,
+            )
+            if file_size > self._get_transcription_max_upload_bytes():
+                return self._transcribe_large_audio_path(
+                    file_path,
+                    language=language,
+                    prompt=prompt,
+                )
+
+            response = self._transcribe_upload(
+                file=audio_file,
+                language=language,
+                prompt=prompt,
+            )
+
+        return self._extract_transcription_text(response)
+
+    def transcribe_stream(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.wav",
+        content_type: str = "audio/wav",
+        language: str | None = None,
+        prompt: str | None = None,
+    ) -> Iterator[Any]:
+        if not audio_bytes:
+            raise ValueError("audio_bytes must not be empty")
+
+        safe_filename = self._sanitize_upload_filename(filename)
+        sniffed_family = self._sniff_audio_family(audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES])
+        self._validate_audio_signature(
+            filename=safe_filename,
+            content_type=content_type,
+            prefix=audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES],
+            sniffed_family=sniffed_family,
+        )
+        safe_content_type = self._normalize_content_type(
+            content_type,
+            safe_filename,
+            sniffed_family=sniffed_family,
+        )
+        self._validate_transcription_stream_size(len(audio_bytes))
+
+        response, _model_used = self._call_with_model_fallback(
+            self._primary_streaming_stt_model(),
+            self._streaming_stt_fallbacks(),
+            lambda model: self._get_audio_client().audio.transcriptions.create(
+                **self._build_transcription_request(
+                    model=model,
+                    file=(safe_filename, audio_bytes, safe_content_type),
+                    language=language,
+                    prompt=prompt,
+                    response_format="text",
+                    stream=True,
+                )
+            ),
+        )
+        return self._wrap_streaming_transcription_response(response)
+
+    def transcribe_path_stream(
+        self,
+        path: str | Path,
+        *,
+        language: str | None = None,
+        prompt: str | None = None,
+    ) -> Iterator[Any]:
+        file_path = self._resolve_transcription_path(path)
+        with self._open_audio_file(file_path) as audio_file:
+            file_size = self._get_file_size(audio_file)
+            prefix = self._read_file_prefix(audio_file)
+            sniffed_family = self._sniff_audio_family(prefix)
+            self._validate_audio_signature(
+                filename=file_path.name,
+                content_type=mimetypes.guess_type(file_path.name)[0],
+                prefix=prefix,
+                sniffed_family=sniffed_family,
+            )
+            self._validate_transcription_stream_size(file_size)
+
+            response, _model_used = self._call_with_model_fallback(
+                self._primary_streaming_stt_model(),
+                self._streaming_stt_fallbacks(),
+                lambda model: self._stream_transcription_file_handle(
+                    audio_file,
+                    model=model,
+                    language=language,
+                    prompt=prompt,
+                ),
+            )
+
+        return self._wrap_streaming_transcription_response(response)
+
+    def transcribe_diarized(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.wav",
+        content_type: str = "audio/wav",
+        language: str | None = None,
+        known_speaker_names: Sequence[str] | None = None,
+        known_speaker_references: Sequence[bytes | str | Path] | None = None,
+        chunking_strategy: str | Mapping[str, Any] = "auto",
+    ) -> dict[str, Any]:
+        if not audio_bytes:
+            raise ValueError("audio_bytes must not be empty")
+        if len(audio_bytes) > self._get_transcription_max_upload_bytes():
+            raise ValueError(
+                "Diarized transcription currently requires an upload smaller than the configured "
+                "transcription size limit"
+            )
+
+        safe_filename = self._sanitize_upload_filename(filename)
+        sniffed_family = self._sniff_audio_family(audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES])
+        self._validate_audio_signature(
+            filename=safe_filename,
+            content_type=content_type,
+            prefix=audio_bytes[:_AUDIO_SIGNATURE_READ_BYTES],
+            sniffed_family=sniffed_family,
+        )
+        safe_content_type = self._normalize_content_type(
+            content_type,
+            safe_filename,
+            sniffed_family=sniffed_family,
+        )
+
+        response, _model_used = self._call_with_model_fallback(
+            "gpt-4o-transcribe-diarize",
+            (),
+            lambda model: self._get_audio_client().audio.transcriptions.create(
+                **self._build_transcription_request(
+                    model=model,
+                    file=(safe_filename, audio_bytes, safe_content_type),
+                    language=language,
+                    prompt=None,
+                    response_format="diarized_json",
+                    chunking_strategy=chunking_strategy,
+                    extra_body=self._build_known_speaker_extra_body(
+                        known_speaker_names,
+                        known_speaker_references,
+                    ),
+                )
+            ),
+        )
+        return self._normalize_structured_response(response)
+
+    def transcribe_diarized_path(
+        self,
+        path: str | Path,
+        *,
+        language: str | None = None,
+        known_speaker_names: Sequence[str] | None = None,
+        known_speaker_references: Sequence[bytes | str | Path] | None = None,
+        chunking_strategy: str | Mapping[str, Any] = "auto",
+    ) -> dict[str, Any]:
+        file_path = self._resolve_transcription_path(path)
+        with self._open_audio_file(file_path) as audio_file:
+            file_size = self._get_file_size(audio_file)
+            prefix = self._read_file_prefix(audio_file)
+            sniffed_family = self._sniff_audio_family(prefix)
+            self._validate_audio_signature(
+                filename=file_path.name,
+                content_type=mimetypes.guess_type(file_path.name)[0],
+                prefix=prefix,
+                sniffed_family=sniffed_family,
+            )
+            if file_size > self._get_transcription_max_upload_bytes():
+                raise ValueError(
+                    "Diarized transcription currently requires an upload smaller than the configured "
+                    "transcription size limit"
                 )
 
             response, _model_used = self._call_with_model_fallback(
-                self.config.openai_stt_model,
-                STT_MODEL_FALLBACKS,
-                call,
+                "gpt-4o-transcribe-diarize",
+                (),
+                lambda model: self._transcribe_file_handle(
+                    audio_file,
+                    model=model,
+                    language=language,
+                    prompt=None,
+                    response_format="diarized_json",
+                    chunking_strategy=chunking_strategy,
+                    extra_body=self._build_known_speaker_extra_body(
+                        known_speaker_names,
+                        known_speaker_references,
+                    ),
+                ),
             )
-        # AUDIT-FIX(#5): Reject unknown response objects explicitly so SDK/API contract changes cannot masquerade as an empty transcript.
-        return self._extract_transcription_text(response)
+
+        return self._normalize_structured_response(response)
 
     def synthesize(
         self,
         text: str,
         *,
-        voice: str | None = None,
+        voice: VoiceLike = None,
         response_format: str | None = None,
         instructions: str | None = None,
     ) -> bytes:
-        """Synthesize speech into one in-memory audio payload.
-
-        Args:
-            text: Text to synthesize.
-            voice: Optional voice override.
-            response_format: Optional audio format override.
-            instructions: Optional TTS instructions override.
-
-        Returns:
-            The synthesized audio payload as bytes.
-        """
-
         tts_instructions = (
             instructions if instructions is not None else self.config.openai_tts_instructions
         )
-        # AUDIT-FIX(#4): Bind STT/TTS calls to explicit per-request client options so voice requests do not inherit the SDK's long default timeout implicitly.
-        request_client = self._get_audio_client()
 
         response, _model_used = self._call_with_model_fallback(
             self.config.openai_tts_model,
             TTS_MODEL_FALLBACKS,
-            lambda model: request_client.audio.speech.create(
+            lambda model: self._get_audio_client().audio.speech.create(
                 **self._build_tts_request(
                     text,
                     model=model,
                     voice=voice,
                     response_format=response_format,
                     instructions=tts_instructions,
+                    for_stream=False,
                 )
             ),
         )
-        # AUDIT-FIX(#6): Read and close binary responses deterministically so the mixin does not rely on GC for socket cleanup.
         return self._extract_binary_response(response)
 
     def synthesize_stream(
         self,
         text: str,
         *,
-        voice: str | None = None,
+        voice: VoiceLike = None,
         response_format: str | None = None,
         instructions: str | None = None,
         chunk_size: int = 4096,
+        stream_format: str | None = None,
     ) -> Iterator[bytes]:
-        """Stream synthesized speech in chunks.
-
-        Args:
-            text: Text to synthesize.
-            voice: Optional voice override.
-            response_format: Optional audio format override.
-            instructions: Optional TTS instructions override.
-            chunk_size: Byte size for each streamed chunk.
-
-        Returns:
-            An iterator yielding synthesized audio chunks.
-
-        Raises:
-            ValueError: If ``chunk_size`` is not positive.
-            RuntimeError: If no accessible TTS model can satisfy the request.
-        """
-
         if chunk_size <= 0:
-            # AUDIT-FIX(#8): Reject invalid chunk sizes locally instead of handing undefined values to iter_bytes().
             raise ValueError("chunk_size must be greater than 0")
 
         tts_instructions = (
             instructions if instructions is not None else self.config.openai_tts_instructions
         )
-        # AUDIT-FIX(#4): Bind STT/TTS calls to explicit per-request client options so voice requests do not inherit the SDK's long default timeout implicitly.
         request_client = self._get_audio_client()
         stop_requested = Event()
         response_lock = Lock()
@@ -293,6 +469,7 @@ class OpenAISpeechMixin:
         def iterator() -> Iterator[bytes]:
             attempted_models: list[str] = []
             last_error: Exception | None = None
+
             for model in (self.config.openai_tts_model, *TTS_MODEL_FALLBACKS):
                 if not model or model in attempted_models:
                     continue
@@ -306,6 +483,8 @@ class OpenAISpeechMixin:
                             voice=voice,
                             response_format=response_format,
                             instructions=tts_instructions,
+                            for_stream=True,
+                            stream_format=stream_format,
                         )
                     ) as response:
                         with response_lock:
@@ -326,15 +505,88 @@ class OpenAISpeechMixin:
                     with response_lock:
                         if response_holder["response"] is response:
                             response_holder["response"] = None
+
             if last_error is not None:
                 candidate_list = ", ".join(attempted_models)
                 raise RuntimeError(
-                    f"OpenAI project does not have access to any candidate models for this request: {candidate_list}"
+                    "OpenAI project does not have access to any candidate models for this request: "
+                    f"{candidate_list}"
                 ) from last_error
             raise RuntimeError("No model candidates were available for the OpenAI request")
 
-        # AUDIT-FIX(#6): Return a closable wrapper so callers can abort mid-stream without leaking the underlying response context.
         return _ClosableIterator(iterator(), close_callback=request_close)
+
+    def _transcribe_upload(
+        self,
+        *,
+        file: Any,
+        language: str | None,
+        prompt: str | None,
+    ) -> Any:
+        response, _model_used = self._call_with_model_fallback(
+            self.config.openai_stt_model,
+            STT_MODEL_FALLBACKS,
+            lambda model: self._transcribe_file_handle(
+                file,
+                model=model,
+                language=language,
+                prompt=prompt,
+            ),
+        )
+        return response
+
+    def _transcribe_file_handle(
+        self,
+        file: Any,
+        *,
+        model: str,
+        language: str | None,
+        prompt: str | None,
+        response_format: str | None = None,
+        stream: bool = False,
+        include: Sequence[str] | None = None,
+        chunking_strategy: str | Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Any:
+        request_client = self._get_audio_client()
+        seek = getattr(file, "seek", None)
+        if callable(seek):
+            seek(0)
+        return request_client.audio.transcriptions.create(
+            **self._build_transcription_request(
+                model=model,
+                file=file,
+                language=language,
+                prompt=prompt,
+                response_format=response_format,
+                stream=stream,
+                include=include,
+                chunking_strategy=chunking_strategy,
+                extra_body=extra_body,
+            )
+        )
+
+    def _stream_transcription_file_handle(
+        self,
+        file: Any,
+        *,
+        model: str,
+        language: str | None,
+        prompt: str | None,
+    ) -> Any:
+        return self._transcribe_file_handle(
+            file,
+            model=model,
+            language=language,
+            prompt=prompt,
+            response_format="text",
+            stream=True,
+        )
+
+    def _wrap_streaming_transcription_response(self, response: Any) -> Iterator[Any]:
+        iterator = iter(response)
+        close = getattr(response, "close", None)
+        return _ClosableIterator(iterator, close_callback=close if callable(close) else None)
 
     def _build_transcription_request(
         self,
@@ -343,15 +595,20 @@ class OpenAISpeechMixin:
         file: Any,
         language: str | None,
         prompt: str | None,
+        response_format: str | None = None,
+        stream: bool = False,
+        include: Sequence[str] | None = None,
+        chunking_strategy: str | Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build a model-aware transcription request payload."""
-
         normalized_model = self._normalize_model_name(model)
         request: dict[str, Any] = {
             "model": model,
             "file": file,
-            # AUDIT-FIX(#2): Use model-aware response_format selection because current transcription models no longer share a single compatible format.
-            "response_format": self._transcription_response_format(normalized_model),
+            "response_format": self._transcription_response_format(
+                normalized_model,
+                requested=response_format,
+            ),
         }
 
         normalized_language = self._normalize_optional_text(language)
@@ -363,8 +620,21 @@ class OpenAISpeechMixin:
             normalized_prompt is not None
             and normalized_model not in _PROMPT_UNSUPPORTED_TRANSCRIPTION_MODELS
         ):
-            # AUDIT-FIX(#2): Omit prompt on diarization models where the API does not accept it.
             request["prompt"] = normalized_prompt
+
+        if stream:
+            request["stream"] = True
+
+        if include:
+            request["include"] = list(include)
+
+        if chunking_strategy is not None:
+            request["chunking_strategy"] = chunking_strategy
+        elif normalized_model == "gpt-4o-transcribe-diarize":
+            request["chunking_strategy"] = "auto"
+
+        if extra_body:
+            request["extra_body"] = dict(extra_body)
 
         return request
 
@@ -373,48 +643,71 @@ class OpenAISpeechMixin:
         text: str,
         *,
         model: str,
-        voice: str | None,
+        voice: VoiceLike,
         response_format: str | None,
         instructions: str | None,
+        for_stream: bool,
+        stream_format: str | None = None,
     ) -> dict[str, Any]:
-        """Build a validated text-to-speech request payload."""
-
-        resolved_voice = voice if voice is not None else self.config.openai_tts_voice
-        resolved_response_format = (
-            response_format if response_format is not None else self.config.openai_tts_format
-        )
         request: dict[str, Any] = {
             "model": model,
-            "voice": self._resolve_tts_voice(model, resolved_voice),
-            # AUDIT-FIX(#7): Coerce and range-check speed locally so a malformed .env value does not crash or produce an invalid provider request.
+            "voice": self._resolve_tts_voice(model, voice),
             "speed": self._coerce_tts_speed(self.config.openai_tts_speed),
-            # AUDIT-FIX(#7): Normalize and bound TTS input locally so blank/oversized payloads fail deterministically before the provider call.
             "input": self._normalize_tts_input_text(text),
-            "response_format": self._normalize_tts_response_format(resolved_response_format),
+            "response_format": self._resolve_tts_response_format(
+                response_format,
+                for_stream=for_stream,
+            ),
         }
 
-        normalized_instructions = self._normalize_optional_text(instructions)
+        normalized_instructions = self._normalize_tts_instructions(instructions)
         if normalized_instructions is not None and not self._is_legacy_tts_model(model):
-            # AUDIT-FIX(#3): Exclude instructions when the selected model is tts-1/tts-1-hd because those legacy models reject that parameter.
             request["instructions"] = normalized_instructions
+
+        if for_stream:
+            normalized_stream_format = self._resolve_tts_stream_format(model, stream_format)
+            if normalized_stream_format is not None:
+                request["stream_format"] = normalized_stream_format
+
         return request
 
-    # AUDIT-FIX(#5): Normalize accepted STT response shapes centrally and fail closed for everything else.
     def _extract_transcription_text(self, response: Any) -> str:
-        """Extract transcript text from supported response shapes."""
-
         if isinstance(response, str):
             return response.strip()
+
+        if isinstance(response, Mapping):
+            return str(response.get("text") or "").strip()
 
         if hasattr(response, "text"):
             return str(getattr(response, "text") or "").strip()
 
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            payload = model_dump()
+            if isinstance(payload, Mapping):
+                return str(payload.get("text") or "").strip()
+
         raise RuntimeError("Unexpected transcription response type")
 
-    # AUDIT-FIX(#6): Normalize accepted binary response shapes centrally and always attempt deterministic cleanup.
-    def _extract_binary_response(self, response: Any) -> bytes:
-        """Extract bytes from supported speech responses and close them."""
+    def _normalize_structured_response(self, response: Any) -> dict[str, Any]:
+        if isinstance(response, dict):
+            return dict(response)
 
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            payload = model_dump()
+            if isinstance(payload, dict):
+                return payload
+
+        to_dict = getattr(response, "dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, dict):
+                return payload
+
+        raise RuntimeError("Unexpected structured transcription response type")
+
+    def _extract_binary_response(self, response: Any) -> bytes:
         close = getattr(response, "close", None)
         try:
             reader = getattr(response, "read", None)
@@ -440,49 +733,113 @@ class OpenAISpeechMixin:
                 try:
                     close()
                 except Exception:
-                    logger.warning("OpenAI speech response close failed after synthesis.", exc_info=True)
+                    logger.warning(
+                        "OpenAI speech response close failed after synthesis.",
+                        exc_info=True,
+                    )
 
-    # AUDIT-FIX(#2): Current STT models no longer share one universal response_format contract.
-    def _transcription_response_format(self, normalized_model: str) -> str:
-        """Return the response format supported by the transcription model."""
+    def _transcription_response_format(
+        self,
+        normalized_model: str,
+        *,
+        requested: str | None,
+    ) -> str:
+        normalized_requested = self._normalize_optional_text(requested)
+        if normalized_requested is None:
+            if normalized_model in _JSON_DEFAULT_TRANSCRIPTION_MODELS:
+                return "json"
+            if normalized_model == "gpt-4o-transcribe-diarize":
+                return "text"
+            return "text"
 
-        if normalized_model in _JSON_ONLY_TRANSCRIPTION_MODELS:
-            return "json"
-        return "text"
+        supported_formats = self._supported_transcription_response_formats(normalized_model)
+        if normalized_requested not in supported_formats:
+            supported_text = ", ".join(sorted(supported_formats))
+            raise ValueError(
+                f"Transcription response format {normalized_requested!r} is not supported by "
+                f"model {normalized_model!r}; supported formats: {supported_text}"
+            )
+        return normalized_requested
 
-    def _resolve_tts_voice(self, model: str, requested_voice: str) -> str:
-        """Resolve the final TTS voice for the chosen model."""
+    def _supported_transcription_response_formats(self, normalized_model: str) -> frozenset[str]:
+        if normalized_model == "gpt-4o-transcribe-diarize":
+            return frozenset({"json", "text", "diarized_json"})
+        if normalized_model in _JSON_DEFAULT_TRANSCRIPTION_MODELS:
+            # Current OpenAI docs are inconsistent here. We keep `json` as the safe default
+            # but also allow explicit `text`, matching the official streaming example.
+            return frozenset({"json", "text"})
+        return frozenset({"json", "text", "srt", "verbose_json", "vtt"})
 
+    def _resolve_tts_voice(self, model: str, requested_voice: VoiceLike) -> str | dict[str, str]:
         normalized_model = self._normalize_model_name(model)
-        normalized_voice = str(requested_voice or "").strip()
-        if self._is_legacy_tts_model(normalized_model) and normalized_voice not in _LEGACY_TTS_VOICES:
-            return _LEGACY_TTS_FALLBACK_VOICE
-        if not normalized_voice:
-            # AUDIT-FIX(#7): Reject empty voices explicitly for non-legacy models instead of sending a malformed request downstream.
-            raise ValueError("TTS voice must not be empty")
+        resolved_voice = self._default_tts_voice(requested_voice)
+
+        if isinstance(resolved_voice, Mapping):
+            voice_id = self._normalize_optional_text(str(resolved_voice.get("id") or ""))
+            if voice_id is None:
+                raise ValueError("Custom TTS voice objects must provide a non-empty 'id'")
+            if self._is_legacy_tts_model(normalized_model):
+                raise ValueError("Legacy TTS models do not support custom voice IDs")
+            return {"id": voice_id}
+
+        normalized_voice = self._normalize_optional_text(str(resolved_voice))
+        if normalized_voice is None:
+            normalized_voice = self._default_builtin_tts_voice(normalized_model)
+
+        if self._is_legacy_tts_model(normalized_model):
+            if normalized_voice not in _LEGACY_TTS_VOICES:
+                return _LEGACY_TTS_FALLBACK_VOICE
+            return normalized_voice
+
+        if normalized_voice in _BUILTIN_TTS_VOICES:
+            return normalized_voice
+        if normalized_voice.startswith(_CUSTOM_VOICE_PREFIX):
+            return {"id": normalized_voice}
+
+        supported = ", ".join(sorted(_BUILTIN_TTS_VOICES))
+        raise ValueError(
+            f"Unsupported TTS voice {normalized_voice!r} for model {normalized_model!r}; "
+            f"use one of: {supported}, or pass a custom voice id"
+        )
+
+    def _default_tts_voice(self, requested_voice: VoiceLike) -> VoiceLike:
+        if requested_voice is not None:
+            return requested_voice
+
+        configured_voice_id = getattr(self.config, "openai_tts_voice_id", None)
+        normalized_voice_id = self._normalize_optional_text(
+            str(configured_voice_id) if configured_voice_id is not None else None
+        )
+        if normalized_voice_id is not None:
+            return {"id": normalized_voice_id}
+
+        configured_voice = getattr(self.config, "openai_tts_voice", None)
+        if isinstance(configured_voice, Mapping):
+            return configured_voice
+
+        normalized_voice = self._normalize_optional_text(
+            str(configured_voice) if configured_voice is not None else None
+        )
         return normalized_voice
 
-    def _is_legacy_tts_model(self, model: str) -> bool:
-        """Return whether the model uses the legacy TTS API contract."""
+    def _default_builtin_tts_voice(self, normalized_model: str) -> str:
+        if self._is_legacy_tts_model(normalized_model):
+            return _LEGACY_TTS_FALLBACK_VOICE
+        return _NON_LEGACY_DEFAULT_TTS_VOICE
 
+    def _is_legacy_tts_model(self, model: str) -> bool:
         return self._normalize_model_name(model) in _LEGACY_TTS_MODELS
 
     def _normalize_model_name(self, model: str) -> str:
-        """Normalize a model identifier for comparisons."""
-
         return str(model or "").strip().lower()
 
     def _normalize_optional_text(self, value: str | None) -> str | None:
-        """Strip optional text and collapse empty strings to ``None``."""
-
         if value is None:
             return None
         normalized = value.strip()
         return normalized or None
 
     def _normalize_tts_input_text(self, text: str) -> str:
-        """Validate and normalize TTS input text."""
-
         normalized = text.strip()
         if not normalized:
             raise ValueError("TTS input text must not be empty")
@@ -492,17 +849,71 @@ class OpenAISpeechMixin:
             )
         return normalized
 
-    def _normalize_tts_response_format(self, response_format: str | None) -> str:
-        """Validate and normalize the TTS response format."""
+    def _normalize_tts_instructions(self, instructions: str | None) -> str | None:
+        normalized = self._normalize_optional_text(instructions)
+        if normalized is None:
+            return None
+        if len(normalized) > _MAX_TTS_INSTRUCTIONS_CHARS:
+            raise ValueError(
+                "TTS instructions exceed the supported limit of "
+                f"{_MAX_TTS_INSTRUCTIONS_CHARS} characters"
+            )
+        return normalized
 
+    def _resolve_tts_response_format(self, response_format: str | None, *, for_stream: bool) -> str:
         normalized = self._normalize_optional_text(response_format)
         if normalized is None:
-            raise ValueError("TTS response format must not be empty")
+            candidate_attrs = (
+                ("openai_tts_stream_response_format", "openai_tts_format")
+                if for_stream
+                else ("openai_tts_format",)
+            )
+            for attr_name in candidate_attrs:
+                candidate = getattr(self.config, attr_name, None)
+                normalized_candidate = self._normalize_optional_text(
+                    str(candidate) if candidate is not None else None
+                )
+                if normalized_candidate is not None:
+                    normalized = normalized_candidate
+                    break
+
+        if normalized is None:
+            return (
+                _DEFAULT_TTS_STREAM_RESPONSE_FORMAT
+                if for_stream
+                else _DEFAULT_TTS_RESPONSE_FORMAT
+            )
+
+        if normalized not in _SUPPORTED_TTS_RESPONSE_FORMATS:
+            supported = ", ".join(sorted(_SUPPORTED_TTS_RESPONSE_FORMATS))
+            raise ValueError(
+                f"Unsupported TTS response format {normalized!r}; supported formats: {supported}"
+            )
+        return normalized
+
+    def _resolve_tts_stream_format(self, model: str, stream_format: str | None) -> str | None:
+        normalized = self._normalize_optional_text(stream_format)
+        if normalized is None:
+            candidate = getattr(self.config, "openai_tts_stream_format", None)
+            normalized = self._normalize_optional_text(
+                str(candidate) if candidate is not None else None
+            )
+
+        if normalized is None:
+            normalized = _DEFAULT_TTS_STREAM_FORMAT
+
+        if normalized not in _SUPPORTED_TTS_STREAM_FORMATS:
+            supported = ", ".join(sorted(_SUPPORTED_TTS_STREAM_FORMATS))
+            raise ValueError(
+                f"Unsupported TTS stream_format {normalized!r}; supported formats: {supported}"
+            )
+
+        if normalized == "sse" and self._is_legacy_tts_model(model):
+            raise ValueError("stream_format='sse' is not supported for legacy TTS models")
+
         return normalized
 
     def _coerce_tts_speed(self, raw_speed: Any) -> float:
-        """Convert configured TTS speed into a supported float value."""
-
         try:
             speed = float(raw_speed)
         except (TypeError, ValueError):
@@ -513,29 +924,33 @@ class OpenAISpeechMixin:
         return speed
 
     def _sanitize_upload_filename(self, filename: str) -> str:
-        """Return a printable filename safe to send in audio uploads."""
-
         raw_name = Path(str(filename or "audio.wav")).name.strip()
         candidate = "".join(ch for ch in raw_name if ch.isprintable() and ch not in {"/", "\\"})
         return candidate or "audio.wav"
 
-    def _normalize_content_type(self, content_type: str | None, filename: str) -> str:
-        """Return a valid content type for an uploaded audio payload."""
-
-        if content_type is not None:
-            normalized_content_type = content_type.strip()
-            if (
-                normalized_content_type
-                and "/" in normalized_content_type
-                and normalized_content_type.isprintable()
-            ):
+    def _normalize_content_type(
+        self,
+        content_type: str | None,
+        filename: str,
+        *,
+        sniffed_family: str | None = None,
+    ) -> str:
+        normalized_content_type = self._normalize_optional_text(content_type)
+        if (
+            normalized_content_type is not None
+            and "/" in normalized_content_type
+            and normalized_content_type.isprintable()
+            and normalized_content_type.split("/", 1)[0] in {"audio", "video", "application"}
+        ):
+            if normalized_content_type != "application/octet-stream":
                 return normalized_content_type
+
+        if sniffed_family is not None:
+            return _AUDIO_FAMILY_TO_CONTENT_TYPE.get(sniffed_family, "application/octet-stream")
+
         return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    # AUDIT-FIX(#4): Derive a request-scoped client view so timeout/retry policy is enforced consistently across STT, TTS, and streaming TTS.
     def _get_audio_client(self) -> Any:
-        """Return a client view with audio-specific timeout and retry options."""
-
         options: dict[str, Any] = {}
         timeout = self._get_audio_request_timeout()
         if timeout is not None:
@@ -550,8 +965,6 @@ class OpenAISpeechMixin:
         return self._client
 
     def _get_audio_request_timeout(self) -> float | None:
-        """Return the timeout applied to STT and TTS requests."""
-
         for attr_name in (
             "openai_audio_timeout_seconds",
             "openai_request_timeout",
@@ -569,12 +982,9 @@ class OpenAISpeechMixin:
                 return _DEFAULT_OPENAI_AUDIO_TIMEOUT_SECONDS
             return timeout if timeout > 0 else _DEFAULT_OPENAI_AUDIO_TIMEOUT_SECONDS
 
-        # AUDIT-FIX(#4): Default to a bounded voice-request timeout instead of inheriting the SDK's much longer generic timeout.
         return _DEFAULT_OPENAI_AUDIO_TIMEOUT_SECONDS
 
     def _get_audio_max_retries(self) -> int | None:
-        """Return the retry limit applied to audio requests, if configured."""
-
         for attr_name in ("openai_audio_max_retries", "openai_max_retries"):
             candidate = getattr(self.config, attr_name, None)
             if candidate is None:
@@ -588,10 +998,7 @@ class OpenAISpeechMixin:
                 return None
         return None
 
-    # AUDIT-FIX(#1): Allow deployments to confine path-based transcription to an explicit root without breaking the existing config schema.
     def _get_audio_input_root(self) -> Path | None:
-        """Return the optional filesystem root allowed for path transcription."""
-
         for attr_name in ("openai_audio_input_root", "audio_input_root"):
             candidate = getattr(self.config, attr_name, None)
             if candidate is None:
@@ -601,11 +1008,13 @@ class OpenAISpeechMixin:
                 return Path(candidate_text)
         return None
 
-    # AUDIT-FIX(#1): Resolve the caller path once, reject obvious non-audio inputs, and optionally enforce a configured root before opening the file descriptor.
     def _resolve_transcription_path(self, path: str | Path) -> Path:
-        """Resolve and validate a local audio path for transcription."""
-
         candidate_path = Path(path).expanduser()
+        allowed_root = self._get_audio_input_root()
+
+        if allowed_root is not None and not candidate_path.is_absolute():
+            candidate_path = allowed_root.expanduser() / candidate_path
+
         resolved_path = candidate_path.resolve(strict=True)
 
         if resolved_path.suffix.lower() not in _SUPPORTED_AUDIO_SUFFIXES:
@@ -614,10 +1023,9 @@ class OpenAISpeechMixin:
                 f"{resolved_path.suffix or '<none>'}"
             )
 
-        if candidate_path.is_symlink():
+        if Path(path).expanduser().is_symlink():
             raise PermissionError("Symlinked audio inputs are not allowed")
 
-        allowed_root = self._get_audio_input_root()
         if allowed_root is not None:
             resolved_root = allowed_root.expanduser().resolve(strict=True)
             try:
@@ -629,10 +1037,7 @@ class OpenAISpeechMixin:
 
         return resolved_path
 
-    # AUDIT-FIX(#1): Open the file descriptor with nofollow/close-on-exec flags and verify a regular file to reduce symlink and special-file abuse.
     def _open_audio_file(self, path: Path) -> Any:
-        """Open a regular audio file with nofollow-style safety checks."""
-
         flags = os.O_RDONLY
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -648,3 +1053,401 @@ class OpenAISpeechMixin:
         except Exception:
             os.close(fd)
             raise
+
+    def _get_file_size(self, file_obj: Any) -> int:
+        fileno = getattr(file_obj, "fileno", None)
+        if callable(fileno):
+            return os.fstat(fileno()).st_size
+
+        position = file_obj.tell()
+        file_obj.seek(0, os.SEEK_END)
+        size = file_obj.tell()
+        file_obj.seek(position)
+        return size
+
+    def _read_file_prefix(self, file_obj: Any, size: int = _AUDIO_SIGNATURE_READ_BYTES) -> bytes:
+        position = file_obj.tell()
+        file_obj.seek(0)
+        prefix = file_obj.read(size)
+        file_obj.seek(position)
+        return prefix
+
+    def _sniff_audio_family(self, prefix: bytes) -> str | None:
+        if len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WAVE":
+            return "wav"
+        if prefix.startswith(b"fLaC"):
+            return "flac"
+        if prefix.startswith(b"OggS"):
+            return "ogg"
+        if len(prefix) >= 4 and prefix[:4] == b"\x1a\x45\xdf\xa3":
+            return "webm"
+        if len(prefix) >= 8 and prefix[4:8] == b"ftyp":
+            return "mp4"
+        if prefix.startswith(b"ID3"):
+            return "mpeg"
+        if len(prefix) >= 2 and prefix[0] == 0xFF and (prefix[1] & 0xE0) == 0xE0:
+            return "mpeg"
+        return None
+
+    def _validate_audio_signature(
+        self,
+        *,
+        filename: str,
+        content_type: str | None,
+        prefix: bytes,
+        sniffed_family: str | None = None,
+    ) -> None:
+        if not prefix:
+            raise ValueError("Audio payload must not be empty")
+
+        suffix = Path(filename).suffix.lower()
+        expected_family = _AUDIO_SUFFIX_FAMILIES.get(suffix)
+        normalized_content_type = self._normalize_optional_text(content_type)
+        normalized_content_type_lower = normalized_content_type.lower() if normalized_content_type else None
+        family = sniffed_family or self._sniff_audio_family(prefix)
+        if (
+            family is None
+            and prefix.startswith(b"RIFF")
+            and (
+                expected_family == "wav"
+                or normalized_content_type_lower
+                in {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}
+            )
+        ):
+            family = "wav"
+        if family is None:
+            raise ValueError("Audio payload is not a recognized supported container")
+
+        if expected_family is not None and family != expected_family:
+            raise ValueError(
+                f"Audio payload signature does not match filename extension {suffix!r}"
+            )
+
+        if normalized_content_type is None:
+            return
+        if normalized_content_type_lower == "application/octet-stream":
+            return
+        if "/" not in normalized_content_type_lower:
+            raise ValueError("content_type must contain a media type")
+        major_type = normalized_content_type_lower.split("/", 1)[0]
+        if major_type not in {"audio", "video"}:
+            raise ValueError("content_type must describe audio or video media")
+
+    def _get_transcription_max_upload_bytes(self) -> int:
+        for attr_name in (
+            "openai_transcription_max_upload_bytes",
+            "openai_audio_max_upload_bytes",
+            "audio_max_upload_bytes",
+        ):
+            candidate = getattr(self.config, attr_name, None)
+            if candidate is None:
+                continue
+            candidate_text = str(candidate).strip()
+            if not candidate_text:
+                continue
+            try:
+                parsed = int(candidate_text)
+            except (TypeError, ValueError):
+                return _MAX_TRANSCRIPTION_UPLOAD_BYTES
+            return max(parsed, 1)
+        return _MAX_TRANSCRIPTION_UPLOAD_BYTES
+
+    def _validate_transcription_stream_size(self, payload_size: int) -> None:
+        if payload_size > self._get_transcription_max_upload_bytes():
+            raise ValueError(
+                "Streaming transcription of completed audio recordings currently requires an "
+                "upload smaller than the configured transcription size limit"
+            )
+
+    def _should_auto_chunk_large_transcriptions(self) -> bool:
+        for attr_name in ("openai_audio_auto_chunk", "audio_auto_chunk"):
+            candidate = getattr(self.config, attr_name, None)
+            if candidate is None:
+                continue
+            if isinstance(candidate, bool):
+                return candidate
+            candidate_text = str(candidate).strip().lower()
+            if candidate_text in {"1", "true", "yes", "on"}:
+                return True
+            if candidate_text in {"0", "false", "no", "off"}:
+                return False
+        return True
+
+    def _get_transcription_chunk_overlap_ms(self) -> int:
+        for attr_name in ("openai_audio_chunk_overlap_ms", "audio_chunk_overlap_ms"):
+            candidate = getattr(self.config, attr_name, None)
+            if candidate is None:
+                continue
+            try:
+                return max(int(str(candidate).strip()), 0)
+            except (TypeError, ValueError):
+                return _DEFAULT_TRANSCRIPTION_CHUNK_OVERLAP_MS
+        return _DEFAULT_TRANSCRIPTION_CHUNK_OVERLAP_MS
+
+    def _get_transcription_max_chunk_duration_ms(self) -> int:
+        for attr_name in (
+            "openai_audio_max_chunk_duration_ms",
+            "audio_max_chunk_duration_ms",
+        ):
+            candidate = getattr(self.config, attr_name, None)
+            if candidate is None:
+                continue
+            try:
+                return max(int(str(candidate).strip()), _MIN_TRANSCRIPTION_CHUNK_DURATION_MS)
+            except (TypeError, ValueError):
+                return _DEFAULT_MAX_TRANSCRIPTION_CHUNK_DURATION_MS
+        return _DEFAULT_MAX_TRANSCRIPTION_CHUNK_DURATION_MS
+
+    def _transcribe_large_audio_bytes(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str,
+        sniffed_family: str | None,
+        language: str | None,
+        prompt: str | None,
+    ) -> str:
+        if not self._should_auto_chunk_large_transcriptions():
+            raise ValueError(
+                "Audio upload exceeds the configured transcription size limit; enable auto-chunking "
+                "or split the audio before calling transcribe()"
+            )
+
+        suffix = Path(filename).suffix or self._preferred_suffix_for_audio_family(sniffed_family)
+        with NamedTemporaryFile(suffix=suffix, delete=True) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_file.flush()
+            return self._transcribe_large_audio_path(
+                Path(temp_file.name),
+                language=language,
+                prompt=prompt,
+            )
+
+    def _transcribe_large_audio_path(
+        self,
+        path: Path,
+        *,
+        language: str | None,
+        prompt: str | None,
+    ) -> str:
+        if not self._should_auto_chunk_large_transcriptions():
+            raise ValueError(
+                "Audio upload exceeds the configured transcription size limit; enable auto-chunking "
+                "or split the audio before calling transcribe_path()"
+            )
+
+        try:
+            from pydub import AudioSegment  # type: ignore
+        except ImportError as exc:
+            raise ValueError(
+                "Audio upload exceeds the configured transcription size limit and auto-chunking "
+                "requires the optional 'pydub' dependency plus ffmpeg"
+            ) from exc
+
+        logger.info("Auto-chunking oversized audio file for transcription: %s", path)
+
+        audio = AudioSegment.from_file(str(path))
+        if len(audio) <= 0:
+            raise ValueError("Audio file appears to be empty")
+
+        chunk_duration_ms = self._derive_transcription_chunk_duration_ms(audio)
+        overlap_ms = min(
+            self._get_transcription_chunk_overlap_ms(),
+            max(chunk_duration_ms // 10, 0),
+        )
+        step_ms = max(chunk_duration_ms - overlap_ms, _MIN_TRANSCRIPTION_CHUNK_DURATION_MS)
+
+        chunk_transcripts: list[str] = []
+        previous_transcript: str | None = None
+
+        for start_ms in range(0, len(audio), step_ms):
+            end_ms = min(start_ms + chunk_duration_ms, len(audio))
+            if end_ms <= start_ms:
+                break
+
+            chunk = audio[start_ms:end_ms]
+            if len(chunk) <= 0:
+                continue
+
+            chunk_prompt = self._build_chunk_prompt(prompt, previous_transcript)
+            with NamedTemporaryFile(suffix=".wav", delete=True) as temp_file:
+                chunk.export(temp_file.name, format="wav")
+                with open(temp_file.name, "rb") as exported_chunk:
+                    chunk_text = self._extract_transcription_text(
+                        self._transcribe_upload(
+                            file=exported_chunk,
+                            language=language,
+                            prompt=chunk_prompt,
+                        )
+                    )
+
+            normalized_chunk_text = chunk_text.strip()
+            if normalized_chunk_text:
+                chunk_transcripts.append(normalized_chunk_text)
+                previous_transcript = normalized_chunk_text
+
+            if end_ms >= len(audio):
+                break
+
+        if not chunk_transcripts:
+            return ""
+
+        return self._merge_transcript_chunks(chunk_transcripts)
+
+    def _derive_transcription_chunk_duration_ms(self, audio_segment: Any) -> int:
+        bytes_per_second = max(
+            int(audio_segment.frame_rate)
+            * int(audio_segment.channels)
+            * int(audio_segment.sample_width),
+            1,
+        )
+        usable_bytes = max(self._get_transcription_max_upload_bytes() - 4096, 1)
+        derived_ms = int((usable_bytes / bytes_per_second) * 1000 * 0.98)
+        bounded_ms = max(derived_ms, _MIN_TRANSCRIPTION_CHUNK_DURATION_MS)
+        return min(bounded_ms, self._get_transcription_max_chunk_duration_ms())
+
+    def _build_chunk_prompt(
+        self,
+        base_prompt: str | None,
+        previous_transcript: str | None,
+    ) -> str | None:
+        parts: list[str] = []
+
+        normalized_base = self._normalize_optional_text(base_prompt)
+        if normalized_base is not None:
+            parts.append(normalized_base)
+
+        normalized_previous = self._normalize_optional_text(previous_transcript)
+        if normalized_previous is not None:
+            parts.append(normalized_previous[-800:])
+
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    def _merge_transcript_chunks(self, chunks: Sequence[str]) -> str:
+        merged = ""
+        for chunk in chunks:
+            normalized_chunk = chunk.strip()
+            if not normalized_chunk:
+                continue
+            if not merged:
+                merged = normalized_chunk
+                continue
+            merged = self._merge_transcript_pair(merged, normalized_chunk)
+        return merged.strip()
+
+    def _merge_transcript_pair(self, left: str, right: str) -> str:
+        left_words = left.split()
+        right_words = right.split()
+        max_overlap = min(len(left_words), len(right_words), 48)
+        overlap = 0
+
+        for candidate in range(max_overlap, 0, -1):
+            left_slice = [self._normalize_overlap_token(token) for token in left_words[-candidate:]]
+            right_slice = [self._normalize_overlap_token(token) for token in right_words[:candidate]]
+            if left_slice == right_slice:
+                overlap = candidate
+                break
+
+        if overlap:
+            right_words = right_words[overlap:]
+
+        if not right_words:
+            return left
+        separator = "" if left.endswith((" ", "\n")) else " "
+        return left + separator + " ".join(right_words)
+
+    def _normalize_overlap_token(self, token: str) -> str:
+        return re.sub(r"^\W+|\W+$", "", token).lower()
+
+    def _primary_streaming_stt_model(self) -> str:
+        candidates = [self.config.openai_stt_model, *STT_MODEL_FALLBACKS]
+        for candidate in candidates:
+            normalized = self._normalize_model_name(candidate)
+            if normalized and normalized not in _STREAM_UNSUPPORTED_TRANSCRIPTION_MODELS:
+                return candidate
+        raise RuntimeError("No streaming-capable STT model is configured")
+
+    def _streaming_stt_fallbacks(self) -> tuple[str, ...]:
+        fallbacks: list[str] = []
+        primary = self._normalize_model_name(self._primary_streaming_stt_model())
+        for candidate in STT_MODEL_FALLBACKS:
+            normalized = self._normalize_model_name(candidate)
+            if (
+                normalized
+                and normalized != primary
+                and normalized not in _STREAM_UNSUPPORTED_TRANSCRIPTION_MODELS
+            ):
+                fallbacks.append(candidate)
+        return tuple(fallbacks)
+
+    def _build_known_speaker_extra_body(
+        self,
+        names: Sequence[str] | None,
+        references: Sequence[bytes | str | Path] | None,
+    ) -> dict[str, Any] | None:
+        if names is None and references is None:
+            return None
+        if not names or not references:
+            raise ValueError("known_speaker_names and known_speaker_references must both be set")
+        if len(names) != len(references):
+            raise ValueError("known_speaker_names and known_speaker_references must have equal length")
+        if len(names) > 4:
+            raise ValueError("OpenAI diarization supports at most 4 known speakers")
+
+        normalized_names = [self._normalize_known_speaker_name(name) for name in names]
+        data_urls = [self._coerce_audio_reference_to_data_url(reference) for reference in references]
+        return {
+            "known_speaker_names": normalized_names,
+            "known_speaker_references": data_urls,
+        }
+
+    def _normalize_known_speaker_name(self, name: str) -> str:
+        normalized = self._normalize_optional_text(name)
+        if normalized is None:
+            raise ValueError("Known speaker names must not be empty")
+        return normalized
+
+    def _preferred_suffix_for_audio_family(self, family: str | None) -> str:
+        for suffix, suffix_family in _AUDIO_SUFFIX_FAMILIES.items():
+            if suffix_family == family:
+                return suffix
+        return ".wav"
+
+    def _coerce_audio_reference_to_data_url(self, reference: bytes | str | Path) -> str:
+        if isinstance(reference, bytes):
+            prefix = reference[:_AUDIO_SIGNATURE_READ_BYTES]
+            family = self._sniff_audio_family(prefix)
+            self._validate_audio_signature(
+                filename="reference.wav" if family == "wav" else "reference.bin",
+                content_type=None,
+                prefix=prefix,
+                sniffed_family=family,
+            )
+            content_type = _AUDIO_FAMILY_TO_CONTENT_TYPE.get(
+                family or "",
+                "application/octet-stream",
+            )
+            encoded = base64.b64encode(reference).decode("ascii")
+            return f"data:{content_type};base64,{encoded}"
+
+        reference_text = str(reference)
+        if reference_text.startswith("data:"):
+            return reference_text
+
+        file_path = self._resolve_transcription_path(reference_text)
+        with self._open_audio_file(file_path) as audio_file:
+            prefix = self._read_file_prefix(audio_file)
+            family = self._sniff_audio_family(prefix)
+            self._validate_audio_signature(
+                filename=file_path.name,
+                content_type=mimetypes.guess_type(file_path.name)[0],
+                prefix=prefix,
+                sniffed_family=family,
+            )
+            payload = audio_file.read()
+
+        content_type = _AUDIO_FAMILY_TO_CONTENT_TYPE.get(family or "", "application/octet-stream")
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"

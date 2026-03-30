@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.memory.longterm.core.ontology import kind_matches
-from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermRetentionResultV1
+from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermRetentionResultV1, LongTermSourceRefV1
 
 logger = logging.getLogger(__name__)
 
@@ -244,8 +244,32 @@ class LongTermRetentionPolicy:
             return datetime.now(zone)
         return self._normalize_datetime(now, zone=zone)
 
+    def reference_now(self, now: datetime | None = None) -> datetime:
+        """Return one normalized reference timestamp for retention decisions."""
+
+        return self._reference_now(now)
+
     def _age(self, value: datetime, *, now: datetime, zone: tzinfo) -> timedelta:
         return now - self._normalize_datetime(value, zone=zone)
+
+    def projection_requires_action(
+        self,
+        projection: Mapping[str, object],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return whether one catalog projection would change under retention.
+
+        Active remote-primary retention can classify many objects directly from
+        current-head catalog projections. When a projection is incomplete or
+        malformed, return ``False`` so the selector stays fail-safe and avoids
+        mutating records without enough evidence.
+        """
+
+        candidate = self._projection_candidate_object(projection)
+        if candidate is None:
+            return False
+        return self._classify(item=candidate, now=self._reference_now(now)) != "keep"
 
     def apply(
         self,
@@ -318,6 +342,58 @@ class LongTermRetentionPolicy:
             pruned_memory_ids=tuple(pruned_ids),
             archived_objects=tuple(archived),
         )
+
+    def _projection_candidate_object(
+        self,
+        projection: Mapping[str, object],
+    ) -> LongTermMemoryObjectV1 | None:
+        """Build one minimal retention-classifiable object from a projection."""
+
+        if not isinstance(projection, Mapping):
+            return None
+        memory_id = str(projection.get("memory_id") or "").strip()
+        kind = str(projection.get("kind") or "").strip()
+        created_at = str(projection.get("created_at") or "").strip()
+        updated_at = str(projection.get("updated_at") or created_at).strip()
+        if not memory_id or not kind or not created_at or not updated_at:
+            return None
+        source_type = str(projection.get("source_type") or "selection_projection").strip() or "selection_projection"
+        raw_event_ids = projection.get("source_event_ids")
+        event_ids = tuple(
+            str(item).strip()
+            for item in raw_event_ids
+            if isinstance(raw_event_ids, list) and isinstance(item, str) and item.strip()
+        )
+        payload: dict[str, object] = {
+            "memory_id": memory_id,
+            "kind": kind,
+            "summary": str(projection.get("summary") or memory_id).strip() or memory_id,
+            "details": str(projection.get("details") or "").strip(),
+            "source": LongTermSourceRefV1(
+                source_type=source_type,
+                event_ids=event_ids or (memory_id,),
+            ).to_payload(),
+            "status": str(projection.get("status") or "candidate").strip() or "candidate",
+            "confidence": projection.get("confidence", 0.5),
+            "canonical_language": str(projection.get("canonical_language") or "en").strip() or "en",
+            "confirmed_by_user": bool(projection.get("confirmed_by_user")),
+            "sensitivity": str(projection.get("sensitivity") or "normal").strip() or "normal",
+            "slot_key": str(projection.get("slot_key") or "").strip() or None,
+            "value_key": str(projection.get("value_key") or "").strip() or None,
+            "valid_from": str(projection.get("valid_from") or "").strip() or None,
+            "valid_to": str(projection.get("valid_to") or "").strip() or None,
+            "archived_at": str(projection.get("archived_at") or "").strip() or None,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        raw_attributes = projection.get("attributes")
+        if isinstance(raw_attributes, Mapping):
+            payload["attributes"] = dict(raw_attributes)
+        try:
+            return LongTermMemoryObjectV1.from_payload(payload)
+        except Exception:
+            logger.warning("Failed to build retention candidate from selection projection.", exc_info=True)
+            return None
 
     def _classify(self, *, item: LongTermMemoryObjectV1, now: datetime) -> str:
         zone = self._policy_zone()

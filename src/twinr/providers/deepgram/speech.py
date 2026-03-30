@@ -6,14 +6,39 @@ use this provider through the higher-level contracts in
 ``twinr.agent.base_agent.contracts``.
 """
 
+# CHANGELOG: 2026-03-30
+# BUG-1: Streaming prompt bias was silently ignored. Live STT now applies
+#        Deepgram keyterms/keywords on both Nova and Flux streams.
+# BUG-2: Flux used the wrong transport contract (`/v1/listen`, Nova events,
+#        `Finalize`, `language=`). Streaming now switches automatically to the
+#        2026 Flux `/v2/listen` protocol and parses TurnInfo events.
+# BUG-3: Nova `UtteranceEnd` / `SpeechStarted` handling was misconfigured
+#        because `vad_events=true` was never sent. Endpoint callbacks now fire
+#        reliably when those features are enabled.
+# BUG-4: `transcribe_path()` loaded whole files into RAM and accepted arbitrary
+#        regular files. It now streams bounded, probable-audio files only.
+# BUG-5: Batch and connect paths lacked transient retry/backoff, which caused
+#        avoidable turn failures on flaky Raspberry Pi / Wi-Fi deployments.
+# SEC-1: Insecure `http://` / `ws://` Deepgram URLs could leak senior audio and
+#        credentials. Insecure transport is now refused by default outside
+#        explicit local / self-hosted deployments.
+# SEC-2: The provider now prefers short-lived Deepgram access tokens when
+#        available and opts requests out of Deepgram's Model Improvement
+#        Program by default unless config disables it.
+# IMP-1: Added 2026-first streaming support for Flux end-of-turn detection,
+#        eager EOT, TurnResumed handling, and configurable thresholds.
+# IMP-2: Added PCM micro-chunking (80 ms default for Flux) and bounded retries /
+#        request-id-rich errors for lower latency and better observability.
+
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -33,11 +58,76 @@ from twinr.agent.base_agent.contracts import (
 
 logger = logging.getLogger(__name__)
 _DEEPGRAM_KEYWORD_INTENSIFIER = 2.0
+_DEEPGRAM_TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_DEEPGRAM_ACCESS_TOKEN_ENV = "DEEPGRAM_TOKEN"
+_DEEPGRAM_API_KEY_ENV = "DEEPGRAM_API_KEY"
+
+_AUDIO_EXTENSIONS = frozenset(
+    {
+        ".aac",
+        ".aif",
+        ".aiff",
+        ".amr",
+        ".au",
+        ".caf",
+        ".flac",
+        ".m4a",
+        ".m4b",
+        ".mka",
+        ".mkv",
+        ".mov",
+        ".mp2",
+        ".mp3",
+        ".mp4",
+        ".oga",
+        ".ogg",
+        ".opus",
+        ".pcm",
+        ".raw",
+        ".wav",
+        ".wave",
+        ".webm",
+        ".wma",
+    }
+)
+_AUDIO_MIME_PREFIXES = ("audio/",)
+_AUDIO_MIME_ALLOWLIST = frozenset(
+    {
+        "application/ogg",
+        "application/octet-stream",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+    }
+)
+_FLUX_SUPPORTED_SAMPLE_RATES = frozenset({8000, 16000, 24000, 44100, 48000})
+
+
+def _normalize_model_name(model: str | None) -> str:
+    """Normalize provider model names while preserving backwards compatibility."""
+    normalized = str(model or "").strip()
+    if not normalized:
+        return "nova-3"
+    if normalized.casefold() == "flux":
+        logger.warning(
+            "Deepgram model 'flux' is ambiguous in 2026; using 'flux-general-en'."
+        )
+        return "flux-general-en"
+    return normalized
+
+
+def _is_flux_model(model: str | None) -> bool:
+    """Return whether the configured model uses Deepgram's Flux protocol."""
+    return _normalize_model_name(model).casefold().startswith("flux")
+
+
+def _is_nova3_model(model: str | None) -> bool:
+    """Return whether the configured model is from the Nova-3 family."""
+    return _normalize_model_name(model).casefold().startswith("nova-3")
 
 
 def _extract_transcript(payload: dict[str, object]) -> str:
     """Extract the best transcript string from a batch Deepgram response."""
-    # AUDIT-FIX(#5): Validate Deepgram payload structure defensively so malformed 2xx responses do not explode with AttributeError/IndexError.
     if not isinstance(payload, dict):
         raise RuntimeError("Deepgram response payload must be a JSON object")
 
@@ -67,41 +157,136 @@ def _extract_transcript(payload: dict[str, object]) -> str:
     return transcript.strip()
 
 
-def _prompt_bias_terms(prompt: str | None) -> tuple[str, ...]:
-    """Extract one bounded list of transcription-bias terms from a prompt string."""
+def _extract_request_id_from_headers(headers: Any) -> str | None:
+    """Extract a Deepgram request identifier from an HTTP or websocket header map."""
+    if headers is None:
+        return None
+    for key in ("x-dg-request-id", "dg-request-id", "DG-Request-Id", "x-request-id"):
+        try:
+            value = headers.get(key)
+        except Exception:
+            value = None
+        if value:
+            return str(value).strip()
+    return None
 
+
+def _extract_request_id_from_payload(payload: dict[str, object]) -> str | None:
+    """Extract a Deepgram request identifier from a JSON payload."""
+    request_id = payload.get("request_id")
+    if isinstance(request_id, str) and request_id.strip():
+        return request_id.strip()
+
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        nested_request_id = metadata.get("request_id")
+        if isinstance(nested_request_id, str) and nested_request_id.strip():
+            return nested_request_id.strip()
+
+    return None
+
+
+def _extract_transient_retry_delay_s(response: httpx.Response) -> float | None:
+    """Parse a simple Retry-After header into seconds when present."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        delay_s = float(retry_after.strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, delay_s)
+
+
+def _redacted_error_details(response: httpx.Response) -> str:
+    """Build a compact, request-id-rich error string without leaking payload bytes."""
+    request_id = _extract_request_id_from_headers(response.headers)
+    response_text = ""
+    try:
+        response_text = response.text
+    except Exception:
+        response_text = ""
+    response_text = " ".join(response_text.split())
+    if len(response_text) > 240:
+        response_text = f"{response_text[:237]}..."
+
+    detail_parts = [f"status={response.status_code}"]
+    if request_id:
+        detail_parts.append(f"request_id={request_id}")
+    if response_text:
+        detail_parts.append(f"body={response_text}")
+    return ", ".join(detail_parts)
+
+
+def _best_response_request_id(
+    *,
+    response: httpx.Response | None = None,
+    payload: dict[str, object] | None = None,
+) -> str | None:
+    """Return the most useful request id available from response or payload."""
+    payload_request_id = _extract_request_id_from_payload(payload or {})
+    if payload_request_id:
+        return payload_request_id
+    if response is not None:
+        return _extract_request_id_from_headers(response.headers)
+    return None
+
+
+def _prompt_bias_terms(
+    prompt: str | None,
+    *,
+    max_terms: int = 100,
+    max_token_budget: int = 500,
+) -> tuple[str, ...]:
+    """Extract a bounded list of Deepgram-compatible bias terms from a prompt string."""
     normalized_prompt = str(prompt or "").strip()
     if not normalized_prompt:
         return ()
+
     translated = normalized_prompt
     for separator in ("\n", "\r", ";", "|"):
         translated = translated.replace(separator, ",")
+
     terms: list[str] = []
     seen: set[str] = set()
+    consumed_tokens = 0
+
     for raw_part in translated.split(","):
         term = raw_part.strip(" \t.,!?:")
         normalized_term = term.casefold()
         if not term or normalized_term in seen:
             continue
+
+        approximate_tokens = max(1, len(term.split()))
+        if len(terms) >= max_terms or consumed_tokens + approximate_tokens > max_token_budget:
+            logger.warning(
+                "Deepgram prompt bias truncated to %s terms / ~%s tokens for API limits.",
+                len(terms),
+                consumed_tokens,
+            )
+            break
+
         seen.add(normalized_term)
         terms.append(term)
+        consumed_tokens += approximate_tokens
+
     return tuple(terms)
 
 
 def _deepgram_prompt_params(*, model: str, prompt: str | None) -> list[tuple[str, str]]:
     """Map one provider-agnostic prompt string onto Deepgram bias parameters."""
-
     terms = _prompt_bias_terms(prompt)
     if not terms:
         return []
-    normalized_model = str(model or "").strip().lower()
-    if normalized_model.startswith("nova-3"):
+
+    normalized_model = _normalize_model_name(model).lower()
+    if normalized_model.startswith("flux") or normalized_model.startswith("nova-3"):
         return [("keyterm", term) for term in terms]
     return [("keywords", f"{term}:{_DEEPGRAM_KEYWORD_INTENSIFIER:g}") for term in terms]
 
 
 def _extract_streaming_transcript(payload: dict[str, object]) -> str:
-    """Extract the latest transcript fragment from a streaming event payload."""
+    """Extract the latest transcript fragment from a Nova streaming payload."""
     channel = payload.get("channel", {})
     if not isinstance(channel, dict):
         return ""
@@ -116,7 +301,7 @@ def _extract_streaming_transcript(payload: dict[str, object]) -> str:
 
 
 def _extract_streaming_confidence(payload: dict[str, object]) -> float | None:
-    """Extract a confidence estimate from a streaming event payload."""
+    """Extract a confidence estimate from a Nova streaming payload."""
     channel = payload.get("channel", {})
     if not isinstance(channel, dict):
         return None
@@ -134,6 +319,13 @@ def _extract_streaming_confidence(payload: dict[str, object]) -> float | None:
     words = first.get("words")
     if not isinstance(words, list) or not words:
         return None
+    return _average_word_confidence(words)
+
+
+def _average_word_confidence(words: object) -> float | None:
+    """Average a Deepgram words array into one confidence score."""
+    if not isinstance(words, list) or not words:
+        return None
     confidences: list[float] = []
     for word in words:
         if not isinstance(word, dict):
@@ -149,20 +341,78 @@ def _extract_streaming_confidence(payload: dict[str, object]) -> float | None:
     return sum(confidences) / len(confidences)
 
 
-def _build_websocket_url(
-    *,
-    base_url: str,
-    model: str,
-    language: str | None,
-    smart_format: bool,
-    sample_rate: int,
-    channels: int,
-    interim_results: bool,
-    endpointing_ms: int,
-    utterance_end_ms: int,
-) -> str:
-    """Build the Deepgram websocket URL for a streaming transcription session."""
-    # AUDIT-FIX(#1): Preserve secure ws/wss schemes and reject invalid base URLs instead of silently downgrading TLS or producing malformed URLs.
+def _extract_flux_confidence(payload: dict[str, object]) -> float | None:
+    """Extract a confidence estimate from a Flux TurnInfo payload."""
+    raw_confidence = payload.get("end_of_turn_confidence")
+    if isinstance(raw_confidence, (int, float)):
+        confidence = float(raw_confidence)
+        if 0.0 <= confidence <= 1.0:
+            return confidence
+    return _average_word_confidence(payload.get("words"))
+
+
+def _require_positive_int(name: str, value: int) -> int:
+    """Return a validated positive integer for audio transport settings."""
+    if isinstance(value, bool) or int(value) <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _require_non_negative_float(name: str, value: Any) -> float:
+    """Validate that a configuration value is a non-negative float."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative float") from exc
+    if parsed < 0.0:
+        raise ValueError(f"{name} must be a non-negative float")
+    return parsed
+
+
+def _require_flux_sample_rate(sample_rate: int) -> int:
+    """Validate Flux raw-audio sample rates according to the 2026 API contract."""
+    if sample_rate not in _FLUX_SUPPORTED_SAMPLE_RATES:
+        raise ValueError(
+            "Flux requires sample_rate to be one of "
+            f"{sorted(_FLUX_SUPPORTED_SAMPLE_RATES)} for raw audio"
+        )
+    return sample_rate
+
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    """Parse permissive config booleans without surprising truthiness."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _host_is_local_or_private(host: str | None) -> bool:
+    """Return whether a URL host is clearly local / RFC1918 / loopback."""
+    normalized = (host or "").strip().strip("[]").lower()
+    if not normalized:
+        return False
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if normalized.endswith(".local"):
+        return True
+    if "." not in normalized and ":" not in normalized:
+        return True
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+
+
+def _validate_transport_security(base_url: str, *, allow_insecure: bool) -> Any:
+    """Validate the Deepgram base URL and refuse unsafe remote cleartext transports."""
     normalized_base_url = base_url.strip()
     if not normalized_base_url:
         raise ValueError("Deepgram base URL must not be empty")
@@ -171,39 +421,110 @@ def _build_websocket_url(
     if split.scheme not in {"http", "https", "ws", "wss"} or not split.netloc:
         raise ValueError(f"Invalid Deepgram base URL: {base_url!r}")
 
+    hostname = split.hostname
+    if split.scheme in {"http", "ws"} and not allow_insecure and not _host_is_local_or_private(hostname):
+        # BREAKING: Public cleartext Deepgram transport is now rejected by default.
+        raise RuntimeError(
+            "Refusing insecure Deepgram transport to a non-local host; use HTTPS/WSS "
+            "or set deepgram_allow_insecure_transport=True for an explicit self-hosted deployment"
+        )
+    return split
+
+
+def _join_listen_path(base_path: str, version: str) -> str:
+    """Replace any trailing Deepgram version/listen suffix with the requested version."""
+    parts = [part for part in base_path.split("/") if part]
+    if parts and parts[-1] == "listen":
+        parts.pop()
+    if parts and parts[-1] in {"v1", "v2"}:
+        parts.pop()
+    parts.extend([version, "listen"])
+    return "/" + "/".join(parts)
+
+
+def _build_listen_url(
+    *,
+    base_url: str,
+    version: str,
+    websocket: bool,
+    params: Iterable[tuple[str, str]],
+    allow_insecure: bool,
+) -> str:
+    """Build an HTTP(S) or WS(S) Deepgram listen URL with the requested API version."""
+    split = _validate_transport_security(base_url, allow_insecure=allow_insecure)
     scheme_map = {
-        "http": "ws",
-        "https": "wss",
-        "ws": "ws",
-        "wss": "wss",
+        False: {"http": "http", "https": "https", "ws": "http", "wss": "https"},
+        True: {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"},
     }
-    scheme = scheme_map[split.scheme]
-    params: dict[str, str] = {
-        "model": model,
-        "encoding": "linear16",
-        "sample_rate": str(sample_rate),
-        "channels": str(channels),
-    }
-    if language:
-        params["language"] = language
-    if smart_format:
-        params["smart_format"] = "true"
-    if interim_results:
-        params["interim_results"] = "true"
-    if endpointing_ms > 0:
-        params["endpointing"] = str(endpointing_ms)
-    if utterance_end_ms > 0:
-        params["utterance_end_ms"] = str(utterance_end_ms)
-    path = split.path.rstrip("/") + "/listen"
-    return urlunsplit((scheme, split.netloc, path, urlencode(params), ""))
+    scheme = scheme_map[websocket][split.scheme]
+    path = _join_listen_path(split.path.rstrip("/"), version)
+    return urlunsplit((scheme, split.netloc, path, urlencode(list(params), doseq=True), ""))
 
 
-def _require_positive_int(name: str, value: int) -> int:
-    """Return a validated positive integer for audio transport settings."""
-    # AUDIT-FIX(#9): Fail fast on invalid audio transport settings locally instead of shipping broken parameters to Deepgram.
-    if isinstance(value, bool) or int(value) <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(value)
+def _iter_file_chunks(file_obj, *, chunk_size: int) -> Iterator[bytes]:
+    """Yield a regular file as bounded binary chunks."""
+    while True:
+        chunk = file_obj.read(chunk_size)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _looks_like_audio_bytes(header: bytes) -> bool:
+    """Cheap magic-byte sniffing for common audio containers."""
+    if not header:
+        return False
+    if header.startswith(b"RIFF") and b"WAVE" in header[:16]:
+        return True
+    if header.startswith(b"fLaC"):
+        return True
+    if header.startswith(b"OggS"):
+        return True
+    if header.startswith(b"ID3"):
+        return True
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return True
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        return True
+    if header.startswith(b"\x1A\x45\xDF\xA3"):
+        return True
+    if header.startswith(b"FORM") and b"AIFF" in header[:16]:
+        return True
+    if header.startswith(b"#!AMR"):
+        return True
+    return False
+
+
+def _is_probable_audio_path(
+    *,
+    path: Path,
+    content_type: str,
+    header: bytes,
+) -> bool:
+    """Return whether a local file is very likely to be an audio file."""
+    suffix = path.suffix.lower()
+    if suffix in _AUDIO_EXTENSIONS:
+        return True
+    normalized_content_type = str(content_type or "").strip().lower()
+    if any(normalized_content_type.startswith(prefix) for prefix in _AUDIO_MIME_PREFIXES):
+        return True
+    if normalized_content_type in _AUDIO_MIME_ALLOWLIST:
+        return True
+    return _looks_like_audio_bytes(header)
+
+
+def _compute_pcm_chunk_bytes(
+    *,
+    sample_rate: int,
+    channels: int,
+    chunk_ms: float,
+    sample_width_bytes: int = 2,
+) -> int:
+    """Convert a target PCM chunk duration to a byte count."""
+    if chunk_ms <= 0.0:
+        return 0
+    frames = max(1, int(round(sample_rate * (chunk_ms / 1000.0))))
+    return frames * channels * sample_width_bytes
 
 
 class _DeepgramStreamingSession(StreamingSpeechToTextSession):
@@ -213,25 +534,36 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         self,
         *,
         connection,
+        protocol: str,
         finalize_timeout_s: float,
         keepalive_interval_s: float,
         send_timeout_s: float,
         max_pending_messages: int,
+        outgoing_audio_chunk_bytes: int,
+        finalize_control_message: str | None,
+        close_control_message: str | None,
+        keepalive_control_message: str | None,
         on_interim: Callable[[str], None] | None = None,
         on_endpoint: Callable[[StreamingSpeechEndpointEvent], None] | None = None,
     ) -> None:
         """Start sender, reader, and keepalive workers for one websocket stream."""
         self._connection = connection
+        self._protocol = str(protocol).strip().lower() or "nova"
         self._finalize_timeout_s = max(0.5, float(finalize_timeout_s))
         self._keepalive_interval_s = max(0.0, float(keepalive_interval_s))
         self._send_timeout_s = max(0.5, float(send_timeout_s))
+        self._outgoing_audio_chunk_bytes = max(0, int(outgoing_audio_chunk_bytes))
+        self._finalize_control_message = finalize_control_message
+        self._close_control_message = close_control_message
+        self._keepalive_control_message = keepalive_control_message
         self._on_interim = on_interim
         self._on_endpoint = on_endpoint
+
         self._state_lock = Lock()
         self._send_lock = Lock()
-        # AUDIT-FIX(#2): Carry optional per-message acknowledgements so finalize/close no longer depend on unbounded Queue.join() waits.
-        # AUDIT-FIX(#6): Bound the outbound queue to prevent memory blowups if the network stalls while audio continues arriving.
-        self._outgoing: Queue[tuple[bytes | str, Event | None]] = Queue(maxsize=max(1, int(max_pending_messages)))
+        self._outgoing: Queue[tuple[bytes | str, Event | None]] = Queue(
+            maxsize=max(1, int(max_pending_messages))
+        )
         self._done = Event()
         self._closed = Event()
         self._finalize_requested = Event()
@@ -244,31 +576,44 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         self._latest_confidence: float | None = None
         self._last_send_monotonic = time.monotonic()
         self._request_id = self._read_request_id()
-        self._sender = Thread(target=self._sender_loop, daemon=True, name="deepgram-stt-sender")
+        self._last_interim_callback_value = ""
+        self._sender = Thread(
+            target=self._sender_loop, daemon=True, name="deepgram-stt-sender"
+        )
         self._sender.start()
-        self._reader = Thread(target=self._reader_loop, daemon=True, name="deepgram-stt-reader")
+        self._reader = Thread(
+            target=self._reader_loop, daemon=True, name="deepgram-stt-reader"
+        )
         self._reader.start()
-        # AUDIT-FIX(#4): Keep the Deepgram stream alive across long senior pauses to avoid NET-0001 disconnects during silence.
-        self._keepalive = Thread(target=self._keepalive_loop, daemon=True, name="deepgram-stt-keepalive")
+        self._keepalive = Thread(
+            target=self._keepalive_loop, daemon=True, name="deepgram-stt-keepalive"
+        )
         self._keepalive.start()
 
     def send_pcm(self, pcm_bytes: bytes) -> None:
         """Queue raw PCM bytes for delivery to the Deepgram websocket."""
         if not pcm_bytes:
             return
-        # AUDIT-FIX(#6): Reject writes after shutdown or sender failure instead of silently queueing audio that can never be delivered.
         self._raise_if_unusable()
-        self._enqueue(bytes(pcm_bytes))
+        payload = bytes(pcm_bytes)
+        if self._outgoing_audio_chunk_bytes > 0 and len(payload) > self._outgoing_audio_chunk_bytes:
+            for start in range(0, len(payload), self._outgoing_audio_chunk_bytes):
+                self._enqueue(payload[start : start + self._outgoing_audio_chunk_bytes])
+            return
+        self._enqueue(payload)
 
     def finalize(self) -> StreamingTranscriptionResult:
         """Request finalization and return the last stable transcription snapshot."""
         self._raise_if_unusable(allow_closed=False)
         self._finalize_requested.set()
 
-        # AUDIT-FIX(#2): Bound control-message delivery waits so finalize cannot deadlock the voice turn forever if the sender thread dies.
         finalize_ack = Event()
-        if self._sender.is_alive():
-            self._enqueue("Finalize", ack=finalize_ack, allow_error=True)
+        if self._sender.is_alive() and self._finalize_control_message:
+            self._enqueue(
+                self._finalize_control_message,
+                ack=finalize_ack,
+                allow_error=True,
+            )
             finalize_ack.wait(timeout=self._send_timeout_s)
 
         self._done.wait(timeout=self._finalize_timeout_s)
@@ -291,19 +636,29 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             return
 
         self._closed.set()
-        # AUDIT-FIX(#2): Attempt a graceful Deepgram CloseStream, but never block indefinitely on a dead sender or stuck queue.
         close_ack = Event()
-        if self._sender.is_alive():
+        if self._sender.is_alive() and self._close_control_message:
             try:
-                self._enqueue("CloseStream", ack=close_ack, allow_error=True, allow_closed=True)
+                self._enqueue(
+                    self._close_control_message,
+                    ack=close_ack,
+                    allow_error=True,
+                    allow_closed=True,
+                )
                 close_ack.wait(timeout=self._send_timeout_s)
             except Exception:
-                logger.warning("Deepgram CloseStream enqueue failed during session shutdown.", exc_info=True)
+                logger.warning(
+                    "Deepgram CloseStream enqueue failed during session shutdown.",
+                    exc_info=True,
+                )
 
         try:
             self._connection.close()
         except Exception:
-            logger.warning("Deepgram websocket close failed during session shutdown.", exc_info=True)
+            logger.warning(
+                "Deepgram websocket close failed during session shutdown.",
+                exc_info=True,
+            )
 
         self._done.set()
 
@@ -318,13 +673,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         """Read the request identifier exposed by the websocket handshake."""
         response = getattr(self._connection, "response", None)
         headers = getattr(response, "headers", None)
-        if headers is None:
-            return None
-        for key in ("dg-request-id", "DG-Request-Id", "x-request-id"):
-            value = headers.get(key)
-            if value:
-                return str(value)
-        return None
+        return _extract_request_id_from_headers(headers)
 
     def _reader_loop(self) -> None:
         """Consume Deepgram events and fold them into the session state."""
@@ -333,101 +682,198 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                 if isinstance(message, bytes):
                     continue
                 payload = json.loads(message)
+                if not isinstance(payload, dict):
+                    continue
+
+                payload_request_id = _extract_request_id_from_payload(payload)
+                if payload_request_id:
+                    with self._state_lock:
+                        if self._request_id is None:
+                            self._request_id = payload_request_id
+
                 event_type = str(payload.get("type", "")).strip()
 
-                if event_type == "Results":
-                    transcript = _extract_streaming_transcript(payload)
-                    confidence = _extract_streaming_confidence(payload)
-                    is_final = bool(payload.get("is_final"))
-                    speech_final = bool(payload.get("speech_final"))
-                    from_finalize = bool(payload.get("from_finalize"))
-                    metadata = payload.get("metadata", {})
-
-                    with self._state_lock:
-                        if transcript:
-                            if is_final:
-                                if not self._final_segments or self._final_segments[-1] != transcript:
-                                    self._final_segments.append(transcript)
-                                self._latest_interim = transcript
-                            else:
-                                self._latest_interim = transcript
-                                self._saw_interim = True
-                        if confidence is not None:
-                            self._latest_confidence = confidence
-
-                        if isinstance(metadata, dict) and self._request_id is None:
-                            request_id = metadata.get("request_id")
-                            if isinstance(request_id, str) and request_id.strip():
-                                self._request_id = request_id.strip()
-
-                        if speech_final:
-                            self._saw_speech_final = True
-
-                    if transcript and not is_final:
-                        # AUDIT-FIX(#3): Isolate callback failures so UI/observer bugs do not tear down the transcription transport.
-                        self._safe_invoke_callback(self._on_interim, transcript)
-
-                    if speech_final and transcript and not from_finalize:
-                        self._safe_invoke_callback(
-                            self._on_endpoint,
-                            StreamingSpeechEndpointEvent(
-                                transcript=transcript,
-                                event_type="speech_final",
-                                request_id=self._request_id,
-                                is_final=is_final,
-                                speech_final=speech_final,
-                                from_finalize=from_finalize,
-                            ),
-                        )
-
-                    # AUDIT-FIX(#11): A bare speech_final callback is only an
-                    # endpoint hint for the turn controller, not a stable final
-                    # transcript. finalize() must keep waiting until Deepgram
-                    # delivers an actual final segment, otherwise Twinr can
-                    # return and close on a truncated fragment.
-                    if is_final:
-                        self._done.set()
-
-                elif event_type == "UtteranceEnd":
-                    with self._state_lock:
-                        self._saw_utterance_end = True
-                    transcript = self._current_transcript()
-                    if transcript:
-                        self._safe_invoke_callback(
-                            self._on_endpoint,
-                            StreamingSpeechEndpointEvent(
-                                transcript=transcript,
-                                event_type="utterance_end",
-                                request_id=self._request_id,
-                            ),
-                        )
-                    self._done.set()
-
-                elif event_type == "Metadata":
-                    # AUDIT-FIX(#7): Capture request_id from Metadata frames because Deepgram may only emit it there after close/finalize.
-                    request_id = payload.get("request_id")
-                    if isinstance(request_id, str) and request_id.strip():
-                        with self._state_lock:
-                            if self._request_id is None:
-                                self._request_id = request_id.strip()
-                    continue
-
-                elif event_type == "CloseStream":
-                    continue
-
-                elif event_type == "SpeechStarted":
-                    continue
-
-                elif event_type == "Error":
-                    message_text = str(payload.get("description") or payload.get("message") or "Deepgram streaming error").strip()
-                    self._set_stream_error(RuntimeError(message_text))
-                    return
+                if self._protocol == "flux":
+                    self._handle_flux_message(event_type, payload)
+                else:
+                    self._handle_nova_message(event_type, payload)
 
         except Exception as exc:  # pragma: no cover - network close races
             if not self._closed.is_set():
                 self._set_stream_error(exc)
         finally:
             self._done.set()
+
+    def _handle_nova_message(self, event_type: str, payload: dict[str, object]) -> None:
+        """Fold a Nova streaming event into session state."""
+        if event_type == "Results":
+            transcript = _extract_streaming_transcript(payload)
+            confidence = _extract_streaming_confidence(payload)
+            is_final = bool(payload.get("is_final"))
+            speech_final = bool(payload.get("speech_final"))
+            from_finalize = bool(payload.get("from_finalize"))
+
+            with self._state_lock:
+                if transcript:
+                    if is_final:
+                        if not self._final_segments or self._final_segments[-1] != transcript:
+                            self._final_segments.append(transcript)
+                        self._latest_interim = transcript
+                    else:
+                        self._latest_interim = transcript
+                        self._saw_interim = True
+                if confidence is not None:
+                    self._latest_confidence = confidence
+                if speech_final:
+                    self._saw_speech_final = True
+
+            if transcript and not is_final:
+                self._emit_interim(transcript)
+
+            if speech_final and transcript and not from_finalize:
+                self._safe_invoke_callback(
+                    self._on_endpoint,
+                    StreamingSpeechEndpointEvent(
+                        transcript=transcript,
+                        event_type="speech_final",
+                        request_id=self._request_id,
+                        is_final=is_final,
+                        speech_final=speech_final,
+                        from_finalize=from_finalize,
+                    ),
+                )
+
+            if is_final:
+                self._done.set()
+            return
+
+        if event_type == "UtteranceEnd":
+            with self._state_lock:
+                self._saw_utterance_end = True
+            transcript = self._current_transcript()
+            if transcript:
+                self._safe_invoke_callback(
+                    self._on_endpoint,
+                    StreamingSpeechEndpointEvent(
+                        transcript=transcript,
+                        event_type="utterance_end",
+                        request_id=self._request_id,
+                    ),
+                )
+            self._done.set()
+            return
+
+        if event_type == "Metadata":
+            return
+
+        if event_type in {"CloseStream", "SpeechStarted"}:
+            return
+
+        if event_type == "Error":
+            message_text = str(
+                payload.get("description")
+                or payload.get("message")
+                or "Deepgram streaming error"
+            ).strip()
+            self._set_stream_error(RuntimeError(message_text))
+            return
+
+    def _handle_flux_message(self, event_type: str, payload: dict[str, object]) -> None:
+        """Fold a Flux streaming event into session state."""
+        if event_type == "Connected":
+            return
+
+        if event_type == "TurnInfo":
+            turn_event = str(payload.get("event", "")).strip()
+            transcript = str(payload.get("transcript") or "").strip()
+            confidence = _extract_flux_confidence(payload)
+
+            with self._state_lock:
+                if transcript:
+                    if turn_event == "EndOfTurn":
+                        if not self._final_segments or self._final_segments[-1] != transcript:
+                            self._final_segments.append(transcript)
+                        self._latest_interim = transcript
+                    else:
+                        self._latest_interim = transcript
+                        self._saw_interim = True
+                if confidence is not None:
+                    self._latest_confidence = confidence
+                if turn_event == "EndOfTurn":
+                    self._saw_speech_final = True
+
+            if turn_event == "Update" and transcript:
+                self._emit_interim(transcript)
+                return
+
+            if turn_event == "EagerEndOfTurn":
+                if transcript:
+                    self._safe_invoke_callback(
+                        self._on_endpoint,
+                        StreamingSpeechEndpointEvent(
+                            transcript=transcript,
+                            event_type="eager_end_of_turn",
+                            request_id=self._request_id,
+                            is_final=False,
+                            speech_final=False,
+                            from_finalize=False,
+                        ),
+                    )
+                return
+
+            if turn_event == "TurnResumed":
+                if transcript:
+                    self._emit_interim(transcript)
+                self._safe_invoke_callback(
+                    self._on_endpoint,
+                    StreamingSpeechEndpointEvent(
+                        transcript=transcript,
+                        event_type="turn_resumed",
+                        request_id=self._request_id,
+                        is_final=False,
+                        speech_final=False,
+                        from_finalize=False,
+                    ),
+                )
+                return
+
+            if turn_event == "EndOfTurn":
+                if transcript:
+                    self._safe_invoke_callback(
+                        self._on_endpoint,
+                        StreamingSpeechEndpointEvent(
+                            transcript=transcript,
+                            event_type="end_of_turn",
+                            request_id=self._request_id,
+                            is_final=True,
+                            speech_final=True,
+                            from_finalize=False,
+                        ),
+                    )
+                self._done.set()
+                return
+
+            return
+
+        if event_type == "ConfigureSuccess":
+            return
+
+        if event_type == "ConfigureFailure":
+            description = str(payload.get("description") or "Flux configure rejected").strip()
+            logger.warning("Deepgram Flux ConfigureFailure: %s", description)
+            return
+
+        if event_type in {"CloseStream"}:
+            return
+
+        if event_type == "Error":
+            message_text = str(
+                payload.get("description")
+                or payload.get("message")
+                or "Deepgram Flux streaming error"
+            ).strip()
+            self._set_stream_error(RuntimeError(message_text))
+            return
 
     def _result_snapshot(self, *, transcript: str) -> StreamingTranscriptionResult:
         """Build the contract object exposed to Twinr runtime callers."""
@@ -448,46 +894,43 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
 
     def _sender_loop(self) -> None:
         """Drain queued audio and control frames to the websocket connection."""
-        try:
-            while True:
-                try:
-                    payload, ack = self._outgoing.get(timeout=0.5)
-                except Empty:
-                    if self._closed.is_set():
-                        return
+        while True:
+            try:
+                payload, ack = self._outgoing.get(timeout=0.5)
+            except Empty:
+                if self._closed.is_set():
+                    return
+                continue
+
+            try:
+                if self._get_stream_error() is not None and payload not in {"CloseStream", "Finalize"}:
                     continue
 
-                try:
-                    if self._get_stream_error() is not None and payload not in {"CloseStream", "Finalize"}:
-                        continue
+                with self._send_lock:
+                    if isinstance(payload, bytes):
+                        self._connection.send(payload)
+                    else:
+                        self._connection.send(json.dumps({"type": payload}))
 
-                    with self._send_lock:
-                        if isinstance(payload, bytes):
-                            self._connection.send(payload)
-                        else:
-                            self._connection.send(json.dumps({"type": payload}))
+                with self._state_lock:
+                    self._last_send_monotonic = time.monotonic()
 
-                    with self._state_lock:
-                        self._last_send_monotonic = time.monotonic()
-
-                    if payload == "CloseStream":
-                        return
-
-                except Exception as exc:  # pragma: no cover - network close races
-                    if not self._closed.is_set():
-                        self._set_stream_error(exc)
+                if isinstance(payload, str) and payload == "CloseStream":
                     return
 
-                finally:
-                    if ack is not None:
-                        ack.set()
-                    self._outgoing.task_done()
-        finally:
-            self._done.set()
+            except Exception as exc:  # pragma: no cover - network close races
+                if not self._closed.is_set():
+                    self._set_stream_error(exc)
+                return
+
+            finally:
+                if ack is not None:
+                    ack.set()
+                self._outgoing.task_done()
 
     def _keepalive_loop(self) -> None:
         """Send Deepgram keepalives during long idle periods."""
-        if self._keepalive_interval_s <= 0:
+        if self._keepalive_interval_s <= 0 or not self._keepalive_control_message:
             return
 
         while not self._closed.wait(timeout=self._keepalive_interval_s):
@@ -503,10 +946,23 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                 continue
 
             try:
-                self._enqueue("KeepAlive", allow_error=True)
+                self._enqueue(self._keepalive_control_message, allow_error=True)
             except Exception:
-                logger.warning("Deepgram keepalive enqueue failed; continuing without keepalive", exc_info=True)
+                logger.warning(
+                    "Deepgram keepalive enqueue failed; continuing without keepalive",
+                    exc_info=True,
+                )
                 return
+
+    def _emit_interim(self, transcript: str) -> None:
+        """Emit an interim callback only when the text actually changed."""
+        should_emit = False
+        with self._state_lock:
+            if transcript and transcript != self._last_interim_callback_value:
+                self._last_interim_callback_value = transcript
+                should_emit = True
+        if should_emit:
+            self._safe_invoke_callback(self._on_interim, transcript)
 
     def _enqueue(
         self,
@@ -539,7 +995,11 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                 transcript = self._latest_interim.strip()
             return transcript
 
-    def _safe_invoke_callback(self, callback: Callable[[Any], None] | None, value: Any) -> None:
+    def _safe_invoke_callback(
+        self,
+        callback: Callable[[Any], None] | None,
+        value: Any,
+    ) -> None:
         """Invoke a caller callback without letting callback failures break STT."""
         if callback is None:
             return
@@ -584,8 +1044,10 @@ class DeepgramSpeechToTextProvider:
         """Create the provider with optional HTTP and websocket test doubles."""
         self.config = config
         self._owns_client = client is None
-        # AUDIT-FIX(#8): Track ownership and expose close() so provider-created HTTP clients can release pooled sockets cleanly at shutdown.
-        self._client = client or httpx.Client(timeout=self.config.deepgram_timeout_s)
+        self._client = client or httpx.Client(
+            timeout=httpx.Timeout(float(self.config.deepgram_timeout_s)),
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        )
         self._websocket_connector = websocket_connector or websocket_connect
 
     def close(self) -> None:
@@ -601,6 +1063,393 @@ class DeepgramSpeechToTextProvider:
         """Close provider-owned resources when leaving a context manager."""
         self.close()
 
+    def _get_config(self, name: str, default: Any) -> Any:
+        """Read optional config fields without requiring a TwinrConfig schema bump."""
+        return getattr(self.config, name, default)
+
+    def _allow_insecure_transport(self) -> bool:
+        """Whether cleartext HTTP/WS should be allowed for Deepgram transport."""
+        return _parse_bool(self._get_config("deepgram_allow_insecure_transport", False), False)
+
+    def _mip_opt_out_enabled(self) -> bool:
+        """Whether to opt out of Deepgram's model-improvement retention path."""
+        # BREAKING: Privacy-first default is now True unless config explicitly disables it.
+        return _parse_bool(self._get_config("deepgram_mip_opt_out", True), True)
+
+    def _resolve_credentials(self) -> tuple[str, str]:
+        """Prefer short-lived access tokens, then fall back to API keys."""
+        access_token = str(
+            self._get_config("deepgram_access_token", None)
+            or self._get_config("deepgram_token", None)
+            or os.getenv(_DEEPGRAM_ACCESS_TOKEN_ENV, "")
+        ).strip()
+        if access_token:
+            return ("Bearer", access_token)
+
+        api_key = str(
+            self._get_config("deepgram_api_key", None)
+            or os.getenv(_DEEPGRAM_API_KEY_ENV, "")
+        ).strip()
+        if api_key:
+            return ("Token", api_key)
+
+        raise RuntimeError(
+            "DEEPGRAM_TOKEN or DEEPGRAM_API_KEY is required to use the Deepgram speech provider"
+        )
+
+    def _authorization_header_value(self) -> str:
+        """Build the Authorization header for Deepgram requests."""
+        scheme, credential = self._resolve_credentials()
+        return f"{scheme} {credential}"
+
+    def _resolved_streaming_model(self) -> str:
+        """Return the model used for live streaming STT."""
+        return _normalize_model_name(self.config.deepgram_stt_model)
+
+    def _resolved_batch_model(self) -> str:
+        """Return the model used for batch transcription requests."""
+        configured_batch_model = self._get_config("deepgram_batch_stt_model", None)
+        if configured_batch_model:
+            return _normalize_model_name(configured_batch_model)
+
+        streaming_model = self._resolved_streaming_model()
+        if _is_flux_model(streaming_model):
+            # BREAKING: Flux is streaming-only; batch now falls back to Nova-3 unless
+            #           a dedicated deepgram_batch_stt_model is configured.
+            return "nova-3"
+        return streaming_model
+
+    def _max_retries(self) -> int:
+        """Return bounded retry count for transient HTTP / connect failures."""
+        return max(0, int(self._get_config("deepgram_max_retries", 2)))
+
+    def _retry_backoff_s(self) -> float:
+        """Base backoff between transient retry attempts."""
+        return max(0.0, float(self._get_config("deepgram_retry_backoff_s", 0.5)))
+
+    def _max_retry_backoff_s(self) -> float:
+        """Upper bound for retry delays."""
+        return max(0.1, float(self._get_config("deepgram_retry_max_backoff_s", 4.0)))
+
+    def _sleep_before_retry(self, *, attempt: int, response: httpx.Response | None = None) -> None:
+        """Sleep using Retry-After or capped exponential backoff."""
+        delay_s = None
+        if response is not None:
+            delay_s = _extract_transient_retry_delay_s(response)
+        if delay_s is None:
+            delay_s = min(
+                self._max_retry_backoff_s(),
+                self._retry_backoff_s() * (2 ** attempt),
+            )
+        if delay_s > 0.0:
+            time.sleep(delay_s)
+
+    def _run_with_retries(
+        self,
+        *,
+        operation_name: str,
+        request_fn: Callable[[], httpx.Response],
+    ) -> httpx.Response:
+        """Run an idempotent Deepgram request with bounded retry/backoff."""
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries() + 1):
+            try:
+                response = request_fn()
+                if (
+                    response.status_code in _DEEPGRAM_TRANSIENT_STATUS_CODES
+                    and attempt < self._max_retries()
+                ):
+                    logger.warning(
+                        "Transient Deepgram %s response (%s); retrying attempt %s/%s",
+                        operation_name,
+                        response.status_code,
+                        attempt + 1,
+                        self._max_retries(),
+                    )
+                    response.close()
+                    self._sleep_before_retry(attempt=attempt, response=response)
+                    continue
+                response.raise_for_status()
+                return response
+
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                response = exc.response
+                if (
+                    response is not None
+                    and response.status_code in _DEEPGRAM_TRANSIENT_STATUS_CODES
+                    and attempt < self._max_retries()
+                ):
+                    logger.warning(
+                        "Transient Deepgram %s error (%s); retrying attempt %s/%s",
+                        operation_name,
+                        response.status_code,
+                        attempt + 1,
+                        self._max_retries(),
+                    )
+                    response.close()
+                    self._sleep_before_retry(attempt=attempt, response=response)
+                    continue
+
+                if response is not None:
+                    details = _redacted_error_details(response)
+                    response.close()
+                    raise RuntimeError(
+                        f"Deepgram {operation_name} failed: {details}"
+                    ) from exc
+                raise RuntimeError(f"Deepgram {operation_name} failed: {exc}") from exc
+
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+                if attempt < self._max_retries():
+                    logger.warning(
+                        "Transient Deepgram %s transport error (%s); retrying attempt %s/%s",
+                        operation_name,
+                        exc.__class__.__name__,
+                        attempt + 1,
+                        self._max_retries(),
+                    )
+                    self._sleep_before_retry(attempt=attempt)
+                    continue
+                raise RuntimeError(
+                    f"Deepgram {operation_name} failed after retries: {exc}"
+                ) from exc
+
+        if last_error is None:
+            raise RuntimeError(f"Deepgram {operation_name} failed with an unknown error")
+        raise RuntimeError(f"Deepgram {operation_name} failed after retries: {last_error}") from last_error
+
+    def _common_query_params(self) -> list[tuple[str, str]]:
+        """Return query params that should be attached to all Deepgram listen requests."""
+        params: list[tuple[str, str]] = []
+        if self._mip_opt_out_enabled():
+            params.append(("mip_opt_out", "true"))
+        request_tag = str(self._get_config("deepgram_request_tag", "") or "").strip()
+        if request_tag:
+            params.append(("tag", request_tag))
+        return params
+
+    def _batch_query_params(
+        self,
+        *,
+        model: str,
+        language: str | None,
+        prompt: str | None,
+    ) -> list[tuple[str, str]]:
+        """Build the query parameter list for batch transcription."""
+        params: list[tuple[str, str]] = [("model", model)]
+        resolved_language = (language or self.config.deepgram_stt_language or "").strip()
+        if resolved_language and not _is_flux_model(model):
+            params.append(("language", resolved_language))
+        if self.config.deepgram_stt_smart_format:
+            params.append(("smart_format", "true"))
+        params.extend(_deepgram_prompt_params(model=model, prompt=prompt))
+        params.extend(self._common_query_params())
+        return params
+
+    def _streaming_query_params(
+        self,
+        *,
+        model: str,
+        language: str | None,
+        prompt: str | None,
+        sample_rate: int,
+        channels: int,
+        on_interim: Callable[[str], None] | None,
+    ) -> tuple[str, list[tuple[str, str]], bool]:
+        """Build the query parameter list for a streaming websocket session."""
+        if _is_flux_model(model):
+            params: list[tuple[str, str]] = [
+                ("model", model),
+                ("encoding", "linear16"),
+                ("sample_rate", str(sample_rate)),
+                ("channels", str(channels)),
+            ]
+            params.extend(_deepgram_prompt_params(model=model, prompt=prompt))
+
+            eot_threshold = self._get_config("deepgram_flux_eot_threshold", None)
+            if eot_threshold is not None:
+                threshold = _require_non_negative_float("deepgram_flux_eot_threshold", eot_threshold)
+                if not 0.5 <= threshold <= 0.9:
+                    raise ValueError("deepgram_flux_eot_threshold must be between 0.5 and 0.9")
+                params.append(("eot_threshold", f"{threshold:g}"))
+
+            eager_eot_threshold = self._get_config("deepgram_flux_eager_eot_threshold", None)
+            if eager_eot_threshold is not None:
+                threshold = _require_non_negative_float(
+                    "deepgram_flux_eager_eot_threshold",
+                    eager_eot_threshold,
+                )
+                if not 0.3 <= threshold <= 0.9:
+                    raise ValueError(
+                        "deepgram_flux_eager_eot_threshold must be between 0.3 and 0.9"
+                    )
+                params.append(("eager_eot_threshold", f"{threshold:g}"))
+
+            eot_timeout_ms = self._get_config("deepgram_flux_eot_timeout_ms", None)
+            if eot_timeout_ms is not None:
+                timeout_ms = int(eot_timeout_ms)
+                if not 500 <= timeout_ms <= 10000:
+                    raise ValueError("deepgram_flux_eot_timeout_ms must be between 500 and 10000")
+                params.append(("eot_timeout_ms", str(timeout_ms)))
+
+            if language:
+                logger.warning(
+                    "Ignoring Deepgram language=%r for Flux; language is encoded in the model name.",
+                    language,
+                )
+
+            params.extend(self._common_query_params())
+            return ("flux", params, False)
+
+        interim_results_enabled = bool(
+            self.config.deepgram_streaming_interim_results
+            or on_interim is not None
+            or int(self.config.deepgram_streaming_utterance_end_ms) > 0
+        )
+        vad_events_enabled = _parse_bool(
+            self._get_config("deepgram_streaming_vad_events", True),
+            True,
+        )
+
+        params = [
+            ("model", model),
+            ("encoding", "linear16"),
+            ("sample_rate", str(sample_rate)),
+            ("channels", str(channels)),
+        ]
+        resolved_language = (language or self.config.deepgram_stt_language or "").strip()
+        if resolved_language:
+            params.append(("language", resolved_language))
+        if self.config.deepgram_stt_smart_format:
+            params.append(("smart_format", "true"))
+        if interim_results_enabled:
+            params.append(("interim_results", "true"))
+        if vad_events_enabled:
+            params.append(("vad_events", "true"))
+        if self.config.deepgram_streaming_endpointing_ms > 0:
+            params.append(("endpointing", str(self.config.deepgram_streaming_endpointing_ms)))
+        if self.config.deepgram_streaming_utterance_end_ms > 0:
+            params.append(("utterance_end_ms", str(self.config.deepgram_streaming_utterance_end_ms)))
+        params.extend(_deepgram_prompt_params(model=model, prompt=prompt))
+        params.extend(self._common_query_params())
+        return ("nova", params, True)
+
+    def _batch_listen_url(self, *, params: Iterable[tuple[str, str]]) -> str:
+        """Build the hosted or self-hosted URL for batch `/v1/listen` requests."""
+        return _build_listen_url(
+            base_url=self.config.deepgram_base_url,
+            version="v1",
+            websocket=False,
+            params=params,
+            allow_insecure=self._allow_insecure_transport(),
+        )
+
+    def _streaming_listen_url(self, *, protocol: str, params: Iterable[tuple[str, str]]) -> str:
+        """Build the hosted or self-hosted websocket URL for streaming listen requests."""
+        version = "v2" if protocol == "flux" else "v1"
+        return _build_listen_url(
+            base_url=self.config.deepgram_base_url,
+            version=version,
+            websocket=True,
+            params=params,
+            allow_insecure=self._allow_insecure_transport(),
+        )
+
+    def _transcribe_bytes_request(
+        self,
+        *,
+        audio_bytes: bytes,
+        content_type: str,
+        params: list[tuple[str, str]],
+    ) -> dict[str, object]:
+        """POST in-memory audio bytes to Deepgram with retries and structured errors."""
+        max_request_bytes = max(
+            64 * 1024,
+            int(self._get_config("deepgram_transcribe_max_bytes", 32 * 1024 * 1024)),
+        )
+        if len(audio_bytes) > max_request_bytes:
+            raise RuntimeError(
+                f"Audio payload too large for Deepgram batch transcription: {len(audio_bytes)} > {max_request_bytes} bytes"
+            )
+
+        def request_fn() -> httpx.Response:
+            return self._client.post(
+                self._batch_listen_url(params=params),
+                headers={
+                    "Authorization": self._authorization_header_value(),
+                    "Content-Type": content_type or "application/octet-stream",
+                },
+                content=audio_bytes,
+            )
+
+        response = self._run_with_retries(
+            operation_name="transcription request",
+            request_fn=request_fn,
+        )
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Deepgram transcription response was not valid JSON: {_redacted_error_details(response)}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Deepgram transcription response JSON was not an object")
+        return payload
+
+    def _validate_audio_path(self, path: Path) -> tuple[object, int, str, bytes]:
+        """Open and validate a local path before sending bytes off-device."""
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+        open_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
+
+        try:
+            fd = os.open(path, open_flags)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Audio path does not exist: {path}") from exc
+        except OSError as exc:
+            if path.is_symlink():
+                raise RuntimeError(f"Refusing to transcribe symlinked path: {path}") from exc
+            raise RuntimeError(f"Unable to open audio path safely: {path}") from exc
+
+        file_obj = os.fdopen(fd, "rb")
+        try:
+            file_stat = os.fstat(file_obj.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError(f"Audio path is not a regular file: {path}")
+
+            max_request_bytes = max(
+                64 * 1024,
+                int(self._get_config("deepgram_transcribe_max_bytes", 32 * 1024 * 1024)),
+            )
+            if file_stat.st_size > max_request_bytes:
+                raise RuntimeError(
+                    f"Audio path exceeds configured transcription size limit: {file_stat.st_size} > {max_request_bytes} bytes"
+                )
+
+            header = file_obj.read(64)
+            file_obj.seek(0)
+
+            allow_non_audio = _parse_bool(
+                self._get_config("deepgram_allow_non_audio_files", False),
+                False,
+            )
+            if not allow_non_audio and not _is_probable_audio_path(
+                path=path,
+                content_type=content_type,
+                header=header,
+            ):
+                raise RuntimeError(
+                    f"Refusing to upload a non-audio-looking file for transcription: {path}"
+                )
+
+            return file_obj, file_stat.st_size, content_type, header
+        except Exception:
+            file_obj.close()
+            raise
+
     def transcribe(
         self,
         audio_bytes: bytes,
@@ -610,59 +1459,21 @@ class DeepgramSpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
-        """Transcribe an in-memory audio payload with Deepgram's REST API.
-
-        Args:
-            audio_bytes: Raw audio bytes to send to Deepgram.
-            filename: Unused compatibility parameter kept for provider parity.
-            content_type: MIME type describing ``audio_bytes``.
-            language: Optional override for the configured transcription language.
-            prompt: Optional provider-agnostic hint terms to bias transcription.
-
-        Returns:
-            The best transcript string returned by Deepgram, or an empty string
-            when the provider produced no transcript text.
-
-        Raises:
-            RuntimeError: If configuration is incomplete or the request fails.
-        """
+        """Transcribe an in-memory audio payload with Deepgram's REST API."""
         del filename
         if not audio_bytes:
             return ""
 
-        api_key = (self.config.deepgram_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError("DEEPGRAM_API_KEY is required to use the Deepgram speech provider")
-
-        params: list[tuple[str, str]] = [("model", self.config.deepgram_stt_model)]
-        resolved_language = (language or self.config.deepgram_stt_language or "").strip()
-        if resolved_language:
-            params.append(("language", resolved_language))
-        if self.config.deepgram_stt_smart_format:
-            params.append(("smart_format", "true"))
-        params.extend(
-            _deepgram_prompt_params(
-                model=self.config.deepgram_stt_model,
+        model = self._resolved_batch_model()
+        payload = self._transcribe_bytes_request(
+            audio_bytes=audio_bytes,
+            content_type=content_type,
+            params=self._batch_query_params(
+                model=model,
+                language=language,
                 prompt=prompt,
-            )
+            ),
         )
-
-        try:
-            response = self._client.post(
-                f"{self.config.deepgram_base_url.rstrip('/')}/listen",
-                params=params,
-                headers={
-                    "Authorization": f"Token {api_key}",
-                    "Content-Type": content_type or "application/octet-stream",
-                },
-                content=audio_bytes,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            # AUDIT-FIX(#11): Re-raise transport and decode failures as controlled runtime errors for cleaner upstream recovery paths.
-            raise RuntimeError(f"Deepgram transcription request failed: {exc}") from exc
-
         return _extract_transcript(payload)
 
     def transcribe_path(
@@ -672,57 +1483,43 @@ class DeepgramSpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
-        """Safely read a regular audio file from disk and transcribe it.
-
-        Args:
-            path: Filesystem path to a regular audio file.
-            language: Optional override for the configured transcription language.
-            prompt: Optional provider-agnostic hint terms to bias transcription.
-
-        Returns:
-            The transcript produced by :meth:`transcribe`.
-
-        Raises:
-            RuntimeError: If the file cannot be opened safely or transcription fails.
-        """
+        """Safely read a regular audio file from disk and transcribe it."""
         audio_path = Path(path)
-        content_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
-
-        open_flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            # AUDIT-FIX(#12): Refuse symlink traversal on platforms that support O_NOFOLLOW.
-            open_flags |= os.O_NOFOLLOW
-
-        try:
-            fd = os.open(audio_path, open_flags)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Audio path does not exist: {audio_path}") from exc
-        except OSError as exc:
-            if audio_path.is_symlink():
-                raise RuntimeError(f"Refusing to transcribe symlinked path: {audio_path}") from exc
-            raise RuntimeError(f"Unable to open audio path safely: {audio_path}") from exc
-
-        try:
-            file_stat = os.fstat(fd)
-            # AUDIT-FIX(#12): Only regular files are accepted; devices, pipes, and directories are rejected before any bytes leave the device.
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise RuntimeError(f"Audio path is not a regular file: {audio_path}")
-
-            # AUDIT-FIX(#13): Use an explicit file descriptor wrapper so the file handle is always closed deterministically.
-            with os.fdopen(fd, "rb") as audio_file:
-                fd = -1
-                audio_bytes = audio_file.read()
-        finally:
-            if fd >= 0:
-                os.close(fd)
-
-        return self.transcribe(
-            audio_bytes,
-            filename=audio_path.name,
-            content_type=content_type,
-            language=language,
-            prompt=prompt,
+        model = self._resolved_batch_model()
+        file_chunk_bytes = max(
+            8 * 1024,
+            int(self._get_config("deepgram_transcribe_file_chunk_bytes", 128 * 1024)),
         )
+        params = self._batch_query_params(model=model, language=language, prompt=prompt)
+
+        audio_file, _, content_type, _ = self._validate_audio_path(audio_path)
+        try:
+            def request_fn() -> httpx.Response:
+                audio_file.seek(0)
+                return self._client.post(
+                    self._batch_listen_url(params=params),
+                    headers={
+                        "Authorization": self._authorization_header_value(),
+                        "Content-Type": content_type,
+                    },
+                    content=_iter_file_chunks(audio_file, chunk_size=file_chunk_bytes),
+                )
+
+            response = self._run_with_retries(
+                operation_name="path transcription request",
+                request_fn=request_fn,
+            )
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Deepgram transcription response was not valid JSON: {_redacted_error_details(response)}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("Deepgram transcription response JSON was not an object")
+            return _extract_transcript(payload)
+        finally:
+            audio_file.close()
 
     def start_streaming_session(
         self,
@@ -734,76 +1531,100 @@ class DeepgramSpeechToTextProvider:
         on_interim: Callable[[str], None] | None = None,
         on_endpoint: Callable[[StreamingSpeechEndpointEvent], None] | None = None,
     ) -> StreamingSpeechToTextSession:
-        """Open a bounded Deepgram websocket session for live PCM input.
-
-        Args:
-            sample_rate: PCM sample rate in Hz.
-            channels: Number of PCM channels sent through the stream.
-            language: Optional override for the configured transcription language.
-            prompt: Unused compatibility parameter kept for provider parity.
-            on_interim: Optional callback for interim transcript fragments.
-            on_endpoint: Optional callback for endpoint notifications.
-
-        Returns:
-            A live :class:`StreamingSpeechToTextSession` ready to receive PCM bytes.
-
-        Raises:
-            RuntimeError: If configuration is incomplete or the websocket cannot open.
-            ValueError: If ``sample_rate`` or ``channels`` are not positive integers.
-        """
-        del prompt
-        api_key = (self.config.deepgram_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError("DEEPGRAM_API_KEY is required to use the Deepgram speech provider")
-
+        """Open a bounded Deepgram websocket session for live PCM input."""
         sample_rate = _require_positive_int("sample_rate", sample_rate)
         channels = _require_positive_int("channels", channels)
-        resolved_language = (language or self.config.deepgram_stt_language or "").strip() or None
 
-        # AUDIT-FIX(#14): Bound incoming message size instead of disabling limits completely; STT results are tiny, unbounded frames are unnecessary risk.
+        model = self._resolved_streaming_model()
+        if _is_flux_model(model):
+            _require_flux_sample_rate(sample_rate)
+
+        protocol, params, supports_keepalive = self._streaming_query_params(
+            model=model,
+            language=language,
+            prompt=prompt,
+            sample_rate=sample_rate,
+            channels=channels,
+            on_interim=on_interim,
+        )
+
         max_message_bytes = max(
             64 * 1024,
-            int(getattr(self.config, "deepgram_streaming_max_message_bytes", 4 * 1024 * 1024)),
+            int(self._get_config("deepgram_streaming_max_message_bytes", 4 * 1024 * 1024)),
         )
         keepalive_interval_s = max(
             0.0,
-            float(getattr(self.config, "deepgram_streaming_keepalive_interval_s", 4.0)),
+            float(self._get_config("deepgram_streaming_keepalive_interval_s", 4.0)),
         )
         send_timeout_s = max(
             0.5,
-            float(getattr(self.config, "deepgram_streaming_send_timeout_s", self.config.deepgram_timeout_s)),
+            float(
+                self._get_config(
+                    "deepgram_streaming_send_timeout_s",
+                    self.config.deepgram_timeout_s,
+                )
+            ),
         )
-
         max_pending_messages = max(
             8,
-            int(getattr(self.config, "deepgram_streaming_max_pending_messages", 256)),
+            int(self._get_config("deepgram_streaming_max_pending_messages", 256)),
         )
 
-        connection = self._websocket_connector(
-            _build_websocket_url(
-                base_url=self.config.deepgram_base_url,
-                model=self.config.deepgram_stt_model,
-                language=resolved_language,
-                smart_format=self.config.deepgram_stt_smart_format,
-                sample_rate=sample_rate,
-                channels=channels,
-                interim_results=self.config.deepgram_streaming_interim_results,
-                endpointing_ms=self.config.deepgram_streaming_endpointing_ms,
-                utterance_end_ms=self.config.deepgram_streaming_utterance_end_ms,
-            ),
-            additional_headers={
-                "Authorization": f"Token {api_key}",
-            },
-            open_timeout=self.config.deepgram_timeout_s,
-            close_timeout=self.config.deepgram_timeout_s,
-            max_size=max_message_bytes,
+        default_chunk_ms = 80.0 if protocol == "flux" else 100.0
+        chunk_ms = max(
+            0.0,
+            float(self._get_config("deepgram_streaming_audio_chunk_ms", default_chunk_ms)),
         )
+        outgoing_audio_chunk_bytes = _compute_pcm_chunk_bytes(
+            sample_rate=sample_rate,
+            channels=channels,
+            chunk_ms=chunk_ms,
+        )
+
+        websocket_url = self._streaming_listen_url(protocol=protocol, params=params)
+
+        def connect_once():
+            return self._websocket_connector(
+                websocket_url,
+                additional_headers={
+                    "Authorization": self._authorization_header_value(),
+                },
+                open_timeout=self.config.deepgram_timeout_s,
+                close_timeout=self.config.deepgram_timeout_s,
+                max_size=max_message_bytes,
+            )
+
+        last_error: Exception | None = None
+        connection = None
+        for attempt in range(self._max_retries() + 1):
+            try:
+                connection = connect_once()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self._max_retries():
+                    break
+                logger.warning(
+                    "Transient Deepgram websocket connect failure (%s); retrying attempt %s/%s",
+                    exc.__class__.__name__,
+                    attempt + 1,
+                    self._max_retries(),
+                )
+                self._sleep_before_retry(attempt=attempt)
+        if connection is None:
+            raise RuntimeError(f"Deepgram websocket connect failed: {last_error}") from last_error
+
         return _DeepgramStreamingSession(
             connection=connection,
+            protocol=protocol,
             finalize_timeout_s=self.config.deepgram_streaming_finalize_timeout_s,
-            keepalive_interval_s=keepalive_interval_s,
+            keepalive_interval_s=keepalive_interval_s if supports_keepalive else 0.0,
             send_timeout_s=send_timeout_s,
             max_pending_messages=max_pending_messages,
+            outgoing_audio_chunk_bytes=outgoing_audio_chunk_bytes,
+            finalize_control_message="CloseStream" if protocol == "flux" else "Finalize",
+            close_control_message="CloseStream",
+            keepalive_control_message="KeepAlive" if supports_keepalive else None,
             on_interim=on_interim,
             on_endpoint=on_endpoint,
         )

@@ -540,6 +540,7 @@ class LongTermRemoteStateReadMixin:
             prefer_cached_document_id=prefer_cached_document_id,
             prefer_metadata_only=prefer_metadata_only,
             fast_fail=fast_fail,
+            repair_pointer_after_origin_read=False,
         )
 
     def _probe_snapshot_load_internal(
@@ -550,6 +551,7 @@ class LongTermRemoteStateReadMixin:
         prefer_cached_document_id: bool,
         prefer_metadata_only: bool = False,
         fast_fail: bool = False,
+        repair_pointer_after_origin_read: bool = True,
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one remote snapshot read, optionally reusing a learned document id."""
 
@@ -580,6 +582,7 @@ class LongTermRemoteStateReadMixin:
                 local_path=local_path,
                 prefer_metadata_only=prefer_metadata_only,
                 fast_fail=fast_fail,
+                repair_pointer_after_origin_read=repair_pointer_after_origin_read,
             )
         else:
             probe = self._load_snapshot_with_pointer_fallback(
@@ -588,6 +591,7 @@ class LongTermRemoteStateReadMixin:
                 local_path=local_path,
                 prefer_metadata_only=prefer_metadata_only,
                 fast_fail=fast_fail,
+                repair_pointer_after_origin_read=repair_pointer_after_origin_read,
             )
         self._store_cached_probe(probe)
         return probe
@@ -600,6 +604,7 @@ class LongTermRemoteStateReadMixin:
         local_path: Path | None = None,
         prefer_metadata_only: bool = False,
         fast_fail: bool = False,
+        repair_pointer_after_origin_read: bool = True,
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one snapshot by a remembered document id before pointer/origin resolution."""
 
@@ -636,6 +641,7 @@ class LongTermRemoteStateReadMixin:
             local_path=local_path,
             prefer_metadata_only=prefer_metadata_only,
             fast_fail=fast_fail,
+            repair_pointer_after_origin_read=repair_pointer_after_origin_read,
         )
         if (
             hinted_document_id
@@ -674,6 +680,7 @@ class LongTermRemoteStateReadMixin:
         prefer_metadata_only: bool = False,
         bypass_circuit_open: bool = False,
         fast_fail: bool = False,
+        repair_pointer_after_origin_read: bool = True,
     ) -> LongTermRemoteSnapshotProbe:
         started = time.monotonic()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
@@ -733,7 +740,12 @@ class LongTermRemoteStateReadMixin:
             fast_fail=fast_fail,
         )
         attempt_records.extend(origin_result.attempts)
-        if origin_result.payload is not None and origin_result.document_id and not self._is_pointer_snapshot_kind(snapshot_kind):
+        if (
+            repair_pointer_after_origin_read
+            and origin_result.payload is not None
+            and origin_result.document_id
+            and not self._is_pointer_snapshot_kind(snapshot_kind)
+        ):
             write_client = self.write_client
             if write_client is not None:
                 try:

@@ -22,6 +22,57 @@ from .shared import (
 
 
 class RemoteCatalogCatalogMixin:
+    def load_catalog_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Load the authoritative current catalog payload for one collection."""
+
+        payload = self._load_catalog_payload(snapshot_kind=snapshot_kind)
+        if isinstance(payload, Mapping):
+            self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=payload)
+            return dict(payload)
+        cached = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+        if isinstance(cached, Mapping):
+            return dict(cached)
+        return None
+
+    def probe_catalog_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Probe the fixed-URI current head document without falling back to snapshots."""
+
+        payload = self._load_catalog_head_payload(snapshot_kind=snapshot_kind, metadata_only=True)
+        if isinstance(payload, Mapping):
+            self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=payload)
+            return dict(payload)
+        cached = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+        if isinstance(cached, Mapping):
+            return dict(cached)
+        return None
+
+    def _recent_catalog_head_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Return one bounded same-process current-head payload bridge."""
+
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._recent_catalog_head_cache.get(snapshot_kind)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._recent_catalog_head_cache.pop(snapshot_kind, None)
+                return None
+            return dict(cached.payload)
+
+    def _store_recent_catalog_head_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        """Keep the latest same-process catalog head long enough for read-after-write probes."""
+
+        with self._cache_lock:
+            self._recent_catalog_head_cache[snapshot_kind] = _CachedItemPayload(
+                payload=dict(payload),
+                expires_at_monotonic=time.monotonic() + self._recent_catalog_head_ttl_s(),
+            )
+
     def _cached_catalog_entries(self, *, snapshot_kind: str) -> tuple[LongTermRemoteCatalogEntry, ...] | None:
         ttl_s = self._persistent_read_cache_ttl_s()
         if ttl_s <= 0.0:
@@ -37,6 +88,19 @@ class RemoteCatalogCatalogMixin:
                 return None
             return cached.entries
 
+    def _recent_catalog_entries(self, *, snapshot_kind: str) -> tuple[LongTermRemoteCatalogEntry, ...] | None:
+        """Return one bounded same-process current-catalog bridge."""
+
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._recent_catalog_entries_cache.get(snapshot_kind)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._recent_catalog_entries_cache.pop(snapshot_kind, None)
+                return None
+            return cached.entries
+
     def _store_catalog_entries(
         self,
         *,
@@ -44,18 +108,26 @@ class RemoteCatalogCatalogMixin:
         entries: tuple[LongTermRemoteCatalogEntry, ...],
     ) -> None:
         ttl_s = self._persistent_read_cache_ttl_s()
-        if ttl_s <= 0.0:
+        recent_ttl_s = self._recent_catalog_entries_ttl_s()
+        if ttl_s <= 0.0 and recent_ttl_s <= 0.0:
             return
+        expires_at_monotonic = time.monotonic()
         with self._cache_lock:
-            self._catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
-                entries=entries,
-                expires_at_monotonic=time.monotonic() + ttl_s,
-            )
-            self._local_search_selector_cache[snapshot_kind] = _CachedLocalSearchSelector(
-                selector=self._build_local_search_selector(entries=entries),
-                by_item_id={entry.item_id: entry for entry in entries},
-                expires_at_monotonic=time.monotonic() + ttl_s,
-            )
+            if ttl_s > 0.0:
+                self._catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
+                    entries=entries,
+                    expires_at_monotonic=expires_at_monotonic + ttl_s,
+                )
+                self._local_search_selector_cache[snapshot_kind] = _CachedLocalSearchSelector(
+                    selector=self._build_local_search_selector(entries=entries),
+                    by_item_id={entry.item_id: entry for entry in entries},
+                    expires_at_monotonic=expires_at_monotonic + ttl_s,
+                )
+            if recent_ttl_s > 0.0:
+                self._recent_catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
+                    entries=entries,
+                    expires_at_monotonic=expires_at_monotonic + recent_ttl_s,
+                )
 
     def _build_local_search_selector(
         self,
@@ -176,6 +248,7 @@ class RemoteCatalogCatalogMixin:
         with self._cache_lock:
             self._catalog_entries_cache.pop(snapshot_kind, None)
             self._local_search_selector_cache.pop(snapshot_kind, None)
+            self._recent_catalog_entries_cache.pop(snapshot_kind, None)
             self._item_payload_cache = {
                 cache_key: cached
                 for cache_key, cached in self._item_payload_cache.items()
@@ -227,16 +300,17 @@ class RemoteCatalogCatalogMixin:
         *,
         snapshot_kind: str,
         payload: Mapping[str, object] | None = None,
+        bypass_cache: bool = False,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         """Load and normalize the current catalog entries for one collection."""
 
         definition = self._require_definition(snapshot_kind)
-        if payload is None:
+        if payload is None and not bypass_cache:
             cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
             if cached_entries is not None:
                 return cached_entries
         if payload is None:
-            payload = self._load_catalog_payload(snapshot_kind=snapshot_kind)
+            payload = self.load_catalog_payload(snapshot_kind=snapshot_kind)
         if not isinstance(payload, Mapping):
             return ()
         if self._is_segmented_catalog_payload(definition=definition, payload=payload):
@@ -256,13 +330,13 @@ class RemoteCatalogCatalogMixin:
 
         return self.is_catalog_payload(
             snapshot_kind=snapshot_kind,
-            payload=self._load_catalog_payload(snapshot_kind=snapshot_kind),
+            payload=self.load_catalog_payload(snapshot_kind=snapshot_kind),
         )
 
     def catalog_item_count(self, *, snapshot_kind: str) -> int | None:
         """Return the current catalog item count when the remote head exposes it."""
 
-        payload = self._load_catalog_payload(snapshot_kind=snapshot_kind)
+        payload = self.load_catalog_payload(snapshot_kind=snapshot_kind)
         if not isinstance(payload, Mapping):
             return None
         raw_count = payload.get("items_count")
@@ -277,11 +351,16 @@ class RemoteCatalogCatalogMixin:
         *,
         snapshot_kind: str,
         payload: Mapping[str, object] | None,
+        bypass_cache: bool = False,
     ) -> dict[str, object] | None:
         """Load every current remote item referenced by one catalog payload."""
 
         definition = self._require_definition(snapshot_kind)
-        entries = self.load_catalog_entries(snapshot_kind=snapshot_kind, payload=payload)
+        entries = self.load_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            payload=payload,
+            bypass_cache=bypass_cache,
+        )
         item_payloads: list[dict[str, object]] = []
         loaded_payloads = self._load_item_payloads_from_entries(
             snapshot_kind=definition.snapshot_kind,
@@ -315,11 +394,16 @@ class RemoteCatalogCatalogMixin:
         *,
         snapshot_kind: str,
         payload: Mapping[str, object] | None,
+        bypass_cache: bool = False,
     ) -> LongTermRemoteCatalogAssemblyResult:
         """Load a startup-compatible snapshot and report whether it stayed catalog-only."""
 
         definition = self._require_definition(snapshot_kind)
-        entries = self.load_catalog_entries(snapshot_kind=snapshot_kind, payload=payload)
+        entries = self.load_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            payload=payload,
+            bypass_cache=bypass_cache,
+        )
         item_payloads: list[dict[str, object]] = []
         upgraded_entries: list[LongTermRemoteCatalogEntry] = []
         loaded_payloads, direct_catalog_complete = self._load_compat_item_payloads_from_entries(

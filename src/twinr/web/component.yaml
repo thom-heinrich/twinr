@@ -10,7 +10,7 @@ owned_concerns:
   - Keep state-changing web requests fail-closed while honoring trusted same-origin posts behind a proxy-terminated HTTPS deployment
   - Expose the self-coding operator page and learned-skill control forms backed by `src/twinr/agent/self_coding`
   - Expose the tabbed debug page for runtime, ChonkyDB, live memory attestation, memory search, Conversation Lab, LLM, events, hardware, and raw artifacts
-  - Persist and replay portal Conversation Lab sessions with human-readable turn traces while delegating real text-turn execution to focused helpers
+  - Persist and replay portal Conversation Lab sessions with human-readable turn traces while delegating real text-turn execution to focused helpers and isolating short-term session state from the shared Pi runtime snapshot
   - Provide camera-backed helper surfaces for Conversation Lab tool turns such as local portrait enrollment and inspect-camera requests
   - Expose the `/connect/whatsapp` wizard for one-number WhatsApp self-chat setup, including allowlist, runtime, a bounded pairing window, live worker status, and the final self-chat test
   - Expose the `/integrations/email` wizard for managed mailbox setup, including provider presets, mailbox login storage, transport review, bounded IMAP/SMTP connection tests, and final mail guardrails
@@ -35,7 +35,7 @@ files:
   - path: app_impl/
     role: Internal FastAPI implementation package split across auth, shell, ops, integrations/connect, automations, and preference routes
   - path: conversation_lab.py
-    role: Portal conversation-lab session storage and real text-turn execution helper
+    role: Portal conversation-lab session storage and real text-turn execution helper, including session-scoped runtime snapshot isolation for short-term context
   - path: conversation_lab_vision.py
     role: Camera and reference-image helpers used by Conversation Lab tool owners
   - path: context.py

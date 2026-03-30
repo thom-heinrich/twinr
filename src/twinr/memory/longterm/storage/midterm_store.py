@@ -18,11 +18,11 @@ import stat
 from threading import Lock
 import tempfile
 from contextlib import suppress
-
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMidtermPacketV1, LongTermReflectionResultV1
+from twinr.memory.longterm.storage._remote_midterm import LongTermRemoteMidtermState
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 from twinr.text_utils import retrieval_terms
@@ -251,6 +251,7 @@ class LongTermMidtermStore:
     base_path: Path
     remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=Lock, repr=False)
+    _remote_midterm: LongTermRemoteMidtermState = field(init=False, repr=False)
 
     packet_type = LongTermMidtermPacketV1
 
@@ -262,6 +263,7 @@ class LongTermMidtermStore:
         if normalized_base_path.exists() and not normalized_base_path.is_dir():
             raise ValueError(f"LongTermMidtermStore base_path must be a directory: {normalized_base_path}")
         self.base_path = normalized_base_path
+        self._remote_midterm = LongTermRemoteMidtermState(self.remote_state)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermMidtermStore":
@@ -279,44 +281,43 @@ class LongTermMidtermStore:
         return self.base_path / "twinr_memory_midterm_v1.json"
 
     def ensure_remote_snapshot(self) -> bool:
-        """Bootstrap the remote midterm snapshot when it is still missing."""
+        """Bootstrap the remote midterm current-head state when it is still missing."""
 
-        if self.remote_state is None or not self.remote_state.enabled:
+        if not self._remote_midterm.enabled():
             return False
-        payload = self.remote_state.load_snapshot(snapshot_kind="midterm", local_path=self.packets_path)
-        if _validate_payload(payload, source="remote:midterm") is not None:
-            return False
-        local_payload = _validate_payload(_read_json_object(self.packets_path), source=str(self.packets_path))
-        self.remote_state.save_snapshot(
-            snapshot_kind="midterm",
-            payload=local_payload or self._empty_payload(),
+        local_packets = self._load_packets_from_payload(
+            self._load_local_payload(),
+            source=str(self.packets_path),
         )
-        return True
+        return self._remote_midterm.ensure_seeded(packets=local_packets)
+
+    def probe_remote_current_head(self) -> dict[str, object] | None:
+        """Probe the fixed-URI remote midterm current head without hydrating packets."""
+
+        if not self._remote_midterm.enabled():
+            return None
+        payload = self._remote_midterm.probe_current_head()
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def load_remote_current_head(self) -> dict[str, object] | None:
+        """Load the authoritative remote midterm current head payload."""
+
+        if not self._remote_midterm.enabled():
+            return None
+        payload = self._remote_midterm.current_head_payload()
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def remote_current_packet_ids(self) -> tuple[str, ...]:
+        """Return packet ids currently referenced by the remote midterm head."""
+
+        if not self._remote_midterm.enabled():
+            return ()
+        return self._remote_midterm.current_packet_ids()
 
     def load_packets(self) -> tuple[LongTermMidtermPacketV1, ...]:
         """Load all valid midterm packets from the current snapshot."""
 
-        payload = self._load_payload()
-        if payload is None:
-            return ()
-
-        items = payload.get("packets", [])
-        if not isinstance(items, list):
-            LOGGER.warning("Midterm store payload has non-list packets field at %s", self.packets_path)
-            return ()
-
-        packets: list[LongTermMidtermPacketV1] = []
-        for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                LOGGER.warning("Skipping non-object midterm packet at index %d", index)
-                continue
-            try:
-                # AUDIT-FIX(#3): Skip only the malformed packet instead of aborting the whole store load.
-                packets.append(LongTermMidtermPacketV1.from_payload(item))
-            except Exception:
-                LOGGER.warning("Skipping invalid midterm packet at index %d", index, exc_info=True)
-
-        return tuple(packets)
+        return self._load_packets_from_payload(self._load_payload(), source=str(self.packets_path))
 
     def save_packets(self, *, packets: tuple[LongTermMidtermPacketV1, ...]) -> None:
         """Persist one complete midterm packet snapshot.
@@ -337,19 +338,19 @@ class LongTermMidtermStore:
 
             if self.remote_state is not None and self.remote_state.enabled:
                 try:
-                    # AUDIT-FIX(#2): Remote persistence is best-effort replication; local durability must survive remote outages.
-                    self.remote_state.save_snapshot(snapshot_kind="midterm", payload=payload)
+                    # AUDIT-FIX(#2): The remote midterm authority now lives in typed packet records plus a fixed current head.
+                    self._remote_midterm.save_packets(packets=packets)
                 except LongTermRemoteUnavailableError:
                     if self.remote_state.required:
                         raise
                     LOGGER.warning(
-                        "Failed to replicate midterm snapshot remotely; local snapshot at %s was kept",
+                        "Failed to replicate midterm current-head state remotely; local cache at %s was kept",
                         self.packets_path,
                         exc_info=True,
                     )
                 except Exception:
                     LOGGER.warning(
-                        "Failed to replicate midterm snapshot remotely; local snapshot at %s was kept",
+                        "Failed to replicate midterm current-head state remotely; local cache at %s was kept",
                         self.packets_path,
                         exc_info=True,
                     )
@@ -459,42 +460,33 @@ class LongTermMidtermStore:
         return tuple(matching[:bounded_limit])
 
     def _load_payload(self) -> dict[str, object] | None:
-        """Load the best available validated payload from local or remote."""
+        """Load the best available validated payload from remote authority or local cache."""
 
-        local_payload = _validate_payload(_read_json_object(self.packets_path), source=str(self.packets_path))
-        if local_payload is not None:
-            return local_payload
+        if self._remote_midterm.enabled():
+            try:
+                current_head = self._remote_midterm.current_head_payload()
+            except LongTermRemoteUnavailableError:
+                raise
+            except Exception:
+                LOGGER.warning("Failed to load remote midterm current head", exc_info=True)
+                current_head = None
+            if isinstance(current_head, Mapping):
+                remote_packets = self._remote_midterm.load_packets()
+                remote_payload = self._payload_from_packets(
+                    packets=remote_packets,
+                    written_at=current_head.get("written_at"),
+                )
+                try:
+                    _write_json_atomic(self.packets_path, remote_payload)
+                except OSError:
+                    LOGGER.warning(
+                        "Loaded remote midterm current head but failed to refresh local cache at %s",
+                        self.packets_path,
+                        exc_info=True,
+                    )
+                return remote_payload
 
-        if self.remote_state is None or not self.remote_state.enabled:
-            return None
-
-        try:
-            # AUDIT-FIX(#4): Remote snapshot failure must degrade to "no remote data" instead of crashing memory retrieval.
-            remote_payload = self.remote_state.load_snapshot(
-                snapshot_kind="midterm",
-                local_path=self.packets_path,
-            )
-        except LongTermRemoteUnavailableError:
-            raise
-        except Exception:
-            LOGGER.warning("Failed to load remote midterm snapshot", exc_info=True)
-            return None
-
-        validated_remote_payload = _validate_payload(remote_payload, source="remote:midterm")
-        if validated_remote_payload is None:
-            return None
-
-        try:
-            # AUDIT-FIX(#2): Refresh the local cache from a valid remote snapshot so later offline loads still work.
-            _write_json_atomic(self.packets_path, validated_remote_payload)
-        except OSError:
-            LOGGER.warning(
-                "Loaded remote midterm snapshot but failed to refresh local cache at %s",
-                self.packets_path,
-                exc_info=True,
-            )
-
-        return validated_remote_payload
+        return self._load_local_payload()
 
     def select_relevant_packets(
         self,
@@ -518,11 +510,25 @@ class LongTermMidtermStore:
         if normalized_limit == 0:
             return ()
 
+        clean_query = _normalize_text(query_text)
+        if self._remote_midterm.enabled():
+            try:
+                remote_selected = self._remote_midterm.select_relevant_packets(
+                    query_text=clean_query,
+                    limit=normalized_limit,
+                )
+            except LongTermRemoteUnavailableError:
+                raise
+            except Exception:
+                LOGGER.warning("Remote midterm packet selection failed; falling back to hydrated packet ordering", exc_info=True)
+            else:
+                if remote_selected or not clean_query:
+                    return remote_selected
+
         packets = self.load_packets()
         if not packets:
             return ()
 
-        clean_query = _normalize_text(query_text)
         if not clean_query:
             return packets[:normalized_limit]
 
@@ -559,6 +565,48 @@ class LongTermMidtermStore:
                 limit=normalized_limit,
             )
         )
+
+    def _payload_from_packets(
+        self,
+        *,
+        packets: tuple[LongTermMidtermPacketV1, ...],
+        written_at: object = None,
+    ) -> dict[str, object]:
+        payload = {
+            "schema": _MIDTERM_STORE_SCHEMA,
+            "version": _MIDTERM_STORE_VERSION,
+            "packets": [item.to_payload() for item in sorted(packets, key=lambda row: row.packet_id)],
+        }
+        normalized_written_at = _normalize_text(written_at if isinstance(written_at, str) else "")
+        if normalized_written_at:
+            payload["written_at"] = normalized_written_at
+        return payload
+
+    def _load_local_payload(self) -> dict[str, object] | None:
+        return _validate_payload(_read_json_object(self.packets_path), source=str(self.packets_path))
+
+    def _load_packets_from_payload(
+        self,
+        payload: Mapping[str, object] | None,
+        *,
+        source: str,
+    ) -> tuple[LongTermMidtermPacketV1, ...]:
+        if payload is None:
+            return ()
+        items = payload.get("packets", [])
+        if not isinstance(items, list):
+            LOGGER.warning("Midterm store payload has non-list packets field at %s", source)
+            return ()
+        packets: list[LongTermMidtermPacketV1] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                LOGGER.warning("Skipping non-object midterm packet at index %d from %s", index, source)
+                continue
+            try:
+                packets.append(LongTermMidtermPacketV1.from_payload(item))
+            except Exception:
+                LOGGER.warning("Skipping invalid midterm packet at index %d from %s", index, source, exc_info=True)
+        return tuple(packets)
 
     def _packet_search_text(self, item: LongTermMidtermPacketV1) -> str:
         parts: list[str] = [

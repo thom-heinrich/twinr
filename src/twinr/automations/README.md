@@ -10,6 +10,7 @@ other subsystems use to create and inspect supported automations.
 - define automation triggers, conditions, actions, and stored entries
 - evaluate scheduled and fact-based triggers
 - persist automations safely to the JSON store and backup file
+- keep the automation JSON store, backup, and lock file owner-only (`0600`) so the Pi runtime and operator tools coordinate on the same state without reopening world-readable/writable state files
 - map supported sensor triggers, including smart-home motion, button, alarm, and device-health events, to canonical if/then trigger shapes
 
 `automations` does **not** own:

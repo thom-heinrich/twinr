@@ -116,7 +116,7 @@ class StructuredStoreQueryMixin:
         memory_id: str,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         rewritten: list[LongTermMemoryConflictV1] = []
-        for conflict in self.load_conflicts():
+        for conflict in self.load_conflicts_for_memory_ids((memory_id,)):
             if conflict.candidate_memory_id == memory_id:
                 continue
             existing_ids = tuple(value for value in conflict.existing_memory_ids if value != memory_id)
@@ -141,7 +141,7 @@ class StructuredStoreQueryMixin:
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         updated_objects: list[LongTermMemoryObjectV1] = []
         update_time = _utcnow()
-        for item in self.load_objects():
+        for item in self.load_objects_referencing_memory_ids((target_memory_id,)):
             if item.memory_id == target_memory_id:
                 continue
             conflicts_with = tuple(value for value in item.conflicts_with if value != target_memory_id)

@@ -21,7 +21,7 @@ import tempfile
 import time
 from typing import Iterator
 
-from twinr import TwinrConfig
+from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
 from twinr.memory.longterm.evaluation.live_midterm_attest import (
     LiveMidtermAttestResult,
@@ -135,7 +135,19 @@ def _build_isolated_config(
         long_term_memory_background_store_turns=background_store_turns,
         openai_enable_web_search=False,
         restore_runtime_state_on_startup=False,
+        **_isolated_runtime_state_overrides(state_dir=state_dir),
     )
+
+
+def _isolated_runtime_state_overrides(*, state_dir: Path) -> dict[str, str]:
+    """Return runtime-owned state files that must stay inside one isolated root."""
+
+    return {
+        "reminder_store_path": str(state_dir / "reminders.json"),
+        "automation_store_path": str(state_dir / "automations.json"),
+        "voice_profile_store_path": str(state_dir / "voice_profile.json"),
+        "adaptive_timing_store_path": str(state_dir / "adaptive_timing.json"),
+    }
 
 
 def _normalize_lookup_text(text: object | None) -> str:
@@ -196,19 +208,13 @@ def _await_midterm_persistence(
     """Wait until midterm packets exist both locally and in remote storage."""
 
     deadline = time.monotonic() + max(0.1, float(timeout_s))
-    remote_state = service.midterm_store.remote_state
     writer_packet_ids: tuple[str, ...] = ()
     remote_packet_ids: tuple[str, ...] = ()
     while True:
         remaining_s = max(0.1, deadline - time.monotonic())
         flush_finished = bool(service.flush(timeout_s=min(_FLUSH_TIMEOUT_S, remaining_s)))
         writer_packet_ids = tuple(packet.packet_id for packet in service.midterm_store.load_packets())
-        if remote_state is not None:
-            remote_payload = remote_state.load_snapshot(
-                snapshot_kind="midterm",
-                local_path=service.midterm_store.packets_path,
-            )
-            remote_packet_ids = _packet_ids_from_payload(remote_payload)
+        remote_packet_ids = service.midterm_store.remote_current_packet_ids()
         if writer_packet_ids and remote_packet_ids == writer_packet_ids:
             return True, writer_packet_ids, remote_packet_ids
         if flush_finished and writer_packet_ids and remote_packet_ids:

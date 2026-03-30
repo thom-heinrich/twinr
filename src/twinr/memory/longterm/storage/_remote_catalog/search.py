@@ -23,6 +23,42 @@ from .shared import (
 )
 
 
+def _emit_query_plan_workflow_event(
+    *,
+    snapshot_kind: str,
+    operation: str,
+    response: object,
+    query_text: str,
+    result_limit: int,
+    allowed_doc_count: int,
+    scope_ref: str | None,
+    namespace: str | None,
+    catalog_entry_count: int,
+) -> None:
+    """Surface server-reported query plans as retrieval trace events."""
+
+    query_plan = getattr(response, "query_plan", None)
+    if not isinstance(query_plan, Mapping):
+        return
+    workflow_event(
+        kind="retrieval",
+        msg="longterm_remote_catalog_query_plan",
+        details={
+            **_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=query_text,
+                result_limit=result_limit,
+                allowed_doc_count=allowed_doc_count,
+                scope_ref=scope_ref,
+                namespace=namespace,
+                catalog_entry_count=catalog_entry_count,
+            ),
+            "operation": operation,
+            "query_plan": dict(query_plan),
+        },
+    )
+
+
 class RemoteCatalogSearchMixin:
     def search_current_item_payloads(
         self,
@@ -284,7 +320,7 @@ class RemoteCatalogSearchMixin:
                 candidate_limit=len(selected_entries),
             ),
         ):
-            return self.load_item_payloads(
+            return self.load_selection_item_payloads(
                 snapshot_kind=snapshot_kind,
                 item_ids=(entry.item_id for entry in selected_entries),
             )
@@ -299,11 +335,22 @@ class RemoteCatalogSearchMixin:
     ) -> tuple[dict[str, object], ...] | None:
         """Recover fast scope reads from the current remote catalog when possible."""
 
-        try:
-            current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
-        except Exception:
-            return None
-        if not current_entries:
+        current_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
+        if current_entries is None:
+            current_entries = self._recent_catalog_entries(snapshot_kind=snapshot_kind)
+        if current_entries is None:
+            workflow_event(
+                kind="branch",
+                msg="longterm_remote_catalog_fast_scope_search_rescue_skipped",
+                details={
+                    "snapshot_kind": snapshot_kind,
+                    "result_limit": max(1, int(limit)),
+                    "failure_classification": failure_details.get("classification"),
+                    "failure_status_code": failure_details.get("status_code"),
+                    "failure_timeout_reason": failure_details.get("timeout_reason"),
+                    "reason": "current_catalog_projection_not_cached_in_process",
+                },
+            )
             return None
         with workflow_span(
             name="longterm_remote_catalog_fast_scope_cached_selector_search",
@@ -340,7 +387,7 @@ class RemoteCatalogSearchMixin:
                 "rescue_trigger": str(failure_details.get("classification") or "unknown"),
             },
         ):
-            payloads = self.load_item_payloads(
+            payloads = self.load_selection_item_payloads(
                 snapshot_kind=snapshot_kind,
                 item_ids=(entry.item_id for entry in selected_entries),
             )
@@ -526,7 +573,7 @@ class RemoteCatalogSearchMixin:
         )
         if not selected_catalog_entries:
             return ()
-        return self.load_item_payloads(
+        return self.load_selection_item_payloads(
             snapshot_kind=snapshot_kind,
             item_ids=(entry.item_id for entry in selected_catalog_entries),
         )
@@ -781,6 +828,17 @@ class RemoteCatalogSearchMixin:
                             timeout_seconds=timeout_s,
                         )
                     ),
+                )
+                _emit_query_plan_workflow_event(
+                    snapshot_kind=snapshot_kind,
+                    operation=str(getattr(topk_context, "operation", None) or "topk_search"),
+                    response=response,
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    scope_ref=scope_ref,
+                    namespace=namespace,
+                    catalog_entry_count=catalog_entry_count,
                 )
                 record_remote_read_observation(
                     remote_state=remote_state,

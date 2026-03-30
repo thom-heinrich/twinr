@@ -7,6 +7,7 @@ personalization cues for a single user turn.
 
 `retrieval` owns:
 - assemble durable, episodic, mid-term, graph, and conflict context
+- keep conflict-context supporting object loads on the same bounded selection-hydration contract as the upstream conflict selector, so one queue render does not rehydrate per-item documents after the relevant ids are already known
 - merge original-language and canonical-English query variants during store-backed recall so optional rewrites improve recall without suppressing same-language memories
 - keep that cross-variant merge bounded but wide enough that a noisy first-language hit set does not starve better canonical-query episodic or durable matches before reranking
 - rerank durable recall across merged query variants so confirmed/current facts surface ahead of generic siblings for meta-memory questions
@@ -19,6 +20,8 @@ personalization cues for a single user turn.
 - compile and render silent personalization cues from graph and episodic memory, including graph-only turns where no episodic match is available
 - opportunistically reuse or background-build expensive silent subtext packets so live foreground turns do not stall on cold personalization compilation
 - build one tiny fast-topic hint block from current-scope ChonkyDB objects for latency-sensitive answer lanes without running the full retriever
+- build one internal unified retrieval plan across durable objects, conflict queues, graph candidates, and selected midterm packets before rendering the stable public context sections
+- reuse the graph selected by that unified plan for subtext compilation so one turn does not issue a second graph-selection pass just to render silent personalization
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
 - reject compiled personalization payloads that leak schema/JSON/markup structure and fall back to the static subtext path instead of injecting corrupted hidden guidance
 - expose a read-only operator search view over durable, episodic, midterm, graph, and conflict recall without constructing the full runtime service
@@ -39,6 +42,7 @@ dumps.
 |---|---|
 | `__init__.py` | Package marker |
 | `retriever.py` | Context assembly, including environment-aware durable and midterm rendering |
+| `unified_plan.py` | Internal candidate normalization, explicit-anchor joins, and explainable mixed graph+structured+midterm query plans |
 | `fast_topic.py` | One-shot current-topic hint builder for low-latency answer paths |
 | `adaptive_policy.py` | Adaptive prompt-policy compiler from stored long-term signals, including confirmed response-channel preference packets |
 | `restart_recall_policy.py` | Persistent restart-recall packet compiler from stable durable memory |

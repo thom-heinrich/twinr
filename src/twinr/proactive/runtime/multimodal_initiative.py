@@ -51,6 +51,7 @@ _HIGH_INTERRUPTION_RISK_THRESHOLD = 0.78
 _ALLOWED_BLOCK_REASONS = frozenset(
     {
         "audio_policy_blocked",
+        "background_media_active",
         "camera_unavailable",
         "high_interrupt_risk",
         "low_confidence_speaker_association",
@@ -59,6 +60,7 @@ _ALLOWED_BLOCK_REASONS = frozenset(
         "multi_person_context",
         "mute_blocks_voice_capture",
         "no_visible_person",
+        "non_speech_audio_active",
         "person_visibility_unknown",
         "respeaker_unavailable",
         "respeaker_unready",
@@ -74,6 +76,7 @@ _ALLOWED_BLOCK_REASONS = frozenset(
 _BLOCK_REASON_ALIASES = {
     "audio_policy_block": "audio_policy_blocked",
     "audio_policy_blocked": "audio_policy_blocked",
+    "background_media_active": "background_media_active",
     "defer": "speech_delivery_deferred",
     "deferred": "speech_delivery_deferred",
     "display_only": "speech_delivery_deferred",
@@ -84,6 +87,7 @@ _BLOCK_REASON_ALIASES = {
     "mute_blocks_voice_capture": "mute_blocks_voice_capture",
     "muted": "mute_blocks_voice_capture",
     "no_visible_person": "no_visible_person",
+    "non_speech_audio_active": "non_speech_audio_active",
     "overlapping_speech": "room_busy_or_overlapping",
     "person_visibility_unknown": "person_visibility_unknown",
     "respeaker_unavailable": "respeaker_unavailable",

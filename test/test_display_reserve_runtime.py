@@ -14,6 +14,22 @@ from twinr.proactive.runtime.display_reserve_runtime import (
 
 
 class DisplayReserveRuntimePublisherTests(unittest.TestCase):
+    def test_runtime_publisher_uses_project_local_lock_path_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            publisher = DisplayReserveRuntimePublisher.from_config(
+                config,
+                default_source="proactive_ambient_impulse",
+            )
+
+        self.assertEqual(
+            Path(publisher.publish_lock_path),
+            publisher.active_store.path.with_name(
+                f".{publisher.active_store.path.name}.reserve-runtime.lock"
+            ),
+        )
+        self.assertTrue(str(publisher.publish_lock_path).startswith(temp_dir))
+
     def test_runtime_publisher_writes_one_shared_cue_and_history_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)

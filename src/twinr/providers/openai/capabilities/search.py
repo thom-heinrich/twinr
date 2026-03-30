@@ -1,3 +1,11 @@
+# CHANGELOG: 2026-03-30
+# BUG-1: Fixed relative-day resolution; today/tomorrow/yesterday/übermorgen now resolve to the correct shifted ISO date.
+# BUG-2: Live-search responses now require an actual web-search tool call; stale non-search answers are rejected.
+# BUG-3: Replayed search conversation now preserves assistant phase to avoid GPT-5.4 commentary/final-answer misclassification.
+# SEC-1: Disabled provider-side response storage by default for search/rewrite calls and sanitized model-proposed follow-up URLs to public http(s) targets only.
+# IMP-1: Added bounded transient retry/backoff, optional domain filtering/external_web_access, and safer search-tool forcing.
+# IMP-2: Upgraded model fallback and structured-rewrite selection for 2026 GPT-5.4 search latency/capability patterns.
+
 """Resolve live-information queries with OpenAI web-search capable models.
 
 This module contains the search-specific prompt shaping, date disambiguation,
@@ -6,13 +14,16 @@ It keeps live-search behavior isolated from the generic response helpers.
 """
 
 from __future__ import annotations
-##REFACTOR: 2026-03-16##
+##REFACTOR: 2026-03-30##
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
+import ipaddress
 import json
+import random
 import re
-from typing import Any
+import time
+from typing import Any, Iterable
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,6 +36,7 @@ from ..core.types import ConversationLike, OpenAISearchAttempt, OpenAISearchResu
 _SEARCH_CONTEXT_MAX_TURNS = 3
 _SEARCH_CONTEXT_CHAR_LIMIT = 160
 _DATE_CONTEXT_ISO_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_GPT_VERSION_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:[-_.].*)?$")
 _TODAY_PATTERNS = (
     re.compile(r"\bheute\b", re.IGNORECASE),
     re.compile(r"\btoday\b", re.IGNORECASE),
@@ -59,6 +71,12 @@ _ENGLISH_RELATIVE_PATTERNS = frozenset(
         _YESTERDAY_PATTERNS[1],
     }
 )
+_RELATIVE_DAY_PATTERN_GROUPS: tuple[tuple[tuple[re.Pattern[str], ...], int], ...] = (
+    (_YESTERDAY_PATTERNS, -1),
+    (_TODAY_PATTERNS, 0),
+    (_TOMORROW_PATTERNS, 1),
+    (_DAY_AFTER_TOMORROW_PATTERNS, 2),
+)
 _WEEKDAY_INDEX_BY_NAME = {
     "monday": 0,
     "montag": 0,
@@ -79,10 +97,35 @@ _VALID_SEARCH_CONTEXT_SIZES = frozenset({"low", "medium", "high"})
 _DEFAULT_SEARCH_MAX_OUTPUT_TOKENS = 1024
 _DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS = 1536
 _SEARCH_OUTPUT_TOKEN_RETRY_LADDER = (512, 768, 1024, 1536, 2048, 3072)
-_FALLBACK_SEARCH_MODEL = DEFAULT_OPENAI_MAIN_MODEL
+_FRONTIER_DEFAULT_SEARCH_MODEL = "gpt-5.4-mini"
+_FRONTIER_SEARCH_MODEL_PREFERENCES = (
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-5-mini",
+    "gpt-5.4-nano",
+)
 _SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS = 160
 _MAX_SEARCH_ATTEMPT_DETAIL_CHARS = 240
 _SEARCH_VERIFICATION_STATUSES = frozenset({"verified", "partial", "unverified"})
+_SEARCH_TRANSIENT_RETRIES_DEFAULT = 2
+_SEARCH_TRANSIENT_RETRY_BASE_DELAY_SECONDS = 0.35
+_SEARCH_TRANSIENT_RETRY_MAX_DELAY_SECONDS = 2.5
+_SEARCH_FOLLOW_UP_ALLOWED_SCHEMES = frozenset({"http", "https"})
+_SEARCH_BLOCKED_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+        "metadata",
+    }
+)
+_SEARCH_BLOCKED_HOST_SUFFIXES = (
+    ".local",
+    ".internal",
+    ".home",
+    ".home.arpa",
+    ".lan",
+)
 _SEARCH_SPOKEN_ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -185,6 +228,40 @@ def _coerce_positive_int(value: Any, *, default: int, minimum: int = 1) -> int:
     return max(minimum, coerced)
 
 
+def _coerce_bool(value: Any) -> bool | None:
+    """Coerce a loosely typed config value into ``bool`` when possible."""
+
+    if isinstance(value, bool):
+        return value
+    normalized = _collapse_whitespace(None if value is None else str(value)).lower()
+    if not normalized:
+        return None
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _iter_string_values(value: Any) -> tuple[str, ...]:
+    """Return one normalized flat sequence of candidate string values."""
+
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts = [part.strip() for part in re.split(r"[\s,;]+", value) if part.strip()]
+        return tuple(parts)
+    if isinstance(value, Iterable):
+        items: list[str] = []
+        for item in value:
+            normalized = _collapse_whitespace(None if item is None else str(item))
+            if normalized:
+                items.append(normalized)
+        return tuple(items)
+    normalized = _collapse_whitespace(str(value))
+    return (normalized,) if normalized else ()
+
+
 def _normalize_search_attempt_detail(value: object) -> str | None:
     """Return a bounded readable detail string for search-attempt journaling."""
 
@@ -244,6 +321,17 @@ def _same_search_model_identity(requested_model: str | None, actual_model: str |
         if actual_base and (requested == actual_base or requested.startswith(f"{actual_base}-")):
             return True
     return False
+
+
+def _parse_search_gpt_version(model: str) -> tuple[int, int] | None:
+    """Parse a GPT-family model string into ``(major, minor)`` components."""
+
+    match = _GPT_VERSION_RE.match(_collapse_whitespace(model).lower())
+    if not match:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return major, minor
 
 
 def _normalize_search_context_size(value: Any) -> str | None:
@@ -318,13 +406,87 @@ def _normalize_search_verification_status(value: object) -> str:
     return normalized
 
 
-def _extract_domain_hint(url: str | None) -> str | None:
-    """Return a normalized host name for one candidate follow-up URL."""
+def _is_public_hostname(hostname: str | None) -> bool:
+    """Return whether a host name is a public routable host candidate."""
+
+    host = _collapse_whitespace(hostname).lower().rstrip(".")
+    if not host:
+        return False
+    if host in _SEARCH_BLOCKED_HOSTNAMES:
+        return False
+    if any(host.endswith(suffix) for suffix in _SEARCH_BLOCKED_HOST_SUFFIXES):
+        return False
+    try:
+        ip_value = ipaddress.ip_address(host)
+    except ValueError:
+        return "." in host and "@" not in host and " " not in host
+    return not (
+        ip_value.is_private
+        or ip_value.is_loopback
+        or ip_value.is_link_local
+        or ip_value.is_multicast
+        or ip_value.is_reserved
+        or ip_value.is_unspecified
+    )
+
+
+def _normalize_public_hostname(value: str | None) -> str | None:
+    """Normalize one public host name hint or return ``None``."""
+
+    normalized = _collapse_whitespace(value).lower()
+    if not normalized:
+        return None
+    if "://" in normalized:
+        parsed = urlparse(normalized)
+        return _normalize_public_hostname(parsed.hostname)
+    candidate = normalized.lstrip("/").rstrip("/")
+    if "/" in candidate:
+        candidate = candidate.split("/", 1)[0]
+    if "@" in candidate:
+        return None
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if ":" in candidate:
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            candidate = candidate.split(":", 1)[0]
+    candidate = candidate.strip().rstrip(".")
+    if not _is_public_hostname(candidate):
+        return None
+    return candidate
+
+
+def _sanitize_public_url(url: str | None) -> str | None:
+    """Return a sanitized public http(s) URL or ``None``."""
 
     normalized_url = _collapse_whitespace(url)
     if not normalized_url:
         return None
     parsed = urlparse(normalized_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in _SEARCH_FOLLOW_UP_ALLOWED_SCHEMES:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    hostname = _normalize_public_hostname(parsed.hostname)
+    if hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return parsed._replace(netloc=netloc, fragment="").geturl()
+
+
+def _extract_domain_hint(url: str | None) -> str | None:
+    """Return a normalized host name for one candidate follow-up URL."""
+
+    sanitized_url = _sanitize_public_url(url)
+    if not sanitized_url:
+        return None
+    parsed = urlparse(sanitized_url)
     hostname = _collapse_whitespace(parsed.hostname)
     return hostname.lower() or None
 
@@ -348,11 +510,9 @@ def _extract_structured_search_answer(text: str) -> _StructuredSearchVoiceResult
     if not isinstance(site_follow_up_recommended, bool):
         raise ValueError("search structured output is missing site_follow_up_recommended")
     site_follow_up_reason = _collapse_whitespace(payload.get("site_follow_up_reason")) or None
-    site_follow_up_url = _collapse_whitespace(payload.get("site_follow_up_url")) or None
-    site_follow_up_domain = _collapse_whitespace(payload.get("site_follow_up_domain")) or None
-    normalized_follow_up_domain = _extract_domain_hint(site_follow_up_url) or (
-        site_follow_up_domain.lower() if site_follow_up_domain else None
-    )
+    site_follow_up_url = _sanitize_public_url(payload.get("site_follow_up_url"))
+    site_follow_up_domain = _normalize_public_hostname(payload.get("site_follow_up_domain"))
+    normalized_follow_up_domain = _extract_domain_hint(site_follow_up_url) or site_follow_up_domain
     if not site_follow_up_recommended:
         site_follow_up_reason = None
         site_follow_up_url = None
@@ -397,24 +557,32 @@ def _date_phrase_for_pattern(pattern: re.Pattern[str], resolved_date: str) -> st
     return f"am {resolved_date}"
 
 
-def _replace_relative_day_reference(question: str, resolved_date: str) -> str | None:
-    """Replace one relative-day phrase with an explicit ISO-date phrase."""
+def _should_skip_ambiguous_german_morgen(question: str, match: re.Match[str]) -> bool:
+    """Avoid rewriting the time-of-day phrase ``heute morgen`` as tomorrow."""
 
-    for patterns in (
-        _DAY_AFTER_TOMORROW_PATTERNS,
-        _TOMORROW_PATTERNS,
-        _TODAY_PATTERNS,
-        _YESTERDAY_PATTERNS,
-    ):
+    before = question[: match.start()].strip().lower()
+    return before.endswith("heute")
+
+
+def _replace_relative_day_reference(question: str, reference_date: date) -> str | None:
+    """Replace one relative-day phrase with the authoritative explicit ISO date."""
+
+    resolved_date = reference_date.isoformat()
+    for patterns, _day_offset in _RELATIVE_DAY_PATTERN_GROUPS:
         for pattern in patterns:
-            if pattern.search(question):
-                return pattern.sub(_date_phrase_for_pattern(pattern, resolved_date), question, count=1)
+            match = pattern.search(question)
+            if match is None:
+                continue
+            if pattern is _TOMORROW_PATTERNS[0] and _should_skip_ambiguous_german_morgen(question, match):
+                continue
+            return pattern.sub(_date_phrase_for_pattern(pattern, resolved_date), question, count=1)
     return None
 
 
 def _replace_next_weekday_reference(question: str, reference_date: date) -> str | None:
-    """Replace one next-weekday phrase with the matching ISO date."""
+    """Replace one next-weekday phrase with the authoritative explicit ISO date."""
 
+    resolved_date = reference_date.isoformat()
     for pattern, is_english in ((_NEXT_WEEKDAY_EN_RE, True), (_NEXT_WEEKDAY_DE_RE, False)):
         match = pattern.search(question)
         if match is None:
@@ -423,10 +591,6 @@ def _replace_next_weekday_reference(question: str, reference_date: date) -> str 
         target_weekday = _WEEKDAY_INDEX_BY_NAME.get(weekday_name)
         if target_weekday is None:
             continue
-        delta_days = (target_weekday - reference_date.weekday()) % 7
-        if delta_days == 0:
-            delta_days = 7
-        resolved_date = (reference_date + timedelta(days=delta_days)).isoformat()
         replacement = f"on {resolved_date}" if is_english else f"am {resolved_date}"
         return pattern.sub(replacement, question, count=1)
     return None
@@ -439,19 +603,16 @@ def _resolved_explicit_search_query(question: str, date_context: str | None) -> 
     if not normalized_question:
         return None
     if _contains_explicit_iso_date(normalized_question):
-        # AUDIT-FIX(#2): Do not append a second target date to a question that already names an ISO date.
         return normalized_question
     reference_date = _parse_context_reference_date(date_context)
     if reference_date is None:
         return None
 
-    # AUDIT-FIX(#2): Resolve weekday-relative queries like "next Monday" into a concrete ISO date.
     replaced_weekday = _replace_next_weekday_reference(normalized_question, reference_date)
     if replaced_weekday is not None and replaced_weekday != normalized_question:
         return replaced_weekday
 
-    # AUDIT-FIX(#2): Only synthesize an explicit-date retrieval query when the user actually used a relative date phrase.
-    replaced_relative_day = _replace_relative_day_reference(normalized_question, reference_date.isoformat())
+    replaced_relative_day = _replace_relative_day_reference(normalized_question, reference_date)
     if replaced_relative_day is not None and replaced_relative_day != normalized_question:
         return replaced_relative_day
     return None
@@ -519,7 +680,6 @@ class OpenAISearchMixin:
                     continue
                 for max_output_tokens in output_token_candidates:
                     try:
-                        # AUDIT-FIX(#3): Keep per-model fallback alive if a preview request fails transiently.
                         candidate, is_complete, attempt = self._search_with_preview_model(
                             model,
                             prompt,
@@ -651,12 +811,15 @@ class OpenAISearchMixin:
                 if normalized_content:
                     messages.append({"role": normalized_role, "content": normalized_content})
         messages.append({"role": "user", "content": prompt})
-        # AUDIT-FIX(#8): Provide structured geography/search-context hints to the Chat Completions web-search models.
-        response = self._client.chat.completions.create(
-            model=model,
-            web_search_options=self._build_preview_web_search_options(location_hint=location_hint),
-            max_completion_tokens=max_output_tokens,
-            messages=messages,
+
+        response = self._call_with_transient_retries(
+            lambda: self._client.chat.completions.create(
+                model=model,
+                web_search_options=self._build_preview_web_search_options(location_hint=location_hint),
+                max_completion_tokens=max_output_tokens,
+                messages=messages,
+                store=self._search_store_enabled(),
+            )
         )
         message = response.choices[0].message if getattr(response, "choices", None) else None
         answer = _collapse_whitespace((getattr(message, "content", "") or "").replace("\r", " ").replace("\n", " "))
@@ -669,7 +832,6 @@ class OpenAISearchMixin:
             token_usage=self._extract_preview_usage(response),
             used_web_search=True,
         )
-        # AUDIT-FIX(#7): Reject truncated/filtered preview answers instead of returning potentially partial output.
         is_complete = self._preview_response_is_complete(response)
         attempt = _build_search_attempt(
             model=model,
@@ -693,12 +855,7 @@ class OpenAISearchMixin:
         location_hint: str | None,
         output_token_candidates: tuple[int, ...],
     ) -> tuple[OpenAISearchResult | None, Exception | None, tuple[OpenAISearchAttempt, ...]]:
-        """Run a search request through a Responses web-search model.
-
-        The configured primary/retry budgets remain the first attempts, but an
-        incomplete response with ``reason=max_output_tokens`` now expands
-        through a bounded ladder instead of failing as a generic blank answer.
-        """
+        """Run a search request through a Responses web-search model."""
 
         pending_output_tokens = list(output_token_candidates)
         attempted_output_tokens: set[int] = set()
@@ -721,11 +878,11 @@ class OpenAISearchMixin:
                     max_output_tokens=max_output_tokens,
                     prompt_cache_scope="search",
                 )
-                # AUDIT-FIX(#6): Patch the actual web-search tool only, validate search_context_size, and preserve other include fields.
                 self._apply_web_search_request_overrides(request, location_hint=location_hint)
+                self._apply_search_request_output_controls(request, model=model)
                 self._ensure_web_search_sources_included(request)
-                # AUDIT-FIX(#3): Keep trying remaining models/attempts on transient Responses API failures.
-                response = self._client.responses.create(**request)
+                request["store"] = self._search_store_enabled()
+                response = self._call_with_transient_retries(lambda: self._client.responses.create(**request))
                 candidate = OpenAISearchResult(
                     answer=_collapse_whitespace(self._extract_output_text(response).replace("\r", " ").replace("\n", " ")),
                     sources=self._extract_web_search_sources(response),
@@ -748,7 +905,7 @@ class OpenAISearchMixin:
                 )
                 continue
 
-            if candidate.answer and self._response_is_complete(response):
+            if candidate.answer and candidate.used_web_search and self._response_is_complete(response):
                 attempt_log.append(
                     _build_search_attempt(
                         model=model,
@@ -760,12 +917,19 @@ class OpenAISearchMixin:
                 )
                 return candidate, None, tuple(attempt_log)
 
-            retry_reason = self._search_budget_retry_reason(response, answer=candidate.answer)
+            retry_reason = self._search_budget_retry_reason(
+                response,
+                answer=candidate.answer,
+                used_web_search=candidate.used_web_search,
+                model=model,
+            )
             retry_budget = self._next_search_retry_max_output_tokens(
                 response,
                 current_max_output_tokens=max_output_tokens,
                 output_token_candidates=output_token_candidates,
                 answer=candidate.answer,
+                used_web_search=candidate.used_web_search,
+                model=model,
             )
             if retry_budget is not None:
                 attempt_log.append(
@@ -782,11 +946,30 @@ class OpenAISearchMixin:
                     pending_output_tokens.insert(0, retry_budget)
                 continue
 
+            if self._response_is_complete(response) and not candidate.used_web_search:
+                last_error = RuntimeError(
+                    f"OpenAI web search response unusable for model={model!r}; "
+                    f"max_output_tokens={max_output_tokens}; status={_response_status_text(response)!r}; "
+                    "used_web_search=false"
+                )
+                attempt_log.append(
+                    _build_search_attempt(
+                        model=model,
+                        api_path="responses",
+                        max_output_tokens=max_output_tokens,
+                        outcome="unusable",
+                        status=_response_status_text(response),
+                        detail="used_web_search=false",
+                    )
+                )
+                continue
+
             last_error = self._build_search_response_error(
                 model=model,
                 response=response,
                 max_output_tokens=max_output_tokens,
                 answer=candidate.answer,
+                used_web_search=candidate.used_web_search,
             )
             attempt_log.append(
                 _build_search_attempt(
@@ -807,15 +990,8 @@ class OpenAISearchMixin:
         question: str,
         candidate: OpenAISearchResult,
     ) -> OpenAISearchResult:
-        """Rewrite a search result into clean spoken output plus verification metadata.
+        """Rewrite a search result into clean spoken output plus verification metadata."""
 
-        Web-search models tend to keep inline citations or web-style phrasing
-        even under strict instructions. Twinr therefore runs one bounded
-        non-search voice rewrite that preserves only the search-result facts
-        already present in the answer.
-        """
-
-        preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None)) or DEFAULT_OPENAI_MAIN_MODEL
         rendered_sources = ", ".join(candidate.sources) if candidate.sources else "none"
         prompt = (
             f"Original user question: {question}\n"
@@ -844,12 +1020,7 @@ class OpenAISearchMixin:
             "Keep site_follow_up_reason short and concrete."
         )
         last_error: Exception | None = None
-        rewrite_models: list[str] = []
-        for candidate_model in (preferred_model, *SEARCH_MODEL_FALLBACKS):
-            normalized_candidate = _collapse_whitespace(candidate_model)
-            if normalized_candidate and normalized_candidate not in rewrite_models:
-                rewrite_models.append(normalized_candidate)
-        for model in rewrite_models:
+        for model in self._structured_rewrite_models():
             try:
                 request = self._build_response_request(
                     prompt,
@@ -861,8 +1032,9 @@ class OpenAISearchMixin:
                     max_output_tokens=_SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS,
                     prompt_cache_scope="search_voice",
                 )
+                request["store"] = self._search_store_enabled()
                 request["text"] = {"format": _search_responses_text_format()}
-                response = self._client.responses.create(**request)
+                response = self._call_with_transient_retries(lambda: self._client.responses.create(**request))
                 structured_result = _extract_structured_search_answer(self._extract_output_text(response))
                 if structured_result.spoken_answer:
                     return OpenAISearchResult(
@@ -897,14 +1069,7 @@ class OpenAISearchMixin:
         location_hint: str | None,
         date_context: str | None,
     ) -> str:
-        """Return a structured search prompt with explicit place/date context.
-
-        Search must stay anchored to the user's actual request, but the
-        provider also needs the structured handoff hints when ASR wording is
-        slightly garbled or relative dates need grounding. The prompt therefore
-        keeps the literal question while surfacing any explicit structured
-        context in separate bounded lines.
-        """
+        """Return a structured search prompt with explicit place/date context."""
 
         normalized_question = _collapse_whitespace(question)
         explicit_query = _resolved_explicit_search_query(normalized_question, date_context)
@@ -936,7 +1101,7 @@ class OpenAISearchMixin:
             action = getattr(item, "action", None)
             sources = getattr(action, "sources", None) or []
             for source in sources:
-                url = str(getattr(source, "url", "")).strip()
+                url = _collapse_whitespace(getattr(source, "url", None))
                 if url:
                     urls.append(url)
         deduped: list[str] = []
@@ -955,7 +1120,6 @@ class OpenAISearchMixin:
         effective_label: str
         try:
             if timezone_name:
-                # AUDIT-FIX(#1): Use a real ZoneInfo object and never emit a misleading configured label after fallback.
                 now = datetime.now(ZoneInfo(timezone_name))
                 effective_label = timezone_name
             else:
@@ -970,26 +1134,51 @@ class OpenAISearchMixin:
         """Return the ordered list of search model candidates to try."""
 
         candidates: list[str] = []
-        configured = _collapse_whitespace(getattr(self.config, "openai_search_model", None))
-        if configured:
-            candidates.append(configured)
-        default_model = _collapse_whitespace(getattr(self.config, "default_model", None))
-        if default_model and default_model not in candidates:
-            candidates.append(default_model)
-        for fallback in SEARCH_MODEL_FALLBACKS:
-            normalized_fallback = _collapse_whitespace(fallback)
-            if normalized_fallback and normalized_fallback not in candidates:
-                candidates.append(normalized_fallback)
+        for candidate in (
+            getattr(self.config, "openai_search_model", None),
+            getattr(self.config, "default_model", None),
+            DEFAULT_OPENAI_MAIN_MODEL,
+            *_FRONTIER_SEARCH_MODEL_PREFERENCES,
+            *SEARCH_MODEL_FALLBACKS,
+        ):
+            normalized = _collapse_whitespace(candidate)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
         if not candidates:
-            # AUDIT-FIX(#5): Ensure a deterministic last-resort model candidate instead of an empty iteration set.
-            candidates.append(_FALLBACK_SEARCH_MODEL)
+            candidates.append(_FRONTIER_DEFAULT_SEARCH_MODEL)
         return tuple(candidates)
+
+    def _structured_rewrite_models(self) -> tuple[str, ...]:
+        """Return ordered rewrite models that are likely to support structured output."""
+
+        candidates: list[str] = []
+        preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None))
+        for candidate in (
+            preferred_model,
+            *_FRONTIER_SEARCH_MODEL_PREFERENCES,
+            DEFAULT_OPENAI_MAIN_MODEL,
+            *SEARCH_MODEL_FALLBACKS,
+        ):
+            normalized = _collapse_whitespace(candidate)
+            if not normalized or normalized in candidates:
+                continue
+            if not self._model_likely_supports_structured_outputs(normalized):
+                continue
+            candidates.append(normalized)
+        if not candidates:
+            candidates.append(_FRONTIER_DEFAULT_SEARCH_MODEL)
+        return tuple(candidates)
+
+    def _model_likely_supports_structured_outputs(self, model: str) -> bool:
+        """Return a conservative structured-output capability heuristic."""
+
+        normalized = _collapse_whitespace(model).lower()
+        return "-pro" not in normalized
 
     def _is_search_preview_model(self, model: str) -> bool:
         """Return whether a model name should use the preview search path."""
 
         normalized = _collapse_whitespace(model).lower()
-        # AUDIT-FIX(#5): Search-chat model families are not limited to names containing "search-preview".
         return "search-preview" in normalized or normalized.endswith("-search-api")
 
     def _search_preview_supported(self) -> bool:
@@ -1006,7 +1195,7 @@ class OpenAISearchMixin:
         urls: list[str] = []
         for annotation in getattr(message, "annotations", None) or []:
             url_citation = getattr(annotation, "url_citation", None)
-            url = str(getattr(url_citation, "url", "") or "").strip()
+            url = _collapse_whitespace(getattr(url_citation, "url", None))
             if url:
                 urls.append(url)
         deduped: list[str] = []
@@ -1053,17 +1242,19 @@ class OpenAISearchMixin:
                 return True
         return False
 
+    # BREAKING: search conversation snippets now preserve assistant phase when available;
+    # callers that assumed only ``(role, content)`` tuples must also accept ``(role, content, phase)``.
     def _prepare_search_conversation(
         self,
         conversation: ConversationLike | None,
-    ) -> tuple[tuple[str, str], ...] | None:
+    ) -> tuple[tuple[str, str, str | None], ...] | None:
         """Trim conversation history down to the search-specific context window."""
 
         if not conversation:
             return None
-        filtered: list[tuple[str, str]] = []
+        filtered: list[tuple[str, str, str | None]] = []
         for item in conversation:
-            role, content, _phase = self._coerce_message(item)
+            role, content, phase = self._coerce_message(item)
             normalized_role = role.strip().lower()
             if normalized_role not in {"user", "assistant"}:
                 continue
@@ -1072,7 +1263,8 @@ class OpenAISearchMixin:
                 continue
             if len(normalized_content) > _SEARCH_CONTEXT_CHAR_LIMIT:
                 normalized_content = normalized_content[: _SEARCH_CONTEXT_CHAR_LIMIT - 1].rstrip() + "…"
-            filtered.append((normalized_role, normalized_content))
+            normalized_phase = _collapse_whitespace(phase).lower() or None
+            filtered.append((normalized_role, normalized_content, normalized_phase))
         if not filtered:
             return None
         trimmed = filtered[-_SEARCH_CONTEXT_MAX_TURNS :]
@@ -1092,7 +1284,6 @@ class OpenAISearchMixin:
     def _search_output_token_candidates(self) -> tuple[int, ...]:
         """Return the output-token limits used for primary and retry search attempts."""
 
-        # AUDIT-FIX(#4): Parse env-backed token limits defensively so invalid config cannot crash the search path.
         primary = _coerce_positive_int(
             getattr(self.config, "openai_search_max_output_tokens", None),
             default=_DEFAULT_SEARCH_MAX_OUTPUT_TOKENS,
@@ -1114,30 +1305,53 @@ class OpenAISearchMixin:
         current_max_output_tokens: int,
         output_token_candidates: tuple[int, ...],
         answer: str,
+        used_web_search: bool,
+        model: str,
     ) -> int | None:
         """Return the next larger retry budget for token-exhausted search responses."""
 
-        if self._search_budget_retry_reason(response, answer=answer) is None:
+        if self._search_budget_retry_reason(
+            response,
+            answer=answer,
+            used_web_search=used_web_search,
+            model=model,
+        ) is None:
             return None
-        larger_budgets = sorted(
-            {
-                *output_token_candidates,
-                *_SEARCH_OUTPUT_TOKEN_RETRY_LADDER,
-            }
-        )
+        larger_budgets = sorted({*output_token_candidates, *_SEARCH_OUTPUT_TOKEN_RETRY_LADDER})
         for budget in larger_budgets:
             if budget > current_max_output_tokens:
                 return budget
         return None
 
-    def _search_budget_retry_reason(self, response: Any, *, answer: str) -> str | None:
+    def _search_budget_retry_reason(
+        self,
+        response: Any,
+        *,
+        answer: str,
+        used_web_search: bool,
+        model: str,
+    ) -> str | None:
         """Return why the same model deserves a larger search budget."""
 
         if self._response_hit_max_output_tokens_limit(response):
             return "max_output_tokens"
-        if not _collapse_whitespace(answer) and _response_status_text(response) == "completed":
-            return "blank_completed"
+        if (
+            used_web_search
+            and not answer
+            and self._response_is_complete(response)
+            and self._model_supports_blank_answer_retry(model)
+        ):
+            return "answer_text=blank"
         return None
+
+    def _model_supports_blank_answer_retry(self, model: str) -> bool:
+        """Return whether blank completed search responses deserve the retry ladder."""
+
+        version = _parse_search_gpt_version(model)
+        if version is None:
+            return False
+        major, minor = version
+        return major > 5 or (major == 5 and minor >= 4)
 
     def _response_hit_max_output_tokens_limit(self, response: Any) -> bool:
         """Return whether a search response stopped because max_output_tokens was exhausted."""
@@ -1155,6 +1369,7 @@ class OpenAISearchMixin:
         response: Any,
         max_output_tokens: int,
         answer: str,
+        used_web_search: bool,
     ) -> RuntimeError:
         """Return an informative error for an unusable search response."""
 
@@ -1171,6 +1386,7 @@ class OpenAISearchMixin:
         error_detail = _extract_detail_message(getattr(response, "error", None))
         if error_detail:
             parts.append(f"error={error_detail}")
+        parts.append(f"used_web_search={str(bool(used_web_search)).lower()}")
         if answer:
             parts.append("answer_text=partial")
         else:
@@ -1195,16 +1411,18 @@ class OpenAISearchMixin:
         return finish_reason in {"", "stop"}
 
     def _apply_web_search_request_overrides(self, request: dict[str, Any], *, location_hint: str | None) -> None:
-        """Apply search-context and location overrides to a request payload."""
+        """Apply search-context, privacy, and location overrides to a request payload."""
 
         tools = request.get("tools")
         if not isinstance(tools, list):
             return
+        request["tool_choice"] = "required"
         search_context_size = _normalize_search_context_size(
             getattr(self.config, "openai_web_search_context_size", None)
         )
-        # AUDIT-FIX(#8): Use structured user_location on Responses web_search instead of relying on prompt prose alone.
         user_location = self._build_responses_web_search_user_location(location_hint=location_hint)
+        allowed_domains = self._configured_search_allowed_domains()
+        external_web_access = self._configured_search_external_web_access()
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
@@ -1218,7 +1436,33 @@ class OpenAISearchMixin:
                     tool["user_location"] = user_location
                 else:
                     tool.pop("user_location", None)
+                if allowed_domains:
+                    existing_filters = tool.get("filters")
+                    if not isinstance(existing_filters, dict):
+                        existing_filters = {}
+                    existing_filters["allowed_domains"] = list(allowed_domains)
+                    tool["filters"] = existing_filters
+                if external_web_access is not None:
+                    tool["external_web_access"] = external_web_access
             break
+
+    def _apply_search_request_output_controls(self, request: dict[str, Any], *, model: str) -> None:
+        """Apply lower-latency output controls to plain-text GPT-5 search requests."""
+
+        normalized_model = _collapse_whitespace(model).lower()
+        if not normalized_model.startswith("gpt-5"):
+            return
+        text_payload = request.get("text")
+        if text_payload is None:
+            request["text"] = {"format": {"type": "text"}, "verbosity": "low"}
+            return
+        if not isinstance(text_payload, dict):
+            return
+        format_payload = text_payload.get("format")
+        if isinstance(format_payload, dict):
+            format_type = _collapse_whitespace(format_payload.get("type")).lower()
+            if format_type == "text":
+                text_payload.setdefault("verbosity", "low")
 
     def _ensure_web_search_sources_included(self, request: dict[str, Any]) -> None:
         """Ensure source URLs are requested from the Responses API."""
@@ -1284,3 +1528,95 @@ class OpenAISearchMixin:
                 "approximate": approximate,
             }
         return options
+
+    def _configured_search_allowed_domains(self) -> tuple[str, ...]:
+        """Return a normalized allowlist of domains for Responses web search."""
+
+        raw_value = getattr(self.config, "openai_web_search_allowed_domains", None)
+        if raw_value is None:
+            raw_value = getattr(self.config, "openai_search_allowed_domains", None)
+        normalized_domains: list[str] = []
+        for item in _iter_string_values(raw_value):
+            normalized = _normalize_public_hostname(item)
+            if normalized and normalized not in normalized_domains:
+                normalized_domains.append(normalized)
+        return tuple(normalized_domains[:100])
+
+    def _configured_search_external_web_access(self) -> bool | None:
+        """Return the configured external_web_access flag for Responses web search."""
+
+        configured = _coerce_bool(getattr(self.config, "openai_web_search_external_web_access", None))
+        if configured is not None:
+            return configured
+        return _coerce_bool(getattr(self.config, "openai_search_external_web_access", None))
+
+    def _search_store_enabled(self) -> bool:
+        """Return whether provider-side request/response storage is allowed for search."""
+
+        configured = _coerce_bool(getattr(self.config, "openai_search_store", None))
+        if configured is None:
+            configured = _coerce_bool(getattr(self.config, "openai_store_search_responses", None))
+        return bool(configured) if configured is not None else False
+
+    def _search_transient_retry_attempts(self) -> int:
+        """Return how many transient retries are allowed per API request."""
+
+        return _coerce_positive_int(
+            getattr(self.config, "openai_search_transient_retries", None),
+            default=_SEARCH_TRANSIENT_RETRIES_DEFAULT,
+            minimum=0,
+        )
+
+    def _is_transient_search_exception(self, exc: Exception) -> bool:
+        """Return whether an SDK exception looks transient and retryable."""
+
+        status_code = _coerce_int(getattr(exc, "status_code", None))
+        if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+        type_name = type(exc).__name__.lower()
+        if any(
+            token in type_name
+            for token in (
+                "timeout",
+                "connection",
+                "rate",
+                "internalserver",
+                "serviceunavailable",
+                "apiconnection",
+            )
+        ):
+            return True
+        message = _collapse_whitespace(str(exc)).lower()
+        return any(
+            token in message
+            for token in (
+                "timeout",
+                "timed out",
+                "connection",
+                "temporarily unavailable",
+                "rate limit",
+                "try again",
+                "server error",
+                "overloaded",
+            )
+        )
+
+    def _transient_retry_delay_seconds(self, retry_index: int) -> float:
+        """Return one bounded exponential-backoff delay with small jitter."""
+
+        base = _SEARCH_TRANSIENT_RETRY_BASE_DELAY_SECONDS * (2**retry_index)
+        jitter = random.uniform(0.0, 0.15)
+        return min(_SEARCH_TRANSIENT_RETRY_MAX_DELAY_SECONDS, base + jitter)
+
+    def _call_with_transient_retries(self, operation):
+        """Execute one API operation with bounded transient retries."""
+
+        max_retries = self._search_transient_retry_attempts()
+        for retry_index in range(max_retries + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                if retry_index >= max_retries or not self._is_transient_search_exception(exc):
+                    raise
+                time.sleep(self._transient_retry_delay_seconds(retry_index))
+        raise RuntimeError("unreachable transient retry state")

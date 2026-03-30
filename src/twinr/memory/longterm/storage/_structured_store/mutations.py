@@ -35,7 +35,7 @@ class StructuredStoreMutationMixin:
         """Persist a consolidation result into object and conflict snapshots."""
 
         with self._lock:
-            existing_objects = {item.memory_id: item for item in self.load_objects()}
+            existing_objects = {item.memory_id: item for item in self.load_objects_fine_grained_for_write()}
             for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
                 existing = existing_objects.get(item.memory_id)
                 existing_objects[item.memory_id] = self._merge_object(
@@ -43,7 +43,7 @@ class StructuredStoreMutationMixin:
                     incoming=item,
                     increment_support=True,
                 )
-            existing_conflicts = {self._conflict_key(item): item for item in self.load_conflicts()}
+            existing_conflicts = {self._conflict_key(item): item for item in self.load_conflicts_fine_grained_for_write()}
             for conflict in result.conflicts:
                 existing_conflicts[self._conflict_key(conflict)] = conflict
             objects_payload = {
@@ -74,36 +74,46 @@ class StructuredStoreMutationMixin:
         """Persist reflected objects and summaries into the object snapshot."""
 
         with self._lock:
-            existing_objects = {item.memory_id: item for item in self.load_objects()}
+            target_ids = tuple(
+                dict.fromkeys(
+                    item.memory_id
+                    for item in (*result.reflected_objects, *result.created_summaries)
+                    if isinstance(item, LongTermMemoryObjectV1)
+                )
+            )
+            existing_objects = {item.memory_id: item for item in self.load_objects_by_ids(target_ids)}
             for item in (*result.reflected_objects, *result.created_summaries):
                 existing_objects[item.memory_id] = self._merge_object(
                     existing=existing_objects.get(item.memory_id),
                     incoming=item,
                     increment_support=False,
                 )
-            payload = {
-                "schema": _OBJECT_STORE_SCHEMA,
-                "version": _OBJECT_STORE_VERSION,
-                "objects": [item.to_payload() for item in sorted(existing_objects.values(), key=lambda row: row.memory_id)],
-            }
-            self._persist_snapshot_payload(
-                snapshot_kind="objects",
-                local_path=self.objects_path,
-                payload=payload,
+            self.commit_active_delta(
+                object_upserts=tuple(
+                    sorted(existing_objects.values(), key=lambda row: row.memory_id)
+                ),
             )
 
     def apply_retention(self, result: LongTermRetentionResultV1) -> None:
         """Persist kept objects and archive retained-off objects."""
 
         with self._lock:
-            objects = {item.memory_id: item for item in result.kept_objects}
-            archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
+            archived_ids = tuple(item.memory_id for item in result.archived_objects)
+            expired_ids = tuple(item.memory_id for item in result.expired_objects)
+            if self._remote_catalog_enabled() and self._remote_catalog is not None:
+                self.commit_active_delta(
+                    object_upserts=result.kept_objects,
+                    object_delete_ids=tuple(dict.fromkeys((*expired_ids, *archived_ids, *result.pruned_memory_ids))),
+                    archive_upserts=result.archived_objects,
+                )
+                return
+            archived_objects = {item.memory_id: item for item in self.load_archived_objects_fine_grained()}
             for item in result.archived_objects:
                 archived_objects[item.memory_id] = item
             payload = {
                 "schema": _OBJECT_STORE_SCHEMA,
                 "version": _OBJECT_STORE_VERSION,
-                "objects": [item.to_payload() for item in sorted(objects.values(), key=lambda row: row.memory_id)],
+                "objects": [item.to_payload() for item in sorted(result.kept_objects, key=lambda row: row.memory_id)],
             }
             archive_payload = {
                 "schema": _ARCHIVE_STORE_SCHEMA,
@@ -125,7 +135,7 @@ class StructuredStoreMutationMixin:
         """Persist updated objects and the remaining conflict queue."""
 
         with self._lock:
-            existing_objects = {item.memory_id: item for item in self.load_objects()}
+            existing_objects = {item.memory_id: item for item in self.load_objects_fine_grained_for_write()}
             for item in result.updated_objects:
                 existing_objects[item.memory_id] = item
             objects_payload = {
@@ -200,8 +210,9 @@ class StructuredStoreMutationMixin:
         """Persist a user-driven mutation result across all snapshots."""
 
         with self._lock:
-            existing_objects = {item.memory_id: item for item in self.load_objects()}
-            archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
+            current_state = self.load_current_state_fine_grained_for_write()
+            existing_objects = {item.memory_id: item for item in current_state.objects}
+            archived_objects = {item.memory_id: item for item in current_state.archived_objects}
             for memory_id in result.deleted_memory_ids:
                 existing_objects.pop(memory_id, None)
                 archived_objects.pop(memory_id, None)
@@ -255,9 +266,26 @@ class StructuredStoreMutationMixin:
 
         with self._lock:
             bounded_limit = max(1, limit)
+            remote_selected = self.select_review_objects_query_first(
+                query_text=query_text,
+                status=status,
+                kind=kind,
+                include_episodes=include_episodes,
+                limit=bounded_limit,
+            )
+            if remote_selected is not None:
+                selected, total_count = remote_selected
+                return LongTermMemoryReviewResultV1(
+                    items=tuple(self._to_review_item(item) for item in selected),
+                    total_count=total_count,
+                    query_text=_normalize_text(query_text),
+                    status_filter=status,
+                    kind_filter=kind,
+                    include_episodes=include_episodes,
+                )
             objects = [
                 item
-                for item in self.load_objects()
+                for item in self.load_objects_fine_grained()
                 if (include_episodes or item.kind != "episode")
                 and (status is None or item.status == status)
                 and (kind is None or item.kind == kind)
@@ -317,7 +345,7 @@ class StructuredStoreMutationMixin:
                 action="confirm",
                 target_memory_id=current.memory_id,
                 updated_objects=(updated,),
-                remaining_conflicts=self.load_conflicts(),
+                remaining_conflicts=self.load_conflicts_fine_grained(),
             )
 
     def invalidate_object(

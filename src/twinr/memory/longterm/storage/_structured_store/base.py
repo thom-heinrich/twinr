@@ -11,6 +11,7 @@ from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
+from .active_delta import StructuredStoreActiveDeltaMixin
 from .mutations import StructuredStoreMutationMixin
 from .query import StructuredStoreQueryMixin
 from .remote_select import StructuredStoreRemoteSelectionMixin
@@ -22,6 +23,7 @@ from .snapshots import StructuredStoreSnapshotMixin
 class LongTermStructuredStoreBase(
     StructuredStoreSnapshotMixin,
     StructuredStoreRemoteSelectionMixin,
+    StructuredStoreActiveDeltaMixin,
     StructuredStoreMutationMixin,
     StructuredStoreRetrievalMixin,
     StructuredStoreQueryMixin,

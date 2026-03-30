@@ -3,6 +3,9 @@
 # BUG-2: Replace first-non-empty topic keys with visible semantic keys to fix silent dedupe collisions and duplicate cards.
 # BUG-3: Skip malformed persisted records instead of letting one bad record blank the whole reflection lane.
 # BUG-4: device_context/device_interaction packets were unintentionally suppressed despite dedicated context handling; they can now surface again.
+# BUG-5: Reflection summary loading now routes through the shared query-first
+#        runtime selector layer so the visible reserve lane never hydrates full
+#        remote object snapshots again.
 # SEC-1: Redact PII-like literals, strip control/BiDi characters, and stop using raw transcript excerpts as visible anchors.
 # IMP-1: Upgrade salience to a multi-factor score (recency, confidence, anchor quality, content prior, corroboration).
 # IMP-2: Add semantic merge + soft family diversity so the right lane is less repetitive.
@@ -24,6 +27,7 @@ from typing import Any
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermMidtermPacketV1
+from twinr.memory.longterm.runtime.live_object_selectors import select_reflection_summary_objects
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
 logger = logging.getLogger(__name__)
@@ -930,6 +934,12 @@ def _select_diverse_candidates(
     return tuple(selected[:limit])
 
 
+def _load_reflection_summary_objects(memory_service: LongTermMemoryService) -> Sequence[object]:
+    """Load summary-like long-term objects through the shared query-first selector layer."""
+
+    return select_reflection_summary_objects(memory_service.object_store)
+
+
 def load_display_reserve_reflection_candidates(
     memory_service: LongTermMemoryService,
     *,
@@ -948,7 +958,7 @@ def load_display_reserve_reflection_candidates(
     effective_now = _to_utc(local_now, assume_tz=_local_timezone())
     grouped: dict[str, list[AmbientDisplayImpulseCandidate]] = {}
 
-    for item in memory_service.object_store.load_objects():
+    for item in _load_reflection_summary_objects(memory_service):
         candidate = _safe_convert_summary(item, now=effective_now, max_age_days=resolved.max_age_days)
         if candidate is not None:
             grouped.setdefault(_candidate_semantic_key(candidate), []).append(candidate)

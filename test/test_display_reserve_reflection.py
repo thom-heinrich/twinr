@@ -23,8 +23,12 @@ class _FakeObjectStore:
     def __init__(self, objects):
         self._objects = tuple(objects)
 
-    def load_objects(self):
+    def select_fast_topic_objects(self, *, query_text=None, limit=0):
+        _ = query_text, limit
         return self._objects
+
+    def load_objects(self):
+        raise AssertionError("Reflection reserve must not hydrate the full object snapshot.")
 
 
 class _FakeMidtermStore:

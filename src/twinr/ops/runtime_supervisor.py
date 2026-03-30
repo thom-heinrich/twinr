@@ -1,3 +1,12 @@
+# CHANGELOG: 2026-03-30
+# BUG-1: Handle SIGTERM/SIGINT so the supervisor reaches finally and does not orphan productive child processes on normal service stop/restart.
+# BUG-2: Add bounded exponential backoff for crash loops and spawn failures; the previous loop could thrash CPU/I/O on a Raspberry Pi after repeated child exits.
+# BUG-3: Restart the streaming loop on real conversation-loop outages even when the worker still owns the singleton lock; previously that failure mode could stay stuck indefinitely.
+# SEC-1: Harden adoption of pre-existing worker PIDs with exact cmdline/env-file/project-root validation and race-resistant PID identity tracking.
+# IMP-1: Use Linux pidfd when available for race-free liveness and signalling of adopted processes.
+# IMP-2: Add optional systemd sd_notify READY/STATUS/WATCHDOG/STOPPING integration for production supervision.
+# IMP-3: Start children in isolated POSIX sessions when supported and stop their full process groups during internal restarts.
+
 """Supervise the productive Pi runtime under one authoritative owner.
 
 The productive Raspberry Pi runtime should not depend on three unrelated
@@ -14,10 +23,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import inspect
 import json
 import logging
 import os
 from pathlib import Path
+import select
+import signal
+import socket
+import threading
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
@@ -51,6 +65,9 @@ from twinr.ops.runtime_supervisor_process import (
 
 RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 EXTERNAL_WATCHDOG_ENV_KEY = "TWINR_REMOTE_MEMORY_WATCHDOG_MANAGED_EXTERNALLY"
+_SYSTEMD_NOTIFY_SOCKET_ENV_KEY = "NOTIFY_SOCKET"
+_SYSTEMD_WATCHDOG_USEC_ENV_KEY = "WATCHDOG_USEC"
+_SYSTEMD_WATCHDOG_PID_ENV_KEY = "WATCHDOG_PID"
 _DEFAULT_POLL_INTERVAL_S = 1.0
 _DEFAULT_WATCHDOG_STARTUP_GRACE_S = 6.0
 _DEFAULT_WATCHDOG_STARTUP_TIMEOUT_S = 60.0
@@ -58,13 +75,18 @@ _DEFAULT_STREAMING_STARTUP_TIMEOUT_S = 60.0
 _DEFAULT_STREAMING_HEALTH_GRACE_S = 10.0
 _DEFAULT_MAX_SNAPSHOT_AGE_S = 45.0
 _DEFAULT_RESTART_BACKOFF_S = 5.0
+_DEFAULT_RESTART_MAX_BACKOFF_S = 60.0
 _DEFAULT_STOP_TIMEOUT_S = 10.0
+_DEFAULT_STATUS_EMIT_INTERVAL_S = 5.0
 _STREAMING_HEALTH_FAILURE_THRESHOLD = 2
 _REQUIRED_REMOTE_PUBLIC_ERROR_MESSAGE = "Required remote long-term memory is unavailable."
 _REQUIRED_REMOTE_RECOVERY_ERROR_FRAGMENTS = (
     "remote long-term memory is temporarily cooling down after recent failures.",
     "remote memory watchdog snapshot",
 )
+_MAX_EMIT_TEXT_LEN = 240
+_MAX_EVENT_TEXT_LEN = 240
+_MAX_SYSTEMD_STATUS_LEN = 180
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +165,8 @@ class TwinrRuntimeSupervisor:
         max_snapshot_age_s: Maximum allowed runtime-snapshot age before a
             streaming restart is triggered.
         restart_backoff_s: Minimum delay between restarts of the same child.
+        restart_max_backoff_s: Maximum crash-loop backoff between child start
+            attempts after repeated exits or spawn failures.
         stop_timeout_s: Graceful shutdown timeout for child termination.
         manage_watchdog: When false, the supervisor consumes an externally
             managed watchdog artifact/service instead of spawning and recycling
@@ -175,12 +199,14 @@ class TwinrRuntimeSupervisor:
         streaming_health_grace_s: float = _DEFAULT_STREAMING_HEALTH_GRACE_S,
         max_snapshot_age_s: float = _DEFAULT_MAX_SNAPSHOT_AGE_S,
         restart_backoff_s: float = _DEFAULT_RESTART_BACKOFF_S,
+        restart_max_backoff_s: float = _DEFAULT_RESTART_MAX_BACKOFF_S,
         stop_timeout_s: float = _DEFAULT_STOP_TIMEOUT_S,
         manage_watchdog: bool | None = None,
         external_watchdog_starter: ExternalWatchdogStarterFn = _default_external_watchdog_starter,
     ) -> None:
         self.config = config
         self.env_file = str(env_file)
+        self._resolved_env_file = Path(self.env_file).expanduser().resolve()
         self.emit = emit
         self.event_store = event_store or TwinrOpsEventStore.from_config(config)
         self.snapshot_store = snapshot_store or RuntimeSnapshotStore(config.runtime_state_path)
@@ -201,6 +227,7 @@ class TwinrRuntimeSupervisor:
         self.streaming_health_grace_s = max(0.0, float(streaming_health_grace_s))
         self.max_snapshot_age_s = max(1.0, float(max_snapshot_age_s))
         self.restart_backoff_s = max(0.0, float(restart_backoff_s))
+        self.restart_max_backoff_s = max(self.restart_backoff_s, float(restart_max_backoff_s))
         self.stop_timeout_s = max(0.1, float(stop_timeout_s))
         self.manage_watchdog = (
             not _env_flag(EXTERNAL_WATCHDOG_ENV_KEY)
@@ -221,6 +248,43 @@ class TwinrRuntimeSupervisor:
         self._last_streaming_gate_reason: str | None = None
         self._run_started_at_monotonic: float = -1.0
         self._last_external_watchdog_recovery_at_monotonic: float = -1.0
+        self._terminate_requested = False
+        self._shutdown_signal: int | None = None
+        self._previous_signal_handlers: dict[int, object] = {}
+        self._child_next_start_at_monotonic: dict[str, float] = {
+            self._watchdog.key: -1.0,
+            self._streaming.key: -1.0,
+        }
+        self._child_failure_streak: dict[str, int] = {
+            self._watchdog.key: 0,
+            self._streaming.key: 0,
+        }
+        self._child_last_start_defer_reason: dict[str, str | None] = {
+            self._watchdog.key: None,
+            self._streaming.key: None,
+        }
+        self._child_pidfds: dict[str, int | None] = {
+            self._watchdog.key: None,
+            self._streaming.key: None,
+        }
+        self._child_start_ticks: dict[str, int | None] = {
+            self._watchdog.key: None,
+            self._streaming.key: None,
+        }
+        self._child_process_group_ids: dict[str, int | None] = {
+            self._watchdog.key: None,
+            self._streaming.key: None,
+        }
+        self._child_isolated_process_group: dict[str, bool] = {
+            self._watchdog.key: False,
+            self._streaming.key: False,
+        }
+        self._systemd_ready = False
+        self._systemd_restart_counter_reset = False
+        self._systemd_watchdog_interval_s = self._resolve_systemd_watchdog_interval_s()
+        self._last_systemd_watchdog_ping_at_monotonic = -1.0
+        self._last_systemd_status: str | None = None
+        self._last_systemd_status_at_monotonic = -1.0
 
     def run(self, *, duration_s: float | None = None) -> int:
         """Run the authoritative supervisor loop."""
@@ -228,6 +292,7 @@ class TwinrRuntimeSupervisor:
         resolved_duration = None if duration_s is None else max(0.0, float(duration_s))
         self._run_started_at_monotonic = self._monotonic()
         deadline = None if resolved_duration is None else self._run_started_at_monotonic + resolved_duration
+        self._install_signal_handlers()
         self._emit_payload(
             "runtime_supervisor_started",
             env_file=self.env_file,
@@ -237,6 +302,8 @@ class TwinrRuntimeSupervisor:
             watchdog_startup_timeout_s=self.watchdog_startup_timeout_s,
             streaming_startup_timeout_s=self.streaming_startup_timeout_s,
             streaming_health_grace_s=self.streaming_health_grace_s,
+            systemd_notify_active=bool(os.environ.get(_SYSTEMD_NOTIFY_SOCKET_ENV_KEY)),
+            pidfd_active=bool(getattr(os, "pidfd_open", None)),
         )
         self._append_event(
             event="runtime_supervisor_started",
@@ -246,13 +313,21 @@ class TwinrRuntimeSupervisor:
                 "project_root": str(self.project_root),
             },
         )
+        self._maybe_notify_systemd_state(
+            now_monotonic=self._run_started_at_monotonic,
+            assessment=None,
+            snapshot=None,
+        )
         try:
             while True:
                 now_monotonic = self._monotonic()
-                if self.manage_watchdog:
-                    self._ensure_child_running(self._watchdog, now_monotonic, reason="startup")
+                if self._terminate_requested:
+                    return 0
+
                 assessment = self._assess_watchdog()
                 if self.manage_watchdog:
+                    if self._ensure_watchdog_running(now_monotonic=now_monotonic, assessment=assessment):
+                        assessment = self._assess_watchdog()
                     self._maybe_restart_watchdog_for_health(
                         now_monotonic=now_monotonic,
                         assessment=assessment,
@@ -262,14 +337,25 @@ class TwinrRuntimeSupervisor:
                         now_monotonic=now_monotonic,
                         assessment=assessment,
                     )
+
                 self._ensure_streaming_running(
                     now_monotonic=now_monotonic,
                     assessment=assessment,
                 )
+                snapshot = self._load_snapshot() if self._streaming.is_running() else None
                 self._enforce_streaming_health(
                     now_monotonic=now_monotonic,
                     assessment=assessment,
+                    snapshot=snapshot,
                 )
+                self._maybe_reset_child_failure_streak(self._watchdog, now_monotonic)
+                self._maybe_reset_child_failure_streak(self._streaming, now_monotonic)
+                self._maybe_notify_systemd_state(
+                    now_monotonic=now_monotonic,
+                    assessment=assessment,
+                    snapshot=snapshot,
+                )
+
                 if deadline is not None and now_monotonic >= deadline:
                     return 0
                 sleep_s = self.poll_interval_s
@@ -280,18 +366,37 @@ class TwinrRuntimeSupervisor:
         except KeyboardInterrupt:
             return 0
         finally:
+            self._notify_systemd("STOPPING=1", "STATUS=Stopping Twinr runtime supervisor.")
             self._stop_child(self._streaming, reason="supervisor_stop")
             if self.manage_watchdog:
                 self._stop_child(self._watchdog, reason="supervisor_stop")
-            self._emit_payload("runtime_supervisor_stopped")
+            self._emit_payload("runtime_supervisor_stopped", signal=self._shutdown_signal)
             self._append_event(
                 event="runtime_supervisor_stopped",
                 message="Twinr runtime supervisor stopped.",
                 data={
                     "streaming_restarts": self._streaming.restart_count,
                     "watchdog_restarts": self._watchdog.restart_count,
+                    "signal": self._shutdown_signal,
                 },
             )
+            self._restore_signal_handlers()
+
+    def _ensure_watchdog_running(
+        self,
+        *,
+        now_monotonic: float,
+        assessment: RequiredRemoteWatchdogAssessment,
+    ) -> bool:
+        self._clear_dead_child(self._watchdog, now_monotonic=now_monotonic)
+        if self._watchdog.is_running():
+            return False
+        if self._maybe_adopt_existing_watchdog_owner(
+            now_monotonic=now_monotonic,
+            assessment=assessment,
+        ):
+            return True
+        return self._ensure_child_running(self._watchdog, now_monotonic, reason="startup")
 
     def _ensure_streaming_running(
         self,
@@ -299,7 +404,7 @@ class TwinrRuntimeSupervisor:
         now_monotonic: float,
         assessment: RequiredRemoteWatchdogAssessment,
     ) -> None:
-        self._clear_dead_child(self._streaming)
+        self._clear_dead_child(self._streaming, now_monotonic=now_monotonic)
         if self._streaming.is_running():
             self._last_streaming_gate_reason = None
             return
@@ -329,40 +434,145 @@ class TwinrRuntimeSupervisor:
         owner_pid = self.loop_owner(self.config, "streaming-loop")
         if owner_pid is None or owner_pid <= 0:
             return False
-        if not self.pid_alive(owner_pid):
+        return self._maybe_adopt_existing_child_owner(
+            child=self._streaming,
+            owner_pid=owner_pid,
+            now_monotonic=now_monotonic,
+            expected_flag="--run-streaming-loop",
+            reason="existing_lock_owner",
+        )
+
+    def _maybe_adopt_existing_watchdog_owner(
+        self,
+        *,
+        now_monotonic: float,
+        assessment: RequiredRemoteWatchdogAssessment,
+    ) -> bool:
+        """Adopt one already-running watchdog after supervisor restarts."""
+
+        if self._watchdog.process is not None:
             return False
-        owner_cmdline = self.pid_cmdline(owner_pid)
-        if "--run-streaming-loop" not in owner_cmdline:
+        owner_pid = getattr(assessment, "watchdog_pid", None)
+        if owner_pid is None or owner_pid <= 0:
             return False
-        self._streaming.process = _PidProcessHandle(
+        if not assessment.pid_alive:
+            return False
+        return self._maybe_adopt_existing_child_owner(
+            child=self._watchdog,
+            owner_pid=owner_pid,
+            now_monotonic=now_monotonic,
+            expected_flag="--watch-remote-memory",
+            reason="existing_watchdog_owner",
+        )
+
+    def _maybe_adopt_existing_child_owner(
+        self,
+        *,
+        child: _ManagedChild,
+        owner_pid: int,
+        now_monotonic: float,
+        expected_flag: str,
+        reason: str,
+    ) -> bool:
+        valid, owner_cmdline, detail = self._validate_existing_twinr_owner(
             owner_pid,
-            pid_alive=self.pid_alive,
-            pid_signal=self.pid_signal,
+            expected_flag=expected_flag,
+        )
+        if not valid:
+            if detail:
+                self._emit_payload(
+                    "runtime_supervisor_child_adoption_rejected",
+                    child=child.key,
+                    pid=owner_pid,
+                    detail=detail,
+                )
+            return False
+
+        pidfd = self._pidfd_open(owner_pid)
+        start_ticks = self._pid_start_ticks(owner_pid)
+
+        def exact_pid_alive(pid: int) -> bool:
+            return self._pid_identity_matches(pid, pidfd=pidfd, start_ticks=start_ticks)
+
+        def exact_pid_signal(pid: int, sig: int) -> None:
+            if not self._pid_identity_matches(pid, pidfd=pidfd, start_ticks=start_ticks):
+                raise ProcessLookupError(pid)
+            self._send_signal_to_exact_pid(pid=pid, sig=sig, pidfd=pidfd)
+
+        self._release_child_identity(child)
+        self._child_pidfds[child.key] = pidfd
+        self._child_start_ticks[child.key] = start_ticks
+        self._capture_process_group_metadata(child.key, owner_pid)
+
+        self._child_next_start_at_monotonic[child.key] = -1.0
+        self._child_failure_streak[child.key] = 0
+        self._child_last_start_defer_reason[child.key] = None
+
+        self._append_event(
+            event="runtime_supervisor_child_adopted",
+            message=f"Supervisor adopted existing {child.label}.",
+            data={
+                "child": child.key,
+                "pid": owner_pid,
+                "owner_cmdline": " ".join(owner_cmdline[:8]),
+                "reason": reason,
+            },
+        )
+        child.process = _PidProcessHandle(
+            owner_pid,
+            pid_alive=exact_pid_alive,
+            pid_signal=exact_pid_signal,
             monotonic=self._monotonic,
             sleep=self._sleep,
         )
-        self._streaming.started_at_monotonic = now_monotonic
-        self._streaming.started_at_utc = self._utcnow()
-        self._streaming.last_restart_at_monotonic = now_monotonic
-        self._streaming.clear_health_issue()
+        child.started_at_monotonic = now_monotonic
+        child.started_at_utc = self._utcnow()
+        child.last_restart_at_monotonic = now_monotonic
+        child.clear_health_issue()
         self._emit_payload(
             "runtime_supervisor_child_adopted",
-            child=self._streaming.key,
+            child=child.key,
             pid=owner_pid,
-            owner_cmdline=" ".join(owner_cmdline[:6]),
-            reason="existing_lock_owner",
-        )
-        self._append_event(
-            event="runtime_supervisor_child_adopted",
-            message=f"Supervisor adopted existing {self._streaming.label}.",
-            data={
-                "child": self._streaming.key,
-                "pid": owner_pid,
-                "owner_cmdline": " ".join(owner_cmdline[:6]),
-                "reason": "existing_lock_owner",
-            },
+            owner_cmdline=" ".join(owner_cmdline[:8]),
+            reason=reason,
         )
         return True
+
+    def _validate_existing_twinr_owner(
+        self,
+        pid: int,
+        *,
+        expected_flag: str,
+    ) -> tuple[bool, tuple[str, ...], str | None]:
+        if pid <= 0:
+            return False, (), "Invalid PID for adoption."
+        if not self.pid_alive(pid):
+            return False, (), "PID is not alive."
+        try:
+            cmdline = self.pid_cmdline(pid)
+        except Exception as exc:
+            return False, (), compact_text(f"pid_cmdline failed: {type(exc).__name__}: {exc}", limit=160)
+        if expected_flag not in cmdline:
+            return False, cmdline, f"Expected flag {expected_flag} missing."
+        # BREAKING: the supervisor now only adopts existing workers whose
+        # command line still matches the canonical Twinr runtime invocation.
+        if "-m" not in cmdline or "twinr" not in cmdline:
+            return False, cmdline, "Expected Twinr module marker missing."
+        env_file_arg = self._extract_cli_option_value(cmdline, "--env-file")
+        if env_file_arg is None:
+            return False, cmdline, "Expected --env-file missing."
+        try:
+            resolved_env_file_arg = Path(env_file_arg).expanduser().resolve()
+        except Exception:
+            return False, cmdline, "Unable to resolve adopted process env-file."
+        if resolved_env_file_arg != self._resolved_env_file:
+            return False, cmdline, "Adopted process env-file does not match supervisor env-file."
+        cwd = self._pid_cwd(pid)
+        if cwd is None:
+            return False, cmdline, "Unable to inspect adopted process cwd."
+        if cwd != self.project_root:
+            return False, cmdline, "Adopted process cwd does not match project root."
+        return True, cmdline, None
 
     def _streaming_gate_reason(
         self,
@@ -394,13 +604,15 @@ class TwinrRuntimeSupervisor:
         now_monotonic: float,
         *,
         reason: str,
-    ) -> None:
-        self._clear_dead_child(child)
+    ) -> bool:
+        self._clear_dead_child(child, now_monotonic=now_monotonic)
         if child.is_running():
-            return
-        self._start_child(child, now_monotonic, reason=reason)
+            return False
+        if not self._can_attempt_child_start(child, now_monotonic, reason=reason):
+            return False
+        return self._start_child(child, now_monotonic, reason=reason)
 
-    def _clear_dead_child(self, child: _ManagedChild) -> None:
+    def _clear_dead_child(self, child: _ManagedChild, *, now_monotonic: float) -> None:
         process = child.process
         if process is None:
             return
@@ -425,6 +637,12 @@ class TwinrRuntimeSupervisor:
         )
         child.process = None
         child.clear_health_issue()
+        self._note_child_failure(
+            child,
+            now_monotonic=now_monotonic,
+            reason=f"child_exit:{exit_code}",
+        )
+        self._release_child_identity(child)
 
     def _start_child(
         self,
@@ -432,16 +650,49 @@ class TwinrRuntimeSupervisor:
         now_monotonic: float,
         *,
         reason: str,
-    ) -> None:
+    ) -> bool:
         argv = self._child_command(child.key)
         env = self._child_environment()
-        process = self.process_factory(argv, cwd=self.project_root, env=env)
+        kwargs = self._process_factory_kwargs()
+        try:
+            process = self.process_factory(argv, cwd=self.project_root, env=env, **kwargs)
+        except TypeError as exc:
+            if kwargs and self._kwargs_typeerror_is_unsupported_kwarg(exc):
+                try:
+                    process = self.process_factory(argv, cwd=self.project_root, env=env)
+                except Exception as nested_exc:
+                    return self._record_child_start_failure(
+                        child,
+                        now_monotonic=now_monotonic,
+                        reason=reason,
+                        exc=nested_exc,
+                    )
+            else:
+                return self._record_child_start_failure(
+                    child,
+                    now_monotonic=now_monotonic,
+                    reason=reason,
+                    exc=exc,
+                )
+        except Exception as exc:
+            return self._record_child_start_failure(
+                child,
+                now_monotonic=now_monotonic,
+                reason=reason,
+                exc=exc,
+            )
+
         child.process = process
         child.started_at_monotonic = now_monotonic
         child.started_at_utc = self._utcnow()
         child.last_restart_at_monotonic = now_monotonic
         child.restart_count += 1
         child.clear_health_issue()
+
+        self._child_next_start_at_monotonic[child.key] = -1.0
+        self._child_last_start_defer_reason[child.key] = None
+        self._capture_child_identity(child, process)
+
         self._emit_payload(
             "runtime_supervisor_child_started",
             child=child.key,
@@ -476,14 +727,48 @@ class TwinrRuntimeSupervisor:
                     "runtime_supervisor_watchdog_bootstrap_failed",
                     detail=compact_text(f"{type(exc).__name__}: {exc}", limit=200),
                 )
+        return True
+
+    def _record_child_start_failure(
+        self,
+        child: _ManagedChild,
+        *,
+        now_monotonic: float,
+        reason: str,
+        exc: Exception,
+    ) -> bool:
+        detail = compact_text(f"{type(exc).__name__}: {exc}", limit=200)
+        self._emit_payload(
+            "runtime_supervisor_child_start_failed",
+            child=child.key,
+            reason=reason,
+            detail=detail,
+        )
+        self._append_event(
+            event="runtime_supervisor_child_start_failed",
+            message=f"Supervisor failed to start {child.label}.",
+            level="error",
+            data={
+                "child": child.key,
+                "reason": reason,
+                "detail": detail,
+            },
+        )
+        child.process = None
+        child.clear_health_issue()
+        self._release_child_identity(child)
+        self._note_child_failure(child, now_monotonic=now_monotonic, reason=f"spawn_failure:{reason}")
+        return False
 
     def _stop_child(self, child: _ManagedChild, *, reason: str) -> None:
         process = child.process
         if process is None:
+            self._release_child_identity(child)
             return
         if process.poll() is not None:
             child.process = None
             child.clear_health_issue()
+            self._release_child_identity(child)
             return
         self._emit_payload(
             "runtime_supervisor_child_stopping",
@@ -492,7 +777,7 @@ class TwinrRuntimeSupervisor:
             reason=reason,
         )
         try:
-            process.terminate()
+            self._terminate_child_tree(child, process)
             process.wait(timeout=self.stop_timeout_s)
         except Exception:
             _LOGGER.warning(
@@ -501,7 +786,7 @@ class TwinrRuntimeSupervisor:
                 exc_info=True,
             )
             try:
-                process.kill()
+                self._kill_child_tree(child, process)
                 process.wait(timeout=self.stop_timeout_s)
             except Exception:
                 _LOGGER.warning(
@@ -511,6 +796,7 @@ class TwinrRuntimeSupervisor:
                 )
         child.process = None
         child.clear_health_issue()
+        self._release_child_identity(child)
 
     def _restart_child(
         self,
@@ -532,6 +818,8 @@ class TwinrRuntimeSupervisor:
             },
         )
         self._stop_child(child, reason=reason)
+        self._child_next_start_at_monotonic[child.key] = -1.0
+        self._child_last_start_defer_reason[child.key] = None
         self._start_child(child, now_monotonic, reason=reason)
 
     def _maybe_restart_watchdog_for_health(
@@ -581,7 +869,7 @@ class TwinrRuntimeSupervisor:
         self._emit_payload(
             "runtime_supervisor_external_watchdog_recovery_requested",
             detail=assessment.detail,
-            watchdog_pid=assessment.watchdog_pid,
+            watchdog_pid=getattr(assessment, "watchdog_pid", None),
             sample_status=assessment.sample_status,
             snapshot_stale=assessment.snapshot_stale,
         )
@@ -591,7 +879,7 @@ class TwinrRuntimeSupervisor:
             level="warn",
             data={
                 "detail": assessment.detail,
-                "watchdog_pid": assessment.watchdog_pid,
+                "watchdog_pid": getattr(assessment, "watchdog_pid", None),
                 "sample_status": assessment.sample_status,
                 "snapshot_stale": assessment.snapshot_stale,
             },
@@ -626,6 +914,7 @@ class TwinrRuntimeSupervisor:
         *,
         now_monotonic: float,
         assessment: RequiredRemoteWatchdogAssessment,
+        snapshot: RuntimeSnapshot | None,
     ) -> None:
         if not self._streaming.is_running():
             return
@@ -633,7 +922,6 @@ class TwinrRuntimeSupervisor:
             self._streaming.clear_health_issue()
             return
 
-        snapshot = self._load_snapshot()
         if not self._streaming_startup_has_progress(snapshot):
             if self._streaming.age_s(now_monotonic) < self.streaming_startup_timeout_s:
                 self._streaming.clear_health_issue()
@@ -716,12 +1004,12 @@ class TwinrRuntimeSupervisor:
             return False
         process = self._watchdog.process
         current_pid = getattr(process, "pid", None) if process is not None else None
-        if current_pid is not None and assessment.watchdog_pid == current_pid:
+        if current_pid is not None and getattr(assessment, "watchdog_pid", None) == current_pid:
             return True
         started_at_utc = self._watchdog.started_at_utc
         if started_at_utc is None:
             return False
-        updated_at = _parse_utc_timestamp(assessment.snapshot_updated_at)
+        updated_at = _parse_utc_timestamp(getattr(assessment, "snapshot_updated_at", None))
         if updated_at is None:
             return False
         return updated_at >= started_at_utc
@@ -775,7 +1063,12 @@ class TwinrRuntimeSupervisor:
         # snapshot. Once that authoritative contract is satisfied, auxiliary
         # ops process inventories must not tear down the healthy child because
         # transient `ps`/count drift would otherwise trigger false restarts.
+        # BUGFIX: still treat an explicitly non-running conversation loop as a
+        # real speech-path outage even while the process keeps the lock.
         if self._current_streaming_child_owns_lock():
+            conversation = self._service(health, "conversation_loop")
+            if conversation is not None and not conversation.running:
+                return "conversation_loop_unhealthy"
             return None
         conversation = self._service(health, "conversation_loop")
         if conversation is None or not conversation.running or conversation.count != 1:
@@ -860,10 +1153,17 @@ class TwinrRuntimeSupervisor:
         # Prime the supervisor process first so freshly spawned children inherit
         # the detached user-session audio sockets even before their own runtime
         # bootstrap runs.
-        prime_user_session_audio_env()
+        prime_user_session_audio_env(
+            configured_runtime_dir=getattr(self.config, "display_wayland_runtime_dir", None)
+        )
         env = dict(os.environ)
         env["PYTHONPATH"] = _prepend_pythonpath(env.get("PYTHONPATH"))
         env[RUNTIME_SUPERVISOR_ENV_KEY] = "1"
+        # BREAKING: child workers no longer inherit systemd notification
+        # variables; only the top-level supervisor owns readiness/watchdog I/O.
+        env.pop(_SYSTEMD_NOTIFY_SOCKET_ENV_KEY, None)
+        env.pop(_SYSTEMD_WATCHDOG_USEC_ENV_KEY, None)
+        env.pop(_SYSTEMD_WATCHDOG_PID_ENV_KEY, None)
         return env
 
     def _append_event(
@@ -877,9 +1177,9 @@ class TwinrRuntimeSupervisor:
         try:
             self.event_store.append(
                 event=event,
-                message=message,
+                message=compact_text(message, limit=_MAX_EVENT_TEXT_LEN),
                 level=level,
-                data=data,
+                data=self._normalize_mapping(data),
             )
         except Exception:
             _LOGGER.warning(
@@ -890,8 +1190,411 @@ class TwinrRuntimeSupervisor:
             return
 
     def _emit_payload(self, event: str, **data: object) -> None:
-        payload = {"event": event, **data}
+        payload = {"event": event, **self._normalize_mapping(data)}
         self.emit(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+
+    def _normalize_mapping(self, data: dict[str, object] | None) -> dict[str, object] | None:
+        if data is None:
+            return None
+        return {str(key): self._normalize_payload_value(value) for key, value in data.items()}
+
+    def _normalize_payload_value(self, value: object) -> object:
+        if isinstance(value, str):
+            return compact_text(value, limit=_MAX_EMIT_TEXT_LEN)
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return [self._normalize_payload_value(item) for item in value]
+        if isinstance(value, list):
+            return [self._normalize_payload_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._normalize_payload_value(item) for key, item in value.items()}
+        return value
+
+    def _install_signal_handlers(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self._previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle_shutdown_signal)
+            except Exception:
+                _LOGGER.debug("Failed to install runtime supervisor signal handler for %s.", signum, exc_info=True)
+
+    def _restore_signal_handlers(self) -> None:
+        for signum, handler in self._previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except Exception:
+                _LOGGER.debug("Failed to restore runtime supervisor signal handler for %s.", signum, exc_info=True)
+        self._previous_signal_handlers.clear()
+
+    def _handle_shutdown_signal(self, signum: int, frame: object) -> None:
+        del frame
+        self._shutdown_signal = signum
+        self._terminate_requested = True
+
+    def _can_attempt_child_start(self, child: _ManagedChild, now_monotonic: float, *, reason: str) -> bool:
+        next_start_at = self._child_next_start_at_monotonic.get(child.key, -1.0)
+        if next_start_at <= 0.0 or now_monotonic >= next_start_at:
+            self._child_last_start_defer_reason[child.key] = None
+            return True
+        remaining_s = max(0.0, next_start_at - now_monotonic)
+        detail = f"Backoff active for {child.label}; retry in {remaining_s:.1f}s."
+        if self._child_last_start_defer_reason.get(child.key) != detail:
+            self._child_last_start_defer_reason[child.key] = detail
+            self._emit_payload(
+                "runtime_supervisor_child_start_deferred",
+                child=child.key,
+                reason=reason,
+                retry_in_s=round(remaining_s, 2),
+                detail=detail,
+            )
+        return False
+
+    def _note_child_failure(
+        self,
+        child: _ManagedChild,
+        *,
+        now_monotonic: float,
+        reason: str,
+    ) -> None:
+        streak = int(self._child_failure_streak.get(child.key, 0)) + 1
+        self._child_failure_streak[child.key] = streak
+        delay_s = self._restart_delay_for_streak(streak)
+        self._child_next_start_at_monotonic[child.key] = now_monotonic + delay_s
+        self._child_last_start_defer_reason[child.key] = f"{reason}:{delay_s:.1f}s"
+        self._emit_payload(
+            "runtime_supervisor_child_retry_scheduled",
+            child=child.key,
+            reason=reason,
+            failure_streak=streak,
+            retry_in_s=round(delay_s, 2),
+        )
+
+    def _maybe_reset_child_failure_streak(self, child: _ManagedChild, now_monotonic: float) -> None:
+        if not child.is_running():
+            return
+        if self._child_failure_streak.get(child.key, 0) <= 0:
+            return
+        stable_after_s = max(15.0, self.restart_backoff_s * 3.0)
+        if child.age_s(now_monotonic) < stable_after_s:
+            return
+        self._child_failure_streak[child.key] = 0
+        self._child_next_start_at_monotonic[child.key] = -1.0
+        self._child_last_start_defer_reason[child.key] = None
+        self._emit_payload(
+            "runtime_supervisor_child_retry_reset",
+            child=child.key,
+            stable_after_s=round(stable_after_s, 2),
+        )
+
+    def _restart_delay_for_streak(self, streak: int) -> float:
+        if self.restart_backoff_s <= 0.0:
+            return 0.0
+        exponent = max(0, int(streak) - 1)
+        delay_s = self.restart_backoff_s * (2 ** exponent)
+        return min(self.restart_max_backoff_s, delay_s)
+
+    def _process_factory_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        if os.name != "posix":
+            return kwargs
+        # BREAKING: when the process factory supports it, child workers are
+        # launched in isolated sessions so internal restarts can reap their
+        # whole descendant trees instead of only the direct child PID.
+        if self._process_factory_supports_kwarg("start_new_session"):
+            kwargs["start_new_session"] = True
+        return kwargs
+
+    def _process_factory_supports_kwarg(self, name: str) -> bool:
+        try:
+            signature = inspect.signature(self.process_factory)
+        except (TypeError, ValueError):
+            return self.process_factory is _default_process_factory
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+        return name in signature.parameters
+
+    @staticmethod
+    def _kwargs_typeerror_is_unsupported_kwarg(exc: TypeError) -> bool:
+        message = str(exc)
+        return "unexpected keyword argument" in message or "got an unexpected keyword argument" in message
+
+    def _capture_child_identity(self, child: _ManagedChild, process: ProcessHandle) -> None:
+        pid = getattr(process, "pid", None)
+        if pid is None or pid <= 0:
+            self._release_child_identity(child)
+            return
+        self._release_child_identity(child)
+        self._child_pidfds[child.key] = self._pidfd_open(pid)
+        self._child_start_ticks[child.key] = self._pid_start_ticks(pid)
+        self._capture_process_group_metadata(child.key, pid)
+
+    def _capture_process_group_metadata(self, child_key: str, pid: int) -> None:
+        pgid: int | None = None
+        isolated = False
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(pid)
+            except Exception:
+                pgid = None
+            if pgid is not None:
+                try:
+                    isolated = pgid == pid and pgid != os.getpgrp()
+                except Exception:
+                    isolated = pgid == pid
+        self._child_process_group_ids[child_key] = pgid
+        self._child_isolated_process_group[child_key] = isolated
+
+    def _release_child_identity(self, child: _ManagedChild) -> None:
+        pidfd = self._child_pidfds.get(child.key)
+        if pidfd is not None:
+            try:
+                os.close(pidfd)
+            except Exception:
+                _LOGGER.debug("Failed to close pidfd for child %s.", child.key, exc_info=True)
+        self._child_pidfds[child.key] = None
+        self._child_start_ticks[child.key] = None
+        self._child_process_group_ids[child.key] = None
+        self._child_isolated_process_group[child.key] = False
+
+    def _terminate_child_tree(self, child: _ManagedChild, process: ProcessHandle) -> None:
+        if self._can_signal_child_process_group(child, process):
+            os.killpg(self._child_process_group_ids[child.key] or 0, signal.SIGTERM)
+            return
+        process.terminate()
+
+    def _kill_child_tree(self, child: _ManagedChild, process: ProcessHandle) -> None:
+        if self._can_signal_child_process_group(child, process):
+            os.killpg(self._child_process_group_ids[child.key] or 0, signal.SIGKILL)
+            return
+        process.kill()
+
+    def _can_signal_child_process_group(self, child: _ManagedChild, process: ProcessHandle) -> bool:
+        if os.name != "posix":
+            return False
+        pid = getattr(process, "pid", None)
+        if pid is None or pid <= 0:
+            return False
+        if not self._child_isolated_process_group.get(child.key, False):
+            return False
+        pgid = self._child_process_group_ids.get(child.key)
+        if pgid is None or pgid <= 0 or pgid != pid:
+            return False
+        return self._pid_identity_matches(
+            pid,
+            pidfd=self._child_pidfds.get(child.key),
+            start_ticks=self._child_start_ticks.get(child.key),
+        )
+
+    @staticmethod
+    def _extract_cli_option_value(argv: tuple[str, ...], option: str) -> str | None:
+        for index, token in enumerate(argv):
+            if token == option and index + 1 < len(argv):
+                return argv[index + 1]
+            if token.startswith(option + "="):
+                return token.split("=", 1)[1]
+        return None
+
+    def _pid_cwd(self, pid: int) -> Path | None:
+        try:
+            return Path(os.readlink(f"/proc/{pid}/cwd")).expanduser().resolve()
+        except Exception:
+            return None
+
+    def _pid_start_ticks(self, pid: int) -> int | None:
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        end = raw.rfind(")")
+        if end < 0:
+            return None
+        fields = raw[end + 2 :].split()
+        if len(fields) <= 19:
+            return None
+        try:
+            return int(fields[19])
+        except Exception:
+            return None
+
+    def _pidfd_open(self, pid: int) -> int | None:
+        pidfd_open = getattr(os, "pidfd_open", None)
+        if pidfd_open is None or pid <= 0:
+            return None
+        flags = getattr(os, "PIDFD_NONBLOCK", 0)
+        try:
+            return int(pidfd_open(pid, flags))
+        except TypeError:
+            try:
+                return int(pidfd_open(pid))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _pidfd_is_running(self, pidfd: int) -> bool:
+        try:
+            readable, _, _ = select.select([pidfd], [], [], 0.0)
+        except Exception:
+            return False
+        return not bool(readable)
+
+    def _pid_identity_matches(
+        self,
+        pid: int,
+        *,
+        pidfd: int | None,
+        start_ticks: int | None,
+    ) -> bool:
+        if pid <= 0:
+            return False
+        if pidfd is not None and not self._pidfd_is_running(pidfd):
+            return False
+        if start_ticks is not None:
+            current_start_ticks = self._pid_start_ticks(pid)
+            if current_start_ticks is None or current_start_ticks != start_ticks:
+                return False
+            return True
+        return self.pid_alive(pid)
+
+    def _send_signal_to_exact_pid(self, *, pid: int, sig: int, pidfd: int | None) -> None:
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if pidfd is not None and pidfd_send_signal is not None:
+            pidfd_send_signal(pidfd, sig)
+            return
+        self.pid_signal(pid, sig)
+
+    def _resolve_systemd_watchdog_interval_s(self) -> float | None:
+        notify_socket = str(os.environ.get(_SYSTEMD_NOTIFY_SOCKET_ENV_KEY, "") or "").strip()
+        if not notify_socket:
+            return None
+        watchdog_usec_raw = str(os.environ.get(_SYSTEMD_WATCHDOG_USEC_ENV_KEY, "") or "").strip()
+        if not watchdog_usec_raw:
+            return None
+        watchdog_pid_raw = str(os.environ.get(_SYSTEMD_WATCHDOG_PID_ENV_KEY, "") or "").strip()
+        if watchdog_pid_raw:
+            try:
+                watchdog_pid = int(watchdog_pid_raw)
+            except Exception:
+                return None
+            if watchdog_pid not in (0, os.getpid()):
+                return None
+        try:
+            watchdog_usec = int(watchdog_usec_raw)
+        except Exception:
+            return None
+        if watchdog_usec <= 0:
+            return None
+        return max(1.0, watchdog_usec / 1_000_000.0 / 2.0)
+
+    def _notify_systemd(self, *assignments: str) -> None:
+        notify_socket = str(os.environ.get(_SYSTEMD_NOTIFY_SOCKET_ENV_KEY, "") or "").strip()
+        if not notify_socket:
+            return
+        state = "\n".join(part for part in assignments if part).strip()
+        if not state:
+            return
+        address = ("\0" + notify_socket[1:]) if notify_socket.startswith("@") else notify_socket
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(state.encode("utf-8", errors="replace"), address)
+        except Exception as exc:
+            self._emit_payload(
+                "runtime_supervisor_systemd_notify_failed",
+                detail=compact_text(f"{type(exc).__name__}: {exc}", limit=180),
+            )
+
+    def _maybe_notify_systemd_state(
+        self,
+        *,
+        now_monotonic: float,
+        assessment: RequiredRemoteWatchdogAssessment | None,
+        snapshot: RuntimeSnapshot | None,
+    ) -> None:
+        status = self._systemd_status_text(now_monotonic=now_monotonic, assessment=assessment, snapshot=snapshot)
+        should_emit_status = (
+            status != self._last_systemd_status
+            or self._last_systemd_status_at_monotonic < 0.0
+            or (now_monotonic - self._last_systemd_status_at_monotonic) >= _DEFAULT_STATUS_EMIT_INTERVAL_S
+        )
+        assignments: list[str] = []
+        ready = self._systemd_should_report_ready(snapshot)
+        if ready and not self._systemd_ready:
+            self._systemd_ready = True
+            assignments.append("READY=1")
+        if status and should_emit_status:
+            assignments.append(f"STATUS={status}")
+        if ready and not self._systemd_restart_counter_reset:
+            assignments.append("RESTART_RESET=1")
+            self._systemd_restart_counter_reset = True
+        if ready and self._systemd_watchdog_interval_s is not None:
+            if (
+                self._last_systemd_watchdog_ping_at_monotonic < 0.0
+                or (now_monotonic - self._last_systemd_watchdog_ping_at_monotonic) >= self._systemd_watchdog_interval_s
+            ):
+                assignments.append("WATCHDOG=1")
+                self._last_systemd_watchdog_ping_at_monotonic = now_monotonic
+        if not assignments:
+            return
+        self._notify_systemd(*assignments)
+        if status and should_emit_status:
+            self._last_systemd_status = status
+            self._last_systemd_status_at_monotonic = now_monotonic
+
+    def _systemd_should_report_ready(self, snapshot: RuntimeSnapshot | None) -> bool:
+        if not self._streaming.is_running():
+            return False
+        if not self._current_streaming_child_owns_lock():
+            return False
+        return self._streaming_snapshot_has_progress(snapshot)
+
+    def _systemd_status_text(
+        self,
+        *,
+        now_monotonic: float,
+        assessment: RequiredRemoteWatchdogAssessment | None,
+        snapshot: RuntimeSnapshot | None,
+    ) -> str:
+        if self._terminate_requested:
+            return "Stopping Twinr runtime supervisor."
+        if not self._streaming.is_running():
+            retry_in_s = self._child_start_retry_remaining_s(self._streaming, now_monotonic)
+            if retry_in_s is not None:
+                return compact_text(
+                    f"Streaming loop restarting after failure; next retry in {retry_in_s:.1f}s.",
+                    limit=_MAX_SYSTEMD_STATUS_LEN,
+                )
+            if self._last_streaming_gate_reason:
+                return compact_text(
+                    f"Starting; streaming gate blocked: {self._last_streaming_gate_reason}",
+                    limit=_MAX_SYSTEMD_STATUS_LEN,
+                )
+            return "Starting; waiting for streaming loop."
+        if not self._current_streaming_child_owns_lock():
+            return "Streaming loop launched; waiting for runtime lock."
+        if not self._streaming_snapshot_has_progress(snapshot):
+            return "Streaming loop owns runtime lock; waiting for fresh runtime snapshot."
+        if assessment is None:
+            return "Running; watchdog status unknown."
+        if assessment.ready:
+            return "Running; streaming loop healthy and remote-memory watchdog ready."
+        detail = compact_text(
+            assessment.detail or "remote memory watchdog degraded",
+            limit=100,
+        )
+        return compact_text(
+            f"Running in degraded mode; {detail}",
+            limit=_MAX_SYSTEMD_STATUS_LEN,
+        )
+
+    def _child_start_retry_remaining_s(self, child: _ManagedChild, now_monotonic: float) -> float | None:
+        next_start_at = self._child_next_start_at_monotonic.get(child.key, -1.0)
+        if next_start_at <= 0.0 or now_monotonic >= next_start_at:
+            return None
+        return max(0.0, next_start_at - now_monotonic)
 
 
 __all__ = ["RUNTIME_SUPERVISOR_ENV_KEY", "TwinrRuntimeSupervisor"]

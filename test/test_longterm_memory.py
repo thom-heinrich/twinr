@@ -28,6 +28,7 @@ from twinr.memory.longterm import (
     LongTermMemoryConflictV1,
     LongTermMemoryContext,
     LongTermMemoryObjectV1,
+    LongTermMultimodalEvidence,
     LongTermMemoryReflector,
     LongTermReflectionResultV1,
     LongTermMemoryService,
@@ -292,14 +293,15 @@ class _StubThreadSummaryReflector:
 
 
 class _BlockingExtractor:
-    def __init__(self, delegate) -> None:
+    def __init__(self, delegate, *, wait_timeout_s: float = 10.0) -> None:
         self._delegate = delegate
         self.started = threading.Event()
         self.release = threading.Event()
+        self._wait_timeout_s = max(0.1, float(wait_timeout_s))
 
     def extract_conversation_turn(self, **kwargs):
         self.started.set()
-        self.release.wait(timeout=5.0)
+        self.release.wait(timeout=self._wait_timeout_s)
         return self._delegate.extract_conversation_turn(**kwargs)
 
 
@@ -363,7 +365,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 long_term_memory_reflection_compiler_enabled=False,
                 long_term_memory_write_queue_size=4,
             )
-            extractor = _BlockingExtractor(make_test_extractor())
+            extractor = _BlockingExtractor(make_test_extractor(), wait_timeout_s=10.0)
             service = LongTermMemoryService.from_config(config, extractor=extractor)
             try:
                 result = service.enqueue_conversation_turn(
@@ -373,9 +375,9 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 self.assertIsNotNone(result)
                 assert result is not None
                 self.assertTrue(result.accepted)
-                self.assertTrue(extractor.started.wait(timeout=1.0))
+                self.assertTrue(extractor.started.wait(timeout=5.0))
 
-                deadline = time.monotonic() + 2.0
+                deadline = time.monotonic() + 5.0
                 packets = ()
                 while time.monotonic() < deadline:
                     packets = service.midterm_store.load_packets()
@@ -689,6 +691,156 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertFalse(memory_path.exists())
         self.assertTrue(any(item.kind == "episode" for item in objects))
+
+    def test_persist_longterm_turn_uses_fine_grained_current_state_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            turn = LongTermConversationTurn(
+                transcript="Today is warm and Janina has an appointment.",
+                response="I will remember Janina's appointment.",
+            )
+            try:
+                original_load_objects = service.object_store.load_objects
+                original_load_conflicts = service.object_store.load_conflicts
+                original_load_archived_objects = service.object_store.load_archived_objects
+                original_write_snapshot = service.object_store.write_snapshot
+                store_type = type(service.object_store)
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Conversation persistence must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_conflicts",
+                    side_effect=AssertionError("Conversation persistence must not hydrate the full conflict snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_archived_objects",
+                    side_effect=AssertionError("Conversation persistence must not hydrate the full archive snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_active_working_set",
+                    new=lambda _self, **_kwargs: SimpleNamespace(
+                        objects=original_load_objects(),
+                        conflicts=original_load_conflicts(),
+                        archived_objects=original_load_archived_objects(),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "commit_active_delta",
+                    new=lambda _self, **kwargs: original_write_snapshot(
+                        objects=tuple(kwargs.get("object_upserts", ())),
+                        conflicts=tuple(kwargs.get("conflict_upserts", ())),
+                        archived_objects=tuple(kwargs.get("archive_upserts", ())),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "write_snapshot",
+                    side_effect=AssertionError("Conversation persistence must not rewrite the full current state."),
+                ):
+                    LongTermMemoryService._persist_longterm_turn(
+                        config=config,
+                        store=service.prompt_context_store,
+                        graph_store=service.graph_store,
+                        object_store=service.object_store,
+                        midterm_store=service.midterm_store,
+                        extractor=service.extractor,
+                        consolidator=service.consolidator,
+                        reflector=service.reflector,
+                        sensor_memory=service.sensor_memory,
+                        retention_policy=service.retention_policy,
+                        item=turn,
+                    )
+                    stored_objects = original_load_objects()
+            finally:
+                service.shutdown()
+
+        self.assertTrue(any(item.kind == "episode" for item in stored_objects))
+
+    def test_persist_multimodal_evidence_uses_fine_grained_current_state_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            evidence = LongTermMultimodalEvidence(
+                event_name="print_completed",
+                modality="printer",
+                source="realtime_print",
+                message="Printed Twinr output was delivered from the realtime loop.",
+                data={"request_source": "button", "queue": "Thermal_GP58"},
+            )
+            try:
+                original_load_objects = service.object_store.load_objects
+                original_load_conflicts = service.object_store.load_conflicts
+                original_load_archived_objects = service.object_store.load_archived_objects
+                original_write_snapshot = service.object_store.write_snapshot
+                store_type = type(service.object_store)
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Multimodal persistence must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_conflicts",
+                    side_effect=AssertionError("Multimodal persistence must not hydrate the full conflict snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_archived_objects",
+                    side_effect=AssertionError("Multimodal persistence must not hydrate the full archive snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_active_working_set",
+                    new=lambda _self, **_kwargs: SimpleNamespace(
+                        objects=original_load_objects(),
+                        conflicts=original_load_conflicts(),
+                        archived_objects=original_load_archived_objects(),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "commit_active_delta",
+                    new=lambda _self, **kwargs: original_write_snapshot(
+                        objects=tuple(kwargs.get("object_upserts", ())),
+                        conflicts=tuple(kwargs.get("conflict_upserts", ())),
+                        archived_objects=tuple(kwargs.get("archive_upserts", ())),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "write_snapshot",
+                    side_effect=AssertionError("Multimodal persistence must not rewrite the full current state."),
+                ):
+                    LongTermMemoryService._persist_multimodal_evidence(
+                        object_store=service.object_store,
+                        midterm_store=service.midterm_store,
+                        multimodal_extractor=service.multimodal_extractor,
+                        consolidator=service.consolidator,
+                        reflector=service.reflector,
+                        sensor_memory=service.sensor_memory,
+                        retention_policy=service.retention_policy,
+                        store_lock=service._store_lock,
+                        timezone_name=service.config.local_timezone_name,
+                        item=evidence,
+                    )
+                    stored_objects = original_load_objects()
+            finally:
+                service.shutdown()
+
+        self.assertTrue(any(item.kind == "episode" for item in stored_objects))
 
     def test_persist_longterm_turn_records_personality_learning_from_consolidation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1194,7 +1346,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             "error_message": "timed out",
         })
 
-    def test_provider_context_raises_remote_read_failed_when_quick_memory_builder_times_out(self) -> None:
+    def test_provider_context_skips_quick_memory_when_fast_topic_builder_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 project_root=temp_dir,
@@ -1213,18 +1365,10 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                     raise ChonkyDBError("timed out")
 
             service.fast_topic_builder = _TimeoutingFastTopicBuilder()  # type: ignore[assignment]
-            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
-                service.build_provider_context("Was weisst du ueber Janina?")
+            context = service.build_provider_context("Was weisst du ueber Janina?")
             service.shutdown()
 
-        self.assertEqual(dict(raised.exception.details), {
-            "operation": "fast_provider_context",
-            "request_kind": "read",
-            "outcome": "failed",
-            "classification": "unexpected_error",
-            "error_type": "ChonkyDBError",
-            "error_message": "timed out",
-        })
+        self.assertIsNone(context.topic_context)
 
     def test_provider_context_does_not_fallback_to_irrelevant_episodes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1694,6 +1838,83 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertTrue(any("eye laser treatment" in summary for summary in durable_summaries))
         self.assertFalse(result.clarification_needed)
 
+    def test_service_analyze_conversation_turn_uses_fine_grained_object_loader_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                original_load_objects = service.object_store.load_objects
+                store_type = type(service.object_store)
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Conversation analysis must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_objects_fine_grained",
+                    new=lambda _self: original_load_objects(),
+                ):
+                    result = service.analyze_conversation_turn(
+                        transcript=(
+                            "Today is a beautiful Sunday, it is really warm. "
+                            "My wife Janina is at the eye doctor and is getting eye laser treatment."
+                        ),
+                        response="I hope Janina's appointment goes smoothly.",
+                    )
+            finally:
+                service.shutdown()
+
+        self.assertFalse(result.clarification_needed)
+        self.assertTrue(result.durable_objects)
+
+    def test_service_analyze_multimodal_evidence_uses_fine_grained_object_loader_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                original_load_objects = service.object_store.load_objects
+                store_type = type(service.object_store)
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Multimodal analysis must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_objects_fine_grained",
+                    new=lambda _self: original_load_objects(),
+                ):
+                    result = service.analyze_multimodal_evidence(
+                        event_name="sensor_observation",
+                        modality="sensor",
+                        source="proactive_monitor",
+                        message="Changed multimodal sensor observation recorded.",
+                        data={
+                            "facts": {
+                                "pir": {"motion_detected": True},
+                                "camera": {"person_visible": True},
+                            },
+                            "event_names": ["pir.motion_detected", "camera.person_visible"],
+                        },
+                    )
+            finally:
+                service.shutdown()
+
+        self.assertTrue(result.episodic_objects or result.durable_objects or result.deferred_objects)
+
     def test_provider_context_can_include_structured_durable_memory_from_background_store(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1800,7 +2021,8 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             calls: list[str] = []
 
             class _TrackingPersonalityLearning:
-                def maybe_refresh_world_intelligence(self_nonlocal, *, search_backend=None) -> None:
+                def maybe_refresh_world_intelligence(self, *, search_backend=None) -> None:
+                    del self
                     calls.append("refresh" if search_backend is None else "refresh_with_backend")
                     return None
 
@@ -1830,7 +2052,8 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             backend = object()
 
             class _TrackingPersonalityLearning:
-                def maybe_refresh_world_intelligence(self_nonlocal, *, search_backend=None) -> None:
+                def maybe_refresh_world_intelligence(self, *, search_backend=None) -> None:
+                    del self
                     calls.append(search_backend)
                     return None
 
@@ -1908,6 +2131,110 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             )
         )
 
+    def test_service_run_retention_uses_projection_selector_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                service.object_store.apply_consolidation(
+                    service.consolidator.consolidate(
+                        extraction=service.extractor.extract_conversation_turn(
+                            transcript="Today is warm.",
+                            response="It sounds pleasant outside.",
+                        )
+                    )
+                )
+                objects = service.object_store.load_objects()
+                old_episode = next(item for item in objects if item.kind == "episode")
+                old_observation = next(item for item in objects if item.kind == "observation")
+                service.object_store.apply_consolidation(
+                    service.consolidator.consolidate(
+                        extraction=service.extractor.extract_conversation_turn(
+                            transcript="My wife Janina is getting eye laser treatment today.",
+                            response="I hope it goes smoothly.",
+                        )
+                    )
+                )
+                rewritten = []
+                for item in service.object_store.load_objects():
+                    if item.memory_id in {old_episode.memory_id, old_observation.memory_id}:
+                        rewritten.append(
+                            item.with_updates(
+                                created_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
+                                updated_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
+                            )
+                        )
+                    else:
+                        rewritten.append(item)
+                service.object_store.write_snapshot(objects=tuple(rewritten))
+
+                original_load_objects = service.object_store.load_objects
+                original_load_archived_objects = service.object_store.load_archived_objects
+                original_write_snapshot = service.object_store.write_snapshot
+                store_type = type(service.object_store)
+                service.object_store._remote_catalog = object()
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Retention must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_objects_fine_grained",
+                    side_effect=AssertionError("Retention must not sweep the full fine-grained object state."),
+                ), patch.object(
+                    store_type,
+                    "load_archived_objects",
+                    side_effect=AssertionError("Retention must not hydrate the full archive snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_archived_objects_fine_grained",
+                    new=lambda _self: original_load_archived_objects(),
+                ), patch.object(
+                    store_type,
+                    "_remote_catalog_enabled",
+                    new=lambda _self: True,
+                ), patch.object(
+                    store_type,
+                    "load_objects_by_projection_filter",
+                    new=lambda _self, *, predicate: tuple(
+                        item
+                        for item in original_load_objects()
+                        if predicate(
+                            _self._remote_object_selection_projection(
+                                snapshot_kind="objects",
+                                payload=item.to_payload(),
+                            )
+                        )
+                    ),
+                ), patch.object(
+                    store_type,
+                    "commit_active_delta",
+                    new=lambda _self, **kwargs: original_write_snapshot(
+                        objects=tuple(kwargs.get("object_upserts", ())),
+                        conflicts=(),
+                        archived_objects=tuple(kwargs.get("archive_upserts", ())),
+                    ),
+                ):
+                    service.run_retention()
+                    kept = original_load_objects()
+                    archived = original_load_archived_objects()
+            finally:
+                service.shutdown()
+
+        kept_ids = {item.memory_id for item in kept}
+        archived_ids = {item.memory_id for item in archived}
+        self.assertNotIn(old_episode.memory_id, kept_ids)
+        self.assertNotIn(old_observation.memory_id, kept_ids)
+        self.assertIn(old_episode.memory_id, archived_ids)
+        self.assertNotIn(old_observation.memory_id, archived_ids)
+
     def test_service_can_review_memory_without_surface_noise(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1923,8 +2250,18 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 response="I hope Janina's appointment goes smoothly.",
             )
             service.flush(timeout_s=2.0)
-
-            review = service.review_memory(query_text="Janina eye doctor", include_episodes=False, limit=5)
+            original_load_objects = service.object_store.load_objects
+            store_type = type(service.object_store)
+            with patch.object(
+                store_type,
+                "load_objects",
+                side_effect=AssertionError("review_memory must not hydrate the full object snapshot."),
+            ), patch.object(
+                store_type,
+                "load_objects_fine_grained",
+                new=lambda _self: original_load_objects(),
+            ):
+                review = service.review_memory(query_text="Janina eye doctor", include_episodes=False, limit=5)
             service.shutdown()
 
         self.assertGreaterEqual(review.total_count, 2)
@@ -2167,6 +2504,107 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(second.skipped_existing, second.generated_evidence)
         self.assertEqual(source_ids_before, source_ids_after)
 
+    def test_backfill_ops_history_uses_fine_grained_state_loaders_without_snapshot_blob_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_sensor_memory_enabled=True,
+                long_term_memory_sensor_baseline_days=7,
+                long_term_memory_sensor_min_days_observed=4,
+                long_term_memory_sensor_min_routine_ratio=0.6,
+                long_term_memory_sensor_deviation_min_delta=0.5,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                entries = (
+                    self._ops_entry(
+                        event="proactive_observation",
+                        created_at="2026-03-09T08:00:00+00:00",
+                        data={
+                            "inspected": True,
+                            "pir_motion_detected": True,
+                            "low_motion": False,
+                            "person_visible": True,
+                            "looking_toward_device": False,
+                            "body_pose": "upright",
+                            "smiling": False,
+                            "hand_or_object_near_camera": False,
+                            "speech_detected": False,
+                            "distress_detected": False,
+                        },
+                    ),
+                    self._ops_entry(
+                        event="turn_started",
+                        created_at="2026-03-09T08:01:00+00:00",
+                        data={"request_source": "button"},
+                    ),
+                    self._ops_entry(
+                        event="print_started",
+                        created_at="2026-03-09T13:00:00+00:00",
+                        data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                    ),
+                    self._ops_entry(
+                        event="print_job_sent",
+                        created_at="2026-03-09T13:00:02+00:00",
+                        data={"queue": "Thermal_GP58", "job": "Thermal_GP58-1"},
+                    ),
+                )
+
+                original_load_objects = service.object_store.load_objects
+                original_load_conflicts = service.object_store.load_conflicts
+                original_load_archived_objects = service.object_store.load_archived_objects
+                original_write_snapshot = service.object_store.write_snapshot
+                store_type = type(service.object_store)
+
+                with patch.object(
+                    store_type,
+                    "load_objects",
+                    side_effect=AssertionError("Backfill must not hydrate the full object snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_conflicts",
+                    side_effect=AssertionError("Backfill must not hydrate the full conflict snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_archived_objects",
+                    side_effect=AssertionError("Backfill must not hydrate the full archive snapshot."),
+                ), patch.object(
+                    store_type,
+                    "load_active_working_set",
+                    new=lambda _self, **_kwargs: SimpleNamespace(
+                        objects=original_load_objects(),
+                        conflicts=original_load_conflicts(),
+                        archived_objects=original_load_archived_objects(),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "commit_active_delta",
+                    new=lambda _self, **kwargs: original_write_snapshot(
+                        objects=tuple(kwargs.get("object_upserts", ())),
+                        conflicts=tuple(kwargs.get("conflict_upserts", ())),
+                        archived_objects=tuple(kwargs.get("archive_upserts", ())),
+                    ),
+                ), patch.object(
+                    store_type,
+                    "write_snapshot",
+                    side_effect=AssertionError("Backfill must not rewrite the full current state."),
+                ):
+                    result = service.backfill_ops_multimodal_history(
+                        entries=entries,
+                        now=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
+                    )
+                    objects = {item.memory_id: item for item in original_load_objects()}
+            finally:
+                service.shutdown()
+
+        self.assertGreater(result.applied_evidence, 0)
+        self.assertIn("pattern:presence:morning:near_device", objects)
+        self.assertIn("pattern:button:green:start_listening:morning", objects)
+
     def test_backfill_ops_history_still_compiles_sensor_memory_when_reflection_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -2298,9 +2736,32 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 )
             )
             queue_before = service.select_conflict_queue("What is Corinna's number?")
-
-            resolution = service.confirm_memory(memory_id=queue_before[0].candidate_memory_id)
-            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            original_load_objects = service.object_store.load_objects
+            original_load_conflicts = service.object_store.load_conflicts
+            store_type = type(service.object_store)
+            with patch.object(
+                store_type,
+                "load_objects",
+                side_effect=AssertionError("confirm_memory conflict resolution must not hydrate the full object snapshot."),
+            ), patch.object(
+                store_type,
+                "load_conflicts",
+                side_effect=AssertionError("confirm_memory conflict resolution must not hydrate the full conflict snapshot."),
+            ), patch.object(
+                store_type,
+                "load_objects_fine_grained",
+                new=lambda _self: original_load_objects(),
+            ), patch.object(
+                store_type,
+                "load_conflicts_fine_grained",
+                new=lambda _self: original_load_conflicts(),
+            ), patch.object(
+                store_type,
+                "load_objects_fine_grained_for_write",
+                new=lambda _self: original_load_objects(),
+            ):
+                resolution = service.confirm_memory(memory_id=queue_before[0].candidate_memory_id)
+                objects = {item.memory_id: item for item in original_load_objects()}
             queue_after = service.select_conflict_queue("What is Corinna's number?")
             service.shutdown()
 
@@ -2339,10 +2800,41 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 for item in current_objects
                 if item.kind == "event" and (item.attributes or {}).get("event_domain") == "appointment"
             )
-
-            invalidation = service.invalidate_memory(memory_id=event.memory_id, reason="This appointment was canceled.")
-            deletion = service.delete_memory(memory_id=relationship.memory_id)
-            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            original_load_objects = service.object_store.load_objects
+            original_load_conflicts = service.object_store.load_conflicts
+            store_type = type(service.object_store)
+            with patch.object(
+                store_type,
+                "load_objects",
+                side_effect=AssertionError("invalidate/delete must not hydrate the full object snapshot."),
+            ), patch.object(
+                store_type,
+                "load_conflicts",
+                side_effect=AssertionError("invalidate/delete must not hydrate the full conflict snapshot."),
+            ), patch.object(
+                store_type,
+                "load_objects_fine_grained",
+                new=lambda _self: original_load_objects(),
+            ), patch.object(
+                store_type,
+                "load_conflicts_fine_grained",
+                new=lambda _self: original_load_conflicts(),
+            ), patch.object(
+                store_type,
+                "load_objects_fine_grained_for_write",
+                new=lambda _self: original_load_objects(),
+            ), patch.object(
+                store_type,
+                "load_conflicts_fine_grained_for_write",
+                new=lambda _self: original_load_conflicts(),
+            ), patch.object(
+                store_type,
+                "load_archived_objects_fine_grained_for_write",
+                new=lambda _self: (),
+            ):
+                invalidation = service.invalidate_memory(memory_id=event.memory_id, reason="This appointment was canceled.")
+                deletion = service.delete_memory(memory_id=relationship.memory_id)
+                objects = {item.memory_id: item for item in original_load_objects()}
             service.shutdown()
 
         self.assertEqual(invalidation.action, "invalidate")

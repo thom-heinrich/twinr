@@ -26,6 +26,8 @@ from twinr.memory.user_discovery import (
     UserDiscoveryStoredFact,
     UserDiscoveryTopicState,
 )
+from twinr.memory.user_discovery_authoritative_profile import UserDiscoveryAuthoritativeProfileReader
+from twinr.memory.user_discovery_impl.store import UserDiscoveryStateStore
 from twinr.proactive.runtime.display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
 
 
@@ -47,6 +49,67 @@ def _active_preference_object(
 
 
 class UserDiscoveryTests(unittest.TestCase):
+    def test_authoritative_profile_reader_uses_targeted_object_queries_before_graph_blob_reads(self) -> None:
+        basics_object = _active_preference_object(
+            memory_id="fact:user:main:prefers_name:thom",
+            summary="The user wants to be called Thom.",
+            attributes={
+                "subject_ref": "user:main",
+                "predicate": "prefers_name",
+                "preference_type": "name",
+                "preference_value": "Thom",
+            },
+        )
+        style_object = _active_preference_object(
+            memory_id="pref:initiative:gentle",
+            summary="The user likes gentle initiative in follow-ups.",
+            attributes={
+                "subject_ref": "user:main",
+                "predicate": "user_prefers_small_follow_up_when_helpful",
+                "preference_type": "initiative",
+                "preference_value": "gently_proactive",
+            },
+        )
+
+        class QueryOnlyObjectStore:
+            def __init__(self) -> None:
+                self.queries: list[tuple[str | None, int]] = []
+
+            def select_fast_topic_objects(
+                self,
+                *,
+                query_text: str | None,
+                limit: int = 4,
+            ) -> tuple[LongTermMemoryObjectV1, ...]:
+                self.queries.append((query_text, limit))
+                normalized_query = str(query_text or "")
+                if "preference_type name" in normalized_query and "prefers_name" in normalized_query:
+                    return (basics_object,)
+                if "preference_type initiative" in normalized_query:
+                    return (style_object,)
+                return ()
+
+            def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+                raise AssertionError("Full structured object snapshot loads are forbidden here.")
+
+        class NoBlobGraphStore:
+            def load_document(self) -> None:
+                raise AssertionError("Graph blob loads should stay lazy when targeted object queries already cover the topics.")
+
+        object_store = QueryOnlyObjectStore()
+        reader = UserDiscoveryAuthoritativeProfileReader(
+            graph_store=NoBlobGraphStore(),
+            object_store=object_store,
+        )
+
+        coverage = reader.load()
+
+        self.assertTrue(coverage.covers("basics"))
+        self.assertTrue(coverage.covers("companion_style"))
+        self.assertEqual(len(object_store.queries), 2)
+        self.assertTrue(any("preference_type name" in str(query) for query, _limit in object_store.queries))
+        self.assertTrue(any("preference_type initiative" in str(query) for query, _limit in object_store.queries))
+
     def test_runtime_user_discovery_commits_high_value_user_profile_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             personality_dir = Path(temp_dir) / "personality"
@@ -85,6 +148,18 @@ class UserDiscoveryTests(unittest.TestCase):
         self.assertIn("user_discovery_basics: User prefers to be called Thom.", user_text)
         self.assertEqual(discovery_state["active_topic_id"], "companion_style")
         self.assertEqual(discovery_state["phase"], "initial_setup")
+
+    def test_state_store_save_writes_cross_service_readable_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state" / "user_discovery.json"
+            store = UserDiscoveryStateStore(path=path)
+
+            store.save(UserDiscoveryState.empty())
+            store.save(UserDiscoveryState.empty())
+
+            mode = path.stat().st_mode & 0o777
+
+        self.assertEqual(mode, 0o644)
 
     def test_handler_can_store_personality_learning_and_emit_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

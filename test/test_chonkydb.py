@@ -10,16 +10,18 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
-from twinr.memory.chonkydb import (
-    ChonkyDBBulkRecordRequest,
+from twinr.memory.chonkydb.client import (
     ChonkyDBClient,
     ChonkyDBConnectionConfig,
     ChonkyDBError,
+    chonkydb_data_path,
+)
+from twinr.memory.chonkydb.models import (
+    ChonkyDBBulkRecordRequest,
     ChonkyDBRecordItem,
     ChonkyDBRecordRequest,
     ChonkyDBRetrieveRequest,
     ChonkyDBTopKRecordsRequest,
-    chonkydb_data_path,
 )
 from twinr.memory.chonkydb.client import _PooledTransport
 
@@ -46,13 +48,19 @@ class FakeOpener:
     def queue_json(self, payload: dict[str, object]) -> None:
         self.responses.append(FakeHTTPResponse(payload))
 
-    def queue_http_error(self, status_code: int, payload: dict[str, object]) -> None:
+    def queue_http_error(
+        self,
+        status_code: int,
+        payload: dict[str, object],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.responses.append(
             HTTPError(
                 url="https://memory.test/fail",
                 code=status_code,
                 msg="bad request",
-                hdrs=None,
+                hdrs=headers,
                 fp=BytesIO(json.dumps(payload).encode("utf-8")),
             )
         )
@@ -365,6 +373,29 @@ class ChonkyDBClientTests(unittest.TestCase):
         error = exc_info.exception
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.response_json, {"type": "validation_error", "detail": "bad request"})
+
+    def test_http_errors_preserve_retry_after_header(self) -> None:
+        opener = FakeOpener()
+        opener.queue_http_error(
+            429,
+            {
+                "type": "about:blank",
+                "detail": "queue_saturated",
+            },
+            headers={"Retry-After": "7"},
+        )
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test"),
+            opener=opener,
+        )
+
+        with self.assertRaises(ChonkyDBError) as exc_info:
+            client.store_records_bulk({"items": []})
+
+        error = exc_info.exception
+        self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.response_headers, {"Retry-After": "7"})
+        self.assertEqual(error.retry_after_seconds(), 7.0)
 
     def test_pooled_transport_reuses_connections_and_disables_redirects(self) -> None:
         pool_response = FakePoolResponse(

@@ -19,9 +19,11 @@ def _authoritative_observation(
     token: int | None,
     gesture: SocialFineHandGesture,
     confidence: float,
+    resolved_source: str | None = "live_stream",
+    hand_or_object_near_camera: bool = True,
 ) -> SocialVisionObservation:
     return SocialVisionObservation(
-        hand_or_object_near_camera=True,
+        hand_or_object_near_camera=hand_or_object_near_camera,
         fine_hand_gesture=gesture,
         fine_hand_gesture_confidence=confidence,
         perception_stream=PerceptionStreamObservation(
@@ -30,6 +32,8 @@ def _authoritative_observation(
                 activation_key=None if token is None else f"fine:{gesture.value}",
                 activation_token=token,
                 activation_rising=token is not None,
+                hand_or_object_near_camera=hand_or_object_near_camera,
+                resolved_source=resolved_source,
             )
         ),
     )
@@ -138,6 +142,42 @@ class GestureWakeupLaneTests(unittest.TestCase):
 
         self.assertFalse(decision.active)
         self.assertEqual(decision.reason, "gesture_wakeup_disabled")
+
+    def test_lane_rejects_trigger_without_current_hand_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureWakeupLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=_authoritative_observation(
+                    token=4,
+                    gesture=SocialFineHandGesture.PEACE_SIGN,
+                    confidence=0.95,
+                    resolved_source="person_roi",
+                    hand_or_object_near_camera=False,
+                ),
+            )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "gesture_wakeup_missing_hand_evidence")
+
+    def test_lane_rejects_trigger_from_stale_rescue_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = GestureWakeupLane.from_config(TwinrConfig(project_root=temp_dir))
+
+            decision = lane.observe(
+                observed_at=10.0,
+                observation=_authoritative_observation(
+                    token=5,
+                    gesture=SocialFineHandGesture.PEACE_SIGN,
+                    confidence=0.95,
+                    resolved_source="recent_live_hand_roi",
+                    hand_or_object_near_camera=True,
+                ),
+            )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "gesture_wakeup_unsafe_source")
 
 
 if __name__ == "__main__":

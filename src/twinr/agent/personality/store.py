@@ -48,6 +48,7 @@ from twinr.agent.personality.models import (
     PlaceSignal,
     WorldSignal,
 )
+from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
 _ItemT = TypeVar("_ItemT")
@@ -124,6 +125,117 @@ def _set_cached_snapshot_fingerprint(
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _normalized_record_text(value: object, *, limit: int = 512) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _record_json_content(payload: Mapping[str, object]) -> str:
+    return json.dumps(
+        dict(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _record_written_at(payloads: Sequence[Mapping[str, object]]) -> str | None:
+    candidates: list[str] = []
+    for payload in payloads:
+        for field_name in (
+            "updated_at",
+            "created_at",
+            "generated_at",
+            "last_refreshed_at",
+            "last_discovered_at",
+            "last_recalibrated_at",
+            "fresh_until",
+            "review_at",
+        ):
+            value = _normalized_record_text(payload.get(field_name), limit=80)
+            if value:
+                candidates.append(value)
+                break
+    return max(candidates) if candidates else None
+
+
+def _snapshot_record_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    trait_names = payload.get("core_traits")
+    summary = ""
+    if isinstance(trait_names, Sequence) and not isinstance(trait_names, (str, bytes, bytearray)):
+        names = [
+            _normalized_record_text(item.get("name"), limit=160)
+            for item in trait_names
+            if isinstance(item, Mapping) and _normalized_record_text(item.get("name"), limit=160)
+        ]
+        if names:
+            summary = ", ".join(names[:3])
+    generated_at = _normalized_record_text(payload.get("generated_at"), limit=80)
+    return {
+        "kind": "personality_snapshot",
+        "summary": summary or "current personality snapshot",
+        "created_at": generated_at,
+        "updated_at": generated_at,
+    }
+
+
+def _interaction_signal_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    created_at = _normalized_record_text(payload.get("created_at"), limit=80)
+    updated_at = _normalized_record_text(payload.get("updated_at"), limit=80) or created_at
+    return {
+        "kind": _normalized_record_text(payload.get("signal_kind"), limit=160) or "interaction_signal",
+        "summary": _normalized_record_text(payload.get("summary"), limit=220),
+        "slot_key": _normalized_record_text(payload.get("target"), limit=160),
+        "value_key": _normalized_record_text(payload.get("signal_id"), limit=160),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _place_signal_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    updated_at = _normalized_record_text(payload.get("updated_at"), limit=80)
+    return {
+        "kind": _normalized_record_text(payload.get("geography"), limit=160) or "place_signal",
+        "summary": _normalized_record_text(payload.get("summary"), limit=220),
+        "slot_key": _normalized_record_text(payload.get("place_name"), limit=160),
+        "value_key": _normalized_record_text(payload.get("signal_id"), limit=160),
+        "updated_at": updated_at,
+    }
+
+
+def _world_signal_item_id(payload: Mapping[str, object]) -> str:
+    topic = _normalized_record_text(payload.get("topic"), limit=160).casefold()
+    region = _normalized_record_text(payload.get("region"), limit=160).casefold()
+    source = _normalized_record_text(payload.get("source"), limit=160).casefold()
+    key = "::".join((topic, region, source)).strip(":")
+    if key:
+        return key
+    return _sha256_hex(_canonical_json_bytes(dict(payload)))[:32]
+
+
+def _world_signal_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    fresh_until = _normalized_record_text(payload.get("fresh_until"), limit=80)
+    return {
+        "kind": _normalized_record_text(payload.get("source"), limit=160) or "world_signal",
+        "summary": _normalized_record_text(payload.get("topic"), limit=220),
+        "slot_key": _normalized_record_text(payload.get("region"), limit=160),
+        "updated_at": fresh_until,
+    }
+
+
+def _delta_metadata(payload: Mapping[str, object]) -> dict[str, object]:
+    review_at = _normalized_record_text(payload.get("review_at"), limit=80)
+    return {
+        "kind": _normalized_record_text(payload.get("status"), limit=160) or "personality_delta",
+        "summary": _normalized_record_text(payload.get("summary"), limit=220),
+        "slot_key": _normalized_record_text(payload.get("target"), limit=160),
+        "value_key": _normalized_record_text(payload.get("delta_id"), limit=160),
+        "updated_at": review_at,
+    }
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -438,12 +550,20 @@ def _load_raw_snapshot_payload(
     config: TwinrConfig,
     remote_state: LongTermRemoteStateStore | None,
     snapshot_kind: str,
+    metadata_builder: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
+    content_builder: Callable[[Mapping[str, object]], str] | None = None,
     max_payload_bytes: int,
     max_compressed_bytes: int,
 ) -> tuple[LongTermRemoteStateStore | None, Mapping[str, object] | None, str | None]:
     resolved_remote_state = _resolve_remote_state(config=config, remote_state=remote_state)
     if resolved_remote_state is None:
         return None, None, None
+
+    current_records = LongTermRemoteCurrentRecordStore(resolved_remote_state)
+    payload = current_records.load_single_payload(snapshot_kind=snapshot_kind)
+    if isinstance(payload, Mapping):
+        payload_dict = dict(payload)
+        return resolved_remote_state, payload_dict, _sha256_hex(_canonical_json_bytes(payload_dict))
 
     with _snapshot_lock(snapshot_kind):
         raw_payload = resolved_remote_state.load_snapshot(snapshot_kind=snapshot_kind)
@@ -465,6 +585,8 @@ def _load_raw_snapshot_payload(
             snapshot_kind=snapshot_kind,
             snapshot_fingerprint=snapshot_fingerprint,
         )
+        # Keep prompt-time snapshot loads read-only. Legacy-head promotion can
+        # trigger remote writes and job polling, which blocks live Pi turns.
         return resolved_remote_state, payload, payload_hash
 
 
@@ -474,6 +596,8 @@ def _save_raw_snapshot_payload(
     remote_state: LongTermRemoteStateStore | None,
     snapshot_kind: str,
     payload: Mapping[str, object],
+    metadata_builder: Callable[[Mapping[str, object]], Mapping[str, object]],
+    content_builder: Callable[[Mapping[str, object]], str],
     max_payload_bytes: int,
     max_compressed_bytes: int,
     compression_threshold_bytes: int,
@@ -482,15 +606,9 @@ def _save_raw_snapshot_payload(
     if resolved_remote_state is None:
         return
 
-    envelope = _build_envelope(
-        config=config,
-        snapshot_kind=snapshot_kind,
-        payload=payload,
-        max_payload_bytes=max_payload_bytes,
-        max_compressed_bytes=max_compressed_bytes,
-        compression_threshold_bytes=compression_threshold_bytes,
-    )
-    snapshot_fingerprint = _snapshot_fingerprint(envelope)
+    del max_payload_bytes, max_compressed_bytes, compression_threshold_bytes, config
+    snapshot_fingerprint = _sha256_hex(_canonical_json_bytes(payload))
+    current_records = LongTermRemoteCurrentRecordStore(resolved_remote_state)
 
     with _snapshot_lock(snapshot_kind):
         cached_fingerprint = _get_cached_snapshot_fingerprint(
@@ -501,9 +619,13 @@ def _save_raw_snapshot_payload(
             logger.debug("Skipping unchanged snapshot save for %s.", snapshot_kind)
             return
 
-        # BREAKING: remote snapshots are now written as v2 envelopes. Legacy snapshots still load,
-        # but any code that bypasses this store and reads raw remote payloads directly must unwrap the envelope.
-        resolved_remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=envelope)
+        current_records.save_single_payload(
+            snapshot_kind=snapshot_kind,
+            payload=payload,
+            metadata_builder=metadata_builder,
+            content_builder=content_builder,
+            written_at=_record_written_at((payload,)),
+        )
         _set_cached_snapshot_fingerprint(
             resolved_remote_state=resolved_remote_state,
             snapshot_kind=snapshot_kind,
@@ -544,28 +666,33 @@ def _load_list_snapshot(
     remote_state: LongTermRemoteStateStore | None,
     snapshot_kind: str,
     item_factory: Callable[[Mapping[str, object]], _ItemT],
+    item_id_getter: Callable[[Mapping[str, object]], object],
+    metadata_builder: Callable[[Mapping[str, object]], Mapping[str, object]],
+    content_builder: Callable[[Mapping[str, object]], str],
     max_items: int = _DEFAULT_MAX_LIST_ITEMS,
     max_payload_bytes: int = _DEFAULT_MAX_PAYLOAD_BYTES,
     max_compressed_bytes: int = _DEFAULT_MAX_COMPRESSED_BYTES,
     strict_load: bool = False,
 ) -> tuple[_ItemT, ...]:
     """Load a typed list snapshot from remote state when present."""
-
-    _, payload, _ = _load_raw_snapshot_payload(
-        config=config,
-        remote_state=remote_state,
-        snapshot_kind=snapshot_kind,
-        max_payload_bytes=max_payload_bytes,
-        max_compressed_bytes=max_compressed_bytes,
-    )
-    if payload is None:
+    resolved_remote_state = _resolve_remote_state(config=config, remote_state=remote_state)
+    if resolved_remote_state is None:
         return ()
-
-    items = _validated_list_items(
-        snapshot_kind=snapshot_kind,
-        payload=payload,
-        max_items=max_items,
-    )
+    current_records = LongTermRemoteCurrentRecordStore(resolved_remote_state)
+    head = current_records.load_current_head(snapshot_kind=snapshot_kind)
+    if isinstance(head, Mapping):
+        items = current_records.load_collection_payloads(snapshot_kind=snapshot_kind)
+    else:
+        raw_payload = resolved_remote_state.load_snapshot(snapshot_kind=snapshot_kind)
+        if raw_payload is None:
+            return ()
+        if not isinstance(raw_payload, Mapping):
+            raise ValueError(f"{snapshot_kind} must decode to a mapping payload.")
+        items = _validated_list_items(
+            snapshot_kind=snapshot_kind,
+            payload=raw_payload,
+            max_items=max_items,
+        )
 
     loaded: list[_ItemT] = []
     dropped_count = 0
@@ -600,6 +727,27 @@ def _load_list_snapshot(
             snapshot_kind,
             dropped_count,
         )
+    if not isinstance(head, Mapping) and loaded:
+        try:
+            current_records.save_collection(
+                snapshot_kind=snapshot_kind,
+                item_payloads=(dict(item.to_payload()) if hasattr(item, "to_payload") else dict(item) for item in loaded),
+                item_id_getter=item_id_getter,
+                metadata_builder=metadata_builder,
+                content_builder=content_builder,
+                written_at=_record_written_at(
+                    tuple(
+                        dict(item.to_payload()) if hasattr(item, "to_payload") else dict(item)
+                        for item in loaded
+                    )
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to promote legacy %s list snapshot into the current-head record contract.",
+                snapshot_kind,
+                exc_info=True,
+            )
     return tuple(loaded)
 
 
@@ -661,28 +809,38 @@ def _save_list_snapshot(
     snapshot_kind: str,
     items: Sequence[object],
     item_serializer: Callable[[object], Mapping[str, object]],
+    item_id_getter: Callable[[Mapping[str, object]], object],
+    metadata_builder: Callable[[Mapping[str, object]], Mapping[str, object]],
+    content_builder: Callable[[Mapping[str, object]], str],
     max_items: int = _DEFAULT_MAX_LIST_ITEMS,
     max_payload_bytes: int = _DEFAULT_MAX_PAYLOAD_BYTES,
     max_compressed_bytes: int = _DEFAULT_MAX_COMPRESSED_BYTES,
     compression_threshold_bytes: int = _DEFAULT_COMPRESSION_THRESHOLD_BYTES,
 ) -> None:
     """Save a typed list snapshot through the remote snapshot adapter."""
-
-    payload = _compact_list_payload(
+    del max_payload_bytes, max_compressed_bytes, compression_threshold_bytes
+    resolved_remote_state = _resolve_remote_state(config=config, remote_state=remote_state)
+    if resolved_remote_state is None:
+        return
+    serialized_items = [dict(item_serializer(item)) for item in items]
+    if len(serialized_items) > max_items:
+        logger.warning(
+            "Snapshot %s contains %s item(s), exceeding the configured limit of %s. "
+            "Dropping the oldest %s item(s).",
+            snapshot_kind,
+            len(serialized_items),
+            max_items,
+            len(serialized_items) - max_items,
+        )
+        serialized_items = serialized_items[-max_items:]
+    current_records = LongTermRemoteCurrentRecordStore(resolved_remote_state)
+    current_records.save_collection(
         snapshot_kind=snapshot_kind,
-        items=items,
-        item_serializer=item_serializer,
-        max_items=max_items,
-        max_payload_bytes=max_payload_bytes,
-    )
-    _save_raw_snapshot_payload(
-        config=config,
-        remote_state=remote_state,
-        snapshot_kind=snapshot_kind,
-        payload=payload,
-        max_payload_bytes=max_payload_bytes,
-        max_compressed_bytes=max_compressed_bytes,
-        compression_threshold_bytes=compression_threshold_bytes,
+        item_payloads=serialized_items,
+        item_id_getter=item_id_getter,
+        metadata_builder=metadata_builder,
+        content_builder=content_builder,
+        written_at=_record_written_at(serialized_items),
     )
 
 
@@ -728,6 +886,8 @@ class RemoteStatePersonalitySnapshotStore:
             config=config,
             remote_state=remote_state,
             snapshot_kind=self.snapshot_kind,
+            metadata_builder=_snapshot_record_metadata,
+            content_builder=_record_json_content,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
         )
@@ -749,10 +909,38 @@ class RemoteStatePersonalitySnapshotStore:
             remote_state=remote_state,
             snapshot_kind=self.snapshot_kind,
             payload=snapshot.to_payload(),
+            metadata_builder=_snapshot_record_metadata,
+            content_builder=_record_json_content,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
             compression_threshold_bytes=self.compression_threshold_bytes,
         )
+
+    def probe_remote_current_snapshot(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+    ) -> dict[str, object] | None:
+        """Expose the authoritative personality current head for readiness checks."""
+
+        resolved = _resolve_remote_state(config=config, remote_state=remote_state)
+        if resolved is None:
+            return None
+        return LongTermRemoteCurrentRecordStore(resolved).probe_current_head(snapshot_kind=self.snapshot_kind)
+
+    def load_remote_current_snapshot(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+    ) -> dict[str, object] | None:
+        """Expose the authoritative personality current head payload."""
+
+        resolved = _resolve_remote_state(config=config, remote_state=remote_state)
+        if resolved is None:
+            return None
+        return LongTermRemoteCurrentRecordStore(resolved).load_current_head(snapshot_kind=self.snapshot_kind)
 
 
 class PersonalityEvolutionStore(Protocol):
@@ -854,6 +1042,9 @@ class RemoteStatePersonalityEvolutionStore:
             remote_state=remote_state,
             snapshot_kind=self.interaction_snapshot_kind,
             item_factory=InteractionSignal.from_payload,
+            item_id_getter=lambda payload: payload.get("signal_id"),
+            metadata_builder=_interaction_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -875,6 +1066,9 @@ class RemoteStatePersonalityEvolutionStore:
             snapshot_kind=self.interaction_snapshot_kind,
             items=signals,
             item_serializer=lambda item: item.to_payload(),
+            item_id_getter=lambda payload: payload.get("signal_id"),
+            metadata_builder=_interaction_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -894,6 +1088,9 @@ class RemoteStatePersonalityEvolutionStore:
             remote_state=remote_state,
             snapshot_kind=self.place_snapshot_kind,
             item_factory=PlaceSignal.from_payload,
+            item_id_getter=lambda payload: payload.get("signal_id"),
+            metadata_builder=_place_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -915,6 +1112,9 @@ class RemoteStatePersonalityEvolutionStore:
             snapshot_kind=self.place_snapshot_kind,
             items=signals,
             item_serializer=lambda item: item.to_payload(),
+            item_id_getter=lambda payload: payload.get("signal_id"),
+            metadata_builder=_place_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -934,6 +1134,9 @@ class RemoteStatePersonalityEvolutionStore:
             remote_state=remote_state,
             snapshot_kind=self.world_snapshot_kind,
             item_factory=WorldSignal.from_payload,
+            item_id_getter=_world_signal_item_id,
+            metadata_builder=_world_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -955,6 +1158,9 @@ class RemoteStatePersonalityEvolutionStore:
             snapshot_kind=self.world_snapshot_kind,
             items=signals,
             item_serializer=lambda item: item.to_payload(),
+            item_id_getter=_world_signal_item_id,
+            metadata_builder=_world_signal_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -974,6 +1180,9 @@ class RemoteStatePersonalityEvolutionStore:
             remote_state=remote_state,
             snapshot_kind=self.delta_snapshot_kind,
             item_factory=PersonalityDelta.from_payload,
+            item_id_getter=lambda payload: payload.get("delta_id"),
+            metadata_builder=_delta_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,
@@ -995,6 +1204,9 @@ class RemoteStatePersonalityEvolutionStore:
             snapshot_kind=self.delta_snapshot_kind,
             items=deltas,
             item_serializer=lambda item: item.to_payload(),
+            item_id_getter=lambda payload: payload.get("delta_id"),
+            metadata_builder=_delta_metadata,
+            content_builder=_record_json_content,
             max_items=self.max_items_per_snapshot,
             max_payload_bytes=self.max_payload_bytes,
             max_compressed_bytes=self.max_compressed_bytes,

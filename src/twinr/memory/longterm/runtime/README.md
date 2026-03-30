@@ -14,6 +14,9 @@ bounded background writers into the APIs used by agent runtime loops.
 - Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
+- Centralize bounded query-first object selectors reused by discovery, proactive planning, reflection, sensor-memory compilation, and restart-recall refresh so live runtime paths do not hydrate full remote object snapshots
+- Route conversation/multimodal persistence and backfill through storage-owned active working sets plus delta commits so required remote writes do not hydrate full object/conflict/archive state or rewrite whole snapshots before consolidation
+- Prefilter remote-primary online retention candidates from current-head catalog projections before exact hydration, so retention no longer starts from a global active-object sweep
 - Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
 - Persist conversation turns and multimodal evidence through bounded workers
 - Preserve turn provenance such as external channel source and input modality so text channels like WhatsApp reach durable memory and personality learning as first-class turns instead of generic voice-only records
@@ -27,6 +30,8 @@ bounded background writers into the APIs used by agent runtime loops.
 - Expose explicit delete entry points for durable prompt memory and managed user/personality context so discovery corrections can retract stale learned facts cleanly
 - Verify remote-primary snapshot readiness before runtime loops start
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
+- Probe graph and midterm readiness through their store-owned current-view/current-head contracts so health attestation checks the same remote authority path used at runtime
+- Let graph/midterm readiness fall back from a lagging direct fixed-URI head to the small loadable compatibility current-head contract, so fresh runtime roots stay fail-closed without reintroducing whole-snapshot blob reads or duplicate bootstrap writes
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Propagate successful external watchdog attestations back into every owned remote-state adapter so stale local cooldown state cannot contradict the Pi's required-remote gate
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
@@ -52,17 +57,18 @@ bounded background writers into the APIs used by agent runtime loops.
 | File | Purpose |
 |---|---|
 | `service.py` | Compatibility shim that preserves the historic import surface while delegating to `service_impl/` |
+| `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads |
 | `service_impl/README.md` | Internal map of the refactored service implementation package |
 | `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface |
 | `service_impl/builder.py` | Runtime service assembly and background-writer construction |
 | `service_impl/readiness.py` | Required-remote readiness probes and cache helpers |
 | `service_impl/context.py` | Provider-context assembly for normal, fast, and tool-facing paths |
-| `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points |
-| `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration |
-| `service_impl/proactive.py` | Proactive planning and reservation state transitions |
+| `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points, with dry-run object reads sourced through fine-grained current-state loaders |
+| `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with live-near reflection/sensor inputs coming from the shared query-first selector layer, active backfill writes using storage-owned working-set delta commits, and remote-primary retention prefiltering candidates from catalog projections |
+| `service_impl/proactive.py` | Proactive planning and reservation state transitions using shared query-first planner-object selectors instead of inline query constants |
 | `service_impl/mutations.py` | Conflict resolution, review, and prompt-context mutation entry points |
-| `service_impl/lifecycle.py` | Flush/shutdown orchestration for bounded background writers |
-| `service_impl/persistence.py` | Static persistence pipeline helpers and multimodal payload sanitization |
+| `service_impl/lifecycle.py` | Flush/shutdown orchestration for bounded background writers plus query-first restart-recall packet refresh |
+| `service_impl/persistence.py` | Static persistence pipeline helpers and multimodal payload sanitization, with conversation/multimodal writes using storage-owned working-set delta commits |
 | `service_impl/compat.py` | Shared limits, logger, helper functions, and remote-readiness dataclasses |
 | `worker.py` | Bounded async persistence |
 | `flush_budget.py` | Total-deadline planner for multi-writer flush budgeting |

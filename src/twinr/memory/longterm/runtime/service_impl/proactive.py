@@ -12,6 +12,9 @@ from twinr.memory.longterm.core.models import (
     LongTermProactivePlanV1,
 )
 from twinr.memory.longterm.proactive.state import LongTermProactiveReservationV1
+from twinr.memory.longterm.runtime.live_object_selectors import (
+    select_proactive_planner_objects as _select_proactive_planner_objects,
+)
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 from ._typing import ServiceMixinBase
@@ -33,7 +36,7 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
         try:
             with self._store_lock:
                 return self.planner.plan(
-                    objects=self.object_store.load_objects(),
+                    objects=_select_proactive_planner_objects(self.object_store),
                     now=normalized_now,
                     live_facts=live_facts,
                 )
@@ -55,7 +58,7 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
         try:
             with self._store_lock:
                 plan = self.planner.plan(
-                    objects=self.object_store.load_objects(),
+                    objects=_select_proactive_planner_objects(self.object_store),
                     now=normalized_now,
                     live_facts=live_facts,
                 )
@@ -90,7 +93,7 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
         try:
             with self._store_lock:
                 plan = self.planner.plan(
-                    objects=self.object_store.load_objects(),
+                    objects=_select_proactive_planner_objects(self.object_store),
                     now=normalized_now,
                     live_facts=live_facts,
                 )

@@ -12,6 +12,7 @@ turn-boundary evaluation, and post-response closure checks.
 - Evaluate streaming turn boundaries through tool-calling providers
 - Evaluate whether follow-up listening should close after a response, including an explicit structured `follow_up_action` contract for continue/end, question-style fast paths, a fast structured-decision path for OpenAI, and a hard wall-clock watchdog when provider calls stall
 - Derive and store one bounded immediate follow-up carryover hint from the just-finished exchange so short clarification turns can preserve the newly established anchors from the still-open thread
+- Build bounded recent-thread carryover system messages for text turns so short repairs or elliptical continuations can keep the anchors from the immediate thread even outside the live follow-up window
 - Expose privacy-safe observability helpers for that carryover hint so workflows can trace whether a hint was built, stored, cleared, or injected without logging raw user text
 - Accept machine-readable turn-steering cues, including compact semantic match summaries, so closure decisions can return matched shared-thread or cooling topics back to the runtime without over-matching nearby themes
 
@@ -30,7 +31,8 @@ turn-boundary evaluation, and post-response closure checks.
 | `language.py` | Build language and memory instructions |
 | `turn_controller.py` | Evaluate streaming turn boundaries |
 | `closure.py` | Evaluate post-response closure and echo matched steering topics |
-| `follow_up_context.py` | Build and store one bounded carryover hint for the next explicit follow-up turn, plus privacy-safe trace payload helpers for follow-up accountability |
+| `follow_up_context.py` | Build and store bounded carryover hints for follow-up and text-turn thread continuity, plus privacy-safe trace payload helpers for follow-up accountability |
+| `thread_resolution.py` | Focus text turns on the immediate recent thread and optionally rewrite short repair prompts into standalone requests |
 | `__init__.py` | Mark package only |
 
 `normalize_turn_text()` lives in `decision_core.py` and is the canonical import

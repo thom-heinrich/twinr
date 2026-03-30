@@ -15,6 +15,10 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1
+from twinr.memory.longterm.runtime.live_object_selectors import (
+    select_discovery_basics_objects,
+    select_discovery_companion_style_objects,
+)
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 _ACTIVE_MEMORY_STATUSES = frozenset({"active"})
@@ -39,8 +43,6 @@ _COMPANION_STYLE_PREDICATES = frozenset(
     }
 )
 _COMPANION_STYLE_FEEDBACK_TARGETS = frozenset({"humor"})
-
-
 def _normalize_token(value: object | None, *, limit: int = 80) -> str:
     text = " ".join(str(value or "").split()).strip().lower().replace("-", "_").replace(" ", "_")
     if len(text) <= limit:
@@ -84,12 +86,17 @@ class UserDiscoveryAuthoritativeProfileReader:
 
     def load(self) -> UserDiscoveryAuthoritativeCoverage:
         covered_topics: set[str] = set()
-        objects = self.object_store.load_objects() if self.object_store is not None else ()
-        document = self.graph_store.load_document() if self.graph_store is not None else None
+        basics_objects = tuple(select_discovery_basics_objects(self.object_store))
+        companion_style_objects = tuple(select_discovery_companion_style_objects(self.object_store))
+        basics_covered_by_objects = self._objects_cover_basics(basics_objects)
+        companion_style_covered_by_objects = self._objects_cover_companion_style(companion_style_objects)
+        document = None
+        if (not basics_covered_by_objects or not companion_style_covered_by_objects) and self.graph_store is not None:
+            document = self.graph_store.load_document()
 
-        if self._objects_cover_basics(objects) or self._graph_covers_basics(document):
+        if basics_covered_by_objects or self._graph_covers_basics(document):
             covered_topics.add("basics")
-        if self._objects_cover_companion_style(objects) or self._graph_covers_companion_style(document):
+        if companion_style_covered_by_objects or self._graph_covers_companion_style(document):
             covered_topics.add("companion_style")
         return UserDiscoveryAuthoritativeCoverage(covered_topics=frozenset(covered_topics))
 

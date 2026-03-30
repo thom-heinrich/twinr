@@ -3,9 +3,9 @@ name: groq
 path: src/twinr/providers/groq
 kind: python-package
 visibility: internal
-summary: Provide Groq-backed text and tool-calling adapters with validated SDK client construction.
+summary: Provide Groq-backed text and tool-calling adapters with validated Groq SDK construction.
 owned_concerns:
-  - Validate Groq client configuration and construct the OpenAI-compatible SDK client
+  - Validate Groq client configuration and construct the preferred official SDK client with OpenAI-compatible fallback
   - Execute streaming and non-streaming Groq text turns for Twinr
   - Manage bounded continuation state for Groq tool-calling turns
 out_of_scope:
@@ -38,6 +38,7 @@ primary_callers:
   - path: src/twinr/providers/factory.py
   - path: src/twinr/agent/workflows/streaming_runner.py
 tests:
+  - path: test/test_groq_client.py
   - path: test/test_groq_providers.py
   - path: test/test_provider_factory.py
   - path: test/test_streaming_runner.py

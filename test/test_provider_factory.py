@@ -29,7 +29,7 @@ class StreamingProviderFactoryTests(unittest.TestCase):
         self.assertIsInstance(bundle.tool_agent, GroqToolCallingAgentProvider)
         self.assertEqual(bundle.tts.__class__.__name__, "OpenAITextToSpeechProvider")
         self.assertEqual(bundle.print_backend.__class__.__name__, "CompositeSpeechAgentProvider")
-        self.assertEqual(bundle.verification_stt.__class__.__name__, "OpenAISpeechToTextProvider")
+        self.assertEqual(bundle.verification_stt.__class__.__name__, "_LazyManagedSpeechToTextProvider")
 
     @patch("twinr.providers.factory._build_openai_streaming_verification_provider")
     def test_builds_verification_stt_when_enabled(
@@ -37,7 +37,7 @@ class StreamingProviderFactoryTests(unittest.TestCase):
         build_verifier,
     ) -> None:
         verifier_stt = object()
-        build_verifier.return_value = verifier_stt
+        build_verifier.return_value = (verifier_stt, ())
         bundle = build_streaming_provider_bundle(
             TwinrConfig(
                 openai_api_key="openai-key",
@@ -45,6 +45,7 @@ class StreamingProviderFactoryTests(unittest.TestCase):
                 llm_provider="openai",
                 tts_provider="openai",
                 streaming_transcript_verifier_enabled=True,
+                streaming_transcript_verifier_lazy_init=False,
                 streaming_transcript_verifier_model="gpt-4o-mini-transcribe",
             )
         )

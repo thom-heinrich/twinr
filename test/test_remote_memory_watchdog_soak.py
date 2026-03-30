@@ -25,6 +25,10 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                     watchdog_ok=True,
                     artifact_fresh=True,
                     stale_seconds=12.0,
+                    freshness_source="updated_at",
+                    collection_latency_ms=4.0,
+                    status_reason="ok",
+                    status_flags=["ok"],
                     service=SystemdServiceState(
                         active_state="active",
                         sub_state="running",
@@ -45,6 +49,8 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                         current_consecutive_ok=40,
                         current_consecutive_fail=0,
                         current_captured_at="2026-03-16T17:59:48Z",
+                        file_mtime="2026-03-16T17:59:48Z",
+                        file_size_bytes=4096,
                     ),
                 ),
                 WatchdogSoakSample(
@@ -54,6 +60,10 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                     watchdog_ok=True,
                     artifact_fresh=True,
                     stale_seconds=18.0,
+                    freshness_source="updated_at",
+                    collection_latency_ms=5.0,
+                    status_reason="ok",
+                    status_flags=["ok"],
                     service=SystemdServiceState(
                         active_state="active",
                         sub_state="running",
@@ -74,6 +84,8 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                         current_consecutive_ok=42,
                         current_consecutive_fail=0,
                         current_captured_at="2026-03-16T18:00:12Z",
+                        file_mtime="2026-03-16T18:00:12Z",
+                        file_size_bytes=4352,
                     ),
                 ),
             ]
@@ -82,12 +94,19 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                 samples,
                 started_at="2026-03-16T18:00:00Z",
                 ended_at="2026-03-16T18:00:30Z",
-                duration_s=30.0,
+                requested_duration_s=30.0,
+                observed_duration_s=30.0,
                 interval_s=30.0,
                 max_stale_s=180.0,
+                min_samples=2,
+                require_artifact_progress=True,
                 service_name="twinr-remote-memory-watchdog.service",
                 snapshot_path=snapshot_path,
                 output_dir=output_dir,
+                stop_reason="deadline_reached",
+                interrupted=False,
+                termination_signal=None,
+                systemctl_timeout_s=5.0,
             )
 
         self.assertTrue(summary["all_checks_passed"])
@@ -109,6 +128,10 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                     watchdog_ok=True,
                     artifact_fresh=True,
                     stale_seconds=10.0,
+                    freshness_source="updated_at",
+                    collection_latency_ms=4.0,
+                    status_reason="ok",
+                    status_flags=["ok"],
                     service=SystemdServiceState(
                         active_state="active",
                         sub_state="running",
@@ -129,6 +152,8 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                         current_consecutive_ok=40,
                         current_consecutive_fail=0,
                         current_captured_at="2026-03-16T17:59:50Z",
+                        file_mtime="2026-03-16T17:59:50Z",
+                        file_size_bytes=4096,
                     ),
                 ),
                 WatchdogSoakSample(
@@ -138,6 +163,10 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                     watchdog_ok=False,
                     artifact_fresh=False,
                     stale_seconds=240.0,
+                    freshness_source="updated_at",
+                    collection_latency_ms=8.0,
+                    status_reason="service_not_running",
+                    status_flags=["service_not_running", "watchdog_not_ok", "artifact_stale"],
                     service=SystemdServiceState(
                         active_state="activating",
                         sub_state="auto-restart",
@@ -158,6 +187,8 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                         current_consecutive_ok=0,
                         current_consecutive_fail=1,
                         current_captured_at="2026-03-16T18:00:45Z",
+                        file_mtime="2026-03-16T17:57:00Z",
+                        file_size_bytes=4096,
                     ),
                 ),
             ]
@@ -166,12 +197,19 @@ class RemoteMemoryWatchdogSoakTests(unittest.TestCase):
                 samples,
                 started_at="2026-03-16T18:00:00Z",
                 ended_at="2026-03-16T18:01:00Z",
-                duration_s=60.0,
+                requested_duration_s=60.0,
+                observed_duration_s=60.0,
                 interval_s=30.0,
                 max_stale_s=180.0,
+                min_samples=2,
+                require_artifact_progress=True,
                 service_name="twinr-remote-memory-watchdog.service",
                 snapshot_path=snapshot_path,
                 output_dir=output_dir,
+                stop_reason="deadline_reached",
+                interrupted=False,
+                termination_signal=None,
+                systemctl_timeout_s=5.0,
             )
 
         self.assertFalse(summary["all_checks_passed"])

@@ -28,6 +28,7 @@ _DEFAULT_SAMPLE_RATE_HZ = 24000
 _DEFAULT_CHUNK_MS = 200
 _DIRECT_GUARD_POLL_S = 0.05
 _DIRECT_GUARD_RELEASE_TIMEOUT_S = 1.0
+_DIRECT_GUARD_RESUME_GRACE_S = 0.35
 _KEEPALIVE_ERROR_MAX_CHARS = 180
 _RESTART_DELAY_S = 0.05
 _PLAYBACK_DEVICES_COMPATIBLE_WITH_RESPEAKER_DUPLEX = frozenset(
@@ -138,6 +139,7 @@ class ReSpeakerDuplexKeepalive:
         self._direct_guard_active = False
         self._direct_guard_transitioning = False
         self._foreground_playback_depth = 0
+        self._resume_guard_not_before_monotonic = 0.0
 
     def open(self) -> "ReSpeakerDuplexKeepalive":
         """Start the background keepalive loop once."""
@@ -151,6 +153,7 @@ class ReSpeakerDuplexKeepalive:
                 self._foreground_playback_depth = 0
                 self._direct_guard_active = False
                 self._direct_guard_transitioning = False
+                self._resume_guard_not_before_monotonic = 0.0
                 self._direct_guard_state.notify_all()
             thread = Thread(
                 target=self._worker_main,
@@ -221,8 +224,20 @@ class ReSpeakerDuplexKeepalive:
     def _run_direct_guard_keepalive(self) -> None:
         while not self._stop_event.is_set():
             with self._direct_guard_state:
-                while not self._stop_event.is_set() and self._foreground_playback_depth > 0:
-                    self._direct_guard_state.wait(timeout=_DIRECT_GUARD_POLL_S)
+                while not self._stop_event.is_set():
+                    if self._foreground_playback_depth > 0:
+                        self._direct_guard_state.wait(timeout=_DIRECT_GUARD_POLL_S)
+                        continue
+                    resume_guard_not_before = self._resume_guard_not_before_monotonic
+                    if resume_guard_not_before <= 0.0:
+                        break
+                    # Avoid reclaiming the softvol device in the tiny gap between
+                    # processing feedback and the next real TTS/playback request.
+                    remaining_s = resume_guard_not_before - time.monotonic()
+                    if remaining_s <= 0.0:
+                        self._resume_guard_not_before_monotonic = 0.0
+                        break
+                    self._direct_guard_state.wait(timeout=min(_DIRECT_GUARD_POLL_S, remaining_s))
                 if self._stop_event.is_set():
                     return
 
@@ -288,10 +303,12 @@ class ReSpeakerDuplexKeepalive:
             )
 
     def _resume_direct_guard_after_foreground_playback(self) -> None:
-        self._safe_emit("voice_orchestrator_duplex_keepalive=resumed_after_playback")
+        self._safe_emit("voice_orchestrator_duplex_keepalive=resume_grace_after_playback")
         with self._direct_guard_state:
             if self._foreground_playback_depth > 0:
                 self._foreground_playback_depth -= 1
+            if self._foreground_playback_depth == 0:
+                self._resume_guard_not_before_monotonic = time.monotonic() + _DIRECT_GUARD_RESUME_GRACE_S
             self._direct_guard_state.notify_all()
 
     def _set_direct_guard_state(self, *, active: bool, transitioning: bool) -> None:

@@ -17,6 +17,9 @@ from twinr.memory.chonkydb import (
     ChonkyDBGraphNeighborsRequest,
     ChonkyDBGraphPathRequest,
     ChonkyDBGraphPatternsRequest,
+    ChonkyDBGraphStoreManyEdge,
+    ChonkyDBGraphStoreManyNode,
+    ChonkyDBGraphStoreManyRequest,
     TWINR_GRAPH_ALLOWED_EDGE_TYPES,
     TWINR_GRAPH_SCHEMA_NAME,
     TWINR_GRAPH_SCHEMA_VERSION,
@@ -150,12 +153,30 @@ class TwinrGraphSchemaTests(unittest.TestCase):
 class ChonkyDBGraphClientTests(unittest.TestCase):
     def test_graph_methods_encode_expected_paths_and_bodies(self) -> None:
         opener = FakeOpener()
+        opener.queue_json({"success": True, "stored": True})
         opener.queue_json({"success": True, "edge_created": True})
         opener.queue_json({"success": True, "neighbors": [{"label": "Corinna Maier"}]})
         opener.queue_json({"success": True, "path": ["user:main", "person:corinna_maier"]})
         opener.queue_json({"success": True, "matches": [{"depth": 1}]})
         client = ChonkyDBClient(ChonkyDBConnectionConfig(base_url="https://memory.test"), opener=opener)
 
+        client.graph_store_many(
+            ChonkyDBGraphStoreManyRequest(
+                index_name="twinr_graph_test",
+                nodes=(
+                    ChonkyDBGraphStoreManyNode(label="gen1:user:main"),
+                    ChonkyDBGraphStoreManyNode(label="gen1:person:corinna_maier"),
+                ),
+                edges=(
+                    ChonkyDBGraphStoreManyEdge(
+                        source_label="gen1:user:main",
+                        target_label="gen1:person:corinna_maier",
+                        edge_type="social_related_to_user",
+                    ),
+                ),
+                timeout_seconds=15,
+            )
+        )
         client.add_graph_edge_smart(
             ChonkyDBGraphAddEdgeSmartRequest(
                 from_ref="user:main",
@@ -188,14 +209,16 @@ class ChonkyDBGraphClientTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(opener.calls[0]["full_url"].endswith("/v1/external/graph/edges/smart"))
-        self.assertTrue(opener.calls[1]["full_url"].endswith("/v1/external/graph/neighbors"))
-        self.assertTrue(opener.calls[2]["full_url"].endswith("/v1/external/graph/path"))
-        self.assertTrue(opener.calls[3]["full_url"].endswith("/v1/external/graph/patterns"))
-        self.assertEqual(json.loads(opener.calls[0]["body"])["edge_type"], "social_related_to_user")
-        self.assertEqual(json.loads(opener.calls[1]["body"])["edge_types"], ["general_has_contact_method"])
-        self.assertEqual(json.loads(opener.calls[2]["body"])["target"], "brand:melitta")
-        self.assertEqual(json.loads(opener.calls[3]["body"])["patterns"][0]["edge_type"], "user_prefers")
+        self.assertTrue(opener.calls[0]["full_url"].endswith("/v1/graph/store_many"))
+        self.assertTrue(opener.calls[1]["full_url"].endswith("/v1/external/graph/edges/smart"))
+        self.assertTrue(opener.calls[2]["full_url"].endswith("/v1/external/graph/neighbors"))
+        self.assertTrue(opener.calls[3]["full_url"].endswith("/v1/external/graph/path"))
+        self.assertTrue(opener.calls[4]["full_url"].endswith("/v1/external/graph/patterns"))
+        self.assertEqual(json.loads(opener.calls[0]["body"])["nodes"][0]["label"], "gen1:user:main")
+        self.assertEqual(json.loads(opener.calls[1]["body"])["edge_type"], "social_related_to_user")
+        self.assertEqual(json.loads(opener.calls[2]["body"])["edge_types"], ["general_has_contact_method"])
+        self.assertEqual(json.loads(opener.calls[3]["body"])["target"], "brand:melitta")
+        self.assertEqual(json.loads(opener.calls[4]["body"])["patterns"][0]["edge_type"], "user_prefers")
 
     def test_graph_http_errors_raise_chonkydb_error(self) -> None:
         opener = FakeOpener()

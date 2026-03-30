@@ -1,7 +1,9 @@
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -9,6 +11,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.ops.locks import (
     TwinrInstanceAlreadyRunningError,
     TwinrInstanceLock,
+    _open_lock_fd,
     loop_instance_lock,
     loop_lock_owner,
     loop_lock_path,
@@ -67,6 +70,43 @@ class LoopLockTests(unittest.TestCase):
             self.assertIsInstance(owner, int)
             self.assertGreater(owner or 0, 0)
             self.assertIsNone(loop_lock_owner(config, "realtime-loop"))
+
+    def test_open_lock_fd_uses_zero_mode_for_existing_lock_openat2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "twinr-realtime-loop.lock"
+            path.write_text("123\n", encoding="utf-8")
+            recorded: list[tuple[int, int]] = []
+
+            def fake_openat2(target: Path, *, flags: int, mode: int = 0, resolve: int = 0) -> int:
+                recorded.append((flags, mode))
+                return os.open(str(target), flags, 0o600)
+
+            with mock.patch("twinr.ops.locks._openat2_fd", side_effect=fake_openat2):
+                fd = _open_lock_fd(path, create=False)
+
+            try:
+                self.assertEqual(len(recorded), 1)
+                self.assertEqual(recorded[0][1], 0)
+            finally:
+                os.close(fd)
+
+    def test_open_lock_fd_keeps_create_mode_for_new_lock_openat2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "twinr-realtime-loop.lock"
+            recorded: list[tuple[int, int]] = []
+
+            def fake_openat2(target: Path, *, flags: int, mode: int = 0, resolve: int = 0) -> int:
+                recorded.append((flags, mode))
+                return os.open(str(target), flags, 0o600)
+
+            with mock.patch("twinr.ops.locks._openat2_fd", side_effect=fake_openat2):
+                fd = _open_lock_fd(path, create=True)
+
+            try:
+                self.assertEqual(len(recorded), 1)
+                self.assertEqual(recorded[0][1], 0o600)
+            finally:
+                os.close(fd)
 
 
 if __name__ == "__main__":

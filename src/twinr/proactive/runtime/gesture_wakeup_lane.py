@@ -8,6 +8,7 @@
 # IMP-1: Added configurable confidence gating for the authoritative gesture stream to match 2026 live-stream gesture-recognition practice.
 # IMP-2: Upgraded forensics emission to low-cardinality, rate-limited structured events with bounded context fields.
 # IMP-3: Hardened trigger-gesture parsing to accept enum members, names, values, and common config spellings without silently falling back.
+# BUG-6: Reject visual wake dispatch when the gesture stream lacks current hand evidence or only resolves through stale/slow rescue sources.
 
 """Consume authoritative gesture-stream activations for visual wakeup."""
 
@@ -24,6 +25,7 @@ from twinr.agent.workflows.forensics import workflow_decision
 
 from ..social.engine import SocialFineHandGesture, SocialVisionObservation
 from ..social.perception_stream import gesture_stream, gesture_stream_authoritative
+from .gesture_stream_guards import evaluate_gesture_stream_user_intent
 
 
 _DEFAULT_TRIGGER_GESTURE = SocialFineHandGesture.PEACE_SIGN
@@ -38,6 +40,8 @@ _WORKFLOW_DECISION_OPTIONS = [
     {"id": "gesture_wakeup_not_authoritative", "summary": "Ignore the frame because no authoritative gesture stream was attached."},
     {"id": "gesture_wakeup_not_rising", "summary": "Ignore the frame because the authoritative activation was not on a rising edge."},
     {"id": "gesture_wakeup_low_confidence", "summary": "Ignore the frame because the authoritative gesture confidence is below the configured minimum."},
+    {"id": "gesture_wakeup_missing_hand_evidence", "summary": "Ignore the frame because the fast lane has no current hand-near-camera evidence."},
+    {"id": "gesture_wakeup_unsafe_source", "summary": "Ignore the frame because the gesture only survived through a stale or slow rescue source."},
     {"id": "gesture_wakeup_already_active", "summary": "Do not re-dispatch while the same authoritative activation remains active."},
     {"id": "gesture_wakeup_cooldown", "summary": "Suppress a repeated wake gesture during cooldown."},
     {"id": "no_gesture_wakeup_candidate", "summary": "Ignore the frame because the configured trigger gesture is absent or incomplete."},
@@ -226,6 +230,10 @@ class GestureWakeupLane:
         if self.require_rising and activation_rising is False:
             return None, "gesture_wakeup_not_rising"
 
+        guard_reason = _wakeup_guard_block_reason(observation)
+        if guard_reason is not None:
+            return None, guard_reason
+
         return (
             _ActivationFingerprint(
                 activation_key=_sanitize_small_text(getattr(stream, "activation_key", None)),
@@ -251,6 +259,7 @@ class GestureWakeupLane:
         """Prepare one bounded decision ledger entry for the wake lane."""
 
         stream = gesture_stream(observation)
+        user_intent_guard = evaluate_gesture_stream_user_intent(observation)
         signature = (
             decision.active,
             decision.reason,
@@ -299,6 +308,13 @@ class GestureWakeupLane:
                 "stream_activation_rising": _coerce_optional_bool(
                     None if stream is None else getattr(stream, "activation_rising", None)
                 ),
+                "stream_resolved_source": _sanitize_small_text(
+                    None if stream is None else getattr(stream, "resolved_source", None)
+                ),
+                "stream_hand_or_object_near_camera": _coerce_optional_bool(
+                    None if stream is None else getattr(stream, "hand_or_object_near_camera", None)
+                ),
+                "user_intent_guard_reason": user_intent_guard.reason,
                 "last_seen_activation_key": (
                     None if self._last_seen_activation is None else self._last_seen_activation.activation_key
                 ),
@@ -339,6 +355,19 @@ class GestureWakeupLane:
         if signature != self._last_trace_signature:
             return True
         return (now_ns - self._last_trace_clock_ns) >= self._trace_min_interval_ns
+
+
+def _wakeup_guard_block_reason(observation: SocialVisionObservation) -> str | None:
+    """Map gesture-stream user-intent guards into wake-lane decision reasons."""
+
+    guard = evaluate_gesture_stream_user_intent(observation)
+    if guard.allowed:
+        return None
+    if guard.reason == "missing_hand_evidence":
+        return "gesture_wakeup_missing_hand_evidence"
+    if guard.reason == "unsafe_resolved_source":
+        return "gesture_wakeup_unsafe_source"
+    return "no_gesture_wakeup_candidate"
 
 
 def _coerce_trigger_gesture(value: object) -> SocialFineHandGesture:

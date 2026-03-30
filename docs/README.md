@@ -652,6 +652,8 @@ TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES=8
 TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=4
 TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=12.0
 TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.2
+TWINR_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator
+TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=true
 TWINR_VOICE_ORCHESTRATOR_ENABLED=true
 TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator/voice
 TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true
@@ -680,7 +682,7 @@ The active realtime and streaming loops can also trigger the camera automaticall
 With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
 With `TWINR_VOICE_ORCHESTRATOR_ENABLED=true`, the Pi keeps one live websocket stream open to the transcript-first voice gateway and leaves wake detection there. The same remote stream stays authoritative for wake, transcript commit, continuation, and follow-up closure. Twinr has no separate local wake or STT path in the live product flow.
-When the current development-host `:8797` bridge is used, that websocket is still plain `ws://` transport without TLS termination. Set `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` explicitly for that attested LAN bridge; prefer `wss://` whenever a TLS terminator is available.
+When the current development-host `:8797` bridge is used, both the text orchestrator probe path and the live voice gateway still run over plain `ws://` transport without TLS termination. Set `TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for the text `/ws/orchestrator` endpoint and `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for `/ws/orchestrator/voice` on that attested LAN bridge; prefer `wss://` whenever a TLS terminator is available.
 Remove any retired local voice-selector env from current deployments. The live runtime contract is remote-only and fails closed on legacy local-selector config.
 
 The active runtime loops keep the same green/yellow button UX. They can inspect the camera for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".

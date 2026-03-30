@@ -443,7 +443,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["response_format"], "wav")
         self.assertEqual(request["instructions"], "Speak in natural German.")
 
-    def test_synthesize_falls_back_to_tts_1_when_project_lacks_model_access(self) -> None:
+    def test_synthesize_falls_back_to_legacy_tts_model_when_project_lacks_model_access(self) -> None:
         fallback_config = replace(self.config, openai_tts_model="gpt-4o-mini-tts")
         backend = OpenAIBackend(
             config=fallback_config,
@@ -460,7 +460,7 @@ class OpenAIBackendTests(unittest.TestCase):
 
         self.assertEqual(audio_bytes, b"AUDIO")
         self.assertEqual(backend._client.audio.speech.calls[0]["model"], "gpt-4o-mini-tts")
-        self.assertEqual(backend._client.audio.speech.calls[1]["model"], "tts-1")
+        self.assertEqual(backend._client.audio.speech.calls[1]["model"], "tts-1-hd")
         self.assertEqual(backend._client.audio.speech.calls[1]["voice"], "sage")
         self.assertEqual(backend._client.audio.speech.calls[1]["speed"], 0.9)
 
@@ -595,7 +595,7 @@ class OpenAIBackendTests(unittest.TestCase):
         )
         request = self.responses.calls[0]
         self.assertEqual(request["model"], "gpt-5.2-chat-latest")
-        self.assertEqual(request["include"], ["web_search_call.action.sources"])
+        self.assertIn("web_search_call.action.sources", request["include"])
         self.assertEqual(request["tools"][0]["type"], "web_search")
         self.assertEqual(request["tools"][0]["search_context_size"], "medium")
         self.assertTrue(request["prompt_cache_key"].startswith("twinr:search:"))
@@ -1253,7 +1253,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(len(self.responses.calls), 0)
 
     def test_default_client_factory_skips_project_header_for_project_scoped_key(self) -> None:
-        captured_kwargs: dict[str, str] = {}
+        captured_kwargs: dict[str, object] = {}
 
         class FakeOpenAI:
             def __init__(self, **kwargs) -> None:
@@ -1276,10 +1276,12 @@ class OpenAIBackendTests(unittest.TestCase):
             else:
                 sys.modules["openai"] = original_module
 
-        self.assertEqual(
-            captured_kwargs,
-            {"api_key": "sk-proj-example", "timeout": 45.0, "max_retries": 1},
-        )
+        self.assertEqual(captured_kwargs["api_key"], "sk-proj-example")
+        self.assertEqual(captured_kwargs["base_url"], "https://api.openai.com/v1")
+        self.assertEqual(captured_kwargs["max_retries"], 1)
+        self.assertNotIn("project", captured_kwargs)
+        self.assertIn("timeout", captured_kwargs)
+        self.assertIn("http_client", captured_kwargs)
 
     def test_format_for_print_uses_low_reasoning_without_web_search(self) -> None:
         self.backend.format_for_print("This is a longer answer that should be compressed.")

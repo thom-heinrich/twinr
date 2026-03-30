@@ -39,6 +39,7 @@ FIRST_WORD_AGENT_INSTRUCTIONS = (
 
 DEFAULT_TOOL_AGENT_INSTRUCTIONS = (
     "Keep user-facing replies clear, warm, natural, concise, practical, and easy for a senior user to understand. "
+    "If the user's new message is a brief repair, clarification, or continuation of the same thread, preserve explicit anchors already established in that thread, such as place, date, timezone, or task scope, unless the user overrides them. "
     "If the user explicitly asks for a printout, use the print_receipt tool. "
     "If the user gave exact wording, quoted text, or said exactly this text, you must pass that literal wording in the tool field text. "
     "Use focus_hint only as a short hint about the target content. "
@@ -193,6 +194,7 @@ DEFAULT_TOOL_AGENT_INSTRUCTIONS = (
 
 COMPACT_TOOL_AGENT_INSTRUCTIONS = (
     "Reply clearly, warmly, briefly, and in simple senior-friendly language. "
+    "If the user's new message is a brief repair, clarification, or continuation of the same thread, preserve explicit anchors already established in that thread, such as place, date, timezone, or task scope, unless the user overrides them. "
     "Use print_receipt only when the user explicitly wants something printed, and pass literal wording in text whenever the user asked for exact text. "
     "Use search_live_info for any fresh or external web information and briefly say you are checking the web first. "
     "Do not answer a freshness-sensitive external question from memory or estimation before an explicit verification tool has run for that turn. "
@@ -437,7 +439,10 @@ def tool_agent_time_context(config: TwinrConfig) -> str:
     now = datetime.now(zone)
     return (
         "Local date/time context for resolving reminders, timers, and scheduled automations: "
-        f"{now.strftime('%A, %Y-%m-%d %H:%M:%S %z')} ({timezone_name})."
+        f"{now.strftime('%A, %Y-%m-%d %H:%M:%S %z')} ({timezone_name}). "
+        "This local time anchor is for reminders, timers, and scheduling resolution only. "
+        "Do not treat it as permission to answer an unspecified exact-current-time question with Twinr's local device time. "
+        "If the user asks for the current exact time without giving a place or timezone and the current thread did not already establish one, ask one short clarification for the missing place or timezone first."
     )
 
 

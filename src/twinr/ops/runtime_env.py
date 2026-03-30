@@ -17,24 +17,64 @@ from pathlib import Path
 import os
 
 
-def prime_user_session_audio_env() -> dict[str, str]:
+def _resolve_runtime_dir_candidate(
+    *,
+    configured_runtime_dir: str | os.PathLike[str] | None,
+) -> Path | None:
+    runtime_dir_text = str(os.environ.get("XDG_RUNTIME_DIR", "") or "").strip()
+    if runtime_dir_text:
+        runtime_dir = Path(runtime_dir_text)
+        if runtime_dir.is_dir():
+            return runtime_dir
+
+    uid_getter = getattr(os, "getuid", None)
+    if not callable(uid_getter):
+        return None
+    uid = int(uid_getter())
+
+    configured_candidate: Path | None = None
+    if configured_runtime_dir is not None:
+        configured_text = str(configured_runtime_dir).strip()
+        if configured_text:
+            candidate = Path(configured_text).expanduser()
+            if candidate.is_dir():
+                configured_candidate = candidate
+
+    # Productive Pi runtimes run as root but borrow the logged-in desktop
+    # user's session for audio and Wayland. Prefer the configured desktop
+    # runtime dir there over /run/user/0, which often does not carry the
+    # needed DBus/Pulse sockets.
+    if uid == 0 and configured_candidate is not None:
+        return configured_candidate
+
+    own_runtime_dir = Path(f"/run/user/{uid}")
+    if own_runtime_dir.is_dir():
+        return own_runtime_dir
+
+    return configured_candidate
+
+
+def prime_user_session_audio_env(
+    *,
+    configured_runtime_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
     """Fill missing user-session env vars needed for detached audio runtime.
 
     The helper only writes variables that are currently unset. It derives the
-    canonical runtime directory from the effective UID and then populates the
-    DBus and PulseAudio socket addresses when the corresponding sockets exist.
+    canonical runtime directory from the effective UID or, on productive
+    root-owned Pi runtimes, from the configured desktop runtime directory.
+    It then populates the DBus and PulseAudio socket addresses when the
+    corresponding sockets exist.
     """
 
     updates: dict[str, str] = {}
     if os.name != "posix":
         return updates
 
-    uid_getter = getattr(os, "getuid", None)
-    if not callable(uid_getter):
-        return updates
-    uid = int(uid_getter())
-    runtime_dir = Path(f"/run/user/{uid}")
-    if not runtime_dir.is_dir():
+    runtime_dir = _resolve_runtime_dir_candidate(
+        configured_runtime_dir=configured_runtime_dir,
+    )
+    if runtime_dir is None:
         return updates
 
     if not str(os.environ.get("XDG_RUNTIME_DIR", "")).strip():

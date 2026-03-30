@@ -1,5 +1,5 @@
 from pathlib import Path
-from tempfile import TemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryFile
 from unittest import mock
 import io
 import itertools
@@ -396,6 +396,50 @@ class WaveAudioPlayerTests(unittest.TestCase):
 
         self.assertGreaterEqual(process.terminate_calls, 1)
         self.assertEqual(process.wait_timeouts, [1.0])
+
+    def test_stream_playback_keeps_root_borrowed_session_audio_for_respeaker_output(self) -> None:
+        player = WaveAudioPlayer(device="twinr_playback_softvol")
+        process = _FakePlaybackProcess()
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process) as spawn_process,
+            mock.patch("twinr.hardware.audio._wait_for_writable", return_value=True),
+            mock.patch("twinr.hardware.audio.os.set_blocking"),
+            mock.patch("twinr.hardware.audio.os.write", return_value=5),
+        ):
+            player.play_wav_chunks([b"chunk"])
+
+        self.assertTrue(spawn_process.call_args.kwargs["allow_root_borrowed_session_audio"])
+
+    def test_stream_playback_keeps_sanitized_env_for_non_respeaker_output(self) -> None:
+        player = WaveAudioPlayer(device="default")
+        process = _FakePlaybackProcess()
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process) as spawn_process,
+            mock.patch("twinr.hardware.audio._wait_for_writable", return_value=True),
+            mock.patch("twinr.hardware.audio.os.set_blocking"),
+            mock.patch("twinr.hardware.audio.os.write", return_value=5),
+        ):
+            player.play_wav_chunks([b"chunk"])
+
+        self.assertFalse(spawn_process.call_args.kwargs["allow_root_borrowed_session_audio"])
+
+    def test_file_playback_keeps_root_borrowed_session_audio_for_respeaker_output(self) -> None:
+        player = WaveAudioPlayer(device="twinr_playback_softvol")
+        process = _FakePlaybackProcess()
+
+        with NamedTemporaryFile() as handle:
+            handle.write(b"wav")
+            handle.flush()
+
+            with mock.patch(
+                "twinr.hardware.audio._spawn_audio_process",
+                return_value=process,
+            ) as spawn_process:
+                player.play_file(handle.name)
+
+        self.assertTrue(spawn_process.call_args.kwargs["allow_root_borrowed_session_audio"])
 
     def test_stop_playback_terminates_active_process(self) -> None:
         player = WaveAudioPlayer(device="default")

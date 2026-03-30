@@ -25,6 +25,10 @@ from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolida
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
 from twinr.memory.longterm.reasoning.turn_continuity import LongTermTurnContinuityCompiler
+from twinr.memory.longterm.runtime.live_object_selectors import (
+    select_reflection_neighborhood_objects,
+    select_sensor_memory_neighborhood_objects,
+)
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
@@ -89,9 +93,6 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         attribute_key="persistence_scope",
                         attribute_value="restart_recall",
                     )
-                existing_objects = tuple(object_store.load_objects())
-                existing_conflicts = tuple(object_store.load_conflicts())
-                existing_archived = tuple(object_store.load_archived_objects())
                 extraction = extractor.extract_conversation_turn(
                     transcript=item.transcript,
                     response=item.response,
@@ -100,6 +101,12 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     modality=item.modality,
                     episode_attributes=episode_attributes,
                 )
+                working_set = object_store.load_active_working_set(
+                    candidate_objects=(extraction.episode, *extraction.candidate_objects),
+                    event_ids=(extraction.turn_id,),
+                )
+                existing_objects = working_set.objects
+                existing_conflicts = working_set.conflicts
                 result = consolidator.consolidate(
                     extraction=extraction,
                     existing_objects=existing_objects,
@@ -111,7 +118,14 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     result=result,
                 )
                 try:
-                    reflection = reflector.reflect(objects=current_objects)
+                    reflection = reflector.reflect(
+                        objects=tuple(
+                            select_reflection_neighborhood_objects(
+                                object_store,
+                                seed_objects=current_objects,
+                            )
+                        )
+                    )
                 except Exception:
                     logger.exception("Long-term reflection failed during conversation-turn persistence.")
                 else:
@@ -121,7 +135,15 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         reflection=reflection,
                     )
                 try:
-                    sensor_reflection = sensor_memory.compile(objects=current_objects, now=occurred_at)
+                    sensor_reflection = sensor_memory.compile(
+                        objects=tuple(
+                            select_sensor_memory_neighborhood_objects(
+                                object_store,
+                                seed_objects=current_objects,
+                            )
+                        ),
+                        now=occurred_at,
+                    )
                 except Exception:
                     logger.exception("Sensor-memory compilation failed during conversation-turn persistence.")
                 else:
@@ -135,13 +157,14 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     retention_policy=retention_policy,
                     objects=current_objects,
                 )
-                object_store.write_snapshot(
-                    objects=_sort_objects_by_memory_id(retention.kept_objects),
-                    conflicts=current_conflicts,
-                    archived_objects=LongTermMemoryServicePersistenceMixin._merge_archived_objects(
-                        existing_archived=existing_archived,
-                        archived_updates=retention.archived_objects,
+                object_store.commit_active_delta(
+                    object_upserts=_sort_objects_by_memory_id(retention.kept_objects),
+                    object_delete_ids=LongTermMemoryServicePersistenceMixin._retention_deleted_memory_ids(
+                        current_objects=current_objects,
+                        retention=retention,
                     ),
+                    conflict_upserts=current_conflicts,
+                    archive_upserts=retention.archived_objects,
                 )
                 try:
                     graph_store.apply_candidate_edges(result.graph_edges)
@@ -196,10 +219,13 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
 
         try:
             with effective_store_lock:
-                existing_objects = tuple(object_store.load_objects())
-                existing_conflicts = tuple(object_store.load_conflicts())
-                existing_archived = tuple(object_store.load_archived_objects())
                 extraction = multimodal_extractor.extract_evidence(item)
+                working_set = object_store.load_active_working_set(
+                    candidate_objects=(extraction.episode, *extraction.candidate_objects),
+                    event_ids=(extraction.turn_id,),
+                )
+                existing_objects = working_set.objects
+                existing_conflicts = working_set.conflicts
                 result = consolidator.consolidate(
                     extraction=extraction,
                     existing_objects=existing_objects,
@@ -212,7 +238,12 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                 )
                 try:
                     reflection = reflector.reflect(
-                        objects=current_objects,
+                        objects=tuple(
+                            select_reflection_neighborhood_objects(
+                                object_store,
+                                seed_objects=current_objects,
+                            )
+                        ),
                         include_midterm=LongTermMemoryServicePersistenceMixin._should_include_midterm_in_multimodal_reflection(result),
                     )
                 except Exception:
@@ -224,7 +255,15 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         reflection=reflection,
                     )
                 try:
-                    sensor_reflection = sensor_memory.compile(objects=current_objects, now=created_at)
+                    sensor_reflection = sensor_memory.compile(
+                        objects=tuple(
+                            select_sensor_memory_neighborhood_objects(
+                                object_store,
+                                seed_objects=current_objects,
+                            )
+                        ),
+                        now=created_at,
+                    )
                 except Exception:
                     logger.exception("Sensor-memory compilation failed during multimodal persistence.")
                 else:
@@ -238,13 +277,14 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     retention_policy=retention_policy,
                     objects=current_objects,
                 )
-                object_store.write_snapshot(
-                    objects=_sort_objects_by_memory_id(retention.kept_objects),
-                    conflicts=current_conflicts,
-                    archived_objects=LongTermMemoryServicePersistenceMixin._merge_archived_objects(
-                        existing_archived=existing_archived,
-                        archived_updates=retention.archived_objects,
+                object_store.commit_active_delta(
+                    object_upserts=_sort_objects_by_memory_id(retention.kept_objects),
+                    object_delete_ids=LongTermMemoryServicePersistenceMixin._retention_deleted_memory_ids(
+                        current_objects=current_objects,
+                        retention=retention,
                     ),
+                    conflict_upserts=current_conflicts,
+                    archive_upserts=retention.archived_objects,
                 )
                 if LongTermMemoryServicePersistenceMixin._has_reflection_payload(reflection):
                     midterm_store.apply_reflection(reflection)
@@ -419,6 +459,45 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
         for archived_item in archived_updates:
             archived[archived_item.memory_id] = archived_item
         return _sort_objects_by_memory_id(archived.values())
+
+    @staticmethod
+    def _merge_unique_objects(
+        *object_groups: Iterable[Any],
+    ) -> tuple[Any, ...]:
+        """Return unique objects keyed by memory id while preserving first-seen order."""
+
+        merged: dict[str, Any] = {}
+        for group in object_groups:
+            for item in group:
+                memory_id = getattr(item, "memory_id", None)
+                if not isinstance(memory_id, str) or not memory_id:
+                    continue
+                if memory_id not in merged:
+                    merged[memory_id] = item
+        return tuple(merged.values())
+
+    @staticmethod
+    def _retention_deleted_memory_ids(
+        *,
+        current_objects: Iterable[Any],
+        retention: LongTermRetentionResultV1,
+    ) -> tuple[str, ...]:
+        """Return touched current memory ids removed by one retention pass."""
+
+        kept_ids = {item.memory_id for item in retention.kept_objects}
+        deleted_ids = [
+            item.memory_id
+            for item in current_objects
+            if item.memory_id not in kept_ids
+        ]
+        deleted_ids.extend(retention.pruned_memory_ids)
+        return tuple(
+            dict.fromkeys(
+                memory_id
+                for memory_id in deleted_ids
+                if isinstance(memory_id, str) and memory_id
+            )
+        )
 
     @staticmethod
     def _clone_local_memory_store(memory_store: Any) -> Any | None:

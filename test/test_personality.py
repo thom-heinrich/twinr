@@ -28,11 +28,33 @@ from twinr.agent.base_agent.prompting.personality import (
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
-        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.required = False
+        self.namespace = "test-namespace"
+        self.load_error: Exception | None = None
+        self.client = _FakeCatalogClient(remote_state=self)
+        self.read_client = self.client
+        self.write_client = self.client
+        self.config = SimpleNamespace(
+            long_term_memory_migration_enabled=False,
+            long_term_memory_migration_batch_size=64,
+            long_term_memory_remote_read_timeout_s=8.0,
+            long_term_memory_remote_write_timeout_s=15.0,
+            long_term_memory_remote_flush_timeout_s=60.0,
+            long_term_memory_remote_bulk_request_max_bytes=512 * 1024,
+            long_term_memory_remote_shard_max_content_chars=1000,
+            long_term_memory_remote_max_content_chars=2_000_000,
+            long_term_memory_remote_read_cache_ttl_s=0.0,
+        )
         self.snapshots: dict[str, dict[str, object]] = {}
+
+    def _record_snapshot_access(self, snapshot_kind: str) -> None:
+        del snapshot_kind
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         del local_path
+        self._record_snapshot_access(snapshot_kind)
+        if self.load_error is not None:
+            raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
 
@@ -41,11 +63,9 @@ class _FakeRemoteState:
 
 
 class _FailingRemoteState(_FakeRemoteState):
-    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
-        del local_path
-        raise LongTermRemoteUnavailableError(
-            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
-        )
+    def __init__(self) -> None:
+        super().__init__()
+        self.load_error = LongTermRemoteUnavailableError("Failed to read remote long-term current head: status=503")
 
 
 class _CountingRemoteState(_FakeRemoteState):
@@ -53,9 +73,57 @@ class _CountingRemoteState(_FakeRemoteState):
         super().__init__()
         self.load_calls: list[str] = []
 
-    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+    def _record_snapshot_access(self, snapshot_kind: str) -> None:
         self.load_calls.append(snapshot_kind)
-        return super().load_snapshot(snapshot_kind=snapshot_kind, local_path=local_path)
+
+
+class _FakeCatalogClient:
+    def __init__(self, *, remote_state: _FakeRemoteState) -> None:
+        self._remote_state = remote_state
+        self._next_document_id = 1
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+
+    def _maybe_raise(self) -> None:
+        error = self._remote_state.load_error
+        if error is not None:
+            raise error
+
+    def store_records_bulk(self, request):
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        self._maybe_raise()
+        record = None
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+        elif isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+        if record is None:
+            raise LongTermRemoteUnavailableError("remote document unavailable")
+        snapshot_kind = str((record.get("metadata") or {}).get("twinr_snapshot_kind") or "").strip()
+        if snapshot_kind:
+            self._remote_state._record_snapshot_access(snapshot_kind)
+        return dict(record)
 
 
 def _section_marker(title: str, authority: str) -> str:
@@ -678,17 +746,15 @@ class PersonalityTests(unittest.TestCase):
             ):
                 first = load_tool_loop_instructions(config)
                 first_remote_calls = len(remote_state.load_calls)
-                remote_state.snapshots["user_context"] = {
-                    "schema": "twinr_managed_context",
-                    "version": 1,
-                    "entries": [
-                        {
-                            "key": "pets",
-                            "instruction": "Thom now also helps his daughter with her cat.",
-                            "updated_at": "2026-03-21T20:15:00+00:00",
-                        }
-                    ],
-                }
+                ManagedContextFileStore(
+                    personality_dir / "USER.md",
+                    section_title="Twinr managed user updates",
+                    remote_state=remote_state,
+                    remote_snapshot_kind="user_context",
+                ).upsert(
+                    category="pets",
+                    instruction="Thom now also helps his daughter with her cat.",
+                )
                 hints_path = remote_snapshot_document_hints_path(config)
                 assert hints_path is not None
                 hints_path.parent.mkdir(parents=True, exist_ok=True)

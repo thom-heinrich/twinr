@@ -9,6 +9,7 @@ owned_concerns:
   - Build provider and tool-facing long-term memory context for runtime prompts
   - Build one bounded fast-topic provider context for latency-sensitive answer lanes and preserve precise required-remote read-failure semantics on that hot path
   - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
+  - Centralize bounded query-first object selectors for live-near discovery, reserve, proactive, reflection, sensor-memory, and restart-recall reads
   - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
   - Route consolidated turns and post-turn tool history into the structured personality-learning service
   - Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh and recalibration into the structured personality-learning service
@@ -30,6 +31,8 @@ files:
       - LongTermMemoryService
       - LongTermRemoteReadinessResult
       - LongTermRemoteReadinessStep
+  - path: live_object_selectors.py
+    role: Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads
   - path: service_impl/README.md
     role: Internal map of the refactored service implementation package
   - path: service_impl/main.py
@@ -50,13 +53,13 @@ files:
   - path: service_impl/ingestion.py
     role: Conversation/multimodal enqueue paths and dry-run analysis entry points
   - path: service_impl/maintenance.py
-    role: Reflection, sensor-memory, ops backfill, and retention orchestration
+    role: Reflection, sensor-memory, ops backfill, and retention orchestration over shared query-first live object slices
   - path: service_impl/proactive.py
-    role: Proactive planning, reservation, and delivery/skip state transitions
+    role: Proactive planning, reservation, and delivery/skip state transitions over shared query-first planner selectors
   - path: service_impl/mutations.py
     role: Conflict resolution, review, and prompt-context mutation entry points
   - path: service_impl/lifecycle.py
-    role: Flush and shutdown orchestration for bounded background writers
+    role: Flush and shutdown orchestration for bounded background writers plus query-first restart-recall refresh
   - path: service_impl/persistence.py
     role: Static persistence pipeline helpers and multimodal/ops payload sanitization
   - path: worker.py
@@ -101,4 +104,5 @@ tests:
   - path: test/test_longterm_memory.py
   - path: test/test_longterm_multimodal.py
   - path: test/test_longterm_proactive.py
+  - path: test/test_longterm_runtime_query_selectors.py
   - path: test/test_longterm_remote_state.py

@@ -187,7 +187,11 @@ class LongTermMemoryServiceIngestionMixin(ServiceMixinBase):
             modality=modality,
         )
         with self._store_lock:
-            existing_objects = tuple(self.object_store.load_objects())
+            working_set = self.object_store.load_active_working_set(
+                candidate_objects=(extraction.episode, *extraction.candidate_objects),
+                event_ids=(extraction.turn_id,),
+            )
+            existing_objects = working_set.objects
         return self.consolidator.consolidate(
             extraction=extraction,
             existing_objects=existing_objects,
@@ -213,7 +217,11 @@ class LongTermMemoryServiceIngestionMixin(ServiceMixinBase):
         )
         extraction = self.multimodal_extractor.extract_evidence(evidence)
         with self._store_lock:
-            existing_objects = tuple(self.object_store.load_objects())
+            working_set = self.object_store.load_active_working_set(
+                candidate_objects=(extraction.episode, *extraction.candidate_objects),
+                event_ids=(extraction.turn_id,),
+            )
+            existing_objects = working_set.objects
         return self.consolidator.consolidate(
             extraction=extraction,
             existing_objects=existing_objects,

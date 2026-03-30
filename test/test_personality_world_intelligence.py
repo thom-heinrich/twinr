@@ -38,6 +38,7 @@ from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
 class _FakeRemoteState:
@@ -45,12 +46,20 @@ class _FakeRemoteState:
 
     def __init__(self) -> None:
         self.enabled = True
+        self.required = False
+        self.namespace = "test-namespace"
+        self.load_error: Exception | None = None
+        self.client = _FakeCatalogClient(remote_state=self)
+        self.read_client = self.client
+        self.write_client = self.client
         self.snapshots: dict[str, dict[str, object]] = {}
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         """Return one saved snapshot payload when present."""
 
         del local_path
+        if self.load_error is not None:
+            raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         if payload is None:
             return None
@@ -60,6 +69,53 @@ class _FakeRemoteState:
         """Persist one snapshot payload in memory."""
 
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FakeCatalogClient:
+    def __init__(self, *, remote_state: _FakeRemoteState) -> None:
+        self._remote_state = remote_state
+        self._next_document_id = 1
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+
+    def _maybe_raise(self) -> None:
+        error = self._remote_state.load_error
+        if error is not None:
+            raise error
+
+    def store_records_bulk(self, request):
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        self._maybe_raise()
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+            if record is not None:
+                return dict(record)
+        if isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+            if record is not None:
+                return dict(record)
+        raise LongTermRemoteUnavailableError("remote document unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,8 +235,14 @@ class WorldIntelligenceTests(unittest.TestCase):
             remote_state=remote_state,
         )
 
-        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema_version"], 2)
-        self.assertEqual(remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]["schema_version"], 2)
+        self.assertEqual(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema"],
+            "twinr_world_intelligence_subscription_catalog_v3",
+        )
+        self.assertEqual(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]["schema"],
+            "twinr_world_intelligence_state_catalog_v3",
+        )
         self.assertEqual(loaded_subscriptions[0].label, "Hamburg local politics")
         self.assertEqual(loaded_subscriptions[0].topics, ("local politics", "transit"))
         self.assertEqual(loaded_state.last_discovery_query, "hamburg local politics rss")
@@ -546,6 +608,22 @@ class WorldIntelligenceTests(unittest.TestCase):
         )
         self.assertEqual(refresh.world_signals[0].topic, "New district transit funding package advances")
         self.assertAlmostEqual(updated_state.interest_signals[0].engagement_score, 0.84)
+
+    def test_load_state_does_not_promote_legacy_snapshot_on_read(self) -> None:
+        remote_state = _FakeRemoteState()
+        state = WorldIntelligenceState(
+            last_refreshed_at="2026-03-20T12:00:00Z",
+        )
+        remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND] = state.to_payload()
+
+        loaded = RemoteStateWorldIntelligenceStore().load_state(
+            config=TwinrConfig(project_root="."),
+            remote_state=remote_state,
+        )
+
+        self.assertEqual(loaded.last_refreshed_at, "2026-03-20T12:00:00Z")
+        self.assertEqual(remote_state.client.records_by_document_id, {})
+        self.assertEqual(remote_state.client.records_by_uri, {})
 
     def test_refresh_builds_and_updates_situational_awareness_threads(self) -> None:
         remote_state = _FakeRemoteState()
@@ -1357,9 +1435,7 @@ class WorldIntelligenceTests(unittest.TestCase):
             ),
         )
 
-        state = WorldIntelligenceState.from_payload(
-            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]
-        )
+        state = learning.world_intelligence.store.load_state(config=config, remote_state=remote_state)
         self.assertEqual(len(state.interest_signals), 1)
         self.assertEqual(state.interest_signals[0].topic, "local politics")
         self.assertEqual(state.interest_signals[0].region, "Hamburg")
@@ -1434,9 +1510,7 @@ class WorldIntelligenceTests(unittest.TestCase):
                 ),
             )
 
-        state = WorldIntelligenceState.from_payload(
-            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]
-        )
+        state = learning.world_intelligence.store.load_state(config=config, remote_state=remote_state)
         signals_by_topic = {signal.topic: signal for signal in state.interest_signals}
 
         self.assertIn("AI companions", signals_by_topic)

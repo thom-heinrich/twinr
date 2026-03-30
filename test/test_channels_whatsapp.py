@@ -120,6 +120,9 @@ class _FakeRuntime:
     def provider_conversation_context(self):
         return (("system", "memory context"), *tuple(self._conversation_turns))
 
+    def provider_text_surface_conversation_context(self):
+        return self.provider_conversation_context()
+
     def complete_agent_turn(self, answer: str, *, source: str = "conversation", modality: str = "voice"):
         self.events.append(("complete_agent_turn", answer, source, modality))
         if self.last_transcript:
@@ -156,6 +159,9 @@ class _FakeToolRuntime(_FakeRuntime):
     def tool_provider_conversation_context(self):
         self.events.append(("tool_provider_conversation_context", "done"))
         return (("system", "tool memory context"), *tuple(self._conversation_turns))
+
+    def tool_provider_text_surface_conversation_context(self):
+        return self.tool_provider_conversation_context()
 
     def lookup_contact(
         self,
@@ -954,6 +960,44 @@ class WhatsAppChannelTests(unittest.TestCase):
             [("Hallo Twinr", (("system", "memory context"),), None)],
         )
 
+    def test_text_channel_turn_service_adds_recent_thread_carryover_guidance(self) -> None:
+        runtime = _FakeRuntime()
+        runtime._conversation_turns = [
+            ("user", "Wie spaet ist es in New York?"),
+            ("assistant", "In New York ist es gerade 10:53 Uhr am 29. Maerz 2026."),
+        ]
+        backend = _FakeBackend()
+        service = TwinrTextChannelTurnService(runtime=runtime, backend=backend)
+
+        service.handle_inbound(self._message(text="Ich meinte, wie spaet es ist."))
+
+        conversation = backend.calls[0][1]
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Recent thread carryover for this turn." in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
+
+    def test_text_channel_turn_service_uses_recent_thread_rewritten_prompt(self) -> None:
+        runtime = _FakeRuntime()
+        backend = _FakeBackend()
+        service = TwinrTextChannelTurnService(runtime=runtime, backend=backend)
+
+        with patch(
+            "twinr.channels.runtime.maybe_rewrite_prompt_against_recent_thread",
+            return_value=SimpleNamespace(
+                original_prompt="Ich meinte, wie spaet es ist.",
+                effective_prompt="Wie spaet ist es in New York?",
+                resolution="rewrite",
+            ),
+        ):
+            service.handle_inbound(self._message(text="Ich meinte, wie spaet es ist."))
+
+        self.assertEqual(backend.calls[0][0], "Wie spaet ist es in New York?")
+
     def test_text_channel_turn_service_warms_memory_before_live_turns_when_available(self) -> None:
         runtime = _FakeRuntime()
         backend = _FakeBackend()
@@ -1022,6 +1066,94 @@ class WhatsAppChannelTests(unittest.TestCase):
         self.assertIn("Because this turn came through WhatsApp", str(provider.start_calls[0]["instructions"]))
         self.assertIn("more detailed and explicit than in voice", str(provider.start_calls[0]["instructions"]))
         dispatch_mock.assert_called_once()
+
+    def test_tool_text_channel_turn_service_adds_recent_thread_carryover_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            auth_dir = root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            worker_root.mkdir(parents=True, exist_ok=True)
+            (auth_dir / "creds.json").write_text("{\"me\":{}}\n", encoding="utf-8")
+            (worker_root / "package.json").write_text("{\"name\":\"worker\"}\n", encoding="utf-8")
+            config = _test_twinr_whatsapp_config(root)
+            runtime = _FakeToolRuntime(config)
+            runtime._conversation_turns = [
+                ("user", "Wie spaet ist es in New York?"),
+                ("assistant", "In New York ist es gerade 10:53 Uhr am 29. Maerz 2026."),
+            ]
+            provider = _FakeToolAgentProvider(config)
+            service = TwinrToolTextChannelTurnService(
+                runtime=runtime,
+                tool_agent_provider=provider,
+                print_backend=SimpleNamespace(config=config),
+            )
+
+            with patch(
+                "twinr.channels.tool_runtime.dispatch_whatsapp_outbound_message",
+                return_value=SimpleNamespace(
+                    ok=True,
+                    status="sent",
+                    message_id="wa-tool-1",
+                    error_code=None,
+                    error=None,
+                ),
+            ):
+                service.handle_inbound(
+                    self._message(text="Schreib Anna auf WhatsApp, dass sie den Schluessel mitbringen soll.")
+                )
+
+        conversation = provider.start_calls[0]["conversation"]
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Recent thread carryover for this turn." in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
+
+    def test_tool_text_channel_turn_service_uses_recent_thread_rewritten_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            auth_dir = root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            worker_root.mkdir(parents=True, exist_ok=True)
+            (auth_dir / "creds.json").write_text("{\"me\":{}}\n", encoding="utf-8")
+            (worker_root / "package.json").write_text("{\"name\":\"worker\"}\n", encoding="utf-8")
+            config = _test_twinr_whatsapp_config(root)
+            runtime = _FakeToolRuntime(config)
+            provider = _FakeToolAgentProvider(config)
+            service = TwinrToolTextChannelTurnService(
+                runtime=runtime,
+                tool_agent_provider=provider,
+                print_backend=SimpleNamespace(config=config),
+            )
+
+            with (
+                patch(
+                    "twinr.channels.tool_runtime.dispatch_whatsapp_outbound_message",
+                    return_value=SimpleNamespace(
+                        ok=True,
+                        status="sent",
+                        message_id="wa-tool-1",
+                        error_code=None,
+                        error=None,
+                    ),
+                ),
+                patch(
+                    "twinr.channels.tool_runtime.maybe_rewrite_prompt_against_recent_thread",
+                    return_value=SimpleNamespace(
+                        original_prompt="Ich meinte, wie spaet es ist.",
+                        effective_prompt="Wie spaet ist es in New York?",
+                        resolution="rewrite",
+                    ),
+                ),
+            ):
+                service.handle_inbound(self._message(text="Ich meinte, wie spaet es ist."))
+
+        self.assertEqual(provider.start_calls[0]["prompt"], "Wie spaet ist es in New York?")
 
     def test_tool_text_channel_turn_service_uses_direct_whatsapp_dispatcher_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,3 +1,16 @@
+# CHANGELOG: 2026-03-30
+# BUG-1: Fixed stale/latest-exchange selection so print fallback no longer grabs an older assistant reply when the newest turn is user-only or assistant commentary.
+# BUG-2: Fixed prompt-field sanitization so stripped newlines become spaces instead of silently merging words and corrupting prompts.
+# BUG-3: Fixed "bounded timeout" behavior by disabling implicit SDK retries for print calls; print latency now respects the configured timeout budget much more closely.
+# BUG-4: Removed the second network round-trip from the fallback path; when model output is unusable, the mixin now falls back locally and deterministically.
+# SEC-1: Disabled server-side response storage for print requests (`store=False`) so sensitive senior-assistance content is not persisted unnecessarily.
+# SEC-2: Added hard caps for scanned conversation items and raw input size to reduce practical CPU/RAM denial-of-service risk on Raspberry Pi deployments.
+# IMP-1: Upgraded print generation to Structured Outputs (`text.format` with strict JSON Schema) plus low verbosity, matching current Responses API best practice.
+# IMP-2: Preserved 2026 assistant `phase` semantics by ignoring commentary-only assistant updates when selecting printable content.
+# IMP-3: Switched to per-request `with_options(timeout=..., max_retries=0)` where available, with compatibility fallbacks for older clients.
+# IMP-4: Added deterministic local compaction, sentence-aware segmentation, Unicode normalization, and bounded config values for safer receipt formatting.
+# IMP-5: Added optional dedicated `config.print_model` support, while remaining drop-in compatible with `config.default_model`.
+
 """Compose and sanitize Twinr print output through OpenAI.
 
 This module keeps thermal-printer-specific prompt construction, text
@@ -7,9 +20,16 @@ used by the rest of the OpenAI backend package.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import unicodedata
+from collections import deque
+from collections.abc import Mapping, Sequence
+from itertools import islice
 from typing import Any
+
+import httpx
 
 from twinr.ops.usage import extract_model_name, extract_token_usage
 
@@ -18,6 +38,11 @@ from ..core.types import ConversationLike, OpenAITextResponse
 
 
 _LOG = logging.getLogger(__name__)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[^\s])")
+
+
+class _NoPrintableContentError(RuntimeError):
+    """Raised when no safe printable content is available."""
 
 
 class OpenAIPrintMixin:
@@ -27,15 +52,36 @@ class OpenAIPrintMixin:
     runtime can always fall back to a local path when model output is unusable.
     """
 
-    # AUDIT-FIX(#6): Clamp invalid or missing print-related config values to safe defaults for Python 3.11 / .env resilience.
     _DEFAULT_PRINT_MAX_LINES = 8
     _DEFAULT_PRINT_MAX_CHARS = 240
     _DEFAULT_PRINT_CONTEXT_TURNS = 6
     _DEFAULT_PRINT_MODEL_TIMEOUT_SECONDS = 12.0
+    _DEFAULT_PRINT_MODEL_MAX_RETRIES = 0
+    _DEFAULT_PRINT_INPUT_CHAR_LIMIT = 16_000
+    _DEFAULT_PRINT_SCAN_ITEMS = 128
+    _DEFAULT_PRINT_MODEL = "gpt-5.4-mini"
 
-    # AUDIT-FIX(#8): Use senior-safe low-jargon errors when nothing printable is available or preparation fails.
     _EMPTY_PRINT_ERROR = "There is nothing ready to print yet."
     _PREPARE_PRINT_ERROR = "I couldn't prepare that for printing."
+
+    _LOW_INFORMATION_PRINT_MARKERS = frozenset(
+        {
+            "ok",
+            "okay",
+            "done",
+            "ready",
+            "printed",
+            "print",
+            "yes",
+            "no",
+            "sure",
+            "thanks",
+            "thank you",
+            "youre welcome",
+            "you're welcome",
+            "working on it",
+        }
+    )
 
     def format_for_print(self, text: str) -> str:
         """Return printer-ready text without OpenAI metadata."""
@@ -55,29 +101,37 @@ class OpenAIPrintMixin:
             RuntimeError: If no safe printable output can be prepared.
         """
 
-        # AUDIT-FIX(#1): Always sanitize printable content and keep a deterministic local fallback so the public formatter cannot emit raw/unsafe printer text.
-        safe_input_text = self._coerce_optional_text(text)
+        safe_input_text = self._bounded_runtime_text(text, self._print_input_char_limit())
         fallback_text, fallback_error = self._try_sanitize_print_text(safe_input_text)
+
         request: dict[str, Any] | None = None
+        response: Any | None = None
         try:
             request = self._build_response_request(
                 safe_input_text,
                 instructions=PRINT_FORMATTER_INSTRUCTIONS,
                 allow_web_search=False,
-                model=self.config.default_model,
+                model=self._print_model_name(),
                 reasoning_effort="low",
                 max_output_tokens=140,
             )
-            # AUDIT-FIX(#2): Route model calls through a best-effort timeout wrapper instead of making an unbounded blocking network call directly.
-            response = self._responses_create(request)
-            final_text = self._sanitize_print_text(self._extract_output_text(response))
+            request = self._prepare_print_request(request)
+            response, request, structured_used = self._create_print_response(
+                request,
+                stage="format_for_print_with_metadata",
+            )
+            final_text = self._sanitize_print_text(
+                self._extract_print_text_from_response(
+                    response,
+                    structured_expected=structured_used,
+                )
+            )
             return self._build_print_text_response(
                 text=final_text,
                 response=response,
                 request=request,
             )
         except Exception as exc:
-            # AUDIT-FIX(#2): Degrade gracefully to deterministic formatting when the model stack or metadata extraction fails.
             self._log_print_failure("format_for_print_with_metadata", exc)
             if fallback_text:
                 return self._build_print_text_response(
@@ -129,9 +183,7 @@ class OpenAIPrintMixin:
             RuntimeError: If no printable content can be prepared.
         """
 
-        # AUDIT-FIX(#5): Materialize conversation once so generators are not exhausted and malformed state cannot desynchronize prompt/fallback/context handling.
         materialized_conversation = self._materialize_conversation(conversation)
-        # AUDIT-FIX(#5): Normalize request_source defensively because callers may pass None/non-str values from external state or endpoints.
         normalized_request_source = self._normalize_request_source(request_source)
 
         literal_tool_text = self._literal_tool_print_text(
@@ -152,6 +204,7 @@ class OpenAIPrintMixin:
             request_source=normalized_request_source,
         )
         fallback_source = self._fallback_print_source(materialized_conversation, direct_text)
+        fallback_text, fallback_error = self._try_sanitize_print_text(fallback_source)
 
         request: dict[str, Any] | None = None
         response: Any | None = None
@@ -164,15 +217,20 @@ class OpenAIPrintMixin:
                 conversation=self._limit_print_conversation(materialized_conversation),
                 instructions=self._print_composer_instructions(),
                 allow_web_search=False,
-                model=self.config.default_model,
+                model=self._print_model_name(),
                 reasoning_effort="medium",
                 max_output_tokens=180,
             )
-            # AUDIT-FIX(#2): Apply the same bounded/best-effort model call wrapper to the composer path.
-            response = self._responses_create(request)
-            candidate_text, candidate_error = self._try_sanitize_print_text(self._extract_output_text(response))
+            request = self._prepare_print_request(request)
+            response, request, structured_used = self._create_print_response(
+                request,
+                stage="compose_print_job_with_metadata",
+            )
+            candidate_text, candidate_error = self._try_extract_and_sanitize_print_text(
+                response,
+                structured_expected=structured_used,
+            )
         except Exception as exc:
-            # AUDIT-FIX(#2): Convert transport/parsing failures into graceful fallback instead of crashing the print flow.
             self._log_print_failure("compose_print_job_with_metadata", exc)
             candidate_error = RuntimeError(self._PREPARE_PRINT_ERROR)
 
@@ -183,18 +241,12 @@ class OpenAIPrintMixin:
                 request=request,
             )
 
-        if fallback_source:
-            try:
-                fallback_response = self.format_for_print_with_metadata(fallback_source)
-                # AUDIT-FIX(#3): When fallback text is used, return metadata for the response that actually produced the final print text.
-                return fallback_response
-            except RuntimeError:
-                if candidate_text:
-                    return self._build_print_text_response(
-                        text=candidate_text,
-                        response=response,
-                        request=request,
-                    )
+        if fallback_text:
+            return self._build_print_text_response(
+                text=fallback_text,
+                response=None,
+                request=request,
+            )
 
         if candidate_text:
             return self._build_print_text_response(
@@ -205,6 +257,8 @@ class OpenAIPrintMixin:
 
         if candidate_error is not None:
             raise candidate_error
+        if fallback_error is not None:
+            raise fallback_error
         raise RuntimeError(self._EMPTY_PRINT_ERROR)
 
     def _print_composer_instructions(self) -> str:
@@ -212,8 +266,10 @@ class OpenAIPrintMixin:
 
         return (
             f"{PRINT_COMPOSER_INSTRUCTIONS} "
+            "Ignore assistant commentary updates and prefer the latest completed assistant answer "
+            "for the latest user turn. "
             f"Never exceed {self._print_max_lines()} lines or {self._print_max_chars()} characters. "
-            "If there is no clear printable content, return exactly: NO_PRINT_CONTENT"
+            "If there is no clear printable content, return status=no_print in the requested schema."
         )
 
     def _build_print_composer_prompt(
@@ -226,10 +282,9 @@ class OpenAIPrintMixin:
     ) -> str:
         """Build the model prompt used to compose receipt text."""
 
-        # AUDIT-FIX(#4): Bound all prompt fields, including the latest exchange, so long replies cannot blow up latency, cost, or context limits.
         safe_focus_hint = self._clip_prompt_field(focus_hint, 240)
         safe_direct_text = self._clip_prompt_field(
-            direct_text,
+            self._bounded_runtime_text(direct_text, self._print_input_char_limit()),
             min(max(self._print_max_chars() * 2, 240), 4000),
         )
         latest_user, latest_assistant = self._latest_print_exchange(conversation)
@@ -257,37 +312,49 @@ class OpenAIPrintMixin:
     def _sanitize_print_text(self, text: str) -> str:
         """Normalize model or tool text into receipt-safe output."""
 
-        # AUDIT-FIX(#1): Strip unsafe control / format characters so model text or tool text cannot inject ESC/POS commands or bidi spoofing into printer output.
         normalized = self._strip_unsafe_print_text(text, preserve_newlines=True).strip()
-        # AUDIT-FIX(#9): Treat common sentinel variants as empty content so the literal marker never reaches the printer.
         if self._is_no_print_content_marker(normalized):
-            raise RuntimeError(self._EMPTY_PRINT_ERROR)
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
 
-        cleaned_lines: list[str] = []
-        for raw_line in normalized.split("\n"):
-            compact = " ".join(raw_line.strip().split())
-            if compact:
-                cleaned_lines.append(compact)
-
-        if not cleaned_lines:
-            raise RuntimeError(self._EMPTY_PRINT_ERROR)
+        segments = self._normalize_print_segments(normalized)
+        if not segments:
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
 
         max_lines = self._print_max_lines()
         max_chars = self._print_max_chars()
 
-        truncated = len(cleaned_lines) > max_lines
-        cleaned_lines = cleaned_lines[:max_lines]
-        result = "\n".join(cleaned_lines)
-        if len(result) > max_chars:
-            result = result[:max_chars].rstrip()
+        lines: list[str] = []
+        truncated = False
+
+        for segment in segments:
+            if len(lines) >= max_lines:
+                truncated = True
+                break
+
+            proposed = "\n".join(lines + [segment]).strip()
+            if proposed and len(proposed) <= max_chars:
+                lines.append(segment)
+                continue
+
+            remaining_chars = max_chars - len("\n".join(lines))
+            if lines:
+                remaining_chars -= 1
+            fitted = self._fit_segment_to_budget(segment, remaining_chars)
+            if fitted:
+                lines.append(fitted)
             truncated = True
-        if truncated and result and not result.endswith("…"):
-            if len(result) >= max_chars:
-                result = result[:-1].rstrip()
-            result = result.rstrip(" .") + "…"
+            break
+
+        result = "\n".join(lines).strip()
+        if not result:
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
+
+        if truncated:
+            result = self._append_print_ellipsis(result, max_chars)
+
         result = result.strip()
         if not result:
-            raise RuntimeError(self._EMPTY_PRINT_ERROR)
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
         return result
 
     def _try_sanitize_print_text(self, text: str) -> tuple[str, RuntimeError | None]:
@@ -299,26 +366,56 @@ class OpenAIPrintMixin:
             return "", exc
 
     def _latest_print_exchange(self, conversation: ConversationLike | None) -> tuple[str | None, str | None]:
-        """Return the latest user and assistant text visible for printing."""
+        """Return the latest user text and its latest completed assistant answer."""
 
-        latest_user: str | None = None
-        latest_assistant: str | None = None
         if not conversation:
             return None, None
-        for item in conversation:
+
+        parsed_messages: list[tuple[str, str, str, int]] = []
+        for index, item in enumerate(conversation):
             try:
-                # AUDIT-FIX(#5): Skip malformed conversation items instead of letting one corrupt record break the entire print path.
-                role, content, _phase = self._coerce_message(item)
+                role, content, phase = self._coerce_message(item)
             except Exception as exc:
                 self._log_print_failure("_latest_print_exchange", exc)
                 continue
+
             normalized_role = self._coerce_optional_text(role).strip().lower()
-            normalized_content = self._coerce_optional_text(content).strip()
-            if normalized_role == "user" and normalized_content:
-                latest_user = normalized_content
-            elif normalized_role == "assistant" and normalized_content:
-                latest_assistant = normalized_content
-        return latest_user, latest_assistant
+            normalized_content = self._bounded_runtime_text(content, self._print_input_char_limit()).strip()
+            normalized_phase = self._coerce_optional_text(phase).strip().lower()
+
+            if normalized_role not in {"user", "assistant"} or not normalized_content:
+                continue
+            parsed_messages.append((normalized_role, normalized_content, normalized_phase, index))
+
+        if not parsed_messages:
+            return None, None
+
+        latest_user: tuple[str, str, str, int] | None = None
+        for message in reversed(parsed_messages):
+            if message[0] == "user":
+                latest_user = message
+                break
+
+        if latest_user is not None:
+            latest_user_index = latest_user[3]
+            assistant_after_user = [
+                message
+                for message in parsed_messages
+                if message[0] == "assistant" and message[3] > latest_user_index
+            ]
+            final_assistant_after_user = [
+                message for message in assistant_after_user if message[2] == "final_answer"
+            ]
+            if final_assistant_after_user:
+                return latest_user[1], final_assistant_after_user[-1][1]
+            if assistant_after_user:
+                return latest_user[1], assistant_after_user[-1][1]
+            return latest_user[1], None
+
+        assistant_messages = [message for message in parsed_messages if message[0] == "assistant"]
+        final_assistants = [message for message in assistant_messages if message[2] == "final_answer"]
+        assistant = final_assistants[-1] if final_assistants else assistant_messages[-1]
+        return None, assistant[1]
 
     def _fallback_print_source(
         self,
@@ -327,10 +424,10 @@ class OpenAIPrintMixin:
     ) -> str:
         """Select the best local fallback source for print formatting."""
 
-        if self._coerce_optional_text(direct_text).strip():
-            return self._coerce_optional_text(direct_text).strip()
+        clean_direct_text = self._bounded_runtime_text(direct_text, self._print_input_char_limit()).strip()
+        if clean_direct_text:
+            return clean_direct_text
         latest_user, latest_assistant = self._latest_print_exchange(conversation)
-        # AUDIT-FIX(#4): Fall back to the latest user text when no assistant reply exists yet, instead of failing with an empty print source.
         return (latest_assistant or latest_user or "").strip()
 
     def _literal_tool_print_text(
@@ -343,7 +440,7 @@ class OpenAIPrintMixin:
 
         if self._normalize_request_source(request_source) != "tool":
             return None
-        clean_direct_text = self._coerce_optional_text(direct_text).strip()
+        clean_direct_text = self._bounded_runtime_text(direct_text, self._print_input_char_limit()).strip()
         if not clean_direct_text:
             return None
         sanitized, error = self._try_sanitize_print_text(clean_direct_text)
@@ -358,34 +455,40 @@ class OpenAIPrintMixin:
 
         if not fallback_source:
             return False
-        line_count = len([line for line in candidate_text.splitlines() if line.strip()])
-        candidate_length = len(candidate_text.strip())
-        fallback_length = len(fallback_source.strip())
-        if candidate_length == 0:
-            return True
-        # AUDIT-FIX(#7): Keep concise but valid one-line receipts instead of aggressively replacing them with a longer fallback.
-        if candidate_length <= 8 and fallback_length >= 48:
-            return True
-        if line_count == 0:
-            return True
-        return False
 
-    # AUDIT-FIX(#2): Centralize OpenAI response creation so timeout handling and compatibility fallback are consistent across composer/formatter paths.
+        candidate_clean = candidate_text.strip()
+        if not candidate_clean:
+            return True
+
+        normalized_candidate = self._normalize_low_information_text(candidate_clean)
+        if normalized_candidate in self._LOW_INFORMATION_PRINT_MARKERS:
+            return True
+
+        line_count = len([line for line in candidate_clean.splitlines() if line.strip()])
+        return line_count == 0
+
     def _responses_create(self, request: dict[str, Any]) -> Any:
-        """Create a response for print flows with timeout compatibility fallback."""
+        """Create a response for print flows with bounded timeout handling."""
 
-        timeout_seconds = self._print_model_timeout_seconds()
+        timeout = self._httpx_print_timeout()
+        max_retries = self._print_model_max_retries()
+        client = self._client
+
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            try:
+                return with_options(timeout=timeout, max_retries=max_retries).responses.create(**request)
+            except TypeError as exc:
+                if not self._looks_like_option_signature_issue(exc):
+                    raise
+
         try:
-            return self._client.responses.create(timeout=timeout_seconds, **request)
+            return client.responses.create(timeout=timeout, **request)
         except TypeError as exc:
-            message = str(exc)
-            if "timeout" not in message or not any(
-                token in message for token in ("unexpected keyword", "multiple values")
-            ):
+            if not self._looks_like_option_signature_issue(exc):
                 raise
-            return self._client.responses.create(**request)
+            return client.responses.create(**request)
 
-    # AUDIT-FIX(#3): Build metadata defensively so instrumentation failures do not block printing and returned metadata matches the actual text source.
     def _build_print_text_response(
         self,
         *,
@@ -420,20 +523,37 @@ class OpenAIPrintMixin:
             used_web_search=False,
         )
 
-    # AUDIT-FIX(#5): Materialize iterables once so multi-pass prompt/fallback logic remains stable even if ConversationLike is a generator.
     def _materialize_conversation(self, conversation: ConversationLike | None) -> ConversationLike | None:
-        """Materialize conversation iterables so print logic can traverse twice."""
+        """Materialize recent conversation items while bounding scan cost."""
 
         if conversation is None:
             return None
-        if isinstance(conversation, tuple):
-            return conversation
-        try:
-            return tuple(conversation)
-        except TypeError:
-            return conversation
+        if isinstance(conversation, (str, bytes, bytearray, Mapping)):
+            return None
 
-    # AUDIT-FIX(#5): Normalize potentially non-string inputs from state or web handlers before prompt construction.
+        scan_limit = self._print_scan_items()
+
+        if isinstance(conversation, tuple):
+            return conversation[-scan_limit:]
+        if isinstance(conversation, list):
+            return tuple(conversation[-scan_limit:])
+        if isinstance(conversation, Sequence):
+            try:
+                return tuple(conversation[-scan_limit:])
+            except Exception:
+                pass
+
+        try:
+            iterator = iter(conversation)
+        except TypeError:
+            return None
+
+        hard_limit = max(scan_limit, min(scan_limit * 4, 512))
+        recent_items: deque[Any] = deque(maxlen=scan_limit)
+        for item in islice(iterator, hard_limit):
+            recent_items.append(item)
+        return tuple(recent_items)
+
     def _coerce_optional_text(self, value: object | None) -> str:
         """Convert optional runtime text inputs into safe strings."""
 
@@ -448,7 +568,6 @@ class OpenAIPrintMixin:
         except Exception:
             return ""
 
-    # AUDIT-FIX(#5): Restrict request_source to a short safe token so prompt fields stay predictable and do not throw on None/non-str values.
     def _normalize_request_source(self, request_source: object | None) -> str:
         """Normalize the print request source to a short safe token."""
 
@@ -458,11 +577,13 @@ class OpenAIPrintMixin:
         safe_chars = "".join(ch for ch in normalized if ch.isalnum() or ch in {"_", "-"})
         return safe_chars[:32] or "button"
 
-    # AUDIT-FIX(#4): Clip prompt text deterministically and remove unsafe control characters before embedding model-visible fields.
     def _clip_prompt_field(self, value: object | None, limit: int) -> str:
         """Clip prompt text deterministically after sanitization."""
 
-        clean_text = self._strip_unsafe_print_text(self._coerce_optional_text(value), preserve_newlines=False).strip()
+        clean_text = self._strip_unsafe_print_text(
+            self._bounded_runtime_text(value, self._print_input_char_limit()),
+            preserve_newlines=False,
+        ).strip()
         if limit <= 0:
             return ""
         if len(clean_text) <= limit:
@@ -471,15 +592,18 @@ class OpenAIPrintMixin:
             return "…"
         return clean_text[: limit - 1].rstrip() + "…"
 
-    # AUDIT-FIX(#1): Remove printer-dangerous control chars and invisible format chars while preserving normal line breaks.
     def _strip_unsafe_print_text(self, text: object | None, *, preserve_newlines: bool) -> str:
         """Remove control and format characters from printer-facing text."""
 
-        raw_text = self._coerce_optional_text(text).replace("\r\n", "\n").replace("\r", "\n")
+        raw_text = self._coerce_optional_text(text)
+        raw_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        raw_text = raw_text.replace("\u2028", "\n").replace("\u2029", "\n").replace("\u0085", "\n")
+        raw_text = unicodedata.normalize("NFC", raw_text)
+
         cleaned_characters: list[str] = []
         for character in raw_text:
-            if character == "\n" and preserve_newlines:
-                cleaned_characters.append("\n")
+            if character == "\n":
+                cleaned_characters.append("\n" if preserve_newlines else " ")
                 continue
             if character == "\t":
                 cleaned_characters.append(" ")
@@ -490,60 +614,349 @@ class OpenAIPrintMixin:
             cleaned_characters.append(character)
         return "".join(cleaned_characters)
 
-    # AUDIT-FIX(#9): Detect common model deviations around the NO_PRINT_CONTENT sentinel instead of printing the sentinel literally.
     def _is_no_print_content_marker(self, text: str) -> bool:
         """Return whether text is a normalized ``NO_PRINT_CONTENT`` sentinel."""
 
         marker = "".join(character for character in text.upper() if character.isalnum() or character == "_")
         return marker == "NO_PRINT_CONTENT"
 
-    # AUDIT-FIX(#6): Validate numeric config sourced from .env so bad values do not produce empty receipts or negative slicing behavior.
-    def _positive_int_config(self, name: str, default: int, *, minimum: int = 1) -> int:
-        """Return a positive integer config value or the supplied default."""
+    def _bounded_int_config(
+        self,
+        name: str,
+        default: int,
+        *,
+        minimum: int = 0,
+        maximum: int | None = None,
+    ) -> int:
+        """Return a bounded integer config value or the supplied default."""
 
         value = getattr(self.config, name, default)
         try:
             parsed = int(value)
         except (TypeError, ValueError):
-            return default
-        return max(parsed, minimum)
+            parsed = default
+        parsed = max(parsed, minimum)
+        if maximum is not None:
+            parsed = min(parsed, maximum)
+        return parsed
 
-    # AUDIT-FIX(#2): Validate timeout config so model calls use a sane bounded default when the .env value is absent or invalid.
-    def _positive_float_config(self, name: str, default: float, *, minimum: float = 0.1) -> float:
-        """Return a positive float config value or the supplied default."""
+    def _bounded_float_config(
+        self,
+        name: str,
+        default: float,
+        *,
+        minimum: float = 0.0,
+        maximum: float | None = None,
+    ) -> float:
+        """Return a bounded float config value or the supplied default."""
 
         value = getattr(self.config, name, default)
         try:
             parsed = float(value)
         except (TypeError, ValueError):
-            return default
-        return max(parsed, minimum)
+            parsed = default
+        parsed = max(parsed, minimum)
+        if maximum is not None:
+            parsed = min(parsed, maximum)
+        return parsed
 
     def _print_max_lines(self) -> int:
         """Return the configured maximum number of receipt lines."""
 
-        return self._positive_int_config("print_max_lines", self._DEFAULT_PRINT_MAX_LINES)
+        return self._bounded_int_config(
+            "print_max_lines",
+            self._DEFAULT_PRINT_MAX_LINES,
+            minimum=1,
+            maximum=32,
+        )
 
     def _print_max_chars(self) -> int:
         """Return the configured maximum number of receipt characters."""
 
-        return self._positive_int_config("print_max_chars", self._DEFAULT_PRINT_MAX_CHARS)
+        return self._bounded_int_config(
+            "print_max_chars",
+            self._DEFAULT_PRINT_MAX_CHARS,
+            minimum=8,
+            maximum=2_048,
+        )
 
     def _print_context_turns(self) -> int:
         """Return the configured number of conversation turns kept for print."""
 
-        return self._positive_int_config("print_context_turns", self._DEFAULT_PRINT_CONTEXT_TURNS)
+        return self._bounded_int_config(
+            "print_context_turns",
+            self._DEFAULT_PRINT_CONTEXT_TURNS,
+            minimum=1,
+            maximum=32,
+        )
 
     def _print_model_timeout_seconds(self) -> float:
         """Return the timeout used for print-model requests."""
 
-        return self._positive_float_config(
+        return self._bounded_float_config(
             "print_model_timeout_seconds",
             self._DEFAULT_PRINT_MODEL_TIMEOUT_SECONDS,
+            minimum=0.5,
+            maximum=30.0,
         )
 
-    # AUDIT-FIX(#2): Log failures without printing user content, preserving operator visibility without leaking sensitive text.
+    def _print_model_max_retries(self) -> int:
+        """Return the retry budget for print-model requests."""
+
+        return self._bounded_int_config(
+            "print_model_max_retries",
+            self._DEFAULT_PRINT_MODEL_MAX_RETRIES,
+            minimum=0,
+            maximum=2,
+        )
+
+    def _print_input_char_limit(self) -> int:
+        """Return the maximum raw input characters processed by the print path."""
+
+        return self._bounded_int_config(
+            "print_input_char_limit",
+            self._DEFAULT_PRINT_INPUT_CHAR_LIMIT,
+            minimum=self._print_max_chars(),
+            maximum=64_000,
+        )
+
+    def _print_scan_items(self) -> int:
+        """Return the maximum number of conversation items scanned for printing."""
+
+        return self._bounded_int_config(
+            "print_scan_items",
+            self._DEFAULT_PRINT_SCAN_ITEMS,
+            minimum=max(self._print_context_turns() * 2, 8),
+            maximum=512,
+        )
+
+    def _print_model_name(self) -> str:
+        """Return the model used for print generation."""
+
+        configured = self._coerce_optional_text(getattr(self.config, "print_model", None)).strip()
+        if configured:
+            return configured
+        default_model = self._coerce_optional_text(getattr(self.config, "default_model", None)).strip()
+        return default_model or self._DEFAULT_PRINT_MODEL
+
     def _log_print_failure(self, stage: str, exc: BaseException) -> None:
         """Log bounded print pipeline failures without leaking receipt content."""
 
         _LOG.warning("Print pipeline issue at %s: %s", stage, exc.__class__.__name__)
+
+    def _bounded_runtime_text(self, value: object | None, limit: int) -> str:
+        """Coerce runtime text and bound its size before further processing."""
+
+        text = self._coerce_optional_text(value)
+        if limit <= 0 or len(text) <= limit:
+            return text
+        return text[:limit]
+
+    def _normalize_print_segments(self, text: str) -> list[str]:
+        """Split sanitized text into compact receipt-sized segments."""
+
+        segments: list[str] = []
+        for raw_line in text.split("\n"):
+            compact = " ".join(raw_line.strip().split())
+            if not compact:
+                continue
+            if compact[:1] in {"-", "*", "•", "·"}:
+                segments.append(compact)
+                continue
+            split_segments = [part.strip() for part in _SENTENCE_SPLIT_RE.split(compact) if part.strip()]
+            segments.extend(split_segments or [compact])
+        return segments
+
+    def _fit_segment_to_budget(self, segment: str, budget: int) -> str:
+        """Fit a segment into the remaining character budget."""
+
+        if budget <= 0:
+            return ""
+        if len(segment) <= budget:
+            return segment
+        if budget == 1:
+            return segment[:1]
+
+        clipped = segment[:budget].rstrip()
+        if " " in clipped:
+            clipped = clipped.rsplit(" ", 1)[0].rstrip(" ,;:-")
+        return clipped or segment[:budget].rstrip()
+
+    def _append_print_ellipsis(self, text: str, max_chars: int) -> str:
+        """Append a single ellipsis while preserving the global char limit."""
+
+        result = text.rstrip()
+        if not result:
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
+        if result.endswith("…") and len(result) <= max_chars:
+            return result
+
+        while result and len(result) >= max_chars:
+            result = result[:-1].rstrip()
+        result = result.rstrip(" .")
+        if not result:
+            raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
+        return result + "…"
+
+    def _normalize_low_information_text(self, text: str) -> str:
+        """Normalize a short candidate for low-information checks."""
+
+        collapsed = " ".join(text.strip().split()).lower()
+        return "".join(ch for ch in collapsed if ch.isalnum() or ch.isspace()).strip()
+
+    def _prepare_print_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Apply print-safe Responses API defaults."""
+
+        prepared = dict(request)
+        prepared["model"] = self._print_model_name()
+        prepared["store"] = False
+        prepared["truncation"] = "auto"
+
+        text_config = prepared.get("text")
+        if not isinstance(text_config, dict):
+            text_config = {}
+        else:
+            text_config = dict(text_config)
+        text_config["verbosity"] = "low"
+        prepared["text"] = text_config
+        return prepared
+
+    def _create_print_response(
+        self,
+        request: dict[str, Any],
+        *,
+        stage: str,
+    ) -> tuple[Any, dict[str, Any], bool]:
+        """Create a print response, preferring structured outputs with plain-text fallback."""
+
+        structured_request = self._with_structured_print_format(request)
+        try:
+            return self._responses_create(structured_request), structured_request, True
+        except Exception as exc:
+            if not self._looks_like_structured_output_request_issue(exc):
+                raise
+            self._log_print_failure(f"{stage}:structured_output", exc)
+            plain_request = self._without_structured_print_format(request)
+            return self._responses_create(plain_request), plain_request, False
+
+    def _with_structured_print_format(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Return a request variant that enforces a strict print JSON schema."""
+
+        prepared = self._without_structured_print_format(request)
+        text_config = dict(prepared.get("text") or {})
+        text_config["format"] = {
+            "type": "json_schema",
+            "name": "twinr_print_receipt",
+            "description": "Compact printer-safe receipt content for a thermal printer.",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "no_print"],
+                    },
+                    "text": {
+                        "type": "string",
+                    },
+                },
+                "required": ["status", "text"],
+                "additionalProperties": False,
+            },
+        }
+        prepared["text"] = text_config
+        return prepared
+
+    def _without_structured_print_format(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Return a request variant without JSON-schema formatting."""
+
+        prepared = dict(request)
+        text_config = prepared.get("text")
+        if isinstance(text_config, dict):
+            text_config = dict(text_config)
+            text_config.pop("format", None)
+            prepared["text"] = text_config
+        return prepared
+
+    def _extract_print_text_from_response(self, response: Any, *, structured_expected: bool) -> str:
+        """Extract text from a print response, parsing structured outputs when present."""
+
+        output_text = self._response_output_text(response)
+        if structured_expected:
+            try:
+                payload = json.loads(output_text)
+            except json.JSONDecodeError:
+                return output_text
+            if not isinstance(payload, dict):
+                return output_text
+
+            status = self._coerce_optional_text(payload.get("status")).strip().lower()
+            text = self._coerce_optional_text(payload.get("text"))
+            if status == "no_print":
+                raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
+            if status not in {"", "ready"}:
+                raise RuntimeError(self._PREPARE_PRINT_ERROR)
+            return text or output_text
+
+        return output_text
+
+    def _try_extract_and_sanitize_print_text(
+        self,
+        response: Any,
+        *,
+        structured_expected: bool,
+    ) -> tuple[str, RuntimeError | None]:
+        """Extract response text and sanitize it for printing."""
+
+        try:
+            raw_text = self._extract_print_text_from_response(
+                response,
+                structured_expected=structured_expected,
+            )
+            return self._sanitize_print_text(raw_text), None
+        except RuntimeError as exc:
+            return "", exc
+
+    def _response_output_text(self, response: Any) -> str:
+        """Extract the aggregated output text from a Responses API object."""
+
+        direct_output_text = getattr(response, "output_text", None)
+        if isinstance(direct_output_text, str) and direct_output_text.strip():
+            return direct_output_text
+        try:
+            extracted = self._extract_output_text(response)
+        except Exception as exc:
+            self._log_print_failure("_response_output_text", exc)
+            extracted = direct_output_text
+        return self._coerce_optional_text(extracted)
+
+    def _httpx_print_timeout(self) -> httpx.Timeout:
+        """Return a granular timeout object for print requests."""
+
+        total = self._print_model_timeout_seconds()
+        connect = min(2.0, total)
+        pool = min(2.0, total)
+        write = min(5.0, total)
+        return httpx.Timeout(total, connect=connect, read=total, write=write, pool=pool)
+
+    def _looks_like_option_signature_issue(self, exc: TypeError) -> bool:
+        """Return whether a TypeError likely comes from unsupported request options."""
+
+        message = str(exc).lower()
+        return "timeout" in message or "max_retries" in message or "with_options" in message
+
+    def _looks_like_structured_output_request_issue(self, exc: BaseException) -> bool:
+        """Return whether an exception indicates unsupported structured-output parameters."""
+
+        message = self._coerce_optional_text(exc).lower()
+        hints = (
+            "json_schema",
+            "structured",
+            "text.format",
+            "response_format",
+            "unsupported parameter",
+            "unknown parameter",
+            "invalid schema",
+            "strict",
+        )
+        return any(hint in message for hint in hints)

@@ -804,7 +804,7 @@ class TemporalIdentityFusionTracker:
                         (session_support_ratio, 0.45),
                         (track_support_ratio, 0.4),
                     ),
-                    source="quality_aware_temporal_multimodal_identity_fusion",
+                    source="voice_profile_plus_temporal_portrait_match_plus_track_history_plus_presence_session_memory",
                     requires_confirmation=True,
                 ),
                 **common_decision_fields,

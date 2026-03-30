@@ -7,7 +7,7 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, subtext 
 `evaluation` owns:
 - deterministic evaluation fixture seeding and case definitions
 - execution of synthetic, multimodal, and live subtext evals
-- execution of live midterm write/read/usage attestations against the real OpenAI and ChonkyDB path in an isolated namespace
+- execution of live midterm write/read/usage attestations against the real OpenAI and ChonkyDB path in an isolated namespace, with remote proof taken from the authoritative midterm current head instead of a legacy snapshot blob
 - execution of live synthetic-memory acceptance matrices covering earlier memory, conflict resolution, restart persistence, and control-query containment against the real OpenAI and ChonkyDB path in an isolated namespace
 - execution of latency profiling runs that capture forensic workflow evidence for remote long-term retrieval bottlenecks, including fast pre-answer topic-hint reads, while bootstrapping required remote snapshot heads before the timed iterations when a fresh namespace has not yet been provisioned
 - structured result payloads and persisted artifact snapshots

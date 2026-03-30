@@ -947,6 +947,28 @@ class TwinrConfigTests(unittest.TestCase):
                         "GROQ_BASE_URL=https://api.groq.example/openai/v1",
                         "GROQ_MODEL=llama-3.3-70b-versatile",
                         "GROQ_TIMEOUT_S=33.0",
+                        "GROQ_REQUEST_TIMEOUT_SECONDS=12.5",
+                        "GROQ_MAX_RETRIES=4",
+                        "GROQ_CONNECT_TIMEOUT_S=7.0",
+                        "GROQ_WRITE_TIMEOUT_S=8.0",
+                        "GROQ_POOL_TIMEOUT_S=3.5",
+                        "GROQ_MAX_CONNECTIONS=11",
+                        "GROQ_MAX_KEEPALIVE_CONNECTIONS=6",
+                        "GROQ_KEEPALIVE_EXPIRY_S=19.0",
+                        "GROQ_HTTP2=1",
+                        "TWINR_GROQ_TRUST_ENV=1",
+                        "GROQ_FOLLOW_REDIRECTS=1",
+                        "TWINR_GROQ_SDK_BACKEND=openai_compat",
+                        "GROQ_TOOL_CONTINUATION_TTL_SECONDS=123.0",
+                        "GROQ_TOOL_MAX_CONTINUATIONS=77",
+                        "GROQ_MAX_TOOL_RESULT_CHARS=16000",
+                        "GROQ_SERVICE_TIER=flex",
+                        "GROQ_REASONING_FORMAT=parsed",
+                        "GROQ_REASONING_EFFORT=high",
+                        "GROQ_TEXT_SEARCH_MODEL=groq/compound",
+                        "GROQ_VISION_MODEL=meta-llama/llama-4-scout-17b-16e-instruct",
+                        "GROQ_ALLOW_SEARCH_FALLBACK=1",
+                        "GROQ_ALLOW_VISION_FALLBACK=1",
                         "OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview",
                         "OPENAI_REALTIME_VOICE=sage",
                         "OPENAI_REALTIME_SPEED=1.05",
@@ -1136,6 +1158,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S=2.25",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S=1.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_TIMEOUT_S=22.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_STARTUP_PROBE_TIMEOUT_S=48.0",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_HISTORY_LIMIT=7200",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS=4",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_BACKOFF_S=2.5",
@@ -1254,6 +1278,31 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.groq_base_url, "https://api.groq.example/openai/v1")
         self.assertEqual(config.groq_model, "llama-3.3-70b-versatile")
         self.assertEqual(config.groq_timeout_s, 33.0)
+        self.assertEqual(config.groq_request_timeout_seconds, 12.5)
+        self.assertEqual(config.groq_max_retries, 4)
+        self.assertEqual(config.groq_connect_timeout_s, 7.0)
+        self.assertEqual(config.groq_write_timeout_s, 8.0)
+        self.assertEqual(config.groq_pool_timeout_s, 3.5)
+        self.assertEqual(config.groq_max_connections, 11)
+        self.assertEqual(config.groq_max_keepalive_connections, 6)
+        self.assertEqual(config.groq_keepalive_expiry_s, 19.0)
+        self.assertTrue(config.groq_http2)
+        self.assertTrue(config.groq_trust_env)
+        self.assertTrue(config.groq_follow_redirects)
+        self.assertEqual(config.groq_sdk_backend, "openai_compat")
+        self.assertEqual(config.groq_tool_continuation_ttl_seconds, 123.0)
+        self.assertEqual(config.groq_tool_max_continuations, 77)
+        self.assertEqual(config.groq_max_tool_result_chars, 16000)
+        self.assertEqual(config.groq_service_tier, "flex")
+        self.assertEqual(config.groq_reasoning_format, "parsed")
+        self.assertEqual(config.groq_reasoning_effort, "high")
+        self.assertEqual(config.groq_text_search_model, "groq/compound")
+        self.assertEqual(
+            config.groq_vision_model,
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+        )
+        self.assertTrue(config.groq_allow_search_fallback)
+        self.assertTrue(config.groq_allow_vision_fallback)
         self.assertEqual(config.openai_realtime_model, "gpt-4o-realtime-preview")
         self.assertEqual(config.openai_realtime_voice, "sage")
         self.assertEqual(config.openai_realtime_speed, 1.05)
@@ -1443,6 +1492,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 2.25)
         self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.5)
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_timeout_s, 22.5)
+        self.assertEqual(config.long_term_memory_remote_watchdog_startup_probe_timeout_s, 48.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 7200)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 4)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 2.5)
@@ -1620,6 +1671,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_timeout_s, 15.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_startup_probe_timeout_s, 45.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 3600)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 3)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 1.0)
@@ -1774,6 +1827,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ORCHESTRATOR_HOST=127.0.0.1",
                         "TWINR_ORCHESTRATOR_PORT=9876",
                         "TWINR_ORCHESTRATOR_WS_URL=ws://10.0.0.5:9876/ws/orchestrator",
+                        "TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=1",
                         "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
                         "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
                         "TWINR_VOICE_ORCHESTRATOR_WS_URL=wss://voice.example/ws/orchestrator/voice",
@@ -1802,6 +1856,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestrator_host, "127.0.0.1")
         self.assertEqual(config.orchestrator_port, 9876)
         self.assertEqual(config.orchestrator_ws_url, "ws://10.0.0.5:9876/ws/orchestrator")
+        self.assertTrue(config.orchestrator_allow_insecure_ws)
         self.assertEqual(config.orchestrator_shared_secret, "secret-token")
         self.assertTrue(config.voice_orchestrator_enabled)
         self.assertEqual(config.voice_orchestrator_ws_url, "wss://voice.example/ws/orchestrator/voice")

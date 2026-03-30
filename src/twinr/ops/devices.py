@@ -4,15 +4,26 @@ This module combines live system probes with recent ops and self-test events
 to build dashboard-friendly device status snapshots.
 """
 
+# CHANGELOG: 2026-03-30
+# BUG-1: Fix false-positive audio health by validating configured ALSA/PipeWire devices instead of treating any reported capture card as success.
+# BUG-2: Fix camera false negatives on Raspberry Pi OS Bookworm+ by probing the supported rpicam/libcamera/Picamera2 stack and by defaulting blank ffmpeg paths to the system ffmpeg.
+# BUG-3: Fix printer live-state misreporting by using lpstat's accepting/device views for current queue state instead of inferring it from lpoptions defaults.
+# BUG-4: Fix impossible PIR/button GPIO values reporting as healthy by bounding Raspberry Pi 4 BCM GPIO validation to the externally exposed range.
+# SEC-1: Stop resolving bare executables through an attacker-controlled PATH; only trusted system paths or explicit absolute executable paths are accepted.
+# SEC-2: Reject relative executable paths and force a trusted PATH plus DEVNULL stdin for subprocess probes to reduce path-hijack and probe-hang risk on shared Pis.
+# IMP-1: Run independent device probes concurrently so the dashboard stays responsive under slow peripherals and command timeouts.
+# IMP-2: Upgrade camera probing for Bookworm-era rpicam/libcamera/Picamera2 and audio probing for PipeWire/WirePlumber-era Raspberry Pi deployments.
+
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from importlib.util import find_spec
 from pathlib import Path
-from shutil import which
 import os
-import shlex
+import re
 import subprocess
 from urllib.parse import urlsplit, urlunsplit
 
@@ -24,7 +35,24 @@ from twinr.ops.locks import loop_lock_owner
 
 
 _COMMAND_TIMEOUT_SECONDS = 2.0
+_CAMERA_PROBE_TIMEOUT_SECONDS = 1.5
+_PIPEWIRE_PROBE_TIMEOUT_SECONDS = 1.0
+_MAX_CONCURRENT_PROBES = 4
+_GPIO_MIN_BCM = 0
+_GPIO_MAX_BCM_PI4 = 27
+_TRUSTED_EXECUTABLE_DIRS = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+_TRUSTED_PATH = os.pathsep.join(_TRUSTED_EXECUTABLE_DIRS)
 _OPS_HISTORY_UNAVAILABLE = "ops history unavailable"
+_CAMERA_HEADER_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$")
+_DEVICE_URI_RE = re.compile(r"^\s*device for .*?:\s*(.+?)\s*$", re.IGNORECASE)
+_AUDIO_CARD_ALIAS_RE = re.compile(r"card\s+(\d+).*?device\s+(\d+)", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,35 +132,43 @@ def collect_device_overview(
     latest_self_tests: dict[str, _SelfTestSnapshot] | None
     last_motion_at: str | None
     try:
-        # AUDIT-FIX(#2): Use explicit None-check instead of truthiness so an injected store instance is never ignored accidentally.
         store = event_store if event_store is not None else TwinrOpsEventStore.from_config(config)
         events = _normalize_event_entries(store.tail(limit=200))
         latest_self_tests = _latest_self_tests(events)
         last_motion_at = _latest_motion_timestamp(events)
     except Exception:
-        # AUDIT-FIX(#1): Degrade gracefully when the file-backed ops store is unreadable or corrupted instead of failing the whole overview.
         latest_self_tests = None
         last_motion_at = _OPS_HISTORY_UNAVAILABLE
 
+    collectors: tuple[tuple[str, str, Callable[[], DeviceStatus]], ...] = (
+        ("printer", "Printer", lambda: _collect_printer_status(config, latest_self_tests)),
+        ("camera", "Camera", lambda: _collect_camera_status(config, latest_self_tests)),
+        ("audio_input", "Primary Audio", lambda: _collect_primary_audio_status(config, latest_self_tests)),
+        ("proactive_audio", "Background Audio", lambda: _collect_proactive_audio_status(config, latest_self_tests)),
+        ("respeaker", "ReSpeaker XVF3800", lambda: _collect_respeaker_status(config, latest_self_tests)),
+        ("pir", "PIR Motion", lambda: _collect_pir_status(config, latest_self_tests, last_motion_at=last_motion_at)),
+        ("buttons", "Buttons", lambda: _collect_button_status(config, latest_self_tests)),
+    )
+
     return DeviceOverview(
         captured_at=_captured_at(),
-        devices=(
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("printer", "Printer", lambda: _collect_printer_status(config, latest_self_tests)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("camera", "Camera", lambda: _collect_camera_status(config, latest_self_tests)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("audio_input", "Primary Audio", lambda: _collect_primary_audio_status(config, latest_self_tests)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("proactive_audio", "Background Audio", lambda: _collect_proactive_audio_status(config, latest_self_tests)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("respeaker", "ReSpeaker XVF3800", lambda: _collect_respeaker_status(config, latest_self_tests)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("pir", "PIR Motion", lambda: _collect_pir_status(config, latest_self_tests, last_motion_at=last_motion_at)),
-            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
-            _safe_collect_device_status("buttons", "Buttons", lambda: _collect_button_status(config, latest_self_tests)),
-        ),
+        devices=_collect_device_statuses_concurrently(collectors),
     )
+
+
+def _collect_device_statuses_concurrently(
+    collectors: tuple[tuple[str, str, Callable[[], DeviceStatus]], ...],
+) -> tuple[DeviceStatus, ...]:
+    if not collectors:
+        return ()
+
+    max_workers = max(1, min(len(collectors), _MAX_CONCURRENT_PROBES))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="twinr-device-overview") as executor:
+        futures = [
+            executor.submit(_safe_collect_device_status, key, label, collector)
+            for key, label, collector in collectors
+        ]
+        return tuple(future.result() for future in futures)
 
 
 def _collect_printer_status(
@@ -149,7 +185,6 @@ def _collect_printer_status(
             facts=(DeviceFact("Queue", "missing"),),
         )
 
-    # AUDIT-FIX(#3): Resolve the exact executable once and run that path, instead of re-searching PATH during subprocess execution.
     lpstat_path = _resolve_executable("lpstat")
     if lpstat_path is None:
         return DeviceStatus(
@@ -159,14 +194,25 @@ def _collect_printer_status(
             summary="Printer queue is configured, but `lpstat` is unavailable on this machine.",
             facts=(
                 DeviceFact("Queue", queue),
+                DeviceFact("Accepting jobs", "unknown"),
+                DeviceFact("Device URI", "unknown"),
                 DeviceFact("Paper status", "unknown on the current path"),
                 DeviceFact("Last self-test", _self_test_label(latest_self_tests, "printer")),
             ),
         )
 
-    lpstat_result = _run_command([lpstat_path, "-l", "-p", queue])
-    if not lpstat_result.ok or lpstat_result.returncode != 0:
-        detail = _display_text(lpstat_result.stderr or lpstat_result.stdout or "Queue is not visible to CUPS.")
+    detail_result = _run_command([lpstat_path, "-l", "-p", queue])
+    accepting_result = _run_command([lpstat_path, "-a", queue])
+    device_result = _run_command([lpstat_path, "-v", queue])
+
+    detail_visible = detail_result.ok and detail_result.returncode == 0
+    accepting_jobs, accepting_detail = _parse_lpstat_accepting_detail(accepting_result.stdout or accepting_result.stderr)
+    device_uri = _parse_lpstat_device_uri(device_result.stdout)
+
+    if not detail_visible and accepting_jobs == "unknown" and not device_uri:
+        detail = _display_text(
+            detail_result.stderr or detail_result.stdout or accepting_result.stderr or "Queue is not visible to CUPS.",
+        )
         return DeviceStatus(
             key="printer",
             label="Printer",
@@ -175,42 +221,46 @@ def _collect_printer_status(
             facts=(
                 DeviceFact("Queue", queue),
                 DeviceFact("CUPS detail", detail),
-                DeviceFact("Paper status", "unknown on the current path"),
+                DeviceFact("Paper status", "unknown on the current raw USB/CUPS path"),
                 DeviceFact("Last self-test", _self_test_label(latest_self_tests, "printer")),
             ),
         )
 
-    lpstat_info = _parse_lpstat_printer_detail(lpstat_result.stdout)
-    # AUDIT-FIX(#3): Resolve the exact executable once and run that path, instead of re-searching PATH during subprocess execution.
-    lpoptions_path = _resolve_executable("lpoptions")
-    lpoptions_info = _parse_lpoptions(lpoptions_path, queue) if lpoptions_path is not None else {}
-    accepting_jobs = _display_text(lpoptions_info.get("printer-is-accepting-jobs", "unknown"), default="unknown")
+    lpstat_info = _parse_lpstat_printer_detail(detail_result.stdout)
     state_reasons = _display_text(
-        lpoptions_info.get("printer-state-reasons") or lpstat_info.get("alerts") or "unknown",
+        lpstat_info.get("printer_state_reasons") or lpstat_info.get("alerts") or "unknown",
         default="unknown",
     )
+    headline = _display_text(lpstat_info.get("headline") or f"Queue `{queue}` is visible to CUPS.")
+    description = _display_text(lpstat_info.get("description") or "—")
+    connection = _display_text(lpstat_info.get("connection") or "—")
+    location = _display_text(lpstat_info.get("location") or "—")
+    enabled_label = "no" if "disabled" in headline.lower() else "yes"
+
     status = "ok"
-    if accepting_jobs not in {"true", "unknown"} or state_reasons not in {"none", "unknown"}:
+    if not detail_visible or accepting_jobs == "no" or state_reasons not in {"none", "unknown"} or enabled_label == "no":
         status = "warn"
-    summary = _display_text(lpstat_info.get("headline") or f"Queue `{queue}` is visible to CUPS.")
+
     return DeviceStatus(
         key="printer",
         label="Printer",
         status=status,
-        summary=summary,
+        summary=headline,
         facts=(
             DeviceFact("Queue", queue),
-            DeviceFact("Description", _display_text(lpstat_info.get("description") or lpoptions_info.get("printer-info") or "—")),
-            DeviceFact("Connection", _display_text(lpstat_info.get("connection") or "—")),
-            # AUDIT-FIX(#4): Redact credentials and query strings from device URIs before returning them to callers.
-            DeviceFact("Device URI", _redact_device_uri(lpoptions_info.get("device-uri", "—"))),
+            DeviceFact("Description", description),
+            DeviceFact("Location", location),
+            DeviceFact("Connection", connection),
+            DeviceFact("Enabled", enabled_label),
             DeviceFact("Accepting jobs", accepting_jobs),
+            DeviceFact("Accepting detail", accepting_detail),
             DeviceFact("State reasons", state_reasons),
+            DeviceFact("Device URI", _redact_device_uri(device_uri or "—")),
             DeviceFact("Paper status", "unknown on the current raw USB/CUPS path"),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "printer")),
         ),
         notes=(
-            "Twinr can see queue and USB/CUPS state here, but it cannot prove real paper output from this printer path.",
+            "Twinr can see queue and live CUPS state here, but it cannot prove real paper output from this printer path.",
         ),
     )
 
@@ -219,27 +269,46 @@ def _collect_camera_status(
     config: TwinrConfig,
     latest_self_tests: dict[str, _SelfTestSnapshot] | None,
 ) -> DeviceStatus:
-    # AUDIT-FIX(#5): Treat blank paths as missing config instead of mapping '' to the current working directory.
     device_value = _strip_text(getattr(config, "camera_device", ""))
     device_path = Path(device_value) if device_value else None
-    # AUDIT-FIX(#5): Require a character device for camera presence so regular files/directories do not report as healthy.
     device_present = _path_is_char_device(device_path)
-    # AUDIT-FIX(#5): Require a real executable file for ffmpeg instead of any existing filesystem path.
-    ffmpeg_path = _resolve_executable(getattr(config, "camera_ffmpeg_path", ""))
-    ffmpeg_ok = ffmpeg_path is not None
 
-    if not device_value:
-        status = "fail"
-        summary = "No camera device is configured."
-    elif device_present and ffmpeg_ok:
+    ffmpeg_candidate = _strip_text(getattr(config, "camera_ffmpeg_path", "")) or "ffmpeg"
+    ffmpeg_path = _resolve_executable(ffmpeg_candidate)
+    camera_probe_path = _resolve_executable("rpicam-hello") or _resolve_executable("libcamera-hello")
+    detected_cameras, camera_probe_detail = _probe_camera_inventory(camera_probe_path)
+    picamera2_available = _python_module_available("picamera2")
+    modern_stack_ready = camera_probe_path is not None or picamera2_available
+
+    notes: list[str] = []
+    if detected_cameras and not device_present:
+        notes.append(
+            "rpicam/libcamera can see a camera even though the configured fixed V4L2 node is missing; this is common with CSI/libcamera-first setups.",
+        )
+    if device_present and not modern_stack_ready and ffmpeg_path is None:
+        notes.append(
+            "A V4L2 device exists, but Twinr cannot see rpicam/libcamera, Picamera2, or ffmpeg tooling on this runtime.",
+        )
+
+    if device_present and (modern_stack_ready or ffmpeg_path is not None):
         status = "ok"
         summary = f"Camera device `{device_value}` is present."
-    elif not device_present:
+    elif detected_cameras and modern_stack_ready and device_value:
+        probe_name = Path(camera_probe_path).name if camera_probe_path else "camera probe"
+        status = "warn"
+        summary = f"Camera(s) are detected via `{probe_name}`, but configured device `{device_value}` is missing or is not a character device."
+    elif detected_cameras and modern_stack_ready:
+        status = "warn"
+        summary = "Camera hardware is detected via rpicam/libcamera, but no fixed V4L2 camera device is configured."
+    elif device_value and not device_present:
         status = "warn"
         summary = f"Camera device `{device_value}` is missing or is not a character device."
-    else:
+    elif device_present:
         status = "warn"
-        summary = f"Camera device `{device_value}` exists, but ffmpeg `{getattr(config, 'camera_ffmpeg_path', '')}` is unavailable."
+        summary = f"Camera device `{device_value}` exists, but no supported userspace camera stack is visible."
+    else:
+        status = "fail"
+        summary = "No camera device is configured and rpicam/libcamera did not detect a camera."
 
     return DeviceStatus(
         key="camera",
@@ -247,15 +316,19 @@ def _collect_camera_status(
         status=status,
         summary=summary,
         facts=(
-            DeviceFact("Device", device_value or "missing"),
+            DeviceFact("Device", device_value or "not configured"),
             DeviceFact("Present", "yes" if device_present else "no"),
             DeviceFact("Resolution", f"{config.camera_width}x{config.camera_height}"),
             DeviceFact("Framerate", f"{config.camera_framerate} fps"),
             DeviceFact("Input format", _display_text(getattr(config, "camera_input_format", "") or "default")),
-            DeviceFact("ffmpeg", ffmpeg_path or f"missing: {_display_text(getattr(config, 'camera_ffmpeg_path', '') or 'not configured')}"),
+            DeviceFact("rpicam/libcamera probe", Path(camera_probe_path).name if camera_probe_path else "missing"),
+            DeviceFact("Detected cameras", _join_limited(detected_cameras, default=camera_probe_detail or "none detected")),
+            DeviceFact("Picamera2", "available" if picamera2_available else "missing"),
+            DeviceFact("ffmpeg", ffmpeg_path or f"missing: {_display_text(ffmpeg_candidate)}"),
             DeviceFact("Reference image", _display_text(getattr(config, "vision_reference_image_path", "") or "not configured")),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "camera")),
         ),
+        notes=tuple(notes),
     )
 
 
@@ -263,29 +336,59 @@ def _collect_primary_audio_status(
     config: TwinrConfig,
     latest_self_tests: dict[str, _SelfTestSnapshot] | None,
 ) -> DeviceStatus:
-    # AUDIT-FIX(#3): Resolve once and pass the exact binary path into the subprocess probe.
     arecord_path = _resolve_executable("arecord")
+    aplay_path = _resolve_executable("aplay")
+    wpctl_path = _resolve_executable("wpctl")
+
     capture_devices = _list_arecord_capture_devices(arecord_path)
+    capture_pcms = _list_audio_pcm_targets(arecord_path)
+    playback_pcms = _list_audio_pcm_targets(aplay_path)
+    pipewire_ready = _probe_pipewire_status(wpctl_path) or _has_pipewire_pcm(capture_pcms) or _has_pipewire_pcm(playback_pcms)
+
+    configured_input = _display_text(getattr(config, "audio_input_device", "") or "not configured")
+    configured_output = _display_text(getattr(config, "audio_output_device", "") or "not configured")
+    input_match = _configured_audio_device_matches(
+        getattr(config, "audio_input_device", ""),
+        capture_devices,
+        capture_pcms,
+        pipewire_ready=pipewire_ready,
+    )
+    output_match = _configured_audio_device_matches(
+        getattr(config, "audio_output_device", ""),
+        (),
+        playback_pcms,
+        pipewire_ready=pipewire_ready,
+    )
+
     if arecord_path is None:
         status = "warn"
         summary = "Audio capture cannot be inspected because `arecord` is unavailable."
-    elif capture_devices:
-        status = "ok"
-        summary = f"{len(capture_devices)} capture device(s) reported by ALSA."
-    else:
+    elif not capture_devices and not capture_pcms and not pipewire_ready:
         status = "warn"
-        summary = "No ALSA capture devices were reported by `arecord -l`."
+        summary = "No ALSA or PipeWire capture targets were reported."
+    elif input_match is False or output_match is False:
+        status = "warn"
+        summary = "Configured audio devices are not fully visible in ALSA/PipeWire right now."
+    else:
+        status = "ok"
+        summary = f"{max(len(capture_devices), len(capture_pcms), 1)} capture target(s) reported by ALSA/PipeWire."
+
     return DeviceStatus(
         key="audio_input",
         label="Primary Audio",
         status=status,
         summary=summary,
         facts=(
-            DeviceFact("Configured input", _display_text(getattr(config, "audio_input_device", "") or "not configured")),
-            DeviceFact("Configured output", _display_text(getattr(config, "audio_output_device", "") or "not configured")),
+            DeviceFact("Configured input", configured_input),
+            DeviceFact("Configured output", configured_output),
+            DeviceFact("Input visible", _match_label(input_match)),
+            DeviceFact("Output visible", _match_label(output_match)),
             DeviceFact("Sample rate", f"{config.audio_sample_rate} Hz"),
             DeviceFact("Channels", str(config.audio_channels)),
-            DeviceFact("Detected capture devices", " | ".join(capture_devices) if capture_devices else "none reported"),
+            DeviceFact("ALSA capture cards", _join_limited(capture_devices, default="none reported")),
+            DeviceFact("ALSA capture PCMs", _join_limited(capture_pcms, default="none reported")),
+            DeviceFact("ALSA playback PCMs", _join_limited(playback_pcms, default="none reported")),
+            DeviceFact("PipeWire/WirePlumber", "available" if pipewire_ready else "not detected"),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "mic")),
         ),
     )
@@ -310,19 +413,34 @@ def _collect_proactive_audio_status(
             ),
         )
 
-    # AUDIT-FIX(#3): Resolve once and pass the exact binary path into the subprocess probe.
     arecord_path = _resolve_executable("arecord")
-    if arecord_path is None:
+    wpctl_path = _resolve_executable("wpctl")
+    capture_devices = _list_arecord_capture_devices(arecord_path)
+    capture_pcms = _list_audio_pcm_targets(arecord_path)
+    pipewire_ready = _probe_pipewire_status(wpctl_path) or _has_pipewire_pcm(capture_pcms)
+
+    target_device = proactive_device or primary_device
+    device_label = proactive_device or (f"reuse primary input ({primary_device})" if primary_device else "missing")
+    device_match = _configured_audio_device_matches(
+        target_device,
+        capture_devices,
+        capture_pcms,
+        pipewire_ready=pipewire_ready,
+    )
+
+    if arecord_path is None and not pipewire_ready:
         status = "warn"
-        summary = "Background-audio capture is enabled, but `arecord` is unavailable."
-    elif proactive_device or primary_device:
-        status = "ok"
-        summary = "Background-audio capture is configured."
-    else:
-        # AUDIT-FIX(#6): Do not report healthy background audio when capture is enabled but no input device is configured at all.
+        summary = "Background-audio capture is enabled, but ALSA/PipeWire capture tooling is unavailable."
+    elif not target_device:
         status = "warn"
         summary = "Background-audio capture is enabled, but no input device is configured."
-    device_label = proactive_device or (f"reuse primary input ({primary_device})" if primary_device else "missing")
+    elif device_match is False:
+        status = "warn"
+        summary = f"Background-audio capture is enabled, but device `{target_device}` is not visible in ALSA/PipeWire."
+    else:
+        status = "ok"
+        summary = "Background-audio capture is configured."
+
     return DeviceStatus(
         key="proactive_audio",
         label="Background Audio",
@@ -330,8 +448,11 @@ def _collect_proactive_audio_status(
         summary=summary,
         facts=(
             DeviceFact("Configured device", device_label),
+            DeviceFact("Device visible", _match_label(device_match)),
             DeviceFact("Sample window", f"{config.proactive_audio_sample_ms} ms"),
             DeviceFact("Distress detector", "enabled" if config.proactive_audio_distress_enabled else "disabled"),
+            DeviceFact("ALSA capture PCMs", _join_limited(capture_pcms, default="none reported")),
+            DeviceFact("PipeWire/WirePlumber", "available" if pipewire_ready else "not detected"),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "proactive_mic")),
         ),
     )
@@ -438,14 +559,13 @@ def _collect_pir_status(
             facts=(DeviceFact("GPIO", "not configured"),),
         )
 
-    # AUDIT-FIX(#7): Validate GPIO values before marking the PIR path as healthy.
     pir_gpio = _normalize_gpio(getattr(config, "pir_motion_gpio", None))
     if pir_gpio is None:
         return DeviceStatus(
             key="pir",
             label="PIR Motion",
             status="warn",
-            summary="PIR motion input is enabled, but the GPIO value is missing or invalid.",
+            summary="PIR motion input is enabled, but the GPIO value is missing or invalid for Raspberry Pi 4 header GPIOs.",
             facts=(
                 DeviceFact("GPIO", _display_text(getattr(config, "pir_motion_gpio", "missing"), default="missing")),
                 DeviceFact("Active high", "yes" if config.pir_active_high else "no"),
@@ -492,7 +612,6 @@ def _collect_button_status(
         try:
             owner = loop_lock_owner(config, loop_name)
         except Exception as exc:
-            # AUDIT-FIX(#1): Lock-inspection failures should degrade this device status, not crash the whole overview.
             owners.append(f"{label} owner unavailable ({exc.__class__.__name__})")
             continue
         if owner is not None:
@@ -521,7 +640,6 @@ def _collect_button_status(
     summary = "Hardware button GPIO mappings are configured."
     notes: list[str] = []
     if missing_buttons or invalid_buttons or duplicate_gpio:
-        # AUDIT-FIX(#7): Require both expected buttons and unique valid GPIOs before reporting a healthy button path.
         status = "warn"
         problems: list[str] = []
         if missing_buttons:
@@ -548,21 +666,19 @@ def _captured_at() -> str:
 
 def _run_command(command: list[str], *, timeout: float = _COMMAND_TIMEOUT_SECONDS) -> _CommandResult:
     env = os.environ.copy()
-    # AUDIT-FIX(#3): Force a stable C locale because downstream parsers depend on English command output tokens.
     env["LC_ALL"] = "C"
-    # AUDIT-FIX(#3): Force a stable C locale because downstream parsers depend on English command output tokens.
     env["LANG"] = "C"
+    env["PATH"] = _TRUSTED_PATH
     try:
         result = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
             env=env,
-            # AUDIT-FIX(#8): Decode defensively so non-UTF-8 device descriptions cannot raise and abort health collection.
             encoding="utf-8",
-            # AUDIT-FIX(#8): Replace undecodable bytes instead of throwing UnicodeDecodeError inside the health probe.
             errors="replace",
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -586,27 +702,61 @@ def _parse_lpstat_printer_detail(raw_text: str) -> dict[str, str]:
         if ":" not in stripped:
             continue
         key, value = stripped.split(":", 1)
-        normalized_key = key.strip().lower().replace(" ", "_")
+        normalized_key = key.strip().lower().replace(" ", "_").replace("-", "_")
         info[normalized_key] = value.strip()
     return info
 
 
-def _parse_lpoptions(lpoptions_path: str, queue: str) -> dict[str, str]:
-    result = _run_command([lpoptions_path, "-p", queue])
-    if not result.ok or result.returncode != 0 or not result.stdout:
-        return {}
-    values: dict[str, str] = {}
-    try:
-        tokens = shlex.split(result.stdout)
-    except ValueError:
-        # AUDIT-FIX(#9): Malformed or localized lpoptions output must not crash the printer overview.
-        tokens = result.stdout.split()
-    for token in tokens:
-        if "=" not in token:
+def _parse_lpstat_accepting_detail(raw_text: str) -> tuple[str, str]:
+    detail = _display_text(raw_text, default="unknown")
+    lowered = detail.lower()
+    if "not accepting requests" in lowered:
+        return "no", detail
+    if "accepting requests" in lowered:
+        return "yes", detail
+    return "unknown", detail
+
+
+def _parse_lpstat_device_uri(raw_text: str) -> str:
+    for line in raw_text.splitlines():
+        match = _DEVICE_URI_RE.match(line)
+        if match is not None:
+            return match.group(1).strip()
+    return ""
+
+
+def _probe_camera_inventory(camera_probe_path: str | None) -> tuple[tuple[str, ...], str | None]:
+    if camera_probe_path is None:
+        return (), "probe unavailable"
+    result = _run_command([camera_probe_path, "--list-cameras"], timeout=_CAMERA_PROBE_TIMEOUT_SECONDS)
+    if not result.ok:
+        return (), _display_text(result.stderr or result.stdout or "camera probe failed")
+
+    combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    cameras = _parse_list_cameras_output(combined)
+    if cameras:
+        return cameras, None
+    if "no cameras available" in combined.lower() or result.returncode == 0:
+        return (), "no cameras available"
+    return (), _display_text(combined or "camera probe failed")
+
+
+def _parse_list_cameras_output(raw_text: str) -> tuple[str, ...]:
+    cameras: list[str] = []
+    for line in raw_text.splitlines():
+        match = _CAMERA_HEADER_RE.match(line)
+        if match is None:
             continue
-        key, value = token.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
+        index, description = match.groups()
+        cameras.append(f"{index}: {_display_text(description, max_length=120)}")
+    return tuple(cameras)
+
+
+def _python_module_available(module_name: str) -> bool:
+    try:
+        return find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _list_arecord_capture_devices(arecord_path: str | None = None) -> tuple[str, ...]:
@@ -625,10 +775,108 @@ def _list_arecord_capture_devices(arecord_path: str | None = None) -> tuple[str,
     return tuple(rows)
 
 
+def _list_audio_pcm_targets(command_path: str | None) -> tuple[str, ...]:
+    if command_path is None:
+        return ()
+    result = _run_command([command_path, "-L"])
+    if not result.ok or result.returncode != 0:
+        return ()
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        if line[0].isspace():
+            continue
+        names.append(line.strip())
+    return tuple(names)
+
+
+def _probe_pipewire_status(wpctl_path: str | None) -> bool:
+    if wpctl_path is None:
+        return False
+    result = _run_command([wpctl_path, "status"], timeout=_PIPEWIRE_PROBE_TIMEOUT_SECONDS)
+    return result.ok and result.returncode == 0 and bool(result.stdout)
+
+
+def _has_pipewire_pcm(names: tuple[str, ...]) -> bool:
+    return any(_normalize_compare_text(name) == "pipewire" for name in names)
+
+
+def _configured_audio_device_matches(
+    configured_value: object,
+    physical_rows: tuple[str, ...],
+    logical_names: tuple[str, ...],
+    *,
+    pipewire_ready: bool,
+) -> bool | None:
+    configured = _strip_text(configured_value)
+    if not configured:
+        return None
+
+    normalized_configured = _normalize_compare_text(configured)
+    candidate_names = {_normalize_compare_text(name) for name in logical_names}
+    candidate_names.update(_audio_aliases_from_cards(physical_rows))
+
+    if normalized_configured in candidate_names:
+        return True
+    if any(
+        normalized_configured == candidate
+        or normalized_configured.startswith(f"{candidate}:")
+        or candidate.startswith(f"{normalized_configured}:")
+        for candidate in candidate_names
+        if candidate
+    ):
+        return True
+    if any(
+        normalized_configured in _normalize_compare_text(row) or _normalize_compare_text(row) in normalized_configured
+        for row in physical_rows
+    ):
+        return True
+    if normalized_configured in {"default", "sysdefault", "pipewire"} and (
+        pipewire_ready or "default" in candidate_names or "pipewire" in candidate_names
+    ):
+        return True
+    if pipewire_ready and normalized_configured.startswith("pipewire"):
+        return True
+    return False
+
+
+def _audio_aliases_from_cards(physical_rows: tuple[str, ...]) -> set[str]:
+    aliases: set[str] = set()
+    for row in physical_rows:
+        normalized_row = _normalize_compare_text(row)
+        if normalized_row:
+            aliases.add(normalized_row)
+        match = _AUDIO_CARD_ALIAS_RE.search(row)
+        if match is not None:
+            card_index, device_index = match.groups()
+            aliases.add(f"hw:{card_index},{device_index}")
+            aliases.add(f"plughw:{card_index},{device_index}")
+    return aliases
+
+
+def _normalize_compare_text(value: object) -> str:
+    return _strip_text(value).strip().lower()
+
+
+def _join_limited(items: tuple[str, ...] | list[str], *, default: str = "—", limit: int = 4) -> str:
+    if not items:
+        return default
+    displayed = [_display_text(item, max_length=80) for item in items[:limit]]
+    if len(items) > limit:
+        displayed.append(f"… +{len(items) - limit} more")
+    return " | ".join(displayed)
+
+
+def _match_label(value: bool | None) -> str:
+    if value is None:
+        return "not configured"
+    return "yes" if value else "no"
+
+
 def _latest_self_tests(entries: list[dict[str, object]]) -> dict[str, _SelfTestSnapshot]:
     latest: dict[str, _SelfTestSnapshot] = {}
     for entry in reversed(entries):
-        # AUDIT-FIX(#10): Skip malformed rows from the file-backed event store instead of assuming every item is a dict.
         if not isinstance(entry, dict):
             continue
         event_name = str(entry.get("event", "")).strip().lower()
@@ -656,7 +904,6 @@ def _latest_self_tests(entries: list[dict[str, object]]) -> dict[str, _SelfTestS
 
 def _latest_motion_timestamp(entries: list[dict[str, object]]) -> str | None:
     for entry in reversed(entries):
-        # AUDIT-FIX(#10): Skip malformed rows from the file-backed event store instead of assuming every item is a dict.
         if not isinstance(entry, dict):
             continue
         if str(entry.get("event", "")).strip().lower() != "proactive_observation":
@@ -664,7 +911,6 @@ def _latest_motion_timestamp(entries: list[dict[str, object]]) -> str | None:
         data = entry.get("data")
         if not isinstance(data, dict):
             continue
-        # AUDIT-FIX(#11): Parse truthy/falsey strings explicitly so 'false' does not become True via bool('false').
         if _as_bool(data.get("pir_motion_detected")) is True:
             return str(entry.get("created_at", "")).strip() or None
     return None
@@ -672,7 +918,6 @@ def _latest_motion_timestamp(entries: list[dict[str, object]]) -> str | None:
 
 def _self_test_label(latest_self_tests: dict[str, _SelfTestSnapshot] | None, test_name: str) -> str:
     if latest_self_tests is None:
-        # AUDIT-FIX(#1): Preserve a truthful degraded state when ops history could not be read at all.
         return _OPS_HISTORY_UNAVAILABLE
     snapshot = latest_self_tests.get(test_name)
     if snapshot is None:
@@ -680,11 +925,10 @@ def _self_test_label(latest_self_tests: dict[str, _SelfTestSnapshot] | None, tes
     return f"{snapshot.status} at {snapshot.created_at}"
 
 
-# AUDIT-FIX(#1): Centralize per-device exception isolation so a single probe failure cannot blank the full overview.
 def _safe_collect_device_status(
     key: str,
     label: str,
-    collector,
+    collector: Callable[[], DeviceStatus],
 ) -> DeviceStatus:
     try:
         result = collector()
@@ -699,7 +943,6 @@ def _safe_collect_device_status(
     return result
 
 
-# AUDIT-FIX(#10): Normalize and filter raw event rows before parsing so corrupted file-backed records are skipped safely.
 def _normalize_event_entries(entries: object) -> list[dict[str, object]]:
     if isinstance(entries, list):
         raw_entries = entries
@@ -714,21 +957,25 @@ def _normalize_event_entries(entries: object) -> list[dict[str, object]]:
     return normalized
 
 
-# AUDIT-FIX(#3): Resolve executables once up front to avoid PATH re-resolution at subprocess execution time.
 def _resolve_executable(command: str) -> str | None:
     candidate = _strip_text(command)
     if not candidate:
         return None
-    resolved = which(candidate)
-    if resolved is not None:
-        return resolved
-    path = Path(candidate)
-    if _path_is_executable_file(path):
-        return str(path)
+
+    if os.sep in candidate or (os.altsep and os.altsep in candidate):
+        path = Path(candidate)
+        # BREAKING: relative executable paths are rejected so probe commands cannot be shadowed from the service working directory.
+        if not path.is_absolute():
+            return None
+        return str(path) if _path_is_executable_file(path) else None
+
+    for directory in _TRUSTED_EXECUTABLE_DIRS:
+        path = Path(directory) / candidate
+        if _path_is_executable_file(path):
+            return str(path)
     return None
 
 
-# AUDIT-FIX(#5): Distinguish real executable files from arbitrary existing paths such as directories.
 def _path_is_executable_file(path: Path | None) -> bool:
     if path is None:
         return False
@@ -738,7 +985,6 @@ def _path_is_executable_file(path: Path | None) -> bool:
         return False
 
 
-# AUDIT-FIX(#5): Validate camera nodes as character devices, not merely existing filesystem entries.
 def _path_is_char_device(path: Path | None) -> bool:
     if path is None:
         return False
@@ -748,24 +994,27 @@ def _path_is_char_device(path: Path | None) -> bool:
         return False
 
 
-# AUDIT-FIX(#7): Reject bools, negative numbers, and non-integer GPIO values before reporting hardware as healthy.
 def _coerce_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if not isinstance(value, (int, float, str)):
         return None
     try:
-        return int(value)
+        coerced = int(value)
     except (TypeError, ValueError):
         return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    if isinstance(value, str) and any(character in value for character in (".", "e", "E")):
+        return None
+    return coerced
 
 
-# AUDIT-FIX(#7): Reject bools, negative numbers, and non-integer GPIO values before reporting hardware as healthy.
 def _normalize_gpio(value: object) -> int | None:
     gpio = _coerce_int(value)
     if gpio is None:
         return None
-    if gpio < 0:
+    if gpio < _GPIO_MIN_BCM or gpio > _GPIO_MAX_BCM_PI4:
         return None
     return gpio
 
@@ -788,8 +1037,6 @@ def _display_text(value: object, *, default: str = "—", max_length: int = 240)
 
 
 def _display_optional_bool(value: object, *, default: str = "unknown") -> str:
-    """Render one tri-state boolean for device facts."""
-
     normalized = _as_bool(value)
     if normalized is None:
         return default
@@ -797,8 +1044,6 @@ def _display_optional_bool(value: object, *, default: str = "unknown") -> str:
 
 
 def _display_optional_number(value: object, *, default: str = "—") -> str:
-    """Render one optional integer-like device fact."""
-
     parsed = _coerce_int(value)
     if parsed is None:
         return default
@@ -806,8 +1051,6 @@ def _display_optional_number(value: object, *, default: str = "—") -> str:
 
 
 def _display_float_tuple(values: tuple[float | None, ...] | None, *, default: str = "unknown") -> str:
-    """Render one bounded tuple of floats for dashboard facts."""
-
     if not values:
         return default
     rendered: list[str] = []
@@ -820,16 +1063,12 @@ def _display_float_tuple(values: tuple[float | None, ...] | None, *, default: st
 
 
 def _display_int_tuple(values: tuple[int, ...] | None, *, default: str = "unknown") -> str:
-    """Render one bounded tuple of integers for dashboard facts."""
-
     if not values:
         return default
     return ", ".join(str(int(value)) for value in values)
 
 
 def _respeaker_firmware_label(version: tuple[int, int, int] | None) -> str | None:
-    """Render one XVF3800 firmware tuple for the dashboard."""
-
     if version is None or len(version) != 3:
         return None
     return ".".join(str(int(part)) for part in version)
@@ -848,7 +1087,6 @@ def _as_bool(value: object) -> bool | None:
     return None
 
 
-# AUDIT-FIX(#4): Strip credentials and query/fragment material from printer URIs before exposing them downstream.
 def _redact_device_uri(value: object) -> str:
     raw_value = _display_text(value, default="—")
     if raw_value == "—":

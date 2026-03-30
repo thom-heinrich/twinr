@@ -9,6 +9,9 @@
 # BUG-3: Fixed retry/duplicate publish behavior; repeated publishes of the same
 #        visible item now dedupe through an idempotency path instead of writing
 #        duplicate exposures during ambiguous retry scenarios.
+# BUG-4: Fixed the default interprocess publish lock path; reserve-lane writes
+#        no longer depend on one global `/tmp` lock that can become root-owned
+#        and block Pi acceptance tests or mixed-user tooling.
 # SEC-1: Fixed blind persistence of arbitrary metadata; metadata is now bounded,
 #        JSON-safe, and sensitive keys are redacted before hitting the history
 #        store.
@@ -38,7 +41,6 @@ import json
 import logging
 import math
 import os
-import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, nullcontext
@@ -109,6 +111,25 @@ _SENSITIVE_METADATA_MARKERS = (
     "jwt",
     "bearer",
 )
+
+
+def _default_publish_lock_path(*, active_store_path: object | None = None) -> str:
+    """Return a writable default lock path for reserve-runtime publishes."""
+
+    if active_store_path is not None:
+        resolved_store_path = os.path.abspath(os.fspath(active_store_path))
+        store_dir = os.path.dirname(resolved_store_path)
+        store_name = os.path.basename(resolved_store_path)
+        if store_dir and store_name:
+            return os.path.join(store_dir, f".{store_name}.reserve-runtime.lock")
+
+    runtime_dir = str(os.getenv("XDG_RUNTIME_DIR", "") or "").strip()
+    if runtime_dir and os.path.isabs(runtime_dir):
+        return os.path.join(runtime_dir, "twinr-display-reserve-runtime.lock")
+
+    get_uid = getattr(os, "getuid", None)
+    uid = int(get_uid()) if callable(get_uid) else 0
+    return os.path.join("/tmp", f"twinr-display-reserve-runtime-{uid}.lock")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,12 +212,7 @@ class DisplayReserveRuntimePublisher:
     controller: DisplayAmbientImpulseController
     active_store: DisplayAmbientImpulseCueStore
     history_store: DisplayAmbientImpulseHistoryStore
-    publish_lock_path: str = field(
-        default_factory=lambda: os.path.join(
-            tempfile.gettempdir(),
-            "twinr-display-reserve-runtime.lock",
-        )
-    )
+    publish_lock_path: str = field(default_factory=_default_publish_lock_path)
     _publish_lock: RLock = field(default_factory=RLock, init=False, repr=False)
     _completed_cache: dict[str, _CompletedPublishCacheEntry] = field(default_factory=dict, init=False, repr=False)
     _pending_history: dict[str, _PendingHistoryReplay] = field(default_factory=dict, init=False, repr=False)
@@ -214,9 +230,9 @@ class DisplayReserveRuntimePublisher:
             config,
             default_source=default_source,
         )
-        publish_lock_path = os.environ.get(
-            "TWINR_DISPLAY_RESERVE_RUNTIME_LOCK_PATH",
-            os.path.join(tempfile.gettempdir(), "twinr-display-reserve-runtime.lock"),
+        publish_lock_path = (
+            str(os.environ.get("TWINR_DISPLAY_RESERVE_RUNTIME_LOCK_PATH", "") or "").strip()
+            or _default_publish_lock_path(active_store_path=controller.store.path)
         )
         return cls(
             controller=controller,

@@ -36,6 +36,9 @@ from twinr.agent.tools import (
 from twinr.agent.base_agent.contracts import supervisor_decision_requires_full_context
 from twinr.agent.base_agent.contracts import normalize_supervisor_decision_context_scope
 from twinr.agent.base_agent.contracts import normalize_supervisor_decision_runtime_tool_name
+from twinr.agent.tools.runtime.runtime_local_handoff import (
+    has_executable_runtime_local_tool_call as _has_executable_runtime_local_tool_call,
+)
 from twinr.agent.workflows.streaming_supervisor_context import (
     build_streaming_supervisor_turn_instructions,
 )
@@ -65,6 +68,7 @@ class _DecisionView:
     context_scope: str | None
     runtime_tool_name: str | None
     runtime_tool_arguments_present: bool
+    runtime_tool_shortcut_ready: bool
     allow_web_search: bool
     spoken_ack: Any
     spoken_reply: Any
@@ -83,6 +87,7 @@ class _DecisionView:
                 context_scope=None,
                 runtime_tool_name=None,
                 runtime_tool_arguments_present=False,
+                runtime_tool_shortcut_ready=False,
                 allow_web_search=False,
                 spoken_ack=None,
                 spoken_reply=None,
@@ -103,6 +108,7 @@ class _DecisionView:
                 _read_field(decision, "runtime_tool_name", None)
             ),
             runtime_tool_arguments_present=isinstance(runtime_tool_arguments, Mapping),
+            runtime_tool_shortcut_ready=_has_executable_runtime_local_tool_call(decision),
             allow_web_search=bool(_read_field(decision, "allow_web_search", False)),
             spoken_ack=_read_field(decision, "spoken_ack", None),
             spoken_reply=_read_field(decision, "spoken_reply", None),
@@ -113,7 +119,7 @@ class _DecisionView:
 
     @property
     def is_runtime_local_tool(self) -> bool:
-        return self.runtime_tool_name is not None
+        return self.runtime_tool_shortcut_ready
 
     @property
     def wants_search_feedback(self) -> bool:
@@ -441,6 +447,17 @@ class StreamingLanePlanner:
             *,
             source: str,
         ):
+            if decision_view.runtime_tool_name is not None and not decision_view.runtime_tool_shortcut_ready:
+                loop._trace_event(
+                    "dual_lane_runtime_local_tool_shortcut_incomplete",
+                    kind="branch",
+                    details={
+                        "source": source,
+                        "transcript": _text_summary(transcript, loop=loop),
+                        "decision": _decision_summary(decision_view.raw, loop=loop),
+                        "fallback": "specialist_handoff",
+                    },
+                )
             if not decision_view.is_runtime_local_tool:
                 return None
             if not _runtime_local_tool_shortcut_authorized(loop, transcript, decision_view.raw):

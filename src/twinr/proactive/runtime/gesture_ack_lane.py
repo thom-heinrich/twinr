@@ -3,10 +3,12 @@
 # BUG-2: Use an internal monotonic timeline for cooldown math so wall-clock jumps or out-of-order frames cannot suppress acknowledgements incorrectly.
 # BUG-3: Deduplicate on (stream key, activation token, gesture key) instead of token alone, avoiding false suppression when the same token is reused or a gesture is refined mid-activation.
 # BUG-4: Make observe() state updates thread-safe and keep telemetry failures from breaking the HDMI acknowledgement path.
+# BUG-5: Restore Pi-tuned per-symbol HDMI ack confidence floors so authoritative live thumbs-up/down gestures are not re-rejected by one generic threshold.
 # SEC-1: Bound and sanitize forensics trace fields so malformed upstream metadata cannot turn tracing into a log/availability problem on the Pi.
 # IMP-1: Add confidence-gated acknowledgement aligned with current edge gesture-recognition practice (temporal tracking + confidence thresholds).
 # IMP-2: Prefer authoritative rising-edge metadata when available to reduce duplicate emits on tracker/token churn.
 # IMP-3: Rate-limit repeated forensics ledger entries and sanitize trace fields for edge-device robustness.
+# BUG-6: Reject user-facing HDMI emoji emits when the authoritative gesture stream lacks current hand evidence or only resolves through stale/slow rescue sources.
 
 """Consume authoritative gesture-stream activations for HDMI emoji acknowledgement."""
 
@@ -22,12 +24,18 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_decision
 
 from ..social.engine import SocialFineHandGesture, SocialGestureEvent, SocialVisionObservation
+from ..social.gesture_calibration import (
+    DEFAULT_HDMI_ACK_FINE_HAND_POLICIES,
+    FineHandGesturePolicy,
+    GestureCalibrationProfile,
+)
 from ..social.perception_stream import gesture_stream, gesture_stream_authoritative
 from .display_gesture_emoji import (
     DisplayGestureEmojiDecision,
     decision_for_coarse_gesture,
     decision_for_fine_hand_gesture,
 )
+from .gesture_stream_guards import evaluate_gesture_stream_user_intent
 
 
 _SUPPORTED_FINE_GESTURES = frozenset(
@@ -69,6 +77,7 @@ class _GestureCandidate:
     decision: DisplayGestureEmojiDecision
     repeat_hold_s: float
     confidence: float
+    min_confidence: float
     activation_rising: bool | None
 
 
@@ -82,6 +91,7 @@ class _LaneSettings:
     trace_repeat_interval_s: float = _DEFAULT_TRACE_REPEAT_INTERVAL_S
     max_trace_string_len: int = _DEFAULT_TRACE_STRING_MAX_LEN
     prefer_activation_rising: bool = True
+    fine_hand_min_confidence_by_gesture: dict[SocialFineHandGesture, float] | None = None
     supported_fine_gestures: frozenset[SocialFineHandGesture] = _SUPPORTED_FINE_GESTURES
     supported_coarse_gestures: frozenset[SocialGestureEvent] = _SUPPORTED_COARSE_GESTURES
 
@@ -121,20 +131,15 @@ class GestureAckLane:
             if authoritative:
                 self._last_authoritative_seen_at_s = observed_at_s
 
-            candidate = self._candidate_from_observation(observation)
+            candidate, candidate_reason = self._candidate_from_observation(observation)
 
             if candidate is None:
-                decision = DisplayGestureEmojiDecision(
-                    reason=(
-                        "gesture_stream_not_authoritative"
-                        if not authoritative
-                        else "no_supported_live_gesture"
-                    )
-                )
+                decision = DisplayGestureEmojiDecision(reason=candidate_reason)
                 trace_payload = self._build_trace_payload(
                     observed_at_s=observed_at_s,
                     observation=observation,
                     candidate=None,
+                    candidate_reason=candidate_reason,
                     decision=decision,
                 )
             elif candidate.activation_identity == self._last_emitted_activation:
@@ -143,6 +148,7 @@ class GestureAckLane:
                     observed_at_s=observed_at_s,
                     observation=observation,
                     candidate=candidate,
+                    candidate_reason=candidate_reason,
                     decision=decision,
                 )
             elif (
@@ -162,6 +168,7 @@ class GestureAckLane:
                     observed_at_s=observed_at_s,
                     observation=observation,
                     candidate=candidate,
+                    candidate_reason=candidate_reason,
                     decision=decision,
                 )
             elif self._recently_emitted_same_key(
@@ -174,6 +181,7 @@ class GestureAckLane:
                     observed_at_s=observed_at_s,
                     observation=observation,
                     candidate=candidate,
+                    candidate_reason=candidate_reason,
                     decision=decision,
                 )
             else:
@@ -184,6 +192,7 @@ class GestureAckLane:
                     observed_at_s=observed_at_s,
                     observation=observation,
                     candidate=candidate,
+                    candidate_reason=candidate_reason,
                     decision=decision,
                 )
 
@@ -192,17 +201,17 @@ class GestureAckLane:
     def _candidate_from_observation(
         self,
         observation: SocialVisionObservation,
-    ) -> _GestureCandidate | None:
+    ) -> tuple[_GestureCandidate | None, str]:
         if not gesture_stream_authoritative(observation):
-            return None
+            return None, "gesture_stream_not_authoritative"
 
         stream = gesture_stream(observation)
         if stream is None:
-            return None
+            return None, "no_supported_live_gesture"
 
         activation_token = _coerce_optional_non_negative_int(getattr(stream, "activation_token", None))
         if activation_token is None:
-            return None
+            return None, "no_supported_live_gesture"
 
         activation_identity_prefix = _ActivationIdentity(
             stream_key=_identity_component(getattr(stream, "activation_key", None)),
@@ -215,7 +224,11 @@ class GestureAckLane:
         fine_confidence = _coerce_confidence(getattr(observation, "fine_hand_gesture_confidence", None))
         if fine_gesture in self._settings.supported_fine_gestures:
             decision = decision_for_fine_hand_gesture(fine_gesture)
-            if decision.active and fine_confidence >= self._settings.min_fine_confidence:
+            fine_min_confidence = self._fine_hand_min_confidence(fine_gesture)
+            if decision.active and fine_confidence >= fine_min_confidence:
+                guard_reason = _ack_guard_block_reason(observation)
+                if guard_reason is not None:
+                    return None, guard_reason
                 gesture_key = f"fine:{fine_gesture.value}"
                 return _GestureCandidate(
                     key=gesture_key,
@@ -227,8 +240,9 @@ class GestureAckLane:
                     decision=decision,
                     repeat_hold_s=_REPEAT_HOLD_S.get(fine_gesture, 0.35),
                     confidence=fine_confidence,
+                    min_confidence=fine_min_confidence,
                     activation_rising=activation_rising,
-                )
+                ), "emit"
 
         coarse_gesture = getattr(observation, "gesture_event", None)
         coarse_confidence = _coerce_confidence(getattr(observation, "gesture_confidence", None))
@@ -238,6 +252,9 @@ class GestureAckLane:
                 motion_priority=True,
             )
             if decision.active and coarse_confidence >= self._settings.min_coarse_confidence:
+                guard_reason = _ack_guard_block_reason(observation)
+                if guard_reason is not None:
+                    return None, guard_reason
                 gesture_key = f"coarse:{coarse_gesture.value}"
                 return _GestureCandidate(
                     key=gesture_key,
@@ -249,10 +266,17 @@ class GestureAckLane:
                     decision=decision,
                     repeat_hold_s=0.35,
                     confidence=coarse_confidence,
+                    min_confidence=self._settings.min_coarse_confidence,
                     activation_rising=activation_rising,
-                )
+                ), "emit"
 
-        return None
+        return None, "no_supported_live_gesture"
+
+    def _fine_hand_min_confidence(self, gesture: SocialFineHandGesture) -> float:
+        fine_hand_min_confidence_by_gesture = self._settings.fine_hand_min_confidence_by_gesture
+        if fine_hand_min_confidence_by_gesture is None:
+            return self._settings.min_fine_confidence
+        return fine_hand_min_confidence_by_gesture.get(gesture, self._settings.min_fine_confidence)
 
     def _recently_emitted_same_key(
         self,
@@ -318,11 +342,13 @@ class GestureAckLane:
         observed_at_s: float,
         observation: SocialVisionObservation,
         candidate: _GestureCandidate | None,
+        candidate_reason: str,
         decision: DisplayGestureEmojiDecision,
     ) -> dict[str, Any] | None:
         """Build one bounded decision ledger entry for the ack lane."""
 
         stream = gesture_stream(observation)
+        user_intent_guard = evaluate_gesture_stream_user_intent(observation)
         signature = (
             decision.reason,
             None if candidate is None else candidate.key,
@@ -342,6 +368,13 @@ class GestureAckLane:
         observed_fine_confidence = _coerce_confidence(getattr(observation, "fine_hand_gesture_confidence", None))
         observed_coarse_confidence = _coerce_confidence(getattr(observation, "gesture_confidence", None))
         candidate_confidence = None if candidate is None else candidate.confidence
+        candidate_min_confidence = None if candidate is None else candidate.min_confidence
+        fine_gesture = getattr(observation, "fine_hand_gesture", None)
+        effective_fine_threshold = (
+            self._fine_hand_min_confidence(fine_gesture)
+            if fine_gesture in self._settings.supported_fine_gestures
+            else None
+        )
 
         return {
             "msg": "gesture_ack_lane_observe",
@@ -360,12 +393,15 @@ class GestureAckLane:
                 {"id": "live_gesture_already_active", "summary": "Do not re-emit while the same authoritative activation is still live."},
                 {"id": "live_gesture_not_rising", "summary": "Suppress a tracker/token churn duplicate because the authoritative stream did not mark a rising edge."},
                 {"id": "live_gesture_cooldown", "summary": "Suppress a repeated gesture during the HDMI repeat hold window."},
+                {"id": "live_gesture_missing_hand_evidence", "summary": "Ignore the gesture because the fast lane has no current hand-near-camera evidence."},
+                {"id": "live_gesture_unsafe_source", "summary": "Ignore the gesture because it only survived through a stale or slow rescue source."},
                 {"id": "no_supported_live_gesture", "summary": "Ignore the frame because the authoritative gesture is unsupported or below the ack confidence gate."},
             ],
             "context": {
                 "gesture_stream_authoritative": gesture_stream_authoritative(observation),
                 "observed_fine_hand_gesture": _enum_value(getattr(observation, "fine_hand_gesture", None)),
                 "observed_fine_hand_confidence": observed_fine_confidence,
+                "observed_fine_hand_min_confidence": effective_fine_threshold,
                 "observed_gesture_event": _enum_value(getattr(observation, "gesture_event", None)),
                 "observed_gesture_confidence": observed_coarse_confidence,
                 "min_fine_confidence": self._settings.min_fine_confidence,
@@ -376,8 +412,18 @@ class GestureAckLane:
                 ),
                 "stream_activation_token": None if stream is None else _coerce_optional_non_negative_int(getattr(stream, "activation_token", None)),
                 "stream_activation_rising": None if stream is None else _coerce_optional_bool(getattr(stream, "activation_rising", None)),
+                "stream_resolved_source": _sanitize_for_trace(
+                    None if stream is None else getattr(stream, "resolved_source", None),
+                    max_len=self._settings.max_trace_string_len,
+                ),
+                "stream_hand_or_object_near_camera": (
+                    None if stream is None else _coerce_optional_bool(getattr(stream, "hand_or_object_near_camera", None))
+                ),
+                "user_intent_guard_reason": user_intent_guard.reason,
+                "candidate_reason": candidate_reason,
                 "candidate_key": None if candidate is None else candidate.key,
                 "candidate_confidence": candidate_confidence,
+                "candidate_min_confidence": candidate_min_confidence,
                 "last_emitted_stream_key": None if self._last_emitted_activation is None else _sanitize_for_trace(
                     self._last_emitted_activation.stream_key,
                     max_len=self._settings.max_trace_string_len,
@@ -391,17 +437,31 @@ class GestureAckLane:
         }
 
 
+def _ack_guard_block_reason(observation: SocialVisionObservation) -> str | None:
+    """Map gesture-stream user-intent guards into ack-lane decision reasons."""
+
+    guard = evaluate_gesture_stream_user_intent(observation)
+    if guard.allowed:
+        return None
+    if guard.reason == "missing_hand_evidence":
+        return "live_gesture_missing_hand_evidence"
+    if guard.reason == "unsafe_resolved_source":
+        return "live_gesture_unsafe_source"
+    return "no_supported_live_gesture"
+
+
 def _settings_from_config(config: TwinrConfig | object) -> _LaneSettings:
     """Resolve best-effort lane overrides from runtime config without assuming schema."""
 
+    raw_min_fine_confidence = _config_lookup(
+        config,
+        "gesture_ack_lane.min_fine_confidence",
+        "gesture_ack.min_fine_confidence",
+        "social.gesture_ack_lane.min_fine_confidence",
+        "gesture_ack_lane_min_fine_confidence",
+    )
     min_fine_confidence = _coerce_probability(
-        _config_lookup(
-            config,
-            "gesture_ack_lane.min_fine_confidence",
-            "gesture_ack.min_fine_confidence",
-            "social.gesture_ack_lane.min_fine_confidence",
-            "gesture_ack_lane_min_fine_confidence",
-        ),
+        raw_min_fine_confidence,
         default=_DEFAULT_MIN_FINE_CONFIDENCE,
     )
     min_coarse_confidence = _coerce_probability(
@@ -475,6 +535,12 @@ def _settings_from_config(config: TwinrConfig | object) -> _LaneSettings:
         ),
         default=_SUPPORTED_COARSE_GESTURES,
     )
+    fine_hand_min_confidence_by_gesture = _resolve_fine_hand_min_confidence_by_gesture(
+        config,
+        supported_fine_gestures=supported_fine_gestures,
+        raw_min_fine_confidence=raw_min_fine_confidence,
+        min_fine_confidence=min_fine_confidence,
+    )
 
     return _LaneSettings(
         min_fine_confidence=min_fine_confidence,
@@ -483,9 +549,47 @@ def _settings_from_config(config: TwinrConfig | object) -> _LaneSettings:
         trace_repeat_interval_s=trace_repeat_interval_s,
         max_trace_string_len=max_trace_string_len,
         prefer_activation_rising=prefer_activation_rising,
+        fine_hand_min_confidence_by_gesture=fine_hand_min_confidence_by_gesture,
         supported_fine_gestures=supported_fine_gestures,
         supported_coarse_gestures=supported_coarse_gestures,
     )
+
+
+def _resolve_fine_hand_min_confidence_by_gesture(
+    config: TwinrConfig | object,
+    *,
+    supported_fine_gestures: frozenset[SocialFineHandGesture],
+    raw_min_fine_confidence: object,
+    min_fine_confidence: float,
+) -> dict[SocialFineHandGesture, float]:
+    """Resolve effective per-symbol HDMI ack floors for the supported fine gestures."""
+
+    if raw_min_fine_confidence is not None:
+        return {
+            gesture: min_fine_confidence
+            for gesture in supported_fine_gestures
+        }
+
+    calibration = GestureCalibrationProfile.from_runtime_config(config)
+    resolved: dict[SocialFineHandGesture, float] = {}
+    for gesture in supported_fine_gestures:
+        fallback_policy = DEFAULT_HDMI_ACK_FINE_HAND_POLICIES.get(
+            gesture,
+            FineHandGesturePolicy(
+                min_fine_confidence,
+                1,
+                _REPEAT_HOLD_S.get(gesture, 0.35),
+            ),
+        )
+        calibrated_policy = calibration.fine_hand_policy(
+            gesture,
+            fallback_min_confidence=fallback_policy.min_confidence,
+            fallback_confirm_samples=fallback_policy.confirm_samples,
+            fallback_hold_s=fallback_policy.hold_s,
+            fallback_min_visible_s=fallback_policy.min_visible_s,
+        )
+        resolved[gesture] = min(calibrated_policy.min_confidence, fallback_policy.min_confidence)
+    return resolved
 
 
 def _config_lookup(config: object, *paths: str) -> object | None:

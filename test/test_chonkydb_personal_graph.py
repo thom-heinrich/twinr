@@ -5,12 +5,14 @@ import json
 import sys
 import tempfile
 from types import SimpleNamespace
+from typing import Callable, cast
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
@@ -22,14 +24,198 @@ _TEST_JANINA_PHONE_A = "+15555550011"
 _TEST_JANINA_PHONE_B = "+15555550012"
 
 
+class _FakeGraphClient:
+    def __init__(self, *, error_getter) -> None:
+        self._error_getter = error_getter
+        self._next_document_id = 1
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+        self.graph_store_many_calls: list[dict[str, object]] = []
+        self.graph_path_calls: list[dict[str, object]] = []
+        self.graph_neighbors_calls: list[dict[str, object]] = []
+        self.graph_indexes: dict[str, dict[str, object]] = {}
+
+    def _maybe_raise(self) -> None:
+        error = self._error_getter()
+        if error is not None:
+            raise error
+
+    def store_records_bulk(self, request):
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        self._maybe_raise()
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+            if record is not None:
+                return dict(record)
+        if isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+            if record is not None:
+                return dict(record)
+        raise LongTermRemoteUnavailableError("remote document unavailable")
+
+    def graph_store_many(self, request):
+        self._maybe_raise()
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        self.graph_store_many_calls.append(dict(payload))
+        index_name = str(payload.get("index_name") or "")
+        index = self.graph_indexes.setdefault(index_name, {"nodes": set(), "edges": []})
+        nodes = index["nodes"]
+        edges = index["edges"]
+        for item in payload.get("nodes", ()):
+            label = str((item or {}).get("label") or "")
+            if label:
+                nodes.add(label)
+        for item in payload.get("edges", ()):
+            edge = (
+                str((item or {}).get("source_label") or ""),
+                str((item or {}).get("edge_type") or ""),
+                str((item or {}).get("target_label") or ""),
+            )
+            if all(edge) and edge not in edges:
+                edges.append(edge)
+        return {"success": True, "index_name": index_name, "node_count": len(nodes), "edge_count": len(edges)}
+
+    def graph_neighbors(self, request):
+        self._maybe_raise()
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        self.graph_neighbors_calls.append(dict(payload))
+        index = self.graph_indexes.get(str(payload.get("index_name") or ""), {"edges": []})
+        edge_types = {str(item) for item in payload.get("edge_types", ()) if str(item)}
+        label = str(payload.get("label_or_id") or "")
+        limit = max(1, int(payload.get("limit") or 10))
+        neighbors: list[dict[str, object]] = []
+        for source, edge_type, target in index["edges"]:
+            if source != label:
+                continue
+            if edge_types and edge_type not in edge_types:
+                continue
+            neighbors.append({"label": target, "edge_type": edge_type})
+            if len(neighbors) >= limit:
+                break
+        return {"success": True, "neighbors": neighbors}
+
+    def graph_path(self, request):
+        self._maybe_raise()
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        self.graph_path_calls.append(dict(payload))
+        index = self.graph_indexes.get(str(payload.get("index_name") or ""), {"edges": []})
+        source = str(payload.get("source") or "")
+        target = str(payload.get("target") or "")
+        allowed_edge_types = {str(item) for item in payload.get("edge_types", ()) if str(item)}
+        adjacency: dict[str, list[str]] = {}
+        for edge_source, edge_type, edge_target in index["edges"]:
+            if allowed_edge_types and edge_type not in allowed_edge_types:
+                continue
+            adjacency.setdefault(edge_source, []).append(edge_target)
+        queue: list[tuple[str, list[str]]] = [(source, [source])]
+        seen = {source}
+        while queue:
+            node, path = queue.pop(0)
+            if node == target:
+                return {"success": True, "path": path}
+            for neighbor in adjacency.get(node, ()):
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                queue.append((neighbor, [*path, neighbor]))
+        return {"success": True, "path": []}
+
+
+class _AsyncGraphControlPlaneFailingClient(_FakeGraphClient):
+    def __init__(self, *, error_getter) -> None:
+        super().__init__(error_getter=error_getter)
+        self.bulk_execution_modes: list[str] = []
+
+    def store_records_bulk(self, request):
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        execution_mode = str(getattr(request, "execution_mode", ""))
+        snapshot_kinds = {
+            str((getattr(item, "metadata", {}) or {}).get("twinr_snapshot_kind") or "")
+            for item in items
+        }
+        self.bulk_execution_modes.append(execution_mode)
+        if execution_mode == "async" and snapshot_kinds & {"graph_nodes", "graph_edges"}:
+            raise LongTermRemoteUnavailableError("graph current-view async visibility failed")
+        return super().store_records_bulk(request)
+
+
+class _TransientGraphQueryFailingClient(_FakeGraphClient):
+    def __init__(self, *, path_failures: int = 0, neighbor_failures: int = 0) -> None:
+        super().__init__(error_getter=lambda: None)
+        self._remaining_path_failures = max(0, int(path_failures))
+        self._remaining_neighbor_failures = max(0, int(neighbor_failures))
+
+    def graph_path(self, request):
+        if self._remaining_path_failures > 0:
+            self._remaining_path_failures -= 1
+            raise ChonkyDBError(
+                "graph path temporarily unavailable",
+                status_code=503,
+                response_headers={"Retry-After": "0"},
+            )
+        return super().graph_path(request)
+
+    def graph_neighbors(self, request):
+        if self._remaining_neighbor_failures > 0:
+            self._remaining_neighbor_failures -= 1
+            raise ChonkyDBError(
+                "graph neighbors temporarily unavailable",
+                status_code=503,
+                response_headers={"Retry-After": "0"},
+            )
+        return super().graph_neighbors(request)
+
+
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
         self.required = False
-        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.namespace = "test-namespace"
+        self.load_error: Exception | None = None
+        self.client = _FakeGraphClient(error_getter=lambda: self.load_error)
+        self.read_client = self.client
+        self.write_client = self.client
+        self.config = SimpleNamespace(
+            long_term_memory_migration_enabled=False,
+            long_term_memory_migration_batch_size=64,
+            long_term_memory_remote_read_timeout_s=8.0,
+            long_term_memory_remote_write_timeout_s=15.0,
+            long_term_memory_remote_flush_timeout_s=60.0,
+            long_term_memory_remote_bulk_request_max_bytes=512 * 1024,
+            long_term_memory_remote_shard_max_content_chars=1000,
+            long_term_memory_remote_max_content_chars=2_000_000,
+            long_term_memory_remote_read_cache_ttl_s=0.0,
+        )
         self.snapshots: dict[str, dict[str, object]] = {}
         self.load_calls: list[dict[str, object]] = []
-        self.load_error: Exception | None = None
+        self.probe_calls: list[dict[str, object]] = []
+        self._next_snapshot_document_id = 1
+        self._snapshot_uri: Callable[[str], str] | None = self._build_snapshot_uri
+        self._extract_snapshot_body: Callable[[object], dict[str, object] | None] | None = (
+            self._extract_snapshot_body_impl
+        )
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None, prefer_cached_document_id: bool = False):
         self.load_calls.append(
@@ -45,8 +231,81 @@ class _FakeRemoteState:
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
 
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "local_path": local_path,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+                "fast_fail": fast_fail,
+            }
+        )
+        payload = self.load_snapshot(
+            snapshot_kind=snapshot_kind,
+            local_path=local_path,
+            prefer_cached_document_id=prefer_cached_document_id,
+        )
+        return SimpleNamespace(
+            snapshot_kind=snapshot_kind,
+            status="found" if isinstance(payload, dict) else "not_found",
+            detail=None,
+            payload=payload,
+        )
+
+    def _build_snapshot_uri(self, snapshot_kind: str) -> str:
+        return f"twinr://longterm/{self.namespace}/{snapshot_kind}"
+
+    def _extract_snapshot_body_impl(self, payload, *, snapshot_kind: str):
+        body = payload.get("body") if isinstance(payload, dict) else None
+        nested_payload = payload.get("payload") if isinstance(payload, dict) else None
+        if not isinstance(body, dict):
+            body = nested_payload.get("body") if isinstance(nested_payload, dict) else None
+        if not isinstance(body, dict):
+            return None
+        snapshot_kind_value = (
+            payload.get("snapshot_kind")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not snapshot_kind_value and isinstance(nested_payload, dict):
+            snapshot_kind_value = nested_payload.get("snapshot_kind")
+        if str(snapshot_kind_value or "") not in {
+            "",
+            snapshot_kind,
+        }:
+            return None
+        return dict(body)
+
     def save_snapshot(self, *, snapshot_kind: str, payload):
-        self.snapshots[snapshot_kind] = dict(payload)
+        payload_dict = dict(payload)
+        self.snapshots[snapshot_kind] = payload_dict
+        document_id = f"snapshot-{self._next_snapshot_document_id}"
+        self._next_snapshot_document_id += 1
+        snapshot_uri_builder = self._snapshot_uri
+        assert callable(snapshot_uri_builder)
+        snapshot_uri = snapshot_uri_builder(snapshot_kind)
+        record = {
+            "document_id": document_id,
+            "payload": {
+                "snapshot_kind": snapshot_kind,
+                "body": payload_dict,
+            },
+            "body": payload_dict,
+            "snapshot_kind": snapshot_kind,
+            "uri": snapshot_uri,
+            "content": json.dumps(payload_dict, ensure_ascii=False),
+        }
+        self.client.records_by_document_id[document_id] = dict(record)
+        self.client.records_by_uri[snapshot_uri] = dict(record)
 
 
 def _memory_payload(context: str) -> dict[str, object]:
@@ -258,12 +517,16 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
             )
             store.remember_plan(summary="go for a walk", when_text="today")
             document = store.load_document()
+            remote_view = store.probe_remote_current_view()
 
         self.assertFalse(store.path.exists())
         self.assertTrue(document.edges)
-        self.assertIn("graph", remote_state.snapshots)
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["graph_id"], "graph:user_main")
+        self.assertTrue(remote_state.client.graph_store_many_calls)
 
-    def test_ensure_remote_snapshot_seeds_empty_graph_document(self) -> None:
+    def test_ensure_remote_snapshot_seeds_empty_remote_current_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
             store = TwinrPersonalGraphStore(
@@ -274,12 +537,81 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
             )
 
             created = store.ensure_remote_snapshot()
+            remote_view = store.probe_remote_current_view()
+            loaded = store.load_document()
 
         self.assertTrue(created)
-        self.assertIn("graph", remote_state.snapshots)
-        self.assertEqual(remote_state.snapshots["graph"]["metadata"]["kind"], "personal_graph")
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertEqual(loaded.metadata["kind"], "personal_graph")
+        self.assertIn("user:main", remote_view["topology_refs"])
+        self.assertTrue(remote_state.client.graph_store_many_calls)
 
-    def test_remote_graph_reads_prefer_cached_document_id_hint(self) -> None:
+    def test_ensure_remote_snapshot_uses_sync_for_tiny_graph_current_view_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _AsyncGraphControlPlaneFailingClient(error_getter=lambda: remote_state.load_error)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot()
+            remote_view = store.probe_remote_current_view()
+
+        self.assertTrue(created)
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertTrue(remote_state.client.graph_store_many_calls)
+        self.assertTrue(remote_state.client.bulk_execution_modes)
+        self.assertTrue(all(mode == "sync" for mode in remote_state.client.bulk_execution_modes))
+
+    def test_ensure_remote_snapshot_repairs_broken_current_view_from_local_graph_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            path = Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json"
+            store = TwinrPersonalGraphStore(
+                path=path,
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            document_before = store.load_document()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(document_before.to_payload(), ensure_ascii=False), encoding="utf-8")
+            graph_store_many_calls_before = len(remote_state.client.graph_store_many_calls)
+            subject_uri = store._remote_graph._catalog.item_uri(snapshot_kind="graph_nodes", item_id="user:main")
+            subject_record = remote_state.client.records_by_uri.pop(subject_uri)
+            remote_state.client.records_by_document_id.pop(str(subject_record.get("document_id") or ""), None)
+            node_segment_uris = tuple(
+                uri
+                for uri in remote_state.client.records_by_uri
+                if "/graph_nodes/catalog/segment/" in uri
+            )
+            for uri in node_segment_uris:
+                record = remote_state.client.records_by_uri.pop(uri, None)
+                if isinstance(record, dict):
+                    remote_state.client.records_by_document_id.pop(str(record.get("document_id") or ""), None)
+
+            repaired = store.ensure_remote_snapshot()
+            document_after = store.load_document()
+
+        self.assertTrue(repaired)
+        self.assertGreater(len(remote_state.client.graph_store_many_calls), graph_store_many_calls_before)
+        self.assertTrue(any(node.node_id == "user:main" for node in document_after.nodes))
+        repaired_record = remote_state.client.records_by_uri.get(subject_uri)
+        self.assertIsNotNone(repaired_record)
+        assert repaired_record is not None
+        self.assertEqual(repaired_record["payload"]["item_id"], "user:main")
+
+    def test_ensure_remote_snapshot_fails_closed_for_broken_current_view_without_local_graph_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
             store = TwinrPersonalGraphStore(
@@ -288,11 +620,749 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
                 timezone_name="Europe/Berlin",
                 remote_state=remote_state,
             )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            self.assertFalse(store.path.exists())
+            subject_uri = store._remote_graph._catalog.item_uri(snapshot_kind="graph_nodes", item_id="user:main")
+            subject_record = remote_state.client.records_by_uri.pop(subject_uri)
+            remote_state.client.records_by_document_id.pop(str(subject_record.get("document_id") or ""), None)
+            node_segment_uris = tuple(
+                uri
+                for uri in remote_state.client.records_by_uri
+                if "/graph_nodes/catalog/segment/" in uri
+            )
+            for uri in node_segment_uris:
+                record = remote_state.client.records_by_uri.pop(uri, None)
+                if isinstance(record, dict):
+                    remote_state.client.records_by_document_id.pop(str(record.get("document_id") or ""), None)
 
-            store.ensure_remote_snapshot()
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                store.ensure_remote_snapshot()
 
-        self.assertTrue(remote_state.load_calls)
-        self.assertTrue(remote_state.load_calls[0]["prefer_cached_document_id"])
+    def test_ensure_remote_snapshot_uses_compatible_current_view_when_direct_heads_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            for snapshot_kind in ("graph_nodes", "graph_edges"):
+                head_payload = primary_store._remote_graph._catalog.probe_catalog_payload(snapshot_kind=snapshot_kind)
+                assert head_payload is not None
+                remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=head_payload)
+            graph_store_many_calls_before = len(remote_state.client.graph_store_many_calls)
+            remote_state.probe_calls.clear()
+            remote_state.load_calls.clear()
+            lagging_uris = tuple(
+                uri
+                for uri in remote_state.client.records_by_uri
+                if uri.endswith("/graph_nodes/catalog/current") or uri.endswith("/graph_edges/catalog/current")
+            )
+            for uri in lagging_uris:
+                remote_state.client.records_by_uri.pop(uri, None)
+
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            created = fresh_store.ensure_remote_snapshot()
+            remote_view = fresh_store.load_remote_current_view()
+
+        self.assertFalse(created)
+        self.assertEqual(len(remote_state.client.graph_store_many_calls), graph_store_many_calls_before)
+        for uri in lagging_uris:
+            self.assertNotIn(uri, remote_state.client.records_by_uri)
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertEqual(remote_state.probe_calls, [])
+        self.assertEqual(remote_state.load_calls, [])
+
+    def test_ensure_remote_snapshot_repairs_generic_direct_heads_when_edge_snapshot_pointer_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            path = Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json"
+            store = TwinrPersonalGraphStore(
+                path=path,
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            document_before = store.load_document()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(document_before.to_payload(), ensure_ascii=False), encoding="utf-8")
+            graph_store_many_calls_before = len(remote_state.client.graph_store_many_calls)
+            for snapshot_kind in ("graph_nodes", "graph_edges"):
+                head_uri = store._remote_graph._catalog._catalog_head_uri(snapshot_kind=snapshot_kind)
+                head_record = dict(remote_state.client.records_by_uri[head_uri])
+                payload = dict(head_record.get("payload") or {})
+                generic_payload = {
+                    "schema": payload.get("schema"),
+                    "version": payload.get("version"),
+                    "items_count": payload.get("items_count"),
+                    "segments": [],
+                }
+                head_record["payload"] = generic_payload
+                head_record["content"] = json.dumps(generic_payload, ensure_ascii=False)
+                remote_state.client.records_by_uri[head_uri] = head_record
+                remote_state.client.records_by_document_id[str(head_record.get("document_id") or "")] = head_record
+            remote_state.snapshots.pop("graph_edges", None)
+            edge_snapshot_uri = remote_state._build_snapshot_uri("graph_edges")
+            edge_snapshot_record = remote_state.client.records_by_uri.pop(edge_snapshot_uri, None)
+            if isinstance(edge_snapshot_record, dict):
+                remote_state.client.records_by_document_id.pop(str(edge_snapshot_record.get("document_id") or ""), None)
+
+            repaired = store.ensure_remote_snapshot()
+            remote_view = store.load_remote_current_view()
+            edge_head = store._remote_graph._catalog.probe_catalog_payload(snapshot_kind="graph_edges")
+
+        self.assertTrue(repaired)
+        self.assertGreater(len(remote_state.client.graph_store_many_calls), graph_store_many_calls_before)
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertIsNotNone(edge_head)
+        assert edge_head is not None
+        self.assertEqual(edge_head["generation_id"], remote_view["generation_id"])
+
+    def test_ensure_remote_snapshot_repairs_generation_mismatched_current_heads_from_local_graph_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            path = Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json"
+            store = TwinrPersonalGraphStore(
+                path=path,
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            document_before = store.load_document()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(document_before.to_payload(), ensure_ascii=False), encoding="utf-8")
+            graph_store_many_calls_before = len(remote_state.client.graph_store_many_calls)
+            for snapshot_kind, bad_generation_id in (
+                ("graph_nodes", "gen-bad-node"),
+                ("graph_edges", "gen-bad-edge"),
+            ):
+                head_uri = store._remote_graph._catalog._catalog_head_uri(snapshot_kind=snapshot_kind)
+                head_record = dict(remote_state.client.records_by_uri[head_uri])
+                payload = dict(head_record.get("payload") or {})
+                payload["generation_id"] = bad_generation_id
+                head_record["payload"] = payload
+                head_record["content"] = json.dumps(payload, ensure_ascii=False)
+                remote_state.client.records_by_uri[head_uri] = head_record
+                remote_state.client.records_by_document_id[str(head_record.get("document_id") or "")] = head_record
+
+            repaired = store.ensure_remote_snapshot()
+            remote_view = store.load_remote_current_view()
+
+        self.assertTrue(repaired)
+        self.assertGreater(len(remote_state.client.graph_store_many_calls), graph_store_many_calls_before)
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertNotEqual(remote_view["generation_id"], "gen-bad-node")
+        self.assertNotEqual(remote_view["generation_id"], "gen-bad-edge")
+
+    def test_probe_remote_current_view_fast_fails_compatible_snapshot_probe_without_cached_doc_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            for snapshot_kind in ("graph_nodes", "graph_edges"):
+                head_payload = primary_store._remote_graph._catalog.probe_catalog_payload(snapshot_kind=snapshot_kind)
+                assert head_payload is not None
+                remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=head_payload)
+            lagging_uris = tuple(
+                uri
+                for uri in remote_state.client.records_by_uri
+                if uri.endswith("/graph_nodes/catalog/current") or uri.endswith("/graph_edges/catalog/current")
+            )
+            for uri in lagging_uris:
+                remote_state.client.records_by_uri.pop(uri, None)
+            remote_state.probe_calls.clear()
+            remote_state.load_calls.clear()
+            remote_state._snapshot_uri = None  # type: ignore[method-assign]
+            remote_state._extract_snapshot_body = None  # type: ignore[method-assign]
+
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            remote_view = fresh_store.probe_remote_current_view()
+
+        self.assertIsNotNone(remote_view)
+        self.assertEqual(
+            {call["snapshot_kind"] for call in remote_state.probe_calls},
+            {"graph_nodes", "graph_edges"},
+        )
+        self.assertTrue(all(call["prefer_cached_document_id"] is False for call in remote_state.probe_calls))
+        self.assertTrue(all(call["prefer_metadata_only"] is True for call in remote_state.probe_calls))
+        self.assertTrue(all(call["fast_fail"] is True for call in remote_state.probe_calls))
+
+    def test_probe_remote_current_view_retries_full_content_when_metadata_only_graph_heads_get_400(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            remote_state.probe_calls.clear()
+            remote_state.load_calls.clear()
+            original_fetch_full_document = remote_state.client.fetch_full_document
+            fetch_calls: list[dict[str, object]] = []
+
+            def _fetch_full_document(*, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+                fetch_calls.append(
+                    {
+                        "document_id": document_id,
+                        "origin_uri": origin_uri,
+                        "include_content": include_content,
+                        "max_content_chars": max_content_chars,
+                    }
+                )
+                if (
+                    not include_content
+                    and isinstance(origin_uri, str)
+                    and (
+                        origin_uri.endswith("/graph_nodes/catalog/current")
+                        or origin_uri.endswith("/graph_edges/catalog/current")
+                    )
+                ):
+                    raise ChonkyDBError(
+                        "ChonkyDB request failed for GET /v1/external/documents/full",
+                        status_code=400,
+                        response_json={
+                            "detail": "Request validation failed",
+                            "success": False,
+                        },
+                    )
+                return original_fetch_full_document(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=max_content_chars,
+                )
+
+            remote_state.client.fetch_full_document = _fetch_full_document  # type: ignore[method-assign]
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            remote_view = fresh_store.probe_remote_current_view()
+
+        self.assertIsNotNone(remote_view)
+        self.assertEqual(remote_state.probe_calls, [])
+        self.assertEqual(remote_state.load_calls, [])
+        graph_head_retry_calls = [
+            call
+            for call in fetch_calls
+            if isinstance(call["origin_uri"], str)
+            and (
+                str(call["origin_uri"]).endswith("/graph_nodes/catalog/current")
+                or str(call["origin_uri"]).endswith("/graph_edges/catalog/current")
+            )
+        ]
+        self.assertGreaterEqual(len(graph_head_retry_calls), 4)
+        self.assertEqual(sum(1 for call in graph_head_retry_calls if not call["include_content"]), 2)
+        self.assertEqual(sum(1 for call in graph_head_retry_calls if call["include_content"]), 2)
+
+    def test_load_remote_current_view_uses_full_head_when_metadata_only_probe_contract_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            remote_state.probe_calls.clear()
+            remote_state.load_calls.clear()
+            original_fetch_full_document = remote_state.client.fetch_full_document
+            fetch_calls: list[dict[str, object]] = []
+
+            def _fetch_full_document(*, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+                fetch_calls.append(
+                    {
+                        "document_id": document_id,
+                        "origin_uri": origin_uri,
+                        "include_content": include_content,
+                        "max_content_chars": max_content_chars,
+                    }
+                )
+                payload = original_fetch_full_document(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=max_content_chars,
+                )
+                if (
+                    not include_content
+                    and isinstance(origin_uri, str)
+                    and origin_uri.endswith("/graph_edges/catalog/current")
+                    and isinstance(payload, dict)
+                ):
+                    full_body = payload.get("body")
+                    if not isinstance(full_body, dict):
+                        nested_payload = payload.get("payload")
+                        full_body = nested_payload.get("body") if isinstance(nested_payload, dict) else None
+                    stripped_body = {
+                        "schema": str(full_body.get("schema") or ""),
+                        "version": full_body.get("version"),
+                        "items_count": full_body.get("items_count"),
+                        "segments": [],
+                    }
+                    return {
+                        "document_id": payload.get("document_id"),
+                        "uri": payload.get("uri"),
+                        "snapshot_kind": payload.get("snapshot_kind"),
+                        "payload": dict(stripped_body),
+                        "body": dict(stripped_body),
+                        "content": None,
+                    }
+                return payload
+
+            remote_state.client.fetch_full_document = _fetch_full_document  # type: ignore[method-assign]
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            self.assertIsNone(fresh_store.probe_remote_current_view())
+            probe_call_count_after_probe = len(remote_state.probe_calls)
+            load_call_count_after_probe = len(remote_state.load_calls)
+            remote_view = fresh_store.load_remote_current_view()
+
+        self.assertIsNotNone(remote_view)
+        assert remote_view is not None
+        self.assertEqual(remote_view["subject_node_id"], "user:main")
+        self.assertEqual(remote_view["graph_id"], "graph:user_main")
+        self.assertEqual(len(remote_state.probe_calls), probe_call_count_after_probe)
+        self.assertEqual(len(remote_state.load_calls), load_call_count_after_probe)
+        graph_head_calls = [
+            call
+            for call in fetch_calls
+            if isinstance(call["origin_uri"], str)
+            and (
+                str(call["origin_uri"]).endswith("/graph_nodes/catalog/current")
+                or str(call["origin_uri"]).endswith("/graph_edges/catalog/current")
+            )
+        ]
+        self.assertGreaterEqual(len(graph_head_calls), 4)
+        self.assertGreaterEqual(sum(1 for call in graph_head_calls if not call["include_content"]), 2)
+        self.assertGreaterEqual(sum(1 for call in graph_head_calls if call["include_content"]), 2)
+
+    def test_remote_graph_load_prefers_remote_current_view_over_stale_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            path = Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json"
+            store = TwinrPersonalGraphStore(
+                path=path,
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": {"name": "twinr_graph", "version": 2},
+                        "subject_node_id": "user:main",
+                        "graph_id": "graph:user_main",
+                        "created_at": "2026-03-14T08:00:00Z",
+                        "updated_at": "2026-03-14T08:05:00Z",
+                        "nodes": [{"id": "user:main", "type": "user", "label": "Erika"}],
+                        "edges": [],
+                        "metadata": {"kind": "stale_local_graph"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = store.load_document()
+
+        self.assertEqual(loaded.metadata["kind"], "personal_graph")
+        self.assertTrue(any(edge.edge_type == "user_plans" for edge in loaded.edges))
+        self.assertFalse(path.exists())
+
+    def test_remote_graph_load_uses_topology_refs_when_node_catalog_segments_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            lagging_uris = tuple(
+                uri
+                for uri in remote_state.client.records_by_uri
+                if "/graph_nodes/catalog/segment/" in uri
+            )
+            for uri in lagging_uris:
+                record = remote_state.client.records_by_uri.pop(uri, None)
+                if isinstance(record, dict):
+                    remote_state.client.records_by_document_id.pop(str(record.get("document_id") or ""), None)
+
+            loaded = store.load_document()
+
+        self.assertEqual(loaded.subject_node_id, "user:main")
+        self.assertTrue(any(node.node_id == "user:main" for node in loaded.nodes))
+        self.assertTrue(any(edge.edge_type == "user_plans" for edge in loaded.edges))
+
+    def test_remote_graph_load_uses_catalog_projections_when_exact_item_documents_do_not_hydrate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            original_fetch = remote_state.client.fetch_full_document
+            unreadable_origin_uris = {
+                entry.uri
+                for entry in store._remote_graph._catalog.load_catalog_entries(snapshot_kind="graph_nodes")
+            }
+            unreadable_origin_uris.update(
+                entry.uri
+                for entry in store._remote_graph._catalog.load_catalog_entries(snapshot_kind="graph_edges")
+            )
+
+            def _fetch_without_payload(
+                *,
+                document_id=None,
+                origin_uri=None,
+                include_content=True,
+                max_content_chars=4000,
+            ):
+                if origin_uri in unreadable_origin_uris:
+                    return {
+                        "success": True,
+                        "document_id": document_id,
+                        "origin_uri": origin_uri,
+                        "chunk_count": 0,
+                        "chunks": [],
+                    }
+                return original_fetch(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=max_content_chars,
+                )
+
+            remote_state.client.fetch_full_document = _fetch_without_payload
+            loaded = store.load_document()
+
+        self.assertEqual(loaded.subject_node_id, "user:main")
+        self.assertTrue(any(node.node_id == "user:main" for node in loaded.nodes))
+        self.assertTrue(any(edge.edge_type == "user_plans" for edge in loaded.edges))
+
+    def test_remote_current_path_maps_generation_refs_back_to_logical_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.apply_candidate_edges(
+                (
+                    LongTermGraphEdgeCandidateV1(
+                        source_ref="user:main",
+                        edge_type="social_related_to_user",
+                        target_ref="person:janina",
+                        confidence=0.95,
+                        confirmed_by_user=True,
+                        attributes={"relation": "wife"},
+                    ),
+                    LongTermGraphEdgeCandidateV1(
+                        source_ref="person:janina",
+                        edge_type="spatial_located_in",
+                        target_ref="place:eye_doctor",
+                        confidence=0.88,
+                        confirmed_by_user=True,
+                    ),
+                )
+            )
+
+            path_payload = store.query_remote_current_path(
+                source_node_id="user:main",
+                target_node_id="place:eye_doctor",
+            )
+            neighbor_payload = store.query_remote_current_neighbors(node_id="person:janina", limit=4)
+
+        self.assertIsNotNone(path_payload)
+        self.assertEqual(path_payload["logical_path"], ["user:main", "person:janina", "place:eye_doctor"])
+        self.assertIsNotNone(neighbor_payload)
+        self.assertEqual(
+            [item["logical_node_id"] for item in neighbor_payload["neighbors"]],
+            ["place:eye_doctor"],
+        )
+        self.assertTrue(remote_state.client.graph_path_calls)
+        self.assertTrue(remote_state.client.graph_neighbors_calls)
+
+    def test_build_prompt_context_prefers_remote_query_first_subgraph_and_emits_query_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_preference(
+                category="brand",
+                value="Melitta",
+                for_product="coffee",
+            )
+            remote_state.load_calls.clear()
+
+            context = store.build_prompt_context("Wo kann ich heute Kaffee kaufen?")
+
+        self.assertIsNotNone(context)
+        payload = _memory_payload(context or "")
+        self.assertEqual(payload["query_plan"]["mode"], "remote_query_first_subgraph")
+        self.assertIn("Melitta", json.dumps(payload, ensure_ascii=False))
+        self.assertTrue(remote_state.client.graph_path_calls)
+        self.assertTrue(remote_state.client.graph_neighbors_calls)
+        self.assertEqual(remote_state.load_calls, [])
+
+    def test_build_prompt_context_retries_transient_remote_graph_expansion_queries_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _TransientGraphQueryFailingClient(path_failures=1, neighbor_failures=1)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone=_TEST_CORINNA_PHONE,
+                role="Physiotherapist",
+            )
+            remote_state.load_calls.clear()
+
+            context = store.build_prompt_context("Was ist Corinnas Nummer?")
+
+        self.assertIsNotNone(context)
+        payload = _memory_payload(context or "")
+        self.assertEqual(payload["query_plan"]["mode"], "remote_query_first_subgraph")
+        self.assertEqual(payload["query_plan"]["path_query_events"][0]["status"], "retried_ok")
+        self.assertEqual(payload["query_plan"]["neighbor_query_events"][0]["status"], "retried_ok")
+        self.assertGreaterEqual(len(remote_state.client.graph_path_calls), 2)
+        self.assertGreaterEqual(len(remote_state.client.graph_neighbors_calls), 2)
+        self.assertEqual(remote_state.load_calls, [])
+
+    def test_select_context_selection_uses_current_head_projections_when_fresh_reader_cannot_read_exact_graph_item_docs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            primary_store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone=_TEST_CORINNA_PHONE,
+                role="Physiotherapist",
+            )
+            unreadable_origin_uris = {
+                entry.uri
+                for snapshot_kind in ("graph_nodes", "graph_edges")
+                for entry in primary_store._remote_graph._catalog.load_catalog_entries(snapshot_kind=snapshot_kind)
+            }
+            unreadable_document_ids = {
+                str(entry.document_id)
+                for snapshot_kind in ("graph_nodes", "graph_edges")
+                for entry in primary_store._remote_graph._catalog.load_catalog_entries(snapshot_kind=snapshot_kind)
+                if isinstance(entry.document_id, str) and entry.document_id
+            }
+            original_fetch = remote_state.client.fetch_full_document
+            fetch_calls: list[dict[str, object]] = []
+
+            def _fetch_without_exact_graph_item_documents(
+                *,
+                document_id=None,
+                origin_uri=None,
+                include_content=True,
+                max_content_chars=4000,
+            ):
+                fetch_calls.append(
+                    {
+                        "document_id": document_id,
+                        "origin_uri": origin_uri,
+                        "include_content": include_content,
+                        "max_content_chars": max_content_chars,
+                    }
+                )
+                if (
+                    isinstance(document_id, str)
+                    and document_id in unreadable_document_ids
+                ) or (
+                    isinstance(origin_uri, str)
+                    and origin_uri in unreadable_origin_uris
+                ):
+                    raise LongTermRemoteUnavailableError("exact graph item document unavailable")
+                return original_fetch(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=max_content_chars,
+                )
+
+            remote_state.client.fetch_full_document = _fetch_without_exact_graph_item_documents  # type: ignore[method-assign]
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            fresh_store._remote_graph._catalog.top_catalog_entries = (  # type: ignore[method-assign]
+                lambda *, snapshot_kind, limit, eligible=None, preserve_order=False: ()
+            )
+
+            selection = fresh_store.select_context_selection("Corinna Maier")
+
+        self.assertIsNotNone(selection.query_plan)
+        assert selection.query_plan is not None
+        self.assertEqual(selection.query_plan["mode"], "remote_query_first_subgraph")
+        self.assertIn("catalog_current_head", selection.query_plan["access_path"])
+        self.assertTrue(any(node.label == "Corinna Maier" for node in selection.document.nodes))
+        exact_item_fetches = [
+            call
+            for call in fetch_calls
+            if (
+                isinstance(call["document_id"], str)
+                and str(call["document_id"]) in unreadable_document_ids
+            ) or (
+                isinstance(call["origin_uri"], str)
+                and str(call["origin_uri"]) in unreadable_origin_uris
+            )
+        ]
+        self.assertEqual(exact_item_fetches, [])
+
+    def test_select_context_selection_and_render_prompt_context_reuse_the_same_query_first_subgraph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone=_TEST_CORINNA_PHONE,
+                role="Physiotherapist",
+            )
+            remote_state.load_calls.clear()
+
+            selection = store.select_context_selection("Was ist Corinnas Nummer?")
+            context = store.render_prompt_context_selection(
+                selection,
+                query_text="Was ist Corinnas Nummer?",
+            )
+
+        self.assertIsNotNone(context)
+        payload = _memory_payload(context or "")
+        self.assertEqual(payload["query_plan"]["mode"], "remote_query_first_subgraph")
+        self.assertIn("Corinna Maier", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(remote_state.load_calls, [])
+
+    def test_build_prompt_context_keeps_query_first_subgraph_when_graph_expansion_503_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _TransientGraphQueryFailingClient(path_failures=3, neighbor_failures=3)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone=_TEST_CORINNA_PHONE,
+                role="Physiotherapist",
+            )
+            remote_state.load_calls.clear()
+
+            context = store.build_prompt_context("Was ist Corinnas Nummer?")
+
+        self.assertIsNotNone(context)
+        payload = _memory_payload(context or "")
+        self.assertEqual(payload["query_plan"]["mode"], "remote_query_first_subgraph")
+        self.assertEqual(payload["query_plan"]["path_query_events"][0]["status"], "degraded")
+        self.assertEqual(payload["query_plan"]["neighbor_query_events"][0]["status"], "degraded")
+        self.assertEqual(remote_state.load_calls, [])
+
+    def test_build_subtext_payload_prefers_remote_query_first_subgraph_and_keeps_query_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(
+                summary="go for a walk",
+                when_text="today",
+                details="Prefer a short gentle walk.",
+            )
+            remote_state.load_calls.clear()
+
+            payload = store.build_subtext_payload("go for a walk today")
+
+        self.assertIsNotNone(payload)
+        payload_dict = cast(dict[str, object], payload)  # pylint: disable=unsubscriptable-object
+        query_plan = cast(dict[str, object], payload_dict["query_plan"])  # pylint: disable=unsubscriptable-object
+        self.assertEqual(query_plan["mode"], "remote_query_first_subgraph")
+        self.assertIn("situational_threads", payload_dict)
+        self.assertTrue(remote_state.client.graph_path_calls)
+        self.assertTrue(remote_state.client.graph_neighbors_calls)
+        self.assertEqual(remote_state.load_calls, [])
 
     def test_optional_remote_unavailable_error_falls_back_to_empty_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -309,7 +1379,7 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
 
         self.assertEqual(document.subject_node_id, "user:main")
         self.assertEqual(document.edges, ())
-        self.assertTrue(remote_state.load_calls)
+        self.assertFalse(store.path.exists())
 
 
 if __name__ == "__main__":

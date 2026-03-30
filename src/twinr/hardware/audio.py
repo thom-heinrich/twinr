@@ -4,6 +4,7 @@
 # BUG-3: Fixed file playback to use the bounded ALSA subprocess environment and active-process tracking, so stop_playback() works for file-backed playback too.
 # BUG-4: Fixed PCM alignment to full frames, preventing truncated multi-channel frames from leaking into capture/playback paths.
 # BUG-5: Reassert the ReSpeaker XVF3800 playback mixer during runtime player construction so spoken replies do not stay whisper-quiet after Linux mixer drift.
+# BUG-6: Preserve the logged-in desktop user's audio-session env for productive root-owned ReSpeaker playback subprocesses, because the XVF3800 softvol path can hang at drain/finalize when root loses that borrowed session on the Pi.
 # SEC-1: Removed temp-file-based play_wav_bytes() disk amplification and added bounded streamed-playback byte limits to prevent practical SD-card/tmp exhaustion and endless remote audio streams on Raspberry Pi deployments.
 # IMP-1: Added optional hybrid WebRTC VAD + adaptive noise floor endpointing with graceful RMS fallback for Pi-class edge devices.
 # IMP-2: Added chunk-accurate PCM buffering and more accurate duration accounting so downstream speech timing is stable under pipe fragmentation.
@@ -42,6 +43,7 @@ except ModuleNotFoundError:
 
 from twinr.hardware.audio_env import build_audio_subprocess_env_for_mode
 from twinr.hardware.respeaker_duplex_playback import (
+    config_targets_respeaker,
     maybe_open_respeaker_duplex_playback_guard,
     resolve_respeaker_duplex_playback_sample_rate_hz,
 )
@@ -70,6 +72,12 @@ _TONE_HEADROOM_SCALE = 0.92
 
 _GENERIC_CAPTURE_DEVICE_ALIASES = frozenset({"default", "pulse", "sysdefault"})
 _CANONICAL_CAPTURE_PREFIXES = frozenset({"dsnoop", "front", "hw", "plughw", "sysdefault"})
+_ROOT_BORROWED_SESSION_PLAYBACK_DEVICE_ALIASES = frozenset(
+    {
+        "twinr_playback_hw",
+        "twinr_playback_softvol",
+    }
+)
 
 _DEFAULT_VAD_MODE = "auto"
 _DEFAULT_WEBRTC_VAD_AGGRESSIVENESS = 2
@@ -127,6 +135,13 @@ def capture_device_identity(device: str | None) -> str:
         return normalized.lower()
     device_index = tokens.get("DEV") or "0"
     return f"alsa-card={card};dev={device_index}"
+
+
+def _playback_device_needs_root_borrowed_session_audio(device: str | None) -> bool:
+    normalized = _normalize_audio_device(device).lower()
+    if normalized in _ROOT_BORROWED_SESSION_PLAYBACK_DEVICE_ALIASES:
+        return True
+    return config_targets_respeaker(device)
 
 
 def _ensure_int(name: str, value: object, *, minimum: int) -> int:
@@ -1921,11 +1936,15 @@ class WaveAudioPlayer:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
+        allow_root_borrowed_session_audio = _playback_device_needs_root_borrowed_session_audio(
+            self.device
+        )
         process = _spawn_audio_process(
             command,
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
             purpose="Audio playback",
+            allow_root_borrowed_session_audio=allow_root_borrowed_session_audio,
         )
         self._set_active_process(process)
 
@@ -2031,6 +2050,9 @@ class WaveAudioPlayer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             purpose="Audio playback",
+            allow_root_borrowed_session_audio=_playback_device_needs_root_borrowed_session_audio(
+                self.device
+            ),
         )
         self._set_active_process(process)
         try:

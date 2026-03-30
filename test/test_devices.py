@@ -106,6 +106,26 @@ class DeviceOverviewTests(unittest.TestCase):
                         "stderr": "",
                     },
                 )()
+            if executable == "lpstat" and command[1:3] == ["-a", "Thermal_GP58"]:
+                return type(
+                    "CompletedProcess",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": "Thermal_GP58 accepting requests since Fri Mar 13 16:03:44 2026\n",
+                        "stderr": "",
+                    },
+                )()
+            if executable == "lpstat" and command[1:3] == ["-v", "Thermal_GP58"]:
+                return type(
+                    "CompletedProcess",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": "device for Thermal_GP58: usb://Gprinter/GP-58?serial=WTTING%20\n",
+                        "stderr": "",
+                    },
+                )()
             if executable == "lpoptions" and command[1:2] == ["-p"]:
                 return type(
                     "CompletedProcess",
@@ -127,6 +147,26 @@ class DeviceOverviewTests(unittest.TestCase):
                     {
                         "returncode": 0,
                         "stdout": "card 3: CameraB409241 [USB Camera-B4.09.24.1], device 0: USB Audio [USB Audio]\n",
+                        "stderr": "",
+                    },
+                )()
+            if executable == "arecord" and command[1:2] == ["-L"]:
+                return type(
+                    "CompletedProcess",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": "default\nsysdefault:CARD=CameraB409241\nplughw:CARD=CameraB409241,DEV=0\n",
+                        "stderr": "",
+                    },
+                )()
+            if executable == "aplay" and command[1:2] == ["-L"]:
+                return type(
+                    "CompletedProcess",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": "default\nsysdefault:CARD=ThermalSpeaker\n",
                         "stderr": "",
                     },
                 )()
@@ -159,7 +199,16 @@ class DeviceOverviewTests(unittest.TestCase):
                 data={"pir_motion_detected": True},
             )
 
-            with patch("twinr.ops.devices.which", side_effect=lambda name: f"/usr/bin/{name}" if name in {"lpstat", "lpoptions", "arecord"} else None):
+            with patch(
+                "twinr.ops.devices._resolve_executable",
+                side_effect=lambda name: (
+                    name
+                    if str(name).startswith("/")
+                    else f"/usr/bin/{name}"
+                    if name in {"lpstat", "lpoptions", "arecord", "aplay"}
+                    else None
+                ),
+            ):
                 with patch("twinr.ops.devices.subprocess.run", side_effect=fake_run):
                     overview = collect_device_overview(config, event_store=events)
 
@@ -176,7 +225,7 @@ class DeviceOverviewTests(unittest.TestCase):
         )
         self.assertIn("warn at", {fact.label: fact.value for fact in printer.facts}["Last self-test"])
         self.assertEqual(devices["camera"].status, "ok")
-        self.assertIn("card 3: CameraB409241", {fact.label: fact.value for fact in devices["audio_input"].facts}["Detected capture devices"])
+        self.assertIn("card 3: CameraB409241", {fact.label: fact.value for fact in devices["audio_input"].facts}["ALSA capture cards"])
         self.assertNotEqual(
             {fact.label: fact.value for fact in devices["pir"].facts}["Last motion seen"],
             "not recorded in recent ops events",

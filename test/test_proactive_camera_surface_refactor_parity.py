@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -29,10 +31,10 @@ except ImportError:  # pragma: no cover - exercised after the refactor package e
     ProactiveCameraSurfaceImpl = None
 
 _EXPECTED_GOLDEN_DIGESTS = {
-    "from_config_fast_attention": "2433b18e17344e2ddcb113cef9f3e140cf8c8e73c3378f7f9642d06bd4d9b4c2",
-    "mixed_presence_sequence": "4458ca679a2afbd29f2bd27ef6b68a575bc44f3eaa5bd5eb08a5ab023b8a404c",
-    "gesture_and_object_sequence": "daf941e27ea4878f20502762c159169d7890cb7cd9039704ecfcd9c2b3093b91",
-    "person_return_sequence": "cfe33f67d9aeaaa38ffda4b7ca32fd86da9f67458a655c83eaf67573088d50ca",
+    "from_config_fast_attention": "dc3f828355eb882d9c8a542e1cb5721a273bef58ec4b689eb25f45b507c5094c",
+    "mixed_presence_sequence": "532b71720d79e6d85c445544d3178e6881d32986b17f515927c784b0eab2dfe3",
+    "gesture_and_object_sequence": "63fb20ec6584ceb2713a8f708dc037a01d637891cc35d973a93c100f741611f7",
+    "person_return_sequence": "17640f05afcdd74d9d4c89a507706c7350c7d371048b4486e25201db3da56b05",
 }
 
 
@@ -48,6 +50,26 @@ def _update_payload(update) -> dict[str, object]:
     }
 
 
+def _jsonable(value: object) -> object:
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {
+            field.name: _jsonable(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {
+            _jsonable(key): _jsonable(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def _capture_from_config_payload() -> dict[str, object]:
     config = ProactiveCameraSurfaceConfig.from_config(
         SimpleNamespace(
@@ -59,7 +81,7 @@ def _capture_from_config_payload() -> dict[str, object]:
             proactive_local_camera_fine_hand_explicit_min_confidence=0.74,
         )
     )
-    return asdict(config)
+    return _jsonable(config)
 
 
 def _capture_mixed_presence_sequence(

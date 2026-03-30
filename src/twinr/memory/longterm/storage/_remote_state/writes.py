@@ -1,5 +1,5 @@
 """Remote snapshot write and attestation helpers for remote state."""
-# mypy: disable-error-code=attr-defined,arg-type
+# mypy: disable-error-code="attr-defined,arg-type"
 
 from __future__ import annotations
 
@@ -9,10 +9,18 @@ from typing import Mapping
 
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
+from twinr.memory.longterm.storage._remote_retry import (
+    clone_client_with_capped_timeout,
+    remote_write_retry_delay_s,
+    retryable_remote_write_attempts,
+    should_fallback_async_job_resolution_error,
+    should_retry_remote_write_error,
+)
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteWriteContext,
     record_remote_write_diagnostic,
 )
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_write_observation
 
 from .shared import (
     LongTermRemoteSnapshotProbe,
@@ -220,7 +228,8 @@ class LongTermRemoteStateWriteMixin:
         last_error: Exception | None = None
         resolved_attempts = max(1, int(attempts or self._retry_attempts()))
         resolved_backoff_s = max(0.0, float(backoff_s if backoff_s is not None else self._retry_backoff_s()))
-        for attempt in range(resolved_attempts):
+        attempt = 0
+        while attempt < resolved_attempts:
             try:
                 result = write_client.store_record(record)
                 failure_detail = _store_result_failure_detail(result)
@@ -231,24 +240,62 @@ class LongTermRemoteStateWriteMixin:
                     )
                 self._note_remote_success()
                 document_id = _extract_store_document_id(result)
-                if document_id is not None:
-                    return document_id
-                return self._await_async_store_document_id(write_client, result=result)
+                resolved_document_id = (
+                    document_id
+                    if document_id is not None
+                    else self._await_async_store_document_id(write_client, result=result)
+                )
+                record_remote_write_observation(
+                    remote_state=self,
+                    context=LongTermRemoteWriteContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="store_snapshot_record",
+                        request_method="POST",
+                        request_payload_kind="snapshot_record",
+                        request_path="/v1/external/record",
+                        timeout_s=getattr(getattr(write_client, "config", None), "timeout_s", None),
+                        namespace=self.namespace,
+                        access_classification="legacy_snapshot_write",
+                        document_id_hint=resolved_document_id,
+                        uri_hint=record.uri,
+                        attempt_count=attempt + 1,
+                        request_item_count=1,
+                    ),
+                    latency_ms=max(0.0, (time.monotonic() - started) * 1000.0),
+                    outcome="ok",
+                    classification="ok",
+                )
+                return resolved_document_id
             except Exception as exc:
                 last_error = exc
                 self._note_remote_failure()
-                if attempt + 1 >= resolved_attempts:
+                resolved_attempts = retryable_remote_write_attempts(resolved_attempts, exc=exc)
+                if not should_retry_remote_write_error(exc) or attempt + 1 >= resolved_attempts:
                     break
-                if resolved_backoff_s > 0:
-                    time.sleep(resolved_backoff_s)
+                delay_s = remote_write_retry_delay_s(
+                    exc,
+                    default_backoff_s=resolved_backoff_s,
+                    attempt_index=attempt,
+                )
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                attempt += 1
+                continue
+            attempt += 1
         if last_error is not None:
             record_remote_write_diagnostic(
                 remote_state=self,
                 context=LongTermRemoteWriteContext(
                     snapshot_kind=snapshot_kind,
                     operation="store_snapshot_record",
+                    request_method="POST",
+                    request_payload_kind="snapshot_record",
+                    request_path="/v1/external/record",
+                    timeout_s=getattr(getattr(write_client, "config", None), "timeout_s", None),
+                    namespace=self.namespace,
+                    access_classification="legacy_snapshot_write",
                     uri_hint=record.uri,
-                    attempt_count=resolved_attempts,
+                    attempt_count=attempt + 1,
                     request_item_count=1,
                 ),
                 exc=last_error,
@@ -278,38 +325,48 @@ class LongTermRemoteStateWriteMixin:
         job_status_client = self._status_probe_client(write_client)
         poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
         total_timeout_s = self._async_job_visibility_timeout_s()
-        attempts = max(1, int(math.ceil(total_timeout_s / poll_interval_s)))
-        for attempt in range(attempts):
-            payload = job_status_client.job_status(job_id)
-            if isinstance(payload, Mapping):
-                raw_status = payload.get("status")
-                status = _normalize_text(raw_status if isinstance(raw_status, str) else None).lower()
-                result_payload = payload.get("result")
-                result_mapping = result_payload if isinstance(result_payload, Mapping) else None
-                if status in {"failed", "cancelled", "rejected"}:
-                    detail = _store_result_failure_detail(result_mapping)
-                    if not detail:
-                        raw_error = payload.get("error")
-                        raw_error_type = payload.get("error_type")
-                        detail = (
-                            _normalize_text(raw_error if isinstance(raw_error, str) else None)
-                            or _normalize_text(raw_error_type if isinstance(raw_error_type, str) else None)
-                            or f"async job status={status}"
+        deadline = time.monotonic() + total_timeout_s
+        while True:
+            remaining_timeout_s = deadline - time.monotonic()
+            if remaining_timeout_s <= 0.0:
+                break
+            capped_client = clone_client_with_capped_timeout(job_status_client, timeout_s=remaining_timeout_s)
+            try:
+                payload = capped_client.job_status(job_id)  # type: ignore[attr-defined]
+            except Exception as exc:
+                if not should_fallback_async_job_resolution_error(exc):
+                    raise
+            else:
+                if isinstance(payload, Mapping):
+                    raw_status = payload.get("status")
+                    status = _normalize_text(raw_status if isinstance(raw_status, str) else None).lower()
+                    result_payload = payload.get("result")
+                    result_mapping = result_payload if isinstance(result_payload, Mapping) else None
+                    if status in {"failed", "cancelled", "rejected"}:
+                        detail = _store_result_failure_detail(result_mapping)
+                        if not detail:
+                            raw_error = payload.get("error")
+                            raw_error_type = payload.get("error_type")
+                            detail = (
+                                _normalize_text(raw_error if isinstance(raw_error, str) else None)
+                                or _normalize_text(raw_error_type if isinstance(raw_error_type, str) else None)
+                                or f"async job status={status}"
+                            )
+                        raise LongTermRemoteUnavailableError(
+                            f"Accepted async remote snapshot write job {job_id!r} failed before readback: {detail}"
                         )
-                    raise LongTermRemoteUnavailableError(
-                        f"Accepted async remote snapshot write job {job_id!r} failed before readback: {detail}"
-                    )
-                document_id = _extract_store_document_id(result_mapping)
-                if document_id is None:
-                    document_id = _extract_store_document_id(payload)
-                if document_id is not None:
-                    return document_id
-                if status in {"succeeded", "done"}:
-                    return None
-            if attempt + 1 >= attempts:
+                    document_id = _extract_store_document_id(result_mapping)
+                    if document_id is None:
+                        document_id = _extract_store_document_id(payload)
+                    if document_id is not None:
+                        return document_id
+                    if status in {"succeeded", "done"}:
+                        return None
+            remaining_sleep_s = deadline - time.monotonic()
+            if remaining_sleep_s <= 0.0:
                 break
             if poll_interval_s > 0.0:
-                time.sleep(poll_interval_s)
+                time.sleep(min(poll_interval_s, remaining_sleep_s))
         return None
 
     def _attest_saved_snapshot_readback(

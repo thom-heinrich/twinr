@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -9,17 +10,20 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.ops.pi_repo_mirror import PiRepoMirrorCycleResult
-from twinr.ops.pi_runtime_deploy import deploy_pi_runtime
+from twinr.ops.pi_runtime_deploy import PiRuntimeDeployError, deploy_pi_runtime
 from twinr.ops.pi_runtime_deploy_remote import (
+    PiSystemdServiceState,
     PiRemoteExecutor,
     install_editable_package,
     verify_python_import_contract,
 )
 from twinr.ops.self_coding_pi import load_pi_connection_settings
+from twinr.ops.venv_bridged_system_cleanup import find_shadowed_direct_dependency_distributions
 from twinr.ops.venv_system_site_bridge import ensure_pi_system_site_packages_bridge
 from twinr.ops.venv_wrapper_repair import repair_venv_python_shebangs
 
@@ -47,6 +51,9 @@ _TEST_PI_IMPORT_MODULES = (
     "zstandard",
     "h2",
     "opentelemetry.trace",
+    "twinr.memory.context_store",
+    "twinr.memory.longterm.storage._remote_current_records",
+    "twinr.memory.longterm.runtime.health",
 )
 _TEST_PI_ATTRIBUTE_CONTRACTS = {
     "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
@@ -107,9 +114,52 @@ def _import_contract_stdout(
     ) + "\n"
 
 
+def _repo_attestation_stdout(
+    *,
+    verified_entry_count: int = 2,
+    verified_file_count: int = 2,
+    verified_symlink_count: int = 0,
+    missing_count: int = 0,
+    mismatch_count: int = 0,
+    sampled_missing_paths: tuple[str, ...] = (),
+    sampled_mismatch_details: tuple[str, ...] = (),
+) -> str:
+    return json.dumps(
+        {
+            "verified_entry_count": verified_entry_count,
+            "verified_file_count": verified_file_count,
+            "verified_symlink_count": verified_symlink_count,
+            "missing_count": missing_count,
+            "mismatch_count": mismatch_count,
+            "sampled_missing_paths": list(sampled_missing_paths),
+            "sampled_mismatch_details": list(sampled_mismatch_details),
+            "elapsed_s": 0.123,
+        }
+    ) + "\n"
+
+
 def _normalized_requirement_name(requirement: str) -> str:
     token = re.split(r"[<>=!~;\[\]\s]", str(requirement).strip(), maxsplit=1)[0]
     return token.strip().lower().replace("_", "-")
+
+
+def _write_dist_metadata(
+    *,
+    site_packages_dir: Path,
+    name: str,
+    version: str,
+    requires: tuple[str, ...] = (),
+) -> None:
+    normalized_name = name.replace("-", "_")
+    dist_info_dir = site_packages_dir / f"{normalized_name}-{version}.dist-info"
+    dist_info_dir.mkdir(parents=True, exist_ok=True)
+    metadata_lines = [
+        "Metadata-Version: 2.1",
+        f"Name: {name}",
+        f"Version: {version}",
+    ]
+    metadata_lines.extend(f"Requires-Dist: {requirement}" for requirement in requires)
+    (dist_info_dir / "METADATA").write_text("\n".join(metadata_lines) + "\n", encoding="utf-8")
 
 
 class _FakeMirrorWatchdog:
@@ -141,7 +191,48 @@ class _FakeMirrorWatchdog:
         )
 
 
+@contextmanager
+def _noop_remote_deploy_lock(*args, **kwargs):
+    del args, kwargs
+    yield
+
+
+def _fake_wait_for_services(*, remote, services, wait_timeout_s):
+    del remote, wait_timeout_s
+    return tuple(
+        PiSystemdServiceState(
+            name=str(service),
+            active_state="active",
+            sub_state="running",
+            unit_file_state="enabled",
+            main_pid=100 + index,
+            exec_main_status=0,
+            healthy=True,
+            load_state="loaded",
+            service_type="simple",
+            service_result="success",
+        )
+        for index, service in enumerate(services)
+    )
+
+
 class PiRuntimeDeployTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._remote_lock_patcher = mock.patch(
+            "twinr.ops.pi_runtime_deploy._remote_deploy_lock",
+            _noop_remote_deploy_lock,
+        )
+        self._remote_lock_patcher.start()
+        self._wait_for_services_patcher = mock.patch(
+            "twinr.ops.pi_runtime_deploy._wait_for_services",
+            _fake_wait_for_services,
+        )
+        self._wait_for_services_patcher.start()
+
+    def tearDown(self) -> None:
+        self._wait_for_services_patcher.stop()
+        self._remote_lock_patcher.stop()
+
     def test_pyproject_declares_direct_runtime_transitive_distributions_explicitly(self) -> None:
         payload = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         dependency_names = {
@@ -204,10 +295,59 @@ class PiRuntimeDeployTests(unittest.TestCase):
             self.assertFalse(second_result.changed)
             self.assertEqual(second_result.active_paths, (str(existing_dist_packages),))
 
-    def test_repair_venv_python_shebangs_rewrites_only_stale_venv_wrappers(self) -> None:
+    def test_find_shadowed_direct_dependency_distributions_prefers_satisfying_system_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pyproject_path = root / "pyproject.toml"
+            pyproject_path.write_text(
+                "[project]\nname = 'twinr'\ndependencies = ['PyQt5>=5.15,<6']\n",
+                encoding="utf-8",
+            )
+            venv_site_packages = root / ".venv" / "lib" / "python3.11" / "site-packages"
+            system_site_packages = root / "usr" / "lib" / "python3" / "dist-packages"
+            _write_dist_metadata(
+                site_packages_dir=venv_site_packages,
+                name="PyQt5",
+                version="5.15.11",
+                requires=("PyQt5-sip (>=12.15, <13)", "PyQt5-Qt5 (>=5.15.2, <5.16.0)"),
+            )
+            _write_dist_metadata(
+                site_packages_dir=system_site_packages,
+                name="PyQt5",
+                version="5.15.9",
+                requires=("PyQt5-sip",),
+            )
+
+            result = find_shadowed_direct_dependency_distributions(
+                project_pyproject=pyproject_path,
+                venv_site_packages_dir=venv_site_packages,
+                bridged_system_paths=(system_site_packages,),
+            )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, "PyQt5")
+        self.assertEqual(result[0].venv_version, "5.15.11")
+        self.assertEqual(result[0].system_version, "5.15.9")
+
+    def test_repair_venv_python_shebangs_rewrites_stale_wrappers_and_activation_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             bin_dir = Path(temp_dir) / ".venv" / "bin"
             bin_dir.mkdir(parents=True, exist_ok=True)
+            activate = bin_dir / "activate"
+            activate.write_text(
+                'VIRTUAL_ENV="/home/thh/twinr/.venv"\nexport VIRTUAL_ENV\n',
+                encoding="utf-8",
+            )
+            activate_csh = bin_dir / "activate.csh"
+            activate_csh.write_text(
+                "setenv VIRTUAL_ENV /home/thh/twinr/.venv\n",
+                encoding="utf-8",
+            )
+            activate_fish = bin_dir / "activate.fish"
+            activate_fish.write_text(
+                "set -gx VIRTUAL_ENV /home/thh/twinr/.venv\n",
+                encoding="utf-8",
+            )
             stale = bin_dir / "pytest"
             stale.write_text(
                 "#!/home/thh/twinr/.venv/bin/python\nfrom pytest import console_main\n",
@@ -229,9 +369,22 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 bin_dir=bin_dir,
                 expected_interpreter="/twinr/.venv/bin/python",
             )
-            self.assertEqual(result.checked_files, 3)
-            self.assertEqual(result.rewritten_files, 1)
-            self.assertEqual(result.sample_paths, ("pytest",))
+            expected_venv_dir = "/twinr/.venv"
+            self.assertEqual(result.checked_files, 6)
+            self.assertEqual(result.rewritten_files, 4)
+            self.assertEqual(result.sample_paths, ("activate", "activate.csh", "activate.fish", "pytest"))
+            self.assertEqual(
+                activate.read_text(encoding="utf-8").splitlines()[0],
+                f'VIRTUAL_ENV="{expected_venv_dir}"',
+            )
+            self.assertEqual(
+                activate_csh.read_text(encoding="utf-8").splitlines()[0],
+                f"setenv VIRTUAL_ENV {expected_venv_dir}",
+            )
+            self.assertEqual(
+                activate_fish.read_text(encoding="utf-8").splitlines()[0],
+                f"set -gx VIRTUAL_ENV {expected_venv_dir}",
+            )
             self.assertEqual(
                 stale.read_text(encoding="utf-8").splitlines()[0],
                 "#!/twinr/.venv/bin/python",
@@ -248,9 +401,11 @@ class PiRuntimeDeployTests(unittest.TestCase):
     def test_deploy_runs_env_sync_install_restart_and_verification(self) -> None:
         commands: list[list[str]] = []
         envs: list[dict[str, str] | None] = []
+        inputs: list[str | None] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
             env_path = root / ".env"
             env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
             pi_env_path = root / ".env.pi"
@@ -272,6 +427,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 command = [str(part) for part in args]
                 commands.append(command)
                 envs.append(kwargs.get("env"))
+                inputs.append(kwargs.get("input"))
                 rendered = " ".join(command)
                 if "scp" in command:
                     return _completed(command)
@@ -291,6 +447,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
                             '{"bridge_path": "/twinr/.venv/lib/python3.11/site-packages/'
                             'twinr_pi_system_site.pth", "active_paths": ["/usr/lib/python3/dist-packages"],'
                             ' "changed": true}\n'
+                        ),
+                    )
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(
+                        command,
+                        stdout=_repo_attestation_stdout(
+                            verified_entry_count=1,
+                            verified_file_count=1,
                         ),
                     )
                 if "importlib.import_module" in rendered:
@@ -326,6 +490,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertTrue(result.repo_mirror.sync_applied)
+        self.assertEqual(result.repo_attestation.verified_entry_count, 1)
+        self.assertEqual(result.repo_attestation.mismatch_count, 0)
         self.assertTrue(result.env_sync is not None)
         assert result.env_sync is not None
         self.assertEqual(result.env_sync.sha256, local_sha)
@@ -343,18 +509,80 @@ class PiRuntimeDeployTests(unittest.TestCase):
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("-type d -name __pycache__ -exec sudo chown -R", joined)
         self.assertIn("compileall -q -f --invalidation-mode checked-hash", joined)
-        self.assertIn("sshpass -e scp", joined)
+        self.assertIn("sshpass -d 0 scp", joined)
         self.assertIn("pip install --no-deps -e", joined)
         self.assertIn("repair_venv_python_shebangs", joined)
+        self.assertIn("repo_attestation_manifest_path", joined)
         self.assertIn("systemctl daemon-reload", joined)
         self.assertIn("systemctl restart", joined)
         self.assertIn("--live-text", joined)
         assert result.bytecode_refresh_summary is not None
         self.assertIn("checked-hash bytecode", result.bytecode_refresh_summary)
-        self.assertTrue(any(env and env.get("SSHPASS") == _TEST_PI_SSH_PASSWORD for env in envs))
+        self.assertTrue(any(value == _TEST_PI_SSH_PASSWORD for value in inputs))
+        self.assertFalse(any(env and env.get("SSHPASS") for env in envs))
         assert result.editable_install_summary is not None
-        self.assertIn("normalized 1 stale venv wrapper shebang", result.editable_install_summary)
+        self.assertIn("normalized 1 stale venv entrypoint file", result.editable_install_summary)
         self.assertIn("bridged 1 Pi system site-package path into the venv", result.editable_install_summary)
+
+    def test_deploy_fails_closed_when_repo_attestation_finds_stale_remote_file(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                "\n".join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(
+                        command,
+                        stdout=_repo_attestation_stdout(
+                            verified_entry_count=1,
+                            verified_file_count=0,
+                            mismatch_count=1,
+                            sampled_mismatch_details=(
+                                "README.md: expected sha256 local, got remote",
+                            ),
+                        ),
+                    )
+                return _completed(command)
+
+            with self.assertRaises(PiRuntimeDeployError) as exc_info:
+                deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    mirror_watchdog=mirror,
+                    install_editable=False,
+                    install_systemd_units=False,
+                    verify_env_contract=False,
+                )
+
+        self.assertEqual(exc_info.exception.phase, "repo_attestation")
+        self.assertIn("1 mismatched", str(exc_info.exception))
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("repo_attestation_manifest_path", joined)
+        self.assertNotIn("systemctl restart", joined)
 
     def test_install_editable_package_syncs_only_pending_project_dependencies(self) -> None:
         commands: list[list[str]] = []
@@ -425,8 +653,101 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("feedparser>=6.0.12,<7", joined)
         self.assertNotIn("pip install -e /twinr", joined)
         self.assertIn("installed 2 mirrored project dependencies", summary)
-        self.assertIn("verified 2 venv wrapper shebang(s)", summary)
+        self.assertIn("verified 2 venv entrypoint file(s)", summary)
         self.assertIn("verified Pi system site-package bridge for 1 path", summary)
+
+    def test_install_editable_package_removes_venv_shadowed_system_dependency_before_checks(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _runner(args, **kwargs):
+                del kwargs
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "venv_system_site_bridge.py" in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '{"bridge_path": "/twinr/.venv/lib/python3.11/site-packages/'
+                            'twinr_pi_system_site.pth", "active_paths": ["/usr/lib/python3/dist-packages"],'
+                            ' "changed": false}\n'
+                        ),
+                    )
+                if "venv_bridged_system_cleanup.py" in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '[{"name": "PyQt5", "venv_version": "5.15.11",'
+                            ' "venv_path": "/twinr/.venv/lib/python3.11/site-packages",'
+                            ' "system_version": "5.15.9",'
+                            ' "system_path": "/usr/lib/python3/dist-packages"}]\n'
+                        ),
+                    )
+                if "pip uninstall -y PyQt5" in rendered:
+                    return _completed(command, stdout="Successfully uninstalled PyQt5-5.15.11\n")
+                if "pip install --no-deps -e" in rendered:
+                    return _completed(command, stdout="Successfully installed twinr\n")
+                if "pip install --dry-run --quiet --report -" in rendered:
+                    return _completed(command, stdout='{"ok": true, "pending": []}\n')
+                if '"$remote_python" -m pip check' in rendered:
+                    return _completed(command, stdout="")
+                if "repair_venv_python_shebangs" in rendered:
+                    return _completed(
+                        command,
+                        stdout='{"checked_files": 2, "rewritten_files": 0, "sample_paths": []}\n',
+                    )
+                return _completed(command)
+
+            remote = PiRemoteExecutor(
+                settings=load_pi_connection_settings(pi_env_path),
+                subprocess_runner=_runner,
+                timeout_s=30,
+            )
+            summary = install_editable_package(
+                remote=remote,
+                remote_root="/twinr",
+                install_with_deps=False,
+            )
+
+        rendered_commands = [" ".join(command) for command in commands]
+        cleanup_index = next(
+            index for index, rendered in enumerate(rendered_commands) if "venv_bridged_system_cleanup.py" in rendered
+        )
+        uninstall_index = next(
+            index for index, rendered in enumerate(rendered_commands) if "pip uninstall -y PyQt5" in rendered
+        )
+        install_index = next(
+            index for index, rendered in enumerate(rendered_commands) if "pip install --no-deps -e" in rendered
+        )
+        dry_run_index = next(
+            index
+            for index, rendered in enumerate(rendered_commands)
+            if "project_name = normalize_name" in rendered
+        )
+        pip_check_index = next(
+            index for index, rendered in enumerate(rendered_commands) if '"$remote_python" -m pip check' in rendered
+        )
+        self.assertLess(cleanup_index, uninstall_index)
+        self.assertLess(uninstall_index, install_index)
+        self.assertLess(install_index, dry_run_index)
+        self.assertLess(dry_run_index, pip_check_index)
+        self.assertIn("removed 1 venv-shadowed direct dependency", summary)
+        self.assertIn("PyQt5 (venv 5.15.11 -> system 5.15.9)", summary)
 
     def test_verify_python_import_contract_attests_all_requested_modules(self) -> None:
         commands: list[list[str]] = []
@@ -470,6 +791,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertEqual(result.python_path, "/twinr/.venv/bin/python")
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("opentelemetry.trace", joined)
+        self.assertIn("twinr.memory.context_store", joined)
+        self.assertIn("twinr.memory.longterm.runtime.health", joined)
         self.assertIn("importlib.import_module", joined)
 
     def test_verify_python_import_contract_validates_required_attributes(self) -> None:
@@ -652,9 +975,9 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 commands.append(command)
                 rendered = " ".join(command)
                 if " scp " in f" {rendered} ":
-                    if "browser_automation/runtime_requirements.txt" in rendered:
+                    if "browser_automation-runtime_requirements.txt" in rendered:
                         copied_manifests.add("runtime_requirements")
-                    if "browser_automation/playwright_browsers.txt" in rendered:
+                    if "browser_automation-playwright_browsers.txt" in rendered:
                         copied_manifests.add("playwright_browsers")
                     return _completed(command)
                 if "sha256sum /twinr/.env" in rendered:
@@ -669,6 +992,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     return _completed(command, stdout="Downloaded Chromium\n")
                 if "pip install --no-deps -e" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -695,7 +1020,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("browser_automation/runtime_requirements.txt", joined)
         self.assertIn("browser_automation/playwright_browsers.txt", joined)
         self.assertIn("pip install -r \"$requirements_path\"", joined)
-        self.assertIn("-m playwright install", joined)
+        self.assertIn("deps_summary = run", joined)
+        self.assertIn("install_summary = run", joined)
 
     def test_deploy_installs_optional_pi_runtime_requirements_manifest(self) -> None:
         commands: list[list[str]] = []
@@ -748,6 +1074,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                             ' "changed": false}\n'
                         ),
                     )
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -804,6 +1132,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 rendered = " ".join(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout=f"{local_sha}\n")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -828,7 +1158,71 @@ class PiRuntimeDeployTests(unittest.TestCase):
         assert result.env_sync is not None
         self.assertFalse(result.env_sync.changed)
         joined = "\n".join(" ".join(command) for command in commands)
-        self.assertNotIn("sshpass -e scp", joined)
+        self.assertNotIn("sshpass -d 0 scp", joined)
+
+    def test_deploy_repairs_shared_state_permissions_before_service_restart(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                if "check_pi_openai_env_contract.py" in rendered:
+                    return _completed(command, stdout='{"ok": true}\n')
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                services=("twinr-runtime-supervisor",),
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+                install_editable=False,
+                install_systemd_units=False,
+            )
+
+        self.assertTrue(result.ok)
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn('install -d -m 700 -o "$owner_user" -g "$owner_user" "$state_dir"', joined)
+        self.assertIn('repair_path_if_exists "$state_dir/automations.json" 600', joined)
+        self.assertIn('repair_path_if_exists "$state_dir/automations.json.bak" 600', joined)
+        self.assertIn('repair_path_if_exists "$state_dir/automations.json.lock" 600', joined)
+        self.assertIn('repair_path_if_exists "$state_dir/user_discovery.json" 600', joined)
+        self.assertIn('verify_path_if_exists "$state_dir/automations.json" 600', joined)
+        self.assertIn('verify_path_if_exists "$state_dir/automations.json.bak" 600', joined)
+        self.assertIn('verify_path_if_exists "$state_dir/automations.json.lock" 600', joined)
+        self.assertIn('verify_path_if_exists "$state_dir/user_discovery.json" 600', joined)
+        self.assertLess(joined.index('repair_path_if_exists "$state_dir/automations.json" 600'), joined.index("sudo systemctl restart"))
+        self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_path_if_exists "$state_dir/automations.json" 600'))
 
     def test_default_deploy_includes_enabled_optional_pi_services(self) -> None:
         commands: list[list[str]] = []
@@ -879,14 +1273,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 rendered = " ".join(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout="")
-                if "UnitFileState" in rendered and "ActiveState,SubState" not in rendered:
+                if "is-enabled" in rendered:
                     return _completed(
                         command,
                         stdout=(
-                            '[{"name": "twinr-remote-memory-watchdog.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-runtime-supervisor.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-web.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-whatsapp-channel.service", "unit_file_state": "enabled"}]\n'
+                            '[{"name": "twinr-remote-memory-watchdog.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-runtime-supervisor.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-web.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-whatsapp-channel.service", "state": "enabled", "returncode": 0}]\n'
                         ),
                     )
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -909,6 +1303,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     )
                 if "pip install" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "check_pi_openai_env_contract.py" in rendered:
@@ -982,14 +1378,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 rendered = " ".join(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout="")
-                if "UnitFileState" in rendered and "ActiveState,SubState" not in rendered:
+                if "is-enabled" in rendered:
                     return _completed(
                         command,
                         stdout=(
-                            '[{"name": "twinr-remote-memory-watchdog.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-runtime-supervisor.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-web.service", "unit_file_state": "enabled"},'
-                            ' {"name": "twinr-whatsapp-channel.service", "unit_file_state": "disabled"}]\n'
+                            '[{"name": "twinr-remote-memory-watchdog.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-runtime-supervisor.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-web.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-whatsapp-channel.service", "state": "disabled", "returncode": 1}]\n'
                         ),
                     )
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -1012,6 +1408,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     )
                 if "pip install" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "check_pi_openai_env_contract.py" in rendered:
@@ -1040,7 +1438,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("twinr-whatsapp-channel.service", joined)
 
-    def test_default_deploy_repairs_masked_optional_pi_unit_with_existing_enable_link(self) -> None:
+    def test_default_deploy_includes_linked_optional_pi_unit(self) -> None:
         commands: list[list[str]] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1085,14 +1483,14 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 rendered = " ".join(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout="")
-                if "UnitFileState" in rendered and "ActiveState,SubState" not in rendered:
+                if "is-enabled" in rendered:
                     return _completed(
                         command,
                         stdout=(
-                            '[{"name": "twinr-remote-memory-watchdog.service", "unit_file_state": "enabled", "install_link_present": true},'
-                            ' {"name": "twinr-runtime-supervisor.service", "unit_file_state": "enabled", "install_link_present": true},'
-                            ' {"name": "twinr-web.service", "unit_file_state": "enabled", "install_link_present": true},'
-                            ' {"name": "twinr-whatsapp-channel.service", "unit_file_state": "masked", "install_link_present": true}]\n'
+                            '[{"name": "twinr-remote-memory-watchdog.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-runtime-supervisor.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-web.service", "state": "enabled", "returncode": 0},'
+                            ' {"name": "twinr-whatsapp-channel.service", "state": "linked", "returncode": 1}]\n'
                         ),
                     )
                 if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
@@ -1115,6 +1513,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     )
                 if "pip install" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
                 if "importlib.import_module" in rendered:
                     return _completed(command, stdout=_import_contract_stdout())
                 if "check_pi_openai_env_contract.py" in rendered:

@@ -9,7 +9,12 @@ import time
 
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event
 from twinr.memory.chonkydb.models import ChonkyDBRetrieveRequest, ChonkyDBTopKRecordsRequest
-from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.core.models import (
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermMidtermPacketV1,
+    LongTermSourceRefV1,
+)
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteReadContext,
     record_remote_read_diagnostic,
@@ -22,6 +27,7 @@ from .shared import (
     _ALLOWED_DOC_IDS_RETRIEVE_QUERY,
     _ITEM_VERSION,
     _RemoteCollectionDefinition,
+    _iter_known_item_envelopes,
     _run_timed_workflow_step,
     _trace_search_details,
 )
@@ -45,9 +51,19 @@ class RemoteCatalogDocumentMixin:
         if not normalized_item_id:
             return None
         cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=normalized_item_id)
-        if cached_payload is not None:
+        if cached_payload is not None and not self._is_projection_compat_payload(cached_payload):
             return cached_payload
         resolved_uri = uri or self.item_uri(snapshot_kind=snapshot_kind, item_id=normalized_item_id)
+        context = LongTermRemoteReadContext(
+            snapshot_kind=snapshot_kind,
+            operation="fetch_item_document",
+            request_method="GET",
+            request_payload_kind="full_document_lookup",
+            item_id=normalized_item_id,
+            document_id_hint=document_id,
+            uri_hint=resolved_uri,
+            request_path="/v1/external/documents/full",
+        )
         started_monotonic = time.monotonic()
         try:
             envelope = read_client.fetch_full_document(
@@ -67,16 +83,7 @@ class RemoteCatalogDocumentMixin:
                 except Exception as fallback_exc:
                     record_remote_read_diagnostic(
                         remote_state=remote_state,
-                        context=LongTermRemoteReadContext(
-                            snapshot_kind=snapshot_kind,
-                            operation="fetch_item_document",
-                            request_method="GET",
-                            request_payload_kind="full_document_lookup",
-                            item_id=normalized_item_id,
-                            document_id_hint=document_id,
-                            uri_hint=resolved_uri,
-                            request_path="/v1/external/documents/full",
-                        ),
+                        context=context,
                         exc=fallback_exc,
                         started_monotonic=started_monotonic,
                         outcome="failed",
@@ -87,16 +94,7 @@ class RemoteCatalogDocumentMixin:
             else:
                 record_remote_read_diagnostic(
                     remote_state=remote_state,
-                    context=LongTermRemoteReadContext(
-                        snapshot_kind=snapshot_kind,
-                        operation="fetch_item_document",
-                        request_method="GET",
-                        request_payload_kind="full_document_lookup",
-                        item_id=normalized_item_id,
-                        document_id_hint=document_id,
-                        uri_hint=resolved_uri,
-                        request_path="/v1/external/documents/full",
-                    ),
+                    context=context,
                     exc=exc,
                     started_monotonic=started_monotonic,
                     outcome="failed",
@@ -111,6 +109,13 @@ class RemoteCatalogDocumentMixin:
         )
         if item_payload is None:
             return None
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=context,
+            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+            outcome="ok",
+            classification="ok",
+        )
         self._store_item_payload(
             snapshot_kind=snapshot_kind,
             item_id=normalized_item_id,
@@ -142,7 +147,7 @@ class RemoteCatalogDocumentMixin:
                 continue
             ordered_item_ids.append(item_id)
             cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=item_id)
-            if cached_payload is not None:
+            if cached_payload is not None and not self._is_projection_compat_payload(cached_payload):
                 loaded_by_item_id[item_id] = cached_payload
                 continue
             uncached_entries.append(entry)
@@ -155,6 +160,43 @@ class RemoteCatalogDocumentMixin:
                 loaded_by_item_id[entry.item_id] = payload
         return tuple(loaded_by_item_id[item_id] for item_id in ordered_item_ids if item_id in loaded_by_item_id)
 
+    def load_selection_item_payloads(
+        self,
+        *,
+        snapshot_kind: str,
+        item_ids: Iterable[str],
+    ) -> tuple[dict[str, object], ...]:
+        """Load query-time payloads without falling through to full item documents.
+
+        Context selection and catalog rescue only need the bounded item
+        projection stored on catalog entries plus retrieve-batch recovery for
+        older live shapes. They must not silently reintroduce expensive
+        per-item `documents/full` reads once the query has already narrowed the
+        candidate set.
+        """
+
+        entry_by_id = {
+            entry.item_id: entry
+            for entry in self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        }
+        ordered_entries: list[LongTermRemoteCatalogEntry] = []
+        for raw_item_id in item_ids:
+            item_id = self._normalize_item_id(raw_item_id)
+            if not item_id:
+                continue
+            entry = entry_by_id.get(item_id)
+            if entry is not None:
+                ordered_entries.append(entry)
+        loaded = self._load_selection_item_payloads_from_entries(
+            snapshot_kind=snapshot_kind,
+            entries=tuple(ordered_entries),
+        )
+        resolved: list[dict[str, object]] = []
+        for payload in loaded:
+            if isinstance(payload, Mapping):
+                resolved.append(dict(payload))
+        return tuple(resolved)
+
     def prewarm_item_payload_cache(self, *, snapshot_kind: str) -> None:
         """Warm the full current snapshot payload set into the read cache."""
 
@@ -166,6 +208,49 @@ class RemoteCatalogDocumentMixin:
         self.load_item_payloads(
             snapshot_kind=snapshot_kind,
             item_ids=(entry.item_id for entry in entries),
+        )
+
+    def _load_selection_item_payloads_from_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: Iterable[LongTermRemoteCatalogEntry],
+    ) -> tuple[dict[str, object] | None, ...]:
+        """Load query-time payloads from projections or retrieve batches only."""
+
+        ordered_entries = tuple(entries)
+        if not ordered_entries:
+            return ()
+        loaded_by_item_id: dict[str, dict[str, object]] = {}
+        unresolved_entries: list[LongTermRemoteCatalogEntry] = []
+        for entry in ordered_entries:
+            cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=entry.item_id)
+            if cached_payload is not None:
+                loaded_by_item_id[entry.item_id] = cached_payload
+                continue
+            projection_payload = self._catalog_entry_item_payload(
+                snapshot_kind=snapshot_kind,
+                entry=entry,
+            )
+            if projection_payload is not None:
+                loaded_by_item_id[entry.item_id] = dict(projection_payload)
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=entry.item_id,
+                    payload=projection_payload,
+                )
+                continue
+            unresolved_entries.append(entry)
+        if unresolved_entries:
+            loaded_by_item_id.update(
+                self._load_item_payloads_via_retrieve(
+                    snapshot_kind=snapshot_kind,
+                    entries=tuple(unresolved_entries),
+                )
+            )
+        return tuple(
+            dict(loaded_by_item_id[entry.item_id]) if entry.item_id in loaded_by_item_id else None
+            for entry in ordered_entries
         )
 
     def _load_item_payloads_from_entries(
@@ -183,8 +268,20 @@ class RemoteCatalogDocumentMixin:
         unresolved_entries: list[LongTermRemoteCatalogEntry] = []
         for entry in ordered_entries:
             cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=entry.item_id)
-            if cached_payload is not None:
+            if cached_payload is not None and not self._is_projection_compat_payload(cached_payload):
                 loaded_by_item_id[entry.item_id] = cached_payload
+                continue
+            projection_payload = self._catalog_entry_item_payload(
+                snapshot_kind=snapshot_kind,
+                entry=entry,
+            )
+            if projection_payload is not None and not self._is_projection_compat_payload(projection_payload):
+                loaded_by_item_id[entry.item_id] = dict(projection_payload)
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=entry.item_id,
+                    payload=projection_payload,
+                )
                 continue
             unresolved_entries.append(entry)
         loaded_by_item_id.update(self._load_item_payloads_via_retrieve(
@@ -220,10 +317,10 @@ class RemoteCatalogDocumentMixin:
 
         ordered_entries = tuple(entries)
         if not ordered_entries:
-            return (), snapshot_kind in {"objects", "archive"}
+            return (), snapshot_kind in {"objects", "archive", "conflicts"}
         loaded_by_item_id: dict[str, dict[str, object]] = {}
         unresolved_entries: list[LongTermRemoteCatalogEntry] = []
-        direct_catalog_complete = snapshot_kind in {"objects", "archive"}
+        direct_catalog_complete = snapshot_kind in {"objects", "archive", "conflicts"}
         if direct_catalog_complete:
             for entry in ordered_entries:
                 payload = self._catalog_entry_item_payload(snapshot_kind=snapshot_kind, entry=entry)
@@ -401,6 +498,22 @@ class RemoteCatalogDocumentMixin:
                         )
                     ),
                 )
+                query_plan = getattr(response, "query_plan", None)
+                if isinstance(query_plan, Mapping):
+                    workflow_event(
+                        kind="retrieval",
+                        msg="longterm_remote_catalog_query_plan",
+                        details={
+                            **_trace_search_details(
+                                snapshot_kind=snapshot_kind,
+                                result_limit=len(batch),
+                                allowed_doc_count=len(batch),
+                                batch_size=len(batch),
+                            ),
+                            "operation": "topk_batch",
+                            "query_plan": dict(query_plan),
+                        },
+                    )
                 record_remote_read_observation(
                     remote_state=remote_state,
                     context=LongTermRemoteReadContext(
@@ -648,6 +761,14 @@ class RemoteCatalogDocumentMixin:
             if self._conflict_doc_id(conflict) != normalized_item_id:
                 return None
             return conflict.to_payload()
+        if definition.snapshot_kind == "midterm":
+            try:
+                packet = LongTermMidtermPacketV1.from_payload(candidate)
+            except Exception:
+                return None
+            if self._normalize_text(packet.packet_id) != normalized_item_id:
+                return None
+            return packet.to_payload()
         return None
 
     def _conflict_doc_id(self, conflict: LongTermMemoryConflictV1) -> str:
@@ -666,11 +787,13 @@ class RemoteCatalogDocumentMixin:
         candidate["twinr_snapshot_kind"] = definition.snapshot_kind
         candidate["twinr_memory_item_id"] = entry.item_id
         candidate["document_id"] = entry.document_id
-        return self._build_compat_object_payload_from_metadata(
+        return self._projection_or_compat_item_payload(
             definition=definition,
             item_id=entry.item_id,
             candidate=candidate,
-            source_type="remote_catalog_entry",
+            projection_source_type="remote_catalog_entry",
+            projection_attribute="remote_catalog_entry_compatibility",
+            compat_source_type="remote_catalog_entry",
             compatibility_attribute="remote_catalog_entry_compatibility",
         )
 
@@ -710,18 +833,179 @@ class RemoteCatalogDocumentMixin:
     ) -> dict[str, object] | None:
         """Rebuild minimal object payloads from legacy metadata-only live reads."""
 
-        if definition.snapshot_kind not in {"objects", "archive"}:
-            return None
         if isinstance(candidate.get("twinr_payload"), Mapping):
             return None
         if self._normalize_text(candidate.get("twinr_snapshot_kind")) != definition.snapshot_kind:
+            return None
+        return self._projection_or_compat_item_payload(
+            definition=definition,
+            item_id=item_id,
+            candidate=candidate,
+            projection_source_type="legacy_remote_catalog_metadata",
+            projection_attribute="legacy_remote_catalog_metadata_only",
+            compat_source_type="legacy_remote_catalog_metadata",
+            compatibility_attribute="legacy_remote_catalog_metadata_only",
+        )
+
+    def _projection_or_compat_item_payload(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        item_id: str,
+        candidate: Mapping[str, object],
+        projection_source_type: str,
+        projection_attribute: str,
+        compat_source_type: str,
+        compatibility_attribute: str,
+    ) -> dict[str, object] | None:
+        projection = self._selection_projection_from_candidate(candidate)
+        if projection is not None:
+            if definition.snapshot_kind in {"objects", "archive"}:
+                payload = self._build_projection_object_payload(
+                    definition=definition,
+                    item_id=item_id,
+                    projection=projection,
+                    source_type=projection_source_type,
+                    compatibility_attribute=projection_attribute,
+                )
+                if payload is not None:
+                    return payload
+            if definition.snapshot_kind == "conflicts":
+                payload = self._build_projection_conflict_payload(
+                    item_id=item_id,
+                    projection=projection,
+                )
+                if payload is not None:
+                    return payload
+            if definition.snapshot_kind == "midterm":
+                payload = self._build_projection_midterm_payload(
+                    item_id=item_id,
+                    projection=projection,
+                )
+                if payload is not None:
+                    return payload
+        if definition.snapshot_kind not in {"objects", "archive"}:
             return None
         return self._build_compat_object_payload_from_metadata(
             definition=definition,
             item_id=item_id,
             candidate=candidate,
-            source_type="legacy_remote_catalog_metadata",
-            compatibility_attribute="legacy_remote_catalog_metadata_only",
+            source_type=compat_source_type,
+            compatibility_attribute=compatibility_attribute,
+        )
+
+    def _selection_projection_from_candidate(
+        self,
+        candidate: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        projection = candidate.get("selection_projection")
+        if isinstance(projection, Mapping):
+            return dict(projection)
+        if isinstance(projection, str):
+            parsed = self._parse_json_mapping(projection)
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+        return None
+
+    def _build_projection_object_payload(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        item_id: str,
+        projection: Mapping[str, object],
+        source_type: str,
+        compatibility_attribute: str | None,
+    ) -> dict[str, object] | None:
+        if definition.snapshot_kind not in {"objects", "archive"}:
+            return None
+        normalized_item_id = self._normalize_item_id(projection.get("memory_id"))
+        if normalized_item_id != item_id:
+            return None
+        kind = self._normalize_text(projection.get("kind"))
+        summary = self._normalize_text(projection.get("summary"))
+        created_at = self._normalize_text(projection.get("created_at"))
+        updated_at = self._normalize_text(projection.get("updated_at")) or created_at
+        if not kind or not summary or not created_at or not updated_at:
+            return None
+        raw_attributes = projection.get("attributes")
+        attributes = dict(raw_attributes) if isinstance(raw_attributes, Mapping) else {}
+        if compatibility_attribute:
+            attributes[compatibility_attribute] = True
+        raw_conflicts_with = projection.get("conflicts_with")
+        conflicts_with = list(raw_conflicts_with) if isinstance(raw_conflicts_with, list) else None
+        raw_supersedes = projection.get("supersedes")
+        supersedes = list(raw_supersedes) if isinstance(raw_supersedes, list) else None
+        try:
+            confidence = float(projection.get("confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        try:
+            return LongTermMemoryObjectV1(
+                memory_id=item_id,
+                kind=kind,
+                summary=summary,
+                source=LongTermSourceRefV1(
+                    source_type=source_type,
+                    event_ids=(item_id,),
+                ),
+                details=self._normalize_text(projection.get("details")),
+                status=self._normalize_text(projection.get("status")) or "candidate",
+                confidence=confidence,
+                canonical_language=self._normalize_text(projection.get("canonical_language")) or "en",
+                confirmed_by_user=bool(projection.get("confirmed_by_user")),
+                sensitivity=self._normalize_text(projection.get("sensitivity")) or "normal",
+                slot_key=self._normalize_text(projection.get("slot_key")),
+                value_key=self._normalize_text(projection.get("value_key")),
+                valid_from=self._normalize_text(projection.get("valid_from")),
+                valid_to=self._normalize_text(projection.get("valid_to")),
+                archived_at=self._normalize_text(projection.get("archived_at")),
+                created_at=created_at,
+                updated_at=updated_at,
+                attributes=attributes or None,
+                conflicts_with=tuple(value for value in conflicts_with or () if isinstance(value, str)),
+                supersedes=tuple(value for value in supersedes or () if isinstance(value, str)),
+            ).to_payload()
+        except Exception:
+            return None
+
+    def _build_projection_conflict_payload(
+        self,
+        *,
+        item_id: str,
+        projection: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        try:
+            payload = LongTermMemoryConflictV1.from_payload(projection).to_payload()
+            conflict = LongTermMemoryConflictV1.from_payload(payload)
+        except Exception:
+            return None
+        return payload if self._conflict_doc_id(conflict) == item_id else None
+
+    def _build_projection_midterm_payload(
+        self,
+        *,
+        item_id: str,
+        projection: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        try:
+            payload = LongTermMidtermPacketV1.from_payload(projection).to_payload()
+            packet = LongTermMidtermPacketV1.from_payload(payload)
+        except Exception:
+            return None
+        return payload if self._normalize_text(packet.packet_id) == item_id else None
+
+    def _is_projection_compat_payload(
+        self,
+        payload: Mapping[str, object],
+    ) -> bool:
+        """Return whether a cached object payload came from a lossy compat projection."""
+
+        raw_attributes = payload.get("attributes")
+        if not isinstance(raw_attributes, Mapping):
+            return False
+        return bool(
+            raw_attributes.get("remote_catalog_entry_compatibility")
+            or raw_attributes.get("legacy_remote_catalog_metadata_only")
         )
 
     def _build_compat_object_payload_from_metadata(
@@ -776,24 +1060,30 @@ class RemoteCatalogDocumentMixin:
 
     def _iter_record_candidates(self, payload: Mapping[str, object]) -> Iterable[Mapping[str, object]]:
         yield payload
+        yield from _iter_known_item_envelopes(payload)
         direct = payload.get("payload")
         if isinstance(direct, Mapping):
             yield direct
+            yield from _iter_known_item_envelopes(direct)
         metadata = payload.get("metadata")
         if isinstance(metadata, Mapping):
             yield metadata
+            yield from _iter_known_item_envelopes(metadata)
             nested_payload = metadata.get("twinr_payload")
             if isinstance(nested_payload, Mapping):
                 yield nested_payload
         nested = payload.get("record")
         if isinstance(nested, Mapping):
             yield nested
+            yield from _iter_known_item_envelopes(nested)
             nested_payload = nested.get("payload")
             if isinstance(nested_payload, Mapping):
                 yield nested_payload
+                yield from _iter_known_item_envelopes(nested_payload)
             nested_metadata = nested.get("metadata")
             if isinstance(nested_metadata, Mapping):
                 yield nested_metadata
+                yield from _iter_known_item_envelopes(nested_metadata)
                 nested_inner_payload = nested_metadata.get("twinr_payload")
                 if isinstance(nested_inner_payload, Mapping):
                     yield nested_inner_payload
@@ -818,15 +1108,18 @@ class RemoteCatalogDocumentMixin:
             for chunk in chunks:
                 if not isinstance(chunk, Mapping):
                     continue
+                yield from _iter_known_item_envelopes(chunk)
                 chunk_metadata = chunk.get("metadata")
                 if isinstance(chunk_metadata, Mapping):
                     yield chunk_metadata
+                    yield from _iter_known_item_envelopes(chunk_metadata)
                     chunk_inner_payload = chunk_metadata.get("twinr_payload")
                     if isinstance(chunk_inner_payload, Mapping):
                         yield chunk_inner_payload
                 chunk_payload = chunk.get("payload")
                 if isinstance(chunk_payload, Mapping):
                     yield chunk_payload
+                    yield from _iter_known_item_envelopes(chunk_payload)
                 chunk_content = chunk.get("content")
                 if isinstance(chunk_content, str):
                     parsed = self._parse_json_mapping(chunk_content)

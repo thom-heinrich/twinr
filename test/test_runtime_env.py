@@ -38,6 +38,36 @@ class RuntimeEnvTests(unittest.TestCase):
         self.assertEqual(updates["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1234/bus")
         self.assertEqual(updates["PULSE_SERVER"], "unix:/run/user/1234/pulse/native")
 
+    def test_prime_user_session_audio_env_uses_configured_runtime_dir_for_root_runtime(self) -> None:
+        original = {key: os.environ.get(key) for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PULSE_SERVER")}
+        for key in original:
+            os.environ.pop(key, None)
+        configured_runtime_dir = Path("/run/user/1000")
+
+        def fake_is_dir(path: Path) -> bool:
+            return path == configured_runtime_dir
+
+        def fake_exists(path: Path) -> bool:
+            return path in {configured_runtime_dir / "bus", configured_runtime_dir / "pulse" / "native"}
+
+        try:
+            with patch("os.getuid", return_value=0):
+                with patch("pathlib.Path.is_dir", fake_is_dir):
+                    with patch("pathlib.Path.exists", fake_exists):
+                        updates = prime_user_session_audio_env(
+                            configured_runtime_dir=configured_runtime_dir
+                        )
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertEqual(updates["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(updates["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
+        self.assertEqual(updates["PULSE_SERVER"], "unix:/run/user/1000/pulse/native")
+
     def test_prime_user_session_audio_env_does_not_override_existing_values(self) -> None:
         original = {key: os.environ.get(key) for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PULSE_SERVER")}
         os.environ["XDG_RUNTIME_DIR"] = "/already/set"

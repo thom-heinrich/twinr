@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.integrations import IntegrationRequest, ReadOnlyCalendarAdapter, manifest_for_id
 from twinr.integrations.calendar import ICSCalendarSource, parse_ics_events
+from twinr.integrations.calendar.models import CalendarEvent
 
 _ICS_SAMPLE = """BEGIN:VCALENDAR
 VERSION:2.0
@@ -36,6 +37,17 @@ class ICSCalendarParserTests(unittest.TestCase):
         self.assertFalse(events[0].all_day)
         self.assertTrue(events[1].all_day)
         self.assertEqual(events[1].starts_at.date().isoformat(), "2026-03-14")
+
+    def test_calendar_event_from_json_bytes_decodes_legacy_payload(self) -> None:
+        event = CalendarEvent.from_json_bytes(
+            b'{"event_id":"event-1","summary":"Arzttermin","starts_at":"2026-03-13T09:00:00+00:00","ends_at":"2026-03-13T10:00:00+00:00","location":"Praxis","description":"Kontrollbesuch","all_day":false}'
+        )
+
+        self.assertEqual(event.event_id, "event-1")
+        self.assertEqual(event.summary, "Arzttermin")
+        self.assertEqual(event.starts_at, datetime(2026, 3, 13, 9, 0, tzinfo=UTC))
+        self.assertEqual(event.ends_at, datetime(2026, 3, 13, 10, 0, tzinfo=UTC))
+        self.assertEqual(event.location, "Praxis")
 
 
 class ReadOnlyCalendarAdapterTests(unittest.TestCase):

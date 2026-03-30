@@ -1,4 +1,4 @@
-"""Carry structured immediate follow-up context across one open thread.
+"""Carry structured immediate follow-up context across short active threads.
 
 Twinr's follow-up window intentionally keeps the microphone open when the
 assistant still expects an immediate reply. The next user utterance is often a
@@ -6,9 +6,11 @@ short clarification or repair such as "I meant the time" that only makes sense
 when the just-established anchors from the previous exchange stay visible.
 
 This module stores one bounded carryover hint on the runtime between the
-assistant's follow-up-opening reply and the next follow-up turn. The hint is
-derived from the immediate conversation state, not from remote memory, and is
-only injected when the current turn is explicitly a follow-up turn.
+assistant's follow-up-opening reply and the next follow-up turn. It also builds
+bounded pre-turn carryover system messages for text surfaces so short repairs
+or continuations keep the anchors that were just established in the same
+thread. The carryover is derived from the immediate conversation state, not
+from remote memory.
 """
 
 from __future__ import annotations
@@ -118,6 +120,40 @@ def build_follow_up_context_hint(
             "Immediate open thread from the latest exchange. "
             f"Recent turns: {rendered_turns}. "
             "Continue this thread unless the user clearly changes topic."
+        ),
+        limit=_MAX_HINT_SUMMARY_CHARS,
+    )
+    return summary or None
+
+
+def build_recent_thread_carryover_hint(
+    *,
+    conversation: Sequence[tuple[str, str]] | None,
+    user_transcript: str,
+) -> str | None:
+    """Build one bounded carryover summary for the next text turn.
+
+    This is intentionally broader than the explicit follow-up-window hint: text
+    channels and operator text probes can receive brief repairs such as
+    "I meant the time" even after a normal completed answer, so the next turn
+    should still see the most recent anchors from the active thread.
+    """
+
+    recent_turns = _coerce_conversation_turns(
+        conversation,
+        user_transcript=user_transcript,
+        assistant_response="",
+    )
+    if len(recent_turns) < 2:
+        return None
+    rendered_turns = "; ".join(
+        f"{role}={content}" for role, content in recent_turns
+    )
+    summary = _normalize_text(
+        (
+            "Recent thread context before this user turn. "
+            f"Recent turns: {rendered_turns}. "
+            "If the new user message is a repair, clarification, or continuation, keep anchors already established in this thread unless the user overrides them."
         ),
         limit=_MAX_HINT_SUMMARY_CHARS,
     )
@@ -240,7 +276,50 @@ def pending_conversation_follow_up_system_message(runtime: Any) -> str | None:
     ) or None
 
 
+def recent_thread_carryover_system_message(
+    *,
+    conversation: Sequence[tuple[str, str]] | None,
+    user_transcript: str,
+) -> str | None:
+    """Return one bounded system message that preserves recent thread anchors."""
+
+    summary = build_recent_thread_carryover_hint(
+        conversation=conversation,
+        user_transcript=user_transcript,
+    )
+    if not summary:
+        return None
+    return _normalize_text(
+        (
+            "Recent thread carryover for this turn. "
+            "The new user message may be a short repair, clarification, or continuation of the current thread even when it is brief or elliptical. "
+            "Preserve explicit anchors already established in the recent thread, such as place, date, timezone, or task scope, unless the user overrides them. "
+            f"{summary}"
+        ),
+        limit=1200,
+    ) or None
+
+
+def append_recent_thread_carryover_message(
+    conversation: Sequence[tuple[str, str]] | None,
+    *,
+    user_transcript: str,
+) -> tuple[tuple[str, str], ...]:
+    """Append one bounded recent-thread carryover system message when useful."""
+
+    normalized_conversation = tuple(conversation or ())
+    message = recent_thread_carryover_system_message(
+        conversation=normalized_conversation,
+        user_transcript=user_transcript,
+    )
+    if not message:
+        return normalized_conversation
+    return normalized_conversation + (("system", message),)
+
+
 __all__ = [
+    "append_recent_thread_carryover_message",
+    "build_recent_thread_carryover_hint",
     "PendingConversationFollowUpHint",
     "build_follow_up_context_hint",
     "clear_pending_conversation_follow_up_hint",
@@ -249,5 +328,6 @@ __all__ = [
     "pending_conversation_follow_up_hint_trace_details",
     "pending_conversation_follow_up_hint_scope",
     "pending_conversation_follow_up_system_message",
+    "recent_thread_carryover_system_message",
     "remember_pending_conversation_follow_up_hint",
 ]

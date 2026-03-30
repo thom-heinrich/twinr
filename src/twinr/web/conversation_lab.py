@@ -20,6 +20,10 @@ import threading
 
 from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation.thread_resolution import (
+    focus_recent_thread_conversation,
+    maybe_rewrite_prompt_against_recent_thread,
+)
 from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.agent.tools import (
     DualLaneToolLoop,
@@ -34,8 +38,9 @@ from twinr.agent.tools import (
 )
 from twinr.agent.tools.runtime.availability import available_realtime_tool_names
 from twinr.memory.longterm.retrieval.operator_search import run_long_term_operator_search
-from twinr.ops import TwinrUsageStore
 from twinr.ops.paths import TwinrOpsPaths
+from twinr.ops.runtime_scope import build_scoped_runtime_config
+from twinr.ops.usage import TwinrUsageStore
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import OpenAIBackend, OpenAISupervisorDecisionProvider, OpenAIToolCallingAgentProvider
 from twinr.web.conversation_lab_vision import build_vision_images, build_vision_prompt, owner_camera
@@ -84,6 +89,7 @@ _CONVERSATION_LAB_SOURCE = "web_conversation_lab"
 _CONVERSATION_LAB_REQUEST_KIND = "conversation_lab"
 _CONVERSATION_LAB_FLUSH_TIMEOUT_MAX_S = 5.0
 _CONVERSATION_LAB_SEARCH_TIMEOUT_S = 3.0
+_CONVERSATION_LAB_RUNTIME_SCOPE_PREFIX = "conversation-lab"
 _TRUNCATE_SUFFIX = "..."
 
 
@@ -788,20 +794,41 @@ def _run_text_turn(
     prompt: str,
 ) -> object:
     instructions = _turn_instructions(config)
+    tool_conversation = focus_recent_thread_conversation(
+        runtime.tool_provider_text_surface_conversation_context(),
+        user_transcript=prompt,
+    )
+    rewrite_backend = None
     if isinstance(loop, DualLaneToolLoop):
+        rewrite_backend = getattr(getattr(loop, "supervisor_provider", None), "backend", None)
+        supervisor_conversation = focus_recent_thread_conversation(
+            runtime.supervisor_provider_text_surface_conversation_context(),
+            user_transcript=prompt,
+        )
+        resolution = maybe_rewrite_prompt_against_recent_thread(
+            rewrite_backend,
+            conversation=supervisor_conversation,
+            user_transcript=prompt,
+        )
         return loop.run(
-            prompt,
-            conversation=runtime.tool_provider_conversation_context(),
-            supervisor_conversation=runtime.supervisor_provider_conversation_context(),
+            resolution.effective_prompt,
+            conversation=tool_conversation,
+            supervisor_conversation=supervisor_conversation,
             instructions=instructions,
             allow_web_search=False,
             on_text_delta=None,
             on_lane_text_delta=None,
         )
     if isinstance(loop, ToolCallingStreamingLoop):
+        rewrite_backend = getattr(getattr(loop, "provider", None), "backend", None)
+        resolution = maybe_rewrite_prompt_against_recent_thread(
+            rewrite_backend,
+            conversation=tool_conversation,
+            user_transcript=prompt,
+        )
         return loop.run(
-            prompt,
-            conversation=runtime.tool_provider_conversation_context(),
+            resolution.effective_prompt,
+            conversation=tool_conversation,
             instructions=instructions,
             allow_web_search=False,
             on_text_delta=None,
@@ -950,21 +977,61 @@ def load_conversation_lab_state(
     }
 
 
-def _conversation_lab_runtime_config(config: TwinrConfig) -> TwinrConfig:
-    """Return the text-only runtime config used by the portal conversation lab.
+def _conversation_lab_runtime_scope_name(*, session_id: str) -> str:
+    """Return the scoped runtime snapshot name used by one lab session."""
+
+    normalized_id = _ensure_session_id(session_id)
+    if normalized_id is None:
+        raise ValueError("Conversation Lab runtime scope requires a valid session_id.")
+    return f"{_CONVERSATION_LAB_RUNTIME_SCOPE_PREFIX}/{normalized_id}"
+
+
+def _conversation_lab_runtime_config(config: TwinrConfig, *, session_id: str) -> TwinrConfig:
+    """Return the text-only, session-scoped runtime config for Conversation Lab.
 
     Portal text turns do not open microphone captures, so adaptive listening
-    state is irrelevant there and should not touch the shared Pi audio timing
-    store. Conversation Lab turns also stay out of the background long-term
-    turn writer so operator debugging does not create bounded flush/shutdown
-    tail work.
+    state is irrelevant there and background long-term writers stay disabled.
+    Short-term context must come from the explicit Conversation Lab session
+    turns, not from the shared Pi runtime snapshot, so startup restore is
+    disabled and the runtime snapshot file is scoped per lab session.
     """
 
-    return replace(
+    scoped_config = build_scoped_runtime_config(
         config,
+        scope_name=_conversation_lab_runtime_scope_name(session_id=session_id),
+        restore_runtime_state_on_startup=False,
+    )
+    return replace(
+        scoped_config,
         adaptive_timing_enabled=False,
         long_term_memory_background_store_turns=False,
     )
+
+
+def _conversation_lab_runtime_isolation_item(
+    runtime_config: TwinrConfig,
+    *,
+    session_id: str,
+) -> dict[str, object]:
+    """Return one human-readable telemetry item for runtime snapshot isolation."""
+
+    return {
+        "badge": "runtime",
+        "status": "ok",
+        "title": "Session Runtime Scope",
+        "body": "Conversation Lab used a session-scoped runtime snapshot and ignored the shared startup snapshot.",
+        "details": {
+            "session_id": session_id,
+            "runtime_snapshot_scope": "session_scoped",
+            "restore_runtime_state_on_startup": "true" if runtime_config.restore_runtime_state_on_startup else "false",
+            "adaptive_timing_enabled": "true" if runtime_config.adaptive_timing_enabled else "false",
+            "background_turn_writers_enabled": (
+                "true" if runtime_config.long_term_memory_background_store_turns else "false"
+            ),
+            "uses_shared_runtime_snapshot": "false",
+        },
+        "created_at": None,
+    }
 
 
 def run_conversation_lab_turn(
@@ -982,6 +1049,7 @@ def run_conversation_lab_turn(
         raise ValueError("Please enter a prompt first.")
 
     session = _load_or_create_session(ops_paths, session_id)
+    resolved_session_id = str(session["session_id"])
     collector = _TurnCollector()
     runtime: TwinrRuntime | None = None
     loop_resources: tuple[object, ...] = ()
@@ -997,7 +1065,13 @@ def run_conversation_lab_turn(
     status = "ok"
 
     try:
-        runtime_config = _conversation_lab_runtime_config(config)
+        runtime_config = _conversation_lab_runtime_config(config, session_id=resolved_session_id)
+        collector.telemetry_items.append(
+            _conversation_lab_runtime_isolation_item(
+                runtime_config,
+                session_id=resolved_session_id,
+            )
+        )
         runtime = TwinrRuntime(runtime_config)
         runtime.user_voice_status = "portal_operator_authenticated"
         _seed_runtime_conversation(runtime, session)

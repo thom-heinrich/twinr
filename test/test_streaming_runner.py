@@ -3766,6 +3766,79 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(tts_provider.stream_calls, ["Heute wird es sonnig."])
         self.assertIn("conversation_closure_fallback=closure_eval_timeout", lines)
 
+    def test_closure_eval_timeout_budget_is_not_restarted_after_playback(self) -> None:
+        class SequencedRecorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def capture_pcm_until_pause_with_options(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        pcm_bytes=b"PCM1",
+                        speech_started_after_ms=80,
+                        resumed_after_pause_count=0,
+                    )
+                raise RuntimeError("No speech detected before timeout")
+
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                conversation_closure_guard_enabled=True,
+                conversation_closure_provider_timeout_seconds=0.25,
+                conversation_follow_up_timeout_s=3.0,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            recorder = SequencedRecorder()
+            player = TimedPlayer(playback_delay_s=0.45)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=recorder,
+                player=player,
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                conversation_closure_evaluator=BlockingConversationClosureEvaluator(delay_s=1.5),
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            beep_times: list[float] = []
+            loop._play_listen_beep = lambda: beep_times.append(time.monotonic())  # type: ignore[method-assign]
+
+            result = loop._run_conversation_session(initial_source="button")
+
+        self.assertTrue(result)
+        self.assertEqual(len(beep_times), 2)
+        self.assertIsNotNone(player.playback_finished_at)
+        assert player.playback_finished_at is not None
+        self.assertLess(
+            beep_times[1] - player.playback_finished_at,
+            0.12,
+        )
+
     def test_tool_history_recording_does_not_delay_turn_completion_after_playback(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -5458,6 +5531,65 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(len(dual_lane.run_runtime_local_tool_only_calls), 1)
         self.assertFalse(dual_lane.run_runtime_local_tool_only_calls[0]["emit_filler"])
         self.assertEqual(len(dual_lane.run_handoff_calls), 0)
+        self.assertEqual(len(dual_lane.run_calls), 0)
+
+    def test_runtime_local_quiet_handoff_without_duration_falls_back_to_generic_loop(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.search_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("search context must not be requested for runtime-local quiet handoff"))  # type: ignore[method-assign]
+            tiny_recent_context = (("system", "tiny recent tool context"),)
+            runtime.tool_provider_tiny_recent_conversation_context = lambda: tiny_recent_context  # type: ignore[method-assign]
+            loop._resolve_local_semantic_route = lambda transcript: None  # type: ignore[method-assign]
+            decision = SimpleNamespace(
+                action="handoff",
+                spoken_ack=None,
+                spoken_reply=None,
+                kind="automation",
+                goal="Ask how long Twinr should stay quiet.",
+                allow_web_search=False,
+                context_scope="tiny_recent",
+                runtime_tool_name="manage_voice_quiet_mode",
+                runtime_tool_arguments={"action": "set"},
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: decision  # type: ignore[method-assign]
+
+            result = loop._run_dual_lane_final_response(
+                "Sei bitte ruhig.",
+                turn_instructions=None,
+            )
+
+        self.assertEqual(result.text, "Heute wird es sonnig.")
+        self.assertEqual(len(dual_lane.run_runtime_local_tool_only_calls), 0)
+        self.assertEqual(len(dual_lane.run_handoff_calls), 1)
+        self.assertEqual(dual_lane.run_handoff_calls[0]["conversation"], tiny_recent_context)
+        self.assertEqual(dual_lane.run_handoff_calls[0]["specialist_conversation"], tiny_recent_context)
         self.assertEqual(len(dual_lane.run_calls), 0)
 
     def test_local_semantic_router_tool_route_synthesizes_tiny_recent_handoff(self) -> None:

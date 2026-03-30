@@ -56,6 +56,7 @@ feedback on device.
 - attach a per-claim ReSpeaker confidence/source contract that later runtime and memory layers can inspect without guessing
 - derive conservative XVF3800 non-speech and background-media suppression facts from the same capture path
 - strip display-only env from ALSA subprocesses and, on the productive Pi root runtime, selectively preserve the logged-in user's audio-session env on the proven XVF3800/ALSA paths that require it
+- keep productive root-owned ReSpeaker playback on the Twinr softvol/hardware ALSA paths inside that same borrowed-session contract, because the Pi can otherwise hang `aplay` at drain/finalize even when user-owned playback works
 - persist and score local voice profiles on device
 
 `hardware` does **not** own:
@@ -69,7 +70,7 @@ feedback on device.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Narrow package export surface |
-| [audio.py](./audio.py) | Bounded audio capture, readable-frame probing, and playback |
+| [audio.py](./audio.py) | Bounded audio capture, readable-frame probing, and playback, including the productive Pi borrowed-session env opt-in for root-owned ReSpeaker output subprocesses |
 | [audio_env.py](./audio_env.py) | Sanitize child-process env for ALSA helpers while allowing explicit root-owned borrowed-session audio on productive Pi paths that need the logged-in user's audio runtime |
 | [respeaker_playback_mixer.py](./respeaker_playback_mixer.py) | Bounded runtime repair for the known XVF3800 Linux playback-mixer drift that can make spoken output too quiet |
 | [respeaker_duplex_playback.py](./respeaker_duplex_playback.py) | Temporary silent-playback guard for bounded XVF3800 capture helpers that need the hardware's duplex playback state outside the long-lived voice orchestrator |

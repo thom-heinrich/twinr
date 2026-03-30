@@ -12,6 +12,8 @@ _PHONE_SEPARATORS = set(" +()-./")
 _PLACEHOLDER_CHARS = set("*xX#.")
 _HTTP_HEADER_TOKEN_CHARS = set("!#$%&'*+-.^_`|~")
 _TEST_PATH_MARKERS = ("/test/", "/tests/", ".test.", "_test.")
+_PREFIX_METADATA_KEY_TOKENS = frozenset({"prefix", "namespace"})
+_PREFIX_METADATA_DELIMITERS = frozenset({":", "-", "_", "/", "."})
 
 
 def _trim_excerpt(text: str, *, max_len: int = 120) -> str:
@@ -54,6 +56,14 @@ def _looks_like_placeholder(value: str) -> bool:
     return False
 
 
+def _looks_like_placeholder_token_text(value: str, placeholder_values: tuple[str, ...]) -> bool:
+    normalized = _normalize_key(value)
+    tokens = tuple(token for token in normalized.split("_") if token)
+    if not tokens:
+        return False
+    return all(token in placeholder_values or _looks_like_placeholder(token) for token in tokens)
+
+
 def _is_test_like_path(path: str) -> bool:
     lowered_path = path.casefold()
     file_name = Path(lowered_path).name
@@ -82,6 +92,22 @@ def _iter_token_like_fragments(text: str) -> tuple[str, ...]:
     if current:
         fragments.append("".join(current))
     return tuple(fragments)
+
+
+def _is_allowed_test_secret_placeholder(
+    fragment: str,
+    *,
+    prefixes: tuple[str, ...],
+    placeholder_values: tuple[str, ...],
+) -> bool:
+    normalized_fragment = fragment.strip()
+    if not normalized_fragment:
+        return False
+    for prefix in sorted((item for item in prefixes if normalized_fragment.startswith(item)), key=len, reverse=True):
+        suffix = normalized_fragment[len(prefix) :]
+        if _looks_like_placeholder_token_text(suffix, placeholder_values):
+            return True
+    return False
 
 
 def _iter_digit_groups(candidate: str) -> tuple[str, ...]:
@@ -288,6 +314,23 @@ def _is_custom_header_name_metadata_assignment(key_text: str, value_text: str) -
     return all(character.isalnum() or character in _HTTP_HEADER_TOKEN_CHARS for character in normalized_value)
 
 
+def _is_prefix_metadata_assignment(key_text: str, value_text: str) -> bool:
+    normalized_key = _normalize_key(key_text)
+    key_tokens = tuple(token for token in normalized_key.split("_") if token)
+    if not any(token in _PREFIX_METADATA_KEY_TOKENS for token in key_tokens):
+        return False
+
+    literal_value = _unwrap_literal_value(value_text)
+    if literal_value is None:
+        return False
+    normalized_value = literal_value.strip()
+    if not normalized_value or any(character.isspace() for character in normalized_value):
+        return False
+    if normalized_value[-1] not in _PREFIX_METADATA_DELIMITERS:
+        return False
+    return all(character.isalnum() or character in _PREFIX_METADATA_DELIMITERS for character in normalized_value)
+
+
 def _looks_like_sensitive_literal_value(value_text: str, *, min_length: int) -> bool:
     unwrapped = _unwrap_literal_value(value_text)
     if unwrapped is None:
@@ -387,6 +430,12 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
         return
 
     for fragment in _iter_token_like_fragments(added_line.text):
+        if is_test_like_path and _is_allowed_test_secret_placeholder(
+            fragment,
+            prefixes=policy.content.secret_prefixes,
+            placeholder_values=policy.content.placeholder_values,
+        ):
+            continue
         for prefix in policy.content.secret_prefixes:
             if not fragment.startswith(prefix):
                 continue
@@ -411,6 +460,8 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
         if _key_matches_sensitive_fragment(key_text, policy.content.sensitive_key_fragments):
             if normalized_value not in policy.content.placeholder_values and not _looks_like_placeholder(normalized_value):
                 if _is_custom_header_name_metadata_assignment(key_text, value_text):
+                    return
+                if _is_prefix_metadata_assignment(key_text, value_text):
                     return
                 if _looks_like_sensitive_literal_value(value_text, min_length=policy.content.secret_min_length):
                     issues.append(

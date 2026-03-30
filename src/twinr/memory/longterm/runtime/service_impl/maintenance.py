@@ -11,6 +11,10 @@ from twinr.memory.longterm.core.models import (
     LongTermReflectionResultV1,
     LongTermRetentionResultV1,
 )
+from twinr.memory.longterm.runtime.live_object_selectors import (
+    select_reflection_neighborhood_objects,
+    select_sensor_memory_neighborhood_objects,
+)
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 from ._typing import ServiceMixinBase
@@ -29,11 +33,15 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
 
         try:
             with self._store_lock:
-                result = self.reflector.reflect(objects=self.object_store.load_objects())
+                result = self.reflector.reflect(
+                    objects=tuple(select_reflection_neighborhood_objects(self.object_store))
+                )
                 if self._has_reflection_payload(result):
                     self.object_store.apply_reflection(result)
                     self.midterm_store.apply_reflection(result)
-                sensor_memory_result = self.sensor_memory.compile(objects=self.object_store.load_objects())
+                sensor_memory_result = self.sensor_memory.compile(
+                    objects=tuple(select_sensor_memory_source_objects(self.object_store))
+                )
                 if self._has_reflection_payload(sensor_memory_result):
                     self.object_store.apply_reflection(sensor_memory_result)
                     self.midterm_store.apply_reflection(sensor_memory_result)
@@ -61,7 +69,10 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:
-                result = self.sensor_memory.compile(objects=self.object_store.load_objects(), now=normalized_now)
+                result = self.sensor_memory.compile(
+                    objects=tuple(select_sensor_memory_neighborhood_objects(self.object_store)),
+                    now=normalized_now,
+                )
                 if self._has_reflection_payload(result):
                     self.object_store.apply_reflection(result)
                     self.midterm_store.apply_reflection(result)
@@ -102,20 +113,22 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
             print_completions = build.print_completions
 
             with self._store_lock:
-                existing_objects = tuple(self.object_store.load_objects())
-                existing_conflicts = tuple(self.object_store.load_conflicts())
-                existing_archived = tuple(self.object_store.load_archived_objects())
-                objects_by_id = {item.memory_id: item for item in existing_objects}
-                conflicts_by_slot = {item.slot_key: item for item in existing_conflicts}
-                seen_turn_ids = {
-                    event_id
-                    for item in objects_by_id.values()
-                    for event_id in item.source.event_ids
-                }
+                objects_by_id: dict[str, object] = {}
+                conflicts_by_slot: dict[str, object] = {}
+                seen_turn_ids: set[str] = set()
 
                 for evidence in build.evidence:
                     try:
                         extraction = self.multimodal_extractor.extract_evidence(evidence)
+                        working_set = self.object_store.load_active_working_set(
+                            candidate_objects=(extraction.episode, *extraction.candidate_objects),
+                            event_ids=(extraction.turn_id,),
+                        )
+                        for item in working_set.objects:
+                            objects_by_id.setdefault(item.memory_id, item)
+                            seen_turn_ids.update(item.source.event_ids)
+                        for conflict in working_set.conflicts:
+                            conflicts_by_slot.setdefault(conflict.slot_key, conflict)
                         if extraction.turn_id in seen_turn_ids:
                             skipped_existing += 1
                             continue
@@ -144,7 +157,14 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                 reflection_result = self._empty_reflection_result()
                 if applied_evidence:
                     try:
-                        reflection_result = self.reflector.reflect(objects=current_objects)
+                        reflection_result = self.reflector.reflect(
+                            objects=tuple(
+                                select_reflection_neighborhood_objects(
+                                    self.object_store,
+                                    seed_objects=current_objects,
+                                )
+                            )
+                        )
                     except Exception as exc:
                         logger.exception("Long-term backfill reflection failed.")
                         if reflection_error is None:
@@ -160,7 +180,15 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
 
                 sensor_result = self._empty_reflection_result()
                 try:
-                    sensor_result = self.sensor_memory.compile(objects=current_objects, now=normalized_now)
+                    sensor_result = self.sensor_memory.compile(
+                        objects=tuple(
+                            select_sensor_memory_neighborhood_objects(
+                                self.object_store,
+                                seed_objects=current_objects,
+                            )
+                        ),
+                        now=normalized_now,
+                    )
                 except Exception as exc:
                     logger.exception("Long-term backfill sensor-memory compilation failed.")
                     if reflection_error is None:
@@ -186,13 +214,14 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                     or bool(retention.expired_objects or retention.pruned_memory_ids or retention.archived_objects)
                 )
                 if should_write_snapshot:
-                    self.object_store.write_snapshot(
-                        objects=_sort_objects_by_memory_id(retention.kept_objects),
-                        conflicts=current_conflicts,
-                        archived_objects=self._merge_archived_objects(
-                            existing_archived=existing_archived,
-                            archived_updates=retention.archived_objects,
+                    self.object_store.commit_active_delta(
+                        object_upserts=_sort_objects_by_memory_id(retention.kept_objects),
+                        object_delete_ids=self._retention_deleted_memory_ids(
+                            current_objects=current_objects,
+                            retention=retention,
                         ),
+                        conflict_upserts=current_conflicts,
+                        archive_upserts=retention.archived_objects,
                     )
                 if self._has_reflection_payload(reflection_result):
                     self.midterm_store.apply_reflection(reflection_result)
@@ -222,7 +251,17 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
 
         try:
             with self._store_lock:
-                result = self.retention_policy.apply(objects=self.object_store.load_objects())
+                reference_now = self.retention_policy.reference_now()
+                if self.object_store._remote_catalog_enabled() and self.object_store._remote_catalog is not None:
+                    candidate_objects = self.object_store.load_objects_by_projection_filter(
+                        predicate=lambda projection: self.retention_policy.projection_requires_action(
+                            projection,
+                            now=reference_now,
+                        )
+                    )
+                else:
+                    candidate_objects = self.object_store.load_objects_fine_grained()
+                result = self.retention_policy.apply(objects=candidate_objects, now=reference_now)
                 self.object_store.apply_retention(result)
                 return result
         except LongTermRemoteUnavailableError:

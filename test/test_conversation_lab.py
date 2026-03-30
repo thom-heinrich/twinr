@@ -1,5 +1,7 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import sys
 import tempfile
 import time
@@ -9,16 +11,22 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.contracts import ToolCallingTurnResponse
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
+from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
+from twinr.agent.tools.runtime.streaming_loop import ToolCallingStreamingLoop
 from twinr.agent.tools.handlers.household_identity import handle_manage_household_identity
 from twinr.agent.tools.handlers.output import handle_inspect_camera
 from twinr.agent.tools.handlers.portrait_identity import handle_enroll_portrait_identity
 from twinr.hardware.camera import CapturedPhoto
+from twinr.memory import ConversationTurn
 from twinr.ops.paths import resolve_ops_paths
 from twinr.web.conversation_lab import (
     _CONVERSATION_LAB_TOOL_NAMES,
     _ConversationLabToolOwner,
     _build_tool_loop,
     _conversation_lab_runtime_config,
+    _run_text_turn,
     _search_snapshot,
     run_conversation_lab_turn,
 )
@@ -57,12 +65,25 @@ class _RuntimeStub:
         self.flush_calls: list[float] = []
         self.recorded_tool_history: list[tuple[tuple[object, ...], tuple[object, ...]]] = []
         self.shutdown_calls: list[float] = []
+        self.tool_context: tuple[tuple[str, str], ...] = ()
 
     def apply_live_config(self, updated_config: TwinrConfig) -> None:
         self.config = updated_config
 
     def provider_conversation_context(self):
         return ()
+
+    def tool_provider_conversation_context(self):
+        return self.tool_context
+
+    def supervisor_provider_conversation_context(self):
+        return self.tool_context
+
+    def tool_provider_text_surface_conversation_context(self):
+        return self.tool_context
+
+    def supervisor_provider_text_surface_conversation_context(self):
+        return self.tool_context
 
     def finalize_agent_turn(self, answer: str) -> str:
         self.finalized_answers.append(answer)
@@ -105,6 +126,33 @@ class _VisionPrintBackend:
             request_id="req_vision_1",
             model="gpt-test",
             token_usage=None,
+        )
+
+
+class _LoopProvider:
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, object]] = []
+
+    def start_turn_streaming(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del instructions, tool_schemas, allow_web_search, on_text_delta
+        self.start_calls.append({"prompt": prompt, "conversation": tuple(conversation or ())})
+        return ToolCallingTurnResponse(
+            text="In New York ist es gerade 10:54 Uhr.",
+            tool_calls=(),
+            continuation_token=None,
+            response_id="resp_text_turn",
+            request_id="req_text_turn",
+            model="gpt-test",
+            used_web_search=False,
         )
 
 
@@ -229,12 +277,62 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
             project_root=".",
             adaptive_timing_enabled=True,
             long_term_memory_background_store_turns=True,
+            restore_runtime_state_on_startup=True,
+            runtime_state_path="state/runtime-state.json",
         )
 
-        runtime_config = _conversation_lab_runtime_config(config)
+        runtime_config = _conversation_lab_runtime_config(
+            config,
+            session_id="session_20260329T201407Z_d4f218cc",
+        )
 
         self.assertFalse(runtime_config.adaptive_timing_enabled)
         self.assertFalse(runtime_config.long_term_memory_background_store_turns)
+        self.assertFalse(runtime_config.restore_runtime_state_on_startup)
+        self.assertIn(
+            "runtime-scopes/conversation-lab-session-20260329t201407z-d4f218cc/runtime-state.json",
+            runtime_config.runtime_state_path,
+        )
+
+    def test_conversation_lab_runtime_config_ignores_shared_runtime_snapshot_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_runtime_state = root / "state" / "runtime-state.json"
+            shared_runtime_state.parent.mkdir(parents=True, exist_ok=True)
+            RuntimeSnapshotStore(shared_runtime_state).save(
+                status="waiting",
+                memory_turns=(
+                    ConversationTurn(
+                        "user",
+                        "Wie spaet ist es in New York?",
+                        datetime(2026, 3, 29, 20, 14, tzinfo=timezone.utc),
+                    ),
+                    ConversationTurn(
+                        "assistant",
+                        "In New York ist es gerade 16:14 Uhr.",
+                        datetime(2026, 3, 29, 20, 14, 5, tzinfo=timezone.utc),
+                    ),
+                ),
+                last_transcript="Wie spaet ist es in New York?",
+                last_response="In New York ist es gerade 16:14 Uhr.",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path="state/runtime-state.json",
+                restore_runtime_state_on_startup=True,
+                long_term_memory_enabled=False,
+            )
+
+            runtime = TwinrRuntime(
+                _conversation_lab_runtime_config(
+                    config,
+                    session_id="session_20260329T201602Z_2ff04632",
+                )
+            )
+            try:
+                self.assertEqual(tuple(runtime.memory.turns), ())
+            finally:
+                runtime.shutdown(timeout_s=0.1)
 
     def test_build_tool_loop_filters_conversation_lab_tools_by_runtime_availability(self) -> None:
         config = TwinrConfig(
@@ -332,12 +430,94 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
 
             session_path = ops_paths.ops_store_root / "conversation_lab" / f"{session_id}.json"
             payload = session_path.read_text(encoding="utf-8")
+            parsed = json.loads(payload)
+            turn = parsed["turns"][-1]
 
             self.assertIn('"status": "ok"', payload)
             self.assertIn('"Flush result"', payload)
             self.assertEqual(runtime.flush_calls, [])
             self.assertEqual(runtime.recorded_tool_history, [])
             self.assertEqual(runtime.shutdown_calls, [2.0])
+            self.assertTrue(
+                any(
+                    item.get("title") == "Session Runtime Scope"
+                    and "runtime_snapshot_scope: session_scoped" in tuple(item.get("meta_lines", ()))
+                    and "restore_runtime_state_on_startup: false" in tuple(item.get("meta_lines", ()))
+                    for item in turn.get("telemetry_items", [])
+                )
+            )
+
+    def test_run_text_turn_injects_recent_thread_carryover_guidance(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        runtime = _RuntimeStub()
+        runtime.tool_context = (
+            ("system", "memory summary"),
+            ("user", "Wie spaet ist es in New York?"),
+            ("assistant", "In New York ist es gerade 10:53 Uhr."),
+        )
+        provider = _LoopProvider()
+        loop = ToolCallingStreamingLoop(
+            provider=provider,
+            tool_handlers={},
+            tool_schemas=(),
+        )
+
+        _run_text_turn(
+            config=config,
+            runtime=runtime,
+            loop=loop,
+            prompt="Ich meinte, wie spaet es ist.",
+        )
+
+        conversation = provider.start_calls[0]["conversation"]
+        assert isinstance(conversation, tuple)
+        self.assertTrue(
+            any(
+                role == "system"
+                and "Recent thread carryover for this turn." in content
+                and "New York" in content
+                for role, content in conversation
+            )
+        )
+
+    def test_run_text_turn_uses_recent_thread_rewritten_prompt(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        runtime = _RuntimeStub()
+        runtime.tool_context = (
+            ("user", "Wie spaet ist es in New York?"),
+            ("assistant", "In New York ist es gerade 10:53 Uhr."),
+        )
+        provider = _LoopProvider()
+        loop = ToolCallingStreamingLoop(
+            provider=provider,
+            tool_handlers={},
+            tool_schemas=(),
+        )
+
+        with patch(
+            "twinr.web.conversation_lab.maybe_rewrite_prompt_against_recent_thread",
+            return_value=SimpleNamespace(
+                original_prompt="Ich meinte, wie spaet es ist.",
+                effective_prompt="Wie spaet ist es in New York?",
+                resolution="rewrite",
+            ),
+        ):
+            _run_text_turn(
+                config=config,
+                runtime=runtime,
+                loop=loop,
+                prompt="Ich meinte, wie spaet es ist.",
+            )
+
+        self.assertEqual(provider.start_calls[0]["prompt"], "Wie spaet ist es in New York?")
 
 
 if __name__ == "__main__":

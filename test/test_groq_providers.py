@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -59,9 +60,12 @@ class FakeGroqChatCompletions:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.results: list[object] = []
+        self.delay_seconds = 0.0
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
         if not self.results:
             raise AssertionError("No fake Groq result configured")
         return self.results.pop(0)
@@ -110,13 +114,106 @@ class GroqProviderTests(unittest.TestCase):
         self.assertEqual(self.client.chat.completions.calls[0]["model"], "llama-3.1-8b-instant")
         self.assertTrue(self.client.chat.completions.calls[0]["stream"])
 
-    def test_agent_text_provider_delegates_web_search_to_support_provider(self) -> None:
+    def test_agent_text_provider_uses_native_groq_web_search_by_default(self) -> None:
+        self.client.chat.completions.results.append(
+            SimpleNamespace(
+                id="groq_search_1",
+                _request_id="groq_req_search_1",
+                model="groq/compound-mini",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="Heute wird es sonnig.",
+                            executed_tools=[{"type": "web_search"}],
+                        )
+                    )
+                ],
+            )
+        )
         provider = GroqAgentTextProvider(self.config, support_provider=self.support, client=self.client)
+
+        response = provider.respond_with_metadata("Wie ist das Wetter?", allow_web_search=True)
+
+        self.assertEqual(response.text, "Heute wird es sonnig.")
+        self.assertTrue(response.used_web_search)
+        self.assertEqual(self.support.calls, [])
+        self.assertEqual(self.client.chat.completions.calls[0]["model"], "groq/compound-mini")
+
+    def test_agent_text_provider_omits_service_tier_when_not_configured(self) -> None:
+        self.client.chat.completions.results.append(
+            SimpleNamespace(
+                id="groq_resp_omit_tier",
+                _request_id="groq_req_omit_tier",
+                model="llama-3.1-8b-instant",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            )
+        )
+        provider = GroqAgentTextProvider(self.config, support_provider=self.support, client=self.client)
+
+        response = provider.respond_with_metadata("Antworte nur mit: ok.")
+
+        self.assertEqual(response.text, "ok")
+        self.assertNotIn("service_tier", self.client.chat.completions.calls[0])
+
+    def test_agent_text_provider_marks_explicit_search_path_as_web_search_without_sdk_metadata(self) -> None:
+        self.client.chat.completions.results.append(
+            SimpleNamespace(
+                id="groq_search_2",
+                _request_id="groq_req_search_2",
+                model="groq/compound-mini",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Es ist 2026."))],
+            )
+        )
+        provider = GroqAgentTextProvider(self.config, support_provider=self.support, client=self.client)
+
+        response = provider.respond_with_metadata("Welches Jahr haben wir?", allow_web_search=True)
+
+        self.assertEqual(response.text, "Es ist 2026.")
+        self.assertTrue(response.used_web_search)
+
+    def test_agent_text_provider_can_opt_in_to_support_fallback_for_web_search(self) -> None:
+        provider = GroqAgentTextProvider(
+            TwinrConfig(
+                groq_api_key="groq-key",
+                groq_model="llama-3.1-8b-instant",
+                groq_allow_search_fallback=True,
+            ),
+            support_provider=self.support,
+            client=self.client,
+        )
 
         response = provider.respond_with_metadata("Wie ist das Wetter?", allow_web_search=True)
 
         self.assertEqual(response.text, "support metadata")
         self.assertEqual(self.support.calls[0][0], "respond_with_metadata")
+
+    def test_agent_text_provider_enforces_wall_clock_timeout_for_native_search(self) -> None:
+        self.client.chat.completions.delay_seconds = 0.2
+        self.client.chat.completions.results.append(
+            SimpleNamespace(
+                id="groq_search_timeout",
+                _request_id="groq_req_search_timeout",
+                model="groq/compound-mini",
+                choices=[SimpleNamespace(message=SimpleNamespace(content="zu spät"))],
+            )
+        )
+        provider = GroqAgentTextProvider(
+            TwinrConfig(
+                groq_api_key="groq-key",
+                groq_model="llama-3.1-8b-instant",
+                groq_request_timeout_seconds=0.05,
+            ),
+            support_provider=self.support,
+            client=self.client,
+        )
+
+        started = time.monotonic()
+        response = provider.respond_with_metadata("Wie spät ist es?", allow_web_search=True)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(response.text, "I am having trouble right now. Please try again.")
+        self.assertEqual(self.support.calls, [])
 
     def test_tool_calling_provider_streams_and_continues(self) -> None:
         self.client.chat.completions.results.append(

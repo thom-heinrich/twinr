@@ -9,19 +9,87 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore, PromptContextStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+
+
+class _FakeCatalogClient:
+    def __init__(self, *, error_getter) -> None:
+        self._error_getter = error_getter
+        self._next_document_id = 1
+        self.bulk_calls = 0
+        self.records_by_document_id: dict[str, dict[str, object]] = {}
+        self.records_by_uri: dict[str, dict[str, object]] = {}
+
+    def _maybe_raise(self) -> None:
+        error = self._error_getter()
+        if error is not None:
+            raise error
+
+    def store_records_bulk(self, request):
+        self.bulk_calls += 1
+        self._maybe_raise()
+        items = tuple(getattr(request, "items", ()))
+        response_items: list[dict[str, object]] = []
+        for item in items:
+            document_id = f"doc-{self._next_document_id}"
+            self._next_document_id += 1
+            record = {
+                "document_id": document_id,
+                "payload": dict(getattr(item, "payload", {}) or {}),
+                "metadata": dict(getattr(item, "metadata", {}) or {}),
+                "content": getattr(item, "content", None),
+                "uri": getattr(item, "uri", None),
+            }
+            self.records_by_document_id[document_id] = record
+            uri = record.get("uri")
+            if isinstance(uri, str) and uri:
+                self.records_by_uri[uri] = record
+            response_items.append({"document_id": document_id})
+        return {"items": response_items}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del include_content, max_content_chars
+        self._maybe_raise()
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+            if record is not None:
+                return dict(record)
+        if isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+            if record is not None:
+                return dict(record)
+        raise LongTermRemoteUnavailableError("remote document unavailable")
 
 
 class _FakeRemoteState:
     def __init__(self, *, migration_enabled: bool = False) -> None:
         self.enabled = True
-        self.config = SimpleNamespace(long_term_memory_migration_enabled=migration_enabled)
+        self.required = False
+        self.namespace = "test-namespace"
+        self.load_error: Exception | None = None
+        self.client = _FakeCatalogClient(error_getter=lambda: self.load_error)
+        self.read_client = self.client
+        self.write_client = self.client
+        self.config = SimpleNamespace(
+            long_term_memory_migration_enabled=migration_enabled,
+            long_term_memory_migration_batch_size=64,
+            long_term_memory_remote_read_timeout_s=8.0,
+            long_term_memory_remote_write_timeout_s=15.0,
+            long_term_memory_remote_flush_timeout_s=60.0,
+            long_term_memory_remote_bulk_request_max_bytes=512 * 1024,
+            long_term_memory_remote_shard_max_content_chars=1000,
+            long_term_memory_remote_max_content_chars=2_000_000,
+            long_term_memory_remote_read_cache_ttl_s=0.0,
+        )
         self.snapshots: dict[str, dict[str, object]] = {}
         self.probe_calls: list[dict[str, object]] = []
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         del local_path
+        if self.load_error is not None:
+            raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
 
@@ -42,6 +110,8 @@ class _FakeRemoteState:
                 "prefer_metadata_only": prefer_metadata_only,
             }
         )
+        if self.load_error is not None:
+            raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         return SimpleNamespace(
             status="found" if isinstance(payload, dict) else "not_found",
@@ -54,24 +124,10 @@ class _FakeRemoteState:
 
 
 class _FailingRemoteState(_FakeRemoteState):
-    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
-        del local_path
-        raise LongTermRemoteUnavailableError(
-            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
-        )
-
-    def probe_snapshot_load(
-        self,
-        *,
-        snapshot_kind: str,
-        local_path=None,
-        prefer_cached_document_id: bool = False,
-        prefer_metadata_only: bool = False,
-        fast_fail: bool = False,
-    ):
-        del local_path, prefer_cached_document_id, prefer_metadata_only, fast_fail
-        raise LongTermRemoteUnavailableError(
-            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
+    def __init__(self) -> None:
+        super().__init__()
+        self.load_error = LongTermRemoteUnavailableError(
+            "Failed to read remote long-term current head: status=503"
         )
 
 
@@ -223,6 +279,7 @@ class ContextStoreTests(unittest.TestCase):
         self.assertEqual(entries[0].summary, "Eye doctor on Tuesday at 10:30.")
         self.assertIn("Eye doctor on Tuesday at 10:30.", context or "")
         self.assertIn("prompt_memory", remote_state.snapshots)
+        self.assertEqual(remote_state.snapshots["prompt_memory"]["schema"], "twinr_prompt_memory_catalog_v3")
 
     def test_managed_context_store_remote_primary_keeps_updates_off_disk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -246,8 +303,9 @@ class ContextStoreTests(unittest.TestCase):
         self.assertIn("Base user facts.", rendered or "")
         self.assertIn("pets: Thom has two dogs.", rendered or "")
         self.assertIn("user_context", remote_state.snapshots)
+        self.assertEqual(remote_state.snapshots["user_context"]["schema"], "twinr_user_context_catalog_v3")
 
-    def test_managed_context_store_ensure_remote_snapshot_seeds_empty_remote_document(self) -> None:
+    def test_managed_context_store_ensure_remote_snapshot_keeps_empty_remote_document_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "USER.md"
             path.write_text("Base user facts.\n", encoding="utf-8")
@@ -261,13 +319,61 @@ class ContextStoreTests(unittest.TestCase):
 
             created = store.ensure_remote_snapshot()
 
-        self.assertTrue(created)
+        self.assertFalse(created)
         self.assertEqual(
-            remote_state.snapshots["user_context"],
-            {"schema": "twinr_managed_context", "version": 1, "entries": []},
+            store.probe_remote_current_head(),
+            {"schema": "twinr_user_context_catalog_v3", "version": 3, "items_count": 0, "segments": []},
         )
+        self.assertEqual(remote_state.snapshots, {})
+        self.assertEqual(remote_state.client.bulk_calls, 0)
 
-    def test_memory_store_ensure_remote_snapshot_seeds_empty_prompt_memory(self) -> None:
+    def test_managed_context_store_retries_transient_queue_saturation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "USER.md"
+            path.write_text(
+                "\n".join(
+                    [
+                        "Base user facts.",
+                        "",
+                        "<!-- TWINR_MANAGED_CONTEXT_START -->",
+                        "## Twinr managed user updates",
+                        "_This section is managed by Twinr. Keep entries short and stable._",
+                        "- pets: Thom has two dogs.",
+                        "<!-- TWINR_MANAGED_CONTEXT_END -->",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            remote_state = _FakeRemoteState()
+            remote_state.config.long_term_memory_remote_retry_backoff_s = 0.0
+            remote_state.client._error_getter = lambda: (
+                ChonkyDBError(
+                    "ChonkyDB request failed for POST /v1/external/records/bulk",
+                    status_code=429,
+                    response_json={"detail": "queue_saturated", "error": "queue_saturated"},
+                )
+                if 0 < remote_state.client.bulk_calls < 3
+                else None
+            )
+            store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+
+            created = store.ensure_remote_snapshot()
+
+        self.assertTrue(created)
+        self.assertEqual(remote_state.client.bulk_calls, 5)
+        self.assertEqual(remote_state.snapshots["user_context"]["schema"], "twinr_user_context_catalog_v3")
+        self.assertEqual(remote_state.snapshots["user_context"]["version"], 3)
+        self.assertEqual(remote_state.snapshots["user_context"]["items_count"], 1)
+        self.assertEqual(len(remote_state.snapshots["user_context"]["segments"]), 1)
+        self.assertIsInstance(remote_state.snapshots["user_context"].get("written_at"), str)
+
+    def test_memory_store_ensure_remote_snapshot_keeps_empty_prompt_memory_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "MEMORY.md"
             remote_state = _FakeRemoteState()
@@ -275,10 +381,90 @@ class ContextStoreTests(unittest.TestCase):
 
             created = store.ensure_remote_snapshot()
 
-        self.assertTrue(created)
+        self.assertFalse(created)
         self.assertEqual(
+            store.probe_remote_current_head(),
+            {"schema": "twinr_prompt_memory_catalog_v3", "version": 3, "items_count": 0, "segments": []},
+        )
+        self.assertEqual(remote_state.snapshots, {})
+        self.assertEqual(remote_state.client.bulk_calls, 0)
+
+    def test_memory_store_load_entries_uses_legacy_head_when_current_head_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "MEMORY.md"
+            remote_state = _FakeRemoteState()
+            writer_store = PersistentMemoryMarkdownStore(path, remote_state=remote_state)
+
+            writer_store.remember(
+                kind="appointment",
+                summary="Eye doctor on Tuesday at 10:30.",
+            )
+            current_head_uri = writer_store._remote_records._catalog._catalog_head_uri(snapshot_kind="prompt_memory")
+            remote_state.client.records_by_uri.pop(current_head_uri, None)
+            remote_state.probe_calls.clear()
+            baseline_bulk_calls = remote_state.client.bulk_calls
+            reader_store = PersistentMemoryMarkdownStore(path, remote_state=remote_state)
+
+            head = reader_store.load_remote_current_head()
+            entries = reader_store.load_entries()
+
+        self.assertEqual(
+            head,
             remote_state.snapshots["prompt_memory"],
-            {"schema": "twinr_prompt_memory", "version": 1, "entries": []},
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].summary, "Eye doctor on Tuesday at 10:30.")
+        self.assertEqual(remote_state.client.bulk_calls, baseline_bulk_calls)
+        self.assertEqual(
+            remote_state.probe_calls[-1],
+            {
+                "snapshot_kind": "prompt_memory",
+                "prefer_cached_document_id": True,
+                "prefer_metadata_only": True,
+            },
+        )
+
+    def test_managed_context_store_load_entries_uses_legacy_head_when_current_head_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "USER.md"
+            path.write_text("Base user facts.\n", encoding="utf-8")
+            remote_state = _FakeRemoteState()
+            writer_store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+
+            writer_store.upsert(category="pets", instruction="Thom has two dogs.")
+            current_head_uri = writer_store._remote_records._catalog._catalog_head_uri(snapshot_kind="user_context")
+            remote_state.client.records_by_uri.pop(current_head_uri, None)
+            remote_state.probe_calls.clear()
+            baseline_bulk_calls = remote_state.client.bulk_calls
+            reader_store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+
+            head = reader_store.load_remote_current_head()
+            entries = reader_store.load_entries()
+
+        self.assertEqual(
+            head,
+            remote_state.snapshots["user_context"],
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].instruction, "Thom has two dogs.")
+        self.assertEqual(remote_state.client.bulk_calls, baseline_bulk_calls)
+        self.assertEqual(
+            remote_state.probe_calls[-1],
+            {
+                "snapshot_kind": "user_context",
+                "prefer_cached_document_id": True,
+                "prefer_metadata_only": True,
+            },
         )
 
     def test_prompt_context_store_serializes_remote_snapshot_checks(self) -> None:

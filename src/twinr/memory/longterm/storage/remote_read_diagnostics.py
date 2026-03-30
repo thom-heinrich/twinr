@@ -17,11 +17,16 @@ import os
 from pathlib import Path
 import socket
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.error import URLError
 
 from twinr.memory.chonkydb.client import ChonkyDBError
-from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
+from twinr.memory.longterm.storage.remote_read_observability import (
+    _log_ops_event_append_failure,
+    record_remote_read_observation,
+    record_remote_write_observation,
+    resolve_remote_access_classification,
+)
 
 if TYPE_CHECKING:
     from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
@@ -58,6 +63,7 @@ class LongTermRemoteReadContext:
     retry_attempts_configured: int | None = None
     retry_backoff_s: float | None = None
     retry_mode: str | None = None
+    access_classification: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +72,12 @@ class LongTermRemoteWriteContext:
 
     snapshot_kind: str
     operation: str
+    request_method: str | None = None
+    request_payload_kind: str | None = None
+    request_path: str | None = None
+    timeout_s: float | None = None
+    namespace: str | None = None
+    access_classification: str | None = None
     document_id_hint: str | None = None
     uri_hint: str | None = None
     attempt_count: int | None = None
@@ -390,12 +402,25 @@ def _record_remote_request_diagnostic(
             message=message,
             data=data,
         )
-    except Exception:
-        _LOG.warning("Failed to append remote long-term %s diagnostic event.", normalized_request_kind, exc_info=True)
+    except Exception as exc:
+        _log_ops_event_append_failure(
+            logger=_LOG,
+            event_kind="diagnostic",
+            request_kind=normalized_request_kind,
+            exc=exc,
+        )
     if normalized_request_kind == "read":
         record_remote_read_observation(
             remote_state=remote_state,
             context=context,
+            latency_ms=elapsed_ms,
+            outcome=normalized_outcome,
+            classification=classification,
+        )
+    elif normalized_request_kind == "write":
+        record_remote_write_observation(
+            remote_state=remote_state,
+            context=cast(LongTermRemoteWriteContext, context),
             latency_ms=elapsed_ms,
             outcome=normalized_outcome,
             classification=classification,
@@ -422,6 +447,10 @@ def _build_remote_request_diagnostic_data(
         "operation": _normalize_text(getattr(context, "operation", None)),
         "request_method": _normalize_text(getattr(context, "request_method", None)),
         "request_payload_kind": _normalize_text(getattr(context, "request_payload_kind", None)),
+        "access_classification": resolve_remote_access_classification(
+            request_kind=normalized_request_kind,
+            context=context,
+        ),
         "outcome": normalized_outcome,
         "classification": classification,
         "latency_ms": round(elapsed_ms, 3),
