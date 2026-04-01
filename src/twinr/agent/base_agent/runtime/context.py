@@ -716,14 +716,18 @@ class TwinrRuntimeContextMixin:
                 raise RuntimeError("long_term_memory is unavailable while remote-primary memory is required")
             return ()
         try:
-            context_builder = (
-                long_term_memory.build_tool_provider_context(
+            if tool_context:
+                context_builder = long_term_memory.build_tool_provider_context(
                     retrieval_query,
                     include_graph_fallback=False,
                 )
-                if tool_context
-                else long_term_memory.build_provider_context(retrieval_query)
-            )
+            else:
+                live_context_builder = getattr(long_term_memory, "build_live_provider_context", None)
+                context_builder = (
+                    live_context_builder(retrieval_query)
+                    if callable(live_context_builder)
+                    else long_term_memory.build_provider_context(retrieval_query)
+                )
             messages: list[str] = []
             for context_message in context_builder.system_messages():
                 sanitized = self._sanitize_context_message_text(context_message)

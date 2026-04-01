@@ -29,6 +29,7 @@ from twinr.memory.longterm.retrieval.restart_recall_policy import (
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.runtime.context_snapshot import LongTermContextSnapshot
 from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
+from twinr.memory.longterm.runtime.provider_answer_front import MaterializedProviderAnswerFront
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.runtime.worker import (
@@ -83,6 +84,7 @@ class LongTermMemoryService(
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
     prepared_context_front: PreparedLongTermContextFront | None = None
+    provider_answer_front: MaterializedProviderAnswerFront | None = None
     fast_topic_builder: LongTermFastTopicContextBuilder | None = None
     turn_continuity_compiler: LongTermTurnContinuityCompiler = field(default_factory=LongTermTurnContinuityCompiler)
     restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None

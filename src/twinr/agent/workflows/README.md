@@ -46,7 +46,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
-- feed transcript-first interim and endpoint transcripts into long-term-memory prepared-context prewarm so the live answer path can reuse already-started full-context retrieval instead of waiting for a fresh synchronous remote rebuild after the user stops speaking
+- feed transcript-first interim and endpoint transcripts into long-term-memory materialized provider-answer-front prewarm so the live answer path can consume already-persisted long-term prompt blocks instead of waiting for a fresh synchronous remote rebuild after the user stops speaking
 - let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
 - when the local semantic router is enabled on the Pi, prewarm its ONNX path before the first live turn so weather/tool/memory turns do not spend the user's first reply budget on cold-start model load
 - when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
@@ -104,12 +104,12 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [voice_turn_latency.py](./voice_turn_latency.py) | Shared wake/commit/supervisor/remote-memory/TTS stage tracker for per-turn Pi journal timing breakdowns |
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
 | [remote_transcript_commit.py](./remote_transcript_commit.py) | Bounded wait coordinator for same-stream server transcript commits during live remote listening |
-| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell, including transcript-first long-term prepared-context prewarm delegation |
+| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell, including transcript-first long-term provider-answer-front prewarm delegation |
 | [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions, including storage of the next-turn carryover hint |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
 | [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
 | [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |
-| [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, same-stream remote transcript waits, transcript-first long-term prewarm triggers, timeout handling, and batch-STT fallback |
+| [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, same-stream remote transcript waits, transcript-first long-term provider-answer-front prewarm triggers, timeout handling, and batch-STT fallback |
 | [streaming_speculation.py](./streaming_speculation.py) | Speculative first-word and supervisor warmup controller |
 | [streaming_lane_planner.py](./streaming_lane_planner.py) | Streaming lane-plan and final-lane path selection |
 | [streaming_supervisor_context.py](./streaming_supervisor_context.py) | Per-turn fast-lane supervisor instruction builder, including visible-card grounding overlays |

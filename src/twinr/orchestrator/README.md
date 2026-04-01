@@ -51,6 +51,7 @@ contracts used by the Alexa-like hybrid voice path.
 | [voice_session.py](./voice_session.py) | Stable compatibility wrapper for the server-side voice-session import surface |
 | [voice_session_impl/](./voice_session_impl/) | Internal package split across runtime-state handling, observability, backend requests, and utterance scanning |
 | [probe_turn.py](./probe_turn.py) | Lightweight text-probe bootstrap for `--orchestrator-probe-turn` with stage timings and no full hardware-loop startup |
+| [non_voice_acceptance.py](./non_voice_acceptance.py) | Deterministic direct/tool/memory text-only E2E acceptance runner with persisted artifacts |
 | [acks.py](./acks.py) | Ack phrase ID map |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
@@ -81,6 +82,18 @@ conversation context and the local realtime tool surface, but it deliberately
 skips GPIO/audio/proactive/live-voice startup that belongs to the full hardware
 loop instead of a text websocket probe. That keeps the probe bounded and makes
 its stage timings actionable when Pi acceptance stalls.
+
+For a deterministic text-only acceptance proof across the real direct/tool/
+memory paths, operators can now run:
+
+```bash
+PYTHONPATH=src python3 -m twinr --env-file .env --non-voice-e2e-acceptance
+```
+
+That runner executes one short direct turn, one live web/tool turn, and the
+live synthetic-memory acceptance matrix, then persists the rolling ops artifact
+to `artifacts/stores/ops/non_voice_e2e_acceptance.json` plus a per-run report
+under `artifacts/reports/non_voice_e2e_acceptance/`.
 
 Twinr's live voice gateway now has one supported activation path only:
 `TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` must point at the thh1986 ASR service.

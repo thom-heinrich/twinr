@@ -68,6 +68,17 @@ files:
     role: Blocking and asyncio-safe websocket client
     exports:
       - OrchestratorWebSocketClient
+  - path: probe_turn.py
+    role: Lightweight text-only websocket probe bootstrap with stage timing evidence
+  - path: non_voice_acceptance.py
+    role: Deterministic text-only direct/tool/memory acceptance runner with persisted artifacts
+    exports:
+      - NonVoiceAcceptanceCaseResult
+      - NonVoiceAcceptanceResult
+      - default_non_voice_acceptance_path
+      - default_non_voice_acceptance_report_dir
+      - run_non_voice_acceptance
+      - write_non_voice_acceptance_artifacts
   - path: voice_contracts.py
     role: Streaming voice websocket dataclasses and payload coercion
     exports:

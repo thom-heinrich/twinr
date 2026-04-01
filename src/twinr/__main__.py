@@ -164,6 +164,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the live synthetic-memory acceptance matrix against the real OpenAI and ChonkyDB path.",
     )
     parser.add_argument(
+        "--non-voice-e2e-acceptance",
+        action="store_true",
+        help="Run the text-only direct/tool/memory E2E acceptance matrix and persist its artifact.",
+    )
+    parser.add_argument(
         "--self-coding-acceptance-capture-only",
         action="store_true",
         help="Capture morning-briefing speech in memory instead of playing it aloud during acceptance.",
@@ -486,6 +491,37 @@ def _print_long_term_memory_live_acceptance_result(result: Any) -> None:
         print(f"long_term_memory_live_acceptance_error={result.error_message}")
 
 
+def _print_non_voice_acceptance_result(result: Any) -> None:
+    """Emit the text-only E2E acceptance result as key/value lines."""
+
+    print("non_voice_e2e_acceptance_case=text_only_matrix")
+    print(f"non_voice_e2e_acceptance_run_id={getattr(result, 'run_id', '')}")
+    print(f"non_voice_e2e_acceptance_status={getattr(result, 'status', 'unknown')}")
+    print(f"non_voice_e2e_acceptance_ready={str(bool(getattr(result, 'ready', False))).lower()}")
+    direct_case = getattr(result, "direct_case", None)
+    tool_case = getattr(result, "tool_case", None)
+    memory_result = getattr(result, "memory_result", None)
+    if direct_case is not None:
+        print(f"non_voice_e2e_acceptance_direct_status={getattr(direct_case, 'status', 'unknown')}")
+        print(f"non_voice_e2e_acceptance_direct_web={str(bool(getattr(direct_case, 'used_web_search', False))).lower()}")
+        if getattr(direct_case, "error_message", None):
+            print(f"non_voice_e2e_acceptance_direct_error={direct_case.error_message}")
+    if tool_case is not None:
+        print(f"non_voice_e2e_acceptance_tool_status={getattr(tool_case, 'status', 'unknown')}")
+        print(f"non_voice_e2e_acceptance_tool_web={str(bool(getattr(tool_case, 'used_web_search', False))).lower()}")
+        if getattr(tool_case, "error_message", None):
+            print(f"non_voice_e2e_acceptance_tool_error={tool_case.error_message}")
+    if memory_result is not None:
+        print(f"non_voice_e2e_acceptance_memory_status={getattr(memory_result, 'status', 'unknown')}")
+        print(f"non_voice_e2e_acceptance_memory_ready={str(bool(getattr(memory_result, 'ready', False))).lower()}")
+        if getattr(memory_result, "error_message", None):
+            print(f"non_voice_e2e_acceptance_memory_error={memory_result.error_message}")
+    if getattr(result, "artifact_path", None):
+        print(f"non_voice_e2e_acceptance_artifact_path={result.artifact_path}")
+    if getattr(result, "report_path", None):
+        print(f"non_voice_e2e_acceptance_report_path={result.report_path}")
+
+
 def _run_web_server(config: TwinrConfig, env_file: str | Path) -> int:
     """Start the local web control plane without bootstrapping the runtime."""
 
@@ -703,6 +739,14 @@ def main() -> int:
         memory_acceptance_result = run_live_memory_acceptance(env_path=args.env_file)
         _print_long_term_memory_live_acceptance_result(memory_acceptance_result)
         return 0 if getattr(memory_acceptance_result, "ready", False) else 1
+
+    if args.non_voice_e2e_acceptance:
+        _assert_pi_runtime_root(args.env_file, command_name="non-voice-e2e-acceptance")
+        from twinr.orchestrator.non_voice_acceptance import run_non_voice_acceptance
+
+        acceptance_result = run_non_voice_acceptance(env_path=args.env_file, emit_line=print)
+        _print_non_voice_acceptance_result(acceptance_result)
+        return 0 if getattr(acceptance_result, "ready", False) else 1
 
     if args.run_web:
         return _run_web_server(config, args.env_file)

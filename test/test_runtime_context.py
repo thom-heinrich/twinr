@@ -136,6 +136,36 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_live_runtime_long_term_context_prefers_materialized_live_builder(self) -> None:
+        runtime = object.__new__(TwinrRuntime)
+        recorded_calls: list[tuple[str, str]] = []
+        runtime._sanitize_context_message_text = lambda text, limit=2000: text  # type: ignore[attr-defined]
+        runtime._safe_append_ops_event = lambda **_kwargs: None  # type: ignore[attr-defined]
+
+        class _LongTermMemory:
+            def build_live_provider_context(self, query_text):
+                recorded_calls.append(("live", query_text))
+                return LongTermMemoryContext(durable_context="live durable")
+
+            def build_provider_context(self, query_text):
+                raise AssertionError("live runtime path must not fall back to broad provider context")
+
+            def build_tool_provider_context(self, query_text, **kwargs):
+                del query_text
+                del kwargs
+                raise AssertionError("tool provider context must not be used in this test")
+
+        messages = runtime._load_long_term_context_messages(
+            long_term_memory=_LongTermMemory(),
+            retrieval_query="Wie geht es Janina?",
+            tool_context=False,
+            event_prefix="test",
+            fatal_remote=True,
+        )
+
+        self.assertEqual(recorded_calls, [("live", "Wie geht es Janina?")])
+        self.assertTrue(any("live durable" in message for message in messages))
+
     def test_identified_voice_guidance_allows_low_risk_discovery_without_identity_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))

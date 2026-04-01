@@ -32,7 +32,14 @@ class PreparedLongTermContextResolution:
     """Describe how one prepared long-term context was obtained."""
 
     context: LongTermMemoryContext
-    source: Literal["cache_hit", "inflight_hit", "built_sync"]
+    source: Literal[
+        "cache_hit",
+        "inflight_hit",
+        "built_sync",
+        "materialized_local_cache_hit",
+        "materialized_remote_front_hit",
+        "materialized_built_sync",
+    ]
 
 
 @dataclass(frozen=True, slots=True)

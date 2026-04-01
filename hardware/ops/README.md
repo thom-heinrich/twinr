@@ -118,6 +118,18 @@ The `twinr-web.service` unit keeps the portal alive, but remote browser access
 still stays fail-closed until `/twinr/.env` enables `TWINR_WEB_ALLOW_REMOTE=1`,
 `TWINR_WEB_REQUIRE_AUTH=1`, and a matching `TWINR_WEB_ALLOWED_HOSTS` allowlist.
 
+For a text-only operator proof that exercises the direct answer path, a real
+web/tool turn, and the live remote-memory acceptance matrix in one run, use:
+
+```bash
+PYTHONPATH=src python3 -m twinr --env-file .env --non-voice-e2e-acceptance
+```
+
+That command persists the rolling result to
+`artifacts/stores/ops/non_voice_e2e_acceptance.json` and a per-run report under
+`artifacts/reports/non_voice_e2e_acceptance/`, so deploy-time checks no longer
+depend on manually comparing separate direct/tool/memory probes.
+
 Install the development-host orchestrator endpoint plus LAN bridge only on
 the machine that owns the leading repo checkout:
 

@@ -50,6 +50,7 @@ _KNOWN_ITEM_ENVELOPE_KEYS = (
     "packet",
     "node",
     "edge",
+    "answer_front_block",
     "memory_entry",
     "managed_context_entry",
     "personality_snapshot",
@@ -271,6 +272,15 @@ _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {
         item_schema="twinr_graph_edge_record_v1",
         envelope_key="edge",
         uri_segment="graph_edges",
+    ),
+    "provider_answer_fronts": _RemoteCollectionDefinition(
+        snapshot_kind="provider_answer_fronts",
+        catalog_schema="twinr_provider_answer_front_catalog_v3",
+        legacy_catalog_schema="twinr_provider_answer_front_catalog_v2",
+        segment_schema="twinr_provider_answer_front_catalog_segment_v1",
+        item_schema="twinr_provider_answer_front_record_v1",
+        envelope_key="answer_front_block",
+        uri_segment="provider_answer_fronts",
     ),
     "prompt_memory": _RemoteCollectionDefinition(
         snapshot_kind="prompt_memory",

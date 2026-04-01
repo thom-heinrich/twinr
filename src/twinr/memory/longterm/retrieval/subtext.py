@@ -385,6 +385,14 @@ class LongTermSubtextCompiler:
         except Exception:
             _LOGGER.warning("Long-term subtext compiler worker prewarm failed; continuing cold.", exc_info=True)
 
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Release the bounded compiler worker so shutdown never leaks a live thread."""
+
+        executor = self._compiler_executor
+        if executor is None:
+            return
+        executor.shutdown(wait=wait, cancel_futures=True)
+
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermSubtextCompiler":
         """Build a compiler from runtime config and optional provider access."""
@@ -753,6 +761,13 @@ class LongTermSubtextBuilder:
     config: TwinrConfig
     graph_store: TwinrPersonalGraphStore
     compiler: LongTermSubtextCompiler | None = None
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Release compiler resources owned by this builder."""
+
+        if self.compiler is None:
+            return
+        self.compiler.shutdown(wait=wait)
 
     def build(
         self,

@@ -385,6 +385,44 @@ class _CurrentHead404Client(_FakeChonkyClient):
         )
 
 
+class _TransientCurrentHead503Client(_CurrentHead404Client):
+    """Emit one transient 503 for one current-head URI before falling back to 404/real data."""
+
+    def __init__(self, *, snapshot_kind: str, failure_count: int = 1) -> None:
+        super().__init__()
+        self.snapshot_kind = str(snapshot_kind)
+        self.remaining_failures = max(0, int(failure_count))
+        self.current_head_attempt_uris: list[str] = []
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        if (
+            self.remaining_failures > 0
+            and isinstance(origin_uri, str)
+            and f"/{self.snapshot_kind}/catalog/current" in origin_uri
+            and origin_uri not in self.records_by_uri
+        ):
+            self.fetch_full_document_calls += 1
+            self.current_head_attempt_uris.append(origin_uri)
+            self.remaining_failures -= 1
+            raise ChonkyDBError(
+                "ChonkyDB request failed for GET /v1/external/documents/full",
+                status_code=503,
+                response_json={
+                    "detail": "Upstream unavailable or restarting",
+                    "status": 503,
+                    "success": False,
+                    "title": "Service Unavailable",
+                    "type": "about:blank",
+                },
+            )
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
+        )
+
+
 class _LaggingCurrentHeadVisibilityClient(_FakeChonkyClient):
     def __init__(self) -> None:
         super().__init__()
@@ -4008,6 +4046,68 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertTrue(bool(fetch_calls[1]["include_content"]))
         self.assertGreater(int(fetch_calls[1]["max_content_chars"]), int(fetch_calls[0]["max_content_chars"]))
 
+    def test_probe_catalog_payload_retries_full_content_when_metadata_only_head_lacks_nonempty_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            metadata_only_head = {
+                "success": True,
+                "document_id": "graph-head-doc-1",
+                "origin_uri": remote_catalog._catalog_head_uri(snapshot_kind="graph_nodes"),
+                "chunk_count": 1,
+                "chunks": [
+                    {
+                        "metadata": {
+                            "twinr_snapshot_kind": "graph_nodes",
+                            "twinr_catalog_current_head": True,
+                            "twinr_catalog_schema": "twinr_graph_node_catalog_v3",
+                            "twinr_catalog_items_count": 5,
+                        }
+                    }
+                ],
+            }
+            full_head = {
+                "schema": "twinr_graph_node_catalog_v3",
+                "version": 3,
+                "items_count": 5,
+                "segments": [
+                    {
+                        "segment_index": 0,
+                        "document_id": "graph-segment-doc-1",
+                        "uri": remote_catalog._catalog_segment_uri(snapshot_kind="graph_nodes", segment_index=0),
+                        "entry_count": 5,
+                    }
+                ],
+                "subject_node_id": "user:main",
+                "graph_id": "graph:user_main",
+            }
+            fetch_calls: list[dict[str, object]] = []
+
+            def _fetch_full_document(*, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+                del document_id
+                fetch_calls.append(
+                    {
+                        "origin_uri": origin_uri,
+                        "include_content": include_content,
+                        "max_content_chars": max_content_chars,
+                    }
+                )
+                return dict(metadata_only_head if not include_content else full_head)
+
+            with patch.object(remote_state.client, "fetch_full_document", side_effect=_fetch_full_document):
+                payload = remote_catalog.probe_catalog_payload(snapshot_kind="graph_nodes")
+
+        assert payload is not None
+        self.assertEqual(payload["schema"], "twinr_graph_node_catalog_v3")
+        self.assertEqual(payload["items_count"], 5)
+        self.assertEqual(len(fetch_calls), 2)
+        self.assertFalse(bool(fetch_calls[0]["include_content"]))
+        self.assertTrue(bool(fetch_calls[1]["include_content"]))
+        self.assertGreater(int(fetch_calls[1]["max_content_chars"]), int(fetch_calls[0]["max_content_chars"]))
+
     def test_probe_catalog_payload_uses_bootstrap_timeout_for_fixed_current_head_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             head_payload = {
@@ -4199,6 +4299,32 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_record_v2"), 4)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_catalog_segment_v1"), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_catalog_v3"), 1)
+
+    def test_remote_primary_store_retries_transient_current_head_503_before_conflict_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _TransientCurrentHead503Client(snapshot_kind="conflicts")
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            remote_state.config.long_term_memory_remote_retry_attempts = 2
+            remote_state.config.long_term_memory_remote_retry_backoff_s = 0.0
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            conflict = LongTermMemoryConflictV1(
+                slot_key="contact:person:lea:phone",
+                candidate_memory_id="fact:lea_phone_current",
+                existing_memory_ids=("fact:lea_phone_old",),
+                question="Welche Telefonnummer soll ich fuer Lea verwenden?",
+                reason="Es gibt widerspruechliche Telefonnummern fuer Lea.",
+            )
+
+            store.write_snapshot(objects=(), conflicts=(conflict,), archived_objects=())
+            loaded_conflicts = store.load_conflicts()
+
+        self.assertEqual(len(loaded_conflicts), 1)
+        self.assertEqual(loaded_conflicts[0].slot_key, conflict.slot_key)
+        self.assertEqual(remote_state.client.remaining_failures, 0)
+        self.assertEqual(len(remote_state.client.current_head_attempt_uris), 1)
 
     def test_remote_primary_store_batches_fine_grained_remote_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

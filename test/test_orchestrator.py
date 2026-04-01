@@ -47,6 +47,7 @@ from twinr.orchestrator.voice_contracts import (
 )
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
+from twinr.ops.usage import TokenUsage
 
 
 class _FakeDecisionProvider:
@@ -1197,22 +1198,38 @@ class OrchestratorClientTests(unittest.TestCase):
                 return False
 
         ack_events = []
+        sockets: list[_FakeSocket] = []
 
         def connector(*args, **kwargs):
             del args, kwargs
-            return _FakeSocket()
+            socket = _FakeSocket()
+            sockets.append(socket)
+            return socket
 
         client = OrchestratorWebSocketClient("ws://127.0.0.1/ws", connector=connector, require_tls=False)
 
         result = client.run_turn(
             OrchestratorTurnRequest(prompt="Wie wird das Wetter morgen?"),
-            tool_handlers={"search_live_info": lambda arguments: {"answer": arguments["question"]}},
+            tool_handlers={
+                "search_live_info": lambda arguments: {
+                    "answer": arguments["question"],
+                    "token_usage": TokenUsage(input_tokens=21, output_tokens=21, total_tokens=42),
+                }
+            },
             on_ack=ack_events.append,
         )
 
         self.assertEqual(len(ack_events), 1)
         self.assertEqual(ack_events[0].ack_id, "checking_now")
         self.assertEqual(result.text, "Morgen wird es sonnig.")
+        self.assertEqual(len(sockets), 1)
+        tool_response = json.loads(sockets[0].sent[1])
+        self.assertEqual(tool_response["type"], "tool_result")
+        self.assertTrue(tool_response["ok"])
+        self.assertEqual(tool_response["output"]["token_usage"]["input_tokens"], 21)
+        self.assertEqual(tool_response["output"]["token_usage"]["output_tokens"], 21)
+        self.assertEqual(tool_response["output"]["token_usage"]["total_tokens"], 42)
+
 
     def test_voice_client_decodes_ready_and_wake_events(self) -> None:
         class _FakeSocket:

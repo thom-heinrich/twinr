@@ -7,6 +7,7 @@ summary: Wire long-term memory stores, reasoning helpers, remote readiness check
 owned_concerns:
   - Assemble the runtime-facing LongTermMemoryService from config and subsystem dependencies
   - Build provider and tool-facing long-term memory context for runtime prompts
+  - Materialize live provider answer fronts through remote current-head records so transcript-first runtime turns consume prompt-ready long-term sections without synchronous broad retriever rebuilds
   - Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without re-running remote recall
   - Build one bounded fast-topic provider context for latency-sensitive answer lanes and preserve precise required-remote read-failure semantics on that hot path
   - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
@@ -34,6 +35,8 @@ files:
       - LongTermRemoteReadinessStep
   - path: live_object_selectors.py
     role: Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads
+  - path: provider_answer_front.py
+    role: Runtime manager for materialized live provider answer fronts backed by remote current-head storage
   - path: context_snapshot.py
     role: Small dataclass that captures the latest built provider/tool long-term context for operator inspection
   - path: service_impl/README.md
@@ -52,7 +55,7 @@ files:
   - path: service_impl/readiness.py
     role: Required-remote readiness probes and remote-state cache helpers
   - path: service_impl/context.py
-    role: Provider-context assembly for normal, fast, and tool-facing runtime retrieval
+    role: Provider-context assembly for normal, live, fast, and tool-facing runtime retrieval
   - path: service_impl/ingestion.py
     role: Conversation/multimodal enqueue paths and dry-run analysis entry points
   - path: service_impl/maintenance.py

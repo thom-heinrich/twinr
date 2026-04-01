@@ -52,7 +52,10 @@ from twinr.orchestrator.contracts import (
     OrchestratorToolResponse,
     OrchestratorTurnCompleteEvent,
     OrchestratorTurnRequest,
+    _json_safe,
 )
+
+_TransportEventCallback = Callable[[str, dict[str, Any]], Any]
 
 
 class OrchestratorProtocolError(RuntimeError):
@@ -190,6 +193,7 @@ class OrchestratorWebSocketClient:
         tool_handlers: Mapping[str, Callable[..., Any]],
         on_text_delta: Callable[[str], Any] | None = None,
         on_ack: Callable[[OrchestratorAckEvent], Any] | None = None,
+        on_transport_event: _TransportEventCallback | None = None,
     ) -> OrchestratorClientTurnResult:
         """Run one orchestrator turn without blocking the active event loop."""
 
@@ -225,14 +229,32 @@ class OrchestratorWebSocketClient:
         streamed_text_bytes = 0
         protocol_events = 0
         handled_tool_calls: dict[str, tuple[str, OrchestratorToolResponse]] = {}
+        first_server_event_emitted = False
 
         try:
             async with self._async_connector(self.url, **connector_kwargs) as websocket:
+                await self._emit_transport_event_async(
+                    on_transport_event,
+                    "ws_connected",
+                    request_id=expected_request_id or None,
+                )
                 await self._async_send_json(websocket, request_payload, context="turn request")
+                await self._emit_transport_event_async(
+                    on_transport_event,
+                    "turn_request_sent",
+                    request_id=expected_request_id or None,
+                )
                 while True:
                     payload = await self._async_recv_payload(websocket, deadline=deadline)
                     protocol_events = self._count_protocol_event(protocol_events)
                     message_type = self._sanitize_text(payload.get("type", ""), limit=64)
+                    if not first_server_event_emitted:
+                        first_server_event_emitted = True
+                        await self._emit_transport_event_async(
+                            on_transport_event,
+                            "first_server_event",
+                            message_type=message_type or None,
+                        )
 
                     if message_type == "ack":
                         event = self._build_ack_event(payload)
@@ -251,6 +273,14 @@ class OrchestratorWebSocketClient:
                         continue
 
                     if message_type == "tool_request":
+                        tool_name = self._sanitize_text(payload.get("name", ""), limit=128)
+                        call_id = self._sanitize_text(payload.get("call_id", ""), limit=256)
+                        await self._emit_transport_event_async(
+                            on_transport_event,
+                            "tool_request_received",
+                            tool_name=tool_name or None,
+                            call_id=call_id or None,
+                        )
                         response = await self._handle_tool_request_async(
                             payload,
                             handlers,
@@ -259,11 +289,28 @@ class OrchestratorWebSocketClient:
                             handled_tool_calls=handled_tool_calls,
                         )
                         await self._async_send_json(websocket, response.to_payload(), context="tool response")
+                        await self._emit_transport_event_async(
+                            on_transport_event,
+                            "tool_response_sent",
+                            tool_name=tool_name or None,
+                            call_id=response.call_id or None,
+                            ok=response.ok,
+                            error=response.error,
+                        )
                         continue
 
                     if message_type == "turn_complete":
                         completed = self._parse_turn_complete(payload)
                         self._validate_completed_request_id(completed.request_id, expected_request_id)
+                        await self._emit_transport_event_async(
+                            on_transport_event,
+                            "turn_complete_received",
+                            request_id=completed.request_id,
+                            response_id=completed.response_id,
+                            model=completed.model,
+                            rounds=completed.rounds,
+                            used_web_search=completed.used_web_search,
+                        )
                         return OrchestratorClientTurnResult(
                             text=completed.text,
                             rounds=completed.rounds,
@@ -279,6 +326,11 @@ class OrchestratorWebSocketClient:
 
                     if message_type == "turn_error":
                         remote_error = self._sanitize_text(payload.get("error", "Orchestrator turn failed"), limit=512)
+                        await self._emit_transport_event_async(
+                            on_transport_event,
+                            "turn_error_received",
+                            error=remote_error or None,
+                        )
                         raise RuntimeError(remote_error or "Orchestrator turn failed")
 
                     raise OrchestratorProtocolError(
@@ -301,6 +353,7 @@ class OrchestratorWebSocketClient:
         tool_handlers: Mapping[str, Callable[..., Any]],
         on_text_delta: Callable[[str], Any] | None = None,
         on_ack: Callable[[OrchestratorAckEvent], Any] | None = None,
+        on_transport_event: _TransportEventCallback | None = None,
     ) -> OrchestratorClientTurnResult:
         """Run one blocking websocket turn against the orchestrator server."""
 
@@ -315,14 +368,32 @@ class OrchestratorWebSocketClient:
         streamed_text_bytes = 0
         protocol_events = 0
         handled_tool_calls: dict[str, tuple[str, OrchestratorToolResponse]] = {}
+        first_server_event_emitted = False
 
         try:
             with self._connector(self.url, **connector_kwargs) as websocket:
+                self._emit_transport_event_blocking(
+                    on_transport_event,
+                    "ws_connected",
+                    request_id=expected_request_id or None,
+                )
                 self._send_json(websocket, request_payload, context="turn request")
+                self._emit_transport_event_blocking(
+                    on_transport_event,
+                    "turn_request_sent",
+                    request_id=expected_request_id or None,
+                )
                 while True:
                     payload = self._recv_payload(websocket, deadline=deadline)
                     protocol_events = self._count_protocol_event(protocol_events)
                     message_type = self._sanitize_text(payload.get("type", ""), limit=64)
+                    if not first_server_event_emitted:
+                        first_server_event_emitted = True
+                        self._emit_transport_event_blocking(
+                            on_transport_event,
+                            "first_server_event",
+                            message_type=message_type or None,
+                        )
 
                     if message_type == "ack":
                         event = self._build_ack_event(payload)
@@ -341,6 +412,14 @@ class OrchestratorWebSocketClient:
                         continue
 
                     if message_type == "tool_request":
+                        tool_name = self._sanitize_text(payload.get("name", ""), limit=128)
+                        call_id = self._sanitize_text(payload.get("call_id", ""), limit=256)
+                        self._emit_transport_event_blocking(
+                            on_transport_event,
+                            "tool_request_received",
+                            tool_name=tool_name or None,
+                            call_id=call_id or None,
+                        )
                         response = self._handle_tool_request_sync(
                             payload,
                             handlers,
@@ -349,11 +428,28 @@ class OrchestratorWebSocketClient:
                             handled_tool_calls=handled_tool_calls,
                         )
                         self._send_json(websocket, response.to_payload(), context="tool response")
+                        self._emit_transport_event_blocking(
+                            on_transport_event,
+                            "tool_response_sent",
+                            tool_name=tool_name or None,
+                            call_id=response.call_id or None,
+                            ok=response.ok,
+                            error=response.error,
+                        )
                         continue
 
                     if message_type == "turn_complete":
                         completed = self._parse_turn_complete(payload)
                         self._validate_completed_request_id(completed.request_id, expected_request_id)
+                        self._emit_transport_event_blocking(
+                            on_transport_event,
+                            "turn_complete_received",
+                            request_id=completed.request_id,
+                            response_id=completed.response_id,
+                            model=completed.model,
+                            rounds=completed.rounds,
+                            used_web_search=completed.used_web_search,
+                        )
                         return OrchestratorClientTurnResult(
                             text=completed.text,
                             rounds=completed.rounds,
@@ -369,6 +465,11 @@ class OrchestratorWebSocketClient:
 
                     if message_type == "turn_error":
                         remote_error = self._sanitize_text(payload.get("error", "Orchestrator turn failed"), limit=512)
+                        self._emit_transport_event_blocking(
+                            on_transport_event,
+                            "turn_error_received",
+                            error=remote_error or None,
+                        )
                         raise RuntimeError(remote_error or "Orchestrator turn failed")
 
                     raise OrchestratorProtocolError(
@@ -546,7 +647,14 @@ class OrchestratorWebSocketClient:
                 error=self._INVALID_TOOL_OUTPUT,
             )
 
-        output_payload = dict(output)
+        safe_output = _json_safe(dict(output))
+        if not isinstance(safe_output, Mapping):
+            return OrchestratorToolResponse(
+                call_id=call_id,
+                ok=False,
+                error=self._INVALID_TOOL_OUTPUT,
+            )
+        output_payload = dict(safe_output)
         output_error = self._validate_tool_output_payload(output_payload)
         if output_error is not None:
             return OrchestratorToolResponse(
@@ -987,12 +1095,40 @@ class OrchestratorWebSocketClient:
         if inspect.isawaitable(result):
             await result
 
+    async def _emit_transport_event_async(
+        self,
+        callback: _TransportEventCallback | None,
+        event: str,
+        **payload: Any,
+    ) -> None:
+        """Emit one bounded transport event for probe/acceptance instrumentation."""
+
+        if callback is None:
+            return
+        safe_payload = _json_safe(payload)
+        details = dict(safe_payload) if isinstance(safe_payload, Mapping) else {}
+        await self._maybe_await_callback(callback(event, details))
+
     @staticmethod
     def _await_callback_blocking(result: Any) -> None:
         """Resolve an awaitable callback result when running in blocking mode."""
 
         if inspect.isawaitable(result):
             asyncio.run(result)
+
+    def _emit_transport_event_blocking(
+        self,
+        callback: _TransportEventCallback | None,
+        event: str,
+        **payload: Any,
+    ) -> None:
+        """Emit one bounded transport event when the sync client is active."""
+
+        if callback is None:
+            return
+        safe_payload = _json_safe(payload)
+        details = dict(safe_payload) if isinstance(safe_payload, Mapping) else {}
+        self._await_callback_blocking(callback(event, details))
 
     def _decode_payload(self, raw_message: Any) -> dict[str, Any]:
         """Decode and validate one JSON protocol message."""

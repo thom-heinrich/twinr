@@ -38,8 +38,11 @@ from twinr.memory.longterm import (
 )
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteReadFailedError,
+    LongTermRemoteUnavailableError,
 )
 from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
+from twinr.memory.longterm.runtime.provider_answer_front import MaterializedProviderAnswerFront
+from twinr.memory.longterm.storage.provider_answer_front_store import MaterializedProviderAnswerFrontRecord
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever, _LongTermContextInputs
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -209,6 +212,59 @@ class _BlockingPreparedRetriever:
         del original_query_text
         del include_graph_fallback
         return LongTermMemoryContext(graph_context=f"tool:{query.retrieval_text}")
+
+
+class _InMemoryProviderAnswerFrontStore:
+    """Tiny in-memory stand-in for the remote provider answer front store."""
+
+    def __init__(self) -> None:
+        self._generation = 0
+        self._records: dict[str, MaterializedProviderAnswerFrontRecord] = {}
+
+    def enabled(self) -> bool:
+        return True
+
+    def current_generation(self) -> int:
+        return self._generation
+
+    def load_front(self, *, query_keys):
+        normalized_keys = {
+            " ".join(str(value or "").split()).strip()
+            for value in query_keys
+            if " ".join(str(value or "").split()).strip()
+        }
+        for record in self._records.values():
+            if record.generation != self._generation:
+                continue
+            if {record.front_key, *record.aliases}.intersection(normalized_keys):
+                return record
+        return None
+
+    def save_front(self, *, query_keys, context, built_at: str | None = None):
+        normalized_keys = tuple(
+            normalized
+            for value in query_keys
+            if (normalized := " ".join(str(value or "").split()).strip())
+        )
+        if not normalized_keys:
+            raise ValueError("query_keys must not be empty")
+        front_key = normalized_keys[0]
+        record = MaterializedProviderAnswerFrontRecord(
+            front_id=front_key.lower().replace(" ", "_"),
+            front_key=front_key,
+            aliases=normalized_keys,
+            generation=self._generation,
+            built_at=str(built_at or "2026-04-01T00:00:00Z"),
+            context=context,
+        )
+        self._records[record.front_id] = record
+        return record
+
+    def invalidate(self, *, reason: str | None = None) -> int:
+        del reason
+        self._generation += 1
+        self._records.clear()
+        return self._generation
 
 
 class _PrewarmObjectStore:
@@ -586,6 +642,113 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             retriever.release.set()
             service.shutdown()
 
+    def test_materialized_provider_front_prewarm_drives_live_provider_context_without_second_retrieval(self) -> None:
+        retriever = _BlockingPreparedRetriever()
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = PreparedLongTermContextFront()
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
+        service._store_lock = threading.RLock()
+        result: dict[str, LongTermMemoryContext] = {}
+
+        try:
+            scheduled = service.prewarm_provider_context("Wie geht es Janina?", rewrite_query=False)
+            self.assertTrue(scheduled)
+            self.assertTrue(retriever.started.wait(timeout=2.0))
+
+            retriever.release.set()
+            for _ in range(50):
+                if service.provider_answer_front.consume(  # type: ignore[union-attr]
+                    query_keys=("Wie geht es Janina?",),
+                    strict_missing=False,
+                ) is not None:
+                    break
+                time.sleep(0.02)
+
+            worker = threading.Thread(
+                target=lambda: result.setdefault(
+                    "context",
+                    service.build_live_provider_context("Wie geht es Janina?"),
+                ),
+                daemon=True,
+            )
+            worker.start()
+            worker.join(timeout=2.0)
+            self.assertIn("context", result)
+            self.assertEqual(result["context"].durable_context, "prepared:Wie geht es Janina?:1")
+            self.assertEqual(len(retriever.provider_calls), 1)
+        finally:
+            retriever.release.set()
+            service.shutdown()
+
+    def test_live_provider_context_fails_closed_when_materialized_front_is_missing(self) -> None:
+        retriever = _BlockingPreparedRetriever()
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = PreparedLongTermContextFront()
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
+        service._store_lock = threading.RLock()
+
+        try:
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                service.build_live_provider_context("Wie geht es Janina?")
+            self.assertEqual(retriever.provider_calls, [])
+        finally:
+            service.shutdown()
+
+    def test_service_shutdown_closes_subtext_builder(self) -> None:
+        shutdown_calls: list[bool] = []
+        service = object.__new__(LongTermMemoryService)
+        service.retriever = SimpleNamespace(
+            subtext_builder=SimpleNamespace(
+                shutdown=lambda *, wait=True: shutdown_calls.append(bool(wait))
+            )
+        )
+        service.prepared_context_front = None
+        service.provider_answer_front = None
+        service.writer = None
+        service.multimodal_writer = None
+
+        service.shutdown(timeout_s=1.0)
+
+        self.assertEqual(shutdown_calls, [False])
+
     def test_confirm_memory_invalidates_prepared_provider_context_front(self) -> None:
         remote_state = _CountingRemoteState()
         retriever = _ProbeCachingRetriever(remote_state)
@@ -615,6 +778,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         service.multimodal_writer = None
         service.fast_topic_builder = None
         service.prepared_context_front = PreparedLongTermContextFront()
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
         service._refresh_restart_recall_packets_locked = lambda: None
         service._store_lock = threading.RLock()
         build_calls: list[str] = []
@@ -631,12 +795,20 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             self.assertEqual(first.durable_context, "durable:1")
             self.assertEqual(second.durable_context, "durable:1")
             self.assertEqual(build_calls, ["Wer ist Janina?"])
+            self.assertEqual(
+                service.build_live_provider_context("Wer ist Janina?").durable_context,
+                "durable:1",
+            )
 
             service.confirm_memory(memory_id="fact:janina")
 
             third = service.build_provider_context("Wer ist Janina?")
             self.assertEqual(third.durable_context, "durable:2")
             self.assertEqual(build_calls, ["Wer ist Janina?", "Wer ist Janina?"])
+            self.assertEqual(
+                service.build_live_provider_context("Wer ist Janina?").durable_context,
+                "durable:2",
+            )
         finally:
             service.shutdown()
 

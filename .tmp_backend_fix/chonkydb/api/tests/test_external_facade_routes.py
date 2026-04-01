@@ -1090,13 +1090,9 @@ def test_external_topk_scope_ref_uses_scope_cache_and_reports_hits(monkeypatch) 
     request_payload = dict(case["input"])
     expected_response = dict(case["response"])
 
-    snapshot_uri = external_router._snapshot_origin_uri(
+    current_head_uri = external_router._catalog_current_origin_uri(
         namespace="acme",
-        snapshot_kind="objects",
-    )
-    pointer_uri = external_router._pointer_origin_uri(
-        namespace="acme",
-        snapshot_kind="objects",
+        uri_segment="objects",
     )
     segment_uri = external_router._segment_origin_uri(
         namespace="acme",
@@ -1104,42 +1100,74 @@ def test_external_topk_scope_ref_uses_scope_cache_and_reports_hits(monkeypatch) 
         segment_index=0,
     )
 
+    class _ScopeLookupRouter:
+        @staticmethod
+        def _origin_lookup_payload_key(value: str) -> str:
+            digest = hashlib.sha256(
+                str(value).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return f"origin_lookup_{digest}"
+
+        def __init__(self) -> None:
+            self.payload_store = {
+                self._origin_lookup_payload_key(current_head_uri): {
+                    "doc_ids": [2002],
+                }
+            }
+
+        def read_payload(self, *, key: str, allow_header_reload_on_miss: bool = True):  # noqa: ANN201
+            _ = allow_header_reload_on_miss
+            if key not in self.payload_store:
+                raise KeyError(key)
+            return self.payload_store[key]
+
+    class _ScopeLookupDM:
+        @staticmethod
+        def get_uuid_for_doc_ids_batch(doc_ids: list[int]) -> dict[int, str | None]:
+            return {
+                int(doc_id): "current-head-doc-1" if int(doc_id) == 2002 else None
+                for doc_id in list(doc_ids or [])
+            }
+
     class _ScopeAwareService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            engine = SimpleNamespace(
+                chonk_router=_ScopeLookupRouter(),
+                docid_mapping_manager=_ScopeLookupDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
         async def get_full_document(self, **kwargs):  # noqa: ANN003
             self.calls["full_document"].append(dict(kwargs))
             origin_uri = kwargs.get("origin_uri")
             document_id = kwargs.get("document_id")
-            if origin_uri == pointer_uri:
+            if document_id == "current-head-doc-1":
                 return {
                     "success": True,
-                    "origin_uri": pointer_uri,
+                    "document_id": "current-head-doc-1",
+                    "origin_uri": current_head_uri,
                     "content": json.dumps(
                         {
-                            "schema": "twinr_remote_snapshot_pointer_v1",
-                            "version": 1,
-                            "snapshot_kind": "objects",
-                            "document_id": "snapshot-doc-1",
-                        }
-                    ),
-                }
-            if document_id == "snapshot-doc-1":
-                return {
-                    "success": True,
-                    "document_id": "snapshot-doc-1",
-                    "origin_uri": snapshot_uri,
-                    "content": json.dumps(
-                        {
-                            "schema": "twinr_remote_snapshot_v1",
-                            "namespace": "acme",
-                            "snapshot_kind": "objects",
-                            "updated_at": "2026-03-20T17:00:00Z",
-                            "body": {
-                                "schema": "twinr_memory_object_catalog_v3",
-                                "version": 3,
-                                "segments": [
-                                    {"segment_index": 0, "document_id": "segment-doc-1"}
-                                ],
-                            },
+                            "schema": "twinr_memory_object_catalog_v3",
+                            "version": 3,
+                            "segments": [
+                                {"segment_index": 0, "document_id": "segment-doc-1"}
+                            ],
                         }
                     ),
                 }
@@ -1205,10 +1233,13 @@ def test_external_topk_scope_ref_uses_scope_cache_and_reports_hits(monkeypatch) 
 
     assert fake.calls["advanced"][0]["allowed_doc_ids"] == list(case["doc_id_list"])
     assert fake.calls["advanced"][1]["allowed_doc_ids"] == list(case["doc_id_list"])
-    assert len(fake.calls["full_document"]) == 3
-    assert fake.calls["full_document"][0]["max_content_chars"] == 32_768
+    assert len(fake.calls["full_document"]) == 2
+    assert fake.calls["full_document"][0]["document_id"] == "current-head-doc-1"
+    assert fake.calls["full_document"][0]["origin_uri"] == current_head_uri
+    assert fake.calls["full_document"][0]["max_content_chars"] == 512_000
+    assert fake.calls["full_document"][1]["document_id"] == "segment-doc-1"
+    assert fake.calls["full_document"][1]["origin_uri"] is None
     assert fake.calls["full_document"][1]["max_content_chars"] == 512_000
-    assert fake.calls["full_document"][2]["max_content_chars"] == 512_000
 
 
 def test_external_get_full_document_caps_twinr_pointer_origin_reads(monkeypatch) -> None:
@@ -1438,6 +1469,102 @@ def test_external_get_full_document_uses_origin_lookup_heads_before_origin_uri_f
     assert fake.calls["full_document"][1]["document_id"] == "snapshot-doc-1"
     assert fake.calls["full_document"][0]["origin_uri"] == pointer_uri
     assert fake.calls["full_document"][1]["origin_uri"] == snapshot_uri
+
+
+def test_external_get_full_document_uses_origin_lookup_heads_for_catalog_current(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    _clear_external_router_caches()
+
+    current_head_uri = external_router._catalog_current_origin_uri(
+        namespace="acme",
+        uri_segment="prompt_memory",
+    )
+    current_head_payload = {
+        "schema": "twinr_prompt_memory_catalog_v3",
+        "version": 3,
+        "items": [{"document_id": "prompt-doc-1"}],
+    }
+
+    class _OriginLookupRouter:
+        @staticmethod
+        def _origin_lookup_payload_key(value: str) -> str:
+            digest = hashlib.sha256(
+                str(value).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return f"origin_lookup_{digest}"
+
+        def __init__(self) -> None:
+            self.payload_store = {
+                self._origin_lookup_payload_key(current_head_uri): {
+                    "doc_ids": [2101, 2102],
+                }
+            }
+
+        def read_payload(self, *, key: str, allow_header_reload_on_miss: bool = True):  # noqa: ANN201
+            _ = allow_header_reload_on_miss
+            if key not in self.payload_store:
+                raise KeyError(key)
+            return self.payload_store[key]
+
+    class _OriginLookupDM:
+        def get_uuid_for_doc_id(self, doc_id: int) -> str | None:
+            return {
+                2101: "current-head-doc-old",
+                2102: "current-head-doc-new",
+            }.get(int(doc_id))
+
+    class _OriginLookupHeadService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            engine = SimpleNamespace(
+                chonk_router=_OriginLookupRouter(),
+                docid_mapping_manager=_OriginLookupDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
+        async def get_full_document(self, **kwargs):  # noqa: ANN003
+            self.calls["full_document"].append(dict(kwargs))
+            if kwargs.get("document_id") == "current-head-doc-new":
+                return {
+                    "success": True,
+                    "document_id": "current-head-doc-new",
+                    "origin_uri": current_head_uri,
+                    "content": json.dumps(current_head_payload),
+                }
+            raise AssertionError(f"unexpected full_document kwargs: {kwargs}")
+
+    fake = _OriginLookupHeadService()
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get(
+            f"/v1/external/documents/full?origin_uri={current_head_uri}&max_content_chars=2000000"
+        )
+        assert response.status_code == 200, response.text
+        assert json.loads(response.json()["content"]) == current_head_payload
+
+    assert len(fake.calls["full_document"]) == 1
+    assert fake.calls["full_document"][0]["document_id"] == "current-head-doc-new"
+    assert fake.calls["full_document"][0]["origin_uri"] == current_head_uri
+    assert fake.calls["full_document"][0]["max_content_chars"] == 512_000
 
 
 def test_external_get_full_document_uses_snapshot_origin_lookup_head_when_pointer_missing(
@@ -1850,6 +1977,21 @@ def test_external_get_full_document_reads_snapshot_head_via_payload_blob_fastpat
         assert json.loads(response.json()["content"]) == snapshot_payload
 
     assert fake.calls["full_document"] == []
+
+
+def test_external_parse_twinr_scope_origin_uri_maps_current_head_uri_segments() -> None:
+    current_head_uri = external_router._catalog_current_origin_uri(
+        namespace="acme",
+        uri_segment="agent_personality_context",
+    )
+
+    parsed = external_router._parse_twinr_scope_origin_uri(current_head_uri)
+
+    assert parsed == {
+        "scope_phase": external_router._TWINR_SCOPE_CURRENT_HEAD_PHASE,
+        "namespace": "acme",
+        "snapshot_kind": "agent_personality_context_v1",
+    }
 
 
 def test_external_get_full_document_payload_blob_contract_mismatch_fails_closed(

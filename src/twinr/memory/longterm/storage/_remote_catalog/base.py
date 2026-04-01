@@ -21,6 +21,10 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
 )
 from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage._remote_retry import (
+    remote_read_retry_delay_s,
+    should_retry_remote_read_error,
+)
 
 from .catalog import RemoteCatalogCatalogMixin
 from .documents import RemoteCatalogDocumentMixin
@@ -221,34 +225,74 @@ class LongTermRemoteCatalogStoreBase(
             request_path="/v1/external/documents/full",
             namespace=self._normalize_text(getattr(remote_state, "namespace", None)),
             access_classification="catalog_current_head",
+            attempt_count=self._remote_retry_attempts(),
+            retry_attempts_configured=self._remote_retry_attempts(),
+            retry_backoff_s=self._remote_retry_backoff_s(),
+            retry_mode="bounded_transient_retry",
         )
         started_monotonic = time.monotonic()
-        try:
-            envelope = self._fetch_catalog_head_envelope(
-                read_client=effective_read_client,
-                snapshot_kind=snapshot_kind,
-                metadata_only=metadata_only,
-            )
-        except Exception as exc:
-            if self._status_code_from_exception(exc) == 404:
-                self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
-                record_remote_read_observation(
+        retry_attempts = max(1, self._remote_retry_attempts())
+        retry_backoff_s = self._remote_retry_backoff_s()
+        attempt_index = 0
+        while True:
+            try:
+                envelope = self._fetch_catalog_head_envelope(
+                    read_client=effective_read_client,
+                    snapshot_kind=snapshot_kind,
+                    metadata_only=metadata_only,
+                )
+                break
+            except Exception as exc:
+                if self._status_code_from_exception(exc) == 404:
+                    self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
+                    record_remote_read_observation(
+                        remote_state=remote_state,
+                        context=context,
+                        latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                        outcome="missing",
+                        classification="not_found",
+                    )
+                    return _CatalogHeadLoadResult(status="not_found")
+                if should_retry_remote_read_error(exc) and attempt_index + 1 < retry_attempts:
+                    delay_s = remote_read_retry_delay_s(
+                        exc,
+                        default_backoff_s=retry_backoff_s,
+                        attempt_index=attempt_index,
+                    )
+                    if delay_s > 0.0:
+                        time.sleep(delay_s)
+                    attempt_index += 1
+                    continue
+                record_remote_read_diagnostic(
                     remote_state=remote_state,
                     context=context,
-                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
-                    outcome="missing",
-                    classification="not_found",
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="fallback",
                 )
-                return _CatalogHeadLoadResult(status="not_found")
-            record_remote_read_diagnostic(
-                remote_state=remote_state,
-                context=context,
-                exc=exc,
-                started_monotonic=started_monotonic,
-                outcome="fallback",
-            )
-            return _CatalogHeadLoadResult(status="unavailable")
+                return _CatalogHeadLoadResult(status="unavailable")
         payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
+        if payload is None and metadata_only:
+            # Metadata-only current-head reads are an optimization. Non-empty
+            # heads can still require one content-bearing read when the backend
+            # omits enough envelope detail that the catalog cannot be rebuilt
+            # from metadata alone.
+            try:
+                envelope = self._fetch_catalog_head_envelope(
+                    read_client=effective_read_client,
+                    snapshot_kind=snapshot_kind,
+                    metadata_only=False,
+                )
+            except Exception as exc:
+                record_remote_read_diagnostic(
+                    remote_state=remote_state,
+                    context=context,
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="fallback",
+                )
+                return _CatalogHeadLoadResult(status="unavailable")
+            payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
         if payload is None:
             record_remote_read_diagnostic(
                 remote_state=remote_state,

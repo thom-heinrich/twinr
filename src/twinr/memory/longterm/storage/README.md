@@ -7,6 +7,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 `storage` owns:
 - persist durable object, conflict, and archive snapshots
 - persist midterm packets used for short-horizon recall
+- persist materialized live-provider answer fronts as bounded current-head collections so runtime can consume prompt-ready long-term blocks without rebuilding the broad retriever inline
 - keep local structured-memory and midterm snapshot files cross-service readable (`0644`) so the dedicated `thh` remote-memory watchdog can validate root-written runtime state without changing the authoritative runtime owner
 - bridge validated local snapshots to fine-grained remote ChonkyDB documents plus compact catalog heads and bounded segment documents
 - persist those current catalog heads as fixed-URI remote-catalog documents (`.../catalog/current`) instead of generic `remote_state` snapshot heads, so current object/conflict/archive authority no longer depends on pointer-walked blob snapshots
@@ -118,6 +119,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | `_structured_store/` | Internal split implementation modules for structured snapshot IO, mutations, ranking, and retrieval |
 | `_structured_store/active_delta.py` | Active-path selective working-set loading plus delta commits for conversation/multimodal persistence and backfill |
 | `midterm_store.py` | Midterm packet store |
+| `provider_answer_front_store.py` | Remote current-head store for materialized live-provider answer-front blocks |
 | `remote_catalog.py` | Public compatibility wrapper for the fine-grained remote object/conflict/archive catalog adapter |
 | `_remote_catalog/` | Internal split implementation modules for remote catalog caching, search, hydration, and write attestation |
 | `_remote_current_records.py` | Shared current-head helper for prompt-memory, managed-context, and other typed remote collections that need read-only legacy-head fallback plus synthetic empty-head bootstrap |

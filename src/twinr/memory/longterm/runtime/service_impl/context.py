@@ -77,6 +77,16 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                 msg="longterm_prewarm_prepared_context_refresh_scheduled",
                 details={"sticky_queries": refreshed},
             )
+        provider_answer_front = getattr(self, "provider_answer_front", None)
+        if provider_answer_front is not None:
+            refreshed = provider_answer_front.refresh_recent_async(
+                build_for_query=self._schedule_provider_answer_front_refresh,
+            )
+            workflow_event(
+                kind="cache",
+                msg="longterm_prewarm_materialized_provider_front_refresh_scheduled",
+                details={"sticky_queries": refreshed},
+            )
 
     def build_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build the normal long-term context injected into provider prompts."""
@@ -119,14 +129,23 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                         details=dict(exc.details),
                     )
                     topic_context = None
-                resolution = self._consume_prepared_context(
-                    profile="provider",
+                resolution = self._consume_materialized_provider_context(
                     query=query,
-                    build_context=lambda: self._build_provider_context_uncached(
-                        query=query,
-                        original_query_text=query_text,
-                    ),
+                    strict_missing=False,
                 )
+                if resolution is None:
+                    resolution = self._consume_prepared_context(
+                        profile="provider",
+                        query=query,
+                        build_context=lambda: self._build_provider_context_uncached(
+                            query=query,
+                            original_query_text=query_text,
+                        ),
+                    )
+                    self._persist_materialized_provider_context(
+                        query=query,
+                        context=resolution.context,
+                    )
                 context = resolution.context
                 if topic_context:
                     context = replace(context, topic_context=topic_context)
@@ -150,6 +169,69 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         except Exception:
             logger.exception("Failed to build long-term provider context.")
             return LongTermMemoryContext()
+        finally:
+            record_voice_turn_remote_memory_ready(
+                duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            )
+
+    def build_live_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+        """Build the live provider context strictly from materialized answer fronts.
+
+        The transcript-first live path is not allowed to resurrect the broad
+        retriever synchronously. If the required materialized front is missing or
+        stale, runtime must fail closed instead of rebuilding the full provider
+        context inline.
+        """
+
+        started_at = time.monotonic()
+        try:
+            query = self.query_rewriter.profile(query_text)
+            writer_details = _writer_state_details(getattr(self, "writer", None))
+            multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
+            with workflow_span(
+                name="longterm_service_build_live_provider_context",
+                kind="retrieval",
+                details={
+                    "query_present": bool(str(query_text or "").strip()),
+                    "conversation_writer": writer_details,
+                    "multimodal_writer": multimodal_writer_details,
+                },
+            ):
+                try:
+                    topic_context = self._build_quick_topic_context(
+                        query_text=query_text,
+                        workflow_event_name="longterm_live_provider_context_quick_memory_remote_read_failed",
+                    )
+                except LongTermRemoteReadFailedError as exc:
+                    workflow_event(
+                        kind="warning",
+                        msg="longterm_live_provider_context_quick_memory_skipped",
+                        details=dict(exc.details),
+                    )
+                    topic_context = None
+                resolution = self._consume_materialized_provider_context(
+                    query=query,
+                    strict_missing=True,
+                )
+                assert resolution is not None
+                context = resolution.context
+                if topic_context:
+                    context = replace(context, topic_context=topic_context)
+                self._remember_context_snapshot(
+                    profile="provider",
+                    query=query,
+                    context=context,
+                    source=resolution.source,
+                )
+                workflow_event(
+                    kind="retrieval",
+                    msg="longterm_live_provider_context_built",
+                    details={
+                        **_context_details(context),
+                        "prepared_source": resolution.source,
+                    },
+                )
+                return context
         finally:
             record_voice_turn_remote_memory_ready(
                 duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
@@ -322,8 +404,7 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
     ) -> bool:
         """Schedule a prepared provider-context build outside the answer hot path."""
 
-        prepared_context_front = getattr(self, "prepared_context_front", None)
-        if prepared_context_front is None or not self.config.long_term_memory_enabled:
+        if not self.config.long_term_memory_enabled:
             return False
         normalized_text = str(query_text or "").strip()
         if not normalized_text:
@@ -334,25 +415,47 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         if not key_texts:
             return False
         if tool_context:
+            prepared_context_front = getattr(self, "prepared_context_front", None)
+            if prepared_context_front is None:
+                return False
             def build_context() -> LongTermMemoryContext:
                 return self._build_tool_provider_context_uncached(
                     query=query,
                     original_query_text=query_text,
                     include_graph_fallback=True,
                 )
+            scheduled = prepared_context_front.prime_async(
+                profile=profile_name,
+                cache_key_texts=key_texts,
+                sticky_query_text=query.original_text or query.retrieval_text,
+                build_context=build_context,
+                sticky=sticky,
+            )
         else:
+            provider_answer_front = getattr(self, "provider_answer_front", None)
             def build_context() -> LongTermMemoryContext:
                 return self._build_provider_context_uncached(
                     query=query,
                     original_query_text=query_text,
                 )
-        scheduled = prepared_context_front.prime_async(
-            profile=profile_name,
-            cache_key_texts=key_texts,
-            sticky_query_text=query.original_text or query.retrieval_text,
-            build_context=build_context,
-            sticky=sticky,
-        )
+            if provider_answer_front is not None and provider_answer_front.enabled():
+                scheduled = provider_answer_front.prime_async(
+                    query_keys=key_texts,
+                    sticky_query_text=query.original_text or query.retrieval_text,
+                    build_context=build_context,
+                    sticky=sticky,
+                )
+            else:
+                prepared_context_front = getattr(self, "prepared_context_front", None)
+                if prepared_context_front is None:
+                    return False
+                scheduled = prepared_context_front.prime_async(
+                    profile=profile_name,
+                    cache_key_texts=key_texts,
+                    sticky_query_text=query.original_text or query.retrieval_text,
+                    build_context=build_context,
+                    sticky=sticky,
+                )
         workflow_event(
             kind="cache",
             msg="longterm_prepared_context_prewarm_requested",
@@ -442,6 +545,16 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
             rewrite_query=True,
         )
 
+    def _schedule_provider_answer_front_refresh(self, query_text: str) -> None:
+        """Refresh one sticky live-provider front after invalidation/startup."""
+
+        self.prewarm_provider_context(
+            query_text,
+            tool_context=False,
+            sticky=True,
+            rewrite_query=True,
+        )
+
     def _invalidate_prepared_contexts(
         self,
         *,
@@ -449,25 +562,43 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         refresh_recent: bool = True,
     ) -> None:
         prepared_context_front = getattr(self, "prepared_context_front", None)
-        if prepared_context_front is None:
-            return
-        generation = prepared_context_front.invalidate()
-        refreshed = 0
-        if refresh_recent:
-            refreshed = prepared_context_front.refresh_recent_async(
-                build_for_query=self._schedule_prepared_context_refresh,
+        if prepared_context_front is not None:
+            generation = prepared_context_front.invalidate()
+            refreshed = 0
+            if refresh_recent:
+                refreshed = prepared_context_front.refresh_recent_async(
+                    build_for_query=self._schedule_prepared_context_refresh,
+                )
+            workflow_event(
+                kind="cache",
+                msg="longterm_prepared_context_invalidated",
+                details={
+                    "reason": reason,
+                    "generation": generation,
+                    "refresh_recent": refresh_recent,
+                    "sticky_queries": prepared_context_front.sticky_query_count(),
+                    "refresh_scheduled": refreshed,
+                },
             )
-        workflow_event(
-            kind="cache",
-            msg="longterm_prepared_context_invalidated",
-            details={
-                "reason": reason,
-                "generation": generation,
-                "refresh_recent": refresh_recent,
-                "sticky_queries": prepared_context_front.sticky_query_count(),
-                "refresh_scheduled": refreshed,
-            },
-        )
+        provider_answer_front = getattr(self, "provider_answer_front", None)
+        if provider_answer_front is not None and provider_answer_front.enabled():
+            generation = provider_answer_front.invalidate()
+            refreshed = 0
+            if refresh_recent:
+                refreshed = provider_answer_front.refresh_recent_async(
+                    build_for_query=self._schedule_provider_answer_front_refresh,
+                )
+            workflow_event(
+                kind="cache",
+                msg="longterm_materialized_provider_front_invalidated",
+                details={
+                    "reason": reason,
+                    "generation": generation,
+                    "refresh_recent": refresh_recent,
+                    "sticky_queries": provider_answer_front.sticky_query_count(),
+                    "refresh_scheduled": refreshed,
+                },
+            )
 
     def _context_snapshot_state(
         self,
@@ -502,3 +633,42 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                 context=context,
                 source=str(source or "built_sync"),
             )
+
+    def _consume_materialized_provider_context(
+        self,
+        *,
+        query: LongTermQueryProfile,
+        strict_missing: bool,
+    ) -> PreparedLongTermContextResolution | None:
+        """Consume the materialized live-provider answer front when available."""
+
+        provider_answer_front = getattr(self, "provider_answer_front", None)
+        if provider_answer_front is None or not provider_answer_front.enabled():
+            return None
+        resolution = provider_answer_front.consume(
+            query_keys=self._prepared_context_key_texts(query),
+            strict_missing=strict_missing,
+        )
+        if resolution is None:
+            return None
+        return PreparedLongTermContextResolution(
+            context=resolution.context,
+            source=resolution.source,
+        )
+
+    def _persist_materialized_provider_context(
+        self,
+        *,
+        query: LongTermQueryProfile,
+        context: LongTermMemoryContext,
+    ) -> None:
+        """Persist one already-built provider context into the live answer front."""
+
+        provider_answer_front = getattr(self, "provider_answer_front", None)
+        if provider_answer_front is None or not provider_answer_front.enabled():
+            return
+        provider_answer_front.persist_built_context(
+            query_keys=self._prepared_context_key_texts(query),
+            sticky_query_text=query.original_text or query.retrieval_text,
+            context=context,
+        )

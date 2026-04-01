@@ -52,18 +52,38 @@ class _FakeOrchestratorClient:
         self.run_calls: list[dict[str, object]] = []
         type(self).last_instance = self
 
-    def run_turn(self, request, *, tool_handlers, on_ack=None, on_text_delta=None):
+    def run_turn(self, request, *, tool_handlers, on_ack=None, on_text_delta=None, on_transport_event=None):
         self.run_calls.append(
             {
                 "request": request,
                 "tool_handlers": dict(tool_handlers),
             }
         )
+        if on_transport_event is not None:
+            on_transport_event("ws_connected", {"request_id": "req-1"})
+            on_transport_event("turn_request_sent", {"request_id": "req-1"})
+            on_transport_event("first_server_event", {"message_type": "ack"})
+            on_transport_event("tool_request_received", {"call_id": "call-1", "tool_name": "search_live_info"})
         if on_ack is not None:
             on_ack(SimpleNamespace(ack_id="checking_now", text="Ich schaue kurz nach."))
         if on_text_delta is not None:
             on_text_delta("Teil ")
             on_text_delta("Antwort")
+        if on_transport_event is not None:
+            on_transport_event(
+                "tool_response_sent",
+                {"call_id": "call-1", "tool_name": "search_live_info", "ok": True, "error": None},
+            )
+            on_transport_event(
+                "turn_complete_received",
+                {
+                    "request_id": "req-1",
+                    "response_id": "resp-1",
+                    "model": "gpt-5.4-mini",
+                    "rounds": 2,
+                    "used_web_search": True,
+                },
+            )
         return SimpleNamespace(
             text="Teil Antwort",
             rounds=2,
@@ -136,12 +156,19 @@ class OrchestratorProbeTurnTests(unittest.TestCase):
         self.assertIn("probe_tool_handler_count=1", lines)
         self.assertTrue(any(line.startswith("probe_stage=provider_bundle status=ok") for line in lines))
         self.assertTrue(any(line.startswith("probe_stage=tool_runtime_bootstrap status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=ws_connect status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=turn_submit status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=first_server_event status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=tool_call status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=turn_complete status=ok") for line in lines))
         self.assertTrue(any(line.startswith("probe_stage=websocket_turn status=ok") for line in lines))
+        self.assertTrue(any(line.startswith("probe_stage=cleanup_complete status=ok") for line in lines))
         self.assertTrue(any(line.startswith("ack=checking_now:Ich schaue kurz nach.") for line in lines))
         self.assertTrue(any(event["event"] == "orchestrator_probe_decision" for event in runtime_events))
         self.assertTrue(
             any(event["event"] == "orchestrator_probe_stage" for event in _FakeProbeLoop.last_instance.recorded_events)
         )
+        self.assertGreaterEqual(len(outcome.stage_results), 7)
 
     def test_probe_turn_can_explicitly_allow_insecure_non_loopback_ws(self) -> None:
         config = TwinrConfig(

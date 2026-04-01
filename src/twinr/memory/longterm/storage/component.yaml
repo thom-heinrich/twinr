@@ -7,6 +7,7 @@ summary: Persist long-term object, conflict, archive, and midterm state locally 
 owned_concerns:
   - Persist canonical long-term object, conflict, and archive snapshots under the configured memory path
   - Persist midterm reflection and restart-recall packets and expose bounded midterm lookup helpers
+  - Persist materialized live-provider answer fronts as bounded remote current-head collections for transcript-first runtime consumption
   - Mirror validated object/conflict/archive state to the remote ChonkyDB namespace as individual documents plus current catalogs and load safe local fallbacks when optional remote reads fail
   - Reuse unchanged remote item documents directly from payload fingerprints plus catalog selectors so transient item readback failures do not amplify no-op snapshot rewrites into oversized bulk writes
   - Keep async snapshot/pointer attestation retries on readback when ChonkyDB acknowledges without an exact document id, avoiding duplicate accepted same-URI writes that would amplify stale-head history
@@ -45,6 +46,8 @@ files:
     role: Midterm packet snapshot store
     exports:
       - LongTermMidtermStore
+  - path: provider_answer_front_store.py
+    role: Remote current-head store for materialized live-provider answer-front blocks
   - path: remote_catalog.py
     role: Public compatibility wrapper for the fine-grained remote object/conflict/archive catalog adapter
     exports:

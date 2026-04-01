@@ -10,9 +10,11 @@ bounded background writers into the APIs used by agent runtime loops.
 `runtime` owns:
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
-- Maintain one bounded prepared full-context front for provider and tool retrieval so live turns can reuse already-built long-term prompt context instead of synchronously rebuilding the same remote recall package on every answer
+- Maintain a remote-authoritative materialized answer-front for the live provider path so transcript-first turns can consume ChonkyDB-backed prompt sections instead of synchronously rebuilding the broad retriever package on every answer
+- Keep the older in-process prepared full-context front only for tool context and compatibility provider callers while the live voice/runtime path migrates to the materialized answer-front contract
 - Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without launching a second independent remote recall
 - Prime and refresh those prepared full-context fronts from transcript-first interim or endpoint transcripts plus post-write invalidations, so the first live answer can reuse already-started long-term retrieval work without shrinking the memory surface
+- Persist those live provider answer fronts as bounded current-head collections keyed by semantic query scope, so post-write invalidation and transcript-first prewarm can keep remote-authoritative prompt blocks hot across turns
 - Inject the bounded fast-topic quick-memory lane into the normal provider context so ordinary answer turns receive a few compact personalized topic hints before the heavier recall sections
 - Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
@@ -62,12 +64,13 @@ bounded background writers into the APIs used by agent runtime loops.
 | `service.py` | Compatibility shim that preserves the historic import surface while delegating to `service_impl/` |
 | `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads, with seeded reflection/sensor neighborhoods kept strict instead of widening back to broad compile-source unions |
 | `prepared_context.py` | Bounded prepared full-context front that stores completed provider/tool prompt artifacts, coalesces transcript-first speculative builds, and refreshes or invalidates them after durable-memory changes |
+| `provider_answer_front.py` | Runtime manager for remote-backed materialized live provider answer fronts, with transcript-first prewarm coalescing, local hot-cache reuse, and strict live consumption |
 | `context_snapshot.py` | Small runtime dataclass that captures the latest built provider/tool context for operator inspection |
 | `service_impl/README.md` | Internal map of the refactored service implementation package |
-| `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface, including the prepared-context front dependency |
-| `service_impl/builder.py` | Runtime service assembly and background-writer construction, plus prepared-context front wiring and persistence invalidation hooks |
+| `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface, including both the compatibility prepared-context front and the materialized live provider-front dependency |
+| `service_impl/builder.py` | Runtime service assembly and background-writer construction, plus prepared-context/materialized-front wiring and persistence invalidation hooks |
 | `service_impl/readiness.py` | Required-remote readiness probes and cache helpers |
-| `service_impl/context.py` | Provider-context assembly for normal, fast, and tool-facing paths, with prepared-front consumption, transcript-first prewarm entry points, and sticky-query refresh scheduling |
+| `service_impl/context.py` | Provider-context assembly for normal, live, fast, and tool-facing paths, with live materialized-front consumption, compatibility prepared-front fallback, transcript-first prewarm entry points, and sticky-query refresh scheduling |
 | `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points, with dry-run object reads sourced through storage-owned active working sets instead of broad current-state hydration |
 | `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with reflection/sensor inputs narrowed through neighborhood selectors, active backfill writes using storage-owned working-set delta commits, and remote-primary retention prefiltering candidates from catalog projections |
 | `service_impl/proactive.py` | Proactive planning and reservation state transitions using shared query-first planner-object selectors instead of inline query constants |

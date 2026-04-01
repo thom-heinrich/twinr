@@ -119,6 +119,101 @@ _TWINR_LONGTERM_SCOPE_DEFINITIONS: Dict[str, Dict[str, str]] = {
         "legacy_catalog_schema": "twinr_memory_archive_catalog_v2",
         "segment_schema": "twinr_memory_archive_catalog_segment_v1",
     },
+    "midterm": {
+        "snapshot_kind": "midterm",
+        "uri_segment": "midterm",
+        "catalog_schema": "twinr_memory_midterm_catalog_v3",
+        "legacy_catalog_schema": "twinr_memory_midterm_catalog_v2",
+        "segment_schema": "twinr_memory_midterm_catalog_segment_v1",
+    },
+    "graph_nodes": {
+        "snapshot_kind": "graph_nodes",
+        "uri_segment": "graph_nodes",
+        "catalog_schema": "twinr_graph_node_catalog_v3",
+        "legacy_catalog_schema": "twinr_graph_node_catalog_v2",
+        "segment_schema": "twinr_graph_node_catalog_segment_v1",
+    },
+    "graph_edges": {
+        "snapshot_kind": "graph_edges",
+        "uri_segment": "graph_edges",
+        "catalog_schema": "twinr_graph_edge_catalog_v3",
+        "legacy_catalog_schema": "twinr_graph_edge_catalog_v2",
+        "segment_schema": "twinr_graph_edge_catalog_segment_v1",
+    },
+    "prompt_memory": {
+        "snapshot_kind": "prompt_memory",
+        "uri_segment": "prompt_memory",
+        "catalog_schema": "twinr_prompt_memory_catalog_v3",
+        "legacy_catalog_schema": "twinr_prompt_memory_catalog_v2",
+        "segment_schema": "twinr_prompt_memory_catalog_segment_v1",
+    },
+    "user_context": {
+        "snapshot_kind": "user_context",
+        "uri_segment": "user_context",
+        "catalog_schema": "twinr_user_context_catalog_v3",
+        "legacy_catalog_schema": "twinr_user_context_catalog_v2",
+        "segment_schema": "twinr_user_context_catalog_segment_v1",
+    },
+    "personality_context": {
+        "snapshot_kind": "personality_context",
+        "uri_segment": "personality_context",
+        "catalog_schema": "twinr_personality_context_catalog_v3",
+        "legacy_catalog_schema": "twinr_personality_context_catalog_v2",
+        "segment_schema": "twinr_personality_context_catalog_segment_v1",
+    },
+    "agent_personality_context_v1": {
+        "snapshot_kind": "agent_personality_context_v1",
+        "uri_segment": "agent_personality_context",
+        "catalog_schema": "twinr_agent_personality_snapshot_catalog_v3",
+        "legacy_catalog_schema": "twinr_agent_personality_snapshot_catalog_v2",
+        "segment_schema": "twinr_agent_personality_snapshot_catalog_segment_v1",
+    },
+    "agent_personality_interaction_signals_v1": {
+        "snapshot_kind": "agent_personality_interaction_signals_v1",
+        "uri_segment": "agent_personality_interaction_signals",
+        "catalog_schema": "twinr_agent_personality_interaction_signal_catalog_v3",
+        "legacy_catalog_schema": "twinr_agent_personality_interaction_signal_catalog_v2",
+        "segment_schema": "twinr_agent_personality_interaction_signal_catalog_segment_v1",
+    },
+    "agent_personality_place_signals_v1": {
+        "snapshot_kind": "agent_personality_place_signals_v1",
+        "uri_segment": "agent_personality_place_signals",
+        "catalog_schema": "twinr_agent_personality_place_signal_catalog_v3",
+        "legacy_catalog_schema": "twinr_agent_personality_place_signal_catalog_v2",
+        "segment_schema": "twinr_agent_personality_place_signal_catalog_segment_v1",
+    },
+    "agent_personality_world_signals_v1": {
+        "snapshot_kind": "agent_personality_world_signals_v1",
+        "uri_segment": "agent_personality_world_signals",
+        "catalog_schema": "twinr_agent_personality_world_signal_catalog_v3",
+        "legacy_catalog_schema": "twinr_agent_personality_world_signal_catalog_v2",
+        "segment_schema": "twinr_agent_personality_world_signal_catalog_segment_v1",
+    },
+    "agent_personality_deltas_v1": {
+        "snapshot_kind": "agent_personality_deltas_v1",
+        "uri_segment": "agent_personality_deltas",
+        "catalog_schema": "twinr_agent_personality_delta_catalog_v3",
+        "legacy_catalog_schema": "twinr_agent_personality_delta_catalog_v2",
+        "segment_schema": "twinr_agent_personality_delta_catalog_segment_v1",
+    },
+    "agent_world_intelligence_subscriptions_v1": {
+        "snapshot_kind": "agent_world_intelligence_subscriptions_v1",
+        "uri_segment": "agent_world_intelligence_subscriptions",
+        "catalog_schema": "twinr_world_intelligence_subscription_catalog_v3",
+        "legacy_catalog_schema": "twinr_world_intelligence_subscription_catalog_v2",
+        "segment_schema": "twinr_world_intelligence_subscription_catalog_segment_v1",
+    },
+    "agent_world_intelligence_state_v1": {
+        "snapshot_kind": "agent_world_intelligence_state_v1",
+        "uri_segment": "agent_world_intelligence_state",
+        "catalog_schema": "twinr_world_intelligence_state_catalog_v3",
+        "legacy_catalog_schema": "twinr_world_intelligence_state_catalog_v2",
+        "segment_schema": "twinr_world_intelligence_state_catalog_segment_v1",
+    },
+}
+_TWINR_LONGTERM_SCOPE_DEFINITIONS_BY_URI_SEGMENT: Dict[str, Dict[str, str]] = {
+    str(definition["uri_segment"]): dict(definition)
+    for definition in _TWINR_LONGTERM_SCOPE_DEFINITIONS.values()
 }
 _SCOPE_ALLOWED_DOC_IDS_CACHE: Dict[tuple[str, str], Dict[str, Any]] = {}
 _SCOPE_ALLOWED_DOC_IDS_CACHE_LOCK = Lock()
@@ -132,6 +227,7 @@ _TWINR_CURRENT_DOCUMENT_CACHE_LOCK = Lock()
 _LOGGER = logging.getLogger(__name__)
 _TWINR_SCOPE_POINTER_PHASE = "pointer_origin"
 _TWINR_SCOPE_SNAPSHOT_PHASE = "snapshot_catalog"
+_TWINR_SCOPE_CURRENT_HEAD_PHASE = "catalog_current_head"
 _TWINR_SCOPE_SEGMENT_PHASE = "catalog_segment"
 _TWINR_SCOPE_READINESS_SCOPE = "token_fast"
 _TWINR_SCOPE_WARMUP_RETRY_ATTEMPTS = 4
@@ -139,11 +235,13 @@ _TWINR_SCOPE_WARMUP_RETRY_DELAY_S = 0.25
 _TWINR_SCOPE_PHASE_CONTENT_CAP_DEFAULTS = {
     _TWINR_SCOPE_POINTER_PHASE: 32_768,
     _TWINR_SCOPE_SNAPSHOT_PHASE: 512_000,
+    _TWINR_SCOPE_CURRENT_HEAD_PHASE: 512_000,
     _TWINR_SCOPE_SEGMENT_PHASE: 512_000,
 }
 _TWINR_SCOPE_PHASE_CONTENT_CAP_ENVS = {
     _TWINR_SCOPE_POINTER_PHASE: "CHONKY_TWINR_POINTER_MAX_CONTENT_CHARS",
     _TWINR_SCOPE_SNAPSHOT_PHASE: "CHONKY_TWINR_SNAPSHOT_MAX_CONTENT_CHARS",
+    _TWINR_SCOPE_CURRENT_HEAD_PHASE: "CHONKY_TWINR_CURRENT_HEAD_MAX_CONTENT_CHARS",
     _TWINR_SCOPE_SEGMENT_PHASE: "CHONKY_TWINR_SEGMENT_MAX_CONTENT_CHARS",
 }
 _INSTANCE_COMPONENT_DEFAULT_TIMEOUT_S = 3.0
@@ -839,6 +937,14 @@ def _scope_definition_for_ref(scope_ref: Any) -> tuple[Optional[str], Optional[D
     return normalized, definition
 
 
+def _scope_definition_for_uri_segment(uri_segment: Optional[str]) -> Optional[Dict[str, str]]:
+    normalized = _normalize_optional_text(uri_segment)
+    if normalized is None:
+        return None
+    definition = _TWINR_LONGTERM_SCOPE_DEFINITIONS_BY_URI_SEGMENT.get(normalized)
+    return None if definition is None else dict(definition)
+
+
 def _scope_cache_key(*, namespace: str, scope_ref: str) -> tuple[str, str]:
     return namespace, scope_ref
 
@@ -1178,6 +1284,13 @@ def _segment_origin_uri(*, namespace: str, uri_segment: str, segment_index: int)
     )
 
 
+def _catalog_current_origin_uri(*, namespace: str, uri_segment: str) -> str:
+    return (
+        f"twinr://longterm/{_encode_uri_segment(namespace)}/"
+        f"{_encode_uri_segment(uri_segment)}/catalog/current"
+    )
+
+
 def _bounded_scope_phase_content_chars(
     *,
     scope_phase: Optional[str],
@@ -1232,16 +1345,34 @@ def _parse_twinr_scope_origin_uri(origin_uri: Optional[str]) -> Optional[Dict[st
             }
         return None
     if (
+        len(raw_parts) == 4
+        and raw_parts[2] == "catalog"
+        and raw_parts[3] == "current"
+    ):
+        namespace = unquote(raw_parts[0])
+        uri_segment = unquote(raw_parts[1])
+        definition = _scope_definition_for_uri_segment(uri_segment)
+        return {
+            "scope_phase": _TWINR_SCOPE_CURRENT_HEAD_PHASE,
+            "namespace": namespace,
+            "snapshot_kind": str(
+                (definition or {}).get("snapshot_kind") or uri_segment
+            ),
+        }
+    if (
         len(raw_parts) == 5
         and raw_parts[2] == "catalog"
         and raw_parts[3] == "segment"
     ):
         namespace = unquote(raw_parts[0])
         uri_segment = unquote(raw_parts[1])
+        definition = _scope_definition_for_uri_segment(uri_segment)
         return {
             "scope_phase": _TWINR_SCOPE_SEGMENT_PHASE,
             "namespace": namespace,
-            "snapshot_kind": uri_segment,
+            "snapshot_kind": str(
+                (definition or {}).get("snapshot_kind") or uri_segment
+            ),
         }
     return None
 
@@ -2711,15 +2842,53 @@ async def _load_current_scope_snapshot(
     definition: Dict[str, str],
 ) -> Dict[str, Any]:
     snapshot_kind = definition["snapshot_kind"]
-    snapshot_payload = await _load_current_twinr_snapshot_document(
+    current_head_uri = _catalog_current_origin_uri(
+        namespace=namespace,
+        uri_segment=definition["uri_segment"],
+    )
+    current_head = _resolve_latest_live_origin_lookup_document_id(
         service,
+        origin_uri=current_head_uri,
+        scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
         namespace=namespace,
         snapshot_kind=snapshot_kind,
+    )
+    current_head_document_id = _normalize_optional_text(current_head.get("document_id"))
+    if current_head_document_id is not None:
+        try:
+            current_head_payload = await _load_scope_document(
+                service,
+                document_id=current_head_document_id,
+                origin_uri=current_head_uri,
+                include_content=True,
+                max_content_chars=512_000,
+                scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                scope_ref=scope_ref,
+                namespace=namespace,
+                snapshot_kind=snapshot_kind,
+            )
+            _annotate_scope_document_request_context(
+                scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                namespace=namespace,
+                snapshot_kind=snapshot_kind,
+                scope_ref=scope_ref,
+            )
+            return current_head_payload
+        except HTTPException as exc:
+            _reraise_contract_http_exception(exc)
+            pass
+    snapshot_payload = await _load_scope_document(
+        service,
+        origin_uri=current_head_uri,
         include_content=True,
         max_content_chars=512_000,
+        scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+        scope_ref=scope_ref,
+        namespace=namespace,
+        snapshot_kind=snapshot_kind,
     )
     _annotate_scope_document_request_context(
-        scope_phase=_TWINR_SCOPE_SNAPSHOT_PHASE,
+        scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
         namespace=namespace,
         snapshot_kind=snapshot_kind,
         scope_ref=scope_ref,
@@ -3948,6 +4117,72 @@ async def get_full_document(
             max_content_chars=effective_max_content_chars,
             request=request,
         )
+    elif (
+        document_id is None
+        and scope_origin_details is not None
+        and scope_origin_details.get("scope_phase") == _TWINR_SCOPE_CURRENT_HEAD_PHASE
+    ):
+        snapshot_kind = str(scope_origin_details.get("snapshot_kind") or "")
+        definition = _TWINR_LONGTERM_SCOPE_DEFINITIONS.get(snapshot_kind)
+        if definition is not None:
+            current_head_uri = _catalog_current_origin_uri(
+                namespace=str(scope_origin_details.get("namespace") or ""),
+                uri_segment=str(definition["uri_segment"]),
+            )
+            current_head = _resolve_latest_live_origin_lookup_document_id(
+                service,
+                origin_uri=current_head_uri,
+                scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                namespace=str(scope_origin_details.get("namespace") or ""),
+                snapshot_kind=snapshot_kind,
+            )
+            current_head_document_id = _normalize_optional_text(current_head.get("document_id"))
+            if current_head_document_id is not None:
+                try:
+                    document = await _load_scope_document(
+                        service,
+                        document_id=current_head_document_id,
+                        origin_uri=current_head_uri,
+                        include_content=include_content,
+                        max_content_chars=effective_max_content_chars,
+                        scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                        scope_ref=None,
+                        namespace=str(scope_origin_details.get("namespace") or ""),
+                        snapshot_kind=snapshot_kind,
+                    )
+                except HTTPException as exc:
+                    _reraise_contract_http_exception(exc)
+                    document = await _load_scope_document(
+                        service,
+                        origin_uri=current_head_uri,
+                        include_content=include_content,
+                        max_content_chars=effective_max_content_chars,
+                        scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                        scope_ref=None,
+                        namespace=str(scope_origin_details.get("namespace") or ""),
+                        snapshot_kind=snapshot_kind,
+                    )
+            else:
+                document = await _load_scope_document(
+                    service,
+                    origin_uri=current_head_uri,
+                    include_content=include_content,
+                    max_content_chars=effective_max_content_chars,
+                    scope_phase=_TWINR_SCOPE_CURRENT_HEAD_PHASE,
+                    scope_ref=None,
+                    namespace=str(scope_origin_details.get("namespace") or ""),
+                    snapshot_kind=snapshot_kind,
+                )
+        else:
+            document = _raise_for_failed_result(
+                await service.get_full_document(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=effective_max_content_chars,
+                ),
+                default_status=404,
+            )
     else:
         document = _raise_for_failed_result(
             await service.get_full_document(

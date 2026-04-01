@@ -34,6 +34,8 @@ from twinr.memory.longterm.retrieval.subtext import (
     LongTermSubtextCompiler,
 )
 from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
+from twinr.memory.longterm.runtime.provider_answer_front import MaterializedProviderAnswerFront
+from twinr.memory.longterm.storage.provider_answer_front_store import LongTermProviderAnswerFrontStore
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.runtime.worker import (
@@ -120,6 +122,13 @@ class LongTermMemoryServiceBuilderMixin:
             object_store=object_store,
         )
         prepared_context_front = PreparedLongTermContextFront() if config.long_term_memory_enabled else None
+        provider_answer_front = (
+            MaterializedProviderAnswerFront(
+                LongTermProviderAnswerFrontStore(remote_state),
+            )
+            if config.long_term_memory_enabled and remote_state is not None
+            else None
+        )
         store_lock = threading.RLock()
         queue_size = _coerce_positive_int(
             getattr(config, "long_term_memory_write_queue_size", 1),
@@ -148,6 +157,7 @@ class LongTermMemoryServiceBuilderMixin:
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
             prepared_context_front=prepared_context_front,
+            provider_answer_front=provider_answer_front,
             restart_recall_policy_compiler=LongTermRestartRecallPolicyCompiler(),
             personality_learning=personality_learning,
             writer=None,

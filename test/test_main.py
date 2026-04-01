@@ -1551,6 +1551,53 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["env_path"], str(env_path))
 
+    def test_non_voice_e2e_acceptance_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            calls: list[dict[str, object]] = []
+            fake_acceptance_module = ModuleType("twinr.orchestrator.non_voice_acceptance")
+
+            def _run_non_voice_acceptance(**kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    run_id="non_voice_123",
+                    status="ok",
+                    ready=True,
+                    direct_case=SimpleNamespace(status="ok", used_web_search=False, error_message=None),
+                    tool_case=SimpleNamespace(status="ok", used_web_search=True, error_message=None),
+                    memory_result=SimpleNamespace(status="ok", ready=True, error_message=None),
+                    artifact_path=str(root / "artifacts" / "stores" / "ops" / "non_voice_e2e_acceptance.json"),
+                    report_path=str(root / "artifacts" / "reports" / "non_voice_e2e_acceptance" / "non_voice_123.json"),
+                )
+
+            fake_acceptance_module.run_non_voice_acceptance = _run_non_voice_acceptance
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {"twinr.orchestrator.non_voice_acceptance": fake_acceptance_module},
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--non-voice-e2e-acceptance",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["env_path"], str(env_path))
+
     def test_runtime_init_failure_returns_error_without_unbound_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

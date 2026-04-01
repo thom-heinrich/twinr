@@ -325,6 +325,33 @@ def _shutdown_service(service: LongTermMemoryService | None) -> None:
         service.shutdown(timeout_s=5.0)
     except Exception:
         _LOGGER.warning("Long-term service shutdown failed during live midterm acceptance cleanup.", exc_info=True)
+    retriever = getattr(service, "retriever", None)
+    subtext_builder = getattr(retriever, "subtext_builder", None)
+    if subtext_builder is not None:
+        shutdown = getattr(subtext_builder, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown(wait=True)
+            except Exception:
+                _LOGGER.warning(
+                    "Long-term subtext builder shutdown wait failed during live midterm acceptance cleanup.",
+                    exc_info=True,
+                )
+    for attr_name, label in (
+        ("prepared_context_front", "prepared context front"),
+        ("provider_answer_front", "provider answer front"),
+    ):
+        front = getattr(service, attr_name, None)
+        shutdown = getattr(front, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown(wait=True)
+            except Exception:
+                _LOGGER.warning(
+                    "Long-term %s shutdown wait failed during live midterm acceptance cleanup.",
+                    label,
+                    exc_info=True,
+                )
 
 
 def _run_seed_turn(

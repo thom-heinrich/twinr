@@ -13,9 +13,9 @@ below do not each own ad-hoc query strings.
 |---|---|
 | `compat.py` | Shared helper functions, limits, logger, and remote-readiness dataclasses |
 | `main.py` | `LongTermMemoryService` dataclass and inherited method surface |
-| `builder.py` | `from_config` dependency wiring, writer construction, and prepared-context invalidation plumbing |
+| `builder.py` | `from_config` dependency wiring, writer construction, and prepared-context/materialized-provider-front invalidation plumbing |
 | `readiness.py` | Required-remote readiness probes and remote-state cache helpers |
-| `context.py` | Normal, fast, and tool-facing provider-context assembly, including prepared full-context front consumption, transcript-first speculative prewarm entry points, remote-memory completion stamps for the live voice-turn latency breakdown, and single-pass tool-context retrieval without duplicate remote durable/conflict reads while keeping graph loading as a fallback only when structured tool recall is empty |
+| `context.py` | Normal, live, fast, and tool-facing provider-context assembly, including strict materialized live-provider-front consumption, compatibility prepared full-context fallback, transcript-first speculative prewarm entry points, remote-memory completion stamps for the live voice-turn latency breakdown, and single-pass tool-context retrieval without duplicate remote durable/conflict reads while keeping graph loading as a fallback only when structured tool recall is empty |
 | `ingestion.py` | Conversation/multimodal enqueue paths and dry-run analysis helpers, with dry-run object reads sourced through storage-owned active working sets instead of `load_objects()` blob hydration or broad current-state hydration |
 | `maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with reflection/sensor inputs sourced through the shared runtime selector layer plus strict seeded neighborhood expansion, backfill writes using storage-owned active working sets plus delta commits instead of full-state rewrites, and remote-primary retention prefiltering candidate objects from catalog projections before exact hydration |
 | `proactive.py` | Proactive planning, reservation, and outcome tracking over the shared query-first planner selector layer instead of inline query constants |
