@@ -9,6 +9,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 - support split playback/capture defaults when output and microphone hardware differ
 - persist proactive-audio env keys used by the runtime
 - install the XVF3800 USB-access rule needed for non-root host-control reads
+- install targeted XVF3800 snd-usb-audio stability overrides on the Pi
 - run bounded playback and capture smoke checks
 
 `mic` does **not** own:
@@ -22,6 +23,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 |---|---|
 | [setup_audio.sh](./setup_audio.sh) | Configure audio defaults, normalize playback loudness, and smoke test |
 | [setup_respeaker_access.sh](./setup_respeaker_access.sh) | Install the XVF3800 udev rule for non-root host-control access |
+| [setup_respeaker_stability.sh](./setup_respeaker_stability.sh) | Install targeted `snd-usb-audio` overrides for the XVF3800 multi-interface registration and autosuspend behavior |
 
 ## Usage
 
@@ -31,6 +33,7 @@ sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match reSp
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match PlayStation
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match reSpeaker --capture-device-match reSpeaker --softvol-max-db 18
 sudo ./hardware/mic/setup_respeaker_access.sh
+sudo ./hardware/mic/setup_respeaker_stability.sh
 ```
 
 `setup_audio.sh` now also resets the selected playback sink plus the target
@@ -61,6 +64,13 @@ resolved playback card directly instead of leaving speech output on the
 desktop-facing `default` alias.
 Pass `--skip-playback-volume` only when you intentionally want to keep the
 current sink/card loudness unchanged.
+`setup_respeaker_stability.sh` installs one targeted `/etc/modprobe.d/`
+override for the Seeed XVF3800: it delays ALSA registration until USB audio
+interface `2` is present. Twinr intentionally omits `quirk_flags` here on the
+current Pi kernel because that build rejects the documented per-device
+`quirk_flags` syntax during module load and would keep `snd_usb_audio` from
+coming back at all. Reload `snd-usb-audio` or reboot after installing the file
+so the kernel reads the new option.
 
 ## See also
 

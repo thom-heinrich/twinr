@@ -33,6 +33,7 @@ from twinr.memory.longterm.retrieval.subtext import (
     LongTermSubtextBuilder,
     LongTermSubtextCompiler,
 )
+from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.runtime.worker import (
@@ -118,54 +119,14 @@ class LongTermMemoryServiceBuilderMixin:
             config=config,
             object_store=object_store,
         )
+        prepared_context_front = PreparedLongTermContextFront() if config.long_term_memory_enabled else None
         store_lock = threading.RLock()
         queue_size = _coerce_positive_int(
             getattr(config, "long_term_memory_write_queue_size", 1),
             default=1,
             maximum=_MAX_QUEUE_SIZE,
         )
-        writer: AsyncLongTermMemoryWriter | None = None
-        multimodal_writer: AsyncLongTermMultimodalWriter | None = None
-        if config.long_term_memory_enabled and config.long_term_memory_background_store_turns:
-            def _write_turn(item: LongTermConversationTurn) -> None:
-                factory._persist_longterm_turn(
-                    config=config,
-                    store=store,
-                    graph_store=graph,
-                    object_store=object_store,
-                    midterm_store=midterm_store,
-                    extractor=extractor,
-                    consolidator=consolidator,
-                    reflector=reflector,
-                    turn_continuity_compiler=turn_continuity_compiler,
-                    sensor_memory=sensor_memory,
-                    retention_policy=retention_policy,
-                    personality_learning=personality_learning,
-                    store_lock=store_lock,
-                    timezone_name=config.local_timezone_name,
-                    item=item,
-                )
-
-            writer = AsyncLongTermMemoryWriter(
-                write_callback=_write_turn,
-                max_queue_size=queue_size,
-            )
-            multimodal_writer = AsyncLongTermMultimodalWriter(
-                write_callback=lambda item: factory._persist_multimodal_evidence(
-                    object_store=object_store,
-                    midterm_store=midterm_store,
-                    multimodal_extractor=multimodal_extractor,
-                    consolidator=consolidator,
-                    reflector=reflector,
-                    sensor_memory=sensor_memory,
-                    retention_policy=retention_policy,
-                    store_lock=store_lock,
-                    timezone_name=config.local_timezone_name,
-                    item=item,
-                ),
-                max_queue_size=queue_size,
-            )
-        return factory(
+        service = factory(
             config=config,
             prompt_context_store=store,
             graph_store=graph,
@@ -186,9 +147,54 @@ class LongTermMemoryServiceBuilderMixin:
             planner=planner,
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
+            prepared_context_front=prepared_context_front,
             restart_recall_policy_compiler=LongTermRestartRecallPolicyCompiler(),
             personality_learning=personality_learning,
-            writer=writer,
-            multimodal_writer=multimodal_writer,
+            writer=None,
+            multimodal_writer=None,
             _store_lock=store_lock,
         )
+        if config.long_term_memory_enabled and config.long_term_memory_background_store_turns:
+            # Build the service first so background writers receive the bound
+            # invalidator instead of an unbound mixin method.
+            def _write_turn(item: LongTermConversationTurn) -> None:
+                service._persist_longterm_turn(
+                    config=config,
+                    store=store,
+                    graph_store=graph,
+                    object_store=object_store,
+                    midterm_store=midterm_store,
+                    extractor=extractor,
+                    consolidator=consolidator,
+                    reflector=reflector,
+                    turn_continuity_compiler=turn_continuity_compiler,
+                    sensor_memory=sensor_memory,
+                    retention_policy=retention_policy,
+                    personality_learning=personality_learning,
+                    prepared_context_invalidator=service._invalidate_prepared_contexts,
+                    store_lock=store_lock,
+                    timezone_name=config.local_timezone_name,
+                    item=item,
+                )
+
+            service.writer = AsyncLongTermMemoryWriter(
+                write_callback=_write_turn,
+                max_queue_size=queue_size,
+            )
+            service.multimodal_writer = AsyncLongTermMultimodalWriter(
+                write_callback=lambda item: service._persist_multimodal_evidence(
+                    object_store=object_store,
+                    midterm_store=midterm_store,
+                    multimodal_extractor=multimodal_extractor,
+                    consolidator=consolidator,
+                    reflector=reflector,
+                    sensor_memory=sensor_memory,
+                    retention_policy=retention_policy,
+                    prepared_context_invalidator=service._invalidate_prepared_contexts,
+                    store_lock=store_lock,
+                    timezone_name=config.local_timezone_name,
+                    item=item,
+                ),
+                max_queue_size=queue_size,
+            )
+        return service

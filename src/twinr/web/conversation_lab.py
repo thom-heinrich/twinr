@@ -44,7 +44,10 @@ from twinr.ops.usage import TwinrUsageStore
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import OpenAIBackend, OpenAISupervisorDecisionProvider, OpenAIToolCallingAgentProvider
 from twinr.web.conversation_lab_vision import build_vision_images, build_vision_prompt, owner_camera
-from twinr.web.presenters.memory_search import build_memory_search_panel_context
+from twinr.web.presenters.memory_search import (
+    build_memory_context_snapshot_panel_context,
+    build_memory_search_panel_context,
+)
 from twinr.web.support.store import read_text_file, write_text_file
 
 
@@ -433,6 +436,35 @@ def _search_snapshot(config: TwinrConfig, query_text: str) -> dict[str, object]:
         )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _captured_context_snapshot_panel(
+    runtime: TwinrRuntime | None,
+    query_text: str,
+    *,
+    detail_message: str,
+    title: str,
+    description: str,
+) -> dict[str, object]:
+    """Render one Conversation Lab retrieval panel from the real runtime context."""
+
+    snapshot = None
+    long_term_memory = getattr(runtime, "long_term_memory", None)
+    latest_snapshot = getattr(long_term_memory, "latest_context_snapshot", None)
+    if callable(latest_snapshot):
+        try:
+            snapshot = latest_snapshot(profile="tool")
+        except Exception:
+            snapshot = None
+    panel = build_memory_context_snapshot_panel_context(
+        query_text=query_text,
+        snapshot=snapshot,
+        error_message=None if snapshot is not None else "Conversation Lab did not capture a tool-facing long-term context for this turn.",
+        detail_message=detail_message,
+    )
+    panel["title"] = title
+    panel["description"] = description
+    return panel
 
 
 def _close_if_possible(component: object | None) -> None:
@@ -1056,7 +1088,12 @@ def run_conversation_lab_turn(
     response_text = ""
     result: object | None = None
     error_message: str | None = None
-    retrieval_before = _search_snapshot(config, normalized_prompt)
+    retrieval_before = build_memory_context_snapshot_panel_context(
+        query_text=normalized_prompt,
+        snapshot=None,
+        error_message="Conversation Lab did not reach long-term context assembly for this turn.",
+        detail_message=None,
+    )
     retrieval_after: dict[str, object] | None = None
     before_enqueue: dict[str, object] = {}
     after_enqueue: dict[str, object] | None = None
@@ -1094,6 +1131,16 @@ def run_conversation_lab_turn(
             loop=loop,
             prompt=normalized_prompt,
         )
+        retrieval_before = _captured_context_snapshot_panel(
+            runtime,
+            normalized_prompt,
+            detail_message=(
+                "Captured from the actual tool-facing long-term context Twinr built before answering this prompt. "
+                "Conversation Lab does not run a second operator memory search for this trace."
+            ),
+            title="Captured Context Before Answer",
+            description="The actual tool-facing long-term context Twinr injected before producing the answer.",
+        )
         response_text = runtime.finalize_agent_turn(_result_text(result))
         usage_store.append(
             source=_CONVERSATION_LAB_SOURCE,
@@ -1113,12 +1160,32 @@ def run_conversation_lab_turn(
             )
             flush_ok = runtime.flush_long_term_memory(timeout_s=flush_timeout_s)
             after_flush = _writer_state_snapshot(runtime)
+            if flush_ok:
+                retrieval_after = _captured_context_snapshot_panel(
+                    runtime,
+                    normalized_prompt,
+                    detail_message=(
+                        "Captured from the latest tool-facing long-term context still available inside the runtime after the flush. "
+                        "Conversation Lab keeps this trace tied to the real turn context instead of launching a separate operator search."
+                    ),
+                    title="Latest Context After Flush",
+                    description="The latest tool-facing long-term context still available inside the runtime after the flush completed.",
+                )
         else:
             flush_ok = True
             after_flush = dict(after_enqueue)
-        if flush_ok:
-            retrieval_after = _search_snapshot(config, normalized_prompt)
-        else:
+            retrieval_after = _captured_context_snapshot_panel(
+                runtime,
+                normalized_prompt,
+                detail_message=(
+                    "Conversation Lab disables background long-term turn writers for bounded operator probes, so this turn did not attempt a durable long-term write. "
+                    "The post-turn panel therefore reuses the same captured tool context instead of rerunning remote recall."
+                ),
+                title="Post-Turn Context",
+                description="No long-term turn write was attempted for this Conversation Lab probe, so the post-turn trace reuses the captured tool context.",
+            )
+        if not flush_ok:
+            retrieval_after = None
             status = "warn"
             error_message = (
                 f"Long-term memory flush did not complete within {flush_timeout_s:.1f}s; "

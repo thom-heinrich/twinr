@@ -449,7 +449,13 @@ class StructuredStoreSnapshotMixin:
                 snapshot_kind=snapshot_kind,
                 compatibility_only=True,
             )
-            if self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=compatibility_payload):
+            if (
+                isinstance(compatibility_payload, Mapping)
+                and self._is_valid_snapshot_payload(
+                    snapshot_kind=snapshot_kind,
+                    payload=compatibility_payload,
+                )
+            ):
                 return self._snapshot_item_payloads(
                     snapshot_kind=snapshot_kind,
                     payload=cast(Mapping[str, object], compatibility_payload),

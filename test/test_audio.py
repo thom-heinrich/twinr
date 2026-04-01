@@ -222,6 +222,63 @@ class ReSpeakerCaptureRecoveryTests(unittest.TestCase):
         reboot_capture.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
         wait_ready.assert_called_once()
 
+    def test_recover_stalled_capture_tries_usb_reset_after_reboot_recovery_fails(self) -> None:
+        with (
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery.wait_for_transient_respeaker_capture_ready",
+                side_effect=[False, False, True],
+            ) as wait_ready,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_host_control_reboot",
+                return_value=True,
+            ) as reboot_capture,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_usb_port_reset",
+                return_value=True,
+            ) as usb_reset,
+        ):
+            recovered = recover_stalled_respeaker_capture(
+                device="plughw:CARD=Array,DEV=0",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+                max_wait_s=2.5,
+            )
+
+        self.assertTrue(recovered)
+        reboot_capture.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        usb_reset.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        self.assertEqual(wait_ready.call_count, 3)
+        self.assertGreaterEqual(wait_ready.call_args_list[1].kwargs["max_wait_s"], 8.0)
+        self.assertGreaterEqual(wait_ready.call_args_list[2].kwargs["max_wait_s"], 12.0)
+
+    def test_recover_stalled_capture_fails_when_usb_reset_is_unavailable_after_reboot_path(self) -> None:
+        with (
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery.wait_for_transient_respeaker_capture_ready",
+                side_effect=[False, False],
+            ) as wait_ready,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_host_control_reboot",
+                return_value=True,
+            ) as reboot_capture,
+            mock.patch(
+                "twinr.hardware.respeaker_capture_recovery._attempt_respeaker_usb_port_reset",
+                return_value=False,
+            ) as usb_reset,
+        ):
+            recovered = recover_stalled_respeaker_capture(
+                device="plughw:CARD=Array,DEV=0",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+            )
+
+        self.assertFalse(recovered)
+        reboot_capture.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        usb_reset.assert_called_once_with(device="plughw:CARD=Array,DEV=0")
+        self.assertEqual(wait_ready.call_count, 2)
+
     def test_build_audio_subprocess_env_keeps_same_owner_session_audio(self) -> None:
         base_env = {
             "XDG_RUNTIME_DIR": "/run/user/1000",

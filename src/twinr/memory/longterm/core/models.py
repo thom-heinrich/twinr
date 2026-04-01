@@ -1359,6 +1359,7 @@ class LongTermConflictResolutionV1:
     selected_memory_id: str
     updated_objects: tuple[LongTermMemoryObjectV1, ...]
     remaining_conflicts: tuple[LongTermMemoryConflictV1, ...]
+    deleted_conflict_slot_keys: tuple[str, ...] = ()
     schema: str = LONGTERM_CONFLICT_RESOLUTION_SCHEMA
     version: int = LONGTERM_CONFLICT_RESOLUTION_VERSION
 
@@ -1386,6 +1387,11 @@ class LongTermConflictResolutionV1:
                 item_name="LongTermMemoryConflictV1",
                 item_coercer=_coerce_conflict,
             ),
+        )
+        object.__setattr__(
+            self,
+            "deleted_conflict_slot_keys",
+            _coerce_str_tuple(self.deleted_conflict_slot_keys, field_name="deleted_conflict_slot_keys"),
         )
         _validate_schema_version(
             schema=self.schema,
@@ -1503,6 +1509,7 @@ class LongTermMemoryMutationResultV1:
     updated_objects: tuple[LongTermMemoryObjectV1, ...] = ()
     deleted_memory_ids: tuple[str, ...] = ()
     remaining_conflicts: tuple[LongTermMemoryConflictV1, ...] = ()
+    deleted_conflict_slot_keys: tuple[str, ...] = ()
     schema: str = LONGTERM_MEMORY_MUTATION_SCHEMA
     version: int = LONGTERM_MEMORY_MUTATION_VERSION
 
@@ -1530,6 +1537,11 @@ class LongTermMemoryMutationResultV1:
                 item_name="LongTermMemoryConflictV1",
                 item_coercer=_coerce_conflict,
             ),
+        )
+        object.__setattr__(
+            self,
+            "deleted_conflict_slot_keys",
+            _coerce_str_tuple(self.deleted_conflict_slot_keys, field_name="deleted_conflict_slot_keys"),
         )
         if self.action not in LONGTERM_MEMORY_MUTATION_ACTIONS:
             raise ValueError(f"action must be one of: {', '.join(sorted(LONGTERM_MEMORY_MUTATION_ACTIONS))}.")

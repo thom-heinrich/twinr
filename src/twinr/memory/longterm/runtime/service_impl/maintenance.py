@@ -40,7 +40,7 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                     self.object_store.apply_reflection(result)
                     self.midterm_store.apply_reflection(result)
                 sensor_memory_result = self.sensor_memory.compile(
-                    objects=tuple(select_sensor_memory_source_objects(self.object_store))
+                    objects=tuple(select_sensor_memory_neighborhood_objects(self.object_store))
                 )
                 if self._has_reflection_payload(sensor_memory_result):
                     self.object_store.apply_reflection(sensor_memory_result)
@@ -56,6 +56,8 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                     self.personality_learning.maybe_refresh_world_intelligence(
                         search_backend=search_backend,
                     )
+                if self._has_reflection_payload(combined_result):
+                    self._invalidate_prepared_contexts(reason="reflection_applied")
                 return combined_result
         except LongTermRemoteUnavailableError:
             raise
@@ -76,6 +78,7 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                 if self._has_reflection_payload(result):
                     self.object_store.apply_reflection(result)
                     self.midterm_store.apply_reflection(result)
+                    self._invalidate_prepared_contexts(reason="sensor_memory_applied")
                 return result
         except LongTermRemoteUnavailableError:
             raise
@@ -227,6 +230,8 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                     self.midterm_store.apply_reflection(reflection_result)
                 if self._has_reflection_payload(sensor_result):
                     self.midterm_store.apply_reflection(sensor_result)
+                if should_write_snapshot:
+                    self._invalidate_prepared_contexts(reason="ops_multimodal_backfill_applied")
         except LongTermRemoteUnavailableError:
             raise
         except Exception as exc:
@@ -263,6 +268,8 @@ class LongTermMemoryServiceMaintenanceMixin(ServiceMixinBase):
                     candidate_objects = self.object_store.load_objects_fine_grained()
                 result = self.retention_policy.apply(objects=candidate_objects, now=reference_now)
                 self.object_store.apply_retention(result)
+                if result.expired_objects or result.pruned_memory_ids or result.archived_objects:
+                    self._invalidate_prepared_contexts(reason="retention_applied")
                 return result
         except LongTermRemoteUnavailableError:
             raise

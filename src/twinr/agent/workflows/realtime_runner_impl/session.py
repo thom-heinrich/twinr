@@ -30,6 +30,12 @@ from twinr.agent.workflows.remote_transcript_commit import (
     RemoteTranscriptWaitHandle,
 )
 from twinr.agent.workflows.required_remote_watch import RequiredRemoteDependencyWatch
+from twinr.agent.workflows.voice_turn_latency import (
+    bind_voice_turn_trace,
+    clear_voice_turn_latency,
+    mark_voice_turn_commit,
+    mark_voice_turn_wake_confirmed,
+)
 from twinr.hardware.audio import AmbientAudioSampler
 from twinr.hardware.buttons import ButtonAction
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
@@ -548,6 +554,9 @@ class TwinrRealtimeSessionMixin:
                 max_chars=self._seed_transcript_max_chars(),
                 trace_reason="voice_activation_seed",
             )
+            mark_voice_turn_wake_confirmed(self, source="voice_activation")
+            if seed_transcript:
+                mark_voice_turn_commit(self, source="voice_activation")
             if seed_transcript:
                 self.emit("voice_activation_mode=direct_text")
             else:
@@ -563,12 +572,16 @@ class TwinrRealtimeSessionMixin:
             if not seed_transcript:
                 self._acknowledge_voice_activation()
                 play_initial_beep = False
-            return self._run_conversation_session(
+            result = self._run_conversation_session(
                 initial_source="voice_activation",
                 seed_transcript=seed_transcript or None,
                 play_initial_beep=play_initial_beep,
             )
+            if not result:
+                clear_voice_turn_latency(self)
+            return result
         except Exception as exc:
+            clear_voice_turn_latency(self)
             self._handle_error(exc)
             return False
 
@@ -763,6 +776,7 @@ class TwinrRealtimeSessionMixin:
             )
             trace_id = self._new_workflow_trace_id()
             self._workflow_trace_set_active(trace_id)
+            bind_voice_turn_trace(self, trace_id=trace_id, initial_source=initial_source)
             self._set_active_turn_stop_event(stop_event)
             with self._get_lock("_background_delivery_transition_lock"):
                 self._conversation_session_active = True

@@ -2,7 +2,7 @@
 # BUG-1: Resolve repo-backed Pi units against the requested remote_root instead of hard-coding /twinr.
 # BUG-2: Use systemctl is-enabled semantics so enabled-runtime/linked-runtime units are not silently skipped.
 # BUG-3: Parse unit files with systemd.syntax-compatible whitespace/comment/continuation handling so valid Pi units are discovered reliably.
-# BUG-4: Snapshot mutable local deploy artifacts and abort when the authoritative repo changes mid-deploy, preventing mixed-state rollouts.
+# BUG-4: Snapshot the authoritative repo mirror scope before sync so shared-worktree churn cannot produce mixed-state or self-aborting rollouts.
 # SEC-1: Reject unsafe remote paths and malformed service identifiers before they reach remote shell/systemctl commands.
 # SEC-2: Serialize deploys on the Pi with a remote lock file to prevent interleaved installs/restarts from corrupting the runtime.
 # IMP-1: Verify repo-backed units on the Pi with systemd-analyze verify before install/restart.
@@ -35,13 +35,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Protocol, Sequence
 
+from twinr.ops.deploy_progress import ProgressCallback, emit_deploy_progress, progress_span
 from twinr.ops.pi_repo_mirror import (
     PiRepoMirrorCycleResult,
     PiRepoMirrorWatchdog,
-    build_authoritative_repo_entry_digests,
+    materialize_authoritative_repo_snapshot,
 )
 from twinr.ops.pi_runtime_deploy_remote import (
     PiRemoteExecutor as _PiRemoteExecutor,
@@ -54,11 +56,14 @@ from twinr.ops.pi_runtime_deploy_remote import (
     install_editable_package as _install_editable_package,
     install_python_requirements_manifest as _install_python_requirements_manifest,
     install_service_units as _install_service_units,
+    repair_ops_artifact_permissions as _repair_ops_artifact_permissions,
     repair_runtime_state_permissions as _repair_runtime_state_permissions,
     refresh_python_bytecode as _refresh_python_bytecode,
     restart_services as _restart_services,
     run_env_contract_probe as _run_env_contract_probe,
+    run_retention_canary_probe as _run_retention_canary_probe,
     sync_authoritative_file as _sync_authoritative_file,
+    verify_ops_artifact_permissions as _verify_ops_artifact_permissions,
     verify_runtime_state_permissions as _verify_runtime_state_permissions,
     verify_python_import_contract as _verify_python_import_contract,
     wait_for_services as _wait_for_services,
@@ -170,6 +175,8 @@ _VERIFY_FATAL_MARKERS: tuple[str, ...] = (
     "not executable",
     "Exec format error",
 )
+_REMOTE_ROOT_REBASED_ENV_KEYS: frozenset[str] = frozenset({"TWINR_WORKFLOW_TRACE_DIR"})
+_RETENTION_CANARY_HEARTBEAT_S = 5.0
 
 
 class _MirrorWatchdog(Protocol):
@@ -202,6 +209,7 @@ class PiRuntimeDeployResult:
     service_states: tuple[PiSystemdServiceState, ...]
     import_contract: PiPythonImportContractResult | None
     env_contract: dict[str, object] | None
+    retention_canary: dict[str, object] | None
     duration_s: float
     unit_verification_summary: str | None = None
 
@@ -230,8 +238,10 @@ def deploy_pi_runtime(
     install_with_deps: bool = False,
     install_systemd_units: bool = True,
     verify_env_contract: bool = True,
+    verify_retention_canary: bool = False,
     live_text: str | None = None,
     live_search: str | None = None,
+    progress_callback: ProgressCallback | None = None,
     subprocess_runner: _SubprocessRunner = subprocess.run,
     mirror_watchdog: _MirrorWatchdog | None = None,
 ) -> PiRuntimeDeployResult:
@@ -268,8 +278,12 @@ def deploy_pi_runtime(
         install_systemd_units: Whether to copy the service unit files from
             ``/twinr/hardware/ops`` into ``/etc/systemd/system`` and reload systemd.
         verify_env_contract: Whether to run the bounded Pi env-contract probe.
+        verify_retention_canary: Whether to run the bounded remote-memory
+            retention canary after the normal deploy health checks.
         live_text: Optional real non-search provider probe for env-contract verification.
         live_search: Optional real search-backed provider probe for env-contract verification.
+        progress_callback: Optional structured progress sink used for
+            operator-facing phase/substep telemetry without polluting stdout.
         subprocess_runner: Injectable subprocess runner for tests.
         mirror_watchdog: Optional prebuilt mirror watchdog for tests.
 
@@ -299,7 +313,6 @@ def deploy_pi_runtime(
     if not resolved_root.exists() or not resolved_root.is_dir():
         raise ValueError(f"project root does not exist: {resolved_root}")
 
-    expected_repo_entries = build_authoritative_repo_entry_digests(resolved_root)
     settings = load_pi_connection_settings(pi_env_path)
     # BREAKING: remote_root and remote_env_path are now validated as absolute, shell-safe POSIX paths.
     resolved_remote_root = _normalize_remote_path(remote_root, field_name="remote_root", reject_dangerous_root=True)
@@ -328,14 +341,25 @@ def deploy_pi_runtime(
 
     with tempfile.TemporaryDirectory(prefix="twinr-pi-runtime-deploy-") as snapshot_dir_str:
         snapshot_dir = Path(snapshot_dir_str)
+        repo_snapshot_root = snapshot_dir / "authoritative_repo"
+        expected_repo_entries = _run_phase(
+            "repo_snapshot",
+            lambda: materialize_authoritative_repo_snapshot(
+                resolved_root,
+                repo_snapshot_root,
+            ),
+            progress_callback=progress_callback,
+        )
         env_source_for_sync = env_source
         if sync_env:
             if not env_source.exists() or not env_source.is_file():
                 raise ValueError(f"authoritative env file does not exist: {env_source}")
-            env_source_for_sync = _snapshot_local_file(
+            env_source_for_sync = _snapshot_env_file_for_remote_sync(
                 source_path=env_source,
                 snapshot_dir=snapshot_dir,
                 snapshot_name="authoritative.env",
+                local_root=resolved_root,
+                remote_root=resolved_remote_root,
             )
 
         optional_manifest_snapshots: dict[Path, Path] = {}
@@ -360,7 +384,7 @@ def deploy_pi_runtime(
             ttl_s=deploy_lock_ttl_s,
         ):
             normalized_services = _resolve_deploy_services(
-                project_root=resolved_root,
+                project_root=repo_snapshot_root,
                 remote=remote,
                 remote_root=resolved_remote_root,
                 requested_services=services,
@@ -369,30 +393,30 @@ def deploy_pi_runtime(
             _run_phase(
                 "service_root_contract",
                 lambda: _assert_selected_repo_units_are_remote_root_compatible(
-                    project_root=resolved_root,
+                    project_root=repo_snapshot_root,
                     services=normalized_services,
                     remote_root=resolved_remote_root,
                 ),
+                progress_callback=progress_callback,
             )
-            watchdog = mirror_watchdog or PiRepoMirrorWatchdog.from_env(
-                project_root=resolved_root,
-                pi_env_path=pi_env_path,
-                remote_root=resolved_remote_root,
-                timeout_s=timeout_s,
-                subprocess_runner=subprocess_runner,
-            )
+            if mirror_watchdog is not None:
+                watchdog = _retarget_mirror_watchdog_project_root(
+                    mirror_watchdog,
+                    project_root=repo_snapshot_root,
+                )
+            else:
+                watchdog = PiRepoMirrorWatchdog.from_env(
+                    project_root=repo_snapshot_root,
+                    pi_env_path=pi_env_path,
+                    remote_root=resolved_remote_root,
+                    timeout_s=timeout_s,
+                    subprocess_runner=subprocess_runner,
+                )
 
             repo_mirror = _run_phase(
                 "repo_mirror",
                 lambda: watchdog.probe_once(apply_sync=True, checksum=True, max_change_lines=40),
-            )
-
-            _run_phase(
-                "repo_stability",
-                lambda: _assert_authoritative_repo_unchanged(
-                    project_root=resolved_root,
-                    expected_entries=expected_repo_entries,
-                ),
+                progress_callback=progress_callback,
             )
 
             env_sync_result: PiSyncedFileResult | None = None
@@ -405,6 +429,7 @@ def deploy_pi_runtime(
                         remote_path=env_target,
                         mode="600",
                     ),
+                    progress_callback=progress_callback,
                 )
 
             if install_browser_requirements:
@@ -416,6 +441,7 @@ def deploy_pi_runtime(
                         local_path=optional_manifest_snapshots[_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS],
                         manifest_relpath=_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS,
                     ),
+                    progress_callback=progress_callback,
                 )
             if install_playwright_browsers:
                 _run_phase(
@@ -426,6 +452,7 @@ def deploy_pi_runtime(
                         local_path=optional_manifest_snapshots[_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS],
                         manifest_relpath=_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS,
                     ),
+                    progress_callback=progress_callback,
                 )
 
             repo_attestation_result = _run_phase(
@@ -435,6 +462,7 @@ def deploy_pi_runtime(
                     remote_root=resolved_remote_root,
                     entries=expected_repo_entries,
                 ),
+                progress_callback=progress_callback,
             )
 
             editable_install_summary: str | None = None
@@ -445,7 +473,9 @@ def deploy_pi_runtime(
                         remote=remote,
                         remote_root=resolved_remote_root,
                         install_with_deps=install_with_deps,
+                        progress_callback=progress_callback,
                     ),
+                    progress_callback=progress_callback,
                 )
                 if install_pi_runtime_requirements:
                     pi_runtime_requirements_summary = _run_phase(
@@ -455,7 +485,10 @@ def deploy_pi_runtime(
                             remote_root=resolved_remote_root,
                             manifest_relpath=_PI_RUNTIME_REQUIREMENTS.as_posix(),
                             label="pi_runtime",
+                            progress_callback=progress_callback,
+                            progress_phase="pi_runtime_requirements",
                         ),
+                        progress_callback=progress_callback,
                     )
                     editable_install_summary = "\n".join(
                         part
@@ -470,7 +503,9 @@ def deploy_pi_runtime(
                             remote_root=resolved_remote_root,
                             install_python_requirements=install_browser_requirements,
                             install_playwright_browsers=install_playwright_browsers,
+                            progress_callback=progress_callback,
                         ),
+                        progress_callback=progress_callback,
                     )
 
             bytecode_refresh_summary = _run_phase(
@@ -483,6 +518,7 @@ def deploy_pi_runtime(
                         for relative_root in _PI_RUNTIME_BYTECODE_RELATIVE_ROOTS
                     ),
                 ),
+                progress_callback=progress_callback,
             )
 
             import_contract_result = _run_phase(
@@ -493,6 +529,7 @@ def deploy_pi_runtime(
                     modules=_PI_RUNTIME_IMPORT_MODULES,
                     attribute_contracts=_PI_RUNTIME_ATTRIBUTE_CONTRACTS,
                 ),
+                progress_callback=progress_callback,
             )
 
             _run_phase(
@@ -502,6 +539,17 @@ def deploy_pi_runtime(
                     remote_root=resolved_remote_root,
                     owner_user=settings.user,
                 ),
+                progress_callback=progress_callback,
+            )
+
+            _run_phase(
+                "ops_artifact_permissions",
+                lambda: _repair_ops_artifact_permissions(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    owner_user=settings.user,
+                ),
+                progress_callback=progress_callback,
             )
 
             unit_verification_summary = _run_phase(
@@ -511,6 +559,7 @@ def deploy_pi_runtime(
                     remote_root=resolved_remote_root,
                     services=normalized_services,
                 ),
+                progress_callback=progress_callback,
             )
 
             if install_systemd_units:
@@ -521,6 +570,7 @@ def deploy_pi_runtime(
                         remote_root=resolved_remote_root,
                         services=normalized_services,
                     ),
+                    progress_callback=progress_callback,
                 )
 
             _run_phase(
@@ -529,6 +579,7 @@ def deploy_pi_runtime(
                     remote=remote,
                     services=normalized_services,
                 ),
+                progress_callback=progress_callback,
             )
 
             service_states = _run_phase(
@@ -538,6 +589,7 @@ def deploy_pi_runtime(
                     services=normalized_services,
                     wait_timeout_s=service_wait_s,
                 ),
+                progress_callback=progress_callback,
             )
 
             _run_phase(
@@ -547,6 +599,17 @@ def deploy_pi_runtime(
                     remote_root=resolved_remote_root,
                     owner_user=settings.user,
                 ),
+                progress_callback=progress_callback,
+            )
+
+            _run_phase(
+                "ops_artifact_permissions_postcheck",
+                lambda: _verify_ops_artifact_permissions(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    owner_user=settings.user,
+                ),
+                progress_callback=progress_callback,
             )
 
             env_contract_result: dict[str, object] | None = None
@@ -560,6 +623,21 @@ def deploy_pi_runtime(
                         live_text=live_text,
                         live_search=live_search,
                     ),
+                    progress_callback=progress_callback,
+                )
+
+            retention_canary_result: dict[str, object] | None = None
+            if verify_retention_canary:
+                retention_canary_result = _run_phase(
+                    "retention_canary",
+                    lambda: _run_retention_canary_with_progress(
+                        remote=remote,
+                        remote_root=resolved_remote_root,
+                        env_path=env_target,
+                        probe_id=f"deploy_retention_canary_{time.time_ns()}",
+                        progress_callback=progress_callback,
+                    ),
+                    progress_callback=progress_callback,
                 )
 
     return PiRuntimeDeployResult(
@@ -576,20 +654,27 @@ def deploy_pi_runtime(
         service_states=service_states,
         import_contract=import_contract_result,
         env_contract=env_contract_result,
+        retention_canary=retention_canary_result,
         duration_s=round(time.monotonic() - started, 3),
         unit_verification_summary=unit_verification_summary,
     )
 
 
-def _run_phase(phase: str, fn: Any) -> Any:
+def _run_phase(
+    phase: str,
+    fn: Any,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Any:
     """Wrap one deploy phase and normalize errors to a phase-specific type."""
 
-    try:
-        return fn()
-    except PiRuntimeDeployError:
-        raise
-    except Exception as exc:  # pragma: no cover - thin error normalization.
-        raise PiRuntimeDeployError(phase, str(exc)) from exc
+    with progress_span(progress_callback, phase=phase):
+        try:
+            return fn()
+        except PiRuntimeDeployError:
+            raise
+        except Exception as exc:  # pragma: no cover - thin error normalization.
+            raise PiRuntimeDeployError(phase, str(exc)) from exc
 
 
 def _has_nonempty_local_file(path: Path) -> bool:
@@ -922,17 +1007,6 @@ def _assert_selected_repo_units_are_remote_root_compatible(
         )
 
 
-def _assert_authoritative_repo_unchanged(*, project_root: Path, expected_entries: Any) -> None:
-    """Abort when the authoritative repo changed after the deploy snapshot."""
-
-    current_entries = build_authoritative_repo_entry_digests(project_root)
-    if current_entries != expected_entries:
-        raise PiRuntimeDeployError(
-            "repo_stability",
-            "authoritative repo changed during deploy; rerun against a stable working tree",
-        )
-
-
 def _snapshot_local_file(*, source_path: Path, snapshot_dir: Path, snapshot_name: str) -> Path:
     """Copy one mutable local file into an immutable deploy snapshot directory."""
 
@@ -942,6 +1016,175 @@ def _snapshot_local_file(*, source_path: Path, snapshot_dir: Path, snapshot_name
     target_path = snapshot_dir / snapshot_name
     shutil.copy2(source_path, target_path)
     return target_path
+
+
+def _snapshot_env_file_for_remote_sync(
+    *,
+    source_path: Path,
+    snapshot_dir: Path,
+    snapshot_name: str,
+    local_root: Path,
+    remote_root: str,
+) -> Path:
+    """Snapshot one env file while rebasing repo-owned absolute paths for the Pi."""
+
+    if not source_path.exists() or not source_path.is_file():
+        raise ValueError(f"snapshot source file does not exist: {source_path}")
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    target_path = snapshot_dir / snapshot_name
+    normalized_text = _rewrite_repo_owned_env_paths(
+        source_path.read_text(encoding="utf-8"),
+        local_root=local_root,
+        remote_root=remote_root,
+    )
+    target_path.write_text(normalized_text, encoding="utf-8")
+    shutil.copystat(source_path, target_path)
+    return target_path
+
+
+def _rewrite_repo_owned_env_paths(raw_text: str, *, local_root: Path, remote_root: str) -> str:
+    """Rewrite repo-root-owned absolute env paths so they point at `remote_root`."""
+
+    local_root_resolved = local_root.expanduser().resolve(strict=False)
+    remote_root_posix = PurePosixPath(remote_root)
+    rewritten_lines: list[str] = []
+    for line in raw_text.splitlines(keepends=True):
+        match = re.match(r"^(?P<prefix>\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(?P<value>.*?)(?P<suffix>\r?\n?)$", line)
+        if match is None:
+            rewritten_lines.append(line)
+            continue
+        prefix = match.group("prefix")
+        value = match.group("value")
+        suffix = match.group("suffix")
+        key = prefix.split("=", 1)[0].strip()
+        if key not in _REMOTE_ROOT_REBASED_ENV_KEYS:
+            rewritten_lines.append(line)
+            continue
+        stripped = value.strip()
+        quote = ""
+        unquoted = stripped
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+            quote = stripped[0]
+            unquoted = stripped[1:-1]
+        rebased_value = _rebase_repo_owned_env_path(
+            unquoted,
+            local_root=local_root_resolved,
+            remote_root=remote_root_posix,
+        )
+        if rebased_value is None:
+            rewritten_lines.append(line)
+            continue
+        rendered_value = f"{quote}{rebased_value}{quote}" if quote else rebased_value
+        rewritten_lines.append(f"{prefix}{rendered_value}{suffix}")
+    return "".join(rewritten_lines)
+
+
+def _rebase_repo_owned_env_path(
+    raw_value: str,
+    *,
+    local_root: Path,
+    remote_root: PurePosixPath,
+) -> str | None:
+    """Rebase one repo-owned absolute env path onto the Pi acceptance checkout."""
+
+    resolved_value = Path(raw_value).expanduser().resolve(strict=False)
+    if not resolved_value.is_absolute():
+        return None
+    if resolved_value.is_relative_to(local_root):
+        relative_tail = PurePosixPath(resolved_value.relative_to(local_root).as_posix())
+        return str(remote_root / relative_tail)
+    parts = resolved_value.parts
+    for index in range(len(parts) - 1):
+        if parts[index] != "state" or parts[index + 1] != "forensics":
+            continue
+        return str(remote_root / PurePosixPath(*parts[index:]))
+    return None
+
+
+def _run_retention_canary_with_progress(
+    *,
+    remote: _PiRemoteExecutor,
+    remote_root: str,
+    env_path: str,
+    probe_id: str,
+    progress_callback: ProgressCallback | None,
+) -> dict[str, object]:
+    """Run the retention canary while emitting heartbeat progress for long waits."""
+
+    result_box: dict[str, dict[str, object]] = {}
+    error_box: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        try:
+            result_box["value"] = _run_retention_canary_probe(
+                remote=remote,
+                remote_root=remote_root,
+                env_path=env_path,
+                probe_id=probe_id,
+            )
+        except BaseException as exc:  # pragma: no cover - propagated after the worker joins.
+            error_box["error"] = exc
+
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="start",
+        step="remote_probe",
+        detail=probe_id,
+    )
+    started = time.monotonic()
+    worker = threading.Thread(target=_worker, name=f"retention-canary-{probe_id}", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(timeout=_RETENTION_CANARY_HEARTBEAT_S)
+        if worker.is_alive():
+            emit_deploy_progress(
+                progress_callback,
+                phase="retention_canary",
+                event="heartbeat",
+                step="remote_probe",
+                detail=probe_id,
+                elapsed_s=time.monotonic() - started,
+            )
+    if "error" in error_box:
+        exc = error_box["error"]
+        emit_deploy_progress(
+            progress_callback,
+            phase="retention_canary",
+            event="error",
+            step="remote_probe",
+            detail=probe_id,
+            elapsed_s=time.monotonic() - started,
+            extra={"error_type": type(exc).__name__, "error": str(exc)},
+        )
+        raise exc
+    result = result_box["value"]
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="end",
+        step="remote_probe",
+        detail=str(result.get("report_path") or probe_id),
+        elapsed_s=time.monotonic() - started,
+        extra={"ready": bool(result.get("ready")), "status": str(result.get("status", ""))},
+    )
+    return result
+
+
+def _retarget_mirror_watchdog_project_root(watchdog: object, *, project_root: Path) -> object:
+    """Point an injected mirror watchdog at the deploy-local repo snapshot."""
+
+    resolved_root = Path(project_root).resolve()
+    setattr(watchdog, "project_root", resolved_root)
+    invalidate_cache = getattr(watchdog, "_invalidate_nonportable_paths_cache", None)
+    if callable(invalidate_cache):
+        invalidate_cache()
+    else:
+        if hasattr(watchdog, "_nonportable_paths_cache"):
+            setattr(watchdog, "_nonportable_paths_cache", None)
+        if hasattr(watchdog, "_nonportable_paths_cache_expires_at"):
+            setattr(watchdog, "_nonportable_paths_cache_expires_at", 0.0)
+    return watchdog
 
 
 def _compute_remote_lock_ttl(*, timeout_s: float, service_wait_s: float) -> int:

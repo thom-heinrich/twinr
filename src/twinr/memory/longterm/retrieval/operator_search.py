@@ -20,6 +20,7 @@ from twinr.memory.longterm.core.models import (
     LongTermMidtermPacketV1,
 )
 from twinr.memory.longterm.proactive.state import LongTermProactiveStateStore
+from twinr.memory.longterm.reasoning.conversation_recall import query_has_conversation_recap_semantics
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
@@ -132,7 +133,12 @@ class LongTermOperatorSearch:
         """Search the real long-term retrieval stack for one operator query."""
 
         normalized_query = _normalize_query_text(query_text)
-        query_profile = self.query_rewriter.profile(normalized_query)
+        is_conversation_recap = query_has_conversation_recap_semantics(normalized_query)
+        query_profile = (
+            LongTermQueryProfile.from_text(normalized_query)
+            if is_conversation_recap
+            else self.query_rewriter.profile(normalized_query)
+        )
         retrieval_text = query_profile.retrieval_text
         if not retrieval_text:
             return LongTermOperatorSearchResult(
@@ -140,12 +146,6 @@ class LongTermOperatorSearch:
                 query_profile=query_profile,
             )
 
-        durable_objects = tuple(
-            self.object_store.select_relevant_objects(
-                query_text=retrieval_text,
-                limit=self.result_limit,
-            )
-        )
         episodic_entries = tuple(
             entry
             for item in self.object_store.select_relevant_episodic_objects(
@@ -155,6 +155,18 @@ class LongTermOperatorSearch:
                 require_query_match=False,
             )
             if (entry := self.retriever._episodic_entry_from_object(item)) is not None
+        )
+        if is_conversation_recap:
+            return LongTermOperatorSearchResult(
+                query_text=normalized_query,
+                query_profile=query_profile,
+                episodic_entries=episodic_entries,
+            )
+        durable_objects = tuple(
+            self.object_store.select_relevant_objects(
+                query_text=retrieval_text,
+                limit=self.result_limit,
+            )
         )
         midterm_packets = tuple(
             self.midterm_store.select_relevant_packets(

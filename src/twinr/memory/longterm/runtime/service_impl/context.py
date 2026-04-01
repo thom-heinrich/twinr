@@ -5,12 +5,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import threading
+import time
 from typing import cast
 
 from twinr.agent.workflows.forensics import workflow_event, workflow_span
+from twinr.agent.workflows.voice_turn_latency import record_voice_turn_remote_memory_ready
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.core.models import LongTermMemoryContext
-from twinr.memory.longterm.core.ontology import kind_matches
+from twinr.memory.longterm.runtime.context_snapshot import LongTermContextSnapshot
+from twinr.memory.longterm.runtime.prepared_context import (
+    PreparedContextProfile,
+    PreparedLongTermContextResolution,
+)
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteReadFailedError,
     LongTermRemoteUnavailableError,
@@ -19,8 +26,6 @@ from twinr.memory.query_normalization import LongTermQueryProfile
 
 from ._typing import ServiceMixinBase
 from .compat import (
-    _MAX_REVIEW_LIMIT,
-    _coerce_positive_int,
     _context_details,
     _writer_state_details,
     logger,
@@ -29,6 +34,17 @@ from .compat import (
 
 class LongTermMemoryServiceContextMixin(ServiceMixinBase):
     """Build normal, fast, and tool-facing provider contexts."""
+
+    def latest_context_snapshot(
+        self,
+        *,
+        profile: PreparedContextProfile,
+    ) -> LongTermContextSnapshot | None:
+        """Return the newest built long-term context snapshot for one profile."""
+
+        lock, snapshots = self._context_snapshot_state()
+        with lock:
+            return snapshots.get(profile)
 
     def prewarm_foreground_read_cache(self) -> None:
         """Warm remote-backed read caches for the first foreground text turn."""
@@ -51,10 +67,21 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                 load_document = getattr(self.graph_store, "load_document", None)
                 if callable(load_document):
                     load_document()
+        prepared_context_front = getattr(self, "prepared_context_front", None)
+        if prepared_context_front is not None:
+            refreshed = prepared_context_front.refresh_recent_async(
+                build_for_query=self._schedule_prepared_context_refresh,
+            )
+            workflow_event(
+                kind="cache",
+                msg="longterm_prewarm_prepared_context_refresh_scheduled",
+                details={"sticky_queries": refreshed},
+            )
 
     def build_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build the normal long-term context injected into provider prompts."""
 
+        started_at = time.monotonic()
         try:
             query = self.query_rewriter.profile(query_text)
             writer_details = _writer_state_details(getattr(self, "writer", None))
@@ -92,22 +119,30 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                         details=dict(exc.details),
                     )
                     topic_context = None
-                with self._temporary_remote_probe_cache():
-                    with workflow_span(
-                        name="longterm_service_provider_context_retrieval",
-                        kind="retrieval",
-                        details={"query_present": bool(str(query_text or "").strip())},
-                    ):
-                        context = self.retriever.build_context(
-                            query=query,
-                            original_query_text=query_text,
-                        )
+                resolution = self._consume_prepared_context(
+                    profile="provider",
+                    query=query,
+                    build_context=lambda: self._build_provider_context_uncached(
+                        query=query,
+                        original_query_text=query_text,
+                    ),
+                )
+                context = resolution.context
                 if topic_context:
                     context = replace(context, topic_context=topic_context)
+                self._remember_context_snapshot(
+                    profile="provider",
+                    query=query,
+                    context=context,
+                    source=resolution.source,
+                )
                 workflow_event(
                     kind="retrieval",
                     msg="longterm_provider_context_built",
-                    details=_context_details(context),
+                    details={
+                        **_context_details(context),
+                        "prepared_source": resolution.source,
+                    },
                 )
                 return context
         except LongTermRemoteUnavailableError:
@@ -115,12 +150,17 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         except Exception:
             logger.exception("Failed to build long-term provider context.")
             return LongTermMemoryContext()
+        finally:
+            record_voice_turn_remote_memory_ready(
+                duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            )
 
     def build_fast_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build a tiny topic-memory context for latency-sensitive answer paths."""
 
         if not self.config.long_term_memory_enabled or not self.config.long_term_memory_fast_topic_enabled:
             return LongTermMemoryContext()
+        started_at = time.monotonic()
         try:
             query = LongTermQueryProfile.from_text(query_text)
             writer_details = _writer_state_details(getattr(self, "writer", None))
@@ -150,6 +190,10 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         except Exception:
             logger.exception("Failed to build fast long-term provider context.")
             return LongTermMemoryContext()
+        finally:
+            record_voice_turn_remote_memory_ready(
+                duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            )
 
     def _build_quick_topic_context(
         self,
@@ -202,9 +246,15 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
             )
             return None
 
-    def build_tool_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+    def build_tool_provider_context(
+        self,
+        query_text: str | None,
+        *,
+        include_graph_fallback: bool = True,
+    ) -> LongTermMemoryContext:
         """Build a tool-facing context with sensitive details redacted."""
 
+        started_at = time.monotonic()
         try:
             query = self.query_rewriter.profile(query_text)
             writer_details = _writer_state_details(getattr(self, "writer", None))
@@ -227,59 +277,29 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                         "multimodal_writer": multimodal_writer_details,
                     },
                 )
-                with self._temporary_remote_probe_cache():
-                    context = self.retriever.build_context(
+                resolution = self._consume_prepared_context(
+                    profile="tool",
+                    query=query,
+                    build_context=lambda: self._build_tool_provider_context_uncached(
                         query=query,
                         original_query_text=query_text,
-                    )
-                    recall_limit = max(
-                        1,
-                        _coerce_positive_int(
-                            getattr(self.config, "long_term_memory_recall_limit", 1),
-                            default=1,
-                            maximum=_MAX_REVIEW_LIMIT,
-                        ),
-                    )
-                    conflict_queue = self.retriever.select_conflict_queue(
-                        query=query,
-                        limit=recall_limit,
-                    )
-                    conflicting_memory_ids = {
-                        option.memory_id
-                        for item in conflict_queue
-                        for option in item.options
-                    }
-                    durable_objects = self.retriever.select_durable_objects(
-                        query=query,
-                        limit=recall_limit,
-                    )
-                    filtered_durable_objects = tuple(
-                        item
-                        for item in durable_objects
-                        if not kind_matches(
-                            item.kind,
-                            "fact",
-                            item.attributes,
-                            attr_key="fact_type",
-                            attr_value="contact_method",
-                        )
-                        and item.memory_id not in conflicting_memory_ids
-                    )
-                    tool_context = LongTermMemoryContext(
-                        subtext_context=context.subtext_context,
-                        midterm_context=context.midterm_context,
-                        durable_context=self.retriever._render_durable_context(filtered_durable_objects),
-                        episodic_context=context.episodic_context,
-                        graph_context=self.graph_store.build_prompt_context(
-                            query.retrieval_text or query.original_text,
-                            include_contact_methods=False,
-                        ),
-                        conflict_context=None,
-                    )
+                        include_graph_fallback=include_graph_fallback,
+                    ),
+                )
+                tool_context = resolution.context
+                self._remember_context_snapshot(
+                    profile="tool",
+                    query=query,
+                    context=tool_context,
+                    source=resolution.source,
+                )
                 workflow_event(
                     kind="retrieval",
                     msg="longterm_tool_provider_context_built",
-                    details=_context_details(tool_context),
+                    details={
+                        **_context_details(tool_context),
+                        "prepared_source": resolution.source,
+                    },
                 )
                 return tool_context
         except LongTermRemoteUnavailableError:
@@ -287,3 +307,198 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         except Exception:
             logger.exception("Failed to build tool-facing long-term provider context.")
             return LongTermMemoryContext()
+        finally:
+            record_voice_turn_remote_memory_ready(
+                duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
+            )
+
+    def prewarm_provider_context(
+        self,
+        query_text: str | None,
+        *,
+        tool_context: bool = False,
+        sticky: bool = False,
+        rewrite_query: bool = False,
+    ) -> bool:
+        """Schedule a prepared provider-context build outside the answer hot path."""
+
+        prepared_context_front = getattr(self, "prepared_context_front", None)
+        if prepared_context_front is None or not self.config.long_term_memory_enabled:
+            return False
+        normalized_text = str(query_text or "").strip()
+        if not normalized_text:
+            return False
+        profile_name: PreparedContextProfile = "tool" if tool_context else "provider"
+        query = self.query_rewriter.profile(query_text) if rewrite_query else LongTermQueryProfile.from_text(query_text)
+        key_texts = self._prepared_context_key_texts(query)
+        if not key_texts:
+            return False
+        if tool_context:
+            def build_context() -> LongTermMemoryContext:
+                return self._build_tool_provider_context_uncached(
+                    query=query,
+                    original_query_text=query_text,
+                    include_graph_fallback=True,
+                )
+        else:
+            def build_context() -> LongTermMemoryContext:
+                return self._build_provider_context_uncached(
+                    query=query,
+                    original_query_text=query_text,
+                )
+        scheduled = prepared_context_front.prime_async(
+            profile=profile_name,
+            cache_key_texts=key_texts,
+            sticky_query_text=query.original_text or query.retrieval_text,
+            build_context=build_context,
+            sticky=sticky,
+        )
+        workflow_event(
+            kind="cache",
+            msg="longterm_prepared_context_prewarm_requested",
+            details={
+                "profile": profile_name,
+                "scheduled": scheduled,
+                "sticky": sticky,
+                "rewrite_query": rewrite_query,
+                "query_present": bool(normalized_text),
+            },
+        )
+        return scheduled
+
+    def _build_provider_context_uncached(
+        self,
+        *,
+        query: LongTermQueryProfile,
+        original_query_text: str | None,
+    ) -> LongTermMemoryContext:
+        with self._temporary_remote_probe_cache():
+            with workflow_span(
+                name="longterm_service_provider_context_retrieval",
+                kind="retrieval",
+                details={
+                    "query_present": bool(query.retrieval_text),
+                    "prepared_query": True,
+                },
+            ):
+                return self.retriever.build_context(
+                    query=query,
+                    original_query_text=original_query_text,
+                )
+
+    def _build_tool_provider_context_uncached(
+        self,
+        *,
+        query: LongTermQueryProfile,
+        original_query_text: str | None,
+        include_graph_fallback: bool = True,
+    ) -> LongTermMemoryContext:
+        with self._temporary_remote_probe_cache():
+            return self.retriever.build_tool_context(
+                query=query,
+                original_query_text=original_query_text,
+                include_graph_fallback=include_graph_fallback,
+            )
+
+    def _consume_prepared_context(
+        self,
+        *,
+        profile: PreparedContextProfile,
+        query: LongTermQueryProfile,
+        build_context: Callable[[], LongTermMemoryContext],
+    ) -> PreparedLongTermContextResolution:
+        prepared_context_front = getattr(self, "prepared_context_front", None)
+        if prepared_context_front is None:
+            return PreparedLongTermContextResolution(context=build_context(), source="built_sync")
+        return prepared_context_front.consume_or_build(
+            profile=profile,
+            cache_key_texts=self._prepared_context_key_texts(query),
+            sticky_query_text=query.original_text or query.retrieval_text,
+            build_context=build_context,
+        )
+
+    def _prepared_context_key_texts(self, query: LongTermQueryProfile) -> tuple[str, ...]:
+        candidates = (
+            query.retrieval_text,
+            query.original_text,
+            query.canonical_english_text or "",
+        )
+        ordered: list[str] = []
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+        return tuple(ordered)
+
+    def _schedule_prepared_context_refresh(
+        self,
+        profile: PreparedContextProfile,
+        query_text: str,
+    ) -> None:
+        self.prewarm_provider_context(
+            query_text,
+            tool_context=profile == "tool",
+            sticky=True,
+            rewrite_query=True,
+        )
+
+    def _invalidate_prepared_contexts(
+        self,
+        *,
+        reason: str,
+        refresh_recent: bool = True,
+    ) -> None:
+        prepared_context_front = getattr(self, "prepared_context_front", None)
+        if prepared_context_front is None:
+            return
+        generation = prepared_context_front.invalidate()
+        refreshed = 0
+        if refresh_recent:
+            refreshed = prepared_context_front.refresh_recent_async(
+                build_for_query=self._schedule_prepared_context_refresh,
+            )
+        workflow_event(
+            kind="cache",
+            msg="longterm_prepared_context_invalidated",
+            details={
+                "reason": reason,
+                "generation": generation,
+                "refresh_recent": refresh_recent,
+                "sticky_queries": prepared_context_front.sticky_query_count(),
+                "refresh_scheduled": refreshed,
+            },
+        )
+
+    def _context_snapshot_state(
+        self,
+    ) -> tuple[threading.RLock, dict[str, LongTermContextSnapshot]]:
+        """Return the mutable store that tracks the newest built context snapshots."""
+
+        lock = getattr(self, "_context_snapshot_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            setattr(self, "_context_snapshot_lock", lock)
+        snapshots = getattr(self, "_latest_context_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            setattr(self, "_latest_context_snapshots", snapshots)
+        return lock, cast(dict[str, LongTermContextSnapshot], snapshots)
+
+    def _remember_context_snapshot(
+        self,
+        *,
+        profile: PreparedContextProfile,
+        query: LongTermQueryProfile,
+        context: LongTermMemoryContext,
+        source: str,
+    ) -> None:
+        """Persist the latest built provider/tool context for operator inspection."""
+
+        lock, snapshots = self._context_snapshot_state()
+        with lock:
+            snapshots[profile] = LongTermContextSnapshot(
+                profile=profile,
+                query_profile=query,
+                context=context,
+                source=str(source or "built_sync"),
+            )

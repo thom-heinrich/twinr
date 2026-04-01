@@ -1,7 +1,9 @@
 # CHANGELOG: 2026-03-30
 # BUG-1: Repair a missing trailing newline before append so a torn/corrupt last record cannot poison the next valid JSONL entry.
 # BUG-2: Bound event/message/data payload sizes and rotate/compress the file with retention so the store cannot grow without limit on Raspberry Pi 4 deployments.
-# SEC-1: Replace path prechecks with dirfd-based O_NOFOLLOW traversal plus 0600/0700 permissions to close practical symlink/permission attacks on the local filesystem.
+# BUG-3: Keep the live current ops event stream writable for both Pi services and operator probes; 0644
+# BUG-3: on a root-owned current file caused real PermissionError failures in the operator-facing probe path.
+# SEC-1: Keep dirfd-based O_NOFOLLOW traversal while moving the sanitized ops-event file onto an explicit cross-service mode contract so Pi runtime and operator diagnostics can share the same store safely.
 # SEC-2: Extend secret redaction from key names to free-text values (headers, URLs, bearer tokens, cookies, passwords, JWTs) so sensitive material is not persisted verbatim.
 # IMP-1: Add OTel-aligned metadata (schema_version, record_id, observed_at, severity_number, trace/span promotion) while preserving the original append()/tail() contract.
 # IMP-2: tail() now spans rotated archives, and archive compression is configurable (gzip by default for filelog compatibility, zstd optional on Python 3.14+).
@@ -46,8 +48,10 @@ _NOFOLLOW_FLAG: Final[int] = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC_FLAG: Final[int] = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAG: Final[int] = getattr(os, "O_DIRECTORY", 0)
 
-_DIR_MODE: Final[int] = 0o700
-_FILE_MODE: Final[int] = 0o600
+_DIR_MODE: Final[int] = 0o755
+_CURRENT_FILE_MODE: Final[int] = 0o666
+_ARCHIVE_FILE_MODE: Final[int] = 0o644
+_LOCK_FILE_MODE: Final[int] = 0o666
 
 _REVERSE_READ_CHUNK_SIZE: Final[int] = 4096
 _STREAM_COPY_CHUNK_SIZE: Final[int] = 1024 * 1024
@@ -545,6 +549,7 @@ class TwinrOpsEventStore:
         parent_fd: int,
         name: str,
         *,
+        file_mode: int,
         read: bool,
         write: bool,
         create: bool = False,
@@ -568,12 +573,12 @@ class TwinrOpsEventStore:
         if exclusive_create:
             flags |= os.O_EXCL
 
-        fd = os.open(name, flags, _FILE_MODE, dir_fd=parent_fd)
+        fd = os.open(name, flags, file_mode, dir_fd=parent_fd)
         try:
             _ensure_regular_fd(fd, path_hint=str(self.path.parent / name))
             if write:
                 try:
-                    os.fchmod(fd, _FILE_MODE)
+                    os.fchmod(fd, file_mode)
                 except OSError:
                     pass
             return fd
@@ -582,7 +587,23 @@ class TwinrOpsEventStore:
             raise
 
     def _open_lock_fd(self, parent_fd: int) -> int:
-        return self._open_regular_file_at(parent_fd, self._lock_filename, read=True, write=True, create=True)
+        return self._open_regular_file_at(
+            parent_fd,
+            self._lock_filename,
+            file_mode=_LOCK_FILE_MODE,
+            read=True,
+            write=True,
+            create=True,
+        )
+
+    def _chmod_path_at(self, parent_fd: int, name: str, mode: int) -> None:
+        """Refresh one regular file mode without following symlinks."""
+
+        fd = self._open_regular_file_at(parent_fd, name, file_mode=mode, read=True, write=False)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
 
     def _archive_names(self, parent_fd: int) -> list[str]:
         names: list[str] = []
@@ -629,11 +650,12 @@ class TwinrOpsEventStore:
             return source_name
 
         target_name = source_name + suffix
-        source_fd = self._open_regular_file_at(parent_fd, source_name, read=True, write=False)
+        source_fd = self._open_regular_file_at(parent_fd, source_name, file_mode=_ARCHIVE_FILE_MODE, read=True, write=False)
         try:
             target_fd = self._open_regular_file_at(
                 parent_fd,
                 target_name,
+                file_mode=_ARCHIVE_FILE_MODE,
                 read=False,
                 write=True,
                 create=True,
@@ -656,7 +678,13 @@ class TwinrOpsEventStore:
                     else:
                         return source_name
             if self.fsync_enabled:
-                compressed_fd = self._open_regular_file_at(parent_fd, target_name, read=True, write=False)
+                compressed_fd = self._open_regular_file_at(
+                    parent_fd,
+                    target_name,
+                    file_mode=_ARCHIVE_FILE_MODE,
+                    read=True,
+                    write=False,
+                )
                 try:
                     _fdatasync(compressed_fd)
                 finally:
@@ -672,7 +700,13 @@ class TwinrOpsEventStore:
 
     def _rotate_locked(self, parent_fd: int) -> bool:
         try:
-            current_fd = self._open_regular_file_at(parent_fd, self.path.name, read=True, write=False)
+            current_fd = self._open_regular_file_at(
+                parent_fd,
+                self.path.name,
+                file_mode=_CURRENT_FILE_MODE,
+                read=True,
+                write=False,
+            )
         except FileNotFoundError:
             return False
 
@@ -686,6 +720,7 @@ class TwinrOpsEventStore:
 
         rotated_name = f"{self.path.name}.{_filename_timestamp()}.{_time_ordered_id()}"
         os.rename(self.path.name, rotated_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        self._chmod_path_at(parent_fd, rotated_name, _ARCHIVE_FILE_MODE)
         final_name = self._compress_archive_locked(parent_fd, rotated_name)
         del final_name  # reserved for future hooks / metrics
 
@@ -722,16 +757,16 @@ class TwinrOpsEventStore:
         if limit <= 0:
             return []
         if name.endswith(".gz"):
-            archive_fd = self._open_regular_file_at(parent_fd, name, read=True, write=False)
+            archive_fd = self._open_regular_file_at(parent_fd, name, file_mode=_ARCHIVE_FILE_MODE, read=True, write=False)
             with os.fdopen(archive_fd, "rb", closefd=True) as raw_file:
                 with gzip.GzipFile(fileobj=raw_file, mode="rb") as compressed_file:
                     return self._tail_from_stream(compressed_file, limit=limit)
         if name.endswith(".zst") and _zstd is not None:
-            archive_fd = self._open_regular_file_at(parent_fd, name, read=True, write=False)
+            archive_fd = self._open_regular_file_at(parent_fd, name, file_mode=_ARCHIVE_FILE_MODE, read=True, write=False)
             with os.fdopen(archive_fd, "rb", closefd=True) as raw_file:
                 with _zstd.open(raw_file, "rb") as compressed_file:
                     return self._tail_from_stream(compressed_file, limit=limit)
-        archive_fd = self._open_regular_file_at(parent_fd, name, read=True, write=False)
+        archive_fd = self._open_regular_file_at(parent_fd, name, file_mode=_ARCHIVE_FILE_MODE, read=True, write=False)
         try:
             return self._tail_from_fd(archive_fd, limit=limit)
         finally:
@@ -787,6 +822,7 @@ class TwinrOpsEventStore:
                     current_fd = self._open_regular_file_at(
                         parent_fd,
                         self.path.name,
+                        file_mode=_CURRENT_FILE_MODE,
                         read=True,
                         write=True,
                         create=True,
@@ -796,6 +832,7 @@ class TwinrOpsEventStore:
                     current_fd = self._open_regular_file_at(
                         parent_fd,
                         self.path.name,
+                        file_mode=_CURRENT_FILE_MODE,
                         read=True,
                         write=True,
                         create=True,
@@ -814,6 +851,7 @@ class TwinrOpsEventStore:
                 current_fd = self._open_regular_file_at(
                     parent_fd,
                     self.path.name,
+                    file_mode=_CURRENT_FILE_MODE,
                     read=True,
                     write=True,
                     create=True,
@@ -860,7 +898,13 @@ class TwinrOpsEventStore:
             entries: deque[dict[str, object]] = deque(maxlen=normalized_limit)
 
             try:
-                current_fd = self._open_regular_file_at(parent_fd, self.path.name, read=True, write=False)
+                    current_fd = self._open_regular_file_at(
+                        parent_fd,
+                        self.path.name,
+                        file_mode=_CURRENT_FILE_MODE,
+                        read=True,
+                        write=False,
+                    )
             except FileNotFoundError:
                 current_fd = None
             except OSError:

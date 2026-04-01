@@ -7,10 +7,16 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
+from twinr.memory.longterm.reasoning.conversation_recall import (
+    conversation_recap_query_variants,
+    is_conversation_episode_object,
+    query_has_conversation_recap_semantics,
+)
 
 from .shared import _LOG, _coerce_aware_utc, _normalize_text
 
 _LIVE_OBJECT_STATUSES = frozenset({"active", "candidate", "uncertain"})
+_REMOTE_RECAP_EPISODIC_WINDOW = 48
 
 
 class StructuredStoreRemoteSelectionMixin:
@@ -555,6 +561,13 @@ class StructuredStoreRemoteSelectionMixin:
             return None
         bounded_limit = max(1, limit)
         clean_query = _normalize_text(query_text)
+        recap_query = include_episodes and query_has_conversation_recap_semantics(clean_query)
+        query_variants = (
+            conversation_recap_query_variants(clean_query)
+            if recap_query
+            else ((clean_query,) if clean_query else ())
+        )
+        effective_query_text = " ".join(query_variants) if query_variants else clean_query
 
         def eligible(entry: object) -> bool:
             metadata = getattr(entry, "metadata", None)
@@ -565,7 +578,21 @@ class StructuredStoreRemoteSelectionMixin:
             if status not in {"active", "candidate", "uncertain"}:
                 return False
             if include_episodes:
-                return kind == "episode"
+                if kind != "episode":
+                    return False
+                if recap_query:
+                    projection = self._catalog_entry_projection(entry)
+                    projection_attributes = (
+                        projection.get("attributes")
+                        if isinstance(projection.get("attributes"), Mapping)
+                        else None
+                    )
+                    if projection and projection_attributes is not None:
+                        return is_conversation_episode_object(
+                            kind=projection.get("kind"),
+                            attributes=projection_attributes,
+                        )
+                return True
             return kind != "episode"
 
         if not clean_query:
@@ -579,13 +606,21 @@ class StructuredStoreRemoteSelectionMixin:
             return self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects")
 
         try:
-            direct_payloads = remote_catalog.search_current_item_payloads(
-                snapshot_kind="objects",
-                query_text=clean_query,
-                limit=bounded_limit,
-                eligible=eligible,
-                allow_catalog_fallback=False,
-            )
+            direct_payloads: tuple[dict[str, object], ...] | None = ()
+            for candidate_query in query_variants:
+                candidate_payloads = remote_catalog.search_current_item_payloads(
+                    snapshot_kind="objects",
+                    query_text=candidate_query,
+                    limit=bounded_limit,
+                    eligible=eligible,
+                    allow_catalog_fallback=False,
+                )
+                if candidate_payloads is None:
+                    direct_payloads = None
+                    break
+                if candidate_payloads:
+                    direct_payloads = candidate_payloads
+                    break
         except Exception:
             if self._remote_is_required():
                 raise
@@ -593,15 +628,41 @@ class StructuredStoreRemoteSelectionMixin:
         if direct_payloads is not None:
             if direct_payloads:
                 selected = list(self._load_remote_objects_from_payloads(payloads=direct_payloads))
-                filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+                filtered = list(
+                    self._filter_query_relevant_objects(
+                        effective_query_text,
+                        selected=selected,
+                        limit=bounded_limit,
+                    )
+                )
                 if filtered:
                     return self.rank_selected_objects(
-                        query_texts=(clean_query,),
+                        query_texts=query_variants or (clean_query,),
                         objects=filtered,
                         limit=bounded_limit,
                     )
+                if recap_query:
+                    rescued = self._remote_select_recent_recap_episodes(
+                        remote_catalog=remote_catalog,
+                        eligible=eligible,
+                        query_text=effective_query_text,
+                        query_texts=query_variants or (clean_query,),
+                        limit=bounded_limit,
+                    )
+                    if rescued:
+                        return rescued
                 return ()
             if include_episodes:
+                if recap_query:
+                    rescued = self._remote_select_recent_recap_episodes(
+                        remote_catalog=remote_catalog,
+                        eligible=eligible,
+                        query_text=effective_query_text,
+                        query_texts=query_variants or (clean_query,),
+                        limit=bounded_limit,
+                    )
+                    if rescued:
+                        return rescued
                 return ()
 
         try:
@@ -681,6 +742,34 @@ class StructuredStoreRemoteSelectionMixin:
             query_texts=(clean_query,),
             objects=filtered,
             limit=bounded_limit,
+        )
+
+    def _remote_select_recent_recap_episodes(
+        self,
+        *,
+        remote_catalog,
+        eligible: Callable[[object], bool],
+        query_text: str,
+        query_texts: tuple[str, ...],
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load a bounded recent episodic window for generic conversation recaps."""
+
+        recent_entries = remote_catalog.top_catalog_entries(
+            snapshot_kind="objects",
+            limit=max(_REMOTE_RECAP_EPISODIC_WINDOW, max(1, int(limit))),
+            eligible=eligible,
+        )
+        if not recent_entries:
+            return ()
+        selected = list(self._load_remote_objects_from_entries(entries=recent_entries, snapshot_kind="objects"))
+        filtered = list(self._filter_query_relevant_objects(query_text, selected=selected, limit=max(1, int(limit))))
+        if not filtered:
+            return ()
+        return self.rank_selected_objects(
+            query_texts=query_texts or (query_text,),
+            objects=filtered,
+            limit=max(1, int(limit)),
         )
 
     def _remote_select_conflicts(

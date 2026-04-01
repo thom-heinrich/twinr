@@ -5,7 +5,8 @@
 # BUG-2: instead of requiring only `active/running`.
 # SEC-1: SSH host-key verification is no longer disabled by default. The default policy is now
 # SEC-1: `accept-new` with a dedicated known_hosts file, with explicit opt-in required for insecure mode.
-# SEC-2: Shared runtime state files are no longer world-writable/readable; permissions are now owner-only.
+# SEC-2: Runtime state files stay owner-only, while the shared ops event stream now has an explicit
+# SEC-2: cross-user writer contract so Pi services and operator probes append to the same diagnostics file.
 # IMP-1: Remote file sync now stages in the target directory and atomically renames into place after checksum verification.
 # IMP-2: Deploy-time package validation now uses pip's modern dry-run/report flow when available and always runs `pip check`.
 # IMP-3: systemd units are verified with `systemd-analyze verify` before enable/restart.
@@ -32,6 +33,7 @@ import tempfile
 import time
 from typing import Any, Sequence
 
+from twinr.ops.deploy_progress import ProgressCallback, progress_span
 from twinr.ops.pi_repo_mirror import PiRepoMirrorEntryDigest
 from twinr.ops.self_coding_pi import PiConnectionSettings
 from twinr.ops.venv_bridged_system_cleanup import BridgedSystemShadowedDistribution
@@ -55,6 +57,13 @@ _STATE_PERMISSION_SPECS: tuple[tuple[str, str], ...] = (
     ("user_discovery.json", "600"),
 )
 _STATE_DIR_MODE = "700"
+_OPS_DIR_MODE = "700"
+_OPS_ARTIFACT_PERMISSION_SPECS: tuple[tuple[str, str], ...] = (
+    ("events.jsonl", "666"),
+    (".events.jsonl.lock", "666"),
+    ("remote_memory_watchdog.json", "644"),
+    ("display_ambient_impulse.json", "644"),
+)
 _SERVICE_HEALTHY_SUBSTATES = frozenset({"running", "listening", "exited"})
 
 
@@ -558,6 +567,7 @@ def install_editable_package(
     remote: PiRemoteExecutor,
     remote_root: str,
     install_with_deps: bool,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Ensure the Pi venv exists and refresh the editable Twinr install.
 
@@ -570,20 +580,31 @@ def install_editable_package(
     """
 
     remote_python = f"{remote_root}/.venv/bin/python"
-    remote.run_ssh(
-        "\n".join(
-            (
-                f"remote_root={shlex.quote(remote_root)}",
-                f"remote_python={shlex.quote(remote_python)}",
-                "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="ensure_remote_venv",
+        detail=remote_root,
+    ):
+        remote.run_ssh(
+            "\n".join(
+                (
+                    f"remote_root={shlex.quote(remote_root)}",
+                    f"remote_python={shlex.quote(remote_python)}",
+                    "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
+                )
             )
         )
-    )
-    site_bridge_result = _bridge_remote_venv_system_site_packages(
-        remote=remote,
-        remote_root=remote_root,
-        remote_python=remote_python,
-    )
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="bridge_system_site_packages",
+    ):
+        site_bridge_result = _bridge_remote_venv_system_site_packages(
+            remote=remote,
+            remote_root=remote_root,
+            remote_python=remote_python,
+        )
     bridge_summary = ""
     if site_bridge_result.active_paths:
         path_count = len(site_bridge_result.active_paths)
@@ -592,40 +613,66 @@ def install_editable_package(
             bridge_summary = f"bridged {path_count} Pi system site-package {noun} into the venv"
         else:
             bridge_summary = f"verified Pi system site-package bridge for {path_count} {noun}"
-    shadowed_cleanup_summary = _cleanup_remote_venv_shadowed_system_distributions(
-        remote=remote,
-        remote_root=remote_root,
-        remote_python=remote_python,
-        active_system_paths=site_bridge_result.active_paths,
-    )
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="cleanup_shadowed_system_packages",
+    ):
+        shadowed_cleanup_summary = _cleanup_remote_venv_shadowed_system_distributions(
+            remote=remote,
+            remote_root=remote_root,
+            remote_python=remote_python,
+            active_system_paths=site_bridge_result.active_paths,
+        )
     pip_args = "-e \"$remote_root\"" if install_with_deps else "--no-deps -e \"$remote_root\""
-    completed = remote.run_ssh(
-        "\n".join(
-            (
-                f"remote_root={shlex.quote(remote_root)}",
-                f"remote_python={shlex.quote(remote_python)}",
-                "export PIP_DISABLE_PIP_VERSION_CHECK=1",
-                "export PYTHONUTF8=1",
-                f"\"$remote_python\" -m pip install {pip_args}",
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="pip_install_editable",
+        detail="with_deps" if install_with_deps else "no_deps",
+    ):
+        completed = remote.run_ssh(
+            "\n".join(
+                (
+                    f"remote_root={shlex.quote(remote_root)}",
+                    f"remote_python={shlex.quote(remote_python)}",
+                    "export PIP_DISABLE_PIP_VERSION_CHECK=1",
+                    "export PYTHONUTF8=1",
+                    f"\"$remote_python\" -m pip install {pip_args}",
+                )
             )
         )
-    )
     dependency_sync_summary = ""
     if not install_with_deps:
-        dependency_sync_summary = sync_project_runtime_dependencies(
+        with progress_span(
+            progress_callback,
+            phase="editable_install",
+            step="sync_runtime_dependencies",
+        ):
+            dependency_sync_summary = sync_project_runtime_dependencies(
+                remote=remote,
+                remote_root=remote_root,
+                remote_python=remote_python,
+            )
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="pip_check",
+    ):
+        package_graph_summary = verify_remote_python_package_graph(
+            remote=remote,
+            remote_python=remote_python,
+        )
+    with progress_span(
+        progress_callback,
+        phase="editable_install",
+        step="repair_venv_entrypoints",
+    ):
+        repair_result = _repair_remote_venv_python_shebangs(
             remote=remote,
             remote_root=remote_root,
             remote_python=remote_python,
         )
-    package_graph_summary = verify_remote_python_package_graph(
-        remote=remote,
-        remote_python=remote_python,
-    )
-    repair_result = _repair_remote_venv_python_shebangs(
-        remote=remote,
-        remote_root=remote_root,
-        remote_python=remote_python,
-    )
     summary_parts = [
         summarize_output(completed),
         bridge_summary,
@@ -1118,33 +1165,52 @@ def install_python_requirements_manifest(
     remote_root: str,
     manifest_relpath: str,
     label: str,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str | None = None,
 ) -> str:
     """Install one mirrored Python requirements manifest into the Pi venv."""
 
     remote_python = f"{remote_root}/.venv/bin/python"
     requirements_path = f"{remote_root}/{manifest_relpath.lstrip('/')}"
-    completed = remote.run_ssh(
-        "\n".join(
-            (
-                f"remote_root={shlex.quote(remote_root)}",
-                f"remote_python={shlex.quote(remote_python)}",
-                f"requirements_path={shlex.quote(requirements_path)}",
-                "export PIP_DISABLE_PIP_VERSION_CHECK=1",
-                "export PYTHONUTF8=1",
-                "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
-                'test -s "$requirements_path"',
-                f'echo "[{label}] installing python requirements"',
-                '"$remote_python" -m pip install -r "$requirements_path"',
+    phase_name = progress_phase or f"{label}_requirements"
+    with progress_span(
+        progress_callback,
+        phase=phase_name,
+        step="pip_install_requirements",
+        detail=manifest_relpath,
+    ):
+        completed = remote.run_ssh(
+            "\n".join(
+                (
+                    f"remote_root={shlex.quote(remote_root)}",
+                    f"remote_python={shlex.quote(remote_python)}",
+                    f"requirements_path={shlex.quote(requirements_path)}",
+                    "export PIP_DISABLE_PIP_VERSION_CHECK=1",
+                    "export PYTHONUTF8=1",
+                    "if [ ! -x \"$remote_python\" ]; then python3 -m venv \"$remote_root/.venv\"; fi",
+                    'if [ ! -s "$requirements_path" ]; then',
+                    '  echo "missing or empty Python requirements manifest: $requirements_path" >&2',
+                    '  requirements_dir=$(dirname -- "$requirements_path")',
+                    '  if [ -d "$requirements_dir" ]; then ls -la "$requirements_dir" >&2; fi',
+                    '  exit 1',
+                    'fi',
+                    f'echo "[{label}] installing python requirements"',
+                    '"$remote_python" -m pip install -r "$requirements_path"',
+                )
             )
         )
-    )
     summary_parts = [summarize_output(completed)]
-    summary_parts.append(
-        verify_remote_python_package_graph(
-            remote=remote,
-            remote_python=remote_python,
+    with progress_span(
+        progress_callback,
+        phase=phase_name,
+        step="pip_check",
+    ):
+        summary_parts.append(
+            verify_remote_python_package_graph(
+                remote=remote,
+                remote_python=remote_python,
+            )
         )
-    )
     return summarize_text("\n".join(part for part in summary_parts if part))
 
 
@@ -1420,6 +1486,7 @@ def install_browser_automation_runtime_support(
     remote_root: str,
     install_python_requirements: bool,
     install_playwright_browsers: bool,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Install mirrored browser-automation runtime requirements on the Pi.
 
@@ -1445,6 +1512,8 @@ def install_browser_automation_runtime_support(
                 remote_root=remote_root,
                 manifest_relpath="browser_automation/runtime_requirements.txt",
                 label="browser_automation",
+                progress_callback=progress_callback,
+                progress_phase="browser_automation_runtime",
             )
         )
     if install_playwright_browsers:
@@ -1513,7 +1582,13 @@ def install_browser_automation_runtime_support(
                 "PY",
             )
         )
-        completed = remote.run_ssh(script)
+        with progress_span(
+            progress_callback,
+            phase="browser_automation_runtime",
+            step="install_playwright_browsers",
+            detail="chromium_manifest",
+        ):
+            completed = remote.run_ssh(script)
         payload = json.loads((completed.stdout or "{}").strip() or "{}")
         browser_names = tuple(
             str(item).strip()
@@ -1659,6 +1734,89 @@ def verify_runtime_state_permissions(
     if not verified_paths:
         return "verified Pi runtime state permissions; no shared-state paths existed"
     return "verified Pi runtime state permissions: " + ", ".join(verified_paths)
+
+
+def repair_ops_artifact_permissions(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    owner_user: str,
+) -> str:
+    """Repair the shared ops event-store paths used by services and operator probes."""
+
+    lines = [
+        f"remote_root={shlex.quote(remote_root)}",
+        f"owner_user={shlex.quote(owner_user)}",
+        "ops_dir=\"$remote_root/artifacts/stores/ops\"",
+        f"sudo install -d -m {_OPS_DIR_MODE} -o \"$owner_user\" -g \"$owner_user\" \"$ops_dir\"",
+        f"repaired_paths=(\"$ops_dir:{_OPS_DIR_MODE}\")",
+        "repair_path_if_exists() {",
+        "  local path=\"$1\"",
+        "  local mode=\"$2\"",
+        "  if [ ! -e \"$path\" ]; then",
+        "    return 0",
+        "  fi",
+        "  sudo chown \"$owner_user:$owner_user\" \"$path\"",
+        "  sudo chmod \"$mode\" \"$path\"",
+        "  repaired_paths+=(\"$path:$mode\")",
+        "}",
+    ]
+    for relative_path, mode in _OPS_ARTIFACT_PERMISSION_SPECS:
+        lines.append(f"repair_path_if_exists \"$ops_dir/{relative_path}\" {mode}")
+    lines.append("printf '%s\\n' \"${repaired_paths[@]}\"")
+    completed = remote.run_ssh("\n".join(lines))
+    repaired_paths = tuple(line.strip() for line in (completed.stdout or "").splitlines() if line.strip())
+    if not repaired_paths:
+        return "verified Pi ops artifact permissions; no shared ops paths required repair"
+    return "repaired Pi ops artifact permissions: " + ", ".join(repaired_paths)
+
+
+def verify_ops_artifact_permissions(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    owner_user: str,
+) -> str:
+    """Verify the shared ops event-store permissions after service restart."""
+
+    lines = [
+        f"remote_root={shlex.quote(remote_root)}",
+        f"owner_user={shlex.quote(owner_user)}",
+        "ops_dir=\"$remote_root/artifacts/stores/ops\"",
+        "verified_paths=()",
+        "if [ -d \"$ops_dir\" ]; then",
+        "  actual_owner=$(stat -c '%U' \"$ops_dir\")",
+        "  actual_group=$(stat -c '%G' \"$ops_dir\")",
+        "  actual_mode=$(stat -c '%a' \"$ops_dir\")",
+        f"  if [ \"$actual_owner\" != \"$owner_user\" ] || [ \"$actual_group\" != \"$owner_user\" ] || [ \"$actual_mode\" != \"{_OPS_DIR_MODE}\" ]; then",
+        f"    echo \"$ops_dir expected $owner_user:$owner_user {_OPS_DIR_MODE} but found $actual_owner:$actual_group $actual_mode\" >&2",
+        "    exit 1",
+        "  fi",
+        f"  verified_paths+=(\"$ops_dir:{_OPS_DIR_MODE}\")",
+        "fi",
+        "verify_mode_if_exists() {",
+        "  local path=\"$1\"",
+        "  local mode=\"$2\"",
+        "  if [ ! -e \"$path\" ]; then",
+        "    return 0",
+        "  fi",
+        "  local actual_mode",
+        "  actual_mode=$(stat -c '%a' \"$path\")",
+        "  if [ \"$actual_mode\" != \"$mode\" ]; then",
+        "    echo \"$path expected mode $mode but found $actual_mode\" >&2",
+        "    exit 1",
+        "  fi",
+        "  verified_paths+=(\"$path:$mode\")",
+        "}",
+    ]
+    for relative_path, mode in _OPS_ARTIFACT_PERMISSION_SPECS:
+        lines.append(f"verify_mode_if_exists \"$ops_dir/{relative_path}\" {mode}")
+    lines.append("printf '%s\\n' \"${verified_paths[@]}\"")
+    completed = remote.run_ssh("\n".join(lines))
+    verified_paths = tuple(line.strip() for line in (completed.stdout or "").splitlines() if line.strip())
+    if not verified_paths:
+        return "verified Pi ops artifact permissions; no shared ops paths existed"
+    return "verified Pi ops artifact permissions: " + ", ".join(verified_paths)
 
 
 def restart_services(*, remote: PiRemoteExecutor, services: Sequence[str]) -> None:
@@ -1834,6 +1992,41 @@ def run_env_contract_probe(
     return json.loads((completed.stdout or "").strip() or "{}")
 
 
+def run_retention_canary_probe(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    env_path: str,
+    probe_id: str,
+) -> dict[str, object]:
+    """Run the bounded live retention canary and parse its JSON result."""
+
+    remote_python = f"{remote_root}/.venv/bin/python"
+    command = " ".join(
+        (
+            shlex.quote(remote_python),
+            "-m",
+            "twinr.memory.longterm.evaluation.live_retention_canary",
+            "--env-file",
+            shlex.quote(env_path),
+            "--probe-id",
+            shlex.quote(probe_id),
+        )
+    )
+    completed = remote.run_ssh(
+        "retention_output=$("
+        + command
+        + " 2>&1) || true; printf '%s\\n' \"$retention_output\""
+    )
+    payload = json.loads((completed.stdout or "").strip() or "{}")
+    if not bool(payload.get("ready")):
+        raise RuntimeError(
+            "retention canary failed: "
+            + summarize_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        )
+    return payload
+
+
 def parse_optional_int(value: object) -> int | None:
     """Normalize systemd numeric fields to ``int | None``."""
 
@@ -1898,14 +2091,17 @@ __all__ = [
     "parse_optional_int",
     "read_remote_sha256",
     "refresh_python_bytecode",
+    "repair_ops_artifact_permissions",
     "repair_runtime_state_permissions",
     "restart_services",
     "run_env_contract_probe",
+    "run_retention_canary_probe",
     "repair_venv_python_shebangs",
     "sshpass_env",
     "summarize_output",
     "summarize_text",
     "sync_authoritative_file",
+    "verify_ops_artifact_permissions",
     "verify_runtime_state_permissions",
     "verify_python_import_contract",
     "wait_for_services",

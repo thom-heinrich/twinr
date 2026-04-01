@@ -49,12 +49,14 @@ from twinr.hardware.respeaker.write_specs import REBOOT_PARAMETER
 _SAMPLE_WIDTH_BYTES = 2
 _DEFAULT_RECOVERY_WAIT_S = 2.5
 _POST_REBOOT_RECOVERY_WAIT_S = 8.0
+_POST_USB_RESET_RECOVERY_WAIT_S = 12.0
 _PROBE_INTERVAL_S = 0.1
 _HOTPLUG_WAIT_SLICE_S = 0.5
 _PROCESS_STOP_TIMEOUT_S = 0.25
 _SELECT_TIMEOUT_S = 0.1
 _READABLE_FRAME_GRACE_S = 0.35
 _HOST_REBOOT_COOLDOWN_S = 30.0
+_USB_RESET_COOLDOWN_S = 30.0
 _HOST_REBOOT_VALUE = 1
 _DEFAULT_SAMPLE_RATE = 16_000
 _DEFAULT_CHANNELS = 1
@@ -76,6 +78,8 @@ _UNSAFE_SUBPROCESS_ENV_KEYS = frozenset(
 )
 _HOST_REBOOT_LOCK = RLock()
 _LAST_HOST_REBOOT_ATTEMPT_AT: dict[str, float] = {}
+_USB_RESET_LOCK = RLock()
+_LAST_USB_RESET_ATTEMPT_AT: dict[str, float] = {}
 
 
 def wait_for_transient_respeaker_capture_ready(
@@ -152,10 +156,12 @@ def recover_stalled_respeaker_capture(
 ) -> bool:
     """Return whether a stalled XVF3800 capture path can be recovered.
 
-    Recovery happens in two bounded stages:
+    Recovery happens in three bounded stages:
     1. wait for a normal transient ALSA/udev recovery
     2. if that fails, issue the official XVF3800 host-control ``REBOOT`` write
        once per cooldown window and then wait for capture to come back
+    3. if capture is still missing but the USB device is visible, request one
+       libusb port reset so the kernel can re-enumerate the board cleanly
     """
 
     if wait_for_transient_respeaker_capture_ready(
@@ -171,6 +177,35 @@ def recover_stalled_respeaker_capture(
     if should_stop is not None and should_stop():
         return False
     if not _attempt_respeaker_host_control_reboot(device=device):
+        if should_stop is not None and should_stop():
+            return False
+        if not _attempt_respeaker_usb_port_reset(device=device):
+            return False
+        return wait_for_transient_respeaker_capture_ready(
+            device=device,
+            sample_rate=sample_rate,
+            channels=channels,
+            chunk_ms=chunk_ms,
+            max_wait_s=max(
+                _POST_USB_RESET_RECOVERY_WAIT_S,
+                _coerce_non_negative_float(max_wait_s, default=0.0),
+            ),
+            should_stop=should_stop,
+        )
+
+    if wait_for_transient_respeaker_capture_ready(
+        device=device,
+        sample_rate=sample_rate,
+        channels=channels,
+        chunk_ms=chunk_ms,
+        max_wait_s=max(_POST_REBOOT_RECOVERY_WAIT_S, _coerce_non_negative_float(max_wait_s, default=0.0)),
+        should_stop=should_stop,
+    ):
+        return True
+
+    if should_stop is not None and should_stop():
+        return False
+    if not _attempt_respeaker_usb_port_reset(device=device):
         return False
 
     return wait_for_transient_respeaker_capture_ready(
@@ -178,7 +213,10 @@ def recover_stalled_respeaker_capture(
         sample_rate=sample_rate,
         channels=channels,
         chunk_ms=chunk_ms,
-        max_wait_s=max(_POST_REBOOT_RECOVERY_WAIT_S, _coerce_non_negative_float(max_wait_s, default=0.0)),
+        max_wait_s=max(
+            _POST_USB_RESET_RECOVERY_WAIT_S,
+            _coerce_non_negative_float(max_wait_s, default=0.0),
+        ),
         should_stop=should_stop,
     )
 
@@ -206,6 +244,32 @@ def _attempt_respeaker_host_control_reboot(*, device: str) -> bool:
             (_HOST_REBOOT_VALUE,),
             probe=probe,
         )
+        return bool(availability.available)
+    except Exception:
+        return False
+    finally:
+        transport.close()
+
+
+def _attempt_respeaker_usb_port_reset(*, device: str) -> bool:
+    normalized_device = str(device or "").strip()
+    if not config_targets_respeaker(normalized_device):
+        return False
+
+    now = time.monotonic()
+    with _USB_RESET_LOCK:
+        last_attempt_at = _LAST_USB_RESET_ATTEMPT_AT.get(normalized_device)
+        if last_attempt_at is not None and (now - last_attempt_at) < _USB_RESET_COOLDOWN_S:
+            return False
+        _LAST_USB_RESET_ATTEMPT_AT[normalized_device] = now
+
+    probe = probe_respeaker_xvf3800()
+    if not getattr(probe, "usb_visible", False):
+        return False
+
+    transport = ReSpeakerLibusbTransport()
+    try:
+        availability = transport.reset_device()
         return bool(availability.available)
     except Exception:
         return False

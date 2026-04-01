@@ -36,12 +36,18 @@ from twinr.agent.base_agent.conversation.follow_up_context import (
     pending_conversation_follow_up_hint_scope,
 )
 from twinr.agent.base_agent.contracts import StreamingSpeechToTextProvider
+from twinr.agent.workflows.forensics import current_workflow_trace_id
 from twinr.agent.workflows.listen_timeout_diagnostics import (
     diagnostics_from_exception,
     emit_listen_timeout_diagnostics,
 )
 from twinr.agent.workflows.playback_coordinator import PlaybackPriority
 from twinr.agent.workflows.print_lane import PrintLaneRequest
+from twinr.agent.workflows.voice_turn_latency import (
+    emit_voice_turn_latency_breakdown,
+    mark_voice_turn_supervisor_ready,
+    mark_voice_turn_tts_started,
+)
 from twinr.hardware.audio import normalize_wav_playback_level, pcm16_to_wav_bytes
 
 
@@ -745,6 +751,8 @@ class TwinrRealtimeTurnExecutionMixin:
         self._emit_status(force=True)
         self._notify_voice_orchestrator_state("thinking", detail=listen_source)
         stop_processing_feedback = self._start_working_feedback_loop("processing")
+        workflow_trace_id = current_workflow_trace_id()
+        mark_voice_turn_supervisor_ready(trace_id=workflow_trace_id)
 
         def stop_answering_feedback() -> None:
             return None
@@ -879,6 +887,7 @@ class TwinrRealtimeTurnExecutionMixin:
             if first_audio_at[0] is None:
                 stop_answering_feedback()
                 first_audio_at[0] = time.monotonic()
+                mark_voice_turn_tts_started(trace_id=workflow_trace_id)
                 ensure_playback_started()
             enqueue_audio_chunk(chunk)
 
@@ -1097,6 +1106,11 @@ class TwinrRealtimeTurnExecutionMixin:
         elif first_audio_at[0] is not None:
             self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
+        emit_voice_turn_latency_breakdown(
+            emit=self.emit,
+            trace_event=self._trace_event,
+            trace_id=workflow_trace_id,
+        )
         if interrupt_event.is_set() and not force_close:
             return self._run_interrupt_follow_up_turn()
         if not force_close and follow_up_mode == "remote":

@@ -147,6 +147,47 @@ class WorkflowForensicsTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
+    def test_forensics_rebases_foreign_repo_trace_dir_back_into_active_project_root(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            foreign_trace_dir = Path("/home/thh/twinr/state/forensics/workflow_host_voice")
+            (project_root / ".env").write_text(
+                "\n".join(
+                    [
+                        'TWINR_WORKFLOW_TRACE_ENABLED="1"',
+                        'TWINR_WORKFLOW_TRACE_MODE="forensic"',
+                        f'TWINR_WORKFLOW_TRACE_DIR="{foreign_trace_dir}"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            expected_trace_dir = project_root / "state" / "forensics" / "workflow_host_voice"
+            previous_env = {
+                key: os.environ.get(key)
+                for key in (
+                    "TWINR_WORKFLOW_TRACE_ENABLED",
+                    "TWINR_WORKFLOW_TRACE_MODE",
+                    "TWINR_WORKFLOW_TRACE_DIR",
+                )
+            }
+            for key in previous_env:
+                os.environ.pop(key, None)
+            try:
+                tracer = WorkflowForensics.from_env(project_root=project_root, service="workflow-test")
+                self.assertEqual(tracer.base_dir, expected_trace_dir)
+                tracer.event(kind="workflow", msg="rebase_probe", details={})
+                tracer.close()
+                run_id = (expected_trace_dir / "LATEST").read_text(encoding="utf-8").strip()
+                self.assertTrue((expected_trace_dir / run_id / "run.jsonl").exists())
+                self.assertFalse((foreign_trace_dir / run_id / "run.jsonl").exists())
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
     def test_forensics_handles_string_exception_payload_without_crashing(self) -> None:
         with TemporaryDirectory() as temp_dir:
             trace_dir = Path(temp_dir) / "state" / "forensics" / "workflow"

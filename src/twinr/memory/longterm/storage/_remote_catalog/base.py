@@ -33,6 +33,7 @@ from .shared import (
     _DEFAULT_ASYNC_ATTESTATION_POLL_S,
     _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
     _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
+    _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S,
     _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S,
     _DEFAULT_BULK_BATCH_SIZE,
     _DEFAULT_BULK_REQUEST_MAX_BYTES,
@@ -52,6 +53,9 @@ from .writes import RemoteCatalogWriteMixin
 _LOG = logging.getLogger("twinr.memory.longterm.storage.remote_catalog")
 _RECENT_CATALOG_HEAD_TTL_S = 120.0
 _RECENT_CATALOG_ENTRIES_TTL_S = 120.0
+_NEGATIVE_REMOTE_CONTRACT_TTL_S = 120.0
+_GRAPH_CURRENT_VIEW_SNAPSHOT_KINDS = frozenset({"graph_nodes", "graph_edges"})
+_GRAPH_CURRENT_VIEW_ASYNC_JOB_TIMEOUT_FLOOR_S = 180.0
 _MUTABLE_CURRENT_HEAD_SNAPSHOT_KINDS = frozenset({"objects", "conflicts", "archive"})
 
 
@@ -80,6 +84,8 @@ class LongTermRemoteCatalogStoreBase(
         self._local_search_selector_cache: dict[str, _CachedLocalSearchSelector] = {}
         self._recent_catalog_head_cache: dict[str, _CachedItemPayload] = {}
         self._recent_catalog_entries_cache: dict[str, _CachedCatalogEntries] = {}
+        self._unsupported_scope_search_cache: dict[str, float] = {}
+        self._invalid_catalog_head_cache: dict[str, float] = {}
 
     def enabled(self) -> bool:
         """Return whether fine-grained remote storage is available."""
@@ -138,6 +144,18 @@ class LongTermRemoteCatalogStoreBase(
         return f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/current"
 
     def _load_catalog_payload(self, *, snapshot_kind: str):
+        recent_head = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+        if self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
+            return dict(recent_head)
+        if self._catalog_head_known_invalid(snapshot_kind=snapshot_kind):
+            payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
+            if not isinstance(payload, Mapping):
+                return None
+            payload_dict = dict(payload)
+            if not self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload_dict):
+                return None
+            self._maybe_promote_legacy_catalog_head(snapshot_kind=snapshot_kind, payload=payload_dict)
+            return payload_dict
         direct_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind)
         direct_payload = direct_result.payload
         if isinstance(direct_payload, dict):
@@ -193,6 +211,7 @@ class LongTermRemoteCatalogStoreBase(
 
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        effective_read_client = self._catalog_head_read_client(read_client=read_client)
         context = LongTermRemoteReadContext(
             snapshot_kind=snapshot_kind,
             operation="load_catalog_current_head",
@@ -206,12 +225,13 @@ class LongTermRemoteCatalogStoreBase(
         started_monotonic = time.monotonic()
         try:
             envelope = self._fetch_catalog_head_envelope(
-                read_client=read_client,
+                read_client=effective_read_client,
                 snapshot_kind=snapshot_kind,
                 metadata_only=metadata_only,
             )
         except Exception as exc:
             if self._status_code_from_exception(exc) == 404:
+                self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
                 record_remote_read_observation(
                     remote_state=remote_state,
                     context=context,
@@ -239,7 +259,9 @@ class LongTermRemoteCatalogStoreBase(
                 started_monotonic=started_monotonic,
                 outcome="fallback",
             )
+            self._remember_invalid_catalog_head(snapshot_kind=snapshot_kind)
             return _CatalogHeadLoadResult(status="invalid")
+        self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
         record_remote_read_observation(
             remote_state=remote_state,
             context=context,
@@ -248,6 +270,88 @@ class LongTermRemoteCatalogStoreBase(
             classification="ok",
         )
         return _CatalogHeadLoadResult(status="found", payload=payload)
+
+    def _catalog_head_read_client(self, *, read_client: object) -> object:
+        """Return the client used for fixed current-head reads.
+
+        Fixed `.../catalog/current` heads are same-URI moving targets, just like
+        cold `origin_uri` snapshot resolution. Some live ChonkyDB builds reject
+        the lighter metadata-only form first and only serve the subsequent full
+        document read, which can exceed the hot-path exact-document timeout on a
+        fresh reader. Reuse the remote state's bootstrap timeout tuning here so
+        fail-closed current-head loads do not time out while the same backend
+        would still satisfy the bounded cold-start budget.
+        """
+
+        remote_state = self.remote_state
+        origin_resolution_client = None if remote_state is None else getattr(remote_state, "_origin_resolution_client", None)
+        if not callable(origin_resolution_client):
+            return read_client
+        try:
+            return origin_resolution_client(read_client)
+        except Exception:
+            return read_client
+
+    def _negative_remote_contract_ttl_s(self) -> float:
+        """Return how long one per-process negative remote contract stays valid."""
+
+        return max(0.0, _NEGATIVE_REMOTE_CONTRACT_TTL_S)
+
+    def _scope_search_supported(self, *, snapshot_kind: str) -> bool:
+        """Return whether current-scope top-k remains worth probing in-process."""
+
+        now = time.monotonic()
+        with self._cache_lock:
+            expires_at = self._unsupported_scope_search_cache.get(snapshot_kind)
+            if expires_at is None:
+                return True
+            if expires_at <= now:
+                self._unsupported_scope_search_cache.pop(snapshot_kind, None)
+                return True
+            return False
+
+    def _remember_unsupported_scope_search(self, *, snapshot_kind: str) -> None:
+        """Suppress repeated unsupported/false-empty scope probes for one process window."""
+
+        ttl_s = self._negative_remote_contract_ttl_s()
+        if ttl_s <= 0.0:
+            return
+        with self._cache_lock:
+            self._unsupported_scope_search_cache[snapshot_kind] = time.monotonic() + ttl_s
+
+    def _clear_unsupported_scope_search(self, *, snapshot_kind: str) -> None:
+        """Forget one previous scope-search contract failure."""
+
+        with self._cache_lock:
+            self._unsupported_scope_search_cache.pop(snapshot_kind, None)
+
+    def _catalog_head_known_invalid(self, *, snapshot_kind: str) -> bool:
+        """Return whether the fixed current-head document was already proven invalid in-process."""
+
+        now = time.monotonic()
+        with self._cache_lock:
+            expires_at = self._invalid_catalog_head_cache.get(snapshot_kind)
+            if expires_at is None:
+                return False
+            if expires_at <= now:
+                self._invalid_catalog_head_cache.pop(snapshot_kind, None)
+                return False
+            return True
+
+    def _remember_invalid_catalog_head(self, *, snapshot_kind: str) -> None:
+        """Cache one invalid current-head shape so repeated reads go straight to the real fallback."""
+
+        ttl_s = self._negative_remote_contract_ttl_s()
+        if ttl_s <= 0.0:
+            return
+        with self._cache_lock:
+            self._invalid_catalog_head_cache[snapshot_kind] = time.monotonic() + ttl_s
+
+    def _clear_invalid_catalog_head(self, *, snapshot_kind: str) -> None:
+        """Forget one previous invalid current-head result."""
+
+        with self._cache_lock:
+            self._invalid_catalog_head_cache.pop(snapshot_kind, None)
 
     def _fetch_catalog_head_envelope(
         self,
@@ -389,12 +493,24 @@ class LongTermRemoteCatalogStoreBase(
             timeout_s = _DEFAULT_REMOTE_FLUSH_TIMEOUT_S
         return max(0.05, float(timeout_s))
 
-    def _remote_async_job_timeout_s(self) -> float | None:
-        """Return the server-side async job budget for accepted bulk writes."""
+    def _remote_async_job_timeout_s(self, *, snapshot_kind: str | None = None) -> float | None:
+        """Return the server-side async job budget for accepted bulk writes.
+
+        Graph current-view writes can arrive right after a backend restart while
+        ChonkyDB is still warming large payload/fulltext indexes. Live Pi
+        incidents show that those accepted async graph jobs can legitimately run
+        past the generic 60 s flush budget and then fail server-side with
+        ``payload_sync_bulk_timeout`` even though the HTTP transport contract is
+        already correct. Keep the transport timeout unchanged, but give
+        `graph_nodes` / `graph_edges` async jobs a larger bounded execution
+        budget.
+        """
 
         transport_timeout_s = self._remote_write_timeout_s()
         flush_timeout_s = self._remote_flush_timeout_s()
         candidate = max(flush_timeout_s, transport_timeout_s or 0.0)
+        if snapshot_kind in _GRAPH_CURRENT_VIEW_SNAPSHOT_KINDS:
+            candidate = max(candidate, _GRAPH_CURRENT_VIEW_ASYNC_JOB_TIMEOUT_FLOOR_S)
         return candidate if candidate > 0.0 else None
 
     def _remote_retry_attempts(self) -> int:
@@ -433,7 +549,7 @@ class LongTermRemoteCatalogStoreBase(
             max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, candidate),
         )
 
-    def _async_job_visibility_timeout_s(self) -> float:
+    def _async_job_visibility_timeout_s(self, *, snapshot_kind: str | None = None) -> float:
         """Return the bounded window for async job completion plus document-id readback."""
 
         config = getattr(getattr(self, "remote_state", None), "config", None)
@@ -442,7 +558,7 @@ class LongTermRemoteCatalogStoreBase(
         except (TypeError, ValueError):
             read_timeout_s = _DEFAULT_REMOTE_READ_TIMEOUT_S
         flush_timeout_s = self._remote_flush_timeout_s()
-        async_job_timeout_s = self._remote_async_job_timeout_s() or flush_timeout_s
+        async_job_timeout_s = self._remote_async_job_timeout_s(snapshot_kind=snapshot_kind) or flush_timeout_s
         candidate = max(
             _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S,
             read_timeout_s,
@@ -450,7 +566,7 @@ class LongTermRemoteCatalogStoreBase(
             async_job_timeout_s + read_timeout_s,
         )
         return min(
-            _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
+            _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S,
             max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, candidate),
         )
 
@@ -598,6 +714,8 @@ class LongTermRemoteCatalogStoreBase(
             items_count = int(candidate.get("twinr_catalog_items_count") or 0)
         except (TypeError, ValueError):
             items_count = 0
+        if items_count > 0:
+            return None
         payload: dict[str, object] = {
             "schema": definition.catalog_schema,
             "version": 3,
@@ -695,6 +813,31 @@ class LongTermRemoteCatalogStoreBase(
                     return None
             current = current.__cause__ or current.__context__
         return None
+
+    def _should_disable_scope_search_from_exception(self, exc: BaseException) -> bool:
+        """Return whether one scope-search failure proves the current backend contract is unusable here."""
+
+        status_code = self._status_code_from_exception(exc)
+        if status_code not in {400, 404}:
+            return False
+        response_bits: list[str] = []
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ChonkyDBError):
+                if isinstance(current.response_text, str):
+                    response_bits.append(current.response_text)
+                if isinstance(current.response_json, Mapping):
+                    for field_name in ("detail", "error", "error_type", "title"):
+                        value = current.response_json.get(field_name)
+                        if value is not None:
+                            response_bits.append(str(value))
+            current = current.__cause__ or current.__context__
+        compact_bits = " ".join(response_bits).strip().lower()
+        if status_code == 400:
+            return "unsupported scope_ref" in compact_bits
+        return "document_not_found" in compact_bits
 
 
 __all__ = [

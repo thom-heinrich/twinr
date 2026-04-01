@@ -14,6 +14,10 @@ from twinr.memory.longterm import (
     LongTermReflectionResultV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.runtime.live_object_selectors import (
+    select_reflection_neighborhood_objects,
+    select_sensor_memory_neighborhood_objects,
+)
 from twinr.memory.longterm.runtime.service_impl.lifecycle import LongTermMemoryServiceLifecycleMixin
 from twinr.memory.longterm.runtime.service_impl.maintenance import LongTermMemoryServiceMaintenanceMixin
 
@@ -42,10 +46,14 @@ class _QueryOnlyObjectStore:
         reflection_objects: tuple[LongTermMemoryObjectV1, ...] = (),
         sensor_objects: tuple[LongTermMemoryObjectV1, ...] = (),
         restart_objects: tuple[LongTermMemoryObjectV1, ...] = (),
+        projection_objects: tuple[LongTermMemoryObjectV1, ...] = (),
+        event_objects: tuple[LongTermMemoryObjectV1, ...] = (),
     ) -> None:
         self.reflection_objects = reflection_objects
         self.sensor_objects = sensor_objects
         self.restart_objects = restart_objects
+        self.projection_objects = projection_objects
+        self.event_objects = event_objects
         self.queries: list[tuple[str, int]] = []
         self.applied_reflections: list[LongTermReflectionResultV1] = []
 
@@ -76,6 +84,34 @@ class _QueryOnlyObjectStore:
 
     def load_objects(self):
         raise AssertionError("Live-near runtime selectors must not hydrate the full object snapshot.")
+
+    def load_objects_by_projection_filter(self, *, predicate):
+        selected: list[LongTermMemoryObjectV1] = []
+        for item in self.projection_objects:
+            payload = item.to_payload()
+            projection = {
+                "memory_id": payload.get("memory_id"),
+                "kind": payload.get("kind"),
+                "summary": payload.get("summary"),
+                "details": payload.get("details"),
+                "status": payload.get("status"),
+                "value_key": payload.get("value_key"),
+                "attributes": dict(payload.get("attributes") or {}),
+            }
+            source = payload.get("source")
+            if isinstance(source, dict) and isinstance(source.get("event_ids"), list):
+                projection["source_event_ids"] = list(source["event_ids"])
+            if predicate(projection):
+                selected.append(item)
+        return tuple(selected)
+
+    def load_objects_by_event_ids(self, event_ids):
+        target_ids = {str(item).strip() for item in event_ids if str(item).strip()}
+        return tuple(
+            item
+            for item in self.event_objects
+            if target_ids.intersection(item.source.event_ids)
+        )
 
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
         self.applied_reflections.append(result)
@@ -222,6 +258,131 @@ def _environment_profile(memory_id: str, *, summary: str) -> LongTermMemoryObjec
 
 
 class LongTermRuntimeQuerySelectorTests(unittest.TestCase):
+    def test_reflection_neighborhood_selector_prefers_touched_person_and_event_neighbors(self) -> None:
+        seed = _fact(
+            "fact:janina_wife",
+            summary="Janina is the user's wife.",
+            attributes={"person_ref": "person:janina", "relation": "wife", "support_count": 3},
+        )
+        thread_summary = LongTermMemoryObjectV1(
+            memory_id="thread:person_janina",
+            kind="summary",
+            summary="Ongoing thread about Janina.",
+            source=_source("turn:thread:janina"),
+            status="active",
+            attributes={"summary_type": "thread", "person_ref": "person:janina"},
+            value_key="person:janina",
+        )
+        same_event = LongTermMemoryObjectV1(
+            memory_id="event:janina_eye_doctor",
+            kind="event",
+            summary="Janina has an eye-doctor appointment.",
+            source=LongTermSourceRefV1(
+                source_type="conversation_turn",
+                event_ids=seed.source.event_ids,
+            ),
+            status="active",
+            attributes={"memory_domain": "planning"},
+        )
+        unrelated = _fact(
+            "fact:mario_friend",
+            summary="Mario is a family friend.",
+            attributes={"person_ref": "person:mario", "support_count": 2},
+        )
+        object_store = _QueryOnlyObjectStore(
+            projection_objects=(thread_summary, unrelated),
+            event_objects=(same_event,),
+        )
+
+        selected = select_reflection_neighborhood_objects(
+            object_store,
+            seed_objects=(seed,),
+        )
+
+        self.assertEqual(
+            {item.memory_id for item in selected},
+            {"fact:janina_wife", "thread:person_janina", "event:janina_eye_doctor"},
+        )
+
+    def test_reflection_neighborhood_selector_does_not_fall_back_to_broad_compile_union(self) -> None:
+        seed = _fact(
+            "fact:bread_preference",
+            summary="The user prefers rye bread.",
+            attributes={"preference_type": "food"},
+        )
+        broad_union_only = _fact(
+            "fact:janina_wife",
+            summary="Janina is the user's wife.",
+            attributes={"person_ref": "person:janina", "relation": "wife", "support_count": 3},
+        )
+        object_store = _QueryOnlyObjectStore(reflection_objects=(broad_union_only,))
+
+        selected = select_reflection_neighborhood_objects(
+            object_store,
+            seed_objects=(seed,),
+        )
+
+        self.assertEqual({item.memory_id for item in selected}, {"fact:bread_preference"})
+
+    def test_sensor_neighborhood_selector_prefers_touched_domain_neighbors(self) -> None:
+        seed_pattern = _pattern(
+            "pattern:presence:2026-03-29:morning",
+            summary="Presence was observed in the kitchen this morning.",
+        )
+        environment_profile = _environment_profile(
+            "environment_profile:home_main:day:2026-03-29",
+            summary="Home activity profile for the day.",
+        )
+        routine = _fact(
+            "routine:presence:weekday:morning",
+            summary="The user is usually active in the morning.",
+            attributes={"memory_domain": "sensor_routine", "routine_type": "presence"},
+        )
+        unrelated = _fact(
+            "fact:favorite_bread",
+            summary="The user prefers rye bread.",
+            attributes={"support_count": 3},
+        )
+        object_store = _QueryOnlyObjectStore(
+            projection_objects=(environment_profile, routine, unrelated),
+        )
+
+        selected = select_sensor_memory_neighborhood_objects(
+            object_store,
+            seed_objects=(seed_pattern,),
+        )
+
+        self.assertEqual(
+            {item.memory_id for item in selected},
+            {
+                "pattern:presence:2026-03-29:morning",
+                "environment_profile:home_main:day:2026-03-29",
+                "routine:presence:weekday:morning",
+            },
+        )
+
+    def test_sensor_neighborhood_selector_does_not_fall_back_to_broad_compile_union(self) -> None:
+        seed_pattern = _pattern(
+            "pattern:presence:2026-03-29:morning",
+            summary="Presence was observed in the kitchen this morning.",
+        )
+        broad_union_only = _fact(
+            "routine:interaction:weekday:morning",
+            summary="Voice interactions usually happen in the morning.",
+            attributes={"memory_domain": "sensor_routine", "routine_type": "interaction"},
+        )
+        object_store = _QueryOnlyObjectStore(sensor_objects=(broad_union_only,))
+
+        selected = select_sensor_memory_neighborhood_objects(
+            object_store,
+            seed_objects=(seed_pattern,),
+        )
+
+        self.assertEqual(
+            {item.memory_id for item in selected},
+            {"pattern:presence:2026-03-29:morning"},
+        )
+
     def test_run_reflection_uses_targeted_queries_without_full_snapshot_reads(self) -> None:
         relationship = _fact(
             "fact:janina_wife",

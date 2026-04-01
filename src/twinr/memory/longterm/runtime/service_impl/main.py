@@ -27,6 +27,8 @@ from twinr.memory.longterm.retrieval.restart_recall_policy import (
     LongTermRestartRecallPolicyCompiler,
 )
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
+from twinr.memory.longterm.runtime.context_snapshot import LongTermContextSnapshot
+from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.runtime.worker import (
@@ -80,6 +82,7 @@ class LongTermMemoryService(
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
+    prepared_context_front: PreparedLongTermContextFront | None = None
     fast_topic_builder: LongTermFastTopicContextBuilder | None = None
     turn_continuity_compiler: LongTermTurnContinuityCompiler = field(default_factory=LongTermTurnContinuityCompiler)
     restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None
@@ -87,3 +90,5 @@ class LongTermMemoryService(
     writer: AsyncLongTermMemoryWriter | None = None
     multimodal_writer: AsyncLongTermMultimodalWriter | None = None
     _store_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    _context_snapshot_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    _latest_context_snapshots: dict[str, LongTermContextSnapshot] = field(default_factory=dict, repr=False, compare=False)

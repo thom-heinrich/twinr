@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
+import importlib.util
+import io
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from unittest import mock
@@ -32,6 +35,7 @@ _TEST_PI_SSH_USER = "pi-test-user"
 _TEST_PI_SSH_PASSWORD = "placeholder-password"
 _TEST_OPENAI_API_KEY = "placeholder-openai-key"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEPLOY_PI_RUNTIME_CLI_PATH = _REPO_ROOT / "hardware" / "ops" / "deploy_pi_runtime.py"
 _TEST_PI_IMPORT_MODULES = (
     "dateutil",
     "markupsafe",
@@ -83,6 +87,18 @@ def _completed(
     stderr: str = "",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _load_deploy_pi_runtime_cli_module() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "test_hardware_ops_deploy_pi_runtime_cli",
+        _DEPLOY_PI_RUNTIME_CLI_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load deploy CLI module from {_DEPLOY_PI_RUNTIME_CLI_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _import_contract_stdout(
@@ -165,6 +181,7 @@ def _write_dist_metadata(
 class _FakeMirrorWatchdog:
     def __init__(self) -> None:
         self.last_call: dict[str, object] = {}
+        self.project_root: Path | None = None
 
     def probe_once(
         self,
@@ -188,6 +205,37 @@ class _FakeMirrorWatchdog:
             change_count=1,
             sampled_change_lines=(">f+++++++++ src/twinr/ops/pi_runtime_deploy.py",),
             duration_s=0.42,
+        )
+
+
+class _MutatingSourceMirrorWatchdog:
+    def __init__(self, authoritative_root: Path) -> None:
+        self.authoritative_root = authoritative_root
+        self.project_root = authoritative_root
+        self.snapshot_readme: str | None = None
+        self.snapshot_root: Path | None = None
+
+    def probe_once(
+        self,
+        *,
+        apply_sync: bool = True,
+        checksum: bool = True,
+        max_change_lines: int = 40,
+    ) -> PiRepoMirrorCycleResult:
+        del apply_sync, checksum, max_change_lines
+        self.snapshot_root = Path(self.project_root)
+        self.snapshot_readme = (self.snapshot_root / "README.md").read_text(encoding="utf-8")
+        (self.authoritative_root / "README.md").write_text("changed during deploy\n", encoding="utf-8")
+        return PiRepoMirrorCycleResult(
+            host=_TEST_PI_HOST,
+            remote_root="/twinr",
+            drift_detected=True,
+            sync_applied=True,
+            checksum_used=True,
+            verified_clean=True,
+            change_count=1,
+            sampled_change_lines=(">f+++++++++ README.md",),
+            duration_s=0.31,
         )
 
 
@@ -232,6 +280,71 @@ class PiRuntimeDeployTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._wait_for_services_patcher.stop()
         self._remote_lock_patcher.stop()
+
+    def test_operator_cli_prints_live_progress_to_stderr(self) -> None:
+        cli_module = _load_deploy_pi_runtime_cli_module()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def _fake_deploy_pi_runtime(**kwargs):
+            progress_callback = kwargs["progress_callback"]
+            progress_callback(
+                {
+                    "kind": "pi_runtime_deploy_progress",
+                    "phase": "editable_install",
+                    "event": "start",
+                    "step": "pip_install_editable",
+                }
+            )
+            progress_callback(
+                {
+                    "kind": "pi_runtime_deploy_progress",
+                    "phase": "editable_install",
+                    "event": "end",
+                    "step": "pip_install_editable",
+                    "elapsed_s": 33.82,
+                }
+            )
+            return object()
+
+        with (
+            mock.patch.object(cli_module, "deploy_pi_runtime", side_effect=_fake_deploy_pi_runtime),
+            mock.patch.object(cli_module, "asdict", return_value={"ok": True, "duration_s": 1.23}),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    str(_DEPLOY_PI_RUNTIME_CLI_PATH),
+                    "--skip-env-sync",
+                    "--skip-env-contract-check",
+                ],
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            exit_code = cli_module.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"ok": True, "duration_s": 1.23})
+        stderr_lines = [json.loads(line) for line in stderr.getvalue().splitlines() if line.strip()]
+        self.assertEqual(
+            stderr_lines,
+            [
+                {
+                    "kind": "pi_runtime_deploy_progress",
+                    "phase": "editable_install",
+                    "event": "start",
+                    "step": "pip_install_editable",
+                },
+                {
+                    "kind": "pi_runtime_deploy_progress",
+                    "phase": "editable_install",
+                    "event": "end",
+                    "step": "pip_install_editable",
+                    "elapsed_s": 33.82,
+                },
+            ],
+        )
 
     def test_pyproject_declares_direct_runtime_transitive_distributions_explicitly(self) -> None:
         payload = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -476,6 +589,17 @@ class PiRuntimeDeployTests(unittest.TestCase):
                     )
                 if "check_pi_openai_env_contract.py" in rendered:
                     return _completed(command, stdout='{"ok": true, "detail": "ready"}\n')
+                if "twinr.memory.longterm.evaluation.live_retention_canary" in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '{"status": "ok", "ready": true, '
+                            '"archived_memory_ids": ["episode:retention_old_weather"], '
+                            '"pruned_memory_ids": ["observation:retention_old_presence"], '
+                            '"fresh_kept_ids": ["event:retention_future_appointment"], '
+                            '"fresh_archived_ids": ["episode:retention_old_weather"]}\n'
+                        ),
+                    )
                 if "actual_sha=$(sha256sum" in rendered:
                     return _completed(command, stdout="/twinr/.env.deploy-backup-20260324T000000Z")
                 return _completed(command)
@@ -486,6 +610,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 subprocess_runner=_runner,
                 mirror_watchdog=mirror,
                 live_text="Antworte nur mit: ok.",
+                verify_retention_canary=True,
             )
 
         self.assertTrue(result.ok)
@@ -504,6 +629,9 @@ class PiRuntimeDeployTests(unittest.TestCase):
             result.import_contract.validated_attribute_contracts,
         )
         self.assertEqual(result.env_contract, {"ok": True, "detail": "ready"})
+        self.assertIsNotNone(result.retention_canary)
+        assert result.retention_canary is not None
+        self.assertTrue(result.retention_canary["ready"])
         self.assertEqual(mirror.last_call["apply_sync"], True)
         self.assertEqual(mirror.last_call["checksum"], True)
         joined = "\n".join(" ".join(command) for command in commands)
@@ -516,6 +644,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("systemctl daemon-reload", joined)
         self.assertIn("systemctl restart", joined)
         self.assertIn("--live-text", joined)
+        self.assertIn("twinr.memory.longterm.evaluation.live_retention_canary", joined)
         assert result.bytecode_refresh_summary is not None
         self.assertIn("checked-hash bytecode", result.bytecode_refresh_summary)
         self.assertTrue(any(value == _TEST_PI_SSH_PASSWORD for value in inputs))
@@ -583,6 +712,70 @@ class PiRuntimeDeployTests(unittest.TestCase):
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("repo_attestation_manifest_path", joined)
         self.assertNotIn("systemctl restart", joined)
+
+    def test_deploy_uses_repo_snapshot_when_authoritative_tree_mutates_during_mirror(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                "\n".join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _MutatingSourceMirrorWatchdog(root)
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(
+                        command,
+                        stdout=_repo_attestation_stdout(
+                            verified_entry_count=1,
+                            verified_file_count=1,
+                        ),
+                    )
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "actual_sha=$(sha256sum" in rendered:
+                    return _completed(command, stdout="")
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                services=("twinr-runtime-supervisor",),
+                sync_env=False,
+                install_editable=False,
+                install_systemd_units=False,
+                verify_env_contract=False,
+                verify_retention_canary=False,
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual((root / "README.md").read_text(encoding="utf-8"), "changed during deploy\n")
+            self.assertEqual(mirror.snapshot_readme, "Twinr\n")
+            self.assertIsNotNone(mirror.snapshot_root)
+            assert mirror.snapshot_root is not None
+            self.assertNotEqual(mirror.snapshot_root, root.resolve())
+            self.assertEqual(mirror.snapshot_root.name, "authoritative_repo")
+
+        joined = "\n".join(" ".join(command) for command in commands)
+        self.assertIn("repo_attestation_manifest_path", joined)
 
     def test_install_editable_package_syncs_only_pending_project_dependencies(self) -> None:
         commands: list[list[str]] = []
@@ -748,6 +941,88 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertLess(dry_run_index, pip_check_index)
         self.assertIn("removed 1 venv-shadowed direct dependency", summary)
         self.assertIn("PyQt5 (venv 5.15.11 -> system 5.15.9)", summary)
+
+    def test_install_editable_package_emits_progress_for_long_substeps(self) -> None:
+        commands: list[list[str]] = []
+        progress_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "venv_system_site_bridge.py" in rendered:
+                    return _completed(
+                        command,
+                        stdout=(
+                            '{"bridge_path": "/twinr/.venv/lib/python3.11/site-packages/'
+                            'twinr_pi_system_site.pth", "active_paths": [], "changed": false}\n'
+                        ),
+                    )
+                if "pip install --no-deps -e" in rendered:
+                    return _completed(command, stdout="Successfully installed twinr\n")
+                if "project_name = normalize_name" in rendered:
+                    return _completed(command, stdout='{"ok": true, "pending": []}\n')
+                if '"$remote_python" -m pip check' in rendered:
+                    return _completed(command, stdout="")
+                if "repair_venv_python_shebangs" in rendered:
+                    return _completed(
+                        command,
+                        stdout='{"checked_files": 2, "rewritten_files": 0, "sample_paths": []}\n',
+                    )
+                return _completed(command)
+
+            remote = PiRemoteExecutor(
+                settings=load_pi_connection_settings(pi_env_path),
+                subprocess_runner=_runner,
+                timeout_s=30,
+            )
+            install_editable_package(
+                remote=remote,
+                remote_root="/twinr",
+                install_with_deps=False,
+                progress_callback=progress_events.append,
+            )
+
+        editable_events = [
+            (str(event.get("event", "")), str(event.get("step", "")))
+            for event in progress_events
+            if event.get("phase") == "editable_install" and event.get("step")
+        ]
+        self.assertEqual(
+            editable_events,
+            [
+                ("start", "ensure_remote_venv"),
+                ("end", "ensure_remote_venv"),
+                ("start", "bridge_system_site_packages"),
+                ("end", "bridge_system_site_packages"),
+                ("start", "cleanup_shadowed_system_packages"),
+                ("end", "cleanup_shadowed_system_packages"),
+                ("start", "pip_install_editable"),
+                ("end", "pip_install_editable"),
+                ("start", "sync_runtime_dependencies"),
+                ("end", "sync_runtime_dependencies"),
+                ("start", "pip_check"),
+                ("end", "pip_check"),
+                ("start", "repair_venv_entrypoints"),
+                ("end", "repair_venv_entrypoints"),
+            ],
+        )
+        self.assertTrue(all(event.get("kind") == "pi_runtime_deploy_progress" for event in progress_events))
 
     def test_verify_python_import_contract_attests_all_requested_modules(self) -> None:
         commands: list[list[str]] = []
@@ -1160,6 +1435,72 @@ class PiRuntimeDeployTests(unittest.TestCase):
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertNotIn("sshpass -d 0 scp", joined)
 
+    def test_deploy_emits_phase_progress_events(self) -> None:
+        progress_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                services=("twinr-runtime-supervisor",),
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+                install_editable=False,
+                install_systemd_units=False,
+                verify_env_contract=False,
+                verify_retention_canary=False,
+                progress_callback=progress_events.append,
+            )
+
+        self.assertTrue(result.ok)
+        phase_events = [
+            (str(event.get("event", "")), str(event.get("phase", "")))
+            for event in progress_events
+            if "step" not in event
+        ]
+        self.assertIn(("start", "repo_snapshot"), phase_events)
+        self.assertIn(("end", "repo_snapshot"), phase_events)
+        self.assertIn(("start", "repo_mirror"), phase_events)
+        self.assertIn(("end", "repo_mirror"), phase_events)
+        self.assertIn(("start", "repo_attestation"), phase_events)
+        self.assertIn(("end", "repo_attestation"), phase_events)
+        self.assertIn(("start", "python_import_contract"), phase_events)
+        self.assertIn(("end", "python_import_contract"), phase_events)
+        self.assertTrue(all(event.get("kind") == "pi_runtime_deploy_progress" for event in progress_events))
+
     def test_deploy_repairs_shared_state_permissions_before_service_restart(self) -> None:
         commands: list[list[str]] = []
 
@@ -1221,8 +1562,157 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn('verify_path_if_exists "$state_dir/automations.json.bak" 600', joined)
         self.assertIn('verify_path_if_exists "$state_dir/automations.json.lock" 600', joined)
         self.assertIn('verify_path_if_exists "$state_dir/user_discovery.json" 600', joined)
+        self.assertIn('install -d -m 700 -o "$owner_user" -g "$owner_user" "$ops_dir"', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/events.jsonl" 666', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/.events.jsonl.lock" 666', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/remote_memory_watchdog.json" 644', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/display_ambient_impulse.json" 644', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/events.jsonl" 666', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/.events.jsonl.lock" 666', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/remote_memory_watchdog.json" 644', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/display_ambient_impulse.json" 644', joined)
         self.assertLess(joined.index('repair_path_if_exists "$state_dir/automations.json" 600'), joined.index("sudo systemctl restart"))
+        self.assertLess(joined.index('repair_path_if_exists "$ops_dir/events.jsonl" 666'), joined.index("sudo systemctl restart"))
+        self.assertLess(joined.index('repair_path_if_exists "$ops_dir/remote_memory_watchdog.json" 644'), joined.index("sudo systemctl restart"))
         self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_path_if_exists "$state_dir/automations.json" 600'))
+        self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/events.jsonl" 666'))
+        self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/remote_memory_watchdog.json" 644'))
+
+    def test_deploy_rebases_repo_owned_workflow_trace_env_path_for_pi_sync(self) -> None:
+        synced_env_snapshots: dict[str, str] = {}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}",
+                        "TWINR_WORKFLOW_TRACE_ENABLED=true",
+                        "TWINR_WORKFLOW_TRACE_MODE=forensic",
+                        "TWINR_WORKFLOW_TRACE_DIR=/home/thh/twinr/state/forensics/workflow_host_voice",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "scp" in command:
+                    local_path = Path(command[-2])
+                    synced_env_snapshots[local_path.name] = local_path.read_text(encoding="utf-8")
+                    return _completed(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                if "check_pi_openai_env_contract.py" in rendered:
+                    return _completed(command, stdout='{"ok": true}\n')
+                return _completed(command)
+
+            result = deploy_pi_runtime(
+                project_root=root,
+                pi_env_path=pi_env_path,
+                services=("twinr-runtime-supervisor",),
+                subprocess_runner=_runner,
+                mirror_watchdog=mirror,
+                install_editable=False,
+                install_systemd_units=False,
+                verify_retention_canary=False,
+            )
+
+        self.assertTrue(result.ok)
+        synced_env = synced_env_snapshots["authoritative.env"]
+        self.assertIn(
+            "TWINR_WORKFLOW_TRACE_DIR=/twinr/state/forensics/workflow_host_voice",
+            synced_env,
+        )
+
+    def test_retention_canary_emits_remote_probe_heartbeat_progress(self) -> None:
+        progress_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch("twinr.ops.pi_runtime_deploy._RETENTION_CANARY_HEARTBEAT_S", 0.01), mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=lambda **_kwargs: (time.sleep(0.03) or {"status": "ok", "ready": True, "report_path": "/twinr/report.json"}),
+            ):
+                result = deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    mirror_watchdog=mirror,
+                    install_editable=False,
+                    install_systemd_units=False,
+                    verify_env_contract=False,
+                    verify_retention_canary=True,
+                    progress_callback=progress_events.append,
+                )
+
+        self.assertTrue(result.ok)
+        remote_probe_events = [
+            event
+            for event in progress_events
+            if event.get("phase") == "retention_canary" and event.get("step") == "remote_probe"
+        ]
+        self.assertTrue(any(event.get("event") == "start" for event in remote_probe_events))
+        self.assertTrue(any(event.get("event") == "heartbeat" for event in remote_probe_events))
+        self.assertTrue(any(event.get("event") == "end" for event in remote_probe_events))
 
     def test_default_deploy_includes_enabled_optional_pi_services(self) -> None:
         commands: list[list[str]] = []

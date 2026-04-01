@@ -39,7 +39,9 @@ _MAX_LABEL_LENGTH: Final[int] = 256
 _MAX_AREA_LENGTH: Final[int] = 128
 _MAX_PROVIDER_LENGTH: Final[int] = 128
 _MAX_ID_LENGTH: Final[int] = 256
-_MAX_CURSOR_LENGTH: Final[int] = 512
+# Aggregate route cursors are opaque signed tokens and can be materially larger
+# than provider-native cursors while still being bounded elsewhere.
+_MAX_CURSOR_LENGTH: Final[int] = 65_536
 _MAX_JSON_DEPTH: Final[int] = 8
 _MAX_JSON_MAPPING_ITEMS: Final[int] = 256
 _MAX_JSON_SEQUENCE_ITEMS: Final[int] = 512
@@ -283,6 +285,11 @@ def _encode_json_payload(payload: object) -> bytes:
 
 class _WireModel:
     """Shared serialization helpers for Twinr wire models."""
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the plain payload dictionary implemented by subclasses."""
+
+        raise NotImplementedError
 
     def as_wire_dict(self) -> dict[str, object]:
         """Return a versioned envelope for cross-process transport."""

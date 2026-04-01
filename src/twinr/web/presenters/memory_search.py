@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from twinr.memory.longterm.retrieval.operator_search import LongTermOperatorSearchResult
+from twinr.memory.longterm.runtime.context_snapshot import LongTermContextSnapshot
 
 
 def build_memory_search_panel_context(
@@ -28,6 +29,32 @@ def build_memory_search_panel_context(
         "summary_rows": _memory_search_summary_rows(result),
         "sections": _memory_search_sections(result),
         "context_blocks": _memory_search_context_blocks(result),
+    }
+
+
+def build_memory_context_snapshot_panel_context(
+    *,
+    query_text: str,
+    snapshot: LongTermContextSnapshot | None,
+    error_message: str | None,
+    detail_message: str | None = None,
+) -> dict[str, object]:
+    """Return template-ready context for one captured runtime memory context."""
+
+    normalized_query = " ".join(str(query_text or "").split()).strip()
+    context_blocks = _memory_context_snapshot_blocks(snapshot)
+    return {
+        "query": normalized_query,
+        "status": _memory_context_snapshot_status(
+            query_text=normalized_query,
+            snapshot=snapshot,
+            error_message=error_message,
+            detail_message=detail_message,
+            block_count=len(context_blocks),
+        ),
+        "summary_rows": _memory_context_snapshot_summary_rows(snapshot, block_count=len(context_blocks)),
+        "sections": (),
+        "context_blocks": context_blocks,
     }
 
 
@@ -85,6 +112,63 @@ def _memory_search_summary_rows(
     return tuple(rows)
 
 
+def _memory_context_snapshot_status(
+    *,
+    query_text: str,
+    snapshot: LongTermContextSnapshot | None,
+    error_message: str | None,
+    detail_message: str | None,
+    block_count: int,
+) -> dict[str, str]:
+    if error_message:
+        return {"label": "Snapshot failed", "detail": error_message, "status": "fail"}
+    if not query_text:
+        return {
+            "label": "Ready",
+            "detail": "Conversation Lab can render the actual long-term context Twinr built for a turn.",
+            "status": "muted",
+        }
+    if snapshot is None:
+        return {
+            "label": "No snapshot",
+            "detail": detail_message or "Twinr did not capture a long-term context snapshot for this turn.",
+            "status": "warn",
+        }
+    if block_count == 0:
+        return {
+            "label": "Empty context",
+            "detail": detail_message or "Twinr built a long-term context snapshot, but it contained no non-empty sections.",
+            "status": "warn",
+        }
+    return {
+        "label": f"{block_count} sections",
+        "detail": detail_message or "Captured from the actual long-term context Twinr built for this turn.",
+        "status": "ok",
+    }
+
+
+def _memory_context_snapshot_summary_rows(
+    snapshot: LongTermContextSnapshot | None,
+    *,
+    block_count: int,
+) -> tuple[dict[str, object], ...]:
+    if snapshot is None or not snapshot.query_profile.retrieval_text:
+        return ()
+    return (
+        _detail_item("Query", snapshot.query_profile.original_text or "—", copy=True, wide=True),
+        _detail_item("Retrieval query", snapshot.query_profile.retrieval_text or "—", copy=True, wide=True),
+        _detail_item(
+            "Canonical English",
+            snapshot.query_profile.canonical_english_text or "—",
+            copy=True,
+            wide=True,
+        ),
+        _detail_item("Context profile", str(snapshot.profile)),
+        _detail_item("Capture source", snapshot.source or "—"),
+        _detail_item("Context sections", str(block_count)),
+    )
+
+
 def _memory_search_sections(
     result: LongTermOperatorSearchResult | None,
 ) -> tuple[dict[str, object], ...]:
@@ -129,6 +213,28 @@ def _memory_search_context_blocks(
             "body": result.graph_context,
         },
     )
+
+
+def _memory_context_snapshot_blocks(
+    snapshot: LongTermContextSnapshot | None,
+) -> tuple[dict[str, str], ...]:
+    if snapshot is None:
+        return ()
+    sections = (
+        ("subtext_context", "Subtext context"),
+        ("topic_context", "Topic context"),
+        ("midterm_context", "Midterm context"),
+        ("durable_context", "Durable context"),
+        ("episodic_context", "Episodic context"),
+        ("graph_context", "Graph context"),
+        ("conflict_context", "Conflict context"),
+    )
+    blocks: list[dict[str, str]] = []
+    for field_name, title in sections:
+        value = getattr(snapshot.context, field_name, None)
+        if isinstance(value, str) and value.strip():
+            blocks.append({"title": title, "body": value})
+    return tuple(blocks)
 
 
 def _durable_item(item: Any) -> dict[str, object]:

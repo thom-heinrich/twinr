@@ -13,6 +13,7 @@ ExecCondition=/usr/bin/env bash -lc 'grep -qa "Raspberry Pi" /proc/device-tree/m
 ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --watch-remote-memory'
 Restart=always
 RestartSec=2
+RestartPreventExitStatus=75
 TimeoutStopSec=20
 KillMode=control-group
 StandardOutput=journal

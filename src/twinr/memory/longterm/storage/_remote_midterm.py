@@ -16,6 +16,7 @@ import inspect
 import logging
 
 from twinr.memory.longterm.core.models import LongTermMidtermPacketV1
+from twinr.memory.longterm.reasoning.turn_continuity import turn_continuity_recall_hints
 from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
@@ -56,6 +57,12 @@ def _packet_search_text(payload: Mapping[str, object]) -> str:
                     parts.append(value_text)
             elif isinstance(value, (list, tuple)):
                 parts.extend(_normalize_text(item) for item in value if _normalize_text(item))
+    parts.extend(
+        turn_continuity_recall_hints(
+            kind=payload.get("kind"),
+            attributes=attributes if isinstance(attributes, Mapping) else None,
+        )
+    )
     return " ".join(part for part in parts if part)
 
 

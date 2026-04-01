@@ -3,12 +3,15 @@ name: evaluation
 path: src/twinr/memory/longterm/evaluation
 kind: python-package
 visibility: internal
-summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, live subtext-response behavior, live midterm memory attestation, live synthetic-memory acceptance, and forensic long-term retrieval latency profiling without mutating production local state paths.
+summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, unified retrieval quality and benchmarking, live subtext-response behavior, live midterm memory attestation, live synthetic-memory acceptance, and forensic long-term retrieval latency profiling without mutating production local state paths.
 owned_concerns:
   - Seed deterministic evaluation fixtures and build fixed evaluation case sets
-  - Execute recall, multimodal, and live subtext evaluations against the real Twinr services/backends
+  - Execute recall, multimodal, unified-retrieval, and live subtext evaluations against the real Twinr services/backends
   - Execute live midterm write/persist/read/LLM-usage attestations against real OpenAI and ChonkyDB in isolated temp roots and namespaces
   - Execute live synthetic-memory acceptance matrices for earlier memory, conflict confirmation, restart persistence, and control-query containment against real OpenAI and ChonkyDB in isolated temp roots and namespaces
+  - Execute fixed unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources
+  - Execute live writer/fresh-reader unified-retrieval acceptance against real ChonkyDB using the same fixed goldset cases as the local goldset runner
+  - Benchmark the fixed unified-retrieval goldset with source-wise precision/recall, selected-id quality, join-anchor quality, and path-safety metrics so over-selection regressions are visible before correctness fully fails
   - Execute read-only forensic latency profiles that capture workflow spans, decisions, and bottleneck summaries for provider-context and fast-provider-context retrieval
   - Snapshot evaluation artifacts and expose structured result payloads for inspection
 out_of_scope:
@@ -36,6 +39,46 @@ files:
       - MultimodalEvalSummary
       - MultimodalEvalResult
       - run_multimodal_longterm_eval
+  - path: _unified_retrieval_shared.py
+    role: Shared fixed fixture, case definitions, and case-evaluation helpers for unified retrieval quality checks
+    exports:
+      - UnifiedRetrievalFixtureSeedStats
+      - UnifiedRetrievalGoldsetCase
+      - UnifiedRetrievalGoldsetCaseResult
+      - default_unified_retrieval_goldset_cases
+      - run_unified_retrieval_cases
+      - seed_unified_retrieval_fixture
+      - unified_retrieval_case_summary
+      - wait_for_unified_retrieval_cases
+  - path: unified_retrieval_goldset.py
+    role: Deterministic unified-retrieval goldset runner against an isolated namespace
+    exports:
+      - UnifiedRetrievalGoldsetResult
+      - default_unified_retrieval_goldset_path
+      - default_unified_retrieval_goldset_report_dir
+      - run_unified_retrieval_goldset
+      - write_unified_retrieval_goldset_artifacts
+  - path: live_unified_retrieval_acceptance.py
+    role: Live writer/fresh-reader unified-retrieval acceptance runner against real ChonkyDB
+    exports:
+      - LiveUnifiedRetrievalAcceptanceResult
+      - default_live_unified_retrieval_acceptance_path
+      - default_live_unified_retrieval_acceptance_report_dir
+      - run_live_unified_retrieval_acceptance
+      - write_live_unified_retrieval_acceptance_artifacts
+  - path: unified_retrieval_benchmark.py
+    role: Precision/recall benchmark over the fixed unified-retrieval goldset
+    exports:
+      - UnifiedRetrievalBenchmarkAnalysis
+      - UnifiedRetrievalBenchmarkCaseMetrics
+      - UnifiedRetrievalBenchmarkNamedMetric
+      - UnifiedRetrievalBenchmarkResult
+      - UnifiedRetrievalBenchmarkSummary
+      - benchmark_unified_retrieval_cases
+      - default_unified_retrieval_benchmark_path
+      - default_unified_retrieval_benchmark_report_dir
+      - run_unified_retrieval_benchmark
+      - write_unified_retrieval_benchmark_artifacts
   - path: subtext_eval.py
     role: Live subtext-response evaluation and grading helpers
     exports:
@@ -97,11 +140,17 @@ primary_callers:
   - path: src/twinr/memory/longterm/__init__.py
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_unified_retrieval_goldset.py
+  - path: test/test_live_unified_retrieval_acceptance.py
+  - path: test/test_unified_retrieval_benchmark.py
   - path: test/test_subtext_response_eval.py
   - path: src/twinr/web/presenters/debug.py
 tests:
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_unified_retrieval_goldset.py
+  - path: test/test_live_unified_retrieval_acceptance.py
+  - path: test/test_unified_retrieval_benchmark.py
   - path: test/test_subtext_response_eval.py
   - path: test/test_longterm_live_midterm_attest.py
   - path: test/test_longterm_latency_profile.py

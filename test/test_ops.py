@@ -4,7 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import base64
 import json
+import os
 import socket
+import stat
 import sys
 import tempfile
 import unittest
@@ -118,6 +120,55 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0]["event"], "event_3")
         self.assertEqual(entries[1]["event"], "event_4")
+
+    def test_event_store_uses_shared_writer_modes_for_current_file_lock_and_created_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "events.jsonl"
+            store = TwinrOpsEventStore(store_path)
+
+            store.append(event="deploy_probe", message="one event")
+            store.tail(limit=1)
+
+            file_mode = stat.S_IMODE(os.stat(store_path).st_mode)
+            lock_mode = stat.S_IMODE(os.stat(store_path.with_name(".events.jsonl.lock")).st_mode)
+            parent_mode = stat.S_IMODE(os.stat(store_path.parent).st_mode)
+
+        self.assertEqual(file_mode, 0o666)
+        self.assertEqual(lock_mode, 0o666)
+        self.assertEqual(parent_mode, 0o755)
+
+    def test_event_store_append_repairs_cross_service_modes_on_existing_file_and_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "events.jsonl"
+            store = TwinrOpsEventStore(store_path)
+
+            store.append(event="before_repair", message="seed")
+            lock_path = store_path.with_name(".events.jsonl.lock")
+            os.chmod(store_path, 0o600)
+            os.chmod(lock_path, 0o600)
+
+            store.append(event="after_repair", message="repair modes")
+            store.tail(limit=2)
+
+            file_mode = stat.S_IMODE(os.stat(store_path).st_mode)
+            lock_mode = stat.S_IMODE(os.stat(lock_path).st_mode)
+
+        self.assertEqual(file_mode, 0o666)
+        self.assertEqual(lock_mode, 0o666)
+
+    def test_event_store_rotation_downgrades_archives_back_to_read_only_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "artifacts" / "stores" / "ops" / "events.jsonl"
+            store = TwinrOpsEventStore(store_path, max_file_bytes=64, compression="none")
+
+            store.append(event="first", message="x" * 80)
+            store.append(event="second", message="y" * 80)
+
+            archive_names = sorted(name for name in os.listdir(store_path.parent) if name.startswith("events.jsonl."))
+            self.assertTrue(archive_names)
+            archive_mode = stat.S_IMODE(os.stat(store_path.parent / archive_names[-1]).st_mode)
+
+        self.assertEqual(archive_mode, 0o644)
 
     def test_usage_store_summarizes_requests_and_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

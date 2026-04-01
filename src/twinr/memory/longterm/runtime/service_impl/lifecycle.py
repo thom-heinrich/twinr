@@ -84,6 +84,12 @@ class LongTermMemoryServiceLifecycleMixin(ServiceMixinBase):
         """Request bounded shutdown for all configured background writers."""
 
         resolved_timeout_s = _coerce_timeout_s(timeout_s, default=2.0)
+        prepared_context_front = getattr(self, "prepared_context_front", None)
+        if prepared_context_front is not None:
+            try:
+                prepared_context_front.shutdown(wait=False)
+            except Exception:
+                logger.exception("Failed to shutdown prepared long-term context front cleanly.")
         if self.writer is not None:
             try:
                 self.writer.shutdown(timeout_s=resolved_timeout_s)

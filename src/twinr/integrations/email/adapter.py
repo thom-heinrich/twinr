@@ -20,9 +20,10 @@ import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email.utils import getaddresses
 from enum import Enum
+from inspect import signature
 from itertools import islice
 from time import monotonic
 from typing import Final, Protocol, runtime_checkable
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_SCHEMA_VERSION: Final[str] = "2026-03-30"
 _DEFAULT_READ_LIMIT: Final[int] = 5
+_GETADDRESSES_SUPPORTS_STRICT: Final[bool] = "strict" in signature(getaddresses).parameters
 _FORBIDDEN_SUMMARY_KEYS: Final[frozenset[str]] = frozenset(
     {
         "body",
@@ -343,8 +345,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
                 operation_id=operation_id,
             )
 
-        self._attach_result_meta(result, operation_id=operation_id, started_at=started_at)
-        return result
+        return self._attach_result_meta(result, operation_id=operation_id, started_at=started_at)
 
     @classmethod
     def operation_schemas(cls) -> Mapping[str, Mapping[str, object]]:
@@ -584,10 +585,9 @@ class EmailMailboxAdapter(IntegrationAdapter):
 
     def _parse_address_fields(self, field_values: Sequence[str]) -> list[tuple[str, str]]:
         """Parse one or more address-header values with the stdlib RFC parser."""
-        try:
-            return getaddresses(field_values, strict=True)  # Python 3.13+
-        except TypeError:  # pragma: no cover - compatibility path for older Python builds
-            return getaddresses(field_values)
+        if _GETADDRESSES_SUPPORTS_STRICT:
+            return getaddresses(field_values, **{"strict": True})  # pylint: disable=unexpected-keyword-arg
+        return getaddresses(field_values)
 
     def _normalize_recipient_candidate(self, candidate: str) -> tuple[str, bool]:
         """Normalize one recipient email address into canonical wire-safe form."""
@@ -873,14 +873,23 @@ class EmailMailboxAdapter(IntegrationAdapter):
             deduplicated_cc.append(value)
         return recipients, tuple(deduplicated_cc)
 
-    def _attach_result_meta(self, result: IntegrationResult, *, operation_id: object, started_at: float) -> None:
+    def _attach_result_meta(
+        self,
+        result: IntegrationResult,
+        *,
+        operation_id: object,
+        started_at: float,
+    ) -> IntegrationResult:
         """Attach non-sensitive adapter metadata to every result."""
         details = getattr(result, "details", None)
-        if not isinstance(details, dict):
-            return
-        details.setdefault("operation_id", str(operation_id) if operation_id is not None else None)
-        details.setdefault("schema_version", _TOOL_SCHEMA_VERSION)
-        details.setdefault("adapter_latency_ms", int((monotonic() - started_at) * 1000))
+        if not isinstance(details, Mapping):
+            return result
+
+        updated_details = dict(details)
+        updated_details.setdefault("operation_id", str(operation_id) if operation_id is not None else None)
+        updated_details.setdefault("schema_version", _TOOL_SCHEMA_VERSION)
+        updated_details.setdefault("adapter_latency_ms", int((monotonic() - started_at) * 1000))
+        return replace(result, details=updated_details)
 
     def _failure_result(self, *, summary: str, error_code: str, operation_id: object) -> IntegrationResult:
         """Build a normalized integration failure payload."""

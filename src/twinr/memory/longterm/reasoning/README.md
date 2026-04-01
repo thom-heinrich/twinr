@@ -13,6 +13,7 @@ compilation, immediate turn-continuity packets, and retention.
 - Maintain slot-level truth and build user-facing conflict choices
 - Reflect over recent memory windows, including room-agnostic smart-home environment reflections, and compile bounded midterm packets
 - Compile deterministic immediate turn-continuity packets from raw conversation turns so fresh follow-up recall does not wait on slower durable enrichment, while preserving short structured excerpts that downstream display/proactive code can reuse without parsing internal English packet text
+- Provide bounded generic recap hints so retrieval can recognize real conversation-turn memories during meta-memory questions
 - Apply retention, expiry, and archival policy to stored objects
 
 Reflection must treat canonical proposition payloads as first-class evidence:
@@ -51,6 +52,7 @@ expiry boundary.
 | `conflicts.py` | User conflict resolution |
 | `reflect.py` | Reflection orchestration for person-thread and smart-home environment summaries |
 | `midterm.py` | Midterm compiler adapter |
+| `conversation_recall.py` | Generic recap-hint helpers for real conversation memories |
 | `turn_continuity.py` | Deterministic immediate midterm packets from raw conversation turns |
 | `retention.py` | Retention classification |
 | `component.yaml` | Structural metadata |

@@ -139,9 +139,11 @@ def register_integrations_routes(app: FastAPI, runtime: AppRuntime) -> None:
                     env_values,
                 )
             elif integration_id == "calendar_agenda":
+                current_record = await _call_sync(store.get, "calendar_agenda")
                 record, env_updates = await _call_sync(
                     _build_calendar_integration_record,
                     form,
+                    current_record,
                 )
             elif integration_id == "smart_home_hub":
                 record, env_updates = await _call_sync(

@@ -48,7 +48,7 @@ from .shared import (
 )
 
 _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES = 16_384
-_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset({"conflicts", "graph_nodes", "graph_edges"})
+_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset({"conflicts"})
 
 
 class RemoteCatalogWriteMixin:
@@ -251,6 +251,7 @@ class RemoteCatalogWriteMixin:
             "twinr_catalog_current_head": True,
             "twinr_catalog_schema": str(payload_dict.get("schema") or ""),
             "twinr_catalog_items_count": max(0, items_count),
+            "twinr_payload": dict(payload_dict),
         }
         if written_at:
             metadata["twinr_catalog_written_at"] = written_at
@@ -1020,7 +1021,7 @@ class RemoteCatalogWriteMixin:
         attempt_index = 0
         while attempt_index < retry_attempts:
             request_correlation_id = self._new_remote_write_correlation_id()
-            async_job_timeout_s = self._remote_async_job_timeout_s()
+            async_job_timeout_s = self._remote_async_job_timeout_s(snapshot_kind=snapshot_kind)
             request_payload_kind = self._record_batch_payload_kind(batch=batch)
             access_classification = self._record_batch_access_classification(batch=batch)
             execution_mode = self._bulk_execution_mode(
@@ -1050,6 +1051,7 @@ class RemoteCatalogWriteMixin:
                     write_client,
                     result=result,
                     expected=len(batch),
+                    snapshot_kind=snapshot_kind,
                 )
                 if job_document_ids is not None:
                     extracted_document_ids = job_document_ids
@@ -1168,18 +1170,19 @@ class RemoteCatalogWriteMixin:
     ) -> str:
         """Choose sync only for tiny one-item control-plane batches.
 
-        Conflict and graph current-view writes are tiny control-plane batches
-        whose async job + readback visibility overhead can dominate the actual
-        write. Keeping these batches synchronous removes that fragility without
-        changing the broader async strategy for heavier object persistence.
+        Conflicts stay small enough that the async job overhead can dominate the
+        actual write. Graph writes used to share that path, but live Pi evidence
+        now shows even tiny graph item and segment batches can exceed the 15 s
+        transport timeout when forced through sync `/records/bulk`. Graph
+        current-view persistence therefore stays on the async job contract.
         """
 
         if snapshot_kind not in _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS or len(batch) != 1:
             return "async"
         if request_payload_kind not in {
             "fine_grained_record_batch",
-            "catalog_segment_record_batch",
             "catalog_current_head_record_batch",
+            "catalog_segment_record_batch",
         }:
             return "async"
         preview_request = ChonkyDBBulkRecordRequest(
@@ -1234,6 +1237,7 @@ class RemoteCatalogWriteMixin:
         *,
         result: object,
         expected: int,
+        snapshot_kind: str,
     ) -> tuple[str | None, ...] | None:
         if not isinstance(result, Mapping):
             return None
@@ -1245,7 +1249,7 @@ class RemoteCatalogWriteMixin:
         if not job_id or not callable(job_status):
             return None
         poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
-        total_timeout_s = self._async_job_visibility_timeout_s()
+        total_timeout_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
         deadline = time.monotonic() + total_timeout_s
         while True:
             remaining_timeout_s = deadline - time.monotonic()
@@ -1304,10 +1308,14 @@ class RemoteCatalogWriteMixin:
             )
         resolved_attempts = max(1, self._remote_retry_attempts())
         poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        visibility_timeout_s = self._attestation_visibility_timeout_s(
+            snapshot_kind=snapshot_kind,
+            record_item=record_item,
+        )
         if poll_interval_s > 0.0:
             resolved_attempts = max(
                 resolved_attempts,
-                int(math.ceil(self._async_attestation_visibility_timeout_s() / poll_interval_s)),
+                int(math.ceil(visibility_timeout_s / poll_interval_s)),
             )
         last_detail = "Remote write attestation did not observe the accepted payload."
         for attempt in range(resolved_attempts):
@@ -1339,6 +1347,40 @@ class RemoteCatalogWriteMixin:
         raise LongTermRemoteUnavailableError(
             f"Accepted remote long-term {snapshot_kind!r} write could not be read back: {last_detail}"
         )
+
+    def _attestation_visibility_timeout_s(
+        self,
+        *,
+        snapshot_kind: str,
+        record_item: ChonkyDBRecordItem,
+    ) -> float:
+        """Return the visibility window for one accepted-write attestation.
+
+        Mutable fixed heads like ``.../catalog/current`` can lag on same-URI
+        visibility longer than ordinary item records even after the async job is
+        already accepted. When the backend has not produced a stable exact
+        document id for that head yet, retrying the whole write after the
+        smaller generic attestation window just republishes the same moving head
+        and can make the lag worse. Current heads therefore inherit the broader
+        accepted-job visibility budget before we declare the write unavailable.
+        """
+
+        visibility_timeout_s = self._async_attestation_visibility_timeout_s()
+        if not self._is_mutable_current_head_record(record_item):
+            return visibility_timeout_s
+        return max(
+            visibility_timeout_s,
+            self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind),
+        )
+
+    def _is_mutable_current_head_record(self, record_item: ChonkyDBRecordItem) -> bool:
+        """Return whether one record item targets a fixed mutable current head."""
+
+        resolved_uri = self._normalize_text(getattr(record_item, "uri", None))
+        if resolved_uri.endswith("/catalog/current"):
+            return True
+        metadata = getattr(record_item, "metadata", None)
+        return isinstance(metadata, Mapping) and metadata.get("twinr_catalog_current_head") is True
 
     def _attestation_probe_targets(
         self,

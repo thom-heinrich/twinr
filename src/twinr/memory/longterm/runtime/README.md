@@ -10,11 +10,14 @@ bounded background writers into the APIs used by agent runtime loops.
 `runtime` owns:
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
+- Maintain one bounded prepared full-context front for provider and tool retrieval so live turns can reuse already-built long-term prompt context instead of synchronously rebuilding the same remote recall package on every answer
+- Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without launching a second independent remote recall
+- Prime and refresh those prepared full-context fronts from transcript-first interim or endpoint transcripts plus post-write invalidations, so the first live answer can reuse already-started long-term retrieval work without shrinking the memory surface
 - Inject the bounded fast-topic quick-memory lane into the normal provider context so ordinary answer turns receive a few compact personalized topic hints before the heavier recall sections
 - Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
-- Centralize bounded query-first object selectors reused by discovery, proactive planning, reflection, sensor-memory compilation, and restart-recall refresh so live runtime paths do not hydrate full remote object snapshots
+- Centralize bounded query-first object selectors reused by discovery, proactive planning, reflection, sensor-memory compilation, and restart-recall refresh so live runtime paths do not hydrate full remote object snapshots or silently widen seeded neighborhood inputs back into broad compile-source unions
 - Route conversation/multimodal persistence and backfill through storage-owned active working sets plus delta commits so required remote writes do not hydrate full object/conflict/archive state or rewrite whole snapshots before consolidation
 - Prefilter remote-primary online retention candidates from current-head catalog projections before exact hydration, so retention no longer starts from a global active-object sweep
 - Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
@@ -57,14 +60,16 @@ bounded background writers into the APIs used by agent runtime loops.
 | File | Purpose |
 |---|---|
 | `service.py` | Compatibility shim that preserves the historic import surface while delegating to `service_impl/` |
-| `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads |
+| `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads, with seeded reflection/sensor neighborhoods kept strict instead of widening back to broad compile-source unions |
+| `prepared_context.py` | Bounded prepared full-context front that stores completed provider/tool prompt artifacts, coalesces transcript-first speculative builds, and refreshes or invalidates them after durable-memory changes |
+| `context_snapshot.py` | Small runtime dataclass that captures the latest built provider/tool context for operator inspection |
 | `service_impl/README.md` | Internal map of the refactored service implementation package |
-| `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface |
-| `service_impl/builder.py` | Runtime service assembly and background-writer construction |
+| `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface, including the prepared-context front dependency |
+| `service_impl/builder.py` | Runtime service assembly and background-writer construction, plus prepared-context front wiring and persistence invalidation hooks |
 | `service_impl/readiness.py` | Required-remote readiness probes and cache helpers |
-| `service_impl/context.py` | Provider-context assembly for normal, fast, and tool-facing paths |
-| `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points, with dry-run object reads sourced through fine-grained current-state loaders |
-| `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with live-near reflection/sensor inputs coming from the shared query-first selector layer, active backfill writes using storage-owned working-set delta commits, and remote-primary retention prefiltering candidates from catalog projections |
+| `service_impl/context.py` | Provider-context assembly for normal, fast, and tool-facing paths, with prepared-front consumption, transcript-first prewarm entry points, and sticky-query refresh scheduling |
+| `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points, with dry-run object reads sourced through storage-owned active working sets instead of broad current-state hydration |
+| `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with reflection/sensor inputs narrowed through neighborhood selectors, active backfill writes using storage-owned working-set delta commits, and remote-primary retention prefiltering candidates from catalog projections |
 | `service_impl/proactive.py` | Proactive planning and reservation state transitions using shared query-first planner-object selectors instead of inline query constants |
 | `service_impl/mutations.py` | Conflict resolution, review, and prompt-context mutation entry points |
 | `service_impl/lifecycle.py` | Flush/shutdown orchestration for bounded background writers plus query-first restart-recall packet refresh |
@@ -87,6 +92,7 @@ from twinr.memory.longterm import LongTermMemoryService
 service = LongTermMemoryService.from_config(config)
 service.ensure_remote_ready()
 steady_state = service.probe_remote_ready(bootstrap=False, include_archive=False)
+service.prewarm_provider_context("Wie ist Janinas Termin heute?")
 context = service.build_provider_context(query_text)  # includes quick-memory topic hints when enabled
 fast_context = service.build_fast_provider_context(query_text)  # compact quick-memory-only context
 service.enqueue_conversation_turn(

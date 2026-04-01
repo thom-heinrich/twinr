@@ -68,6 +68,7 @@ class RemoteCatalogCatalogMixin:
         """Keep the latest same-process catalog head long enough for read-after-write probes."""
 
         with self._cache_lock:
+            self._invalid_catalog_head_cache.pop(snapshot_kind, None)
             self._recent_catalog_head_cache[snapshot_kind] = _CachedItemPayload(
                 payload=dict(payload),
                 expires_at_monotonic=time.monotonic() + self._recent_catalog_head_ttl_s(),
@@ -113,6 +114,7 @@ class RemoteCatalogCatalogMixin:
             return
         expires_at_monotonic = time.monotonic()
         with self._cache_lock:
+            self._unsupported_scope_search_cache.pop(snapshot_kind, None)
             if ttl_s > 0.0:
                 self._catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
                     entries=entries,
@@ -249,6 +251,9 @@ class RemoteCatalogCatalogMixin:
             self._catalog_entries_cache.pop(snapshot_kind, None)
             self._local_search_selector_cache.pop(snapshot_kind, None)
             self._recent_catalog_entries_cache.pop(snapshot_kind, None)
+            self._recent_catalog_head_cache.pop(snapshot_kind, None)
+            self._unsupported_scope_search_cache.pop(snapshot_kind, None)
+            self._invalid_catalog_head_cache.pop(snapshot_kind, None)
             self._item_payload_cache = {
                 cache_key: cached
                 for cache_key, cached in self._item_payload_cache.items()
@@ -277,10 +282,17 @@ class RemoteCatalogCatalogMixin:
         definition: _RemoteCollectionDefinition,
         payload: Mapping[str, object],
     ) -> bool:
+        segments = payload.get("segments")
+        if not isinstance(segments, list):
+            return False
+        try:
+            items_count = int(payload.get("items_count") or 0)
+        except (TypeError, ValueError):
+            return False
         return (
             payload.get("schema") == definition.catalog_schema
             and payload.get("version") == _CATALOG_VERSION
-            and isinstance(payload.get("segments"), list)
+            and (items_count <= 0 or bool(segments))
         )
 
     def _is_legacy_catalog_payload(

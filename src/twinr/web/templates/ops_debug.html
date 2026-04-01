@@ -284,13 +284,13 @@
 
           <details class="conversation-lab-trace">
             <summary>Retrieval Before Turn</summary>
-            {{ memory_search_snapshot(turn.retrieval_before, "Retrieval Before", "What Twinr's long-term retrieval stack returned before answering this prompt.") }}
+            {{ memory_search_snapshot(turn.retrieval_before, turn.retrieval_before.title or "Retrieval Before", turn.retrieval_before.description or "What Twinr's long-term retrieval stack returned before answering this prompt.") }}
           </details>
 
           {% if turn.retrieval_after %}
           <details class="conversation-lab-trace">
             <summary>Retrieval After Turn</summary>
-            {{ memory_search_snapshot(turn.retrieval_after, "Retrieval After", "What the same retrieval stack returned again after the turn was stored and flushed.") }}
+            {{ memory_search_snapshot(turn.retrieval_after, turn.retrieval_after.title or "Retrieval After", turn.retrieval_after.description or "What the same retrieval stack returned again after the turn was stored and flushed.") }}
           </details>
           {% endif %}
 

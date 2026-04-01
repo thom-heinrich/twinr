@@ -22,6 +22,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMidtermPacketV1, LongTermReflectionResultV1
+from twinr.memory.longterm.reasoning.turn_continuity import turn_continuity_recall_hints
 from twinr.memory.longterm.storage._remote_midterm import LongTermRemoteMidtermState
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
@@ -626,6 +627,12 @@ class LongTermMidtermStore:
                     parts.append(value)
                 elif isinstance(value, (list, tuple)):
                     parts.extend(str(entry) for entry in value if isinstance(entry, str))
+        parts.extend(
+            turn_continuity_recall_hints(
+                kind=item.kind,
+                attributes=attributes if isinstance(attributes, Mapping) else None,
+            )
+        )
 
         # AUDIT-FIX(#3): Coerce unexpected scalar fields to strings so partially corrupt packets stay searchable.
         return _normalize_text(" ".join(str(part) for part in parts if part))

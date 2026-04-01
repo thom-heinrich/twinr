@@ -137,9 +137,9 @@ def load_runtime_memory_config(context: ConfigLoadContext) -> dict[str, object]:
         ),
         "long_term_memory_remote_watchdog_startup_probe_timeout_s": _parse_float(
             get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_STARTUP_PROBE_TIMEOUT_S"),
-            45.0,
+            180.0,
             minimum=15.0,
-            maximum=120.0,
+            maximum=300.0,
         ),
         "long_term_memory_remote_watchdog_history_limit": max(
             1,

@@ -1,6 +1,7 @@
 # CHANGELOG: 2026-03-29
 # BUG-1: Honor audio_observer_fallback_factory and automatically degrade to a real fallback observer after primary audio capture failures instead of silently dropping to null audio only.
 # BUG-2: Bound PIR queue draining per tick and serialize hardware access to prevent livelock, duplicated camera/audio access, and race-driven device errors under concurrent refresh threads.
+# BUG-3: Stop busy-state audio facts from falling back to shared PCM capture before TTS starts, avoiding a circular lock contention that can delay spoken replies on Pi voice turns.
 # SEC-1: Gate speech-triggered camera bootstrap behind current audio-policy / presence safety checks to prevent ambient or malicious remote speech from forcing privacy-invasive camera captures.
 # SEC-2: Rate-limit repeated fault emissions and add sensor circuit breakers to prevent practical log-storm / SD-card wear / availability failures on Raspberry Pi deployments with flaky hardware.
 # IMP-1: Reuse shared perception snapshots and specialized proactive vision paths before default camera capture to reduce duplicate camera work and latency on Pi 4.
@@ -720,6 +721,20 @@ class ProactiveCoordinatorCoreMixin:
             observed_at=now,
         )
 
+    def _observe_audio_for_busy_runtime(
+        self,
+        *,
+        now: float,
+    ) -> ProactiveAudioSnapshot:
+        """Return one non-blocking audio snapshot while the assistant is busy.
+
+        Busy runtime states must not reopen shared PCM capture while speech
+        output is still trying to start. Prefer the same fast signal/cache path
+        used by HDMI attention refresh instead of the full observer fallback.
+        """
+
+        return self._observe_audio_for_attention_refresh(now=now)
+
     def _observe_vision_for_attention_refresh(self):
         """Collect one low-cost vision snapshot for the HDMI eye-follow path."""
 
@@ -1163,7 +1178,7 @@ class ProactiveCoordinatorCoreMixin:
             inspect_requested=False,
             runtime_status_value=runtime_status_value,
         )
-        audio_snapshot = self._observe_audio_safe()
+        audio_snapshot = self._observe_audio_for_busy_runtime(now=now)
         audio_policy_snapshot = self._observe_audio_policy(
             now=now,
             audio_observation=audio_snapshot.observation,

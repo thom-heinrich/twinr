@@ -127,7 +127,12 @@ def _default_external_watchdog_starter(
 
     from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
 
-    return ensure_remote_memory_watchdog_process(config, env_file=env_file, emit=emit)
+    return ensure_remote_memory_watchdog_process(
+        config,
+        env_file=env_file,
+        emit=emit,
+        allow_spawn=False,
+    )
 
 
 class TwinrRuntimeSupervisor:
@@ -711,6 +716,10 @@ class TwinrRuntimeSupervisor:
         )
         if child.key == "remote-memory-watchdog":
             try:
+                previous_watchdog_snapshot = self.remote_watchdog_store.load()
+            except Exception:
+                previous_watchdog_snapshot = None
+            try:
                 bootstrap = build_remote_memory_watchdog_bootstrap_snapshot(
                     self.config,
                     pid=getattr(process, "pid", 0) or 0,
@@ -720,6 +729,7 @@ class TwinrRuntimeSupervisor:
                         if child.started_at_utc is not None
                         else None
                     ),
+                    previous_snapshot=previous_watchdog_snapshot,
                 )
                 self.remote_watchdog_store.save(bootstrap)
             except Exception as exc:

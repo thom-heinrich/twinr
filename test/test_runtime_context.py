@@ -27,6 +27,7 @@ from twinr.agent.base_agent.state import snapshot as state_snapshot_module
 from twinr.agent.base_agent.runtime.snapshot import TwinrRuntimeSnapshotMixin
 from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.agent.base_agent.state.machine import TwinrStatus
+from twinr.memory.longterm.core.models import LongTermMemoryContext
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseController
@@ -98,6 +99,40 @@ class RuntimeContextTests(unittest.TestCase):
                 self.assertIn(("assistant", "In New York ist es gerade 10:53 Uhr."), text_context)
                 self.assertIn(("user", "Wie spaet ist es in New York?"), supervisor_text_context)
                 self.assertIn(("assistant", "In New York ist es gerade 10:53 Uhr."), supervisor_text_context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tool_provider_context_disables_graph_fallback_when_recent_context_is_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Erster Turn")
+                runtime.memory.remember("assistant", "Zweiter Turn")
+                runtime.last_transcript = "Worueber haben wir heute gesprochen?"
+                calls: list[dict[str, object]] = []
+
+                class _CapturingLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise AssertionError("provider context should not be used in this tool-path test")
+
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        calls.append({"query_text": query_text, "kwargs": dict(kwargs)})
+                        return LongTermMemoryContext()
+
+                runtime.long_term_memory = _CapturingLongTermMemory()
+
+                context = runtime.tool_provider_conversation_context()
+
+                self.assertGreater(len(context), 0)
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "query_text": "Worueber haben wir heute gesprochen?",
+                            "kwargs": {"include_graph_fallback": False},
+                        }
+                    ],
+                )
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
@@ -234,7 +269,7 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
-    def test_snapshot_restore_reinstates_printing_active_state_machine_fields(self) -> None:
+    def test_snapshot_restore_reinstates_waiting_plus_printing_active_state_machine_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = TwinrConfig(
@@ -244,7 +279,7 @@ class RuntimeContextTests(unittest.TestCase):
                 restore_runtime_state_on_startup=True,
             )
             RuntimeSnapshotStore(config.runtime_state_path).save(
-                status="answering",
+                status="waiting",
                 printing_active=True,
                 memory_turns=(),
                 last_transcript="Bitte drucke das.",
@@ -254,17 +289,51 @@ class RuntimeContextTests(unittest.TestCase):
             with patch.object(runtime_snapshot_module.LOGGER, "warning") as warning_mock:
                 runtime = TwinrRuntime(config=config)
             try:
-                self.assertEqual(runtime.status, TwinrStatus.ANSWERING)
+                self.assertEqual(runtime.status, TwinrStatus.PRINTING)
                 self.assertTrue(runtime.state_machine.printing_active)
                 self.assertEqual(
                     runtime.state_machine.active_statuses,
-                    (TwinrStatus.ANSWERING, TwinrStatus.PRINTING),
+                    (TwinrStatus.PRINTING,),
                 )
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
         warning_texts = [" ".join(str(part) for part in call.args) for call in warning_mock.call_args_list]
         self.assertFalse(any("Unable to restore runtime status" in text for text in warning_texts))
+
+    def test_snapshot_restore_does_not_resurrect_stale_processing_status_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(root / "state" / "chonkydb"),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                restore_runtime_state_on_startup=True,
+            )
+            RuntimeSnapshotStore(config.runtime_state_path).save(
+                status="processing",
+                printing_active=False,
+                memory_turns=(),
+                last_transcript="Worüber haben wir heute gesprochen?",
+                last_response="Danke, mir geht’s gut. Und dir?",
+            )
+
+            runtime = TwinrRuntime(config=config)
+            try:
+                self.assertEqual(runtime.status, TwinrStatus.WAITING)
+                self.assertEqual(runtime.last_transcript, "")
+                self.assertEqual(runtime.last_response, "Danke, mir geht’s gut. Und dir?")
+                restored_snapshot = runtime.snapshot_store.load()
+                self.assertIsNotNone(restored_snapshot)
+                assert restored_snapshot is not None
+                self.assertEqual(restored_snapshot.status, "waiting")
+                self.assertEqual(restored_snapshot.last_transcript, "")
+                self.assertEqual(
+                    restored_snapshot.last_response,
+                    "Danke, mir geht’s gut. Und dir?",
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
 
     def test_runtime_snapshot_store_writes_world_readable_snapshot_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -521,7 +590,8 @@ class RuntimeContextTests(unittest.TestCase):
                     def build_provider_context(self, query_text):
                         raise AssertionError("search context must not query long-term provider context")
 
-                    def build_tool_provider_context(self, query_text):
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        del kwargs
                         raise AssertionError("search context must not query long-term tool context")
 
                 runtime.long_term_memory = _FailingLongTermMemory()
@@ -644,7 +714,8 @@ class RuntimeContextTests(unittest.TestCase):
                     def build_provider_context(self, query_text):
                         raise LongTermRemoteUnavailableError("remote unavailable")
 
-                    def build_tool_provider_context(self, query_text):
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        del kwargs
                         raise LongTermRemoteUnavailableError("remote unavailable")
 
                 runtime.long_term_memory = _UnavailableLongTermMemory()
@@ -710,7 +781,8 @@ class RuntimeContextTests(unittest.TestCase):
                 runtime.manage_user_discovery(action="start_or_resume", topic_id="basics")
 
                 class _FailingLongTermMemory:
-                    def build_tool_provider_context(self, query_text):
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        del kwargs
                         raise AssertionError("tiny recent tool context must not query remote long-term memory")
 
                 runtime.long_term_memory = _FailingLongTermMemory()
@@ -773,7 +845,8 @@ class RuntimeContextTests(unittest.TestCase):
                     def build_provider_context(self, query_text):
                         raise LongTermRemoteUnavailableError("remote unavailable")
 
-                    def build_tool_provider_context(self, query_text):
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        del kwargs
                         raise LongTermRemoteUnavailableError("remote unavailable")
 
                 runtime.long_term_memory = _UnavailableLongTermMemory()

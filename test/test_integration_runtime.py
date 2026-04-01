@@ -57,7 +57,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
         assert readiness is not None
         self.assertEqual(readiness.status, "warn")
         self.assertEqual(readiness.summary, "Ready with warnings")
-        self.assertIn("credential stored separately in .env", readiness.detail)
+        self.assertIn("credential stored outside config", readiness.detail)
         self.assertIn("Outbound email is not restricted to approved contacts.", readiness.detail)
         self.assertIn(
             "Outbound email is not restricted to approved contacts. This increases the risk of misaddressed or unsafe sends.",
@@ -154,7 +154,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
         self.assertEqual(readiness.summary, "Needs OAuth2")
         self.assertIn("OAuth2 / Modern Auth", readiness.detail)
 
-    def test_calendar_runtime_blocks_tokenized_url_before_it_can_leak(self) -> None:
+    def test_calendar_runtime_hides_tokenized_url_query_in_readiness_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             env_path = root / ".env"
@@ -176,11 +176,11 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
 
             runtime = build_managed_integrations(root, env_path=env_path)
 
-        self.assertIsNone(runtime.calendar_agenda)
+        self.assertIsNotNone(runtime.calendar_agenda)
         readiness = runtime.readiness_for("calendar_agenda")
         assert readiness is not None
-        self.assertEqual(readiness.status, "warn")
-        self.assertIn("must not include embedded credentials, query tokens, or fragments", readiness.detail)
+        self.assertEqual(readiness.status, "ok")
+        self.assertIn("https://calendar.example.com/feed.ics", readiness.detail)
         self.assertNotIn("token=super-secret", readiness.detail)
 
     def test_calendar_runtime_builds_plain_url_source_without_fetching_on_setup(self) -> None:
@@ -224,7 +224,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
                     settings={
                         "provider": "hue",
                         "bridge_host": "192.168.1.20",
-                        "verify_tls": "false",
+                        "verify_tls": "true",
                         "request_timeout_s": "10",
                         "event_timeout_s": "2",
                     },
@@ -240,7 +240,8 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
         assert readiness is not None
         self.assertEqual(readiness.status, "ok")
         self.assertIn("192.168.1.20", readiness.detail)
-        self.assertIn("stored separately in .env", readiness.detail)
+        self.assertIn("local app key stored outside config", readiness.detail)
+        self.assertIn("TLS verify on", readiness.detail)
         self.assertNotIn("local-hue-key", readiness.detail)
 
     def test_builds_multi_bridge_smart_home_hub_from_store_and_env(self) -> None:
@@ -267,7 +268,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
                         "provider": "hue",
                         "bridge_host": "192.168.1.20",
                         HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY: "192.168.1.21",
-                        "verify_tls": "false",
+                        "verify_tls": "true",
                         "request_timeout_s": "10",
                         "event_timeout_s": "2",
                     },
@@ -306,7 +307,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
                         "provider": "hue",
                         "bridge_host": "192.168.1.20",
                         HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY: "192.168.1.21",
-                        "verify_tls": "false",
+                        "verify_tls": "true",
                         "request_timeout_s": "10",
                         "event_timeout_s": "2",
                     },
@@ -343,7 +344,7 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
                     settings={
                         "provider": "hue",
                         "bridge_host": "192.168.1.20",
-                        "verify_tls": "false",
+                        "verify_tls": "true",
                         "request_timeout_s": "10",
                         "event_timeout_s": "2",
                     },

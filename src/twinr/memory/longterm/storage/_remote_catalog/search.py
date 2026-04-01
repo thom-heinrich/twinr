@@ -80,7 +80,13 @@ class RemoteCatalogSearchMixin:
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
         scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
-        can_scope_search = bool(supports_topk_records and callable(topk_records) and scope_ref and namespace)
+        can_scope_search = bool(
+            supports_topk_records
+            and callable(topk_records)
+            and scope_ref
+            and namespace
+            and self._scope_search_supported(snapshot_kind=snapshot_kind)
+        )
         workflow_decision(
             msg="longterm_remote_catalog_current_scope_strategy",
             question="Which remote catalog route should resolve the current snapshot search?",
@@ -425,6 +431,25 @@ class RemoteCatalogSearchMixin:
         scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
         if not scope_ref or not namespace:
             raise ChonkyDBError("Current-scope topk_records is required for fast current-scope retrieval.")
+        if not self._scope_search_supported(snapshot_kind=snapshot_kind):
+            failure_details = {
+                "classification": "client_contract_error",
+                "status_code": None,
+                "scope_ref": scope_ref,
+                "reason": "scope_search_suppressed_after_prior_contract_failure",
+            }
+            rescued = self._rescue_fast_scope_search_with_current_catalog(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                limit=max(1, int(limit)),
+                failure_details=failure_details,
+            )
+            if rescued is not None:
+                return rescued
+            raise LongTermRemoteReadFailedError(
+                "Required remote long-term fast-topic retrieval failed.",
+                details=dict(failure_details),
+            )
         bounded_limit = max(1, int(limit))
         definition = self._require_definition(snapshot_kind)
         fast_read_context = LongTermRemoteReadContext(
@@ -733,7 +758,9 @@ class RemoteCatalogSearchMixin:
         """Run remote search, preferring one-shot structured top-k responses."""
 
         remote_state = self._require_remote_state()
-        scope_search = bool(scope_ref and namespace)
+        resolved_scope_ref = scope_ref if scope_ref and namespace and self._scope_search_supported(snapshot_kind=snapshot_kind) else None
+        resolved_namespace = namespace if resolved_scope_ref else None
+        scope_search = bool(resolved_scope_ref and resolved_namespace)
         retrieve_fallback_allowed = bool(allowed_doc_ids) or not scope_search
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
@@ -822,9 +849,9 @@ class RemoteCatalogSearchMixin:
                             result_limit=result_limit,
                             include_content=False,
                             include_metadata=True,
-                            allowed_doc_ids=None if scope_ref and namespace else allowed_doc_ids,
-                            namespace=namespace,
-                            scope_ref=scope_ref,
+                            allowed_doc_ids=None if scope_search else allowed_doc_ids,
+                            namespace=resolved_namespace,
+                            scope_ref=resolved_scope_ref,
                             timeout_seconds=timeout_s,
                         )
                     ),
@@ -849,6 +876,8 @@ class RemoteCatalogSearchMixin:
                 )
                 return tuple(self._iter_retrieve_result_candidates(response))
             except Exception as exc:
+                if scope_search and self._should_disable_scope_search_from_exception(exc):
+                    self._remember_unsupported_scope_search(snapshot_kind=snapshot_kind)
                 last_topk_error = exc
                 record_remote_read_diagnostic(
                     remote_state=remote_state,

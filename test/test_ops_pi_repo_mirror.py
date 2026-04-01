@@ -15,6 +15,7 @@ from twinr.ops.pi_repo_mirror import (
     PiRepoMirrorCapabilities,
     PiRepoMirrorWatchdog,
     build_authoritative_repo_entry_digests,
+    materialize_authoritative_repo_snapshot,
 )
 from twinr.ops.self_coding_pi import PiConnectionSettings
 
@@ -94,6 +95,30 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertNotIn("pkg.egg-info/PKG-INFO", entries_by_path)
         self.assertNotIn("browser_automation/artifacts/trace.json", entries_by_path)
         self.assertNotIn("node_modules/index.js", entries_by_path)
+
+    def test_materialize_authoritative_repo_snapshot_copies_only_mirror_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "repo"
+            snapshot = Path(temp_dir) / "snapshot"
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (root / "state").mkdir()
+            (root / "state" / "runtime-state.json").write_text("{}", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "link-to-app").symlink_to("src/app.py")
+
+            entries = materialize_authoritative_repo_snapshot(root, snapshot)
+
+            snapshot_entries = build_authoritative_repo_entry_digests(snapshot)
+            self.assertEqual(entries, snapshot_entries)
+            self.assertTrue((snapshot / "README.md").is_file())
+            self.assertTrue((snapshot / "src" / "app.py").is_file())
+            self.assertTrue((snapshot / "link-to-app").is_symlink())
+            self.assertEqual(os.readlink(snapshot / "link-to-app"), "src/app.py")
+            self.assertFalse((snapshot / ".env").exists())
+            self.assertFalse((snapshot / "state" / "runtime-state.json").exists())
 
     def test_probe_once_reports_clean_repo_when_rsync_finds_no_changes(self) -> None:
         commands: list[list[str]] = []
@@ -309,7 +334,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         rendered_prune = " ".join(commands[2])
         self.assertIn("common/links", rendered_prune)
         self.assertIn("__pycache__", rendered_prune)
-        self.assertIn("rm -rf", rendered_prune)
+        self.assertIn("sudo rm -rf", rendered_prune)
         self.assertIn("--dry-run", commands[1])
         self.assertNotIn("--dry-run", commands[3])
         self.assertIn("--dry-run", commands[4])

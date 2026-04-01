@@ -79,9 +79,13 @@ class _StaticSensorStream:
     def __init__(self, batch):
         self.batch = batch
         self.calls = []
+        self._returned_initial_batch = False
 
     def read_sensor_stream(self, *, cursor=None, limit):
         self.calls.append({"cursor": cursor, "limit": limit})
+        if self._returned_initial_batch:
+            return SmartHomeEventBatch(events=(), next_cursor=None, stream_live=self.batch.stream_live)
+        self._returned_initial_batch = True
         return self.batch
 
 
@@ -219,6 +223,7 @@ class SmartHomeIntegrationAdapterTests(unittest.TestCase):
                     "entity_ids": ["light-1"],
                     "brightness": 55,
                 },
+                explicit_user_confirmation=True,
             )
         )
 
@@ -282,6 +287,7 @@ class SmartHomeIntegrationAdapterTests(unittest.TestCase):
                 integration_id="smart_home_hub",
                 operation_id="run_safe_scene",
                 parameters={"scene_id": "scene-1"},
+                explicit_user_confirmation=True,
             )
         )
 
@@ -506,8 +512,8 @@ class SmartHomeIntegrationAdapterTests(unittest.TestCase):
             limit=2,
         )
 
-        self.assertEqual(left_stream.calls[0], {"cursor": "cursor-left", "limit": 1})
-        self.assertEqual(right_stream.calls[0], {"cursor": "cursor-right", "limit": 1})
+        self.assertEqual(left_stream.calls[0], {"cursor": "cursor-left", "limit": 2})
+        self.assertEqual(right_stream.calls[0], {"cursor": "cursor-right", "limit": 2})
         self.assertEqual(
             [event.entity_id for event in batch.events],
             [
@@ -519,16 +525,14 @@ class SmartHomeIntegrationAdapterTests(unittest.TestCase):
             [event.details["route_id"] for event in batch.events],
             ["bridge-b", "bridge-a"],
         )
-        self.assertEqual(
-            json.loads(batch.next_cursor),
-            {
-                "routes": {
-                    "bridge-a": "cursor-left-next",
-                    "bridge-b": "cursor-right-next",
-                },
-                "version": 1,
-            },
-        )
+        self.assertIsNone(batch.next_cursor)
+
+    def test_event_batch_accepts_opaque_route_cursor_tokens(self) -> None:
+        cursor = "smarthome-route-cursor:" + ("a" * 600)
+
+        batch = SmartHomeEventBatch(events=(), next_cursor=cursor)
+
+        self.assertEqual(batch.next_cursor, cursor)
 
 
 if __name__ == "__main__":

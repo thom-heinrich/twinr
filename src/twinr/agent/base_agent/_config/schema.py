@@ -434,7 +434,7 @@ class TwinrConfig:
     long_term_memory_remote_watchdog_startup_wait_s: float = 30.0
     long_term_memory_remote_watchdog_interval_s: float = 1.0
     long_term_memory_remote_watchdog_probe_timeout_s: float = 15.0
-    long_term_memory_remote_watchdog_startup_probe_timeout_s: float = 45.0
+    long_term_memory_remote_watchdog_startup_probe_timeout_s: float = 180.0
     long_term_memory_remote_watchdog_history_limit: int = 3600
     long_term_memory_remote_max_content_chars: int = 2_000_000
     long_term_memory_remote_shard_max_content_chars: int = 1_000_000

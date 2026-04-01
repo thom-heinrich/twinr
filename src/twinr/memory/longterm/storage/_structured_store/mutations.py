@@ -135,31 +135,12 @@ class StructuredStoreMutationMixin:
         """Persist updated objects and the remaining conflict queue."""
 
         with self._lock:
-            existing_objects = {item.memory_id: item for item in self.load_objects_fine_grained_for_write()}
-            for item in result.updated_objects:
-                existing_objects[item.memory_id] = item
-            objects_payload = {
-                "schema": _OBJECT_STORE_SCHEMA,
-                "version": _OBJECT_STORE_VERSION,
-                "objects": [item.to_payload() for item in sorted(existing_objects.values(), key=lambda row: row.memory_id)],
-            }
-            conflicts_payload = {
-                "schema": _CONFLICT_STORE_SCHEMA,
-                "version": _CONFLICT_STORE_VERSION,
-                "conflicts": [
-                    item.to_payload()
-                    for item in sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
-                ],
-            }
-            self._persist_snapshot_payload(
-                snapshot_kind="objects",
-                local_path=self.objects_path,
-                payload=objects_payload,
-            )
-            self._persist_snapshot_payload(
-                snapshot_kind="conflicts",
-                local_path=self.conflicts_path,
-                payload=conflicts_payload,
+            self.commit_active_delta(
+                object_upserts=tuple(sorted(result.updated_objects, key=lambda row: row.memory_id)),
+                conflict_upserts=tuple(
+                    sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
+                ),
+                conflict_delete_slot_keys=result.deleted_conflict_slot_keys,
             )
 
     def write_snapshot(
@@ -210,47 +191,22 @@ class StructuredStoreMutationMixin:
         """Persist a user-driven mutation result across all snapshots."""
 
         with self._lock:
-            current_state = self.load_current_state_fine_grained_for_write()
-            existing_objects = {item.memory_id: item for item in current_state.objects}
-            archived_objects = {item.memory_id: item for item in current_state.archived_objects}
-            for memory_id in result.deleted_memory_ids:
-                existing_objects.pop(memory_id, None)
-                archived_objects.pop(memory_id, None)
-            for item in result.updated_objects:
-                existing_objects[item.memory_id] = item
-                archived_objects.pop(item.memory_id, None)
-            objects_payload = {
-                "schema": _OBJECT_STORE_SCHEMA,
-                "version": _OBJECT_STORE_VERSION,
-                "objects": [item.to_payload() for item in sorted(existing_objects.values(), key=lambda row: row.memory_id)],
-            }
-            conflicts_payload = {
-                "schema": _CONFLICT_STORE_SCHEMA,
-                "version": _CONFLICT_STORE_VERSION,
-                "conflicts": [
-                    item.to_payload()
-                    for item in sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
-                ],
-            }
-            archive_payload = {
-                "schema": _ARCHIVE_STORE_SCHEMA,
-                "version": _ARCHIVE_STORE_VERSION,
-                "objects": [item.to_payload() for item in sorted(archived_objects.values(), key=lambda row: row.memory_id)],
-            }
-            self._persist_snapshot_payload(
-                snapshot_kind="objects",
-                local_path=self.objects_path,
-                payload=objects_payload,
+            archive_delete_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *result.deleted_memory_ids,
+                        *(item.memory_id for item in result.updated_objects),
+                    )
+                )
             )
-            self._persist_snapshot_payload(
-                snapshot_kind="conflicts",
-                local_path=self.conflicts_path,
-                payload=conflicts_payload,
-            )
-            self._persist_snapshot_payload(
-                snapshot_kind="archive",
-                local_path=self.archive_path,
-                payload=archive_payload,
+            self.commit_active_delta(
+                object_upserts=tuple(sorted(result.updated_objects, key=lambda row: row.memory_id)),
+                object_delete_ids=result.deleted_memory_ids,
+                conflict_upserts=tuple(
+                    sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
+                ),
+                conflict_delete_slot_keys=result.deleted_conflict_slot_keys,
+                archive_delete_ids=archive_delete_ids,
             )
 
     def review_objects(
@@ -345,7 +301,7 @@ class StructuredStoreMutationMixin:
                 action="confirm",
                 target_memory_id=current.memory_id,
                 updated_objects=(updated,),
-                remaining_conflicts=self.load_conflicts_fine_grained(),
+                remaining_conflicts=(),
             )
 
     def invalidate_object(
@@ -376,7 +332,7 @@ class StructuredStoreMutationMixin:
                 target_memory_id=current.memory_id,
                 drop_supersedes=False,
             )
-            remaining_conflicts = self._rewrite_conflicts_without_memory(current.memory_id)
+            remaining_conflicts, deleted_conflict_slot_keys = self._conflict_delta_without_memory(current.memory_id)
             return LongTermMemoryMutationResultV1(
                 action="invalidate",
                 target_memory_id=current.memory_id,
@@ -384,6 +340,7 @@ class StructuredStoreMutationMixin:
                     sorted((updated_target, *related_updates), key=lambda item: item.memory_id)
                 ),
                 remaining_conflicts=remaining_conflicts,
+                deleted_conflict_slot_keys=deleted_conflict_slot_keys,
             )
 
     def delete_object(self, memory_id: str) -> LongTermMemoryMutationResultV1:
@@ -397,11 +354,12 @@ class StructuredStoreMutationMixin:
                 target_memory_id=current.memory_id,
                 drop_supersedes=True,
             )
-            remaining_conflicts = self._rewrite_conflicts_without_memory(current.memory_id)
+            remaining_conflicts, deleted_conflict_slot_keys = self._conflict_delta_without_memory(current.memory_id)
             return LongTermMemoryMutationResultV1(
                 action="delete",
                 target_memory_id=current.memory_id,
                 updated_objects=tuple(sorted(related_updates, key=lambda item: item.memory_id)),
                 deleted_memory_ids=(current.memory_id,),
                 remaining_conflicts=remaining_conflicts,
+                deleted_conflict_slot_keys=deleted_conflict_slot_keys,
             )

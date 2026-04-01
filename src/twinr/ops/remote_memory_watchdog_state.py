@@ -3,7 +3,7 @@
 # BUG-2: float/int coercion accepted NaN/Infinity and _coerce_int_value could crash on overflow; numeric coercion is now finite-safe and crash-safe.
 # BUG-3: persisted history was neither compacted nor capped despite existing constants; save()/to_dict() now strip heavy probe payloads from history and enforce the persisted sample cap.
 # BUG-4: persistence relied on dataclasses.asdict() deep copies and a single low-level os.write path; serialization is now explicit, bounded, and fully flushed before replace().
-# SEC-1: predictable temp filenames plus 0644 permissions made local clobbering and metadata leakage practical on shared Raspberry Pi deployments; writes now use secure temp files and 0600 permissions.
+# SEC-1: predictable temp filenames plus permissive directory access made local clobbering practical on shared Raspberry Pi deployments; writes now use secure temp files while keeping the final snapshot cross-user readable inside Twinr's 0700 ops directory.
 # SEC-2: load() followed symlinks/special files and parsed unbounded JSON; loads are now size-bounded, regular-file-only, and O_NOFOLLOW-hardened where supported.
 # SEC-3: rename-only persistence was not durable across sudden power loss; the containing directory is now fsync()'d after replace().
 # IMP-1: optional orjson fast-path enables faster, stricter JSON IO on ARM/Pi builds when installed, while preserving a stdlib fallback.
@@ -39,8 +39,9 @@ SNAPSHOT_SCHEMA_VERSION = 1
 PERSISTED_RECENT_SAMPLE_LIMIT = 64
 STARTING_SAMPLE_DETAIL = "Remote memory watchdog is starting."
 
-# BREAKING: persisted watchdog snapshots are now owner-readable only (0600) instead of world-readable (0644).
-_DEFAULT_SNAPSHOT_FILE_MODE = 0o600
+# BREAKING: the watchdog snapshot stays cross-user readable (0644) so non-root
+# operator probes can read it, while the enclosing ops directory remains 0700.
+_DEFAULT_SNAPSHOT_FILE_MODE = 0o644
 _MAX_SNAPSHOT_BYTES = 1 * 1024 * 1024
 _MAX_TEXT_FIELD_CHARS = 240
 _MAX_JSON_SANITIZE_DEPTH = 16
@@ -330,6 +331,7 @@ def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), _DEFAULT_SNAPSHOT_FILE_MODE)
         os.close(fd)
         fd = None
 
@@ -634,6 +636,7 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
     artifact_path: str | Path,
     started_at: str | None = None,
     captured_at: str | None = None,
+    previous_snapshot: RemoteMemoryWatchdogSnapshot | None = None,
 ) -> RemoteMemoryWatchdogSnapshot:
     """Build the supervisor-seeded startup snapshot for a fresh watchdog child."""
 
@@ -647,6 +650,20 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
         getattr(config, "long_term_memory_remote_watchdog_history_limit", DEFAULT_HISTORY_LIMIT),
         default=DEFAULT_HISTORY_LIMIT,
     )
+    previous_recent_samples: tuple[RemoteMemoryWatchdogSample, ...] = ()
+    previous_sample_count = 0
+    previous_failure_count = 0
+    previous_last_ok_at: str | None = None
+    previous_last_failure_at: str | None = None
+    if previous_snapshot is not None:
+        previous_recent_samples = tuple(
+            compact_history_sample(sample)
+            for sample in previous_snapshot.recent_samples[-PERSISTED_RECENT_SAMPLE_LIMIT:]
+        )
+        previous_sample_count = max(0, int(previous_snapshot.sample_count))
+        previous_failure_count = max(0, int(previous_snapshot.failure_count))
+        previous_last_ok_at = RemoteMemoryWatchdogSample._coerce_optional_text(previous_snapshot.last_ok_at)
+        previous_last_failure_at = RemoteMemoryWatchdogSample._coerce_optional_text(previous_snapshot.last_failure_at)
     return RemoteMemoryWatchdogSnapshot(
         schema_version=SNAPSHOT_SCHEMA_VERSION,
         started_at=resolved_started_at,
@@ -655,13 +672,13 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
         pid=max(0, int(pid)),
         interval_s=interval_s,
         history_limit=history_limit,
-        sample_count=0,
-        failure_count=0,
-        last_ok_at=None,
-        last_failure_at=None,
+        sample_count=previous_sample_count,
+        failure_count=previous_failure_count,
+        last_ok_at=previous_last_ok_at,
+        last_failure_at=previous_last_failure_at,
         artifact_path=str(artifact_path),
         current=build_starting_sample(config, captured_at=resolved_captured_at),
-        recent_samples=(),
+        recent_samples=previous_recent_samples,
         heartbeat_at=resolved_captured_at,
         probe_inflight=True,
         probe_started_at=resolved_captured_at,

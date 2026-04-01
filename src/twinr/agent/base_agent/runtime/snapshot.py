@@ -185,12 +185,17 @@ class TwinrRuntimeSnapshotMixin:
                     empty_to_none=False,
                 )
                 restored_printing_active = bool(self._snapshot_get(snapshot, "printing_active"))
-                if self._should_restore_status(restored_status):
+                restore_status = self._should_restore_status(restored_status)
+                if restore_status:
                     self._restore_status(restored_status, printing_active=restored_printing_active)
-                self.last_transcript = self._coerce_optional_text(
-                    self._snapshot_get(snapshot, "last_transcript"),
-                    empty_to_none=False,
-                    max_chars=_MAX_TEXT_CHARS,
+                self.last_transcript = (
+                    self._coerce_optional_text(
+                        self._snapshot_get(snapshot, "last_transcript"),
+                        empty_to_none=False,
+                        max_chars=_MAX_TEXT_CHARS,
+                    )
+                    if restore_status
+                    else ""
                 )
                 self.last_response = self._coerce_optional_text(
                     self._snapshot_get(snapshot, "last_response"),
@@ -1003,10 +1008,11 @@ class TwinrRuntimeSnapshotMixin:
     @staticmethod
     def _should_restore_status(value: str | None) -> bool:
         normalized = str(value or "").strip().lower()
-        # Do not carry a previously persisted operator error across a fresh
-        # process boot. The current runtime/supervisor startup path must prove
-        # and re-assert any real blocker instead of inheriting stale error.
-        return normalized != "error"
+        # Fresh process boots must not resurrect transient in-flight statuses
+        # from an older runtime lifetime. Only the idle waiting state is safe
+        # to carry across supervisor/service restarts; current blockers or new
+        # active turns must be re-established by live bootstrap/workflow code.
+        return normalized == "waiting"
 
     @staticmethod
     def _restore_status_hook_accepts_printing_active(hook: Any) -> bool:

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,26 @@ class DisplayAmbientImpulseCueTests(unittest.TestCase):
 
         self.assertEqual(loaded, saved)
         self.assertIsNone(expired)
+
+    def test_store_persists_shared_readable_mode_for_ops_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            store = DisplayAmbientImpulseCueStore.from_config(config)
+
+            store.save(
+                DisplayAmbientImpulseCue(
+                    source="ambient",
+                    topic_key="ai companions",
+                    headline="AI companions",
+                    body="Da gibt es gerade etwas Neues.",
+                ),
+                hold_seconds=4.0,
+                now=datetime(2026, 3, 22, 9, 5, tzinfo=timezone.utc),
+            )
+
+            mode = stat.S_IMODE(store.path.stat().st_mode)
+
+        self.assertEqual(mode, 0o644)
 
     def test_controller_persists_one_active_impulse(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

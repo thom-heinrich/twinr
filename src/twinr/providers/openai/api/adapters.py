@@ -65,6 +65,15 @@ _STRICT_SCHEMA_UNSUPPORTED_KEYWORDS = {
     "if",
     "then",
     "else",
+    "contains",
+    "minContains",
+    "maxContains",
+    "uniqueItems",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "minProperties",
+    "maxProperties",
 }
 _UNSUPPORTED_OUTPUT_ITEM_TYPES = {
     "custom_tool_call": "Twinr's AgentToolCall contract only supports JSON-object function calls; custom tools return free-form text inputs and need a different executor contract.",
@@ -637,8 +646,10 @@ def _normalize_strict_json_schema(schema: Any, *, root: bool = False) -> Any:
 
     The 2026 Structured Outputs subset supports nested ``anyOf`` and ``enum``
     but still rejects specific composition keywords such as ``allOf`` and
-    conditional branches. We preserve supported constraints, remove only the
-    documented unsupported ones, and make object schemas strict by default.
+    conditional branches, plus several array/object validation keywords such as
+    ``uniqueItems`` and ``propertyNames``. We preserve supported constraints,
+    remove only the documented unsupported ones, and make object schemas strict
+    by default.
     """
     if isinstance(schema, list):
         return [_normalize_strict_json_schema(item) for item in schema]
@@ -655,7 +666,7 @@ def _normalize_strict_json_schema(schema: Any, *, root: bool = False) -> Any:
                 properties[str(prop_name)] = _normalize_strict_json_schema(prop_schema)
             normalized[key] = properties
             continue
-        if key in {"items", "contains", "additionalProperties", "propertyNames", "unevaluatedItems", "unevaluatedProperties"}:
+        if key in {"items", "additionalProperties"}:
             normalized[key] = _normalize_strict_json_schema(value)
             continue
         if key in {"$defs", "definitions", "patternProperties"} and isinstance(value, Mapping):

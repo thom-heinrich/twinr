@@ -111,6 +111,39 @@ class _FakeGraphStore:
         return "Graph says Lea is the daughter and the visit is tonight."
 
 
+class _FailingQueryRewriter:
+    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+        del query_text
+        raise AssertionError("conversation recap operator search must not call the query rewriter")
+
+
+class _RecapOnlyObjectStore(_FakeObjectStore):
+    def select_relevant_objects(self, *, query_text: str | None, limit: int = 0):
+        del query_text
+        del limit
+        raise AssertionError("conversation recap operator search must skip durable-object selection")
+
+
+class _FailingMidtermStore(_FakeMidtermStore):
+    def select_relevant_packets(self, query_text: str | None, *, limit: int = 0):
+        del query_text
+        del limit
+        raise AssertionError("conversation recap operator search must skip midterm selection")
+
+
+class _FailingRetriever(_FakeRetriever):
+    def select_conflict_queue(self, *, query: LongTermQueryProfile, limit: int | None = None):
+        del query
+        del limit
+        raise AssertionError("conversation recap operator search must skip conflict selection")
+
+
+class _FailingGraphStore(_FakeGraphStore):
+    def build_prompt_context(self, query_text: str | None):
+        del query_text
+        raise AssertionError("conversation recap operator search must skip graph-context rendering")
+
+
 class LongTermOperatorSearchTests(unittest.TestCase):
     def test_search_groups_real_memory_sections(self) -> None:
         search = LongTermOperatorSearch(
@@ -131,6 +164,26 @@ class LongTermOperatorSearchTests(unittest.TestCase):
         self.assertEqual(len(result.conflict_queue), 1)
         self.assertEqual(result.total_hits, 4)
         self.assertIn("daughter", result.graph_context or "")
+
+    def test_conversation_recap_search_uses_episodic_only_fast_plan(self) -> None:
+        search = LongTermOperatorSearch(
+            query_rewriter=_FailingQueryRewriter(),
+            retriever=_FailingRetriever(),
+            graph_store=_FailingGraphStore(),
+            object_store=_RecapOnlyObjectStore(),
+            midterm_store=_FailingMidtermStore(),
+            result_limit=4,
+        )
+
+        result = search.search("Worüber haben wir heute gesprochen?")
+
+        self.assertIsNone(result.query_profile.canonical_english_text)
+        self.assertEqual(len(result.episodic_entries), 1)
+        self.assertEqual(len(result.durable_objects), 0)
+        self.assertEqual(len(result.midterm_packets), 0)
+        self.assertEqual(len(result.conflict_queue), 0)
+        self.assertIsNone(result.graph_context)
+        self.assertEqual(result.total_hits, 1)
 
 
 if __name__ == "__main__":

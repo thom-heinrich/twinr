@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 import json
 import threading
@@ -70,6 +70,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
         sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
         personality_learning: PersonalityLearningService | None = None,
+        prepared_context_invalidator: Callable[..., None] | None = None,
         store_lock: threading.RLock | None = None,
         timezone_name: str | None = None,
         item: LongTermConversationTurn,
@@ -186,6 +187,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         turn=item,
                         consolidation=learning_consolidation,
                     )
+                if callable(prepared_context_invalidator):
+                    prepared_context_invalidator(reason="conversation_turn_persisted")
                 if config.long_term_memory_mode == "remote_primary":
                     return None
         except LongTermRemoteUnavailableError:
@@ -205,6 +208,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
         reflector: LongTermMemoryReflector,
         sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
+        prepared_context_invalidator: Callable[..., None] | None = None,
         store_lock: threading.RLock | None = None,
         timezone_name: str | None = None,
         item: LongTermMultimodalEvidence,
@@ -290,6 +294,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     midterm_store.apply_reflection(reflection)
                 if LongTermMemoryServicePersistenceMixin._has_reflection_payload(sensor_reflection):
                     midterm_store.apply_reflection(sensor_reflection)
+                if callable(prepared_context_invalidator):
+                    prepared_context_invalidator(reason="multimodal_evidence_persisted")
         except LongTermRemoteUnavailableError:
             raise
         except Exception:

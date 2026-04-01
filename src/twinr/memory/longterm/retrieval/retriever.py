@@ -25,10 +25,14 @@ from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.core.models import LongTermConflictQueueItemV1, LongTermMemoryContext
+from twinr.memory.longterm.core.ontology import kind_matches
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.retrieval.unified_plan import (
+    UnifiedEpisodicSelectionInput,
     UnifiedGraphSelectionInput,
     UnifiedRetrievalSelection,
+    attach_adaptive_packets_to_query_plan,
+    build_episodic_selection_input,
     build_unified_retrieval_selection,
 )
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
@@ -70,6 +74,7 @@ class _LongTermContextInputs:
 
     episodic_entries: list[PersistentMemoryEntry]
     midterm_packets: tuple[object, ...]
+    adaptive_packets: tuple[object, ...]
     durable_objects: tuple[object, ...]
     conflict_queue: tuple[LongTermConflictQueueItemV1, ...]
     graph_selection: UnifiedGraphSelectionInput | None
@@ -174,57 +179,11 @@ class LongTermRetriever:
                         query_texts=query_texts,
                         retrieval_text=retrieval_text,
                     )
-                episodic_entries = context_inputs.episodic_entries
-                midterm_packets = context_inputs.midterm_packets
-                durable_objects = context_inputs.durable_objects
-                with workflow_span(name="longterm_retriever_build_adaptive_packets", kind="retrieval"):
-                    adaptive_packets = self._build_adaptive_packets(
-                        retrieval_text=self._combine_query_texts(query_texts),
-                        durable_objects=durable_objects,
-                    )
-                conflict_queue = context_inputs.conflict_queue
-                graph_context = context_inputs.graph_context
-                unified_query_plan = context_inputs.unified_query_plan
-                with workflow_span(name="longterm_retriever_render_durable_context", kind="retrieval"):
-                    durable_context = self._render_durable_context(durable_objects)
-                with workflow_span(name="longterm_retriever_render_episodic_context", kind="retrieval"):
-                    episodic_context = self._render_episodic_context(episodic_entries)
-                with workflow_span(name="longterm_retriever_render_conflict_context", kind="retrieval"):
-                    conflict_context = self._render_conflict_context(conflict_queue)
-                with workflow_span(name="longterm_retriever_build_subtext_context", kind="retrieval"):
-                    # Let the subtext builder decide whether graph-only cues,
-                    # episodic carry-over, or both justify a hidden
-                    # personalization layer for this turn.
-                    subtext_context = self._build_subtext_context(
-                        query_text=original_query_text,
-                        retrieval_query_text=retrieval_text,
-                        episodic_entries=episodic_entries,
-                        graph_selection=context_inputs.graph_selection,
-                        unified_query_plan=unified_query_plan,
-                    )
-                with workflow_span(name="longterm_retriever_render_midterm_context", kind="retrieval"):
-                    midterm_context = self._render_midterm_context(tuple((*adaptive_packets, *midterm_packets)))
-                workflow_event(
-                    kind="retrieval",
-                    msg="longterm_retriever_context_sections_built",
-                    details={
-                        "episodic_entries": len(episodic_entries),
-                        "midterm_packets": len(midterm_packets),
-                        "adaptive_packets": len(adaptive_packets),
-                        "durable_objects": len(durable_objects),
-                        "conflict_queue": len(conflict_queue),
-                        "has_graph_context": bool(graph_context),
-                        "has_subtext_context": bool(subtext_context),
-                        "has_unified_query_plan": bool(unified_query_plan),
-                    },
-                )
-                return LongTermMemoryContext(
-                    subtext_context=subtext_context,
-                    midterm_context=midterm_context,
-                    durable_context=durable_context,
-                    episodic_context=episodic_context,
-                    graph_context=graph_context,
-                    conflict_context=conflict_context,
+                return self._build_context_from_inputs(
+                    context_inputs=context_inputs,
+                    retrieval_text=retrieval_text,
+                    original_query_text=original_query_text,
+                    tool_context=False,
                 )
             except LongTermRemoteUnavailableError:
                 raise
@@ -238,11 +197,207 @@ class LongTermRetriever:
                 )
                 return self._empty_context()
 
+    def build_tool_context(
+        self,
+        *,
+        query: LongTermQueryProfile,
+        original_query_text: str | None = None,
+        include_graph_fallback: bool = True,
+    ) -> LongTermMemoryContext:
+        """Build the tool-facing long-term memory context in one retrieval pass.
+
+        Tool turns still need the same factual memory backbone as ordinary
+        full-context turns, but they must not re-hit the remote selectors after
+        the main context has already been loaded. Reuse one shared
+        ``_load_context_inputs`` pass and derive the tool-safe rendering from
+        those already-fetched sections.
+        """
+
+        retrieval_text = self._normalize_query_text(
+            query,
+            fallback_text=original_query_text,
+        )
+        query_texts = self._query_text_variants(
+            query,
+            fallback_text=original_query_text,
+        )
+        with workflow_span(
+            name="longterm_retriever_build_tool_context",
+            kind="retrieval",
+            details=_query_trace_details(query_texts, retrieval_text=retrieval_text),
+        ):
+            if not query_texts:
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_retriever_tool_context_empty_query",
+                    details={"query_variants": 0},
+                )
+                return self._empty_context()
+            try:
+                with workflow_span(
+                    name="longterm_retriever_load_tool_context_inputs",
+                    kind="retrieval",
+                    details=_query_trace_details(query_texts, retrieval_text=retrieval_text),
+                ):
+                    context_inputs = self._load_context_inputs(
+                        query_texts=query_texts,
+                        retrieval_text=retrieval_text,
+                        include_graph=False,
+                    )
+                return self._build_context_from_inputs(
+                    context_inputs=context_inputs,
+                    retrieval_text=retrieval_text,
+                    original_query_text=original_query_text,
+                    tool_context=True,
+                    include_graph_fallback=include_graph_fallback,
+                )
+            except LongTermRemoteUnavailableError:
+                raise
+            except Exception:
+                logger.exception("Long-term tool context build failed; returning empty memory context.")
+                workflow_event(
+                    kind="exception",
+                    msg="longterm_retriever_build_tool_context_failed",
+                    details={"query_variants": len(query_texts)},
+                    level="ERROR",
+                )
+                return self._empty_context()
+
+    def _build_context_from_inputs(
+        self,
+        *,
+        context_inputs: _LongTermContextInputs,
+        retrieval_text: str,
+        original_query_text: str | None,
+        tool_context: bool,
+        include_graph_fallback: bool = True,
+    ) -> LongTermMemoryContext:
+        """Render one provider or tool context from already-fetched inputs."""
+
+        episodic_entries = context_inputs.episodic_entries
+        midterm_packets = context_inputs.midterm_packets
+        adaptive_packets = context_inputs.adaptive_packets
+        durable_objects = context_inputs.durable_objects
+        conflict_queue = context_inputs.conflict_queue
+        unified_query_plan = context_inputs.unified_query_plan
+        graph_context = context_inputs.graph_context
+
+        if tool_context:
+            durable_objects = self._filter_tool_durable_objects(
+                durable_objects=durable_objects,
+                conflict_queue=conflict_queue,
+            )
+            graph_context = self._build_tool_graph_fallback_context(
+                retrieval_text=retrieval_text,
+                episodic_entries=episodic_entries,
+                midterm_packets=midterm_packets,
+                adaptive_packets=adaptive_packets,
+                durable_objects=durable_objects,
+                include_graph_fallback=include_graph_fallback,
+            )
+
+        context_name = "tool_context" if tool_context else "context"
+        with workflow_span(
+            name=f"longterm_retriever_render_{context_name}_durable_context",
+            kind="retrieval",
+        ):
+            durable_context = self._render_durable_context(durable_objects)
+        with workflow_span(
+            name=f"longterm_retriever_render_{context_name}_episodic_context",
+            kind="retrieval",
+        ):
+            episodic_context = self._render_episodic_context(episodic_entries)
+        if tool_context:
+            conflict_context = None
+        else:
+            with workflow_span(
+                name="longterm_retriever_render_conflict_context",
+                kind="retrieval",
+            ):
+                conflict_context = self._render_conflict_context(conflict_queue)
+        if tool_context:
+            subtext_context = None
+        else:
+            with workflow_span(
+                name=f"longterm_retriever_build_{context_name}_subtext_context",
+                kind="retrieval",
+            ):
+                # Let the subtext builder decide whether graph-only cues,
+                # episodic carry-over, or both justify a hidden
+                # personalization layer for this turn.
+                subtext_context = self._build_subtext_context(
+                    query_text=original_query_text,
+                    retrieval_query_text=retrieval_text,
+                    episodic_entries=episodic_entries,
+                    graph_selection=context_inputs.graph_selection,
+                    unified_query_plan=unified_query_plan,
+                )
+        with workflow_span(
+            name=f"longterm_retriever_render_{context_name}_midterm_context",
+            kind="retrieval",
+        ):
+            midterm_context = self._render_midterm_context(tuple((*adaptive_packets, *midterm_packets)))
+        workflow_event(
+            kind="retrieval",
+            msg=f"longterm_retriever_{context_name}_sections_built",
+            details={
+                "tool_context": tool_context,
+                "episodic_entries": len(episodic_entries),
+                "midterm_packets": len(midterm_packets),
+                "adaptive_packets": len(adaptive_packets),
+                "durable_objects": len(durable_objects),
+                "conflict_queue": len(conflict_queue),
+                "has_graph_context": bool(graph_context),
+                "has_subtext_context": bool(subtext_context),
+                "has_unified_query_plan": bool(unified_query_plan),
+            },
+        )
+        return LongTermMemoryContext(
+            subtext_context=subtext_context,
+            midterm_context=midterm_context,
+            durable_context=durable_context,
+            episodic_context=episodic_context,
+            graph_context=graph_context,
+            conflict_context=conflict_context,
+        )
+
+    def _filter_tool_durable_objects(
+        self,
+        *,
+        durable_objects: tuple[object, ...],
+        conflict_queue: tuple[LongTermConflictQueueItemV1, ...],
+    ) -> tuple[object, ...]:
+        """Drop tool-unsafe durable objects without re-reading remote state."""
+
+        conflicting_memory_ids = {
+            option.memory_id
+            for item in conflict_queue
+            for option in getattr(item, "options", ())
+            if isinstance(getattr(option, "memory_id", None), str)
+            and str(getattr(option, "memory_id", "")).strip()
+        }
+        filtered: list[object] = []
+        for item in durable_objects:
+            if kind_matches(
+                getattr(item, "kind", None),
+                "fact",
+                getattr(item, "attributes", None),
+                attr_key="fact_type",
+                attr_value="contact_method",
+            ):
+                continue
+            memory_id = self._normalize_text(getattr(item, "memory_id", None), limit=256)
+            if memory_id and memory_id in conflicting_memory_ids:
+                continue
+            filtered.append(item)
+        return tuple(filtered)
+
     def _load_context_inputs(
         self,
         *,
         query_texts: tuple[str, ...],
         retrieval_text: str,
+        include_graph: bool = True,
     ) -> _LongTermContextInputs:
         """Load independent retrieval sections in parallel for one turn.
 
@@ -264,35 +419,55 @@ class LongTermRetriever:
                 self._select_midterm_packets,
                 query_texts,
             )
-            graph_future = executor.submit(
-                copy_context().run,
-                _run_traced_call,
-                "longterm_retriever_select_graph_context",
-                self._select_graph_context_selection,
-                retrieval_text,
+            graph_future = (
+                executor.submit(
+                    copy_context().run,
+                    _run_traced_call,
+                    "longterm_retriever_select_graph_context",
+                    self._select_graph_context_selection,
+                    retrieval_text,
+                )
+                if include_graph
+                else None
             )
             with workflow_span(name="longterm_retriever_select_context_objects", kind="retrieval"):
                 episodic_entries, durable_objects = self._select_context_object_sections(query_texts)
             with workflow_span(name="longterm_retriever_select_conflict_queue", kind="retrieval"):
                 conflict_selection = self._select_conflict_queue_selection_for_texts(query_texts)
-            graph_selection = graph_future.result()
+            graph_selection = graph_future.result() if graph_future is not None else None
             midterm_packets = midterm_future.result()
             with workflow_span(name="longterm_retriever_build_unified_query_plan", kind="retrieval"):
                 unified_selection = self._build_unified_selection(
                     query_texts=query_texts,
+                    episodic_entries=episodic_entries,
                     durable_objects=durable_objects,
                     conflict_selection=conflict_selection,
                     midterm_packets=midterm_packets,
                     graph_selection=graph_selection,
                 )
+            with workflow_span(name="longterm_retriever_build_adaptive_packets", kind="retrieval"):
+                adaptive_packets = attach_adaptive_packets_to_query_plan(
+                    query_plan=unified_selection.query_plan,
+                    durable_objects=unified_selection.durable_objects,
+                    adaptive_packets=self._build_adaptive_packets(
+                        retrieval_text=self._combine_query_texts(query_texts),
+                        durable_objects=unified_selection.durable_objects,
+                    ),
+                )
+            workflow_event(
+                kind="retrieval",
+                msg="longterm_retriever_unified_query_plan",
+                details={"query_plan": dict(unified_selection.query_plan)},
+            )
             with workflow_span(name="longterm_retriever_render_graph_context", kind="retrieval"):
                 graph_context = self._render_graph_context_selection(
                     graph_selection=unified_selection.graph_selection,
                     retrieval_text=retrieval_text,
                 )
             return _LongTermContextInputs(
-                episodic_entries=episodic_entries,
+                episodic_entries=list(unified_selection.episodic_entries),
                 midterm_packets=unified_selection.midterm_packets,
+                adaptive_packets=adaptive_packets,
                 durable_objects=unified_selection.durable_objects,
                 conflict_queue=unified_selection.conflict_queue,
                 graph_selection=unified_selection.graph_selection,
@@ -300,10 +475,40 @@ class LongTermRetriever:
                 unified_query_plan=unified_selection.query_plan,
             )
 
+    def _build_tool_graph_fallback_context(
+        self,
+        *,
+        retrieval_text: str,
+        episodic_entries: list[PersistentMemoryEntry],
+        midterm_packets: tuple[object, ...],
+        adaptive_packets: tuple[object, ...],
+        durable_objects: tuple[object, ...],
+        include_graph_fallback: bool,
+    ) -> str | None:
+        """Return tool graph context only when visible structured recall is empty.
+
+        Tool-facing turns are latency-sensitive and already omit conflicts plus
+        other sensitive sections. When durable, episodic, or mid-term context is
+        present, the graph is usually additive background rather than the main
+        answer source. Defer the expensive graph fetch unless the visible
+        structured sections are empty and the tool path would otherwise carry no
+        factual long-term context.
+        """
+
+        if (
+            not include_graph_fallback
+            or episodic_entries
+            or midterm_packets
+            or adaptive_packets
+            or durable_objects
+        ):
+            return None
+        return self._build_graph_context(retrieval_text)
+
     def _select_context_object_sections(
         self,
         query_texts: tuple[str, ...],
-    ) -> tuple[list[PersistentMemoryEntry], tuple[object, ...]]:
+    ) -> tuple[list[UnifiedEpisodicSelectionInput], tuple[object, ...]]:
         """Select episodic and durable objects through one shared query per variant."""
 
         if not query_texts:
@@ -363,7 +568,7 @@ class LongTermRetriever:
             logger.exception("Long-term durable retrieval failed; continuing without durable context.")
             durable_objects = ()
 
-        entries: list[PersistentMemoryEntry] = []
+        entries: list[UnifiedEpisodicSelectionInput] = []
         ranked_episodic = self.object_store.rank_selected_objects(
             query_texts=query_texts,
             objects=self._coerce_iterable(episodic_objects),
@@ -372,7 +577,12 @@ class LongTermRetriever:
         for item in self._coerce_iterable(ranked_episodic):
             entry = self._episodic_entry_from_object(item)
             if entry is not None:
-                entries.append(entry)
+                entries.append(
+                    build_episodic_selection_input(
+                        entry=entry,
+                        source_object=item,
+                    )
+                )
         ranked_durable = self.object_store.rank_selected_objects(
             query_texts=query_texts,
             objects=self._coerce_iterable(durable_objects),
@@ -654,6 +864,7 @@ class LongTermRetriever:
         *,
         graph_selection: UnifiedGraphSelectionInput | None,
         retrieval_text: str,
+        include_contact_methods: bool = True,
     ) -> str | None:
         """Render graph-derived prompt context from an already selected graph document."""
 
@@ -666,6 +877,7 @@ class LongTermRetriever:
                     query_plan=graph_selection.query_plan,
                 ),
                 query_text=retrieval_text,
+                include_contact_methods=include_contact_methods,
             )
         except LongTermRemoteUnavailableError:
             raise
@@ -689,6 +901,7 @@ class LongTermRetriever:
         self,
         *,
         query_texts: tuple[str, ...],
+        episodic_entries: list[UnifiedEpisodicSelectionInput],
         durable_objects: tuple[object, ...],
         conflict_selection: _ConflictQueueSelection,
         midterm_packets: tuple[object, ...],
@@ -698,16 +911,12 @@ class LongTermRetriever:
 
         unified_selection = build_unified_retrieval_selection(
             query_texts=query_texts,
+            episodic_entries=episodic_entries,
             durable_objects=durable_objects,
             conflict_queue=conflict_selection.queue,
             conflict_supporting_objects=conflict_selection.supporting_objects,
             midterm_packets=midterm_packets,
             graph_selection=graph_selection,
-        )
-        workflow_event(
-            kind="retrieval",
-            msg="longterm_retriever_unified_query_plan",
-            details={"query_plan": dict(unified_selection.query_plan)},
         )
         return unified_selection
 

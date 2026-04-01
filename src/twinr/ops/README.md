@@ -12,6 +12,8 @@ tools.
 `ops` owns:
 - resolve canonical paths for ops artifacts and stores
 - persist sanitized ops events and usage telemetry
+- keep the sanitized ops-event JSONL store readable across Pi runtime/operator users so deploy and acceptance diagnostics do not go blind when services and probes run under different accounts
+- keep shared ops JSON artifacts such as `remote_memory_watchdog.json` and `display_ambient_impulse.json` readable across Pi runtime/operator users while still confining them inside the `0700` ops directory, so fail-closed runtime probes can consume fresh watchdog/display state without needing `sudo`
 - collect config, device, and system-health snapshots
 - validate the Pi-side OpenAI env contract for acceptance scripts so `/twinr/.env` can be trusted directly for provider probes without one-off shell injection
 - run a dedicated rolling ChonkyDB remote-memory watchdog
@@ -23,7 +25,7 @@ tools.
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, including exact endpoint and request-payload type, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - allow the productive runtime supervisor to consume that external watchdog as the long-lived owner, so restarting the supervisor does not cold-reset the watchdog's warm remote state
-- let the productive runtime supervisor self-heal a dead externally managed watchdog owner by re-spawning the detached companion when the watchdog PID/artifact proves the owner is gone
+- let the productive runtime supervisor self-heal a dead externally managed watchdog owner by requesting the dedicated systemd watchdog unit instead of spawning a second raw watchdog process behind systemd's back
 - reseed the persisted watchdog bootstrap snapshot when the detached companion adopts or spawns a new external owner PID, so handoff windows do not keep advertising a dead previous process
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback, including the configured desktop runtime dir on productive root-owned Pi services where the live audio session belongs to the logged-in user
 - supervise the productive Pi streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
@@ -38,7 +40,8 @@ tools.
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
 - mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, `artifacts/`, and `.cache/`, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
-- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, heal direct-dependency duplicates where a stale venv copy shadows a bridged Pi system package such as `PyQt5`, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, independently attest the mirrored repo contents by SHA256/link-target before restart, restart the productive Pi service set, and verify post-restart health
+- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, heal direct-dependency duplicates where a stale venv copy shadows a bridged Pi system package such as `PyQt5`, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, independently attest the mirrored repo contents by SHA256/link-target before restart, restart the productive Pi service set, run the bounded live retention canary, and verify post-restart health
+- snapshot the authoritative repo mirror scope before Pi deploy sync so shared-worktree edits cannot self-abort a rollout or mix multiple source states into one acceptance checkout
 - repair known shared `/twinr/state` ownership and mode contracts during Pi deploys so cross-user runtime files such as `automations.json`, `automations.json.lock`, and `user_discovery.json` stay usable after rollout
 - verify those shared `/twinr/state` ownership and mode contracts again after the productive services restarted, so post-restart acceptance fails closed if a service recreated one of the shared files with the wrong owner or mode
 - hand root-owned mirrored `__pycache__/` trees back to the runtime user, rebuild checked-hash Python bytecode for mirrored source trees during Pi deploys, and attest critical runtime APIs such as the local camera stream surface plus memory bootstrap imports before services restart
@@ -65,14 +68,14 @@ tools.
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
-| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog process for live Pi loops and reseed bootstrap attestation when the owner PID changes |
+| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr` and reseeding bootstrap attestation when the owner PID changes |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment, preferring the configured desktop runtime dir for productive root-owned Pi services when needed |
 | [runtime_scope.py](./runtime_scope.py) | Build scoped runtime configs so auxiliary loops do not overwrite the primary display/runtime snapshot |
 | [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, and leave display degradation to ops health instead of recycling the speech path |
 | [runtime_supervisor_process.py](./runtime_supervisor_process.py) | Internal child-process, timestamp, and runtime-env helpers kept separate from supervisor orchestration, including dedicated child process-group handling for restart-safe teardown |
 | [pi_repo_mirror.py](./pi_repo_mirror.py) | One-way repo mirror watchdog that keeps `/twinr` aligned with the authoritative leading repo without deleting Pi-local runtime state |
-| [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: mirror code, sync the authoritative runtime `.env`, independently attest the mirrored repo contents before restart, refresh the editable install, heal stale venv duplicates of bridged Pi system packages before dependency verification, verify critical direct-import runtime modules including the memory bootstrap path, repair and then post-restart verify shared `/twinr/state` permissions, restart the base services plus any repo-backed Pi runtime units already enabled on the host, support first rollout of disabled optional Pi units, and verify restart health |
-| [pi_runtime_deploy_remote.py](./pi_runtime_deploy_remote.py) | Internal SSH/SCP/service-state helper layer kept separate from deploy phase orchestration, including remote repo-content attestation, bridged-system duplicate cleanup, and shared-state permission repair/verification helpers |
+| [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: snapshot the authoritative mirror scope, mirror that stable code image, sync the authoritative runtime `.env`, independently attest the mirrored repo contents before restart, refresh the editable install, heal stale venv duplicates of bridged Pi system packages before dependency verification, verify critical direct-import runtime modules including the memory bootstrap path, repair and then post-restart verify shared `/twinr/state` permissions, restart the base services plus any repo-backed Pi runtime units already enabled on the host, run the bounded live retention canary, support first rollout of disabled optional Pi units, and verify restart health |
+| [pi_runtime_deploy_remote.py](./pi_runtime_deploy_remote.py) | Internal SSH/SCP/service-state helper layer kept separate from deploy phase orchestration, including remote repo-content attestation, bridged-system duplicate cleanup, shared-state permission repair/verification helpers, and the remote retention-canary probe |
 | [venv_bridged_system_cleanup.py](./venv_bridged_system_cleanup.py) | Detect direct dependencies where a stale venv dist shadows an acceptable bridged Pi system dist |
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
@@ -100,6 +103,15 @@ TwinrOpsEventStore.from_config(config).append(
     data={"events_path": str(ops_paths.events_path)},
 )
 ```
+
+The live current ops event stream (`events.jsonl` plus its lock file) is kept
+on a shared-writer permission contract so Pi services and operator-triggered
+runtime probes append to the same sanitized diagnostics stream without
+cross-user `PermissionError` drift. Shared read-mostly ops artifacts such as
+`remote_memory_watchdog.json` and `display_ambient_impulse.json` likewise stay
+operator-readable inside the otherwise `0700` ops directory so non-root
+acceptance probes can fail closed on the same fresh artifacts the productive
+root-owned services write.
 
 ```python
 from twinr.ops import TwinrSelfTestRunner, collect_system_health
@@ -184,7 +196,9 @@ preserved Pi bytecode caches from shadowing fresh
 source files after mirror syncs or historical checkout moves.
 When a deleted remote tree survives only because it still contains ignored
 Python caches, the mirror prunes those cache-only stale directories and reruns
-the sync once so the acceptance checkout can still converge cleanly.
+the sync once so the acceptance checkout can still converge cleanly. If the
+stale cache tree is still owned by `root`, that prune path now prefers
+passwordless `sudo rm -rf` before falling back to a normal user-owned delete.
 The deploy helper builds on that mirror contract and adds the explicit pieces
 the mirror intentionally does not own: authoritative `.env` sync, a no-deps
 editable refresh by default, early activation of the bridged Pi
@@ -209,6 +223,18 @@ host. Before any install or restart, the deploy now also uploads an
 authoritative local manifest and independently attests every mirrored regular
 file and symlink on `/twinr` by SHA256 or link target, so the deploy cannot
 report a green rollout solely because the rsync phase believed it converged.
+Before that sync starts, the deploy snapshots the authoritative mirror scope
+into a temporary local tree and mirrors from that immutable image, so parallel
+shared-worktree edits cannot trip the deploy midway or produce a mixed-source
+Pi checkout.
+After the normal restart and env/import/permissions checks, the deploy also
+runs the bounded live retention canary against a fresh remote-memory namespace
+by default; use the low-level API or the operator `--skip-retention-canary`
+flag only when you intentionally want to bypass that extra remote-memory
+proof.
+The operator-facing CLI keeps stdout reserved for the final JSON payload and
+emits live structured phase/substep progress on stderr so long Pi installs no
+longer look indistinguishable from a hang.
 It also repairs the known cross-user state paths under `/twinr/state/` before
 services restart, so deploys do not leave stale permissions on shared files
 such as `automations.json`, `automations.json.lock`, or `user_discovery.json`.

@@ -366,9 +366,36 @@ class LongTermMidtermTests(unittest.TestCase):
             any("thermoskanne" in hint.lower() or "linsensuppe" in hint.lower() for hint in packet.query_hints),
             packet.query_hints,
         )
+        self.assertIn("recent conversation", packet.query_hints)
+        self.assertIn("worueber gesprochen", packet.query_hints)
         self.assertEqual(packet.attributes["persistence_scope"], "turn_continuity")
         self.assertIn("Thermoskanne", packet.attributes["transcript_excerpt"])
         self.assertIn("Lea", packet.attributes["response_excerpt"])
+
+    def test_turn_continuity_packets_match_generic_recap_queries_in_both_languages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            store = LongTermMidtermStore.from_config(config)
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:turn:recap",
+                        kind="recent_turn_continuity",
+                        summary="Recent conversation continuity from the latest user-assistant turn.",
+                        details="User said: Wir haben ueber Medikamente und den Arzttermin gesprochen.",
+                        query_hints=("medikamente", "arzttermin"),
+                        attributes={"persistence_scope": "turn_continuity"},
+                    ),
+                )
+            )
+
+            german_packets = store.select_relevant_packets("Worüber haben wir heute gesprochen?", limit=2)
+            english_packets = store.select_relevant_packets("What did we talk about today?", limit=2)
+            control_packets = store.select_relevant_packets("Was ist ein Regenbogen?", limit=2)
+
+        self.assertEqual([item.packet_id for item in german_packets], ["midterm:turn:recap"])
+        self.assertEqual([item.packet_id for item in english_packets], ["midterm:turn:recap"])
+        self.assertEqual(control_packets, ())
 
     def test_midterm_store_selects_query_relevant_packets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -512,6 +539,38 @@ class LongTermMidtermTests(unittest.TestCase):
         self.assertEqual(remote_head["schema"], "twinr_memory_midterm_catalog_v3")
         self.assertTrue(remote_state.load_calls)
         self.assertTrue(all(call["snapshot_kind"] == "midterm" for call in remote_state.load_calls))
+
+    def test_remote_turn_continuity_packets_match_generic_recap_queries_after_remote_hydration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            primary_store.save_packets(
+                packets=(
+                    primary_store.packet_type(
+                        packet_id="midterm:turn:remote_recap",
+                        kind="recent_turn_continuity",
+                        summary="Recent conversation continuity from the latest user-assistant turn.",
+                        details="User said: Wir haben ueber Medikamente und den Arzttermin gesprochen.",
+                        query_hints=("medikamente", "arzttermin"),
+                        attributes={"persistence_scope": "turn_continuity"},
+                    ),
+                )
+            )
+            fresh_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "fresh" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            german_packets = fresh_store.select_relevant_packets("Worüber haben wir heute gesprochen?", limit=2)
+            english_packets = fresh_store.select_relevant_packets("What did we talk about today?", limit=2)
+            control_packets = fresh_store.select_relevant_packets("Was ist ein Regenbogen?", limit=2)
+
+        self.assertEqual([item.packet_id for item in german_packets], ["midterm:turn:remote_recap"])
+        self.assertEqual([item.packet_id for item in english_packets], ["midterm:turn:remote_recap"])
+        self.assertEqual(control_packets, ())
 
     def test_load_packets_uses_catalog_entry_projection_when_midterm_item_documents_lag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

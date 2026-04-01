@@ -87,3 +87,65 @@ class RemoteMemoryWatchdogCompanionTests(unittest.TestCase):
             self.assertEqual(snapshot.current.status, "starting")
             self.assertTrue(snapshot.probe_inflight)
             self.assertEqual(emitted[:2], ["remote_memory_watchdog=spawned", "remote_memory_watchdog=ready:333"])
+
+    def test_pi_runtime_requests_systemd_watchdog_unit_before_raw_spawn(self) -> None:
+        config = TwinrConfig(
+            project_root="/twinr",
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=True,
+        )
+        emitted: list[str] = []
+
+        with mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.loop_lock_owner",
+            side_effect=[None, 444],
+        ), mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.run",
+            return_value=mock.Mock(returncode=0),
+        ) as run_mock, mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.Popen",
+        ) as popen_mock, mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.time.sleep",
+            return_value=None,
+        ):
+            owner = ensure_remote_memory_watchdog_process(
+                config,
+                env_file="/twinr/.env",
+                emit=emitted.append,
+                startup_timeout_s=0.2,
+            )
+
+        self.assertEqual(owner, 444)
+        run_mock.assert_called_once()
+        popen_mock.assert_not_called()
+        self.assertEqual(
+            emitted[:2],
+            [
+                "remote_memory_watchdog=systemd_start_requested:twinr-remote-memory-watchdog.service",
+                "remote_memory_watchdog=ready:444",
+            ],
+        )
+
+    def test_spawn_disallowed_skips_raw_spawn_when_systemd_unit_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _build_config(root)
+            emitted: list[str] = []
+
+            with mock.patch(
+                "twinr.ops.remote_memory_watchdog_companion.loop_lock_owner",
+                return_value=None,
+            ), mock.patch(
+                "twinr.ops.remote_memory_watchdog_companion.subprocess.Popen",
+            ) as popen_mock:
+                owner = ensure_remote_memory_watchdog_process(
+                    config,
+                    env_file=root / ".env",
+                    emit=emitted.append,
+                    allow_spawn=False,
+                )
+
+        self.assertIsNone(owner)
+        popen_mock.assert_not_called()
+        self.assertEqual(emitted, ["remote_memory_watchdog=spawn_disallowed"])

@@ -40,11 +40,13 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - emit privacy-safe accountability events for committed follow-up transcripts, carryover-hint build/store decisions, and provider-context carryover injection so live wrong-answer turns can be reconstructed after the fact without logging raw speech
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep the post-playback join against the closure guard bounded so a stalled steering, remote-memory, or closure-provider path cannot leave the runtime stuck in `answering` after speech has ended
+- stamp live voice turns with one shared `wake -> commit -> supervisor -> remote-memory -> tts` latency breakdown so Pi journals show exactly which stage consumed the turn budget
 - translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
 - build per-turn fast-lane supervisor instructions from stable routing policy plus the currently visible reserve-lane card so display-grounded turns can route on the actual shown topic without bloating the loop classes
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
+- feed transcript-first interim and endpoint transcripts into long-term-memory prepared-context prewarm so the live answer path can reuse already-started full-context retrieval instead of waiting for a fresh synchronous remote rebuild after the user stops speaking
 - let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
 - when the local semantic router is enabled on the Pi, prewarm its ONNX path before the first live turn so weather/tool/memory turns do not spend the user's first reply budget on cold-start model load
 - when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
@@ -55,6 +57,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - treat an incomplete one-shot runtime-local shortcut payload as a normal specialist handoff instead of executing it directly; this keeps ambiguous quiet-mode requests on the ask-a-duration path instead of throwing the live turn into `Thinking -> Error`
 - route resolved or prefetched dual-lane handoffs straight into the specialist path, using full tool-provider context for memory/general work while keeping pure search handoffs on the bounded search-only context
 - route `tiny_recent` runtime-local tool handoffs onto the bounded compact tool context instead of the heavy remote-backed tool-provider context, so status/control turns do not stall the final lane on synchronous long-term retrieval
+- keep authoritative local `memory` routes on the fast bridge while preserving the full-context handoff, so recall turns still exercise the real long-term-memory path instead of silently downgrading to a recent-only shortcut
 - give tool/search handoffs their own wider final-lane timeout budget so live specialist turns are not cut off by the shorter direct-reply watchdog envelope
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
@@ -98,14 +101,15 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
 | [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery, first-frame stall healing via host-control reboot, and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
+| [voice_turn_latency.py](./voice_turn_latency.py) | Shared wake/commit/supervisor/remote-memory/TTS stage tracker for per-turn Pi journal timing breakdowns |
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
 | [remote_transcript_commit.py](./remote_transcript_commit.py) | Bounded wait coordinator for same-stream server transcript commits during live remote listening |
-| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
+| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell, including transcript-first long-term prepared-context prewarm delegation |
 | [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions, including storage of the next-turn carryover hint |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
 | [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
 | [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |
-| [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, same-stream remote transcript waits, timeout handling, and batch-STT fallback |
+| [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, same-stream remote transcript waits, transcript-first long-term prewarm triggers, timeout handling, and batch-STT fallback |
 | [streaming_speculation.py](./streaming_speculation.py) | Speculative first-word and supervisor warmup controller |
 | [streaming_lane_planner.py](./streaming_lane_planner.py) | Streaming lane-plan and final-lane path selection |
 | [streaming_supervisor_context.py](./streaming_supervisor_context.py) | Per-turn fast-lane supervisor instruction builder, including visible-card grounding overlays |
@@ -154,6 +158,11 @@ Set `TWINR_WORKFLOW_TRACE_ENABLED=1` to write a bounded workflow run pack under
 - `run.metrics.json` — aggregated counts and slow spans
 - `run.summary.json` — top messages, failure buckets, and slowest spans
 - `run.repro/` — sanitized runtime and environment snapshot
+
+If `TWINR_WORKFLOW_TRACE_DIR` still points at another Twinr checkout's absolute
+`state/forensics/...` path, the tracer now re-bases that repo-owned tail onto
+the active `project_root` before opening files. That keeps `/twinr` probes from
+failing on stale leading-repo absolute paths copied through `.env`.
 
 Before each new conversation session, the active loop also checks whether the
 current run pack still has enough event budget left to capture a real spoken

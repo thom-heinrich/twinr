@@ -63,11 +63,12 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
             result = self.conflict_resolver.resolve(
                 conflict=conflict,
                 objects=self.object_store.load_objects_for_conflict(conflict),
-                remaining_conflicts=self.object_store.load_conflicts_fine_grained(),
+                remaining_conflicts=conflicts,
                 selected_memory_id=selected_memory_id,
             )
             self.object_store.apply_conflict_resolution(result)
             self._refresh_restart_recall_packets_locked()
+            self._invalidate_prepared_contexts(reason="conflict_resolved")
             return result
 
     def review_memory(
@@ -108,15 +109,17 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
                 result = self.conflict_resolver.resolve(
                     conflict=conflict,
                     objects=self.object_store.load_objects_for_conflict(conflict),
-                    remaining_conflicts=self.object_store.load_conflicts_fine_grained(),
+                    remaining_conflicts=conflicts,
                     selected_memory_id=memory_id,
                 )
                 self.object_store.apply_conflict_resolution(result)
                 self._refresh_restart_recall_packets_locked()
+                self._invalidate_prepared_contexts(reason="memory_confirmed_via_conflict_resolution")
                 return result
             result = self.object_store.confirm_object(memory_id)
             self.object_store.apply_memory_mutation(result)
             self._refresh_restart_recall_packets_locked()
+            self._invalidate_prepared_contexts(reason="memory_confirmed")
             return result
 
     def invalidate_memory(
@@ -131,6 +134,7 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
             result = self.object_store.invalidate_object(memory_id, reason=reason)
             self.object_store.apply_memory_mutation(result)
             self._refresh_restart_recall_packets_locked()
+            self._invalidate_prepared_contexts(reason="memory_invalidated")
             return result
 
     def delete_memory(self, *, memory_id: str) -> LongTermMemoryMutationResultV1:
@@ -140,6 +144,7 @@ class LongTermMemoryServiceMutationMixin(ServiceMixinBase):
             result = self.object_store.delete_object(memory_id)
             self.object_store.apply_memory_mutation(result)
             self._refresh_restart_recall_packets_locked()
+            self._invalidate_prepared_contexts(reason="memory_deleted")
             return result
 
     def store_explicit_memory(

@@ -44,6 +44,7 @@ from twinr.agent.workflows.streaming_supervisor_context import (
 )
 from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
+from twinr.agent.workflows.voice_turn_latency import mark_voice_turn_supervisor_ready
 
 
 _TRACE_FINGERPRINT_ENV = "TWINR_TRACE_FINGERPRINT_KEY"
@@ -251,6 +252,7 @@ class StreamingLanePlanner:
                         ),
                     )
                 )
+                mark_voice_turn_supervisor_ready()
                 return StreamingTurnLanePlan(
                     turn_instructions=turn_instructions,
                     run_final_lane=lambda: (
@@ -302,6 +304,7 @@ class StreamingLanePlanner:
                     extra_instructions=loop.config.openai_realtime_instructions,
                 )
             )
+            mark_voice_turn_supervisor_ready()
             return StreamingTurnLanePlan(
                 turn_instructions=turn_instructions,
                 run_single_lane=lambda on_text_delta: loop.streaming_turn_loop.run(

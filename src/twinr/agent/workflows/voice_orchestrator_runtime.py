@@ -29,6 +29,10 @@ from twinr.agent.workflows.remote_transcript_commit import (
     RemoteTranscriptCommit,
     RemoteTranscriptWaitHandle,
 )
+from twinr.agent.workflows.voice_turn_latency import (
+    clear_voice_turn_latency,
+    mark_voice_turn_commit,
+)
 from twinr.agent.workflows.voice_identity_runtime import (
     sync_voice_orchestrator_identity_profiles,
 )
@@ -582,7 +586,6 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
                 ),
             },
         )
-
         if committed_source == "follow_up":
             if not _follow_up_reopen_allowed(loop, initial_source="follow_up"):
                 clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
@@ -620,6 +623,7 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
             return False
 
         loop.emit("voice_orchestrator_follow_up=true")
+        mark_voice_turn_commit(loop, source=committed_source)
         loop._trace_event(
             "voice_orchestrator_follow_up_transcript_committed",
             kind="decision",
@@ -628,12 +632,16 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
                 "transcript_chars": len(committed_transcript),
             },
         )
-        return loop._run_conversation_session(
+        result = loop._run_conversation_session(
             initial_source="follow_up",
             seed_transcript=committed_transcript,
             play_initial_beep=False,
         )
+        if not result:
+            clear_voice_turn_latency(loop)
+        return result
     except Exception as exc:
+        clear_voice_turn_latency(loop)
         loop._handle_error(exc)
         return False
 
@@ -739,10 +747,12 @@ def wait_for_remote_transcript_commit(
     deadline_at = time.monotonic() + _bounded_timeout_s(timeout_s)
     while True:
         if loop._active_turn_stop_requested():
+            clear_voice_turn_latency(loop)
             loop._cancel_interrupted_turn()
             return None
 
         if wait_handle.commit is not None:
+            mark_voice_turn_commit(loop, source=wait_handle.commit.source)
             return wait_handle.commit
 
         if wait_handle.close is not None:
@@ -750,6 +760,7 @@ def wait_for_remote_transcript_commit(
                 _sanitize_untrusted_text(wait_handle.close.reason, max_chars=_MAX_DETAIL_CHARS)
                 or "closed"
             )
+            clear_voice_turn_latency(loop)
             loop.runtime.cancel_listening()
             loop._emit_status(force=True)
             _notify_voice_state(loop, "waiting", detail=close_reason)
@@ -781,6 +792,7 @@ def wait_for_remote_transcript_commit(
 
         remaining_s = deadline_at - time.monotonic()
         if remaining_s <= 0:
+            clear_voice_turn_latency(loop)
             loop.runtime.remember_listen_timeout(
                 initial_source=initial_source,
                 follow_up=follow_up,

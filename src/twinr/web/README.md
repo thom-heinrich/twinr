@@ -15,6 +15,7 @@ templates and CSS that power the operator dashboard.
 - render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
 - render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
 - run the interactive `/ops/debug` Conversation Lab tab that sends a real text turn through Twinr's provider/tool/memory path and persists human-readable routing, tool, retrieval, and memory-write traces
+- render Conversation Lab retrieval traces from the actual tool-facing long-term context built during the real turn instead of launching a second independent operator-memory search just to paint the panel
 - inject bounded recent-thread carryover guidance into Conversation Lab text turns so short repairs and clarifications can preserve immediate anchors such as place, date, or task scope
 - isolate each Conversation Lab session from the shared Pi short-term runtime snapshot so fresh portal sessions cannot silently inherit old anchors while still exercising the real provider and remote-memory path
 - run Conversation Lab turns under a text-only runtime config so operator text probes do not touch shared microphone-adaptive timing state that belongs to audio capture

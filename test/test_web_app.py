@@ -1020,7 +1020,8 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Enable mail with clear guardrails", response.text)
         self.assertIn("United Domains", response.text)
         self.assertIn("iCloud Mail", response.text)
-        self.assertIn("Outlook.com / Microsoft mail", response.text)
+        self.assertIn("Outlook.com", response.text)
+        self.assertIn("Microsoft 365 / Exchange Online", response.text)
         self.assertIn("Run connection test", response.text)
 
     def test_email_wizard_post_saves_profile_step(self) -> None:
@@ -1402,8 +1403,9 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(record.value("imap_host"), "imap.gmail.com")
         self.assertEqual(record.value("smtp_host"), "smtp.gmail.com")
         self.assertEqual(record.value("account_email"), "anna@gmail.com")
-        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
-        self.assertNotIn("abcd efgh ijkl mnop", store_text)
+        store_bytes = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_bytes()
+        self.assertNotIn(b"abcd efgh ijkl mnop", store_bytes)
+        self.assertNotIn(b"abcdefghijklmnop", store_bytes)
 
         response = client.get("/integrations")
         self.assertNotIn("abcd", response.text)
@@ -1466,8 +1468,8 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(record.value("provider"), "hue")
         self.assertEqual(record.value("bridge_host"), "192.168.1.20")
         self.assertEqual(record.value("event_timeout_s"), "2")
-        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
-        self.assertNotIn("local-hue-key", store_text)
+        store_bytes = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_bytes()
+        self.assertNotIn(b"local-hue-key", store_bytes)
 
         response = client.get("/integrations")
         self.assertIn("Smart Home", response.text)
@@ -1506,16 +1508,16 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(record.value("provider"), "hue")
         self.assertEqual(record.value("bridge_host"), "192.168.1.20")
         self.assertEqual(record.value(HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY), "192.168.1.21")
-        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
-        self.assertNotIn("primary-hue-key", store_text)
-        self.assertNotIn("secondary-hue-key", store_text)
+        store_bytes = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_bytes()
+        self.assertNotIn(b"primary-hue-key", store_bytes)
+        self.assertNotIn(b"secondary-hue-key", store_bytes)
 
         response = client.get("/integrations")
         self.assertIn("Additional bridge hosts", response.text)
         self.assertIn("192.168.1.21", response.text)
         self.assertIn("Hue application key for 192.168.1.21", response.text)
 
-    def test_integrations_post_rejects_calendar_url_with_query_token(self) -> None:
+    def test_integrations_post_saves_calendar_url_with_query_token_without_echoing_token(self) -> None:
         client, env_path = self.make_client()
 
         response = client.post(
@@ -1533,12 +1535,13 @@ class WebAppTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 303)
-        self.assertIn("error=", response.headers["location"])
+        self.assertEqual(response.headers["location"], "/integrations?saved=1")
         record = TwinrIntegrationStore.from_project_root(env_path.parent).get("calendar_agenda")
-        self.assertFalse(record.enabled)
-        if TwinrIntegrationStore.from_project_root(env_path.parent).path.exists():
-            store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
-            self.assertNotIn("super-secret", store_text)
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("source_value"), "https://calendar.example.com/feed.ics?token=super-secret")
+        response = client.get("/integrations")
+        self.assertNotIn("token=super-secret", response.text)
+        self.assertIn("https://calendar.example.com/feed.ics", response.text)
 
     def test_voice_profile_page_renders_status_and_actions(self) -> None:
         client, _env_path = self.make_client()
@@ -1619,7 +1622,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Sensor-triggered", response.text)
         self.assertIn("Email Mailbox automations", response.text)
         self.assertIn("Calendar Agenda automations", response.text)
-        self.assertIn("Integration not configured", response.text)
+        self.assertIn("Integration status unavailable", response.text)
         self.assertIn("Morning weather", response.text)
         self.assertIn("Quiet room check-in", response.text)
         self.assertIn("Add scheduled automation", response.text)

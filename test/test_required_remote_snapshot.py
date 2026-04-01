@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.required_remote_snapshot import (
+    _default_watchdog_recovery_starter,
     assess_required_remote_watchdog_snapshot,
     ensure_required_remote_watchdog_snapshot_ready,
 )
@@ -121,6 +122,19 @@ def _build_snapshot(
 
 
 class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
+    def test_default_watchdog_recovery_starter_delegates_to_companion_helper(self) -> None:
+        config = TwinrConfig(project_root="/tmp/twinr")
+
+        with mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.ensure_remote_memory_watchdog_process",
+            return_value=4321,
+        ) as ensure_process:
+            owner = _default_watchdog_recovery_starter(config, "/tmp/twinr/.env")
+
+        self.assertEqual(owner, 4321)
+        ensure_process.assert_called_once()
+        self.assertEqual(ensure_process.call_args.kwargs["env_file"], "/tmp/twinr/.env")
+
     def test_assess_accepts_recent_ok_snapshot_with_live_pid(self) -> None:
         now = datetime.now(timezone.utc)
         snapshot = _build_snapshot(now=now, pid=os.getpid(), age_s=2.0)

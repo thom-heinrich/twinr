@@ -48,6 +48,7 @@ from twinr.agent.tools import (
     build_supervisor_decision_instructions,
     build_specialist_tool_agent_instructions,
 )
+from twinr.agent.workflows.forensics import current_workflow_trace_id
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.streaming_capture import (
     StreamingAudioTurnRequest,
@@ -64,6 +65,7 @@ from twinr.agent.workflows.streaming_turn_coordinator import (
     StreamingTurnSpeechServices,
 )
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
+from twinr.agent.workflows.voice_turn_latency import emit_voice_turn_latency_breakdown
 from twinr.hardware.audio import SilenceDetectedRecorder
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import (
@@ -770,6 +772,46 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         with self._speculation_lock:
             self._streaming_speculation.maybe_start_supervisor_decision(text)
 
+    def _maybe_start_speculative_long_term_context(
+        self,
+        text: str,
+        *,
+        final_transcript: bool,
+    ) -> None:
+        long_term_memory = getattr(getattr(self, "runtime", None), "long_term_memory", None)
+        if long_term_memory is None:
+            return
+        prewarm_provider_context = getattr(long_term_memory, "prewarm_provider_context", None)
+        if not callable(prewarm_provider_context):
+            return
+        try:
+            scheduled = prewarm_provider_context(
+                text,
+                rewrite_query=final_transcript,
+                sticky=False,
+            )
+        except Exception as exc:
+            self._trace_event(
+                "streaming_speculative_longterm_context_failed",
+                kind="exception",
+                level="WARN",
+                details={
+                    "error_type": type(exc).__name__,
+                    "final_transcript": final_transcript,
+                    "text_len": len(str(text or "")),
+                },
+            )
+            return
+        self._trace_event(
+            "streaming_speculative_longterm_context_requested",
+            kind="cache",
+            details={
+                "final_transcript": final_transcript,
+                "scheduled": bool(scheduled),
+                "text_len": len(str(text or "")),
+            },
+        )
+
     def _consume_speculative_supervisor_decision(self, transcript: str) -> SupervisorDecision | None:
         self._wait_for_speculative_warmup("supervisor_decision")
         with self._speculation_lock:
@@ -1013,6 +1055,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 capture_ms=capture_ms,
                 stt_ms=stt_ms,
                 allow_follow_up_rearm=allow_follow_up_rearm,
+                workflow_trace_id=current_workflow_trace_id(),
             ),
             lane_plan_factory=lambda: self._build_streaming_turn_lane_plan(transcript),
             speech_services=StreamingTurnSpeechServices(
@@ -1037,6 +1080,11 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 apply_follow_up_closure_evaluation=self._apply_follow_up_closure_evaluation,
                 follow_up_rearm_allowed_now=lambda request_source: self._follow_up_allowed_for_source(
                     initial_source=request_source
+                ),
+                emit_turn_latency_breakdown=lambda trace_id: emit_voice_turn_latency_breakdown(
+                    emit=self.emit,
+                    trace_event=self._trace_event,
+                    trace_id=trace_id,
                 ),
             ),
         )

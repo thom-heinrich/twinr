@@ -140,6 +140,7 @@ class StreamingCaptureController:
         if normalized:
             loop._maybe_start_speculative_first_word(normalized)
             loop._maybe_start_speculative_supervisor_decision(normalized)
+            loop._maybe_start_speculative_long_term_context(normalized, final_transcript=False)
 
     def handle_stt_endpoint(self, event) -> None:
         """Feed final endpoint transcripts into the speculative warmups."""
@@ -159,6 +160,7 @@ class StreamingCaptureController:
         if transcript:
             loop._maybe_start_speculative_first_word(transcript)
             loop._maybe_start_speculative_supervisor_decision(transcript)
+            loop._maybe_start_speculative_long_term_context(transcript, final_transcript=True)
 
     def run_audio_turn(self, request: StreamingAudioTurnRequest) -> bool:
         """Capture one spoken turn and hand the finished transcript to execution."""

@@ -9,6 +9,7 @@ owned_concerns:
   - Detect slot-level truth conflicts and apply user-driven resolution updates
   - Reflect over recent long-term memory windows to promote repeated facts, create person-thread summaries, and synthesize room-agnostic smart-home environment reflections
   - Compile bounded midterm packets from recent memory windows through an optional provider adapter
+  - Provide bounded generic recap semantics for conversation-turn memories so meta-memory questions can recall real conversations without widening unrelated sensor episodes
   - Compile deterministic immediate turn-continuity packets from raw conversation turns for fast follow-up recall
   - Apply retention, expiry, archival, and pruning policy to stored long-term memory objects
 out_of_scope:
@@ -41,6 +42,12 @@ files:
       - LongTermStructuredReflectionProgram
       - OpenAIStructuredReflectionProgram
       - structured_reflection_program_from_config
+  - path: conversation_recall.py
+    role: Generic recap-hint helpers for conversation-turn memories
+    exports:
+      - conversation_episode_recall_hints
+      - query_has_conversation_recap_semantics
+      - is_conversation_episode_object
   - path: turn_continuity.py
     role: Deterministic immediate midterm packet compiler for fresh conversation turns
     exports:

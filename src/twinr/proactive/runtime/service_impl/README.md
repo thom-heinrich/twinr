@@ -9,7 +9,7 @@ No migration is required. The public import path stays
 
 - `../perception_orchestrator.py`: shared runtime perception contract that resolves the single authoritative attention/gesture snapshot consumed by the service implementation
 - `compat.py`: legacy helper functions, constants, and telemetry-safe emit helpers
-- `coordinator_core.py`: dependency wiring plus the main proactive tick/orchestration path
+- `coordinator_core.py`: dependency wiring plus the main proactive tick/orchestration path, including the non-blocking busy-runtime audio refresh path that avoids reopening shared PCM capture while speech output is trying to start
 - `coordinator_display.py`: dedicated HDMI attention and gesture refresh workflows that consume the shared runtime perception orchestrator instead of direct lane-local temporal policy
 - `coordinator_perception.py`: shared display-refresh cycle state that reuses one combined `perception_stream` snapshot when display lanes can safely share it, while dedicated gesture-fast refresh can still bypass the shared capture to preserve low-latency HDMI acknowledgement
 - `coordinator_observation.py`: stable observation-mixin facade that composes the focused observation helper modules

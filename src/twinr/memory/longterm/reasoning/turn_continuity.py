@@ -9,6 +9,7 @@ conversation even while the background writer is still enriching durable state.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -21,8 +22,19 @@ _TURN_CONTINUITY_SCOPE = "turn_continuity"
 _MAX_SUMMARY_CHARS = 160
 _MAX_DETAILS_CHARS = 1100
 _MAX_DETAIL_TEXT_CHARS = 480
-_MAX_QUERY_HINTS = 16
+_MAX_QUERY_HINTS = 24
 _MAX_EXCERPT_CHARS = 120
+_TURN_CONTINUITY_RECALL_HINTS = (
+    "recent conversation",
+    "latest conversation",
+    "conversation recap",
+    "what we talked about",
+    "what we said",
+    "letztes gespraech",
+    "gespraech zusammenfassung",
+    "worueber gesprochen",
+    "was wir gesagt haben",
+)
 
 
 def _normalize_text(value: object | None, *, limit: int) -> str:
@@ -70,6 +82,33 @@ def _query_hints(*texts: object, limit: int) -> tuple[str, ...]:
     return tuple(hints)
 
 
+def is_turn_continuity_packet(
+    *,
+    kind: object | None,
+    attributes: Mapping[str, object] | None,
+) -> bool:
+    """Return whether one packet/payload belongs to the turn-continuity lane."""
+
+    kind_text = _normalize_text(kind, limit=64)
+    if kind_text == "recent_turn_continuity":
+        return True
+    if not isinstance(attributes, Mapping):
+        return False
+    return _normalize_text(attributes.get("persistence_scope"), limit=64) == _TURN_CONTINUITY_SCOPE
+
+
+def turn_continuity_recall_hints(
+    *,
+    kind: object | None,
+    attributes: Mapping[str, object] | None,
+) -> tuple[str, ...]:
+    """Return generic recap hints for recent turn-continuity packets."""
+
+    if not is_turn_continuity_packet(kind=kind, attributes=attributes):
+        return ()
+    return _TURN_CONTINUITY_RECALL_HINTS
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermTurnContinuityCompiler:
     """Compile one immediate midterm continuity packet from a conversation turn."""
@@ -96,19 +135,25 @@ class LongTermTurnContinuityCompiler:
         if response:
             details_parts.append(f"Assistant answered: {response}")
         details = _normalize_text(" ".join(details_parts), limit=_MAX_DETAILS_CHARS) or None
+        semantic_hints = turn_continuity_recall_hints(
+            kind="recent_turn_continuity",
+            attributes={"persistence_scope": _TURN_CONTINUITY_SCOPE},
+        )
+        content_hints = _query_hints(
+            turn.transcript,
+            turn.response,
+            turn.source,
+            turn.modality,
+            limit=max(0, self.max_query_hints - len(semantic_hints)),
+        )
+        query_hints = tuple(dict.fromkeys((*semantic_hints, *content_hints)))[: max(0, self.max_query_hints)]
 
         return LongTermMidtermPacketV1(
             packet_id=_stable_packet_id(turn),
             kind="recent_turn_continuity",
             summary=_normalize_text(_DEFAULT_SUMMARY, limit=_MAX_SUMMARY_CHARS),
             details=details,
-            query_hints=_query_hints(
-                turn.transcript,
-                turn.response,
-                turn.source,
-                turn.modality,
-                limit=self.max_query_hints,
-            ),
+            query_hints=query_hints,
             sensitivity="normal",
             updated_at=turn.created_at,
             attributes={
@@ -125,4 +170,8 @@ class LongTermTurnContinuityCompiler:
         )
 
 
-__all__ = ["LongTermTurnContinuityCompiler"]
+__all__ = [
+    "LongTermTurnContinuityCompiler",
+    "is_turn_continuity_packet",
+    "turn_continuity_recall_hints",
+]

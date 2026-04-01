@@ -63,10 +63,12 @@ from twinr.ops.remote_memory_watchdog_state import (
 _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S = 5.0
 _DEFAULT_PROBE_TIMEOUT_FLOOR_S = 15.0
 _DEFAULT_STARTUP_PROBE_TIMEOUT_FLOOR_S = 45.0
-_DEFAULT_PROBE_TIMEOUT_CAP_S = 120.0
+_DEFAULT_PROBE_TIMEOUT_CAP_S = 300.0
 _DEFAULT_FAILURE_BACKOFF_CAP_S = 120.0
 _DEFAULT_FAILURE_BACKOFF_BASE_MULTIPLIER = 2.0
 _DEFAULT_FAILURE_BACKOFF_JITTER_RATIO = 0.35
+_COLD_BOOTSTRAP_STORE_STEP_COUNT = 4
+_COLD_WARM_CHECK_COUNT = 8
 _RECENT_SUCCESS_TIMEOUT_SAMPLE_LIMIT = 8
 _RECENT_SUCCESS_TIMEOUT_HEADROOM_RATIO = 0.5
 _RECENT_SUCCESS_TIMEOUT_MIN_HEADROOM_S = 2.0
@@ -143,6 +145,40 @@ def _coerce_positive_float(value: object, *, default: float, minimum: float | No
         if minimum is not None:
             resolved = max(minimum, resolved)
     return resolved
+
+
+def _default_startup_probe_timeout_s(config: TwinrConfig, *, probe_timeout_s: float) -> float:
+    """Estimate the bounded first-probe budget for a fresh required-remote reader."""
+
+    read_timeout_s = _coerce_positive_float(
+        getattr(config, "long_term_memory_remote_read_timeout_s", 8.0),
+        default=8.0,
+        minimum=1.0,
+    )
+    chonky_timeout_s = _coerce_positive_float(
+        getattr(config, "chonkydb_timeout_s", 20.0),
+        default=20.0,
+        minimum=read_timeout_s,
+    )
+    status_probe_timeout_s = max(
+        _DEFAULT_PROBE_TIMEOUT_FLOOR_S,
+        read_timeout_s * 2.0,
+        chonky_timeout_s,
+    )
+    origin_resolution_timeout_s = max(
+        chonky_timeout_s,
+        read_timeout_s * 3.0,
+    )
+    estimated_timeout_s = (
+        status_probe_timeout_s
+        + (_COLD_BOOTSTRAP_STORE_STEP_COUNT * origin_resolution_timeout_s)
+        + (_COLD_WARM_CHECK_COUNT * read_timeout_s)
+    )
+    return max(
+        probe_timeout_s,
+        _DEFAULT_STARTUP_PROBE_TIMEOUT_FLOOR_S,
+        min(_DEFAULT_PROBE_TIMEOUT_CAP_S, estimated_timeout_s),
+    )
 
 
 def _looks_sensitive_key(name: str) -> bool:
@@ -343,9 +379,9 @@ class RemoteMemoryWatchdog:
             getattr(
                 config,
                 "long_term_memory_remote_watchdog_startup_probe_timeout_s",
-                max(self.probe_timeout_s, _DEFAULT_STARTUP_PROBE_TIMEOUT_FLOOR_S),
+                _default_startup_probe_timeout_s(config, probe_timeout_s=self.probe_timeout_s),
             ),
-            default=max(self.probe_timeout_s, _DEFAULT_STARTUP_PROBE_TIMEOUT_FLOOR_S),
+            default=_default_startup_probe_timeout_s(config, probe_timeout_s=self.probe_timeout_s),
             minimum=self.probe_timeout_s,
         )
         self.failure_backoff_cap_s = _coerce_positive_float(
@@ -430,6 +466,9 @@ class RemoteMemoryWatchdog:
         self._next_probe_not_before_monotonic = self._monotonic()
         self._last_systemd_watchdog_ping_monotonic: float | None = None
         self._ready_notified = False
+        self._has_success_since_start = False
+
+        self._restore_recent_history_from_store()
 
     def _persisted_recent_samples(self) -> tuple[RemoteMemoryWatchdogSample, ...]:
         """Return a bounded, compact recent history for persisted snapshots."""
@@ -586,6 +625,8 @@ class RemoteMemoryWatchdog:
                     "artifact_path": str(self.artifact_path),
                 }
             )
+            if sample.status == "ok":
+                self._has_success_since_start = True
             self._probe_timeout_reported = False
             self._update_next_probe_deadline_after_sample(sample)
             return snapshot
@@ -717,7 +758,7 @@ class RemoteMemoryWatchdog:
         """
 
         timeout_s = self.probe_timeout_s
-        if self._last_ok_at is None:
+        if not self._has_success_since_start:
             timeout_s = max(timeout_s, self.startup_probe_timeout_s)
         recent_success_latency_s = self._recent_success_latency_s()
         if recent_success_latency_s is None:
@@ -730,9 +771,36 @@ class RemoteMemoryWatchdog:
             ),
         )
         return min(
-            _DEFAULT_PROBE_TIMEOUT_CAP_S,
+            max(_DEFAULT_PROBE_TIMEOUT_CAP_S, self.startup_probe_timeout_s),
             max(timeout_s, recent_success_latency_s + headroom_s),
         )
+
+    def _restore_recent_history_from_store(self) -> None:
+        """Restore bounded counters/history from the persisted rolling snapshot."""
+
+        try:
+            snapshot = self.store.load()
+        except Exception:
+            return
+        if snapshot is None:
+            return
+        restored_samples = tuple(snapshot.recent_samples[-self.history_limit :])
+        if not restored_samples:
+            current_sample = snapshot.current
+            if current_sample.seq > 0 or current_sample.status not in {"starting", "unknown"}:
+                restored_samples = (_compact_history_sample(current_sample),)
+        self._recent_samples.extend(restored_samples)
+        self._sample_count = max(len(restored_samples), int(snapshot.sample_count or 0))
+        self._failure_count = max(0, int(snapshot.failure_count or 0))
+        self._last_ok_at = snapshot.last_ok_at
+        self._last_failure_at = snapshot.last_failure_at
+        if not restored_samples:
+            return
+        last_sample = restored_samples[-1]
+        self._consecutive_ok = max(0, int(last_sample.consecutive_ok))
+        self._consecutive_fail = max(0, int(last_sample.consecutive_fail))
+        self._last_status = last_sample.status
+        self._last_detail = last_sample.detail
 
     def _failure_backoff_s(self, *, last_sample: RemoteMemoryWatchdogSample | None) -> float:
         """Return a jittered capped backoff after failed/degraded probes."""

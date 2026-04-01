@@ -1313,6 +1313,54 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(fake_watchdog.duration_s, 0.0)
 
+    def test_watch_remote_memory_returns_special_exit_code_when_owner_already_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_watchdog = _FakeRemoteMemoryWatchdog()
+            fake_ops_module = ModuleType("twinr.ops")
+            fake_ops_module.RemoteMemoryWatchdog = SimpleNamespace(from_config=lambda _config: fake_watchdog)
+            fake_runtime_env_module = _fake_runtime_env_module()
+            original_argv = list(sys.argv)
+
+            @contextmanager
+            def _contention_lock(_config, _name: str):
+                raise TwinrInstanceAlreadyRunningError(label="remote memory watchdog", owner_pid=4242)
+                yield
+
+            fake_ops_module.loop_instance_lock = _contention_lock
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_env": fake_runtime_env_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--watch-remote-memory",
+                            "--loop-duration",
+                            "0",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 75)
+        self.assertIsNone(fake_watchdog.duration_s)
+
     def test_run_runtime_supervisor_dispatches_without_runtime_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -8,6 +8,11 @@ from collections.abc import Iterable, Mapping
 
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermMemoryReviewItemV1
+from twinr.memory.longterm.reasoning.conversation_recall import (
+    conversation_episode_recall_hints,
+    is_conversation_episode_object,
+    query_has_conversation_recap_semantics,
+)
 from twinr.text_utils import retrieval_terms
 
 from .shared import (
@@ -133,6 +138,39 @@ class StructuredStoreQueryMixin:
             )
         return tuple(rewritten)
 
+    def _conflict_delta_without_memory(
+        self,
+        memory_id: str,
+    ) -> tuple[tuple[LongTermMemoryConflictV1, ...], tuple[str, ...]]:
+        """Return rewritten conflicts plus the touched slot keys for one memory.
+
+        Mutation writers need a delta contract, not a full conflict snapshot.
+        This helper keeps the mutation builder selective by returning only the
+        rewritten conflict rows plus the slot keys that must be deleted or
+        replaced in storage.
+        """
+
+        conflicts = self.load_conflicts_for_memory_ids((memory_id,))
+        rewritten: list[LongTermMemoryConflictV1] = []
+        deleted_slot_keys: list[str] = []
+        for conflict in conflicts:
+            deleted_slot_keys.append(conflict.slot_key)
+            if conflict.candidate_memory_id == memory_id:
+                continue
+            existing_ids = tuple(value for value in conflict.existing_memory_ids if value != memory_id)
+            if not existing_ids:
+                continue
+            rewritten.append(
+                LongTermMemoryConflictV1(
+                    slot_key=conflict.slot_key,
+                    candidate_memory_id=conflict.candidate_memory_id,
+                    existing_memory_ids=existing_ids,
+                    question=conflict.question,
+                    reason=conflict.reason,
+                )
+            )
+        return tuple(rewritten), tuple(dict.fromkeys(deleted_slot_keys))
+
     def _cleanup_references_after_mutation(
         self,
         *,
@@ -240,6 +278,12 @@ class StructuredStoreQueryMixin:
                 parts.append("true" if value else "false")
             elif isinstance(value, (list, tuple)):
                 parts.extend(str(entry) for entry in value if isinstance(entry, str))
+        parts.extend(
+            conversation_episode_recall_hints(
+                kind=item.kind,
+                attributes=item.attributes if isinstance(item.attributes, Mapping) else None,
+            )
+        )
         return _normalize_text(" ".join(part for part in parts if part))
 
     def _object_state_search_text(self, item: LongTermMemoryObjectV1) -> str:
@@ -359,6 +403,17 @@ class StructuredStoreQueryMixin:
         selected: list[LongTermMemoryObjectV1],
         limit: int,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        if query_has_conversation_recap_semantics(query_text):
+            conversation_matches = [
+                item
+                for item in selected
+                if is_conversation_episode_object(
+                    kind=item.kind,
+                    attributes=item.attributes if isinstance(item.attributes, Mapping) else None,
+                )
+            ]
+            if conversation_matches:
+                return tuple(conversation_matches[: max(1, limit)])
         query_terms = self._query_match_terms(retrieval_terms(query_text))
         if not query_terms:
             return tuple(selected[: max(1, limit)])

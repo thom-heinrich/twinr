@@ -54,6 +54,7 @@ except ImportError:  # pragma: no cover - Raspberry Pi / Linux deployments do ha
 _DEFAULT_AMBIENT_IMPULSE_TTL_S = 18.0
 _DEFAULT_AMBIENT_IMPULSE_MAX_TTL_S = 300.0
 _DEFAULT_AMBIENT_IMPULSE_MAX_BYTES = 4_096
+_DEFAULT_AMBIENT_IMPULSE_FILE_MODE = 0o644
 _MAX_AMBIENT_IMPULSE_MAX_BYTES = 65_536
 _MIN_AMBIENT_IMPULSE_TTL_S = 0.1
 _DEFAULT_AMBIENT_IMPULSE_PATH = "artifacts/stores/ops/display_ambient_impulse.json"
@@ -447,7 +448,9 @@ class DisplayAmbientImpulseCueStore:
                 handle.write(payload_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), _DEFAULT_AMBIENT_IMPULSE_FILE_MODE)
             os.replace(temp_path, self.path)
+            os.chmod(self.path, _DEFAULT_AMBIENT_IMPULSE_FILE_MODE)
             _fsync_directory(self.path.parent)
         except Exception:
             try:

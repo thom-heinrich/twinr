@@ -14,7 +14,11 @@ from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.agent.workflows.required_remote_snapshot import RequiredRemoteWatchdogAssessment
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogStore
-from twinr.ops.runtime_supervisor import RUNTIME_SUPERVISOR_ENV_KEY, TwinrRuntimeSupervisor
+from twinr.ops.runtime_supervisor import (
+    RUNTIME_SUPERVISOR_ENV_KEY,
+    TwinrRuntimeSupervisor,
+    _default_external_watchdog_starter,
+)
 
 
 class _FakeClock:
@@ -182,6 +186,29 @@ class RuntimeSupervisorTests(unittest.TestCase):
             project_root=str(root),
             runtime_state_path=str(root / "runtime-state.json"),
             display_wayland_runtime_dir="/run/user/1000",
+        )
+
+    def test_default_external_watchdog_starter_disallows_raw_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            emitted: list[str] = []
+            with mock.patch(
+                "twinr.ops.remote_memory_watchdog_companion.ensure_remote_memory_watchdog_process",
+                return_value=None,
+            ) as ensure_process:
+                owner = _default_external_watchdog_starter(
+                    config,
+                    str(root / ".env"),
+                    emitted.append,
+                )
+
+        self.assertIsNone(owner)
+        ensure_process.assert_called_once_with(
+            config,
+            env_file=str(root / ".env"),
+            emit=emitted.append,
+            allow_spawn=False,
         )
 
     def test_run_starts_watchdog_and_streaming_when_watchdog_is_ready(self) -> None:

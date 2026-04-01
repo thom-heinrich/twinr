@@ -142,22 +142,35 @@ class _FakeGraphClient:
         return {"success": True, "path": []}
 
 
-class _AsyncGraphControlPlaneFailingClient(_FakeGraphClient):
+class _SyncGraphWriteFailingClient(_FakeGraphClient):
     def __init__(self, *, error_getter) -> None:
         super().__init__(error_getter=error_getter)
         self.bulk_execution_modes: list[str] = []
+        self.bulk_timeout_seconds: list[float | None] = []
+        self.bulk_call_details: list[dict[str, object]] = []
 
     def store_records_bulk(self, request):
         self._maybe_raise()
         items = tuple(getattr(request, "items", ()))
         execution_mode = str(getattr(request, "execution_mode", ""))
+        timeout_seconds = getattr(request, "timeout_seconds", None)
         snapshot_kinds = {
             str((getattr(item, "metadata", {}) or {}).get("twinr_snapshot_kind") or "")
             for item in items
         }
+        uris = tuple(str(getattr(item, "uri", "") or "") for item in items)
         self.bulk_execution_modes.append(execution_mode)
-        if execution_mode == "async" and snapshot_kinds & {"graph_nodes", "graph_edges"}:
-            raise LongTermRemoteUnavailableError("graph current-view async visibility failed")
+        self.bulk_timeout_seconds.append(None if timeout_seconds is None else float(timeout_seconds))
+        self.bulk_call_details.append(
+            {
+                "execution_mode": execution_mode,
+                "timeout_seconds": None if timeout_seconds is None else float(timeout_seconds),
+                "snapshot_kinds": tuple(sorted(snapshot_kinds)),
+                "uris": uris,
+            }
+        )
+        if execution_mode == "sync" and snapshot_kinds & {"graph_nodes", "graph_edges"}:
+            raise LongTermRemoteUnavailableError("graph current-view sync write timed out")
         return super().store_records_bulk(request)
 
 
@@ -548,10 +561,10 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertIn("user:main", remote_view["topology_refs"])
         self.assertTrue(remote_state.client.graph_store_many_calls)
 
-    def test_ensure_remote_snapshot_uses_sync_for_tiny_graph_current_view_batches(self) -> None:
+    def test_ensure_remote_snapshot_uses_async_for_graph_current_view_batches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
-            remote_state.client = _AsyncGraphControlPlaneFailingClient(error_getter=lambda: remote_state.load_error)
+            remote_state.client = _SyncGraphWriteFailingClient(error_getter=lambda: remote_state.load_error)
             remote_state.read_client = remote_state.client
             remote_state.write_client = remote_state.client
             store = TwinrPersonalGraphStore(
@@ -569,8 +582,11 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         assert remote_view is not None
         self.assertEqual(remote_view["subject_node_id"], "user:main")
         self.assertTrue(remote_state.client.graph_store_many_calls)
+        self.assertTrue(remote_state.client.bulk_call_details)
         self.assertTrue(remote_state.client.bulk_execution_modes)
-        self.assertTrue(all(mode == "sync" for mode in remote_state.client.bulk_execution_modes))
+        self.assertTrue(all(mode == "async" for mode in remote_state.client.bulk_execution_modes))
+        self.assertTrue(remote_state.client.bulk_timeout_seconds)
+        self.assertTrue(all(value == 180.0 for value in remote_state.client.bulk_timeout_seconds))
 
     def test_ensure_remote_snapshot_repairs_broken_current_view_from_local_graph_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

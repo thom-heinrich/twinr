@@ -23,7 +23,8 @@ Command-line invocation examples::
 
 Outputs
 -------
-- One compact JSON object describing the completed deploy and verification run.
+- Live structured progress JSON lines on stderr while long-running phases are active.
+- One compact JSON object describing the completed deploy and verification run on stdout.
 - Exit code 0 on success, otherwise 1 with a phase-specific JSON error payload.
 """
 
@@ -161,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the bounded Pi env-contract verification after restart.",
     )
+    parser.add_argument(
+        "--skip-retention-canary",
+        action="store_true",
+        help="Skip the bounded remote-memory retention canary after the normal deploy health checks.",
+    )
     probe_group = parser.add_mutually_exclusive_group()
     probe_group.add_argument(
         "--live-text",
@@ -180,6 +186,12 @@ def main() -> int:
 
     args = build_parser().parse_args()
     services = tuple(args.service) if args.service else None
+
+    def _emit_progress(payload: dict[str, object]) -> None:
+        """Write live deploy progress to stderr without polluting stdout JSON."""
+
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
     try:
         result = deploy_pi_runtime(
             project_root=args.project_root,
@@ -196,8 +208,10 @@ def main() -> int:
             install_with_deps=args.install_with_deps,
             install_systemd_units=not args.skip_systemd_install,
             verify_env_contract=not args.skip_env_contract_check,
+            verify_retention_canary=not args.skip_retention_canary,
             live_text=args.live_text,
             live_search=args.live_search,
+            progress_callback=_emit_progress,
         )
     except PiRuntimeDeployError as exc:
         print(

@@ -7,6 +7,7 @@ summary: Wire long-term memory stores, reasoning helpers, remote readiness check
 owned_concerns:
   - Assemble the runtime-facing LongTermMemoryService from config and subsystem dependencies
   - Build provider and tool-facing long-term memory context for runtime prompts
+  - Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without re-running remote recall
   - Build one bounded fast-topic provider context for latency-sensitive answer lanes and preserve precise required-remote read-failure semantics on that hot path
   - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
   - Centralize bounded query-first object selectors for live-near discovery, reserve, proactive, reflection, sensor-memory, and restart-recall reads
@@ -33,6 +34,8 @@ files:
       - LongTermRemoteReadinessStep
   - path: live_object_selectors.py
     role: Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads
+  - path: context_snapshot.py
+    role: Small dataclass that captures the latest built provider/tool long-term context for operator inspection
   - path: service_impl/README.md
     role: Internal map of the refactored service implementation package
   - path: service_impl/main.py

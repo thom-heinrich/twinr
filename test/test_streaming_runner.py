@@ -1073,6 +1073,7 @@ class StreamingRunnerTests(unittest.TestCase):
             processing_feedback=SimpleNamespace(stop=lambda: None),
             state_machine=SimpleNamespace(transition=lambda *args, **kwargs: None),
             turn_started=time.monotonic(),
+            workflow_trace_id=None,
             snapshot_refresh_interval_s=0.01,
         )
 
@@ -3811,7 +3812,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 usage_store=FakeUsageStore(),
                 button_monitor=SimpleNamespace(),
                 proactive_monitor=SimpleNamespace(),
-                conversation_closure_evaluator=BlockingConversationClosureEvaluator(delay_s=1.5),
+                conversation_closure_evaluator=BlockingConversationClosureEvaluator(delay_s=0.8),
             )
             loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
                 action="direct",
@@ -5607,6 +5608,62 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(decision.kind, "general")
         self.assertEqual(decision.context_scope, "tiny_recent")
 
+    def test_local_semantic_router_memory_route_preserves_full_context_handoff(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                local_semantic_router_mode="gated",
+                streaming_first_word_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop._streaming_semantic_router._router = SimpleNamespace(  # type: ignore[attr-defined]
+                classify=lambda transcript: SimpleNamespace(
+                    label="memory",
+                    confidence=0.96,
+                    margin=0.34,
+                    authoritative=True,
+                    fallback_reason=None,
+                    model_id="router-v1",
+                    latency_ms=1.7,
+                )
+            )
+            loop._streaming_semantic_router._router_epoch = 1  # type: ignore[attr-defined]
+            loop._streaming_semantic_router._build_bridge_reply = lambda *args, **kwargs: FirstWordReply(  # type: ignore[attr-defined]
+                mode="filler",
+                spoken_text="Ich schaue kurz in unseren Verlauf.",
+            )
+
+            resolution = loop._streaming_semantic_router.resolve_transcript("Worueber haben wir heute geredet?")  # type: ignore[attr-defined]
+
+        self.assertIsNotNone(resolution)
+        assert resolution is not None
+        self.assertEqual(resolution.route_decision.label, "memory")
+        self.assertIsNotNone(resolution.supervisor_decision)
+        assert resolution.supervisor_decision is not None
+        self.assertEqual(resolution.supervisor_decision.context_scope, "full_context")
+        self.assertIsNotNone(resolution.bridge_reply)
+        assert resolution.bridge_reply is not None
+        self.assertEqual(resolution.bridge_reply.spoken_text, "Ich schaue kurz in unseren Verlauf.")
+
     def test_local_semantic_router_bridge_reply_uses_route_aware_first_word_overlay(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -5912,6 +5969,36 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertEqual(seen, ["Alles okay bei dir"])
 
+    def test_streaming_interim_can_prime_speculative_long_term_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            seen: list[tuple[str, bool]] = []
+            loop._maybe_start_speculative_long_term_context = lambda text, final_transcript: seen.append((text, final_transcript))  # type: ignore[method-assign]
+
+            loop._on_streaming_stt_interim("Alles okay bei dir")
+
+        self.assertEqual(seen, [("Alles okay bei dir", False)])
+
     def test_capture_and_transcribe_streaming_resets_speculative_supervisor_before_capture(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -5980,6 +6067,71 @@ class StreamingRunnerTests(unittest.TestCase):
             loop._on_streaming_stt_endpoint(SimpleNamespace(transcript="Alles okay bei dir", event_type="speech_final"))
 
         self.assertEqual(seen, ["Alles okay bei dir"])
+
+    def test_streaming_endpoint_can_prime_speculative_long_term_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            seen: list[tuple[str, bool]] = []
+            loop._maybe_start_speculative_long_term_context = lambda text, final_transcript: seen.append((text, final_transcript))  # type: ignore[method-assign]
+
+            loop._on_streaming_stt_endpoint(SimpleNamespace(transcript="Alles okay bei dir", event_type="speech_final"))
+
+        self.assertEqual(seen, [("Alles okay bei dir", True)])
+
+    def test_speculative_long_term_context_delegates_to_runtime_service(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+            )
+            runtime = TwinrRuntime(config=config)
+            recorded: list[tuple[str, bool, bool]] = []
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.long_term_memory = SimpleNamespace(
+                prewarm_provider_context=lambda text, rewrite_query=False, sticky=False: recorded.append(
+                    (text, rewrite_query, sticky)
+                )
+                or True
+            )
+
+            loop._maybe_start_speculative_long_term_context("Wie geht es Janina?", final_transcript=True)
+
+        self.assertEqual(recorded, [("Wie geht es Janina?", True, False)])
 
     def test_groq_config_uses_compact_tool_schemas_and_instructions(self) -> None:
         with TemporaryDirectory() as temp_dir:

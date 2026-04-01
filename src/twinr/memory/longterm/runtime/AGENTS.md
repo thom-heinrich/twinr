@@ -15,6 +15,8 @@ Out of scope:
 
 - `service.py` — compatibility shim that preserves the historic import path and delegates to `service_impl/`
 - `live_object_selectors.py` — shared query-first selector layer for live-near reserve/proactive/maintenance object reads
+- `prepared_context.py` — bounded prepared provider/tool context front for transcript-first speculative warmup and hot-path reuse
+- `context_snapshot.py` — latest built provider/tool context snapshot used by operator surfaces such as Conversation Lab
 - `service_impl/compat.py` — shared helper functions, limits, logger, and readiness dataclasses extracted from the old monolith
 - `service_impl/main.py` — `LongTermMemoryService` dataclass and inherited method surface
 - `service_impl/builder.py` — service assembly and bounded writer construction
@@ -36,6 +38,8 @@ Out of scope:
 - `service.py` stays orchestration-focused. New extraction, reasoning, storage, or policy logic belongs in the package that already owns that concern.
 - `service.py` stays a thin compatibility shim. New runtime logic belongs in the appropriate `service_impl/*.py` module instead of growing the shim again.
 - Shared `_store_lock` serialization is reserved for object/graph/midterm mutation paths that truly share those stores. Prompt-context mutations keep their own store-local locking and must not wait behind unrelated background multimodal or turn persistence.
+- Runtime provider/tool context assembly must consume `prepared_context.py` first and must not reintroduce duplicate synchronous full-context rebuilds when an identical speculative build is already in flight.
+- Operator/debug surfaces may inspect the latest built provider/tool context snapshot, but they must not trigger a second independent remote recall merely to repaint the same turn context.
 - Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
 - Foreground runtime turn-finalization paths must only queue tool-history learning and must not reacquire the shared long-term store lock for that queue step; any expensive remote-primary personality commit belongs to the later bounded persistence/flush path, not the answer-finalization hot path.
 - When runtime reflection creates summaries or promotes objects inline, the downstream personality-learning handoff must see that enriched batch instead of only the pre-reflection consolidator result.
@@ -46,7 +50,9 @@ Out of scope:
 - Runtime restart-recall persistence stays orchestration-only here: `service.py` may trigger packet refreshes, but packet compilation logic belongs in retrieval and packet storage semantics belong in storage.
 - Live-near reserve/proactive/runtime maintenance callers must get object slices through `live_object_selectors.py`; do not add new direct `load_objects()` calls in runtime orchestration for those paths.
 - Full-state runtime persistence and maintenance reads must come through the storage layer's shared fine-grained current-state loader; do not reintroduce direct snapshot blob hydration for required remote object/conflict/archive state in runtime orchestration.
-- Conversation and multimodal dry-run analysis must use fine-grained object reads; do not add new `load_objects()` blob hydration to those runtime entry points.
+- Conversation and multimodal dry-run analysis must use storage-owned active working sets; do not add new `load_objects()` blob hydration or broad full-state hydration to those runtime entry points.
+- Reflection and sensor-memory runtime inputs should prefer bounded neighborhood selectors keyed from the touched objects or events instead of broad query unions whenever the caller has a concrete seed set available.
+- Durable-memory writes that materially change live recall must invalidate the prepared context front so the next live answer cannot reuse stale provider/tool prompt artifacts.
 - Runtime may persist a deterministic immediate turn-continuity packet before slower durable enrichment drains, but the packet-compilation logic belongs in reasoning and must not grow ad-hoc inside `service.py`.
 - Multimodal evidence and episodic fallback payloads must remain bounded and sanitized before persistence.
 
@@ -63,6 +69,12 @@ If `service.py` changed, also run:
 
 ```bash
 PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal.py test/test_longterm_proactive.py test/test_longterm_remote_state.py test/test_runtime_context.py test/test_longterm_midterm.py -q
+```
+
+If `prepared_context.py` or `service_impl/context.py` changed, also run:
+
+```bash
+PYTHONPATH=src pytest test/test_longterm_memory.py test/test_streaming_runner.py -q
 ```
 
 ## Coupling

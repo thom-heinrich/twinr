@@ -1,3 +1,5 @@
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 import sys
 import unittest
@@ -8,7 +10,6 @@ from twinr.integrations import (
     CalendarEvent,
     CallableIntegrationAdapter,
     ConfirmationMode,
-    IntegrationDecision,
     IntegrationDomain,
     IntegrationPolicyError,
     IntegrationRegistry,
@@ -60,6 +61,24 @@ class IntegrationCatalogTests(unittest.TestCase):
         self.assertIn("control_entities", operations)
         self.assertIn("read_sensor_stream", operations)
         self.assertIn("run_safe_scene", operations)
+
+    def test_manifest_asdict_handles_frozen_json_containers(self) -> None:
+        manifest = manifest_for_id("calendar_agenda")
+        assert manifest is not None
+
+        serialized = asdict(manifest)
+
+        self.assertEqual(serialized["integration_id"], "calendar_agenda")
+        self.assertIn("operations", serialized)
+
+    def test_manifest_deepcopy_handles_frozen_json_containers(self) -> None:
+        manifest = manifest_for_id("calendar_agenda")
+        assert manifest is not None
+
+        cloned = deepcopy(manifest)
+
+        self.assertIsNot(cloned, manifest)
+        self.assertEqual(cloned.integration_id, manifest.integration_id)
 
 
 class IntegrationRequestTests(unittest.TestCase):

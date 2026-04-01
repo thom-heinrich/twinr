@@ -222,7 +222,11 @@ def _projection_matches_sensor_neighborhood(
         return True
     if _mapping_text(attributes, "pattern_type") in pattern_types:
         return True
+    if _mapping_text(attributes, "pattern_type") in routine_types:
+        return True
     if _mapping_text(attributes, "routine_type") in routine_types:
+        return True
+    if _mapping_text(attributes, "routine_type") in pattern_types:
         return True
     if _mapping_text(attributes, "environment_id") in environment_ids:
         return True
@@ -275,9 +279,9 @@ def select_reflection_neighborhood_objects(
     """Return reflection inputs scoped to the touched memory neighborhood.
 
     Active persistence and backfill already know the fresh/touched object set
-    they are extending. For those hot paths, reflection should prefer the
-    exact touched objects plus their nearby person/event/environment neighbors
-    instead of starting from a broader generic fast-topic union.
+    they are extending. For those hot paths, reflection should stay bounded to
+    the exact touched objects plus their nearby person/event/environment
+    neighbors instead of widening back out to a generic compile-source union.
     """
 
     seed_tuple = _normalize_seed_objects(seed_objects)
@@ -322,8 +326,6 @@ def select_reflection_neighborhood_objects(
         ),
     )
 
-    if len(selected_by_id) <= len(seed_tuple):
-        _add_selected_objects(selected_by_id, select_reflection_compile_source_objects(object_store))
     return tuple(selected_by_id.values())
 
 
@@ -332,7 +334,12 @@ def select_sensor_memory_neighborhood_objects(
     *,
     seed_objects: Iterable[LongTermMemoryObjectV1] = (),
 ) -> tuple[LongTermMemoryObjectV1, ...]:
-    """Return sensor-memory inputs scoped to the touched sensor neighborhood."""
+    """Return sensor-memory inputs scoped to the touched sensor neighborhood.
+
+    Seeded runtime paths must not widen to the broader generic sensor compile
+    union when the touched neighborhood is small; that would reintroduce the
+    broad current-state reasoning shape this selector exists to avoid.
+    """
 
     seed_tuple = _normalize_seed_objects(seed_objects)
     if not seed_tuple:
@@ -375,8 +382,6 @@ def select_sensor_memory_neighborhood_objects(
         ),
     )
 
-    if len(selected_by_id) <= len(seed_tuple):
-        _add_selected_objects(selected_by_id, select_sensor_memory_source_objects(object_store))
     return tuple(selected_by_id.values())
 
 

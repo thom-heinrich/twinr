@@ -250,6 +250,31 @@ def _read_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
+def _normalize_trace_base_dir(raw_value: str, *, project_root: Path) -> Path:
+    """Normalize one configured workflow-trace directory for the active checkout.
+
+    Twinr commonly syncs the leading repo `.env` onto the Pi acceptance checkout.
+    Repo-owned trace directories therefore need to survive a root move from
+    `/home/thh/twinr` to `/twinr`. When a configured absolute path still points
+    at another Twinr checkout's `state/forensics/...` subtree, rebase that tail
+    onto the active `project_root` instead of writing into the foreign checkout.
+    """
+
+    project_root_resolved = project_root.expanduser().resolve(strict=False)
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        return candidate
+    resolved_candidate = candidate.resolve(strict=False)
+    if resolved_candidate.is_relative_to(project_root_resolved):
+        return resolved_candidate
+    parts = resolved_candidate.parts
+    for index in range(len(parts) - 1):
+        if parts[index] != "state" or parts[index + 1] != "forensics":
+            continue
+        return (project_root_resolved / Path(*parts[index:])).resolve(strict=False)
+    return resolved_candidate
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -848,7 +873,7 @@ class WorkflowForensics:
             service=service,
             enabled=enabled,
             mode=mode,
-            base_dir=Path(base_dir_raw) if base_dir_raw else None,
+            base_dir=_normalize_trace_base_dir(base_dir_raw, project_root=project_root) if base_dir_raw else None,
             allow_raw_text=_bool_from_env(allow_raw_text_raw, default=_DEFAULT_ALLOW_RAW_TEXT),
             queue_maxsize=_int_from_env(queue_maxsize_raw, default=_DEFAULT_QUEUE_MAXSIZE, minimum=64),
             max_events=_int_from_env(max_events_raw, default=_DEFAULT_MAX_EVENTS, minimum=128),

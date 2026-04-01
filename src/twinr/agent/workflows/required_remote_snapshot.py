@@ -48,7 +48,6 @@ import math
 import os
 from pathlib import Path
 import stat as statmod
-import subprocess
 import time
 from typing import Any, Protocol
 
@@ -1199,47 +1198,8 @@ def _default_watchdog_env_file(config: TwinrConfig) -> str:
     return str(project_root / ".env")
 
 
-def _systemd_watchdog_unit(config: TwinrConfig) -> str | None:
-    """Return one configured systemd unit for the watchdog, if any."""
-
-    for attr_name in (
-        "long_term_memory_remote_watchdog_systemd_unit",
-        "remote_memory_watchdog_systemd_unit",
-    ):
-        unit = _normalize_text(getattr(config, attr_name, ""))
-        if unit:
-            return unit
-    return None
-
-
-def _start_watchdog_via_systemd(config: TwinrConfig) -> bool:
-    """Best-effort request that systemd starts the watchdog unit."""
-
-    unit = _systemd_watchdog_unit(config)
-    if not unit:
-        return False
-    timeout_s = max(
-        1.0,
-        _coerce_float(getattr(config, "long_term_memory_remote_watchdog_systemd_timeout_s", 10.0)) or 10.0,
-    )
-    try:
-        completed = subprocess.run(
-            ["systemctl", "--no-block", "start", unit],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_s,
-        )
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
-
-
 def _default_watchdog_recovery_starter(config: TwinrConfig, env_file: str) -> int | None:
     """Best-effort spawn helper for a missing or dead external watchdog."""
-
-    if _start_watchdog_via_systemd(config):
-        return 0
 
     from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
 

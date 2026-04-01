@@ -429,7 +429,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
 
             mode = store.path.stat().st_mode & 0o777
 
-        self.assertEqual(mode, 0o600)
+        self.assertEqual(mode, 0o644)
 
     def test_snapshot_round_trips_through_json_payload_after_state_helper_extraction(self) -> None:
         sample = RemoteMemoryWatchdogSample(
@@ -671,6 +671,30 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
             self.assertIsNone(store.load())
             self.assertEqual(watchdog._effective_probe_timeout_s(), 45.0)
 
+    def test_startup_timeout_defaults_to_cold_probe_estimate_when_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+                long_term_memory_remote_watchdog_probe_timeout_s=15.0,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            self.assertEqual(watchdog.startup_probe_timeout_s, 180.0)
+            self.assertEqual(watchdog._effective_probe_timeout_s(), 180.0)
+
     def test_stalled_probe_fails_once_startup_timeout_is_exceeded_before_first_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -732,6 +756,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 latency_ms=12054.8,
                 detail=None,
             )
+            watchdog._has_success_since_start = True
             watchdog._probe_thread = mock.Mock()
             watchdog._probe_thread.is_alive.return_value = True
             watchdog._probe_started_at = "2026-03-30T13:57:52Z"
@@ -769,6 +794,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 latency_ms=12054.8,
                 detail=None,
             )
+            watchdog._has_success_since_start = True
             watchdog._probe_thread = mock.Mock()
             watchdog._probe_thread.is_alive.return_value = True
             watchdog._probe_started_at = "2026-03-30T13:57:52Z"
@@ -782,6 +808,129 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
             self.assertEqual(snapshot.current.status, "fail")
             self.assertFalse(snapshot.current.ready)
             self.assertIn("18.1s", snapshot.current.detail or "")
+
+    def test_watchdog_restores_recent_history_from_store_and_uses_it_for_timeout_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            persisted_ok = RemoteMemoryWatchdogSample(
+                seq=9,
+                captured_at="2026-03-30T20:39:30Z",
+                status="ok",
+                ready=True,
+                mode="remote_primary",
+                required=True,
+                latency_ms=139311.6,
+                consecutive_ok=1,
+                consecutive_fail=0,
+                detail=None,
+            )
+            store.save(
+                RemoteMemoryWatchdogSnapshot(
+                    schema_version=1,
+                    started_at="2026-03-30T20:36:12Z",
+                    updated_at="2026-03-30T20:39:30Z",
+                    hostname="picarx",
+                    pid=123,
+                    interval_s=1.0,
+                    history_limit=3600,
+                    sample_count=9,
+                    failure_count=3,
+                    last_ok_at="2026-03-30T20:39:30Z",
+                    last_failure_at="2026-03-30T20:37:57Z",
+                    artifact_path=str(store.path),
+                    current=RemoteMemoryWatchdogSample(
+                        seq=0,
+                        captured_at="2026-03-30T20:44:06Z",
+                        status="starting",
+                        ready=False,
+                        mode="remote_primary",
+                        required=True,
+                        latency_ms=0.0,
+                        consecutive_ok=0,
+                        consecutive_fail=0,
+                        detail="Remote memory watchdog is starting.",
+                    ),
+                    recent_samples=(persisted_ok,),
+                    heartbeat_at="2026-03-30T20:44:06Z",
+                    probe_inflight=True,
+                    probe_started_at="2026-03-30T20:44:06Z",
+                    probe_age_s=0.0,
+                )
+            )
+
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            self.assertEqual(watchdog._sample_count, 9)
+            self.assertEqual(watchdog._failure_count, 3)
+            self.assertEqual(watchdog._last_ok_at, "2026-03-30T20:39:30Z")
+            self.assertEqual(len(watchdog._recent_samples), 1)
+            self.assertGreater(watchdog._effective_probe_timeout_s(), 145.0)
+
+    def test_bootstrap_snapshot_preserves_previous_recent_history(self) -> None:
+        config = TwinrConfig(
+            project_root="/tmp/twinr",
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+        )
+        previous_sample = RemoteMemoryWatchdogSample(
+            seq=4,
+            captured_at="2026-03-30T20:39:30Z",
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=139311.6,
+            consecutive_ok=1,
+            consecutive_fail=0,
+            detail=None,
+        )
+        previous_snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at="2026-03-30T20:36:12Z",
+            updated_at="2026-03-30T20:39:30Z",
+            hostname="picarx",
+            pid=111,
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=4,
+            failure_count=3,
+            last_ok_at="2026-03-30T20:39:30Z",
+            last_failure_at="2026-03-30T20:37:57Z",
+            artifact_path="/tmp/twinr/remote_memory_watchdog.json",
+            current=previous_sample,
+            recent_samples=(previous_sample,),
+            heartbeat_at="2026-03-30T20:39:30Z",
+            probe_inflight=False,
+            probe_started_at=None,
+            probe_age_s=None,
+        )
+
+        bootstrap = build_remote_memory_watchdog_bootstrap_snapshot(
+            config,
+            pid=222,
+            artifact_path="/tmp/twinr/remote_memory_watchdog.json",
+            previous_snapshot=previous_snapshot,
+        )
+
+        self.assertEqual(bootstrap.sample_count, 4)
+        self.assertEqual(bootstrap.failure_count, 3)
+        self.assertEqual(bootstrap.last_ok_at, "2026-03-30T20:39:30Z")
+        self.assertEqual(len(bootstrap.recent_samples), 1)
+        self.assertEqual(bootstrap.recent_samples[0].latency_ms, 139311.6)
+        self.assertEqual(bootstrap.current.status, "starting")
 
     def test_probe_once_preserves_cached_service_after_expected_remote_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

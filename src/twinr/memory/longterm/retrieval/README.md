@@ -20,8 +20,12 @@ personalization cues for a single user turn.
 - compile and render silent personalization cues from graph and episodic memory, including graph-only turns where no episodic match is available
 - opportunistically reuse or background-build expensive silent subtext packets so live foreground turns do not stall on cold personalization compilation
 - build one tiny fast-topic hint block from current-scope ChonkyDB objects for latency-sensitive answer lanes without running the full retriever
-- build one internal unified retrieval plan across durable objects, conflict queues, graph candidates, and selected midterm packets before rendering the stable public context sections
+- build one internal unified retrieval plan across episodic entries, durable objects, conflict queues, selected midterm packets, adaptive policy packets, and graph candidates before rendering the stable public context sections
+- keep that unified plan on a minimal kept-evidence contract: reorder candidates, prune non-focus components, drop non-dominant source families when a query clearly resolves to continuity vs practical recall, and expose dropped-candidate reasons in the internal plan for debugging
+- treat broad semantic domains such as `memory_domain:*` as explainability hints only, not as candidate-connectivity edges, so unrelated memories in the same domain cannot collapse into one giant retrieval component
 - reuse the graph selected by that unified plan for subtext compilation so one turn does not issue a second graph-selection pass just to render silent personalization
+- derive tool-facing redacted context from that same already-loaded retrieval input set instead of repeating conflict or durable remote reads after the main selection pass
+- keep tool-facing recall bounded by dropping silent subtext entirely and only fetching graph context as a fallback when visible structured recall would otherwise be empty
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
 - reject compiled personalization payloads that leak schema/JSON/markup structure and fall back to the static subtext path instead of injecting corrupted hidden guidance
 - expose a read-only operator search view over durable, episodic, midterm, graph, and conflict recall without constructing the full runtime service
@@ -41,8 +45,8 @@ dumps.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package marker |
-| `retriever.py` | Context assembly, including environment-aware durable and midterm rendering |
-| `unified_plan.py` | Internal candidate normalization, explicit-anchor joins, and explainable mixed graph+structured+midterm query plans |
+| `retriever.py` | Context assembly, including environment-aware durable/midterm rendering and unified-plan attachment of adaptive/subtext metadata |
+| `unified_plan.py` | Internal candidate normalization, focus-component pruning, semantic join-anchor selection, and explainable mixed graph+structured+episodic+midterm query plans |
 | `fast_topic.py` | One-shot current-topic hint builder for low-latency answer paths |
 | `adaptive_policy.py` | Adaptive prompt-policy compiler from stored long-term signals, including confirmed response-channel preference packets |
 | `restart_recall_policy.py` | Persistent restart-recall packet compiler from stable durable memory |

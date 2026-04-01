@@ -19,7 +19,7 @@ from twinr.agent.tools.handlers.household_identity import handle_manage_househol
 from twinr.agent.tools.handlers.output import handle_inspect_camera
 from twinr.agent.tools.handlers.portrait_identity import handle_enroll_portrait_identity
 from twinr.hardware.camera import CapturedPhoto
-from twinr.memory import ConversationTurn
+from twinr.memory.on_device import ConversationTurn
 from twinr.ops.paths import resolve_ops_paths
 from twinr.web.conversation_lab import (
     _CONVERSATION_LAB_TOOL_NAMES,
@@ -241,7 +241,7 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
             owner = self._make_owner(project_root=Path(temp_dir), print_backend=print_backend)
             fake_camera = SimpleNamespace(
                 capture_photo=lambda *, filename: CapturedPhoto(
-                    data=b"not-really-a-png",
+                    data=b"\x89PNG\r\n\x1a\nfake-png-bytes",
                     content_type="image/png",
                     filename=filename,
                     source_device="/dev/video0",
@@ -402,6 +402,29 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
             )
             ops_paths = resolve_ops_paths(project_root)
             runtime = _RuntimeStub()
+            snapshot = SimpleNamespace(
+                profile="tool",
+                source="built_sync",
+                query_profile=SimpleNamespace(
+                    original_text="Wie ist der Status im Haus?",
+                    retrieval_text="Wie ist der Status im Haus?",
+                    canonical_english_text="How is the status in the house?",
+                ),
+                context=SimpleNamespace(
+                    subtext_context=None,
+                    topic_context=None,
+                    midterm_context=None,
+                    durable_context="durable:{status: ruhig}",
+                    episodic_context="episodic:{user asked for house status}",
+                    graph_context=None,
+                    conflict_context=None,
+                ),
+            )
+            runtime.long_term_memory = SimpleNamespace(
+                writer=None,
+                multimodal_writer=None,
+                latest_context_snapshot=lambda *, profile: snapshot if profile == "tool" else None,
+            )
             result = SimpleNamespace(
                 text="Im Haus ist aktuell ruhig.",
                 tool_calls=(),
@@ -418,7 +441,7 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
                 patch("twinr.web.conversation_lab.TwinrUsageStore.from_config", return_value=_UsageStore()),
                 patch("twinr.web.conversation_lab._build_tool_loop", return_value=(object(), ())),
                 patch("twinr.web.conversation_lab._run_text_turn", return_value=result),
-                patch("twinr.web.conversation_lab._search_snapshot", return_value={"status": {"detail": "ok"}}),
+                patch("twinr.web.conversation_lab._search_snapshot", side_effect=AssertionError("_search_snapshot should not run")),
             ):
                 session_id = run_conversation_lab_turn(
                     config,
@@ -435,6 +458,9 @@ class ConversationLabToolOwnerTests(unittest.TestCase):
 
             self.assertIn('"status": "ok"', payload)
             self.assertIn('"Flush result"', payload)
+            self.assertIn("Captured Context Before Answer", payload)
+            self.assertIn("Post-Turn Context", payload)
+            self.assertIn("durable:{status: ruhig}", payload)
             self.assertEqual(runtime.flush_calls, [])
             self.assertEqual(runtime.recorded_tool_history, [])
             self.assertEqual(runtime.shutdown_calls, [2.0])

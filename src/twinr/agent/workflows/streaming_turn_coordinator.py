@@ -57,6 +57,7 @@ from twinr.agent.workflows.streaming_turn_orchestrator import (
     StreamingTurnOrchestrator,
     StreamingTurnTimeoutPolicy,
 )
+from twinr.agent.workflows.voice_turn_latency import mark_voice_turn_tts_started
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 _ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S = 5.0
@@ -69,6 +70,12 @@ def _bool_token(value: bool) -> str:
     """Return the stable lowercase wire-format boolean token."""
 
     return "true" if value else "false"
+
+
+def _noop_turn_latency_breakdown(_trace_id: str | None) -> None:
+    """Default no-op breakdown emitter for tests or legacy hook construction."""
+
+    return None
 
 
 def _coerce_positive_int(value: object, default: int, *, minimum: int = 1) -> int:
@@ -220,6 +227,7 @@ class StreamingTurnRequest:
     capture_ms: int
     stt_ms: int
     allow_follow_up_rearm: bool = False
+    workflow_trace_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +279,7 @@ class StreamingTurnCoordinatorHooks:
     evaluate_follow_up_closure: Callable[..., ConversationClosureEvaluation]
     apply_follow_up_closure_evaluation: Callable[..., bool]
     follow_up_rearm_allowed_now: Callable[[str], bool]
+    emit_turn_latency_breakdown: Callable[[str | None], None] = _noop_turn_latency_breakdown
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,6 +395,7 @@ class _SpeechLifecycle:
     processing_feedback: _ProcessingFeedbackController
     state_machine: _StreamingTurnStateMachine
     turn_started: float
+    workflow_trace_id: str | None
     answer_started: bool = False
     first_audio_at: float | None = None
     snapshot_refresh_interval_s: float = _ANSWERING_SNAPSHOT_REFRESH_INTERVAL_S
@@ -410,6 +420,7 @@ class _SpeechLifecycle:
                 return
             self.first_audio_at = time.monotonic()
             first_audio_at = self.first_audio_at
+        mark_voice_turn_tts_started(trace_id=self.workflow_trace_id)
         self.trace_event(
             "streaming_first_audio_observed",
             kind="metric",
@@ -726,6 +737,7 @@ class StreamingTurnCoordinator:
             processing_feedback=self.processing_feedback,
             state_machine=self.state_machine,
             turn_started=self.request.turn_started,
+            workflow_trace_id=self.request.workflow_trace_id,
         )
         self._lane_plan: StreamingTurnLanePlan | None = None
         self._speech_output: InterruptibleSpeechOutput | None = None
@@ -1340,6 +1352,7 @@ class StreamingTurnCoordinator:
             "timing_total_ms",
             int((time.monotonic() - self.request.turn_started) * 1000),
         )
+        self.hooks.emit_turn_latency_breakdown(self.request.workflow_trace_id)
 
     def _start_follow_up_closure_evaluation(
         self,

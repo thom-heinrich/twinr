@@ -254,6 +254,35 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             ("camera.fine_hand_gesture_detected", "person_state.interaction_ready"),
         )
 
+    def test_run_busy_audio_only_uses_non_blocking_audio_refresh_path(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        calls: list[str] = []
+        audio_snapshot = ProactiveAudioSnapshot(
+            observation=SocialAudioObservation(
+                speech_detected=False,
+                assistant_output_active=False,
+            )
+        )
+
+        service._note_audio_observer_runtime_context = lambda **_kwargs: calls.append("note_context")
+        service._observe_audio_for_busy_runtime = lambda **_kwargs: calls.append("busy_refresh") or audio_snapshot
+        service._observe_audio_safe = lambda: calls.append("observe_audio_safe") or audio_snapshot
+        service._observe_audio_policy = lambda **_kwargs: SimpleNamespace()
+        service._is_low_motion = lambda now, motion_active: False
+        service._record_observation_if_changed = (
+            lambda observation, **_kwargs: calls.append(f"record:{observation.audio.speech_detected}")
+        )
+
+        result = ProactiveCoordinator._run_busy_audio_only(
+            service,
+            now=15.0,
+            motion_active=False,
+            runtime_status_value="processing",
+        )
+
+        self.assertIsInstance(result, proactive_service_mod.ProactiveTickResult)
+        self.assertEqual(calls, ["note_context", "busy_refresh", "record:False"])
+
     def test_update_display_attention_follow_consumes_perception_orchestrator(self) -> None:
         service = object.__new__(ProactiveCoordinator)
         published: list[dict[str, object]] = []

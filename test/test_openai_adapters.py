@@ -265,6 +265,64 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
             ["web_search", "function"],
         )
 
+    def test_start_turn_streaming_strips_openai_unsupported_function_schema_keywords(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.stream_results.append(
+            (
+                [],
+                SimpleNamespace(
+                    id="resp_start_schema_1",
+                    _request_id="req_start_schema_1",
+                    model="gpt-5.2",
+                    output_text="Alles klar.",
+                    output=[],
+                    usage=None,
+                ),
+            )
+        )
+        provider = OpenAIToolCallingAgentProvider(backend)
+
+        provider.start_turn_streaming(
+            "Lege bitte eine Automation an",
+            tool_schemas=[
+                {
+                    "type": "function",
+                    "name": "create_time_automation",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "weekdays": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "minItems": 1,
+                                "uniqueItems": True,
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "uniqueItems": True,
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "propertyNames": {"pattern": "^[a-z]+$"},
+                                "additionalProperties": {"type": "string"},
+                            },
+                        },
+                        "required": ["weekdays"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+            allow_web_search=False,
+        )
+
+        request = backend._client.responses.stream_requests[0]
+        parameters = request["tools"][0]["parameters"]
+        self.assertNotIn("uniqueItems", parameters["properties"]["weekdays"])
+        self.assertNotIn("uniqueItems", parameters["properties"]["tags"])
+        self.assertNotIn("propertyNames", parameters["properties"]["metadata"])
+        self.assertFalse(parameters["properties"]["metadata"]["additionalProperties"])
+
     def test_first_word_provider_requests_structured_fast_reply(self) -> None:
         backend = FakeToolBackend(
             TwinrConfig(

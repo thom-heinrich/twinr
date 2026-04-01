@@ -22,7 +22,7 @@ instead of treating them as supported operating modes.
 - the Pi-side bootstrap entrypoint for self-coding Codex prerequisites
 - the Pi-side operator script that fail-closes the OpenAI env contract before isolated provider probes
 - the development-machine watchdog that mirrors the authoritative repo into `/twinr` without deleting Pi-local runtime state
-- the leading-repo deploy command that mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, and verifies the Pi acceptance runtime
+- the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, runs the bounded live retention canary, and verifies the Pi acceptance runtime
 
 `hardware/ops` does **not** own:
 - the watchdog implementation itself; that lives in `src/twinr/ops`
@@ -44,7 +44,7 @@ instead of treating them as supported operating modes.
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
-| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: mirror the repo, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, optionally first-rollout a disabled Pi unit, and verify post-restart health |
+| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
 
@@ -53,6 +53,15 @@ streaming loop keeps access to GPIO devices on deployed hosts. The dedicated
 remote-memory watchdog also runs as `root` now, so both units share one
 runtime-state ownership model and do not flap on root-vs-user lock files
 inside `/twinr/state/` or `/twinr/state/chonkydb/`.
+Because those root-owned services also refresh shared operator diagnostics
+under `/twinr/artifacts/stores/ops/`, the deploy permission-repair step now
+explicitly keeps `remote_memory_watchdog.json` and
+`display_ambient_impulse.json` operator-readable inside that otherwise `0700`
+ops directory, so non-root acceptance probes can read the same live artifacts
+without weakening directory-level confinement.
+That dedicated watchdog unit now also treats exit code `75` as
+restart-preventing, so an already-owned singleton does not thrash in an
+immediate restart loop while the existing owner is still healthy.
 
 The development-host voice bridge is intentionally transport-only. It must not
 run voice activation logic, STT logic, or websocket-aware product behavior itself.
@@ -240,11 +249,14 @@ By default the deploy command:
 - hands any root-owned mirrored `__pycache__/` trees back to the runtime user before rebuilding checked-hash bytecode, so old productive imports cannot block later deploys
 - runs a fixed `/twinr/.venv/bin/python` import contract before restart, so critical direct-import modules must still import successfully after the deploy instead of failing only later in live runtime
 - explicitly syncs local browser-automation runtime manifests from `browser_automation/runtime_requirements.txt` and `browser_automation/playwright_browsers.txt`, then installs those requirements and Playwright browsers on the Pi when they exist locally
+- snapshots the authoritative repo mirror scope into a temporary local tree before the rsync phase, so unrelated shared-worktree edits cannot self-abort the rollout or produce a mixed-source Pi checkout mid-deploy
 - uploads an authoritative local manifest and independently attests the mirrored `/twinr` repo contents by SHA256/link target before any productive restart, so stale source files cannot still yield a green deploy
 - installs the mirrored productive systemd unit files into `/etc/systemd/system/`
 - restarts `twinr-remote-memory-watchdog.service`, `twinr-runtime-supervisor.service`, and `twinr-web.service`
 - also picks up any additional repo-backed Pi runtime unit that is already enabled on the Pi, such as `twinr-whatsapp-channel.service`
-- verifies that those services are active again and runs the bounded Pi env-contract probe
+- verifies that those services are active again, runs the bounded Pi env-contract probe, and then runs the bounded live retention canary unless `--skip-retention-canary` was requested
+- re-bases repo-owned workflow-trace env paths such as `TWINR_WORKFLOW_TRACE_DIR=/home/thh/twinr/...` onto the active Pi checkout root during env sync, so `/twinr` does not inherit stale leading-repo absolute paths
+- emits nested `retention_canary` progress events while the fresh-namespace probe is still running, so long remote-memory canary runs do not look like a silent deploy hang
 
 `deploy_pi_runtime.py` is the operator-facing replacement for the old manual
 "run the mirror watchdog as the deploy step" workflow. The mirror still exists
@@ -255,6 +267,11 @@ Use `--skip-env-sync` only when the Pi env must intentionally stay divergent
 from the leading repo. Use `--live-text` or `--live-search` when you want the
 post-deploy verification to include one real OpenAI-backed proof, not just the
 fail-closed env-contract plus service-health checks.
+During long-running installs the operator command now writes structured deploy
+progress JSON lines to stderr while keeping stdout reserved for the final
+success or error payload.
+Use `--skip-retention-canary` only when you intentionally want to bypass the
+fresh-namespace remote-memory retention proof after restart.
 If an optional Pi runtime unit such as `twinr-whatsapp-channel.service` was
 already enabled before but its installed unit file later became masked or
 corrupted, the default deploy path now repairs it automatically as long as the

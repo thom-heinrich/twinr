@@ -116,6 +116,7 @@ class LongTermConflictResolverTests(unittest.TestCase):
         self.assertIn("fact:corinna_phone_old", updated["fact:corinna_phone_new"].supersedes)
         self.assertEqual(updated["fact:corinna_phone_old"].status, "superseded")
         self.assertEqual(result.remaining_conflicts, ())
+        self.assertEqual(result.deleted_conflict_slot_keys, ("contact:person:corinna_maier:phone",))
 
 
 class LongTermConflictStoreTests(unittest.TestCase):

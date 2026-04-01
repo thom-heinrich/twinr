@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from email.utils import parseaddr
 from pathlib import Path, PurePath
 from typing import Any, cast
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -459,6 +460,59 @@ def _normalize_calendar_source_value(source_kind: str, raw_value: object) -> str
     if _is_local_calendar_source(source_kind, source_value):
         return _validate_calendar_local_path(source_value)
     return source_value
+
+
+def _calendar_source_form_state(source_kind: str, source_value: str) -> tuple[str, str, str]:
+    """Return the safe form value, placeholder, and help text for one calendar source."""
+
+    default_placeholder = "state/calendar.ics or https://..."
+    normalized_source = source_value.strip()
+    if not normalized_source or _is_local_calendar_source(source_kind, normalized_source):
+        return normalized_source, default_placeholder, ""
+
+    parts = urlsplit(normalized_source)
+    if not parts.query and not parts.fragment:
+        return normalized_source, default_placeholder, ""
+
+    redacted_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return (
+        "",
+        redacted_url or default_placeholder,
+        "Stored tokenized URL is hidden here. Leave the field blank to keep the current URL, or paste a new full URL to replace it.",
+    )
+
+
+def _resolve_calendar_source_value_for_save(
+    source_kind: str,
+    raw_value: object,
+    *,
+    current_record: ManagedIntegrationConfig | None,
+) -> str:
+    """Normalize one submitted calendar source, preserving a hidden tokenized URL when unchanged."""
+
+    raw_text = _coerce_text(raw_value).strip()
+    if raw_text:
+        return _normalize_calendar_source_value(source_kind, raw_text)
+    if current_record is None:
+        return ""
+
+    current_values = _string_settings(getattr(current_record, "settings", {}))
+    current_source_kind = _safe_normalize_choice(
+        current_values.get("source_kind", source_kind),
+        default=source_kind,
+        options=_CALENDAR_SOURCE_OPTIONS,
+        fallback=("ics_url", "ics_feed"),
+    )
+    current_source_value = current_values.get("source_value", "").strip()
+    if current_source_kind != source_kind or not current_source_value:
+        return ""
+    if _is_local_calendar_source(source_kind, current_source_value):
+        return ""
+
+    parts = urlsplit(current_source_value)
+    if not parts.query and not parts.fragment:
+        return ""
+    return current_source_value
 
 
 def _integration_overview_rows(
@@ -908,6 +962,12 @@ def _calendar_integration_sections(record: ManagedIntegrationConfig) -> tuple[Se
         fallback=("ics_url", "ics_feed"),
     )
     values["source_kind"] = source_kind  # AUDIT-FIX(#6): Canonicalize source type before rendering the select field.
+    source_value = values.get("source_value", "").strip()
+    source_field_value, source_placeholder, source_help_text = _calendar_source_form_state(
+        source_kind,
+        source_value,
+    )
+    values["source_value"] = source_field_value
     return (
         SettingsSection(
             title="Calendar",
@@ -933,8 +993,9 @@ def _calendar_integration_sections(record: ManagedIntegrationConfig) -> tuple[Se
                     "source_value",
                     "ICS path or URL",
                     values,
-                    values.get("source_value", "").strip(),
-                    placeholder="state/calendar.ics or https://...",
+                    source_field_value,
+                    help_text=source_help_text,
+                    placeholder=source_placeholder,
                     tooltip_text="Relative file paths are resolved from the Twinr project root.",
                 ),
                 _text_field(
@@ -1213,7 +1274,10 @@ def _build_email_integration_record(
     return record, env_updates
 
 
-def _build_calendar_integration_record(form: Mapping[str, object]) -> tuple[ManagedIntegrationConfig, dict[str, str]]:
+def _build_calendar_integration_record(
+    form: Mapping[str, object],
+    current_record: ManagedIntegrationConfig | None = None,
+) -> tuple[ManagedIntegrationConfig, dict[str, str]]:
     """Validate posted calendar form data into a managed integration record.
 
     Args:
@@ -1235,7 +1299,11 @@ def _build_calendar_integration_record(form: Mapping[str, object]) -> tuple[Mana
         options=_CALENDAR_SOURCE_OPTIONS,
         fallback=("ics_url", "ics_feed"),
     )
-    source_value = _normalize_calendar_source_value(source_kind, form.get("source_value", ""))  # AUDIT-FIX(#2): Block traversal and unsafe local paths.
+    source_value = _resolve_calendar_source_value_for_save(
+        source_kind,
+        form.get("source_value", ""),
+        current_record=current_record,
+    )  # AUDIT-FIX(#2): Block traversal and unsafe local paths while preserving hidden tokenized URLs.
     if enabled and not source_value:
         raise ValueError("Calendar source path or URL is required when calendar is enabled.")
     if source_value:

@@ -28,7 +28,8 @@ from twinr.agent.base_agent.conversation.follow_up_context import (
     pending_conversation_follow_up_system_message,
 )
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
-from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
+from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError, LongTermRemoteUnavailableError
 from twinr.proactive import ProactiveGovernor
 
@@ -716,7 +717,10 @@ class TwinrRuntimeContextMixin:
             return ()
         try:
             context_builder = (
-                long_term_memory.build_tool_provider_context(retrieval_query)
+                long_term_memory.build_tool_provider_context(
+                    retrieval_query,
+                    include_graph_fallback=False,
+                )
                 if tool_context
                 else long_term_memory.build_provider_context(retrieval_query)
             )

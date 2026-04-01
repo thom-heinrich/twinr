@@ -143,7 +143,7 @@ class LongTermConflictResolver:
         Args:
             conflict: Conflict being resolved.
             objects: Current object snapshot containing all conflict options.
-            remaining_conflicts: All currently stored conflicts.
+            remaining_conflicts: Conflict records in the scope being rewritten.
             selected_memory_id: Memory ID chosen by the user.
             now: Optional resolution timestamp. Defaults to the current UTC
                 time when omitted.
@@ -207,6 +207,7 @@ class LongTermConflictResolver:
             selected_memory_id=selected_memory_id,
             updated_objects=tuple(sorted(updated_objects, key=lambda item: item.memory_id)),
             remaining_conflicts=tuple(item for item in remaining_conflicts if item.slot_key != conflict.slot_key),
+            deleted_conflict_slot_keys=(conflict.slot_key,),
         )
 
     def _build_object_map(

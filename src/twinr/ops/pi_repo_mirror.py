@@ -765,7 +765,11 @@ for target in {remote_targets}; do
   if find "$target" -mindepth 1 ! \\( -type d -name '__pycache__' -o -type f \\( -name '*.pyc' -o -name '*.pyo' \\) \\) -print -quit | grep -q .; then
     continue
   fi
-  rm -rf -- "$target"
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo rm -rf -- "$target"
+  else
+    rm -rf -- "$target"
+  fi
 done
 """
         completed = self._run_remote_locked_shell(script)
@@ -1056,6 +1060,41 @@ def build_authoritative_repo_entry_digests(
     return tuple(entries)
 
 
+def materialize_authoritative_repo_snapshot(
+    project_root: str | Path,
+    snapshot_root: str | Path,
+    *,
+    protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+) -> tuple[PiRepoMirrorEntryDigest, ...]:
+    """Copy the authoritative mirror scope into an immutable local snapshot.
+
+    Deploy workflows need a content-stable source tree even when the shared
+    development worktree keeps moving. This helper copies exactly the same
+    files and symlinks that the Pi mirror considers authoritative, preserving
+    symlink targets and file metadata while excluding protected and transient
+    paths.
+    """
+
+    resolved_root = Path(project_root).resolve()
+    resolved_snapshot_root = Path(snapshot_root).resolve()
+    if not resolved_root.exists() or not resolved_root.is_dir():
+        raise ValueError(f"project root does not exist: {resolved_root}")
+    entries = build_authoritative_repo_entry_digests(
+        resolved_root,
+        protected_patterns=protected_patterns,
+    )
+    resolved_snapshot_root.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        source_path = resolved_root / entry.relative_path
+        target_path = resolved_snapshot_root / entry.relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if entry.kind == "symlink":
+            target_path.symlink_to(os.readlink(source_path))
+            continue
+        shutil.copy2(source_path, target_path)
+    return entries
+
+
 def _build_repo_entry_digest(path: Path, project_root: Path) -> PiRepoMirrorEntryDigest:
     """Build one attestation digest for a mirrored file or symlink."""
 
@@ -1335,4 +1374,5 @@ __all__ = [
     "PiRepoMirrorRunResult",
     "PiRepoMirrorWatchdog",
     "build_authoritative_repo_entry_digests",
+    "materialize_authoritative_repo_snapshot",
 ]

@@ -25,6 +25,7 @@ prime_raspberry_pi_system_site_packages()
 from twinr.agent.base_agent.config import TwinrConfig  # noqa: E402
 from twinr.ops.locks import TwinrInstanceAlreadyRunningError  # noqa: E402
 _RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
+_WATCHDOG_ALREADY_RUNNING_EXIT_CODE = 75
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -655,8 +656,12 @@ def main() -> int:
         print(f"remote_memory_watchdog_artifact={watchdog.artifact_path}")
         print(f"remote_memory_watchdog_interval_s={watchdog.interval_s}")
         print(f"remote_memory_watchdog_history_limit={watchdog.history_limit}")
-        with loop_instance_lock(config, "remote-memory-watchdog"):
-            return watchdog.run(duration_s=args.loop_duration)
+        try:
+            with loop_instance_lock(config, "remote-memory-watchdog"):
+                return watchdog.run(duration_s=args.loop_duration)
+        except TwinrInstanceAlreadyRunningError as exc:
+            print(f"error={exc}")
+            return _WATCHDOG_ALREADY_RUNNING_EXIT_CODE
 
     if args.run_runtime_supervisor:
         _assert_pi_runtime_root(args.env_file, command_name="run-runtime-supervisor")
@@ -1071,6 +1076,8 @@ def main() -> int:
             if runtime is not None:
                 print(f"status={runtime.status.value}")
             print(f"error={exc}")
+            if args.watch_remote_memory:
+                return _WATCHDOG_ALREADY_RUNNING_EXIT_CODE
             return 1
         if runtime is not None:
             runtime.fail(str(exc))

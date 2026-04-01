@@ -23,12 +23,33 @@ from twinr.ops.remote_memory_watchdog_state import (
 
 
 EmitFn = Callable[[str], None]
+_PI_RUNTIME_ROOT = Path("/twinr")
+_PI_REMOTE_MEMORY_WATCHDOG_SYSTEMD_UNIT = "twinr-remote-memory-watchdog.service"
+_DEFAULT_SYSTEMD_START_TIMEOUT_S = 10.0
 
 
 def _default_emit(line: str) -> None:
     """Print one bounded lifecycle line."""
 
     print(line, flush=True)
+
+
+def _normalize_text(value: object) -> str:
+    """Return one stripped text value or an empty string."""
+
+    return str(value or "").strip()
+
+
+def _coerce_positive_float(value: object, *, default: float) -> float:
+    """Return one finite positive float or the provided default."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if parsed <= 0.0:
+        return float(default)
+    return parsed
 
 
 def _remote_required(config: TwinrConfig) -> bool:
@@ -50,6 +71,56 @@ def _python_executable_for_runtime(config: TwinrConfig) -> str:
     return sys.executable
 
 
+def _systemd_watchdog_unit(config: TwinrConfig) -> str | None:
+    """Return the dedicated watchdog unit name when one is configured."""
+
+    for attr_name in (
+        "long_term_memory_remote_watchdog_systemd_unit",
+        "remote_memory_watchdog_systemd_unit",
+    ):
+        unit = _normalize_text(getattr(config, attr_name, ""))
+        if unit:
+            return unit
+    try:
+        if Path(config.project_root).expanduser().resolve() == _PI_RUNTIME_ROOT:
+            return _PI_REMOTE_MEMORY_WATCHDOG_SYSTEMD_UNIT
+    except Exception:
+        return None
+    return None
+
+
+def _request_watchdog_systemd_start(
+    config: TwinrConfig,
+    *,
+    emit: EmitFn,
+) -> bool:
+    """Ask systemd to start the canonical watchdog unit when available."""
+
+    unit = _systemd_watchdog_unit(config)
+    if not unit:
+        return False
+    timeout_s = _coerce_positive_float(
+        getattr(config, "long_term_memory_remote_watchdog_systemd_timeout_s", _DEFAULT_SYSTEMD_START_TIMEOUT_S),
+        default=_DEFAULT_SYSTEMD_START_TIMEOUT_S,
+    )
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--no-block", "start", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+        emit(f"remote_memory_watchdog=systemd_start_failed:{type(exc).__name__}:{exc}")
+        return False
+    if completed.returncode == 0:
+        emit(f"remote_memory_watchdog=systemd_start_requested:{unit}")
+        return True
+    emit(f"remote_memory_watchdog=systemd_start_exit:{completed.returncode}:{unit}")
+    return False
+
+
 def _seed_watchdog_bootstrap_snapshot(config: TwinrConfig, *, owner_pid: int) -> None:
     """Persist a fresh startup snapshot when the owner PID changed."""
 
@@ -64,6 +135,7 @@ def _seed_watchdog_bootstrap_snapshot(config: TwinrConfig, *, owner_pid: int) ->
         config,
         pid=owner_pid,
         artifact_path=store.path,
+        previous_snapshot=snapshot,
     )
     store.save(bootstrap)
 
@@ -88,8 +160,15 @@ def ensure_remote_memory_watchdog_process(
     env_file: str | Path,
     emit: EmitFn = _default_emit,
     startup_timeout_s: float = 3.0,
+    allow_spawn: bool = True,
 ) -> int | None:
-    """Start the external watchdog process when it is not already running."""
+    """Ensure the external watchdog owner exists without violating ownership.
+
+    On the productive Pi, the dedicated systemd unit is the canonical owner and
+    this helper requests that unit first. Only environments without a configured
+    unit fall back to a detached direct spawn, and callers can explicitly forbid
+    that fallback when a second raw process would violate the ownership model.
+    """
 
     if not _remote_required(config):
         return None
@@ -99,6 +178,22 @@ def ensure_remote_memory_watchdog_process(
         _maybe_seed_watchdog_bootstrap_snapshot(config, owner_pid=owner, emit=emit)
         emit(f"remote_memory_watchdog=running:{owner}")
         return owner
+
+    deadline = time.monotonic() + max(0.1, float(startup_timeout_s))
+    if _request_watchdog_systemd_start(config, emit=emit):
+        while time.monotonic() < deadline:
+            owner = loop_lock_owner(config, "remote-memory-watchdog")
+            if owner is not None:
+                _maybe_seed_watchdog_bootstrap_snapshot(config, owner_pid=owner, emit=emit)
+                emit(f"remote_memory_watchdog=ready:{owner}")
+                return owner
+            time.sleep(0.1)
+        emit("remote_memory_watchdog=systemd_start_pending")
+        return None
+
+    if not allow_spawn:
+        emit("remote_memory_watchdog=spawn_disallowed")
+        return None
 
     project_root = Path(config.project_root).resolve()
     python_executable = _python_executable_for_runtime(config)
@@ -126,7 +221,6 @@ def ensure_remote_memory_watchdog_process(
         )
     emit("remote_memory_watchdog=spawned")
 
-    deadline = time.monotonic() + max(0.1, float(startup_timeout_s))
     while time.monotonic() < deadline:
         owner = loop_lock_owner(config, "remote-memory-watchdog")
         if owner is not None:

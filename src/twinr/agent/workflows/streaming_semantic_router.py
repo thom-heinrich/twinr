@@ -694,8 +694,6 @@ def _synthesize_supervisor_decision(
         model=getattr(route_decision, "model_id", None),
         token_usage=None,
     )
-
-
 def _handoff_kind_for_label(route_label: str) -> str:
     route_key = _normalized_label(route_label)
     if route_key == "web":

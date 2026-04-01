@@ -32,7 +32,7 @@ dashboard metadata that provider packages plug into.
 | [policy.py](./policy.py) | Safety gate decisions |
 | [registry.py](./registry.py) | Adapter registration and dispatch |
 | [runtime.py](./runtime.py) | Managed email/calendar/smart-home wiring |
-| [store.py](./store.py) | File-backed integration config store |
+| [store.py](./store.py) | Portable SQLite-backed integration config store with legacy-schema rebuild support |
 | [social_history.py](./social_history.py) | Canonical social-history learning consent and import-status model |
 | [web_automation_families.py](./web_automation_families.py) | Dashboard family blocks |
 | [calendar/](./calendar) | Calendar provider package |

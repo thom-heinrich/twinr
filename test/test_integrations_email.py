@@ -43,6 +43,8 @@ class _FakeSMTPConnection:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.message = None
+        self.from_addr = None
+        self.to_addrs = None
 
     def ehlo(self) -> None:
         self.calls.append("ehlo")
@@ -53,9 +55,11 @@ class _FakeSMTPConnection:
     def login(self, username: str, password: str) -> None:
         self.calls.append(f"login:{username}:{password}")
 
-    def send_message(self, message) -> None:
+    def send_message(self, message, from_addr=None, to_addrs=None) -> None:
         self.calls.append("send_message")
         self.message = message
+        self.from_addr = from_addr
+        self.to_addrs = to_addrs
 
     def quit(self) -> None:
         self.calls.append("quit")
@@ -136,7 +140,13 @@ class EmailMailboxAdapterTests(unittest.TestCase):
             settings=EmailAdapterSettings(max_read_results=5),
         )
 
-        result = adapter.execute(IntegrationRequest(integration_id="email_mailbox", operation_id="read_recent"))
+        result = adapter.execute(
+            IntegrationRequest(
+                integration_id="email_mailbox",
+                operation_id="read_recent",
+                explicit_user_confirmation=True,
+            )
+        )
 
         self.assertEqual(result.details["count"], 2)
 
@@ -157,7 +167,13 @@ class EmailMailboxAdapterTests(unittest.TestCase):
             ),
         )
 
-        result = adapter.execute(IntegrationRequest(integration_id="email_mailbox", operation_id="read_recent"))
+        result = adapter.execute(
+            IntegrationRequest(
+                integration_id="email_mailbox",
+                operation_id="read_recent",
+                explicit_user_confirmation=True,
+            )
+        )
 
         self.assertEqual(result.details["count"], 1)
         self.assertEqual(result.details["messages"][0]["sender_email"], "anna@example.com")
@@ -179,13 +195,14 @@ class EmailMailboxAdapterTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual(result.details["error_code"], "invalid_request")
-        self.assertEqual(result.summary, "Please confirm before I prepare or send an email.")
+        self.assertEqual(result.summary, "Please confirm before I prepare, read, or send email.")
 
-    def test_draft_allows_unknown_recipient_after_permission(self) -> None:
+    def test_draft_allows_unknown_recipient_when_contact_restriction_disabled(self) -> None:
         adapter = EmailMailboxAdapter(
             manifest=self.manifest,
             contacts=self.contacts,
             mailbox_reader=_FakeMailboxReader([]),
+            settings=EmailAdapterSettings(restrict_recipients_to_known_contacts=False),
         )
 
         result = adapter.execute(
@@ -224,13 +241,14 @@ class EmailMailboxAdapterTests(unittest.TestCase):
         self.assertEqual(result.summary, "One or more recipients are not approved for sending.")
         self.assertEqual(fake_sender.sent, [])
 
-    def test_send_allows_unknown_recipient_after_permission_by_default(self) -> None:
+    def test_send_allows_unknown_recipient_when_contact_restriction_disabled(self) -> None:
         fake_sender = _FakeMailSender()
         adapter = EmailMailboxAdapter(
             manifest=self.manifest,
             contacts=self.contacts,
             mailbox_reader=_FakeMailboxReader([]),
             mail_sender=fake_sender,
+            settings=EmailAdapterSettings(restrict_recipients_to_known_contacts=False),
         )
 
         result = adapter.execute(

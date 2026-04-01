@@ -36,6 +36,8 @@ from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePoli
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.longterm.retrieval.unified_plan import (
     UnifiedGraphSelectionInput,
+    attach_adaptive_packets_to_query_plan,
+    build_episodic_selection_input,
     build_unified_retrieval_selection,
 )
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -71,6 +73,8 @@ class LongTermRetrieverTests(unittest.TestCase):
     def _make_retriever(
         self,
         temp_dir: str,
+        *,
+        adaptive_policy_builder: LongTermAdaptivePolicyBuilder | None = None,
     ) -> tuple[
         LongTermRetriever,
         LongTermStructuredStore,
@@ -91,6 +95,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             midterm_store=midterm_store,
             conflict_resolver=LongTermConflictResolver(),
             subtext_builder=LongTermSubtextBuilder(config=config, graph_store=graph_store),
+            adaptive_policy_builder=adaptive_policy_builder,
         )
         return retriever, object_store, prompt_context_store, graph_store, midterm_store
 
@@ -271,6 +276,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             ),
             query_plan={
                 "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["person:corinna_maier"],
                 "selected_node_ids": ["person:corinna_maier"],
                 "selected_edge_ids": [],
                 "access_path": ["graph_neighbors_query"],
@@ -279,6 +285,7 @@ class LongTermRetrieverTests(unittest.TestCase):
 
         selection = build_unified_retrieval_selection(
             query_texts=("What is Corinna's phone number?",),
+            episodic_entries=(),
             durable_objects=(unrelated_object, related_object),
             conflict_queue=(unrelated_conflict, related_conflict),
             conflict_supporting_objects=(unrelated_object, related_object),
@@ -359,6 +366,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             ),
             query_plan={
                 "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["person:corinna_maier"],
                 "selected_node_ids": ["person:corinna_maier"],
                 "selected_edge_ids": [],
                 "access_path": ["graph_neighbors_query"],
@@ -367,6 +375,7 @@ class LongTermRetrieverTests(unittest.TestCase):
 
         selection = build_unified_retrieval_selection(
             query_texts=("Should I call Corinna today?",),
+            episodic_entries=(),
             durable_objects=(unrelated_object, related_object),
             conflict_queue=(),
             conflict_supporting_objects=(unrelated_object, related_object),
@@ -377,7 +386,7 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertEqual(selection.midterm_packets[0].packet_id, "midterm:corinna_today")
         self.assertEqual(
             selection.query_plan["selected"]["midterm_packet_ids"],
-            ["midterm:corinna_today", "midterm:janina_today"],
+            ["midterm:corinna_today"],
         )
         join_anchors = {
             item["anchor"]: item["sources"]
@@ -385,7 +394,451 @@ class LongTermRetrieverTests(unittest.TestCase):
         }
         self.assertEqual(
             join_anchors["person_ref:person:corinna_maier"],
-            ["durable", "graph", "midterm"],
+            ["graph", "midterm"],
+        )
+
+    def test_unified_retrieval_selection_keeps_disconnected_practical_meta_memory_when_only_graph_direct_match_is_user_main(self) -> None:
+        jam_generic = LongTermMemoryObjectV1(
+            memory_id="fact:jam_generic",
+            kind="fact",
+            summary="User usually likes some jam on bread at breakfast.",
+            source=_source("turn:jam_generic"),
+            status="active",
+            confidence=0.85,
+            slot_key="fact:user:breakfast:jam",
+            value_key="jam_on_bread_at_breakfast",
+        )
+        jam_new = LongTermMemoryObjectV1(
+            memory_id="fact:jam_preference_new",
+            kind="fact",
+            summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+            details="Neuere Vorliebe fuer das Fruehstueck.",
+            source=_source("turn:jam_new"),
+            status="active",
+            confirmed_by_user=True,
+            confidence=0.95,
+            slot_key="preference:breakfast:jam",
+            value_key="apricot",
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-03-30T09:00:00Z",
+                updated_at="2026-03-30T09:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(
+                        node_id="user:main",
+                        node_type="user",
+                        label="Main user",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["user:main"],
+                "selected_node_ids": ["user:main"],
+                "selected_edge_ids": [],
+                "access_path": ["graph_path_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("Welche Marmelade ist jetzt als bestaetigt gespeichert?",),
+            episodic_entries=(),
+            durable_objects=(jam_new, jam_generic),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.query_plan["pruning"]["mode"], "practical")
+        self.assertEqual(selection.query_plan["selected"]["durable_memory_ids"][0], "fact:jam_preference_new")
+        self.assertEqual(
+            tuple(item.memory_id for item in selection.durable_objects[:2]),
+            ("fact:jam_preference_new", "fact:jam_generic"),
+        )
+
+    def test_unified_retrieval_selection_prefers_confirmed_meta_memory_fact_across_query_variants(self) -> None:
+        thermos = LongTermMemoryObjectV1(
+            memory_id="fact:thermos_location_old",
+            kind="fact",
+            summary="Früher stand die rote Thermoskanne im Flurschrank.",
+            details="Historische Ortsangabe zur roten Thermoskanne.",
+            source=_source("turn:thermos"),
+            status="active",
+            confidence=0.99,
+            confirmed_by_user=True,
+            slot_key="object:red_thermos:location",
+            value_key="hallway_cupboard",
+        )
+        jam_generic = LongTermMemoryObjectV1(
+            memory_id="fact:jam_generic",
+            kind="fact",
+            summary="User usually likes some jam on bread at breakfast.",
+            details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+            source=_source("turn:jam_generic"),
+            status="active",
+            confidence=0.84,
+            slot_key="fact:user:breakfast:jam",
+            value_key="jam_on_bread_at_breakfast",
+            attributes={
+                "fact_type": "general",
+                "memory_domain": "general",
+                "value_text": "jam on bread at breakfast",
+            },
+        )
+        jam_new = LongTermMemoryObjectV1(
+            memory_id="fact:jam_preference_new",
+            kind="fact",
+            summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+            details="Neuere Vorliebe fuer das Fruehstueck.",
+            source=_source("turn:jam_new"),
+            status="active",
+            confirmed_by_user=True,
+            confidence=0.95,
+            slot_key="preference:breakfast:jam",
+            value_key="apricot",
+        )
+        jam_restart = LongTermMidtermPacketV1(
+            packet_id="adaptive:restart:fact_jam_preference_new",
+            kind="restart_recall",
+            summary="Der bestaetigte aktuelle Marmeladeneintrag lautet Aprikosenmarmelade.",
+            source_memory_ids=("fact:jam_preference_new",),
+            attributes={"memory_domain": "general"},
+        )
+        thermos_restart = LongTermMidtermPacketV1(
+            packet_id="adaptive:restart:fact_thermos_location_old",
+            kind="restart_recall",
+            summary="Die rote Thermoskanne stand frueher im Flurschrank.",
+            source_memory_ids=("fact:thermos_location_old",),
+            attributes={"memory_domain": "general"},
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=(
+                "Welche Marmelade ist jetzt als bestaetigt gespeichert?",
+                "Which marmalade is currently saved as confirmed?",
+            ),
+            episodic_entries=(),
+            durable_objects=(jam_new, thermos, jam_generic),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(jam_restart, thermos_restart),
+            graph_selection=None,
+        )
+
+        self.assertEqual(selection.durable_objects[0].memory_id, "fact:jam_preference_new")
+        self.assertEqual(
+            selection.query_plan["selected"]["durable_memory_ids"],
+            ["fact:jam_preference_new", "fact:thermos_location_old", "fact:jam_generic"],
+        )
+        kept_payload_by_id = {
+            item["id"]: item
+            for item in selection.query_plan["candidates"]
+            if item["source"] == "durable"
+        }
+        self.assertIn("confirmed", kept_payload_by_id["fact:jam_preference_new"]["matched_query_terms"])
+
+    def test_unified_retrieval_selection_reorders_episodic_entries_on_shared_explicit_anchors(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details='User said: "Corinna called earlier today."',
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=1.0,
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        unrelated_object = LongTermMemoryObjectV1(
+            memory_id="episode:janina_called",
+            kind="episode",
+            summary='Conversation about "Janina called earlier today."',
+            details='User said: "Janina called earlier today."',
+            source=_source("turn:janina"),
+            status="active",
+            confidence=1.0,
+            attributes={"person_ref": "person:janina"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            related_entry = retriever._episodic_entry_from_object(related_object)
+            unrelated_entry = retriever._episodic_entry_from_object(unrelated_object)
+            self.assertIsNotNone(related_entry)
+            self.assertIsNotNone(unrelated_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-03-30T09:00:00Z",
+                    updated_at="2026-03-30T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(
+                            node_id="user:main",
+                            node_type="user",
+                            label="Erika",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="person:corinna_maier",
+                            node_type="person",
+                            label="Corinna Maier",
+                        ),
+                    ),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:corinna_maier"],
+                    "selected_node_ids": ["person:corinna_maier"],
+                    "selected_edge_ids": [],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("What happened with Corinna earlier today?",),
+                episodic_entries=(
+                    build_episodic_selection_input(entry=unrelated_entry, source_object=unrelated_object),
+                    build_episodic_selection_input(entry=related_entry, source_object=related_object),
+                ),
+                durable_objects=(),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(),
+                graph_selection=graph_selection,
+            )
+
+        self.assertEqual(selection.episodic_entries[0].entry_id, "episode:corinna_called")
+        self.assertEqual(
+            selection.query_plan["selected"]["episodic_entry_ids"],
+            ["episode:corinna_called"],
+        )
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in selection.query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["episodic", "graph"],
+        )
+
+    def test_unified_retrieval_selection_prunes_practical_candidates_for_continuity_queries(self) -> None:
+        episodic_object = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details='User said: "Corinna called earlier today."',
+            source=_source("turn:episode"),
+            status="active",
+            confidence=1.0,
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        durable_object = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +15555551234.",
+            source=_source("turn:durable"),
+            status="active",
+            confidence=0.97,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555551234",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        related_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:corinna_today",
+            kind="recent_contact_bundle",
+            summary="Corinna called earlier today and may matter for current continuity.",
+            source_memory_ids=("fact:corinna_phone",),
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        related_conflict = LongTermConflictQueueItemV1(
+            slot_key="contact:person:corinna_maier:phone",
+            question="Which phone number should I use for Corinna Maier?",
+            reason="Conflicting phone numbers exist.",
+            candidate_memory_id="fact:corinna_phone",
+            options=(
+                LongTermConflictOptionV1(
+                    memory_id="fact:corinna_phone",
+                    summary=durable_object.summary,
+                    status="active",
+                    value_key="+15555551234",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            episodic_entry = retriever._episodic_entry_from_object(episodic_object)
+            self.assertIsNotNone(episodic_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-03-30T09:00:00Z",
+                    updated_at="2026-03-30T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(
+                            node_id="user:main",
+                            node_type="user",
+                            label="Erika",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="person:corinna_maier",
+                            node_type="person",
+                            label="Corinna Maier",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="phone:5551234",
+                            node_type="phone",
+                            label="5551234",
+                        ),
+                    ),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:corinna_maier"],
+                    "selected_node_ids": ["user:main", "person:corinna_maier", "phone:5551234"],
+                    "selected_edge_ids": [],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("Did Corinna call earlier today?",),
+                episodic_entries=(build_episodic_selection_input(entry=episodic_entry, source_object=episodic_object),),
+                durable_objects=(durable_object,),
+                conflict_queue=(related_conflict,),
+                conflict_supporting_objects=(durable_object,),
+                midterm_packets=(related_midterm,),
+                graph_selection=graph_selection,
+            )
+
+        self.assertEqual([item.memory_id for item in selection.durable_objects], [])
+        self.assertEqual([item.slot_key for item in selection.conflict_queue], [])
+        self.assertEqual(
+            selection.query_plan["selected"]["graph_node_ids"],
+            ["person:corinna_maier"],
+        )
+        self.assertEqual(
+            {candidate["source"] for candidate in selection.query_plan["candidates"]},
+            {"episodic", "graph", "midterm"},
+        )
+        self.assertEqual(selection.query_plan["pruning"]["mode"], "continuity")
+
+    def test_unified_retrieval_selection_prefers_turn_continuity_for_generic_recap_queries(self) -> None:
+        continuity_packet = LongTermMidtermPacketV1(
+            packet_id="midterm:turn:recap",
+            kind="recent_turn_continuity",
+            summary="Recent conversation continuity from the latest user-assistant turn.",
+            details="This packet preserves immediate continuity until slower durable-memory enrichment finishes.",
+            query_hints=("medikamente",),
+            attributes={"persistence_scope": "turn_continuity"},
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-03-30T09:00:00Z",
+                updated_at="2026-03-30T09:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(
+                        node_id="user:main",
+                        node_type="user",
+                        label="Erika",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="preference:coffee",
+                        node_type="preference",
+                        label="Melitta coffee",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["user:main"],
+                "selected_node_ids": ["user:main", "preference:coffee"],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("Worüber haben wir heute gesprochen?",),
+            episodic_entries=(),
+            durable_objects=(),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(continuity_packet,),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(
+            selection.query_plan["selected"]["midterm_packet_ids"],
+            ["midterm:turn:recap"],
+        )
+        self.assertEqual(selection.query_plan["selected"]["graph_node_ids"], [])
+        self.assertEqual(selection.query_plan["pruning"]["mode"], "continuity")
+
+    def test_attach_adaptive_packets_to_query_plan_adds_selected_ids_and_candidates(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +15555551234.",
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=0.97,
+            confirmed_by_user=True,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555551234",
+            attributes={"person_ref": "person:corinna_maier", "support_count": 3},
+        )
+        selection = build_unified_retrieval_selection(
+            query_texts=("What is Corinna's phone number?",),
+            episodic_entries=(),
+            durable_objects=(related_object,),
+            conflict_queue=(),
+            conflict_supporting_objects=(related_object,),
+            midterm_packets=(),
+            graph_selection=None,
+        )
+        adaptive_packets = LongTermAdaptivePolicyBuilder().build_packets(
+            query_text="What is Corinna's phone number?",
+            durable_objects=(related_object,),
+        )
+
+        attached_packets = attach_adaptive_packets_to_query_plan(
+            query_plan=selection.query_plan,
+            durable_objects=selection.durable_objects,
+            adaptive_packets=adaptive_packets,
+        )
+
+        self.assertTrue(attached_packets)
+        self.assertEqual(
+            selection.query_plan["selected"]["adaptive_packet_ids"],
+            [packet.packet_id for packet in attached_packets],
+        )
+        self.assertEqual(selection.query_plan["sources"]["adaptive_count"], len(attached_packets))
+        adaptive_candidates = [
+            candidate
+            for candidate in selection.query_plan["candidates"]
+            if candidate["source"] == "adaptive"
+        ]
+        self.assertEqual(len(adaptive_candidates), len(attached_packets))
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in selection.query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["adaptive", "durable"],
         )
 
     def test_build_context_surfaces_environment_reflection_in_durable_and_midterm_context(self) -> None:
@@ -564,7 +1017,17 @@ class LongTermRetrieverTests(unittest.TestCase):
                     "updated_at": datetime(2026, 3, 20, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
                 },
             )()
-            return [entry], ()
+            source_object = type(
+                "Object",
+                (),
+                {
+                    "memory_id": "episode:one",
+                    "slot_key": None,
+                    "value_key": None,
+                    "attributes": {"person_ref": "person:corinna_maier"},
+                },
+            )()
+            return [build_episodic_selection_input(entry=entry, source_object=source_object)], ()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
@@ -600,6 +1063,84 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertEqual(section_calls, [("Hallo",)])
         self.assertEqual(context.episodic_context, "episodic-context")
         self.assertEqual(context.subtext_context, "subtext:1")
+
+    def test_load_context_inputs_carries_episodic_and_adaptive_sources_in_one_unified_plan(self) -> None:
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details='User said: "Corinna called earlier today." Twinr answered: "I can keep that in mind."',
+            source=_source("turn:episode"),
+            status="active",
+            confidence=1.0,
+            attributes={
+                "raw_transcript": "Corinna called earlier today.",
+                "raw_response": "I can keep that in mind.",
+                "person_ref": "person:corinna_maier",
+            },
+        )
+        durable = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +15555551234.",
+            details="Use the mobile number ending in 1234.",
+            source=_source("turn:durable"),
+            status="active",
+            confidence=0.97,
+            confirmed_by_user=True,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555551234",
+            attributes={"person_ref": "person:corinna_maier", "support_count": 3},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(
+                temp_dir,
+                adaptive_policy_builder=LongTermAdaptivePolicyBuilder(),
+            )
+            object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:2",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(episode,),
+                    durable_objects=(durable,),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            context_inputs = retriever._load_context_inputs(
+                query_texts=("What is Corinna's phone number?",),
+                retrieval_text="What is Corinna's phone number?",
+            )
+
+        self.assertEqual(
+            [entry.entry_id for entry in context_inputs.episodic_entries],
+            ["episode:corinna_called"],
+        )
+        self.assertTrue(context_inputs.adaptive_packets)
+        self.assertIsNotNone(context_inputs.unified_query_plan)
+        query_plan = context_inputs.unified_query_plan or {}
+        self.assertEqual(
+            query_plan["selected"]["episodic_entry_ids"],
+            ["episode:corinna_called"],
+        )
+        self.assertEqual(
+            query_plan["selected"]["adaptive_packet_ids"],
+            [packet.packet_id for packet in context_inputs.adaptive_packets],
+        )
+        candidate_sources = {candidate["source"] for candidate in query_plan["candidates"]}
+        self.assertIn("episodic", candidate_sources)
+        self.assertIn("adaptive", candidate_sources)
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["adaptive", "durable", "episodic"],
+        )
 
     def test_build_context_still_attempts_subtext_when_no_episodic_matches_exist(self) -> None:
         subtext_calls: list[tuple[str | None, str, int]] = []
