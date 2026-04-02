@@ -6718,7 +6718,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(printer.printed), 1)
         self.assertIn("button=yellow", lines)
 
-    def test_idle_housekeeping_runs_reserve_nightly_maintenance_after_longterm_proactive(self) -> None:
+    def test_idle_housekeeping_runs_nightly_orchestration_after_longterm_proactive(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
         calls: list[str] = []
         loop._required_remote_dependency_current_ready = lambda: True
@@ -6727,12 +6727,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop._maybe_run_due_automation = lambda: calls.append("automation") or False
         loop._maybe_run_sensor_automation = lambda: calls.append("sensor") or False
         loop._maybe_run_long_term_memory_proactive = lambda: calls.append("longterm") or False
-        loop._maybe_run_display_reserve_nightly_maintenance = lambda: calls.append("reserve") or True
+        loop._maybe_run_nightly_orchestration = lambda: calls.append("nightly") or True
 
         did_work = loop._run_idle_housekeeping_cycle()
 
         self.assertTrue(did_work)
-        self.assertEqual(calls, ["reminder", "automation", "sensor", "longterm", "reserve"])
+        self.assertEqual(calls, ["reminder", "automation", "sensor", "longterm", "nightly"])
 
     def test_button_dispatcher_interrupts_busy_green_turn(self) -> None:
         handled: list[str] = []

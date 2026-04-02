@@ -21,6 +21,7 @@ from typing import Final, Protocol
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality._remote_state_utils import (
+    clone_remote_state_with_capped_read_timeout as _clone_remote_state_with_capped_read_timeout,
     resolve_remote_state as _resolve_remote_state,
 )
 from twinr.agent.personality.intelligence.models import (
@@ -37,6 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 _SUBSCRIPTIONS_SCHEMA_VERSION: Final[int] = 2
 _SUPPORTED_SUBSCRIPTIONS_SCHEMA_VERSIONS: Final[frozenset[int]] = frozenset({1, 2})
 _FUTURE_STATE_ENVELOPE_KEY: Final[str] = "data"
+_OPTIONAL_PROMPT_READ_TIMEOUT_S: Final[float] = 2.0
 
 _DEFAULT_MAX_SUBSCRIPTIONS: Final[int] = 256
 _DEFAULT_MAX_CONTAINER_ITEMS: Final[int] = 512
@@ -483,10 +485,17 @@ class RemoteStateWorldIntelligenceStore:
         resolved = _resolve_remote_state(config=config, remote_state=remote_state)
         if resolved is None:
             return WorldIntelligenceState()
-        current_records = LongTermRemoteCurrentRecordStore(resolved)
+        prompt_remote_state = _clone_remote_state_with_capped_read_timeout(
+            config=config,
+            remote_state=resolved,
+            timeout_s=_OPTIONAL_PROMPT_READ_TIMEOUT_S,
+        )
+        if prompt_remote_state is None:
+            return WorldIntelligenceState()
+        current_records = LongTermRemoteCurrentRecordStore(prompt_remote_state)
         payload = current_records.load_single_payload(snapshot_kind=self.state_snapshot_kind)
         if payload is None:
-            payload = resolved.load_snapshot(snapshot_kind=self.state_snapshot_kind)
+            payload = prompt_remote_state.load_snapshot(snapshot_kind=self.state_snapshot_kind)
         if payload is None:
             return WorldIntelligenceState()
 

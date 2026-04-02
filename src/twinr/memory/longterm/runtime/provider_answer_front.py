@@ -160,12 +160,9 @@ class MaterializedProviderAnswerFront:
         normalized_keys = _normalize_keys(query_keys)
         if not normalized_keys or not self.enabled():
             return None
-        self._remember_sticky_query(normalized_keys=normalized_keys, sticky_query_text=sticky_query_text)
-        record = self.store.save_front(query_keys=normalized_keys, context=context)
-        self._store_cached_record(record)
-        with self._lock:
-            self._generation = max(self._generation, record.generation)
-        return MaterializedProviderAnswerFrontResolution(
+        return self._persist_built_context_sync(
+            query_keys=normalized_keys,
+            sticky_query_text=sticky_query_text,
             context=context,
             source="materialized_built_sync",
         )
@@ -199,16 +196,60 @@ class MaterializedProviderAnswerFront:
                     sticky=sticky,
                 )
                 return False
-            future = self._executor.submit(build_context)
+            future = self._executor.submit(
+                self._build_and_materialize_context,
+                query_keys=normalized_keys,
+                sticky_query_text=sticky_query_text,
+                build_context=build_context,
+            )
             self._inflight[primary_key] = future
             if not sticky:
                 self._speculative_inflight = primary_key
             future.add_done_callback(
-                lambda finished, *, callback_keys=normalized_keys, callback_query=sticky_query_text, callback_sticky=sticky: self._complete_async_build(
+                lambda finished, *, callback_keys=normalized_keys, callback_sticky=sticky: self._complete_async_materialization(
                     query_keys=callback_keys,
-                    sticky_query_text=callback_query,
-                    sticky=callback_sticky,
                     future=finished,
+                    sticky=callback_sticky,
+                )
+            )
+        return True
+
+    def schedule_persist_built_context(
+        self,
+        *,
+        query_keys: Sequence[str],
+        sticky_query_text: str | None,
+        context: LongTermMemoryContext,
+    ) -> bool:
+        """Persist one already-built provider context in the background.
+
+        Compatibility callers may still need to build a broad provider context
+        synchronously. They must not then block the same foreground answer path
+        on the remote current-head write for the materialized live front.
+        """
+
+        normalized_keys = _normalize_keys(query_keys)
+        if not normalized_keys or not self.enabled():
+            return False
+        if self._lookup_cached(normalized_keys) is not None:
+            return False
+        primary_key = normalized_keys[0]
+        self._remember_sticky_query(normalized_keys=normalized_keys, sticky_query_text=sticky_query_text)
+        with self._lock:
+            if primary_key in self._inflight:
+                return False
+            future = self._executor.submit(
+                self._materialize_context,
+                query_keys=normalized_keys,
+                sticky_query_text=sticky_query_text,
+                context=context,
+            )
+            self._inflight[primary_key] = future
+            future.add_done_callback(
+                lambda finished, *, callback_keys=normalized_keys: self._complete_async_materialization(
+                    query_keys=callback_keys,
+                    future=finished,
+                    sticky=True,
                 )
             )
         return True
@@ -240,11 +281,10 @@ class MaterializedProviderAnswerFront:
             build_for_query(query_text)
         return len(recent_queries)
 
-    def _complete_async_build(
+    def _complete_async_materialization(
         self,
         *,
         query_keys: tuple[str, ...],
-        sticky_query_text: str | None,
         sticky: bool,
         future: Future[LongTermMemoryContext],
     ) -> None:
@@ -254,15 +294,9 @@ class MaterializedProviderAnswerFront:
             if not sticky and self._speculative_inflight == primary_key:
                 self._speculative_inflight = None
         try:
-            context = future.result()
+            future.result()
         except Exception:
-            context = None
-        if context is not None:
-            self.persist_built_context(
-                query_keys=query_keys,
-                sticky_query_text=sticky_query_text,
-                context=context,
-            )
+            pass
         pending = None
         with self._lock:
             if self._pending_speculative is not None and self._speculative_inflight is None:
@@ -318,3 +352,56 @@ class MaterializedProviderAnswerFront:
             self._recent_queries.move_to_end(primary_key)
             while len(self._recent_queries) > self._max_sticky_queries:
                 self._recent_queries.popitem(last=False)
+
+    def _build_and_materialize_context(
+        self,
+        *,
+        query_keys: tuple[str, ...],
+        sticky_query_text: str | None,
+        build_context: Callable[[], LongTermMemoryContext],
+    ) -> LongTermMemoryContext:
+        """Build one provider context and persist the materialized front once."""
+
+        context = build_context()
+        return self._materialize_context(
+            query_keys=query_keys,
+            sticky_query_text=sticky_query_text,
+            context=context,
+        )
+
+    def _materialize_context(
+        self,
+        *,
+        query_keys: tuple[str, ...],
+        sticky_query_text: str | None,
+        context: LongTermMemoryContext,
+    ) -> LongTermMemoryContext:
+        """Persist one already-built context and return it for callers/tests."""
+
+        self._persist_built_context_sync(
+            query_keys=query_keys,
+            sticky_query_text=sticky_query_text,
+            context=context,
+            source="materialized_built_async",
+        )
+        return context
+
+    def _persist_built_context_sync(
+        self,
+        *,
+        query_keys: tuple[str, ...],
+        sticky_query_text: str | None,
+        context: LongTermMemoryContext,
+        source: str,
+    ) -> MaterializedProviderAnswerFrontResolution:
+        """Persist one front synchronously and update the local cache state."""
+
+        self._remember_sticky_query(normalized_keys=query_keys, sticky_query_text=sticky_query_text)
+        record = self.store.save_front(query_keys=query_keys, context=context)
+        self._store_cached_record(record)
+        with self._lock:
+            self._generation = max(self._generation, record.generation)
+        return MaterializedProviderAnswerFrontResolution(
+            context=context,
+            source=source,
+        )

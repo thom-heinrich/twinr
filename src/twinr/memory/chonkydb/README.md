@@ -31,6 +31,7 @@ used by Twinr's long-term memory flows.
 - build prompt-context and subtext payloads from persisted graph memory
 - probe graph readiness through the current-view heads so required-remote watchdog recovery does not depend on legacy graph snapshot blobs
 - let fresh-reader bootstrap fall back from a lagging fixed-URI graph head to the already-written small compatibility current-head payload in a strictly read-only way, so cross-process readiness does not reseed or re-promote the whole graph just because direct head visibility lags
+- treat a real fixed-URI graph-head `404` on a fresh empty namespace as a legitimate read-only bootstrap state, and synthesize the canonical empty current-view summary instead of forcing an empty remote seed write during required readiness
 - keep compatible graph current-head fallback on the mutable snapshot URI instead of pinned exact document IDs, so fresh readers do not stick to superseded heads or drag startup through slow full-document recovery
 - treat generic `graph_nodes` / `graph_edges` `catalog/current` payloads as insufficient for current-view readiness unless they also carry the graph generation metadata, and let graph repair writes proceed from a valid local cache even when the advertised current view is broken
 - keep graph current-view `probe` and `load` semantics distinct: metadata-only probes may return `None` for incomplete `graph_edges` heads, but authoritative load paths must still perform the full fixed-URI current-head read before failing closed

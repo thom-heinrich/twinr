@@ -391,6 +391,7 @@ class StructuredStoreActiveDeltaMixin:
                         metadata=metadata,
                         content=content_text,
                         uri=uri,
+                        target_indexes=remote_catalog._searchable_write_target_indexes(),
                         enable_chunking=False,
                         include_insights_in_response=False,
                     )

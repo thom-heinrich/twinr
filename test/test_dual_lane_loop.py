@@ -279,6 +279,53 @@ class DualLaneLoopTests(unittest.TestCase):
             ],
         )
 
+    def test_run_runtime_local_tool_only_propagates_web_search_metadata_from_tool_output(self) -> None:
+        loop = DualLaneToolLoop(
+            supervisor_provider=FakeSupervisorProvider(),
+            specialist_provider=FakeSpecialistProvider(),
+            tool_handlers={
+                "search_live_info": lambda arguments: {
+                    "answer_text": "Drei Punkte aus dem Web",
+                    "used_web_search": True,
+                    "response_id": "resp_search_1",
+                    "request_id": "req_search_1",
+                    "model": "gpt-5.4-mini-2026-03-17",
+                    "token_usage": {"total_tokens": 42},
+                }
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_decision_provider=None,
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run_runtime_local_tool_only(
+            "Was gibt es heute im Web?",
+            decision=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich prüfe kurz das Web.",
+                spoken_reply=None,
+                kind="search",
+                goal="Summarize today's web news.",
+                allow_web_search=True,
+                context_scope="tiny_recent",
+                runtime_tool_name="search_live_info",
+                runtime_tool_arguments={"question": "Was gibt es heute im Web?"},
+                response_id="decision_2",
+                request_id="req_decision_2",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+            emit_filler=True,
+        )
+
+        self.assertEqual(result.text, "Drei Punkte aus dem Web")
+        self.assertTrue(result.used_web_search)
+        self.assertEqual(result.response_id, "resp_search_1")
+        self.assertEqual(result.request_id, "req_search_1")
+        self.assertEqual(result.model, "gpt-5.4-mini-2026-03-17")
+        self.assertEqual(result.token_usage, {"total_tokens": 42})
+
     def test_prefetched_handoff_emits_filler_then_preempting_final_lane(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()

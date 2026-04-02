@@ -662,12 +662,20 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         query: LongTermQueryProfile,
         context: LongTermMemoryContext,
     ) -> None:
-        """Persist one already-built provider context into the live answer front."""
+        """Schedule persistence of one built provider context into the live front.
+
+        The compatibility provider-context path may still build the full
+        retriever result synchronously, but it must not also wait on the remote
+        current-head write for the live materialized front. Live transcript-first
+        prewarms own the authoritative front build; this compatibility path only
+        seeds the same front in the background when no materialized version is
+        ready yet.
+        """
 
         provider_answer_front = getattr(self, "provider_answer_front", None)
         if provider_answer_front is None or not provider_answer_front.enabled():
             return
-        provider_answer_front.persist_built_context(
+        provider_answer_front.schedule_persist_built_context(
             query_keys=self._prepared_context_key_texts(query),
             sticky_query_text=query.original_text or query.retrieval_text,
             context=context,

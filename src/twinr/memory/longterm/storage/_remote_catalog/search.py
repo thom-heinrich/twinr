@@ -269,7 +269,8 @@ class RemoteCatalogSearchMixin:
                 )
                 request_limit = next_limit
             if not scope_search_failed:
-                if allow_catalog_fallback:
+                should_reconcile_scope_hits = bool(selected_payloads) or allow_catalog_fallback
+                if should_reconcile_scope_hits:
                     with workflow_span(
                         name="longterm_remote_catalog_scope_rescue",
                         kind="retrieval",
@@ -289,6 +290,7 @@ class RemoteCatalogSearchMixin:
                             eligible=eligible,
                             selected_entries=tuple(selected_entries),
                             selected_payloads=tuple(selected_payloads),
+                            cached_only=not allow_catalog_fallback,
                         )
                     if rescued is not None:
                         return rescued
@@ -534,6 +536,7 @@ class RemoteCatalogSearchMixin:
                 details=failure_details,
             ) from exc
         selected_payloads: list[dict[str, object]] = []
+        selected_entries: list[LongTermRemoteCatalogEntry] = []
         seen_item_ids: set[str] = set()
         for candidate in candidates:
             entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
@@ -553,9 +556,36 @@ class RemoteCatalogSearchMixin:
                 payload=payload_dict,
             )
             selected_payloads.append(payload_dict)
+            selected_entries.append(entry)
             seen_item_ids.add(entry.item_id)
             if len(selected_payloads) >= bounded_limit:
                 break
+        with workflow_span(
+            name="longterm_remote_catalog_fast_scope_rescue",
+            kind="retrieval",
+            details={
+                **_trace_search_details(
+                    snapshot_kind=snapshot_kind,
+                    query_text=clean_query,
+                    result_limit=bounded_limit,
+                    scope_ref=scope_ref,
+                    namespace=namespace,
+                    catalog_entry_count=0,
+                ),
+                "candidate_limit": bounded_limit,
+            },
+        ):
+            rescued = self._rescue_scope_search_payloads_with_current_catalog(
+                snapshot_kind=snapshot_kind,
+                query_text=clean_query,
+                limit=bounded_limit,
+                eligible=None,
+                selected_entries=tuple(selected_entries),
+                selected_payloads=tuple(selected_payloads),
+                cached_only=True,
+            )
+        if rescued is not None:
+            return rescued
         return tuple(selected_payloads)
 
     def _rescue_scope_search_payloads_with_current_catalog(
@@ -567,10 +597,15 @@ class RemoteCatalogSearchMixin:
         eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None,
         selected_entries: tuple[LongTermRemoteCatalogEntry, ...],
         selected_payloads: tuple[dict[str, object], ...],
+        cached_only: bool = False,
     ) -> tuple[dict[str, object], ...] | None:
         """Reconcile empty/stale scope-search hits against the current catalog head."""
 
-        current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        current_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
+        if current_entries is None:
+            current_entries = self._recent_catalog_entries(snapshot_kind=snapshot_kind)
+        if current_entries is None and not cached_only:
+            current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
         if not current_entries:
             return ()
         current_by_id = {entry.item_id: entry for entry in current_entries}
@@ -814,6 +849,7 @@ class RemoteCatalogSearchMixin:
             },
         )
         last_topk_error: Exception | None = None
+        allowed_indexes = self._selection_search_allowed_indexes()
         topk_context = remote_read_context or LongTermRemoteReadContext(
             snapshot_kind=snapshot_kind,
             operation="topk_search",
@@ -849,6 +885,7 @@ class RemoteCatalogSearchMixin:
                             result_limit=result_limit,
                             include_content=False,
                             include_metadata=True,
+                            allowed_indexes=allowed_indexes,
                             allowed_doc_ids=None if scope_search else allowed_doc_ids,
                             namespace=resolved_namespace,
                             scope_ref=resolved_scope_ref,
@@ -936,6 +973,7 @@ class RemoteCatalogSearchMixin:
                         result_limit=result_limit,
                         include_content=False,
                         include_metadata=True,
+                        allowed_indexes=allowed_indexes,
                         allowed_doc_ids=allowed_doc_ids,
                     )
                 ),

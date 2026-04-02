@@ -494,6 +494,17 @@ class TwinrConfig:
     reminder_max_entries: int = 48
     automation_poll_interval_s: float = 5.0
     automation_max_entries: int = 96
+    nightly_orchestration_enabled: bool = True
+    nightly_orchestration_after_local: str = "00:30"
+    nightly_orchestration_poll_interval_s: float = 300.0
+    nightly_orchestration_flush_timeout_s: float = 15.0
+    nightly_orchestration_state_path: str = "artifacts/stores/ops/nightly_run_state.json"
+    nightly_prepared_digest_path: str = "artifacts/stores/ops/nightly_prepared_digest.json"
+    nightly_consolidation_summary_path: str = "artifacts/stores/ops/nightly_consolidation_summary.json"
+    nightly_digest_reminder_limit: int = 6
+    nightly_digest_headline_limit: int = 5
+    nightly_live_web_augmentation_enabled: bool = True
+    nightly_live_web_query_limit: int = 2
     browser_automation_enabled: bool = False
     browser_automation_workspace_path: str = "browser_automation"
     browser_automation_entry_module: str = "adapter.py"

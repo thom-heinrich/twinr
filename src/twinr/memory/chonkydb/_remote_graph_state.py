@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING
 
 from twinr.agent.workflows.forensics import workflow_event
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.chonkydb.models import (
     ChonkyDBGraphNeighborsRequest,
     ChonkyDBGraphPathRequest,
@@ -175,6 +176,11 @@ class TwinrRemoteGraphState:
         if not self.enabled():
             return None
         return self._current_view_summary(use_probe=True)
+
+    def probe_current_view_for_readiness(self) -> dict[str, object] | None:
+        if not self.enabled():
+            return None
+        return self._current_view_summary(use_probe=True, readiness_mode=True)
 
     def current_view_summary(self) -> dict[str, object] | None:
         if not self.enabled():
@@ -1251,14 +1257,21 @@ class TwinrRemoteGraphState:
             classification="ok",
         )
 
-    def _current_view_summary(self, *, use_probe: bool) -> dict[str, object] | None:
+    def _current_view_summary(
+        self,
+        *,
+        use_probe: bool,
+        readiness_mode: bool = False,
+    ) -> dict[str, object] | None:
         node_head = self._resolve_current_head_payload(
             snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
             use_probe=use_probe,
+            readiness_mode=readiness_mode,
         )
         edge_head = self._resolve_current_head_payload(
             snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND,
             use_probe=use_probe,
+            readiness_mode=readiness_mode,
         )
         if not isinstance(node_head, Mapping) or not isinstance(edge_head, Mapping):
             return None
@@ -1306,7 +1319,13 @@ class TwinrRemoteGraphState:
             return False
         return True
 
-    def _resolve_current_head_payload(self, *, snapshot_kind: str, use_probe: bool) -> dict[str, object] | None:
+    def _resolve_current_head_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        use_probe: bool,
+        readiness_mode: bool = False,
+    ) -> dict[str, object] | None:
         """Resolve one graph head read-only from direct or compatible snapshot state.
 
         Graph readiness/bootstrap only needs the node/edge catalog head
@@ -1321,6 +1340,7 @@ class TwinrRemoteGraphState:
         direct_head = self._read_direct_current_head_payload(
             snapshot_kind=snapshot_kind,
             use_probe=use_probe,
+            readiness_mode=readiness_mode,
         )
         if isinstance(direct_head, Mapping):
             direct_payload = dict(direct_head)
@@ -1377,10 +1397,13 @@ class TwinrRemoteGraphState:
         *,
         snapshot_kind: str,
         use_probe: bool,
+        readiness_mode: bool = False,
     ) -> dict[str, object] | None:
         """Read the fixed-URI current head with probe-vs-load semantics preserved."""
 
         if use_probe:
+            if readiness_mode:
+                return self._probe_direct_current_head_payload_read_only(snapshot_kind=snapshot_kind)
             payload = self._catalog.probe_catalog_payload(snapshot_kind=snapshot_kind)
             return dict(payload) if isinstance(payload, Mapping) else None
         load_head_payload = getattr(self._catalog, "_load_catalog_head_payload", None)
@@ -1388,6 +1411,40 @@ class TwinrRemoteGraphState:
             payload = load_head_payload(snapshot_kind=snapshot_kind, metadata_only=False)
             return dict(payload) if isinstance(payload, Mapping) else None
         payload = self._catalog.load_catalog_payload(snapshot_kind=snapshot_kind)
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def _probe_direct_current_head_payload_read_only(
+        self,
+        *,
+        snapshot_kind: str,
+    ) -> dict[str, object] | None:
+        """Probe one graph current head without upgrading 400s into full reads."""
+
+        remote_state = self.remote_state
+        if remote_state is None:
+            return None
+        read_client = getattr(remote_state, "read_client", None)
+        require_client = getattr(self._catalog, "_require_client", None)
+        if not callable(require_client):
+            return None
+        effective_read_client = require_client(read_client, operation="read")
+        catalog_head_read_client = getattr(self._catalog, "_catalog_head_read_client", None)
+        if callable(catalog_head_read_client):
+            effective_read_client = catalog_head_read_client(read_client=effective_read_client)
+        try:
+            envelope = effective_read_client.fetch_full_document(
+                origin_uri=self._catalog._catalog_head_uri(snapshot_kind=snapshot_kind),
+                include_content=False,
+                max_content_chars=self._catalog._metadata_only_max_content_chars(),
+            )
+        except ChonkyDBError as exc:
+            if int(exc.status_code or 0) == 400:
+                return None
+            raise
+        extract_catalog_payload = getattr(self._catalog, "_extract_catalog_payload_from_document", None)
+        if not callable(extract_catalog_payload):
+            return None
+        payload = extract_catalog_payload(snapshot_kind=snapshot_kind, payload=envelope)
         return dict(payload) if isinstance(payload, Mapping) else None
 
     def _probe_compatible_snapshot_head_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:

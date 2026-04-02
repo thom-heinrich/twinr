@@ -54,6 +54,7 @@ from twinr.orchestrator.contracts import (
     OrchestratorTurnRequest,
     _json_safe,
 )
+from twinr.orchestrator.remote_tool_timeout import DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS
 
 _TransportEventCallback = Callable[[str, dict[str, Any]], Any]
 
@@ -91,7 +92,7 @@ class OrchestratorWebSocketClient:
     _DEFAULT_OPEN_TIMEOUT_SECONDS = 10.0
     _DEFAULT_RECV_TIMEOUT_SECONDS = 90.0
     _DEFAULT_TURN_TIMEOUT_SECONDS = 300.0
-    _DEFAULT_TOOL_TIMEOUT_SECONDS = 60.0
+    _DEFAULT_TOOL_TIMEOUT_SECONDS = DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS
     _DEFAULT_CLOSE_TIMEOUT_SECONDS = 10.0
     _DEFAULT_PING_INTERVAL_SECONDS = 20.0
     _DEFAULT_PING_TIMEOUT_SECONDS = 20.0

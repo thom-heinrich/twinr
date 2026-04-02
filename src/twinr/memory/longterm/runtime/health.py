@@ -230,8 +230,12 @@ class LongTermRemoteHealthProbe:
                 if not result.ready:
                     return result
 
-            graph_probe = getattr(self.graph_store, "probe_remote_current_view", None)
-            graph_load = getattr(self.graph_store, "load_remote_current_view", None)
+            graph_probe = getattr(self.graph_store, "probe_remote_current_view_for_readiness", None)
+            if not callable(graph_probe):
+                graph_probe = getattr(self.graph_store, "probe_remote_current_view", None)
+            graph_load = getattr(self.graph_store, "load_remote_current_view_for_readiness", None)
+            if not callable(graph_load):
+                graph_load = getattr(self.graph_store, "load_remote_current_view", None)
             graph_payload, graph_selected_source = self._resolve_store_payload(
                 probe_getter=graph_probe,
                 load_getter=graph_load,
@@ -261,8 +265,12 @@ class LongTermRemoteHealthProbe:
             if not result.ready:
                 return result
 
-            midterm_probe = getattr(self.midterm_store, "probe_remote_current_head", None)
-            midterm_load = getattr(self.midterm_store, "load_remote_current_head", None)
+            midterm_probe = getattr(self.midterm_store, "probe_remote_current_head_for_readiness", None)
+            if not callable(midterm_probe):
+                midterm_probe = getattr(self.midterm_store, "probe_remote_current_head", None)
+            midterm_load = getattr(self.midterm_store, "load_remote_current_head_for_readiness", None)
+            if not callable(midterm_load):
+                midterm_load = getattr(self.midterm_store, "load_remote_current_head", None)
             midterm_payload, midterm_selected_source = self._resolve_store_payload(
                 probe_getter=midterm_probe,
                 load_getter=midterm_load,
@@ -318,16 +326,36 @@ class LongTermRemoteHealthProbe:
     ) -> LongTermRemoteWarmResult:
         """Probe the object store through its current catalog contract when available."""
 
-        object_probe = getattr(self.object_store, "probe_remote_current_snapshot", None)
-        if callable(object_probe):
+        object_probe = getattr(self.object_store, "probe_remote_current_snapshot_for_readiness", None)
+        if not callable(object_probe):
+            object_probe = getattr(self.object_store, "probe_remote_current_snapshot", None)
+        object_load = getattr(self.object_store, "load_remote_current_snapshot_for_readiness", None)
+        payload = None
+        selected_source = "object_store_current_contract"
+        if callable(object_probe) or callable(object_load):
+            payload, selected_source = self._resolve_store_payload(
+                probe_getter=(
+                    (lambda: object_probe(snapshot_kind=snapshot_kind))
+                    if callable(object_probe)
+                    else None
+                ),
+                load_getter=(
+                    (lambda: object_load(snapshot_kind=snapshot_kind))
+                    if callable(object_load)
+                    else None
+                ),
+                probe_selected_source="object_store_current_contract",
+                load_selected_source="object_store_current_load_contract",
+            )
+        if callable(object_probe) or callable(object_load):
             return self._probe_store_payload(
                 store="object_store",
                 snapshot_kind=snapshot_kind,
-                payload=object_probe(snapshot_kind=snapshot_kind),
+                payload=payload,
                 checked=checked,
                 checks=checks,
                 include_archive=include_archive,
-                selected_source="object_store_current_contract",
+                selected_source=selected_source,
             )
         return self._probe_snapshot(
             store="object_store",

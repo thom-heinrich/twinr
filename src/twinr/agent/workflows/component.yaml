@@ -24,7 +24,7 @@ owned_concerns:
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Bridge structured personality steering cues into concrete follow-up reopen/close decisions
   - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns, with display-first prompts routed into the right-hand reserve lane instead of fullscreen presentation
-  - Trigger one bounded overnight reserve-lane maintenance pass from the idle housekeeping worker so the next local day can start from a reviewed/prepared ambient companion plan
+  - Trigger one bounded overnight orchestration pass from the idle housekeeping worker so the next local day can start from consolidated memory/personality state, prepared morning digest artifacts, and a reviewed/prepared ambient companion plan
   - Produce bounded forensic run packs for live button/session/audio investigation
   - Capture bounded helper-thread snapshots for live dual-lane watchdog and timeout failures
   - Share workflow-local support helpers for feedback tones, reference images, background delivery, and streaming capture
@@ -173,9 +173,20 @@ files:
       - play_startup_boot_sound
       - start_startup_boot_sound
   - path: realtime_runtime/background.py
-    role: Active reminder, automation, and proactive background-delivery mixin, including reserve-lane routing for display-first proactive prompts and the overnight reserve-lane maintenance trigger
+    role: Active reminder, automation, and proactive background-delivery mixin, including reserve-lane routing for display-first proactive prompts and the overnight orchestration trigger
     exports:
       - TwinrRealtimeBackgroundMixin
+  - path: realtime_runtime/nightly.py
+    role: Explicit overnight orchestration for long-term flush/refresh, prepared morning digests, durable run-state artifacts, and reserve-planner delegation
+    exports:
+      - NightlyConsolidationSummary
+      - NightlyConsolidationSummaryStore
+      - NightlyOrchestrationResult
+      - NightlyPreparedDigest
+      - NightlyPreparedDigestStore
+      - NightlyRunState
+      - NightlyRunStateStore
+      - TwinrNightlyOrchestrator
   - path: realtime_runtime/background_delivery.py
     role: Idle-window gate for background speech/display delivery starts
     exports:

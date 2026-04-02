@@ -18,7 +18,7 @@ subpackages.
 - review, correct, and delete learned discovery facts while keeping managed-context and structured-memory commits synchronized
 - write local prompt-context snapshots world-readable (`0644`) so the dedicated remote-memory watchdog can validate them even when the productive runtime itself runs as `root`
 - persist prompt memory plus managed user/personality context remotely as typed current-head/item records rather than treating ChonkyDB as a generic prompt-context blob store
-- let prompt-memory and managed-context readiness reuse a readable legacy/current head or a synthetic empty head before attempting any bootstrap write, so the Pi watchdog stays read-only while proving an empty remote store is healthy
+- let prompt-memory and managed-context readiness reuse a current head or a synthetic empty head in the live prompt path, while keeping legacy-head probes only for explicit seed/migration checks, so the Pi watchdog stays read-only and pointer/blob fallback stays out of first-turn rendering
 - overlap independent prompt/user/personality remote current-head bootstrap reads so required-remote readiness is bounded by the slowest prompt-context check instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
 - keep live long-term recall from blocking on cold query-rewrite misses by returning an immediate fallback profile and filling the rewrite cache asynchronously in the background
@@ -35,7 +35,7 @@ subpackages.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Public memory exports resolved lazily to avoid import-time coupling between prompt-context stores and heavier long-term/graph modules |
-| [context_store.py](./context_store.py) | Prompt and managed-context stores that persist remote current heads plus typed entry records for prompt memory, user context, and personality context, and resolve legacy or synthetic empty heads without blocking readiness on empty-head writes |
+| [context_store.py](./context_store.py) | Prompt and managed-context stores that persist remote current heads plus typed entry records for prompt memory, user context, and personality context; live reads stay current-head-only while seed/migration probes can still inspect legacy heads |
 | [reminders.py](./reminders.py) | Reminder persistence, reservation release, and rendering |
 | [user_discovery.py](./user_discovery.py) | Thin compatibility wrapper that preserves the stable `twinr.memory.user_discovery` import surface while delegating the guided-discovery implementation into focused runtime modules |
 | [user_discovery_impl](./user_discovery_impl/) | Internal package split by concern across discovery catalog/helpers, data models, state persistence, commit routing, selection/presentation logic, and the public service orchestration |

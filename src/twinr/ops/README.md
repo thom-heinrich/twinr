@@ -23,6 +23,9 @@ tools.
 - persist only compact recent-sample summaries in watchdog artifacts so Pi heartbeats stay cheap instead of fsyncing multi-megabyte historical probe payloads every tick
 - keep watchdog attestation tiers explicit so current-only probes stay degraded and only archive-safe probes become green/ready
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, including exact endpoint and request-payload type, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
+- diagnose the public Twinr-facing ChonkyDB URL against the dedicated backend service and its loopback `127.0.0.1:3044` surface so P0 incidents can be repaired without blind backend restarts
+- stabilize the dedicated ChonkyDB host itself when shared-host systemd system units, user-session units, or non-Twinr workers directly wired to `127.0.0.1:3044` reclaim CPU/I/O from Twinr's required backend
+- force-repair unreadable prompt-memory and managed-context `catalog/current` heads on an explicit remote namespace when a broken blank head times out before the normal probe-first repair path can publish the canonical empty head
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - allow the productive runtime supervisor to consume that external watchdog as the long-lived owner, so restarting the supervisor does not cold-reset the watchdog's warm remote state
 - let the productive runtime supervisor self-heal a dead externally managed watchdog owner by requesting the dedicated systemd watchdog unit instead of spawning a second raw watchdog process behind systemd's back
@@ -67,6 +70,9 @@ tools.
 | [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
+| [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend |
+| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that disables known conflicting shared-host system units plus user-session units, protects Twinr from non-Twinr workers pointed at `127.0.0.1:3044`, raises backend CPU/IO priority, and validates public `/instance` recovery without conflating it with stricter current-scope query readiness |
+| [remote_prompt_current_head_repair.py](./remote_prompt_current_head_repair.py) | Operator-facing forced empty-head publisher for prompt-memory, user-context, and personality-context `catalog/current` repair on one explicit remote namespace |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr` and reseeding bootstrap attestation when the owner PID changes |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment, preferring the configured desktop runtime dir for productive root-owned Pi services when needed |
@@ -152,6 +158,9 @@ python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
 python3 hardware/ops/deploy_pi_runtime.py
 python3 hardware/ops/deploy_pi_runtime.py --rollout-service twinr-whatsapp-channel
 python3 hardware/ops/check_pi_openai_env_contract.py --env-file /twinr/.env
+python3 hardware/ops/repair_remote_chonkydb.py --no-restart
+python3 hardware/ops/stabilize_remote_chonkydb_host.py
+python3 hardware/ops/repair_remote_prompt_current_heads.py --namespace twinr_longterm_v1:twinr:a7f1ed265838 --base-url http://127.0.0.1:43044 --force
 python3 hardware/ops/bootstrap_self_coding_pi.py
 PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
 PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptance
@@ -160,6 +169,30 @@ PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptan
 The repo mirror uses `rsync --checksum` on every cycle by default. Only opt
 into `--metadata-only` when you explicitly accept the weaker quick-check plus
 periodic checksum-audit model.
+When the live remote-memory endpoint is unhealthy on the development host, use
+`hardware/ops/repair_remote_chonkydb.py` before restarting anything by hand.
+That command proves whether the public `https://tessairact.com:2149` URL, the
+dedicated backend service, or the backend loopback `127.0.0.1:3044` is the
+actual failing layer and only restarts the backend when the backend itself is
+unhealthy.
+If the backend is up but one prompt `catalog/current` head itself is a broken
+blank document that times out on every read, use
+`hardware/ops/repair_remote_prompt_current_heads.py` with an explicit namespace
+and, when needed, a direct loopback SSH tunnel to `127.0.0.1:3044`. That path
+publishes the canonical empty prompt head directly instead of blocking on the
+already-broken old head.
+If the public endpoint stays up but becomes slow or freeze-prone because the
+dedicated backend host is reclaiming CPU or I/O for unrelated CAIA work, use
+`hardware/ops/stabilize_remote_chonkydb_host.py`. That command touches the
+host-side kill-switches for the worst reoffenders, disables the curated
+conflict-unit set across both systemd system scope and the active `thh`
+user-session scope, quiesces non-Twinr CAIA workers that were explicitly
+rewired onto Twinr's dedicated `127.0.0.1:3044` backend, raises
+`caia-twinr-chonkydb-alt.service` CPU/IO weights to the highest priority, and
+then re-probes the live public `/instance` endpoint.
+That probe is intentionally host-availability focused; use
+`hardware/ops/repair_remote_chonkydb.py` when you need the stricter
+current-scope query-surface contract too.
 After a healing sync, the watchdog also retries one extra sync+verify pass if
 the checksum audit still sees source-managed drift, which absorbs brief
 shared-worktree churn without hiding persistent Pi-side divergence.

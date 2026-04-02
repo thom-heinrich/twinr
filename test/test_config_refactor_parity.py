@@ -50,9 +50,9 @@ _NORMALIZED_ROOT_KEYS = (
     "attention_servo_state_path",
 )
 _EXPECTED_GOLDEN_DIGESTS = {
-    "empty": "fdf9370023466f4bf916e07b3c9dde1ac188de3ad07d0b63cb7ef7bc95ef1bca",
-    "feature_env": "9790e3c584477eac8768caaee4f00ed8213cbffb7b87f2c58048e9fbf501022e",
-    "env_override": "1a7bc448ac4fc10d0b94b8099a705e209ece826b19ee030fec2171069c8e38ef",
+    "empty": "8aa5e6905d0efce91628cb72a7c6585a47147a05c3d97c4fb33c8a0efc2171e2",
+    "feature_env": "a46701dc818e866c070dce8d10915d7a13392eab9157c3f2d3e3042435e61a74",
+    "env_override": "86c22423f4586925a30737a4e58d04168e336d843cd54e93936403cc9af8f015",
 }
 
 

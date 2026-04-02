@@ -60,11 +60,20 @@ class LongTermMemoryServiceReadinessMixin(ServiceMixinBase):
         with self._store_lock:
             with self._cache_remote_probe_reads():
                 if bootstrap:
+                    graph_bootstrap = getattr(self.graph_store, "ensure_remote_snapshot_for_readiness", None)
+                    if not callable(graph_bootstrap):
+                        graph_bootstrap = self.graph_store.ensure_remote_snapshot
+                    object_bootstrap = getattr(self.object_store, "ensure_remote_snapshots_for_readiness", None)
+                    if not callable(object_bootstrap):
+                        object_bootstrap = self.object_store.ensure_remote_snapshots
+                    midterm_bootstrap = getattr(self.midterm_store, "ensure_remote_snapshot_for_readiness", None)
+                    if not callable(midterm_bootstrap):
+                        midterm_bootstrap = self.midterm_store.ensure_remote_snapshot
                     for step_name, callback in (
                         ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
-                        ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
-                        ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
-                        ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
+                        ("graph_store.ensure_remote_snapshot_for_readiness", graph_bootstrap),
+                        ("object_store.ensure_remote_snapshots_for_readiness", object_bootstrap),
+                        ("midterm_store.ensure_remote_snapshot_for_readiness", midterm_bootstrap),
                     ):
                         step_started = time.monotonic()
                         try:

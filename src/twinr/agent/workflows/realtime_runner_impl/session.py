@@ -403,7 +403,7 @@ class TwinrRealtimeSessionMixin:
             return True
         if self._maybe_run_long_term_memory_proactive():
             return True
-        if self._maybe_run_display_reserve_nightly_maintenance():
+        if self._maybe_run_nightly_orchestration():
             return True
         return False
 

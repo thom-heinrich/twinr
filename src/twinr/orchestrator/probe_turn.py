@@ -18,6 +18,8 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.orchestrator.client import OrchestratorWebSocketClient
 from twinr.orchestrator.contracts import OrchestratorClientTurnResult, OrchestratorTurnRequest
+from twinr.orchestrator.local_bridge_target import resolve_local_orchestrator_probe_target
+from twinr.orchestrator.remote_tool_timeout import read_remote_tool_timeout_seconds
 from twinr.providers import build_streaming_provider_bundle
 
 
@@ -317,10 +319,23 @@ def run_orchestrator_probe_turn(
             "Probe tool runtime initialized.",
             tool_handler_count=len(tool_handlers),
         )
+        resolved_target = resolve_local_orchestrator_probe_target(probe_config)
+        emit_line(f"probe_orchestrator_target={resolved_target.url}")
+        if resolved_target.reason:
+            emit_line(f"probe_orchestrator_target_reason={resolved_target.reason}")
+        _safe_record_event(
+            loop,
+            "orchestrator_probe_transport_target",
+            "Resolved websocket target for the orchestrator probe.",
+            orchestrator_target=resolved_target.url,
+            orchestrator_target_rewritten=resolved_target.rewritten,
+            orchestrator_target_reason=resolved_target.reason or "",
+        )
 
         client = OrchestratorWebSocketClient(
-            probe_config.orchestrator_ws_url,
+            resolved_target.url,
             shared_secret=probe_config.orchestrator_shared_secret,
+            tool_timeout_seconds=read_remote_tool_timeout_seconds(),
             require_tls=not bool(getattr(probe_config, "orchestrator_allow_insecure_ws", False)),
         )
         deltas: list[str] = []

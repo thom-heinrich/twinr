@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Iterable, Iterator, Mapping
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb._remote_graph_state import TwinrRemoteGraphState
-from twinr.memory.chonkydb.client import chonkydb_data_path
+from twinr.memory.chonkydb.client import ChonkyDBError, chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.chonkydb.schema import (
     TwinrGraphDocumentV1,
@@ -160,6 +160,14 @@ def _remote_unavailable_error_type():
     return LongTermRemoteUnavailableError
 
 
+def _is_remote_not_found_error(exc: Exception) -> bool:
+    """Return whether one backend exception represents a legitimate missing doc."""
+
+    if isinstance(exc, ChonkyDBError):
+        return int(exc.status_code or 0) == 404
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class TwinrGraphContactOption:
     """Describe one contact option shown during lookup clarification."""
@@ -288,6 +296,32 @@ class TwinrPersonalGraphStore:
                 document = self._empty_document()
             return self._remote_graph.ensure_seeded(document=document)
 
+    def ensure_remote_snapshot_for_readiness(self) -> bool:
+        """Bootstrap graph readiness without forcing a seed for an empty namespace.
+
+        Runtime readiness must stay read-only for a fresh namespace. When the
+        local graph is still effectively empty and the remote graph has never
+        been seeded, accept that state and let the readiness-specific probe/load
+        helpers synthesize the canonical empty current-view summary.
+        """
+
+        if not self._remote_graph.enabled():
+            return False
+        with self._document_lock():
+            document = self._load_local_document_locked()
+            if document is None:
+                current_view = self._remote_graph.current_view_summary()
+                if isinstance(current_view, Mapping):
+                    self._remote_graph.validate_current_view()
+                return False
+            if self._document_is_effectively_empty(document):
+                current_view = self._remote_graph.current_view_summary()
+                if isinstance(current_view, Mapping):
+                    self._remote_graph.validate_current_view()
+                    return False
+                return False
+            return self._remote_graph.ensure_seeded(document=document)
+
     def probe_remote_current_view(self) -> dict[str, object] | None:
         """Probe the remote graph current view without hydrating all node and edge payloads."""
 
@@ -303,6 +337,44 @@ class TwinrPersonalGraphStore:
             return None
         payload = self._remote_graph.current_view_summary()
         return dict(payload) if isinstance(payload, Mapping) else None
+
+    def probe_remote_current_view_for_readiness(self) -> dict[str, object] | None:
+        """Probe the remote graph current view, accepting a fresh empty namespace.
+
+        Runtime readiness should stay read-only. When the namespace has never
+        carried any graph state and the local graph is still effectively empty,
+        expose a synthetic empty current-view summary instead of forcing a seed
+        write during `ensure_remote_ready()`.
+        """
+
+        graph_probe = getattr(self._remote_graph, "probe_current_view_for_readiness", None)
+        try:
+            if callable(graph_probe):
+                payload = graph_probe()
+            else:
+                payload = self.probe_remote_current_view()
+        except Exception as exc:
+            if isinstance(exc, _remote_unavailable_error_type()) or _is_remote_not_found_error(exc):
+                payload = None
+            else:
+                raise
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        return self._synthetic_empty_remote_current_view_summary()
+
+    def load_remote_current_view_for_readiness(self) -> dict[str, object] | None:
+        """Load the remote graph current view, accepting a fresh empty namespace."""
+
+        try:
+            payload = self.load_remote_current_view()
+        except Exception as exc:
+            if isinstance(exc, _remote_unavailable_error_type()) or _is_remote_not_found_error(exc):
+                payload = None
+            else:
+                raise
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        return self._synthetic_empty_remote_current_view_summary()
 
     def query_remote_current_path(
         self,
@@ -1295,6 +1367,59 @@ class TwinrPersonalGraphStore:
             edges=(),
             metadata={"kind": "personal_graph"},
         )
+
+    def _document_is_effectively_empty(self, document: TwinrGraphDocumentV1) -> bool:
+        """Return whether one graph document only contains the canonical user node."""
+
+        if document.edges:
+            return False
+        if len(document.nodes) != 1:
+            return False
+        user_node = document.nodes[0]
+        return bool(
+            user_node.node_id == self.user_node_id
+            and user_node.node_type == "user"
+            and document.subject_node_id == self.user_node_id
+        )
+
+    def _synthetic_empty_remote_current_view_summary(self) -> dict[str, object] | None:
+        """Return a read-only synthetic current-view summary for a fresh namespace."""
+
+        if not self._remote_graph.enabled():
+            return None
+        with self._document_lock():
+            document = self._load_local_document_locked()
+            if document is None:
+                user = TwinrGraphNodeV1(node_id=self.user_node_id, node_type="user", label=self.user_label)
+                document = TwinrGraphDocumentV1(
+                    subject_node_id=self.user_node_id,
+                    graph_id="graph:user_main",
+                    created_at="1970-01-01T00:00:00Z",
+                    updated_at="1970-01-01T00:00:00Z",
+                    nodes=(user,),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                )
+            if not self._document_is_effectively_empty(document):
+                return None
+            serialized = json.dumps(
+                document.to_payload(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            namespace = _normalize_text(getattr(self.remote_state, "namespace", None), limit=120) or "twinr_longterm_v1"
+            topology_index_name = f"twinr_graph_{slugify_identifier(namespace, fallback='namespace')}_bootstrap_empty"
+            return {
+                "generation_id": f"gen_{hashlib.sha1(serialized).hexdigest()[:16]}",
+                "topology_index_name": topology_index_name,
+                "subject_node_id": document.subject_node_id,
+                "graph_id": document.graph_id,
+                "created_at": document.created_at,
+                "updated_at": document.updated_at,
+                "topology_refs": {self.user_node_id: f"bootstrap_empty:{self.user_node_id}"},
+                "synthetic_empty": True,
+            }
 
     def _save_document(
         self,

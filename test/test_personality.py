@@ -46,6 +46,7 @@ class _FakeRemoteState:
             long_term_memory_remote_read_cache_ttl_s=0.0,
         )
         self.snapshots: dict[str, dict[str, object]] = {}
+        self.probe_calls: list[dict[str, object]] = []
 
     def _record_snapshot_access(self, snapshot_kind: str) -> None:
         del snapshot_kind
@@ -57,6 +58,38 @@ class _FakeRemoteState:
             raise self.load_error
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        del local_path, fast_fail
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+            }
+        )
+        if self.load_error is not None:
+            raise self.load_error
+        payload = self.snapshots.get(snapshot_kind)
+        if isinstance(payload, dict) and snapshot_kind == DEFAULT_PERSONALITY_SNAPSHOT_KIND:
+            payload = {
+                "schema": "twinr_agent_personality_snapshot_catalog_v2",
+                "version": 2,
+                "items": [{"item_id": "current"}],
+            }
+        return SimpleNamespace(
+            status="found" if isinstance(payload, dict) else "not_found",
+            payload=dict(payload) if isinstance(payload, dict) else None,
+            detail=None,
+        )
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
@@ -78,11 +111,31 @@ class _CountingRemoteState(_FakeRemoteState):
 
 
 class _FakeCatalogClient:
-    def __init__(self, *, remote_state: _FakeRemoteState) -> None:
+    def __init__(
+        self,
+        *,
+        remote_state: _FakeRemoteState,
+        timeout_s: float = 8.0,
+        clone_timeout_history: list[float] | None = None,
+    ) -> None:
         self._remote_state = remote_state
         self._next_document_id = 1
         self.records_by_document_id: dict[str, dict[str, object]] = {}
         self.records_by_uri: dict[str, dict[str, object]] = {}
+        self.config = SimpleNamespace(timeout_s=timeout_s)
+        self.clone_timeout_history = clone_timeout_history if clone_timeout_history is not None else []
+
+    def clone_with_timeout(self, timeout_s: float):
+        self.clone_timeout_history.append(float(timeout_s))
+        clone = _FakeCatalogClient(
+            remote_state=self._remote_state,
+            timeout_s=float(timeout_s),
+            clone_timeout_history=self.clone_timeout_history,
+        )
+        clone._next_document_id = self._next_document_id
+        clone.records_by_document_id = self.records_by_document_id
+        clone.records_by_uri = self.records_by_uri
+        return clone
 
     def _maybe_raise(self) -> None:
         error = self._remote_state.load_error
@@ -107,6 +160,12 @@ class _FakeCatalogClient:
             uri = record.get("uri")
             if isinstance(uri, str) and uri:
                 self.records_by_uri[uri] = record
+            metadata = record.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("twinr_catalog_current_head") is True:
+                snapshot_kind = metadata.get("twinr_snapshot_kind")
+                payload = metadata.get("twinr_payload")
+                if isinstance(snapshot_kind, str) and snapshot_kind and isinstance(payload, dict):
+                    self._remote_state.snapshots[snapshot_kind] = dict(payload)
             response_items.append({"document_id": document_id})
         return {"items": response_items}
 
@@ -479,6 +538,53 @@ class PersonalityTests(unittest.TestCase):
         self.assertIn("Base user profile", instructions)
         self.assertIn("pets: Thom has two dogs.", instructions)
 
+    def test_load_personality_instructions_caps_optional_prompt_context_remote_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("Base user profile", encoding="utf-8")
+            remote_state = _FakeRemoteState()
+            PersistentMemoryMarkdownStore(
+                state_dir / "MEMORY.md",
+                remote_state=remote_state,
+            ).remember(
+                kind="memory",
+                summary="Corinna Maier is a trusted contact.",
+            )
+            ManagedContextFileStore(
+                personality_dir / "USER.md",
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            ).upsert(
+                category="contact",
+                instruction="Corinna Maier is important.",
+            )
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+            )
+
+            with patch("twinr.memory.longterm.storage.remote_state.LongTermRemoteStateStore.from_config", return_value=remote_state), patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                instructions = load_personality_instructions(config)
+
+        self.assertIsNotNone(instructions)
+        self.assertIn("Corinna Maier is a trusted contact.", instructions)
+        self.assertTrue(remote_state.client.clone_timeout_history)
+        self.assertTrue(all(timeout_s <= 2.0 for timeout_s in remote_state.client.clone_timeout_history))
+        self.assertIn(2.0, remote_state.client.clone_timeout_history)
+
     def test_load_personality_instructions_includes_structured_mindshare_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             personality_dir = Path(tmpdir) / "personality"
@@ -646,11 +752,12 @@ class PersonalityTests(unittest.TestCase):
         self.assertTrue(instructions.startswith('<assistant_context_bundle version="2">'))
         self.assertIn(_section_marker("SYSTEM", "configuration"), instructions)
         self.assertIn("System context", instructions)
-        self.assertNotIn(_section_marker("PERSONALITY", "configuration"), instructions)
-        self.assertNotIn(_section_marker("USER", "context_data"), instructions)
-        self.assertNotIn("Style context", instructions)
-        self.assertNotIn("Base user profile", instructions)
+        self.assertIn(_section_marker("PERSONALITY", "configuration"), instructions)
+        self.assertIn(_section_marker("USER", "context_data"), instructions)
+        self.assertIn("Style context", instructions)
+        self.assertIn("Base user profile", instructions)
         self.assertNotIn("Thom has two dogs.", instructions)
+        self.assertNotIn("Keep answers calm.", instructions)
         self.assertNotIn(_section_marker("REMINDERS", "context_data"), instructions)
         self.assertNotIn(_section_marker("AUTOMATIONS", "context_data"), instructions)
 

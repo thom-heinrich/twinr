@@ -52,3 +52,4 @@ hardware/display/vendor/
 build*/
 cache*/
 .git_guard*
+.tmp_*

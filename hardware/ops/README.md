@@ -21,6 +21,9 @@ instead of treating them as supported operating modes.
 - the development-host LAN bridge that exposes a stable `:8797` websocket port to the Pi while forwarding byte-for-byte into that host-side orchestrator endpoint
 - the Pi-side bootstrap entrypoint for self-coding Codex prerequisites
 - the Pi-side operator script that fail-closes the OpenAI env contract before isolated provider probes
+- the development-host operator script that diagnoses the public ChonkyDB endpoint against the dedicated backend service and only restarts the backend when that backend is the proven failing layer
+- the development-host operator script that stabilizes the dedicated Twinr ChonkyDB host when shared-host system units, user-session units, or non-Twinr workers directly pointed at the dedicated backend reclaim CPU/I/O from it
+- the development-host operator script that force-repairs unreadable prompt-memory and managed-context `catalog/current` heads on one explicit remote namespace when those heads themselves have become unreadable blank documents
 - the development-machine watchdog that mirrors the authoritative repo into `/twinr` without deleting Pi-local runtime state
 - the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, runs the bounded live retention canary, and verifies the Pi acceptance runtime
 
@@ -44,6 +47,9 @@ instead of treating them as supported operating modes.
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
+| [repair_remote_chonkydb.py](./repair_remote_chonkydb.py) | Diagnose the public ChonkyDB URL against the dedicated backend host and optionally repair the backend service without blind restarts |
+| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, stop non-Twinr workers that were pointed at Twinr's dedicated backend, and raise the dedicated Twinr backend CPU/IO priority before re-probing public `/instance` availability |
+| [repair_remote_prompt_current_heads.py](./repair_remote_prompt_current_heads.py) | Force-publish canonical empty prompt-memory / managed-context current heads on one explicit remote namespace when the old heads are unreadable |
 | [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
@@ -111,6 +117,9 @@ sudo systemctl status twinr-web.service
 python3 hardware/ops/install_whatsapp_node_runtime.py
 python3 hardware/ops/bootstrap_self_coding_pi.py
 python3 hardware/ops/check_pi_openai_env_contract.py --env-file /twinr/.env
+python3 hardware/ops/repair_remote_chonkydb.py --no-restart
+python3 hardware/ops/stabilize_remote_chonkydb_host.py
+python3 hardware/ops/repair_remote_prompt_current_heads.py --namespace twinr_longterm_v1:twinr:a7f1ed265838 --base-url http://127.0.0.1:43044 --force
 python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
 ```
 
@@ -129,6 +138,39 @@ That command persists the rolling result to
 `artifacts/stores/ops/non_voice_e2e_acceptance.json` and a per-run report under
 `artifacts/reports/non_voice_e2e_acceptance/`, so deploy-time checks no longer
 depend on manually comparing separate direct/tool/memory probes.
+
+When the development-host remote-memory endpoint itself is unhealthy, use the
+dedicated repair helper before issuing any manual backend restart:
+
+```bash
+python3 hardware/ops/repair_remote_chonkydb.py --no-restart
+python3 hardware/ops/repair_remote_chonkydb.py
+python3 hardware/ops/stabilize_remote_chonkydb_host.py
+```
+
+The first command is diagnose-only. It proves the public
+`https://tessairact.com:2149` URL, the dedicated backend systemd unit on
+`thh1986`, and the backend loopback `127.0.0.1:3044` separately. The second
+command keeps the same diagnosis but is allowed to restart the backend service
+when the backend itself is the failing layer. If the backend loopback is
+already healthy and only the public URL is down, the helper refuses a blind
+backend restart and reports a public-proxy/routing outage instead.
+The third command is for the opposite failure shape: the host is up and the
+public endpoint may still answer, but shared-host boot catch-up or background
+CAIA work has made the dedicated Twinr backend slow or freeze-prone. The
+stabilizer touches the worst kill-switches, disables the curated conflict-unit
+set across both system and active user-session scope, stops proven non-Twinr
+workers that were directly wired to Twinr's dedicated `127.0.0.1:3044`
+backend, raises `caia-twinr-chonkydb-alt.service` CPU/IO priority, and then
+re-probes the public `/instance` endpoint so operators can see whether the host
+slowdown actually cleared. That is intentionally a host-availability proof; if
+you need the stricter current-scope query contract as well, follow with
+`repair_remote_chonkydb.py --no-restart`.
+If the backend stays healthy but prompt-context reads time out on one broken
+blank `catalog/current` document, open an SSH tunnel to the backend loopback
+and run `repair_remote_prompt_current_heads.py` against that explicit namespace.
+That helper publishes the canonical empty prompt head directly instead of
+waiting on the unreadable old head.
 
 Install the development-host orchestrator endpoint plus LAN bridge only on
 the machine that owns the leading repo checkout:

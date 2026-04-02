@@ -22,6 +22,29 @@ from .shared import (
 
 
 class RemoteCatalogCatalogMixin:
+    def probe_catalog_payload_result(
+        self,
+        *,
+        snapshot_kind: str,
+    ) -> tuple[str, dict[str, object] | None]:
+        """Probe one fixed current head and preserve missing-vs-invalid status.
+
+        Callers that bootstrap or repair remote state need to distinguish a
+        fresh missing current head from an already-existing but malformed head.
+        The latter should trigger a repair write instead of being treated as a
+        harmless empty namespace forever.
+        """
+
+        result = self._load_catalog_head_result(snapshot_kind=snapshot_kind, metadata_only=True)
+        if isinstance(result.payload, Mapping):
+            payload = dict(result.payload)
+            self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=payload)
+            return result.status, payload
+        cached = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+        if isinstance(cached, Mapping):
+            return "found", dict(cached)
+        return result.status, None
+
     def load_catalog_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:
         """Load the authoritative current catalog payload for one collection."""
 
@@ -37,13 +60,9 @@ class RemoteCatalogCatalogMixin:
     def probe_catalog_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:
         """Probe the fixed-URI current head document without falling back to snapshots."""
 
-        payload = self._load_catalog_head_payload(snapshot_kind=snapshot_kind, metadata_only=True)
+        _status, payload = self.probe_catalog_payload_result(snapshot_kind=snapshot_kind)
         if isinstance(payload, Mapping):
-            self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=payload)
             return dict(payload)
-        cached = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
-        if isinstance(cached, Mapping):
-            return dict(cached)
         return None
 
     def _recent_catalog_head_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:

@@ -25,6 +25,7 @@ from twinr.memory.longterm.evaluation.live_memory_acceptance import (
 from twinr.memory.longterm.evaluation.live_midterm_acceptance import _normalize_base_project_root
 from twinr.orchestrator.probe_turn import (
     OrchestratorProbeStageResult,
+    OrchestratorProbeTurnOutcome,
     run_orchestrator_probe_turn,
 )
 from twinr.providers.openai import OpenAIBackend
@@ -225,10 +226,7 @@ def write_non_voice_acceptance_artifacts(
     report_dir = default_non_voice_acceptance_report_dir(project_root)
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"{result.run_id}.json"
-    payload = result.to_dict()
-    _atomic_write_json(artifact_path, payload)
-    _atomic_write_json(report_path, payload)
-    return NonVoiceAcceptanceResult(
+    persisted = NonVoiceAcceptanceResult(
         run_id=result.run_id,
         status=result.status,
         started_at=result.started_at,
@@ -241,6 +239,10 @@ def write_non_voice_acceptance_artifacts(
         artifact_path=str(artifact_path),
         report_path=str(report_path),
     )
+    payload = persisted.to_dict()
+    _atomic_write_json(artifact_path, payload)
+    _atomic_write_json(report_path, payload)
+    return persisted
 
 
 def _probe_case(
@@ -261,6 +263,25 @@ def _probe_case(
         lines.append(str(line))
         emit_line(f"{case_id}:{line}")
 
+    def _validated_status(outcome: OrchestratorProbeTurnOutcome) -> tuple[str, str | None]:
+        if any(item.status != "ok" for item in outcome.stage_results if item.stage in {"websocket_turn", "cleanup_complete"}):
+            return "failed", "Probe stages did not complete cleanly."
+        if mode != "tool":
+            return "ok", None
+
+        tool_stages = tuple(item for item in outcome.stage_results if item.stage == "tool_call")
+        if not tool_stages:
+            return "failed", "Tool case finished without any tool_call stage."
+        if any(item.status != "ok" for item in tool_stages):
+            return "failed", "Tool case executed a tool_call stage with an error status."
+        used_web_search_attested = bool(outcome.result.used_web_search) or any(
+            line.strip() == f"{case_id}:search_used_web_search=true" or line.strip() == "search_used_web_search=true"
+            for line in lines
+        )
+        if not used_web_search_attested:
+            return "failed", "Tool case did not attest live web usage."
+        return "ok", None
+
     try:
         outcome = run_orchestrator_probe_turn(
             config=config,
@@ -269,12 +290,14 @@ def _probe_case(
             prompt=prompt,
             emit_line=_emit_case_line,
         )
+        status, error_message = _validated_status(outcome)
         return NonVoiceAcceptanceCaseResult(
             case_id=case_id,
             mode=mode,
             prompt=prompt,
-            status="ok",
+            status=status,
             response_text=outcome.result.text,
+            error_message=error_message,
             used_web_search=outcome.result.used_web_search,
             rounds=outcome.result.rounds,
             model=outcome.result.model,

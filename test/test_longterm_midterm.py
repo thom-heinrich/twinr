@@ -482,6 +482,30 @@ class LongTermMidtermTests(unittest.TestCase):
             remote_state.client.records_by_uri,
         )
 
+    def test_midterm_readiness_bootstrap_keeps_fresh_required_namespace_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot_for_readiness()
+            remote_head = store.probe_remote_current_head_for_readiness()
+
+        self.assertFalse(created)
+        self.assertIsNotNone(remote_head)
+        assert remote_head is not None
+        self.assertEqual(remote_head["schema"], "twinr_memory_midterm_store")
+        self.assertEqual(remote_head["packets"], [])
+        self.assertEqual(remote_head["written_at"], "1970-01-01T00:00:00+00:00")
+        self.assertNotIn("midterm", remote_state.snapshots)
+        self.assertFalse(
+            any(uri.endswith("/midterm/catalog/current") for uri in remote_state.client.records_by_uri),
+            remote_state.client.records_by_uri,
+        )
+
     def test_ensure_remote_snapshot_uses_compatible_current_head_when_direct_head_lags(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()

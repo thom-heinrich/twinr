@@ -9,6 +9,7 @@ finishes.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Sequence
@@ -675,6 +676,7 @@ class DualLaneToolLoop:
             )
             raise
         _raise_if_should_stop(should_stop, context="runtime_local_tool_after_handler")
+        tool_output_mapping = tool_output if isinstance(tool_output, Mapping) else {}
 
         final_text = _runtime_local_tool_reply_text(tool_output) or spoken_ack
         if final_text and (on_text_delta is not None or on_lane_text_delta is not None):
@@ -717,11 +719,11 @@ class DualLaneToolLoop:
                     serialized_output=_safe_json_dumps(tool_output),
                 ),
             ),
-            response_id=getattr(decision, "response_id", None),
-            request_id=getattr(decision, "request_id", None),
-            model=getattr(decision, "model", None),
-            token_usage=getattr(decision, "token_usage", None),
-            used_web_search=False,
+            response_id=_strip_text(tool_output_mapping.get("response_id")) or getattr(decision, "response_id", None),
+            request_id=_strip_text(tool_output_mapping.get("request_id")) or getattr(decision, "request_id", None),
+            model=_strip_text(tool_output_mapping.get("model")) or getattr(decision, "model", None),
+            token_usage=tool_output_mapping.get("token_usage", getattr(decision, "token_usage", None)),
+            used_web_search=bool(tool_output_mapping.get("used_web_search", False)),
         )
 
     def run(

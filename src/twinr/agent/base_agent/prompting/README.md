@@ -13,6 +13,7 @@ workflow, and conversation callers use when they need ordered instruction string
 - resolve runtime-owned memory/reminder/automation store paths against `config.project_root` before loading file-backed context
 - keep the fast supervisor bundle semantically lean: stable character/style stays available there, but volatile dynamic layers such as `MINDSHARE`, `CONTINUITY`, `PLACE`, `WORLD`, and `REFLECTION` stay out of that routing lane
 - cache rendered instruction bundles against local source signatures so steady-state Pi turns do not re-fetch unchanged prompt context from remote storage on every turn
+- cap optional prompt-memory and managed-context remote reads to a small prompt-time timeout so slow ChonkyDB spikes do not stall first host/Pi text turns on non-authoritative prompt decorations
 - turn ordered sections into model-facing instruction strings
 - keep turn-controller lane instructions separate from provider-owned tool-loop base instructions so that lane-specific evaluators do not accidentally prepend the same base bundle twice
 - keep the conversation-closure loader lean by reading only the dedicated closure-controller instruction file instead of the full tool-loop bundle

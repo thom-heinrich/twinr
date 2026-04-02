@@ -367,6 +367,69 @@ def _instance_component_error_payload(
     return payload
 
 
+def _recover_instance_system_stats_timeout(
+    *,
+    service: Any,
+    payload: Any,
+) -> Any:
+    if not isinstance(payload, Mapping):
+        return payload
+    if payload.get("success") is not False:
+        return payload
+    if str(payload.get("component") or "").strip() != "system_stats":
+        return payload
+    if str(payload.get("error_type") or "").strip() != "TimeoutError":
+        return payload
+
+    process_cache = getattr(admin_router, "_STATS_CACHE", None)
+    strip_ephemeral = getattr(admin_router, "_strip_stats_cache_ephemeral", None)
+    if callable(strip_ephemeral):
+        with_payload = strip_ephemeral(process_cache)
+    elif isinstance(process_cache, Mapping):
+        with_payload = dict(process_cache)
+    else:
+        with_payload = None
+    if isinstance(with_payload, Mapping) and bool(with_payload.get("success")):
+        recovered = dict(with_payload)
+        recovered.setdefault("stats_cache_stale", True)
+        recovered.setdefault("stats_cache_source", "process")
+        _LOGGER.warning(
+            "instance_overview recovered timed out system_stats via process cache"
+        )
+        return recovered
+
+    build_bootstrap = getattr(admin_router, "_build_bootstrap_system_stats_payload", None)
+    if callable(build_bootstrap):
+        try:
+            bootstrap_payload = build_bootstrap(
+                service,
+                reason="instance_component_timeout",
+            )
+        except Exception:
+            bootstrap_payload = None
+        if isinstance(bootstrap_payload, Mapping) and bool(
+            bootstrap_payload.get("success")
+        ):
+            _LOGGER.warning(
+                "instance_overview recovered timed out system_stats via bootstrap cache"
+            )
+            return dict(bootstrap_payload)
+    return payload
+
+
+def _best_effort_instance_system_stats_snapshot() -> Optional[Dict[str, Any]]:
+    snapshot_reader = getattr(admin_router, "_best_effort_system_stats_snapshot", None)
+    if not callable(snapshot_reader):
+        return None
+    try:
+        snapshot = snapshot_reader()
+    except Exception:
+        return None
+    if not isinstance(snapshot, Mapping):
+        return None
+    return dict(snapshot)
+
+
 async def _await_instance_component(
     component: str,
     awaitable: Any,
@@ -1761,7 +1824,11 @@ def _is_cacheable_twinr_document_payload(payload: Mapping[str, Any]) -> bool:
     if schema == _TWINR_REMOTE_SNAPSHOT_SCHEMA or schema == _TWINR_SNAPSHOT_POINTER_SCHEMA:
         return True
     return any(
-        schema == definition["segment_schema"]
+        schema in {
+            definition["catalog_schema"],
+            definition["legacy_catalog_schema"],
+            definition["segment_schema"],
+        }
         for definition in _TWINR_LONGTERM_SCOPE_DEFINITIONS.values()
     )
 
@@ -2273,56 +2340,9 @@ def _load_scope_document_payload_blob_fastpath(
     metadata_value: Optional[Mapping[str, Any]] = None
     content: Optional[str] = None
     source = ""
-    miss_reason = "component_text_missing"
+    miss_reason = "payload_blob_decoder_missing"
 
-    if callable(read_payload_components):
-        try:
-            metadata_candidate, content_candidate = read_payload_components(
-                dm=dm,
-                router=router,
-                doc_int=int(doc_int),
-                include_content=True,
-                content_mode="full",
-                content_char_limit=None,
-            )
-        except Exception:
-            metadata_candidate, content_candidate = {}, ""
-        component_payload_mapping = _cacheable_twinr_payload_from_content_text(
-            content_candidate
-        )
-        if component_payload_mapping is not None:
-            payload_mapping = component_payload_mapping
-            metadata_value = (
-                dict(metadata_candidate)
-                if isinstance(metadata_candidate, Mapping)
-                else None
-            )
-            content = str(content_candidate or "")
-            source = "component_text"
-        else:
-            miss_reason = (
-                "component_text_not_cacheable"
-                if _normalize_optional_text(content_candidate) is not None
-                else "component_text_missing"
-            )
-
-    if payload_mapping is None:
-        if not callable(decode_payload):
-            elapsed_s = max(0.0, time.perf_counter() - started_at)
-            _LOGGER.info(
-                "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
-                "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
-                scope_phase or "",
-                scope_ref or "",
-                namespace or "",
-                snapshot_kind or "",
-                document_id,
-                origin_uri or "",
-                int(doc_int),
-                "payload_blob_decoder_missing",
-                elapsed_s,
-            )
-            return None
+    if callable(decode_payload):
         try:
             raw_payload = read_document_data(
                 int(doc_int),
@@ -2350,77 +2370,77 @@ def _load_scope_document_payload_blob_fastpath(
         except Exception:
             raw_payload = None
         if raw_payload is None:
-            elapsed_s = max(0.0, time.perf_counter() - started_at)
-            _LOGGER.info(
-                "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
-                "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
-                scope_phase or "",
-                scope_ref or "",
-                namespace or "",
-                snapshot_kind or "",
-                document_id,
-                origin_uri or "",
-                int(doc_int),
-                "payload_blob_missing",
-                elapsed_s,
-            )
-            return None
+            miss_reason = "payload_blob_missing"
+        else:
+            try:
+                decoded = decode_payload(raw_payload)
+            except Exception:
+                miss_reason = "payload_blob_decode_error"
+            else:
+                payload_mapping = _normalize_payload_blob_mapping(decoded)
+                if payload_mapping is None or not _is_cacheable_twinr_document_payload(
+                    payload_mapping
+                ):
+                    payload_mapping = None
+                    miss_reason = "payload_blob_not_cacheable"
+                else:
+                    try:
+                        content = json.dumps(payload_mapping, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        payload_mapping = None
+                        miss_reason = "payload_blob_serialize_error"
+                    else:
+                        source = "payload_blob"
 
+    if payload_mapping is None and callable(read_payload_components):
         try:
-            decoded = decode_payload(raw_payload)
+            # Keep the component-text fallback inside the same scope-phase cap
+            # as the external document contract to avoid unbounded lock-holding reads.
+            metadata_candidate, content_candidate = read_payload_components(
+                dm=dm,
+                router=router,
+                doc_int=int(doc_int),
+                include_content=True,
+                content_mode="full",
+                content_char_limit=int(max_content_chars),
+            )
         except Exception:
-            elapsed_s = max(0.0, time.perf_counter() - started_at)
-            _LOGGER.info(
-                "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
-                "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
-                scope_phase or "",
-                scope_ref or "",
-                namespace or "",
-                snapshot_kind or "",
-                document_id,
-                origin_uri or "",
-                int(doc_int),
-                "payload_blob_decode_error",
-                elapsed_s,
+            metadata_candidate, content_candidate = {}, ""
+        component_payload_mapping = _cacheable_twinr_payload_from_content_text(
+            content_candidate
+        )
+        if component_payload_mapping is not None:
+            payload_mapping = component_payload_mapping
+            metadata_value = (
+                dict(metadata_candidate)
+                if isinstance(metadata_candidate, Mapping)
+                else None
             )
-            return None
-        payload_mapping = _normalize_payload_blob_mapping(decoded)
-        if payload_mapping is None or not _is_cacheable_twinr_document_payload(payload_mapping):
-            miss_reason = "payload_blob_not_cacheable"
-            elapsed_s = max(0.0, time.perf_counter() - started_at)
-            _LOGGER.info(
-                "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
-                "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
-                scope_phase or "",
-                scope_ref or "",
-                namespace or "",
-                snapshot_kind or "",
-                document_id,
-                origin_uri or "",
-                int(doc_int),
-                miss_reason,
-                elapsed_s,
+            content = str(content_candidate or "")
+            source = "component_text"
+        else:
+            miss_reason = (
+                "component_text_not_cacheable"
+                if _normalize_optional_text(content_candidate) is not None
+                else "component_text_missing"
             )
-            return None
-        try:
-            content = json.dumps(payload_mapping, ensure_ascii=False)
-        except (TypeError, ValueError):
-            elapsed_s = max(0.0, time.perf_counter() - started_at)
-            _LOGGER.info(
-                "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
-                "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
-                scope_phase or "",
-                scope_ref or "",
-                namespace or "",
-                snapshot_kind or "",
-                document_id,
-                origin_uri or "",
-                int(doc_int),
-                "payload_blob_serialize_error",
-                elapsed_s,
-            )
-            return None
-        source = "payload_blob"
+
+    if payload_mapping is None:
+        elapsed_s = max(0.0, time.perf_counter() - started_at)
+        _LOGGER.info(
+            "scope_document_payload_blob_fastpath_miss phase=%s scope_ref=%s namespace=%s snapshot_kind=%s "
+            "document_id=%s origin_uri=%s doc_id_int=%s reason=%s elapsed_s=%.6f",
+            scope_phase or "",
+            scope_ref or "",
+            namespace or "",
+            snapshot_kind or "",
+            document_id,
+            origin_uri or "",
+            int(doc_int),
+            miss_reason,
+            elapsed_s,
+        )
+        return None
 
     if metadata_value is None:
         payload_metadata = payload_mapping.get("metadata")
@@ -2447,6 +2467,22 @@ def _load_scope_document_payload_blob_fastpath(
         document["origin_uri"] = resolved_origin_uri
     if isinstance(metadata_value, Mapping):
         document["metadata"] = dict(metadata_value)
+    chunk_payload: Dict[str, Any] = {
+        "payload_id": str(document_id),
+        "document_id": str(document_id),
+        "content": str(content),
+    }
+    try:
+        chunk_payload["doc_id_int"] = int(doc_int)
+        chunk_payload["chonky_id"] = str(int(doc_int))
+    except Exception:
+        pass
+    if resolved_origin_uri is not None:
+        chunk_payload["origin_uri"] = resolved_origin_uri
+    if isinstance(metadata_value, Mapping):
+        chunk_payload["metadata"] = dict(metadata_value)
+    document["chunk_count"] = 1
+    document["chunks"] = [chunk_payload]
 
     elapsed_s = max(0.0, time.perf_counter() - started_at)
     if elapsed_s >= _scope_document_slow_threshold_s():
@@ -3192,10 +3228,24 @@ async def _materialize_topk_results(
     service: Any,
     *,
     hits: List[Mapping[str, Any]],
+    include_content: bool,
+    include_metadata: bool,
 ) -> List[Dict[str, Any]]:
-    payload_loader = _build_topk_payload_blob_loader(service)
+    include_payload = bool(include_content or include_metadata)
+    payload_loader = (
+        _build_topk_payload_blob_loader(service)
+        if bool(include_content)
+        else None
+    )
     if payload_loader is None:
-        return [_materialize_topk_result(hit) for hit in hits]
+        return [
+            _materialize_topk_result(
+                hit,
+                include_payload=include_payload,
+                include_metadata=include_metadata,
+            )
+            for hit in hits
+        ]
 
     try:
         max_concurrency = int(
@@ -3218,6 +3268,8 @@ async def _materialize_topk_results(
             hit,
             payload_override=payload,
             payload_source_override=payload_source,
+            include_payload=include_payload,
+            include_metadata=include_metadata,
         )
 
     return list(await asyncio.gather(*(_one(hit) for hit in hits)))
@@ -3228,11 +3280,19 @@ def _materialize_topk_result(
     *,
     payload_override: Optional[Dict[str, Any]] = None,
     payload_source_override: Optional[str] = None,
+    include_payload: bool = True,
+    include_metadata: bool = True,
 ) -> Dict[str, Any]:
-    payload, payload_source = _extract_topk_payload(hit)
-    if payload_override is not None:
+    payload: Optional[Dict[str, Any]]
+    payload_source: Optional[str]
+    if include_payload:
+        payload, payload_source = _extract_topk_payload(hit)
+    else:
+        payload, payload_source = None, None
+    if include_payload and payload_override is not None:
         payload = dict(payload_override)
         payload_source = payload_source_override or payload_source or "override"
+    metadata = _copy_optional_mapping(hit.get("metadata")) if include_metadata else None
     result = _drop_none_top_level(
         {
             "payload_id": str(hit.get("payload_id") or hit.get("document_id") or "").strip() or None,
@@ -3243,7 +3303,7 @@ def _materialize_topk_result(
             "candidate_origin": hit.get("candidate_origin"),
             "payload_source": payload_source,
             "payload": payload,
-            "metadata": _copy_optional_mapping(hit.get("metadata")),
+            "metadata": metadata,
             "score_breakdown": _copy_optional_mapping(hit.get("score_breakdown")),
         }
     )
@@ -3270,15 +3330,8 @@ def _topk_query_plan(query_result: Mapping[str, Any]) -> Optional[Dict[str, Any]
 async def instance_overview(request: Request):
     service = _get_svc(request)
     component_timeout_s = _instance_component_timeout_s()
-    stats, indexes, metrics = await asyncio.gather(
-        _await_instance_component(
-            "system_stats",
-            admin_router._cached_system_stats_payload(
-                service,
-                timeout_seconds=component_timeout_s,
-            ),
-            timeout_seconds=component_timeout_s,
-        ),
+    stats = _best_effort_instance_system_stats_snapshot()
+    indexes, metrics = await asyncio.gather(
         _await_instance_component(
             "indexes",
             _call_service(service, "list_available_indexes"),
@@ -3290,6 +3343,16 @@ async def instance_overview(request: Request):
             timeout_seconds=component_timeout_s,
         ),
     )
+    if stats is None:
+        stats = await _await_instance_component(
+            "system_stats",
+            admin_router._cached_system_stats_payload(
+                service,
+                timeout_seconds=component_timeout_s,
+            ),
+            timeout_seconds=component_timeout_s,
+        )
+        stats = _recover_instance_system_stats_timeout(service=service, payload=stats)
 
     ready_event = getattr(
         getattr(request.app, "state", None), "_warmup_ready_event", None
@@ -3875,7 +3938,12 @@ async def retrieve_topk_records(request: Request, req: ExternalTopKRecordsReques
         if isinstance(raw_results, list)
         else []
     )
-    materialized_hits = await _materialize_topk_results(service, hits=hits)
+    materialized_hits = await _materialize_topk_results(
+        service,
+        hits=hits,
+        include_content=bool(req.include_content),
+        include_metadata=bool(req.include_metadata),
+    )
     query_plan = _topk_query_plan(out)
     if scope_resolve_latency_ms is not None:
         query_plan = dict(query_plan or {})

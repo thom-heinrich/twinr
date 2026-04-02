@@ -438,6 +438,7 @@ class RemoteCatalogDocumentMixin:
         remote_state = self._require_remote_state()
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        allowed_indexes = self._selection_hydration_allowed_indexes()
         workflow_decision(
             msg="longterm_remote_catalog_batch_api",
             question="Which remote API contract should hydrate the selected document-id batch?",
@@ -494,6 +495,7 @@ class RemoteCatalogDocumentMixin:
                             result_limit=len(batch),
                             include_content=False,
                             include_metadata=True,
+                            allowed_indexes=allowed_indexes,
                             allowed_doc_ids=batch,
                         )
                     ),
@@ -583,6 +585,7 @@ class RemoteCatalogDocumentMixin:
                         result_limit=len(batch),
                         include_content=False,
                         include_metadata=True,
+                        allowed_indexes=allowed_indexes,
                         allowed_doc_ids=batch,
                     )
                 ),

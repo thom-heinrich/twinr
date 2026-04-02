@@ -139,6 +139,22 @@ Do not repoint Twinr directly to `thh1986.ddns.net:3044` unless the public
 proxy/routing contract has deliberately changed and the Pi/runtime config has
 been updated together.
 
+For P0 operator recovery on the development host, Twinr now ships a dedicated
+repair helper:
+
+```bash
+python3 hardware/ops/repair_remote_chonkydb.py --no-restart
+python3 hardware/ops/repair_remote_chonkydb.py
+```
+
+It probes the public `https://tessairact.com:2149` URL, the dedicated backend
+systemd unit on `thh1986`, and the backend loopback
+`http://127.0.0.1:3044/v1/external/instance` separately. The helper only
+restarts the backend when the backend itself is unhealthy; if the backend
+loopback is already healthy and only the public URL is down, it reports that
+as a public proxy/routing outage instead of causing extra downtime with a blind
+restart.
+
 In `remote_primary` mode:
 
 - ChonkyDB is the primary long-term source of truth.

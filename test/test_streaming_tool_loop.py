@@ -103,6 +103,33 @@ class ToolCallingStreamingLoopTests(unittest.TestCase):
             ["Ich prüfe das. ", "Der Bus fährt um 07:30 Uhr."],
         )
 
+    def test_result_marks_web_search_when_tool_output_attests_it(self) -> None:
+        class _FalseFinalSearchProvider(FakeToolCallingProvider):
+            def continue_turn_streaming(self, **kwargs) -> ToolCallingTurnResponse:
+                del kwargs
+                return ToolCallingTurnResponse(
+                    text="Hier ist die Zusammenfassung.",
+                    response_id="resp_continue_1",
+                    used_web_search=False,
+                )
+
+        provider = _FalseFinalSearchProvider()
+        loop = ToolCallingStreamingLoop(
+            provider,
+            tool_handlers={
+                "search_live_info": lambda arguments: {
+                    "status": "ok",
+                    "answer": arguments["question"],
+                    "used_web_search": True,
+                }
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+        )
+
+        result = loop.run("Was gibt es heute im Web?")
+
+        self.assertTrue(result.used_web_search)
+
     def test_handler_can_opt_in_to_full_tool_call_object(self) -> None:
         provider = FakeToolCallingProvider()
         seen_call_ids: list[str] = []

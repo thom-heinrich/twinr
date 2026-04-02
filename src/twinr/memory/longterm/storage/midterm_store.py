@@ -292,6 +292,22 @@ class LongTermMidtermStore:
         )
         return self._remote_midterm.ensure_seeded(packets=local_packets)
 
+    def ensure_remote_snapshot_for_readiness(self) -> bool:
+        """Bootstrap remote midterm state without seeding an empty fresh namespace."""
+
+        if not self._remote_midterm.enabled():
+            return False
+        local_packets = self._load_packets_from_payload(
+            self._load_local_payload(),
+            source=str(self.packets_path),
+        )
+        if local_packets:
+            return self._remote_midterm.ensure_seeded(packets=local_packets)
+        current_head = self._remote_midterm.current_head_payload()
+        if isinstance(current_head, Mapping):
+            return False
+        return False
+
     def probe_remote_current_head(self) -> dict[str, object] | None:
         """Probe the fixed-URI remote midterm current head without hydrating packets."""
 
@@ -307,6 +323,22 @@ class LongTermMidtermStore:
             return None
         payload = self._remote_midterm.current_head_payload()
         return dict(payload) if isinstance(payload, Mapping) else None
+
+    def probe_remote_current_head_for_readiness(self) -> dict[str, object] | None:
+        """Probe the remote midterm current head, accepting a fresh empty namespace."""
+
+        payload = self.probe_remote_current_head()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        return self._synthetic_empty_current_head_for_readiness()
+
+    def load_remote_current_head_for_readiness(self) -> dict[str, object] | None:
+        """Load the remote midterm current head, accepting a fresh empty namespace."""
+
+        payload = self.load_remote_current_head()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        return self._synthetic_empty_current_head_for_readiness()
 
     def remote_current_packet_ids(self) -> tuple[str, ...]:
         """Return packet ids currently referenced by the remote midterm head."""
@@ -362,6 +394,20 @@ class LongTermMidtermStore:
             "version": _MIDTERM_STORE_VERSION,
             "packets": [],
         }
+
+    def _synthetic_empty_current_head_for_readiness(self) -> dict[str, object] | None:
+        """Return one read-only empty current-head payload for fresh namespaces."""
+
+        local_payload = self._load_local_payload()
+        local_packets = self._load_packets_from_payload(local_payload, source=str(self.packets_path))
+        if local_packets:
+            return None
+        if isinstance(local_payload, Mapping):
+            return dict(local_payload)
+        return self._payload_from_packets(
+            packets=(),
+            written_at="1970-01-01T00:00:00+00:00",
+        )
 
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
         """Persist the midterm packets emitted by one reflection result."""

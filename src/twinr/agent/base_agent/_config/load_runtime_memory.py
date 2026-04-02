@@ -349,6 +349,56 @@ def load_runtime_memory_config(context: ConfigLoadContext) -> dict[str, object]:
         "automation_max_entries": int(
             get_value("TWINR_AUTOMATION_MAX_ENTRIES", "96") or "96"
         ),
+        "nightly_orchestration_enabled": _parse_bool(
+            get_value("TWINR_NIGHTLY_ORCHESTRATION_ENABLED"), True
+        ),
+        "nightly_orchestration_after_local": get_value(
+            "TWINR_NIGHTLY_ORCHESTRATION_AFTER_LOCAL",
+            "00:30",
+        )
+        or "00:30",
+        "nightly_orchestration_poll_interval_s": _parse_float(
+            get_value("TWINR_NIGHTLY_ORCHESTRATION_POLL_INTERVAL_S"),
+            300.0,
+            minimum=30.0,
+        ),
+        "nightly_orchestration_flush_timeout_s": _parse_float(
+            get_value("TWINR_NIGHTLY_ORCHESTRATION_FLUSH_TIMEOUT_S"),
+            15.0,
+            minimum=1.0,
+            maximum=300.0,
+        ),
+        "nightly_orchestration_state_path": get_value(
+            "TWINR_NIGHTLY_ORCHESTRATION_STATE_PATH",
+            "artifacts/stores/ops/nightly_run_state.json",
+        )
+        or "artifacts/stores/ops/nightly_run_state.json",
+        "nightly_prepared_digest_path": get_value(
+            "TWINR_NIGHTLY_PREPARED_DIGEST_PATH",
+            "artifacts/stores/ops/nightly_prepared_digest.json",
+        )
+        or "artifacts/stores/ops/nightly_prepared_digest.json",
+        "nightly_consolidation_summary_path": get_value(
+            "TWINR_NIGHTLY_CONSOLIDATION_SUMMARY_PATH",
+            "artifacts/stores/ops/nightly_consolidation_summary.json",
+        )
+        or "artifacts/stores/ops/nightly_consolidation_summary.json",
+        "nightly_digest_reminder_limit": max(
+            1,
+            int(get_value("TWINR_NIGHTLY_DIGEST_REMINDER_LIMIT", "6") or "6"),
+        ),
+        "nightly_digest_headline_limit": max(
+            1,
+            int(get_value("TWINR_NIGHTLY_DIGEST_HEADLINE_LIMIT", "5") or "5"),
+        ),
+        "nightly_live_web_augmentation_enabled": _parse_bool(
+            get_value("TWINR_NIGHTLY_LIVE_WEB_AUGMENTATION_ENABLED"),
+            True,
+        ),
+        "nightly_live_web_query_limit": max(
+            0,
+            int(get_value("TWINR_NIGHTLY_LIVE_WEB_QUERY_LIMIT", "2") or "2"),
+        ),
         "browser_automation_enabled": _parse_bool(
             get_value("TWINR_BROWSER_AUTOMATION_ENABLED"), False
         ),

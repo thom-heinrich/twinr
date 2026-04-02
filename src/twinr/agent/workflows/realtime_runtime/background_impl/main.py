@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from twinr.agent.workflows.realtime_runtime.background_impl.automation import BackgroundAutomationMixin
 from twinr.agent.workflows.realtime_runtime.background_impl.longterm import BackgroundLongTermMixin
+from twinr.agent.workflows.realtime_runtime.background_impl.nightly import BackgroundNightlyMixin
 from twinr.agent.workflows.realtime_runtime.background_impl.observation import BackgroundObservationMixin
 from twinr.agent.workflows.realtime_runtime.background_impl.social import BackgroundSocialMixin
 from twinr.agent.workflows.realtime_runtime.background_impl.support import BackgroundSupportMixin
@@ -13,6 +14,7 @@ from twinr.agent.workflows.realtime_runtime.background_impl.support import Backg
 
 class TwinrRealtimeBackgroundMixinImpl(
     BackgroundAutomationMixin,
+    BackgroundNightlyMixin,
     BackgroundLongTermMixin,
     BackgroundSocialMixin,
     BackgroundObservationMixin,

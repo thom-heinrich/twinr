@@ -325,6 +325,16 @@ def _shutdown_service(service: LongTermMemoryService | None) -> None:
         service.shutdown(timeout_s=5.0)
     except Exception:
         _LOGGER.warning("Long-term service shutdown failed during live midterm acceptance cleanup.", exc_info=True)
+    query_rewriter = getattr(service, "query_rewriter", None)
+    shutdown_query_rewriter = getattr(query_rewriter, "shutdown", None)
+    if callable(shutdown_query_rewriter):
+        try:
+            shutdown_query_rewriter(wait=True)
+        except Exception:
+            _LOGGER.warning(
+                "Long-term query rewriter shutdown wait failed during live midterm acceptance cleanup.",
+                exc_info=True,
+            )
     retriever = getattr(service, "retriever", None)
     subtext_builder = getattr(retriever, "subtext_builder", None)
     if subtext_builder is not None:

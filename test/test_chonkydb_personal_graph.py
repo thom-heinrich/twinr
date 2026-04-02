@@ -903,6 +903,111 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertEqual(sum(1 for call in graph_head_retry_calls if not call["include_content"]), 2)
         self.assertEqual(sum(1 for call in graph_head_retry_calls if call["include_content"]), 2)
 
+    def test_probe_remote_current_view_for_readiness_avoids_full_retry_when_metadata_only_graph_heads_get_400(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            self.assertTrue(primary_store.ensure_remote_snapshot())
+            original_fetch_full_document = remote_state.client.fetch_full_document
+            fetch_calls: list[dict[str, object]] = []
+
+            def _fetch_full_document(*, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+                fetch_calls.append(
+                    {
+                        "document_id": document_id,
+                        "origin_uri": origin_uri,
+                        "include_content": include_content,
+                        "max_content_chars": max_content_chars,
+                    }
+                )
+                if (
+                    not include_content
+                    and isinstance(origin_uri, str)
+                    and (
+                        origin_uri.endswith("/graph_nodes/catalog/current")
+                        or origin_uri.endswith("/graph_edges/catalog/current")
+                    )
+                ):
+                    raise ChonkyDBError(
+                        "ChonkyDB request failed for GET /v1/external/documents/full",
+                        status_code=400,
+                        response_json={
+                            "detail": "Request validation failed",
+                            "success": False,
+                        },
+                    )
+                return original_fetch_full_document(
+                    document_id=document_id,
+                    origin_uri=origin_uri,
+                    include_content=include_content,
+                    max_content_chars=max_content_chars,
+                )
+
+            remote_state.client.fetch_full_document = _fetch_full_document  # type: ignore[method-assign]
+            fresh_store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "fresh" / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            remote_view = fresh_store.probe_remote_current_view_for_readiness()
+
+        self.assertIsNotNone(remote_view)
+        graph_head_calls = [
+            call
+            for call in fetch_calls
+            if isinstance(call["origin_uri"], str)
+            and (
+                str(call["origin_uri"]).endswith("/graph_nodes/catalog/current")
+                or str(call["origin_uri"]).endswith("/graph_edges/catalog/current")
+            )
+        ]
+        self.assertEqual(sum(1 for call in graph_head_calls if not call["include_content"]), 2)
+        self.assertEqual(sum(1 for call in graph_head_calls if call["include_content"]), 0)
+
+    def test_graph_readiness_bootstrap_keeps_fresh_empty_namespace_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot_for_readiness()
+            probed = store.probe_remote_current_view_for_readiness()
+            loaded = store.load_remote_current_view_for_readiness()
+
+        self.assertFalse(created)
+        self.assertIsNotNone(probed)
+        self.assertIsNotNone(loaded)
+        assert probed is not None
+        assert loaded is not None
+        self.assertTrue(probed["synthetic_empty"])
+        self.assertEqual(probed["subject_node_id"], "user:main")
+        self.assertEqual(probed["graph_id"], "graph:user_main")
+        self.assertEqual(probed["topology_refs"], {"user:main": "bootstrap_empty:user:main"})
+        self.assertEqual(probed["generation_id"], loaded["generation_id"])
+        self.assertEqual(probed["topology_index_name"], loaded["topology_index_name"])
+        self.assertFalse(remote_state.client.graph_store_many_calls)
+        self.assertEqual(
+            [
+                uri
+                for uri in remote_state.client.records_by_uri
+                if uri.endswith("/graph_nodes/catalog/current") or uri.endswith("/graph_edges/catalog/current")
+            ],
+            [],
+        )
+
     def test_load_remote_current_view_uses_full_head_when_metadata_only_probe_contract_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()

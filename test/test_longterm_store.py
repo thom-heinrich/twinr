@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test.longterm_test_program import make_test_extractor
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.chonkydb.models import ChonkyDBRecordItem
 from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
@@ -232,10 +233,12 @@ class _FakeChonkyClient:
         self.supports_topk_records = False
         self.bulk_calls = 0
         self.retrieve_calls = 0
+        self.retrieve_payloads: list[dict[str, object]] = []
         self.topk_records_calls = 0
         self.topk_records_payloads: list[dict[str, object]] = []
         self.fetch_full_document_calls = 0
         self.bulk_request_bytes: list[int] = []
+        self.bulk_request_payloads: list[dict[str, object]] = []
         self.bulk_request_schemas: list[tuple[str, ...]] = []
         self.records_by_document_id: dict[str, dict[str, object]] = {}
         self.records_by_uri: dict[str, dict[str, object]] = {}
@@ -253,6 +256,7 @@ class _FakeChonkyClient:
         if self.max_items_per_bulk is not None and len(items) > self.max_items_per_bulk:
             raise LongTermRemoteUnavailableError("bulk request too large")
         payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        self.bulk_request_payloads.append(dict(payload))
         request_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         self.bulk_request_bytes.append(request_bytes)
         if self.max_request_bytes is not None and request_bytes > self.max_request_bytes:
@@ -294,6 +298,7 @@ class _FakeChonkyClient:
         query_text = str(payload.get("query_text") or "").lower()
         allowed = set(str(value) for value in payload.get("allowed_doc_ids", ()) if str(value))
         self.retrieve_calls += 1
+        self.retrieve_payloads.append(dict(payload))
         ranked = []
         for document_id, record in self.records_by_document_id.items():
             if allowed and document_id not in allowed:
@@ -383,6 +388,35 @@ class _CurrentHead404Client(_FakeChonkyClient):
             include_content=include_content,
             max_content_chars=max_content_chars,
         )
+
+
+class _TimeoutCloningReadClient(_FakeChonkyClient):
+    def __init__(self, *, timeout_s: float = 8.0) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(timeout_s=float(timeout_s))
+        self.clone_timeout_history: list[float] = []
+        self.fetch_timeout_history: list[float] = []
+
+    def clone_with_timeout(self, timeout_s: float):
+        self.clone_timeout_history.append(float(timeout_s))
+        return _TimeoutCloningReadClientView(parent=self, timeout_s=float(timeout_s))
+
+
+class _TimeoutCloningReadClientView:
+    def __init__(self, *, parent: _TimeoutCloningReadClient, timeout_s: float) -> None:
+        self._parent = parent
+        self.config = SimpleNamespace(timeout_s=float(timeout_s))
+
+    def clone_with_timeout(self, timeout_s: float):
+        return self._parent.clone_with_timeout(timeout_s)
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        del document_id
+        del origin_uri
+        del include_content
+        del max_content_chars
+        self._parent.fetch_timeout_history.append(float(self.config.timeout_s))
+        raise TimeoutError(f"timed out after {self.config.timeout_s:.3f}s")
 
 
 class _TransientCurrentHead503Client(_CurrentHead404Client):
@@ -749,6 +783,28 @@ class _AsyncBulkJobStatusNoDocumentIdsClient(_AsyncBulkEventuallyVisibleClient):
         }
 
 
+class _AsyncBulkJobStatusNoDocumentIdsItemOrigin404Client(_AsyncBulkJobStatusNoDocumentIdsClient):
+    def __init__(self, *, stale_reads_before_visible: int = 2) -> None:
+        super().__init__(stale_reads_before_visible=stale_reads_before_visible)
+        self.item_origin_404_attempts: dict[str, int] = {}
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        uri = str(origin_uri or "")
+        if uri and "/catalog/" not in uri:
+            self.item_origin_404_attempts[uri] = self.item_origin_404_attempts.get(uri, 0) + 1
+            raise ChonkyDBError(
+                "ChonkyDB request failed for GET /v1/external/documents/full",
+                status_code=404,
+                response_json={"detail": "document_not_found"},
+            )
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
+        )
+
+
 class _AsyncBulkDocumentIdEventuallyVisibleClient(_FakeChonkyClient):
     def __init__(self, *, stale_document_reads_before_visible: int = 2) -> None:
         super().__init__()
@@ -826,6 +882,114 @@ class _AsyncBulkDocumentIdEventuallyVisibleClient(_FakeChonkyClient):
             origin_uri=origin_uri,
             include_content=True,
             max_content_chars=4000,
+        )
+
+
+class _AsyncBulkSegmentJobStatusPreferredClient(_AsyncBulkDocumentIdEventuallyVisibleClient):
+    def __init__(self, *, clock: dict[str, float]) -> None:
+        super().__init__(stale_document_reads_before_visible=0)
+        self.clock = clock
+        self.job_status_calls: list[str] = []
+
+    def job_status(self, job_id):
+        self.job_status_calls.append(str(job_id))
+        return super().job_status(job_id)
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        if isinstance(origin_uri, str) and origin_uri:
+            self.fetch_attempts_by_uri[origin_uri] = self.fetch_attempts_by_uri.get(origin_uri, 0) + 1
+            # Simulate a stale same-URI history hit that consumes the remaining attestation window.
+            self.clock["now"] += 1.0
+            return {
+                "document_id": "doc-stale",
+                "payload": {
+                    "schema": "stale_segment",
+                    "version": 1,
+                    "snapshot_kind": "objects",
+                    "segment_index": 0,
+                    "items": [],
+                },
+                "metadata": {
+                    "twinr_snapshot_kind": "objects",
+                    "twinr_catalog_segment_index": 0,
+                },
+                "content": json.dumps(
+                    {
+                        "schema": "stale_segment",
+                        "version": 1,
+                        "snapshot_kind": "objects",
+                        "segment_index": 0,
+                        "items": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "uri": origin_uri,
+            }
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
+        )
+
+
+class _AsyncBulkCurrentHeadJobStatusPreferredClient(_AsyncBulkDocumentIdEventuallyVisibleClient):
+    def __init__(self, *, clock: dict[str, float]) -> None:
+        super().__init__(stale_document_reads_before_visible=0)
+        self.clock = clock
+        self.job_status_calls: list[str] = []
+
+    def job_status(self, job_id):
+        self.job_status_calls.append(str(job_id))
+        return super().job_status(job_id)
+
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        if isinstance(origin_uri, str) and origin_uri:
+            self.fetch_attempts_by_uri[origin_uri] = self.fetch_attempts_by_uri.get(origin_uri, 0) + 1
+            self.clock["now"] += 1.0
+            fresh_document_id = next(
+                (
+                    str(candidate.get("document_id") or "")
+                    for records in self._job_records_by_id.values()
+                    for candidate in records
+                    if str(candidate.get("uri") or "") == origin_uri
+                ),
+                "doc-1",
+            )
+            stale_payload = {
+                "schema": "twinr_memory_object_catalog_v3",
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+                "written_at": "2026-03-30T09:00:00+00:00",
+            }
+            return {
+                "success": True,
+                "origin_uri": origin_uri,
+                "chunks": [
+                    {
+                        "document_id": "doc-stale",
+                        "metadata": {
+                            "twinr_snapshot_kind": "objects",
+                            "twinr_catalog_current_head": True,
+                            "twinr_payload": dict(stale_payload),
+                        },
+                        "content": json.dumps(stale_payload, ensure_ascii=False),
+                    },
+                    {
+                        "document_id": fresh_document_id,
+                        "metadata": {
+                            "twinr_snapshot_kind": "objects",
+                            "twinr_catalog_current_head": True,
+                        },
+                    },
+                ],
+            }
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
         )
 
 
@@ -1601,6 +1765,26 @@ def _count_bulk_calls_with_schema(client: _FakeChonkyClient, schema: str) -> int
     return sum(1 for schemas in client.bulk_request_schemas if schemas and all(value == schema for value in schemas))
 
 
+def _bulk_item_target_indexes(client: _FakeChonkyClient, schema: str) -> tuple[tuple[str, ...], ...]:
+    targets: list[tuple[str, ...]] = []
+    for request_payload in client.bulk_request_payloads:
+        items = request_payload.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict) or payload.get("schema") != schema:
+                continue
+            raw_targets = item.get("target_indexes")
+            if isinstance(raw_targets, list):
+                targets.append(tuple(str(value) for value in raw_targets if str(value).strip()))
+            else:
+                targets.append(())
+    return tuple(targets)
+
+
 def _sparsify_catalog_segment_entries(client: _FakeChonkyClient, catalog_payload: dict[str, object]) -> None:
     for raw_segment in catalog_payload.get("segments", ()):
         if not isinstance(raw_segment, dict):
@@ -1842,6 +2026,54 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_record_v2"), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_catalog_segment_v1"), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_object_catalog_v3"), 1)
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_record_v2"),
+            (("fulltext", "temporal", "tags"),),
+        )
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_catalog_segment_v1"),
+            (("fulltext",),),
+        )
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_catalog_v3"),
+            (("fulltext",),),
+        )
+
+    def test_write_snapshot_uses_explicit_non_vector_targets_for_remote_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            store = LongTermStructuredStore(
+                base_path=project_root / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            object_fact = LongTermMemoryObjectV1(
+                memory_id="fact:tea_preference",
+                kind="fact",
+                summary="The user drinks black tea in the morning.",
+                source=_source(),
+                status="active",
+                confidence=0.95,
+                slot_key="preference:breakfast:drink",
+                value_key="black_tea",
+            )
+
+            store.write_snapshot(objects=(object_fact,), conflicts=(), archived_objects=())
+
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_record_v2"),
+            (("fulltext", "temporal", "tags"),),
+        )
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_catalog_segment_v1"),
+            (("fulltext",),),
+        )
+        self.assertEqual(
+            _bulk_item_target_indexes(remote_state.client, "twinr_memory_object_catalog_v3"),
+            (("fulltext",),),
+        )
 
     def test_remote_catalog_build_payload_treats_missing_current_head_as_empty_without_legacy_snapshot_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2737,6 +2969,94 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertNotIn("objects:retrieve_batch", operations)
         self.assertNotIn("objects:fetch_item_document", operations)
 
+    def test_select_query_time_objects_by_ids_backfills_missing_exact_ids_after_partial_scope_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _TermOverlapChonkyClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(
+                base_path=project_root / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            old_jam = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_old",
+                kind="fact",
+                summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                details="Aeltere Vorliebe fuer das Fruehstueck.",
+                source=_source(),
+                status="active",
+                confidence=0.94,
+                slot_key="preference:breakfast:jam",
+                value_key="strawberry",
+            )
+            new_jam = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_new",
+                kind="fact",
+                summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                details="Neuere Vorliebe fuer das Fruehstueck.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.95,
+                slot_key="preference:breakfast:jam",
+                value_key="apricot",
+            )
+            conflict = LongTermMemoryConflictV1(
+                slot_key="preference:breakfast:jam",
+                candidate_memory_id="fact:jam_preference_new",
+                existing_memory_ids=("fact:jam_preference_old",),
+                question="Welche Marmelade stimmt gerade?",
+                reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
+            )
+            store.write_snapshot(
+                objects=(old_jam, new_jam),
+                conflicts=(conflict,),
+                archived_objects=(),
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            retriever = LongTermRetriever(
+                config=TwinrConfig(
+                    project_root=str(project_root),
+                    personality_dir="personality",
+                    memory_markdown_path=str(project_root / "state" / "MEMORY.md"),
+                    long_term_memory_path=str(project_root / "state" / "chonkydb"),
+                    long_term_memory_recall_limit=2,
+                ),
+                prompt_context_store=SimpleNamespace(),
+                graph_store=SimpleNamespace(),
+                object_store=store,
+                midterm_store=SimpleNamespace(),
+                conflict_resolver=LongTermConflictResolver(),
+                subtext_builder=SimpleNamespace(),
+            )
+
+            with patch.object(
+                remote_catalog,
+                "search_current_item_payloads",
+                return_value=(new_jam.to_payload(),),
+            ):
+                objects = store.select_query_time_objects_by_ids(
+                    query_text="Welche Marmeladen stehen gerade im Widerspruch?",
+                    memory_ids=("fact:jam_preference_old", "fact:jam_preference_new"),
+                )
+                queue = retriever.select_conflict_queue(
+                    query=LongTermQueryProfile.from_text("Welche Marmeladen stehen gerade im Widerspruch?"),
+                    limit=1,
+                )
+
+        self.assertEqual(
+            tuple(item.memory_id for item in objects),
+            ("fact:jam_preference_old", "fact:jam_preference_new"),
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(
+            {option.memory_id for option in queue[0].options},
+            {"fact:jam_preference_old", "fact:jam_preference_new"},
+        )
+
     def test_scope_topk_404_object_fallback_keeps_segment_and_item_reads_off_documents_full(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
@@ -3376,7 +3696,7 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(catalog_entries), 1)
         self.assertEqual(catalog_entries[0].document_id, "doc-1")
-        self.assertTrue(all(value == 60.0 for value in remote_state.client.bulk_timeout_seconds))
+        self.assertTrue(all(value == 180.0 for value in remote_state.client.bulk_timeout_seconds))
 
     def test_remote_catalog_async_job_timeout_uses_flush_budget_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3391,18 +3711,28 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             self.assertEqual(remote_catalog._remote_async_job_timeout_s(), 60.0)
             self.assertEqual(remote_catalog._async_job_visibility_timeout_s(), 68.0)
             self.assertEqual(remote_catalog._async_attestation_visibility_timeout_s(), 30.0)
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="objects"), 180.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="objects"), 188.0)
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="conflicts"), 180.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="conflicts"), 188.0)
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="archive"), 180.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="archive"), 188.0)
             self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="graph_nodes"), 180.0)
             self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="graph_nodes"), 188.0)
             self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="graph_edges"), 180.0)
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="provider_answer_fronts"), 180.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="provider_answer_fronts"), 188.0)
 
             remote_state.config.long_term_memory_remote_flush_timeout_s = 5.0
             self.assertEqual(remote_catalog._remote_async_job_timeout_s(), 15.0)
             self.assertEqual(remote_catalog._async_job_visibility_timeout_s(), 23.0)
             self.assertEqual(remote_catalog._async_attestation_visibility_timeout_s(), 30.0)
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="objects"), 180.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="objects"), 188.0)
             self.assertEqual(remote_catalog._remote_async_job_timeout_s(snapshot_kind="graph_nodes"), 180.0)
             self.assertEqual(remote_catalog._async_job_visibility_timeout_s(snapshot_kind="graph_nodes"), 188.0)
 
-    def test_remote_catalog_async_job_status_timeout_falls_back_to_uri_attestation(self) -> None:
+    def test_projection_complete_write_skips_async_job_status_and_uri_attestation_when_document_ids_are_optional(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
             remote_state.required = True
@@ -3435,14 +3765,197 @@ class LongTermStructuredStoreTests(unittest.TestCase):
                     content_builder=lambda item: str(item.get("summary") or ""),
                 )
 
-        self.assertEqual(remote_state.client.job_status_calls, ["job-bulk-1", "job-bulk-1"])
-        self.assertEqual(remote_state.client.fetch_attempts_by_uri.get(uri, 0), 1)
+        segment_uri = str(payload["segments"][0]["uri"])
+        self.assertTrue(remote_state.client.job_status_calls)
+        self.assertEqual(remote_state.client.fetch_attempts_by_uri.get(uri, 0), 0)
+        self.assertGreaterEqual(remote_state.client.fetch_attempts_by_uri.get(segment_uri, 0), 1)
         catalog_entries = remote_catalog._load_segmented_catalog_entries(
             definition=remote_catalog._require_definition("objects"),
             payload=payload,
         )
         self.assertEqual(len(catalog_entries), 1)
-        self.assertEqual(catalog_entries[0].document_id, "doc-1")
+        self.assertIsNone(catalog_entries[0].document_id)
+
+    def test_catalog_segment_write_falls_back_to_same_uri_attestation_after_job_status_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _AsyncBulkJobStatusTimeoutClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            definition = remote_catalog._require_definition("objects")
+            base_segment_uri = remote_catalog._catalog_segment_uri(snapshot_kind="objects", segment_index=0)
+
+            with patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.01):
+                refs = remote_catalog._persist_catalog_segments(
+                    remote_state.write_client,
+                    definition=definition,
+                    catalog_entries=[
+                        remote_catalog._build_catalog_entry(
+                            item_id="fact:jam_preference",
+                            document_id="doc-existing",
+                            metadata={"summary": "Du magst Aprikosenmarmelade."},
+                        )
+                    ],
+                )
+
+        segment_uri = str(refs[0]["uri"])
+        self.assertTrue(remote_state.client.job_status_calls)
+        self.assertGreaterEqual(remote_state.client.fetch_attempts_by_uri.get(segment_uri, 0), 1)
+        self.assertTrue(segment_uri.startswith(base_segment_uri + "/"))
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["document_id"], "doc-1")
+
+    def test_catalog_segment_write_uses_versioned_uri_to_avoid_fixed_uri_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _AsyncBulkJobStatusTimeoutClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            base_segment_uri = remote_catalog._catalog_segment_uri(snapshot_kind="objects", segment_index=0)
+            with patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.01):
+                refs = remote_catalog._persist_catalog_segments(
+                    remote_state.write_client,
+                    definition=remote_catalog._require_definition("objects"),
+                    catalog_entries=[
+                        remote_catalog._build_catalog_entry(
+                            item_id="fact:jam_preference",
+                            document_id="doc-existing",
+                            metadata={"summary": "Du magst Aprikosenmarmelade."},
+                        )
+                    ],
+                )
+
+        segment_uri = str(refs[0]["uri"])
+        self.assertTrue(remote_state.client.job_status_calls)
+        self.assertGreaterEqual(remote_state.client.fetch_attempts_by_uri.get(segment_uri, 0), 1)
+        self.assertNotEqual(segment_uri, base_segment_uri)
+        self.assertTrue(segment_uri.startswith(base_segment_uri + "/"))
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["document_id"], "doc-1")
+
+    def test_catalog_segment_write_prefers_job_status_document_id_over_stale_same_uri_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clock = {"now": 0.0}
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _AsyncBulkSegmentJobStatusPreferredClient(clock=clock)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            with (
+                patch("twinr.memory.longterm.storage._remote_catalog.writes.time.monotonic", side_effect=lambda: clock["now"]),
+                patch.object(remote_catalog, "_async_attestation_visibility_timeout_s", return_value=0.5),
+                patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.5),
+                patch.object(remote_catalog, "_remote_retry_backoff_s", return_value=0.0),
+            ):
+                refs = remote_catalog._persist_catalog_segments(
+                    remote_state.write_client,
+                    definition=remote_catalog._require_definition("objects"),
+                    catalog_entries=[
+                        remote_catalog._build_catalog_entry(
+                            item_id="fact:jam_preference",
+                            document_id="doc-existing",
+                            metadata={"summary": "Du magst Aprikosenmarmelade."},
+                        )
+                    ],
+                )
+
+        segment_uri = str(refs[0]["uri"])
+        self.assertTrue(remote_state.client.job_status_calls)
+        self.assertEqual(remote_state.client.fetch_attempts_by_uri.get(segment_uri, 0), 0)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["document_id"], "doc-1")
+
+    def test_catalog_current_head_write_prefers_job_status_document_id_over_stale_same_uri_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clock = {"now": 0.0}
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _AsyncBulkCurrentHeadJobStatusPreferredClient(clock=clock)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            fresh_payload = {
+                "schema": remote_catalog._require_definition("objects").catalog_schema,
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+                "written_at": "2026-03-31T09:00:00+00:00",
+            }
+
+            with (
+                patch("twinr.memory.longterm.storage._remote_catalog.writes.time.monotonic", side_effect=lambda: clock["now"]),
+                patch.object(remote_catalog, "_async_attestation_visibility_timeout_s", return_value=0.5),
+                patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.5),
+                patch.object(remote_catalog, "_remote_retry_backoff_s", return_value=0.0),
+            ):
+                persisted = remote_catalog.persist_catalog_payload(snapshot_kind="objects", payload=fresh_payload)
+
+        current_head_uri = remote_catalog._catalog_head_uri(snapshot_kind="objects")
+        self.assertEqual(persisted["written_at"], "2026-03-31T09:00:00+00:00")
+        self.assertTrue(remote_state.client.job_status_calls)
+        self.assertEqual(remote_state.client.fetch_attempts_by_document_id.get("doc-1", 0), 0)
+        self.assertEqual(remote_state.client.fetch_attempts_by_uri.get(current_head_uri, 0), 0)
+
+    def test_non_projection_complete_write_falls_back_to_uri_attestation_when_async_job_status_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _AsyncBulkJobStatusTimeoutClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            uri = remote_catalog.item_uri(snapshot_kind="midterm", item_id="packet:test")
+            record_item = ChonkyDBRecordItem(
+                payload={
+                    "schema": "twinr_memory_midterm_packet_record_v1",
+                    "version": 1,
+                    "snapshot_kind": "midterm",
+                    "item_id": "packet:test",
+                    "packet": {
+                        "packet_id": "packet:test",
+                        "summary": "Lea mochte die rote Thermoskanne.",
+                    },
+                },
+                metadata={
+                    "twinr_snapshot_kind": "midterm",
+                    "twinr_memory_item_id": "packet:test",
+                    "twinr_payload": {
+                        "packet_id": "packet:test",
+                        "summary": "Lea mochte die rote Thermoskanne.",
+                    },
+                },
+                content=json.dumps({"packet_id": "packet:test", "summary": "Lea mochte die rote Thermoskanne."}),
+                uri=uri,
+                enable_chunking=False,
+                include_insights_in_response=False,
+            )
+
+            with patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.01):
+                document_ids = remote_catalog._store_record_items(
+                    remote_state.write_client,
+                    snapshot_kind="midterm",
+                    record_items=[record_item],
+                )
+
+        self.assertEqual(remote_state.client.job_status_calls, ["job-bulk-1"])
+        self.assertEqual(remote_state.client.fetch_attempts_by_uri.get(uri, 0), 1)
+        self.assertEqual(document_ids, ("doc-1",))
 
     def test_remote_catalog_current_head_attestation_uses_flush_window_for_same_uri_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3499,7 +4012,58 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             "2026-03-31T09:00:00+00:00",
         )
 
-    def test_remote_catalog_readback_attestation_retries_known_document_id_until_visible(self) -> None:
+    def test_remote_catalog_attestation_caps_read_timeout_to_remaining_visibility_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _TimeoutCloningReadClient(timeout_s=8.0)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            head_payload = {
+                "schema": remote_catalog._require_definition("objects").catalog_schema,
+                "version": 3,
+                "items_count": 0,
+                "segments": [],
+            }
+            record_item = ChonkyDBRecordItem(
+                payload=dict(head_payload),
+                metadata={
+                    "twinr_snapshot_kind": "objects",
+                    "twinr_catalog_current_head": True,
+                    "twinr_payload": dict(head_payload),
+                },
+                content=json.dumps(head_payload, ensure_ascii=False),
+                uri=remote_catalog._catalog_head_uri(snapshot_kind="objects"),
+                enable_chunking=False,
+                include_insights_in_response=False,
+            )
+            monotonic_values = iter((0.0, 0.02, 0.04, 0.06))
+
+            with (
+                patch("twinr.memory.longterm.storage._remote_catalog.writes.time.monotonic", side_effect=lambda: next(monotonic_values)),
+                patch.object(remote_catalog, "_async_attestation_visibility_timeout_s", return_value=0.05),
+                patch.object(remote_catalog, "_async_job_visibility_timeout_s", return_value=0.05),
+                patch.object(remote_catalog, "_remote_retry_backoff_s", return_value=0.0),
+            ):
+                with self.assertRaises(LongTermRemoteUnavailableError):
+                    remote_catalog._attest_record_readback(
+                        remote_state.read_client,
+                        snapshot_kind="objects",
+                        record_item=record_item,
+                        document_id=None,
+                    )
+
+        self.assertEqual(len(remote_state.client.fetch_timeout_history), 1)
+        self.assertEqual(len(remote_state.client.clone_timeout_history), 1)
+        self.assertLessEqual(remote_state.client.fetch_timeout_history[0], 0.1)
+        self.assertLessEqual(remote_state.client.clone_timeout_history[0], 0.1)
+        self.assertLess(remote_state.client.fetch_timeout_history[0], remote_state.client.config.timeout_s)
+        self.assertLess(remote_state.client.clone_timeout_history[0], remote_state.client.config.timeout_s)
+
+    def test_remote_catalog_readback_attestation_retries_known_document_id_without_same_uri_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
             remote_state.required = True
@@ -3560,7 +4124,98 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(attested_document_id, "doc-1")
         self.assertGreaterEqual(client.fetch_attempts_by_document_id["doc-1"], 3)
-        self.assertGreaterEqual(client.fetch_attempts_by_uri.get(uri, 0), 1)
+        self.assertEqual(client.fetch_attempts_by_uri.get(uri, 0), 0)
+
+    def test_projection_complete_write_skips_item_origin_attestation_when_async_job_omits_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.long_term_memory_remote_retry_attempts = 1
+            remote_state.config.long_term_memory_remote_retry_backoff_s = 0.0
+            remote_state.client = _AsyncBulkJobStatusNoDocumentIdsItemOrigin404Client(stale_reads_before_visible=0)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            writer_store = LongTermStructuredStore(base_path=root / "writer" / "state" / "chonkydb", remote_state=remote_state)
+            writer_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+            reader_store = LongTermStructuredStore(base_path=root / "reader" / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = reader_store._remote_catalog
+            assert remote_catalog is not None
+            item_uri = remote_catalog.item_uri(snapshot_kind="objects", item_id="fact:jam_preference_old")
+            entries = remote_catalog.load_catalog_entries(snapshot_kind="objects")
+            payloads = remote_catalog.load_selection_item_payloads(
+                snapshot_kind="objects",
+                item_ids=("fact:jam_preference_old",),
+            )
+
+        self.assertEqual(remote_state.client.item_origin_404_attempts.get(item_uri, 0), 0)
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].document_id)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["memory_id"], "fact:jam_preference_old")
+        self.assertEqual(payloads[0]["summary"], "Deine Lieblingsmarmelade ist Erdbeermarmelade.")
+
+    def test_midterm_write_still_requires_item_origin_attestation_when_async_job_omits_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.long_term_memory_remote_retry_attempts = 1
+            remote_state.config.long_term_memory_remote_retry_backoff_s = 0.0
+            remote_state.client = _AsyncBulkJobStatusNoDocumentIdsItemOrigin404Client(stale_reads_before_visible=0)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            item_uri = remote_catalog.item_uri(snapshot_kind="midterm", item_id="packet:test")
+            record_item = ChonkyDBRecordItem(
+                payload={
+                    "schema": "twinr_memory_midterm_packet_record_v1",
+                    "version": 1,
+                    "snapshot_kind": "midterm",
+                    "item_id": "packet:test",
+                    "packet": {
+                        "packet_id": "packet:test",
+                        "summary": "Lea mochte die rote Thermoskanne.",
+                    },
+                },
+                metadata={
+                    "twinr_snapshot_kind": "midterm",
+                    "twinr_memory_item_id": "packet:test",
+                    "twinr_payload": {
+                        "packet_id": "packet:test",
+                        "summary": "Lea mochte die rote Thermoskanne.",
+                    },
+                },
+                content=json.dumps({"packet_id": "packet:test", "summary": "Lea mochte die rote Thermoskanne."}),
+                uri=item_uri,
+                enable_chunking=False,
+                include_insights_in_response=False,
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                remote_catalog._store_record_items(
+                    remote_state.write_client,
+                    snapshot_kind="midterm",
+                    record_items=[record_item],
+                )
+
+        self.assertGreaterEqual(remote_state.client.item_origin_404_attempts.get(item_uri, 0), 1)
 
     def test_remote_catalog_bulk_write_raises_when_async_readback_never_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3717,6 +4372,33 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(archive_head["segments"], [])
         self.assertIn("written_at", archive_head)
         self.assertEqual(remote_state.snapshots, {})
+        self.assertFalse(store.objects_path.exists())
+
+    def test_structured_store_readiness_bootstrap_keeps_fresh_required_namespace_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+
+            ensured = store.ensure_remote_snapshots_for_readiness()
+            objects_payload = store.probe_remote_current_snapshot_for_readiness(snapshot_kind="objects")
+            conflicts_payload = store.probe_remote_current_snapshot_for_readiness(snapshot_kind="conflicts")
+            archive_payload = store.probe_remote_current_snapshot_for_readiness(snapshot_kind="archive")
+
+        self.assertEqual(ensured, ())
+        assert objects_payload is not None
+        assert conflicts_payload is not None
+        assert archive_payload is not None
+        self.assertEqual(objects_payload["schema"], "twinr_memory_object_store")
+        self.assertEqual(objects_payload["objects"], [])
+        self.assertEqual(conflicts_payload["schema"], "twinr_memory_conflict_store")
+        self.assertEqual(conflicts_payload["conflicts"], [])
+        self.assertEqual(archive_payload["schema"], "twinr_memory_archive_store")
+        self.assertEqual(archive_payload["objects"], [])
+        self.assertEqual(objects_payload["written_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(conflicts_payload["written_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(archive_payload["written_at"], "1970-01-01T00:00:00+00:00")
+        self.assertEqual(remote_state.client.bulk_calls, 0)
         self.assertFalse(store.objects_path.exists())
 
     def test_ensure_remote_snapshots_serializes_required_remote_reads(self) -> None:
@@ -6056,6 +6738,159 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             "uncertain",
         )
 
+    def test_search_current_item_payloads_reconciles_stale_scope_payloads_without_catalog_fallback_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _StaleScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+            remote_state.client.snapshot_scope_records()
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="superseded",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                        attributes={"resolved_by_user": True},
+                    ),
+                ),
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text="Aprikosenmarmelade",
+                limit=2,
+                allow_catalog_fallback=False,
+            )
+            payload_by_id = {payload["memory_id"]: payload for payload in payloads}
+
+        self.assertIn("fact:jam_preference_new", payload_by_id)
+        self.assertEqual(payload_by_id["fact:jam_preference_new"]["status"], "active")
+        self.assertTrue(payload_by_id["fact:jam_preference_new"]["confirmed_by_user"])
+        self.assertNotEqual(
+            payload_by_id["fact:jam_preference_new"]["status"],
+            "uncertain",
+        )
+
+    def test_search_current_item_payloads_fast_reconciles_stale_scope_payloads_with_current_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _StaleScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+            )
+            remote_state.client.snapshot_scope_records()
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="superseded",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                        attributes={"resolved_by_user": True},
+                    ),
+                ),
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads_fast(
+                snapshot_kind="objects",
+                query_text="Aprikosenmarmelade",
+                limit=2,
+            )
+            payload_by_id = {payload["memory_id"]: payload for payload in payloads}
+
+        self.assertIn("fact:jam_preference_new", payload_by_id)
+        self.assertEqual(payload_by_id["fact:jam_preference_new"]["status"], "active")
+        self.assertTrue(payload_by_id["fact:jam_preference_new"]["confirmed_by_user"])
+        self.assertNotEqual(
+            payload_by_id["fact:jam_preference_new"]["status"],
+            "uncertain",
+        )
+
     def test_load_catalog_payload_skips_repeated_invalid_current_head_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
@@ -6081,11 +6916,14 @@ class LongTermStructuredStoreTests(unittest.TestCase):
             }
 
             first_payload = remote_catalog.load_catalog_payload(snapshot_kind="user_context")
+            first_fetch_calls = remote_state.client.fetch_full_document_calls
             second_payload = remote_catalog.load_catalog_payload(snapshot_kind="user_context")
+            second_fetch_calls = remote_state.client.fetch_full_document_calls
 
         self.assertEqual(first_payload, remote_state.snapshots["user_context"])
         self.assertEqual(second_payload, remote_state.snapshots["user_context"])
-        self.assertEqual(remote_state.client.fetch_full_document_calls, 1)
+        self.assertGreaterEqual(first_fetch_calls, 1)
+        self.assertEqual(second_fetch_calls, first_fetch_calls)
 
     def test_select_relevant_context_objects_uses_one_scope_search_for_both_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6572,6 +7410,7 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(tuple(entry.item_id for entry in relevant), ("fact:janina_spouse",))
         payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["allowed_indexes"], ["fulltext", "temporal", "tags"])
         self.assertEqual(payload["namespace"], "test-namespace")
         self.assertEqual(payload["scope_ref"], "longterm:objects:current")
         self.assertNotIn("allowed_doc_ids", payload)
@@ -6621,9 +7460,118 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(tuple(entry.item_id for entry in relevant), ("fact:tea_preference",))
         payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["allowed_indexes"], ["fulltext", "temporal", "tags"])
         self.assertNotIn("namespace", payload)
         self.assertNotIn("scope_ref", payload)
         self.assertEqual(len(payload["allowed_doc_ids"]), 2)
+
+    def test_search_catalog_entries_retrieve_fallback_keeps_lightweight_non_ann_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            relevant = remote_catalog.search_catalog_entries(
+                snapshot_kind="objects",
+                query_text="Janina",
+                limit=1,
+            )
+
+        self.assertEqual(tuple(entry.item_id for entry in relevant), ("fact:janina_spouse",))
+        payload = remote_state.client.retrieve_payloads[-1]
+        self.assertEqual(payload["allowed_indexes"], ["fulltext", "temporal", "tags"])
+
+    def test_load_selection_item_payloads_topk_batch_uses_fulltext_only_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.client.supports_topk_records = True
+            store = LongTermStructuredStore(base_path=root / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+            reader_store = LongTermStructuredStore(base_path=root / "reader" / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = reader_store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.load_selection_item_payloads(
+                snapshot_kind="objects",
+                item_ids=("fact:jam_preference_old",),
+            )
+
+        self.assertEqual(len(payloads), 1)
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["query_text"], "__allowed_doc_ids__")
+        self.assertEqual(payload["allowed_indexes"], ["fulltext"])
+
+    def test_load_selection_item_payloads_retrieve_batch_uses_fulltext_only_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=root / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+            reader_store = LongTermStructuredStore(base_path=root / "reader" / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = reader_store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.load_selection_item_payloads(
+                snapshot_kind="objects",
+                item_ids=("fact:jam_preference_old",),
+            )
+
+        self.assertEqual(len(payloads), 1)
+        payload = remote_state.client.retrieve_payloads[-1]
+        self.assertEqual(payload["query_text"], "__allowed_doc_ids__")
+        self.assertEqual(payload["allowed_indexes"], ["fulltext"])
     def test_select_relevant_objects_prefers_query_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = _config(temp_dir)

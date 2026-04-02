@@ -58,9 +58,22 @@ _LOG = logging.getLogger("twinr.memory.longterm.storage.remote_catalog")
 _RECENT_CATALOG_HEAD_TTL_S = 120.0
 _RECENT_CATALOG_ENTRIES_TTL_S = 120.0
 _NEGATIVE_REMOTE_CONTRACT_TTL_S = 120.0
-_GRAPH_CURRENT_VIEW_SNAPSHOT_KINDS = frozenset({"graph_nodes", "graph_edges"})
-_GRAPH_CURRENT_VIEW_ASYNC_JOB_TIMEOUT_FLOOR_S = 180.0
 _MUTABLE_CURRENT_HEAD_SNAPSHOT_KINDS = frozenset({"objects", "conflicts", "archive"})
+_ASYNC_JOB_TIMEOUT_FLOOR_S = 180.0
+_SELECTION_SEARCH_ALLOWED_INDEXES = ("fulltext", "temporal", "tags")
+_SELECTION_HYDRATION_ALLOWED_INDEXES = ("fulltext",)
+_SEARCHABLE_WRITE_TARGET_INDEXES = ("fulltext", "temporal", "tags")
+_CONTROL_PLANE_WRITE_TARGET_INDEXES = ("fulltext",)
+_ASYNC_JOB_TIMEOUT_FLOORED_SNAPSHOT_KINDS = frozenset(
+    {
+        "objects",
+        "conflicts",
+        "archive",
+        "graph_nodes",
+        "graph_edges",
+        "provider_answer_fronts",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,11 +146,21 @@ class LongTermRemoteCatalogStoreBase(
         encoded_id = quote(item_id, safe="")
         return f"twinr://longterm/{namespace}/{definition.uri_segment}/{encoded_id}"
 
-    def _catalog_segment_uri(self, *, snapshot_kind: str, segment_index: int) -> str:
+    def _catalog_segment_uri(
+        self,
+        *,
+        snapshot_kind: str,
+        segment_index: int,
+        segment_token: str | None = None,
+    ) -> str:
         remote_state = self._require_remote_state()
         definition = self._require_definition(snapshot_kind)
         namespace = quote(str(getattr(remote_state, "namespace", "") or "twinr_longterm_v1"), safe="")
-        return f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/segment/{segment_index:04d}"
+        base_uri = f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/segment/{segment_index:04d}"
+        normalized_token = str(segment_token or "").strip()
+        if not normalized_token:
+            return base_uri
+        return f"{base_uri}/{quote(normalized_token, safe='')}"
 
     def _catalog_head_uri(self, *, snapshot_kind: str) -> str:
         """Return the canonical URI for the current catalog head document."""
@@ -540,21 +563,18 @@ class LongTermRemoteCatalogStoreBase(
     def _remote_async_job_timeout_s(self, *, snapshot_kind: str | None = None) -> float | None:
         """Return the server-side async job budget for accepted bulk writes.
 
-        Graph current-view writes can arrive right after a backend restart while
-        ChonkyDB is still warming large payload/fulltext indexes. Live Pi
-        incidents show that those accepted async graph jobs can legitimately run
-        past the generic 60 s flush budget and then fail server-side with
-        ``payload_sync_bulk_timeout`` even though the HTTP transport contract is
-        already correct. Keep the transport timeout unchanged, but give
-        `graph_nodes` / `graph_edges` async jobs a larger bounded execution
-        budget.
+        Live incidents show that accepted current-head/catalog writes can
+        legitimately outlive the generic flush budget while ChonkyDB is still
+        warming payload/fulltext indexes for fresh namespaces or post-restart
+        cold paths. Keep the transport timeout unchanged, but give the heavier
+        current-head collections a larger bounded server-side execution window.
         """
 
         transport_timeout_s = self._remote_write_timeout_s()
         flush_timeout_s = self._remote_flush_timeout_s()
         candidate = max(flush_timeout_s, transport_timeout_s or 0.0)
-        if snapshot_kind in _GRAPH_CURRENT_VIEW_SNAPSHOT_KINDS:
-            candidate = max(candidate, _GRAPH_CURRENT_VIEW_ASYNC_JOB_TIMEOUT_FLOOR_S)
+        if snapshot_kind in _ASYNC_JOB_TIMEOUT_FLOORED_SNAPSHOT_KINDS:
+            candidate = max(candidate, _ASYNC_JOB_TIMEOUT_FLOOR_S)
         return candidate if candidate > 0.0 else None
 
     def _remote_retry_attempts(self) -> int:
@@ -651,6 +671,30 @@ class LongTermRemoteCatalogStoreBase(
 
     def _catalog_segment_max_bytes(self) -> int:
         return max(1, min(self._bulk_request_max_bytes() // 4, self._max_content_chars()))
+
+    @staticmethod
+    def _selection_search_allowed_indexes() -> tuple[str, ...]:
+        """Keep query-time catalog searches on lightweight non-ANN indexes."""
+
+        return _SELECTION_SEARCH_ALLOWED_INDEXES
+
+    @staticmethod
+    def _selection_hydration_allowed_indexes() -> tuple[str, ...]:
+        """Keep exact allowlist hydration on the cheapest content-bearing lane."""
+
+        return _SELECTION_HYDRATION_ALLOWED_INDEXES
+
+    @staticmethod
+    def _searchable_write_target_indexes() -> tuple[str, ...]:
+        """Persist searchable Twinr items only into the indexes the runtime uses."""
+
+        return _SEARCHABLE_WRITE_TARGET_INDEXES
+
+    @staticmethod
+    def _control_plane_write_target_indexes() -> tuple[str, ...]:
+        """Persist fixed-URI catalog control-plane docs without vector indexing."""
+
+        return _CONTROL_PLANE_WRITE_TARGET_INDEXES
 
     def _definition(self, snapshot_kind: str) -> _RemoteCollectionDefinition | None:
         return _DEFINITIONS.get(self._normalize_text(snapshot_kind))

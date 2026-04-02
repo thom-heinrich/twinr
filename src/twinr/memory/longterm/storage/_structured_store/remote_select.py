@@ -516,6 +516,8 @@ class StructuredStoreRemoteSelectionMixin:
         remote_catalog = self._remote_catalog
         clean_query = _normalize_text(query_text)
         if self._remote_catalog_enabled() and remote_catalog is not None:
+            scoped_by_id: dict[str, LongTermMemoryObjectV1] = {}
+            missing_ids = normalized_ids
             if clean_query:
                 try:
                     payloads = remote_catalog.search_current_item_payloads(
@@ -530,15 +532,20 @@ class StructuredStoreRemoteSelectionMixin:
                         raise
                     payloads = None
                 if payloads is not None:
-                    by_id = {
+                    scoped_by_id = {
                         item.memory_id: item
                         for item in self._load_remote_objects_from_payloads(payloads=payloads)
                     }
-                    return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
-            by_id = {
-                item.memory_id: item
-                for item in self._load_remote_objects_from_item_ids(item_ids=normalized_ids)
-            }
+                    missing_ids = tuple(memory_id for memory_id in normalized_ids if memory_id not in scoped_by_id)
+                    if not missing_ids:
+                        return tuple(scoped_by_id[memory_id] for memory_id in normalized_ids if memory_id in scoped_by_id)
+            by_id = dict(scoped_by_id)
+            by_id.update(
+                {
+                    item.memory_id: item
+                    for item in self._load_remote_objects_from_item_ids(item_ids=missing_ids)
+                }
+            )
             if by_id:
                 return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
             if self._remote_is_required():

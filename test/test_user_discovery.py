@@ -73,15 +73,16 @@ class UserDiscoveryTests(unittest.TestCase):
 
         class QueryOnlyObjectStore:
             def __init__(self) -> None:
-                self.queries: list[tuple[str | None, int]] = []
+                self.queries: list[tuple[str | None, int, float | None]] = []
 
             def select_fast_topic_objects(
                 self,
                 *,
                 query_text: str | None,
                 limit: int = 4,
+                timeout_s: float | None = None,
             ) -> tuple[LongTermMemoryObjectV1, ...]:
-                self.queries.append((query_text, limit))
+                self.queries.append((query_text, limit, timeout_s))
                 normalized_query = str(query_text or "")
                 if "preference_type name" in normalized_query and "prefers_name" in normalized_query:
                     return (basics_object,)
@@ -107,8 +108,9 @@ class UserDiscoveryTests(unittest.TestCase):
         self.assertTrue(coverage.covers("basics"))
         self.assertTrue(coverage.covers("companion_style"))
         self.assertEqual(len(object_store.queries), 2)
-        self.assertTrue(any("preference_type name" in str(query) for query, _limit in object_store.queries))
-        self.assertTrue(any("preference_type initiative" in str(query) for query, _limit in object_store.queries))
+        self.assertTrue(any("preference_type name" in str(query) for query, _limit, _timeout in object_store.queries))
+        self.assertTrue(any("preference_type initiative" in str(query) for query, _limit, _timeout in object_store.queries))
+        self.assertTrue(all(timeout_s == 2.0 for _query, _limit, timeout_s in object_store.queries))
 
     def test_runtime_user_discovery_commits_high_value_user_profile_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

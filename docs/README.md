@@ -104,6 +104,8 @@ Time-based automations can either:
 
 For scheduled live-information jobs such as daily weather, daily news, or printed headlines, Twinr stores the automation as an `llm_prompt` action with web search enabled and executes it later from the idle loop.
 
+Separately from those operator-configured automations, the idle loop now owns one explicit nightly orchestration pass. That pass stays silent at night, flushes long-term/background writers, refreshes world intelligence, prepares a morning digest artifact, and then prepares the next reserve-lane day plan so the morning runtime can start from durable overnight state instead of scattered background side effects.
+
 Sensor-triggered automations currently support the following operator-facing trigger kinds:
 
 - `pir_motion_detected`

@@ -47,6 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 _MISSING = object()
+_CacheKey = tuple[int, str]
 
 _SNAPSHOT_LIST_FIELD_CAPS: dict[str, int] = {
     "core_traits": 8,
@@ -90,20 +91,20 @@ class PersonalityContextService:
     max_total_section_chars: int = 48_000
 
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
-    _snapshot_cache: dict[tuple[int, int], _TimedValue[PersonalitySnapshot | None]] = field(
+    _snapshot_cache: dict[_CacheKey, _TimedValue[PersonalitySnapshot | None]] = field(
         default_factory=dict,
         init=False,
         repr=False,
     )
-    _engagement_cache: dict[tuple[int, int], _TimedValue[tuple[WorldInterestSignal, ...]]] = field(
+    _engagement_cache: dict[_CacheKey, _TimedValue[tuple[WorldInterestSignal, ...]]] = field(
         default_factory=dict,
         init=False,
         repr=False,
     )
-    _snapshot_failures_until: dict[tuple[int, int], float] = field(default_factory=dict, init=False, repr=False)
-    _engagement_failures_until: dict[tuple[int, int], float] = field(default_factory=dict, init=False, repr=False)
-    _snapshot_inflight: dict[tuple[int, int], Event] = field(default_factory=dict, init=False, repr=False)
-    _engagement_inflight: dict[tuple[int, int], Event] = field(default_factory=dict, init=False, repr=False)
+    _snapshot_failures_until: dict[_CacheKey, float] = field(default_factory=dict, init=False, repr=False)
+    _engagement_failures_until: dict[_CacheKey, float] = field(default_factory=dict, init=False, repr=False)
+    _snapshot_inflight: dict[_CacheKey, Event] = field(default_factory=dict, init=False, repr=False)
+    _engagement_inflight: dict[_CacheKey, Event] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.runtime_cache_ttl_seconds = self._bounded_float(
@@ -384,10 +385,10 @@ class PersonalityContextService:
     def _load_cached_value(
         self,
         *,
-        cache_key: tuple[int, int],
-        cache: dict[tuple[int, int], _TimedValue[_T]],
-        failure_deadlines: dict[tuple[int, int], float],
-        inflight: dict[tuple[int, int], Event],
+        cache_key: _CacheKey,
+        cache: dict[_CacheKey, _TimedValue[_T]],
+        failure_deadlines: dict[_CacheKey, float],
+        inflight: dict[_CacheKey, Event],
         default: _T,
         loader: Callable[[], _T],
         unavailable_log_message: str,
@@ -659,17 +660,43 @@ class PersonalityContextService:
         *,
         config: TwinrConfig,
         remote_state: LongTermRemoteStateStore | None,
-    ) -> tuple[int, int]:
+    ) -> _CacheKey:
         return (
             id(config),
-            id(remote_state) if remote_state is not None else 0,
+            self._remote_state_cache_marker(remote_state),
         )
+
+    @staticmethod
+    def _remote_state_cache_marker(
+        remote_state: LongTermRemoteStateStore | None,
+    ) -> str:
+        """Return a stable cache marker for equivalent remote-state adapters.
+
+        Prompt assembly frequently recreates ``LongTermRemoteStateStore``
+        wrappers and timeout-capped clones around the same namespace. Caching on
+        the object id turns those semantically identical handles into cache
+        misses and replays the same remote reads unnecessarily.
+        """
+
+        if remote_state is None:
+            return "none"
+        namespace = getattr(remote_state, "namespace", None)
+        if isinstance(namespace, str) and namespace.strip():
+            return f"namespace:{namespace.strip()}"
+        explicit_marker = getattr(remote_state, "cache_key", None) or getattr(
+            remote_state,
+            "instance_id",
+            None,
+        )
+        if isinstance(explicit_marker, str) and explicit_marker.strip():
+            return f"identity:{explicit_marker.strip()}"
+        return f"type:{remote_state.__class__.__module__}.{remote_state.__class__.__qualname__}"
 
     def _read_cache_value(
         self,
         *,
-        cache: dict[tuple[int, int], _TimedValue[_T]],
-        cache_key: tuple[int, int],
+        cache: dict[_CacheKey, _TimedValue[_T]],
+        cache_key: _CacheKey,
         now: float,
         max_age_seconds: float,
     ) -> _T | object:
@@ -684,8 +711,8 @@ class PersonalityContextService:
     def _store_cache_value(
         self,
         *,
-        cache: dict[tuple[int, int], _TimedValue[_T]],
-        cache_key: tuple[int, int],
+        cache: dict[_CacheKey, _TimedValue[_T]],
+        cache_key: _CacheKey,
         value: _T,
         now: float,
     ) -> None:
@@ -695,7 +722,7 @@ class PersonalityContextService:
 
     def _trim_cache_locked(
         self,
-        cache: dict[tuple[int, int], _TimedValue[object]],
+        cache: dict[_CacheKey, _TimedValue[object]],
     ) -> None:
         expiry_before = time.monotonic() - self.stale_if_error_ttl_seconds
         expired_keys = [
@@ -720,8 +747,8 @@ class PersonalityContextService:
     def _record_failure(
         self,
         *,
-        failure_deadlines: dict[tuple[int, int], float],
-        cache_key: tuple[int, int],
+        failure_deadlines: dict[_CacheKey, float],
+        cache_key: _CacheKey,
         now: float,
     ) -> None:
         with self._lock:
@@ -731,8 +758,8 @@ class PersonalityContextService:
     def _clear_failure(
         self,
         *,
-        failure_deadlines: dict[tuple[int, int], float],
-        cache_key: tuple[int, int],
+        failure_deadlines: dict[_CacheKey, float],
+        cache_key: _CacheKey,
     ) -> None:
         with self._lock:
             failure_deadlines.pop(cache_key, None)
@@ -740,8 +767,8 @@ class PersonalityContextService:
     def _is_failure_open(
         self,
         *,
-        failure_deadlines: dict[tuple[int, int], float],
-        cache_key: tuple[int, int],
+        failure_deadlines: dict[_CacheKey, float],
+        cache_key: _CacheKey,
         now: float,
     ) -> bool:
         with self._lock:
@@ -750,7 +777,7 @@ class PersonalityContextService:
 
     def _trim_failure_deadlines_locked(
         self,
-        failure_deadlines: dict[tuple[int, int], float],
+        failure_deadlines: dict[_CacheKey, float],
     ) -> None:
         now = time.monotonic()
         expired_keys = [
@@ -775,8 +802,8 @@ class PersonalityContextService:
     def _claim_inflight_slot(
         self,
         *,
-        inflight: dict[tuple[int, int], Event],
-        cache_key: tuple[int, int],
+        inflight: dict[_CacheKey, Event],
+        cache_key: _CacheKey,
     ) -> tuple[Event, bool]:
         with self._lock:
             existing = inflight.get(cache_key)
@@ -789,8 +816,8 @@ class PersonalityContextService:
     def _release_inflight_slot(
         self,
         *,
-        inflight: dict[tuple[int, int], Event],
-        cache_key: tuple[int, int],
+        inflight: dict[_CacheKey, Event],
+        cache_key: _CacheKey,
         event: Event,
     ) -> None:
         with self._lock:

@@ -39,6 +39,9 @@ from time import monotonic
 from twinr.automations import AutomationStore
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality import PersonalityContextService
+from twinr.agent.personality._remote_state_utils import (
+    clone_remote_state_with_capped_read_timeout as _clone_remote_state_with_capped_read_timeout,
+)
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteUnavailableError,
@@ -69,6 +72,7 @@ _MAX_RENDERED_BUNDLE_CHARS = 96_000
 _DYNAMIC_BUNDLE_CACHE_TTL_S = 15.0
 _SEMI_DYNAMIC_BUNDLE_CACHE_TTL_S = 30.0
 _STATIC_BUNDLE_CACHE_TTL_S = 120.0
+_OPTIONAL_PROMPT_CONTEXT_REMOTE_READ_TIMEOUT_S = 2.0
 
 _PERSONALITY_CONTEXT_SERVICE = PersonalityContextService()
 _REMOTE_CONTEXT_WARNING_LOCK = Lock()
@@ -247,10 +251,14 @@ def load_personality_context(config: TwinrConfig) -> PersonalityContext:
 
 def _load_common_sections(config: TwinrConfig) -> list[tuple[str, str]]:
     sections = _load_static_sections(config)
+    prompt_remote_state = _load_prompt_context_remote_state(config)
 
     memory_context = _safe_render_context(
         "MEMORY",
-        lambda: PersistentMemoryMarkdownStore.from_config(config).render_context(),
+        lambda: PersistentMemoryMarkdownStore.from_config(
+            config,
+            remote_state=prompt_remote_state,
+        ).render_context(),
     )
     if memory_context is not None:
         sections.append(("MEMORY", memory_context))
@@ -348,7 +356,26 @@ def _load_remote_state_store(
         return None, False
 
     _clear_remote_context_warning_key(warning_key)
-    return store, False
+    prompt_remote_state = _clone_remote_state_with_capped_read_timeout(
+        config=config,
+        remote_state=store,
+        timeout_s=_OPTIONAL_PROMPT_CONTEXT_REMOTE_READ_TIMEOUT_S,
+    )
+    return prompt_remote_state or store, False
+
+
+def _load_prompt_context_remote_state(config: TwinrConfig) -> LongTermRemoteStateStore | None:
+    """Return one bounded remote-state clone for optional prompt-context reads."""
+
+    try:
+        remote_state = LongTermRemoteStateStore.from_config(config)
+    except Exception:
+        return None
+    return _clone_remote_state_with_capped_read_timeout(
+        config=config,
+        remote_state=remote_state,
+        timeout_s=_OPTIONAL_PROMPT_CONTEXT_REMOTE_READ_TIMEOUT_S,
+    )
 
 
 def _load_legacy_static_sections(
@@ -416,6 +443,7 @@ def _render_managed_static_section(
         section_title=section_title,
         remote_state=remote_state,
         remote_snapshot_kind=snapshot_kind if remote_state is not None else None,
+        allow_legacy_head_reads=False,
     )
 
     try:

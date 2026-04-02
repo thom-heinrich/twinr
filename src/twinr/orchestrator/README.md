@@ -50,6 +50,8 @@ contracts used by the Alexa-like hybrid voice path.
 | [voice_client.py](./voice_client.py) | Blocking client for the voice websocket |
 | [voice_session.py](./voice_session.py) | Stable compatibility wrapper for the server-side voice-session import surface |
 | [voice_session_impl/](./voice_session_impl/) | Internal package split across runtime-state handling, observability, backend requests, and utterance scanning |
+| [local_bridge_target.py](./local_bridge_target.py) | Host-side probe target resolver that rewrites stale self-LAN websocket URLs to the local `:8797` loopback bridge when available |
+| [remote_tool_timeout.py](./remote_tool_timeout.py) | Shared default/env timeout policy for remote tool execution budgets across the client and server bridge |
 | [probe_turn.py](./probe_turn.py) | Lightweight text-probe bootstrap for `--orchestrator-probe-turn` with stage timings and no full hardware-loop startup |
 | [non_voice_acceptance.py](./non_voice_acceptance.py) | Deterministic direct/tool/memory text-only E2E acceptance runner with persisted artifacts |
 | [acks.py](./acks.py) | Ack phrase ID map |
@@ -82,6 +84,17 @@ conversation context and the local realtime tool surface, but it deliberately
 skips GPIO/audio/proactive/live-voice startup that belongs to the full hardware
 loop instead of a text websocket probe. That keeps the probe bounded and makes
 its stage timings actionable when Pi acceptance stalls.
+
+On the leading repo host, that probe path also resolves stale self-targeted
+LAN websocket URLs back to the authoritative local `ws://127.0.0.1:8797`
+bridge when that loopback bridge is actually reachable. That keeps host-side
+non-voice acceptance from depending on a DHCP-stable self-IP while leaving the
+Pi acceptance instance on `/twinr` untouched.
+
+The probe client and the server-side remote-tool bridge also share one timeout
+policy from [`remote_tool_timeout.py`](./remote_tool_timeout.py). That keeps
+host acceptance from failing a real live-web tool call locally while the server
+is still legitimately waiting for the same tool result.
 
 For a deterministic text-only acceptance proof across the real direct/tool/
 memory paths, operators can now run:

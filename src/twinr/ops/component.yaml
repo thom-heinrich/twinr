@@ -11,6 +11,9 @@ owned_concerns:
   - Validate the Pi-side OpenAI env contract so acceptance probes can trust `/twinr/.env` directly
   - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
   - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
+  - Diagnose the public ChonkyDB URL against the dedicated backend service and repair only the unhealthy backend layer
+  - Stabilize the dedicated ChonkyDB host under shared-host contention by quiescing known conflicting services, timers, and path-triggered jobs while raising backend CPU/IO priority
+  - Force-repair unreadable prompt-memory and managed-context current heads on one explicit remote namespace when the old fixed current-head documents are themselves unreadable
   - Ensure live Pi runtimes can start that watchdog as a separate companion process
   - Seed detached Pi runtime processes with the minimum user-session audio environment required for Pulse/ALSA default playback
   - Build scoped runtime configs so auxiliary loops cannot overwrite the primary display/runtime snapshot
@@ -118,6 +121,12 @@ files:
       - RemoteMemoryWatchdog
       - RemoteMemoryWatchdogSample
       - RemoteMemoryWatchdogSnapshot
+  - path: remote_chonkydb_repair.py
+    role: Diagnose the public ChonkyDB URL against the dedicated backend service and optionally restart only the unhealthy backend layer
+  - path: remote_chonkydb_host_stabilizer.py
+    role: Quiesce known shared-host system/user conflict units, stop non-Twinr workers pointed at the dedicated backend, and raise backend CPU/IO weights for the dedicated ChonkyDB host
+  - path: remote_prompt_current_head_repair.py
+    role: Force-publish canonical empty prompt current heads for one explicit remote namespace when unreadable blank heads block normal repair reads
   - path: remote_memory_watchdog_state.py
     role: Internal sample, snapshot, bootstrap, and store helpers for persisted remote-memory watchdog state
   - path: remote_memory_watchdog_companion.py
@@ -212,3 +221,6 @@ tests:
   - path: test/test_main.py
   - path: test/test_display_service.py
   - path: test/test_ops_openai_env_contract.py
+  - path: test/test_remote_chonkydb_repair.py
+  - path: test/test_remote_chonkydb_host_stabilizer.py
+  - path: test/test_remote_prompt_current_head_repair.py

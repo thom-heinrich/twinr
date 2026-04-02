@@ -649,6 +649,244 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             {"snapshot_kind": "midterm", "prefer_cached_document_id": True, "prefer_metadata_only": True},
         ])
 
+    def test_probe_remote_ready_bootstrap_prefers_graph_readiness_bootstrap_contract(self) -> None:
+        class _ReadinessGraphStore:
+            def __init__(self, remote_state: _CacheAwareFakeRemoteState) -> None:
+                self.remote_state = remote_state
+                self.readiness_bootstrap_calls = 0
+                self.legacy_bootstrap_calls = 0
+
+            def ensure_remote_snapshot_for_readiness(self) -> bool:
+                self.readiness_bootstrap_calls += 1
+                return False
+
+            def ensure_remote_snapshot(self) -> bool:
+                self.legacy_bootstrap_calls += 1
+                raise AssertionError("readiness bootstrap must not seed the graph current view")
+
+            def probe_remote_current_view_for_readiness(self) -> dict[str, object]:
+                return {
+                    "generation_id": "gen-empty",
+                    "topology_index_name": "twinr_graph_test_bootstrap_empty",
+                    "subject_node_id": "user:main",
+                    "graph_id": "graph:user_main",
+                    "created_at": "2026-04-01T10:00:00Z",
+                    "updated_at": "2026-04-01T10:00:00Z",
+                    "topology_refs": {"user:main": "bootstrap_empty:user:main"},
+                    "synthetic_empty": True,
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            prompt_state = _CacheAwareFakeRemoteState(
+                {
+                    "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                    "user_context": {"schema": "managed_context", "entries": []},
+                    "personality_context": {"schema": "managed_context", "entries": []},
+                }
+            )
+            object_state = _CacheAwareFakeRemoteState(
+                {
+                    "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                    "conflicts": {"schema": "conflicts", "conflicts": []},
+                    "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+                }
+            )
+            graph_state = _CacheAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+            graph_store = _ReadinessGraphStore(graph_state)
+            midterm_state = _CacheAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+            service = LongTermMemoryService(
+                config=config,
+                prompt_context_store=_PromptContextStoreDouble(prompt_state),
+                graph_store=graph_store,
+                object_store=_ObjectStoreDouble(object_state),
+                midterm_store=_MidtermStoreDouble(midterm_state),
+                query_rewriter=SimpleNamespace(),
+                retriever=SimpleNamespace(),
+                extractor=SimpleNamespace(),
+                multimodal_extractor=SimpleNamespace(),
+                truth_maintainer=SimpleNamespace(),
+                consolidator=SimpleNamespace(),
+                conflict_resolver=SimpleNamespace(),
+                reflector=SimpleNamespace(),
+                sensor_memory=SimpleNamespace(),
+                ops_backfiller=SimpleNamespace(),
+                planner=SimpleNamespace(),
+                proactive_policy=SimpleNamespace(),
+                retention_policy=SimpleNamespace(),
+            )
+
+            result = service.probe_remote_ready()
+
+        self.assertTrue(result.ready)
+        self.assertEqual(graph_store.readiness_bootstrap_calls, 1)
+        self.assertEqual(graph_store.legacy_bootstrap_calls, 0)
+        self.assertEqual(graph_state.load_calls, [])
+        assert result.warm_result is not None
+        selected_sources = {check.snapshot_kind: check.selected_source for check in result.warm_result.checks}
+        self.assertEqual(selected_sources["graph"], "graph_current_view")
+
+    def test_probe_remote_ready_bootstrap_prefers_object_store_readiness_bootstrap_contract(self) -> None:
+        class _ReadinessObjectStore:
+            def __init__(self, remote_state: _CacheAwareFakeRemoteState) -> None:
+                self.remote_state = remote_state
+                self.readiness_bootstrap_calls = 0
+                self.legacy_bootstrap_calls = 0
+
+            def ensure_remote_snapshots_for_readiness(self) -> tuple[str, ...]:
+                self.readiness_bootstrap_calls += 1
+                return ()
+
+            def ensure_remote_snapshots(self) -> tuple[str, ...]:
+                self.legacy_bootstrap_calls += 1
+                raise AssertionError("readiness bootstrap must not seed empty structured snapshots")
+
+            def probe_remote_current_snapshot_for_readiness(self, *, snapshot_kind: str) -> dict[str, object]:
+                payloads = {
+                    "objects": {
+                        "schema": "twinr_memory_object_store",
+                        "version": 2,
+                        "objects": [],
+                        "written_at": "1970-01-01T00:00:00+00:00",
+                    },
+                    "conflicts": {
+                        "schema": "twinr_memory_conflict_store",
+                        "version": 2,
+                        "conflicts": [],
+                        "written_at": "1970-01-01T00:00:00+00:00",
+                    },
+                    "archive": {
+                        "schema": "twinr_memory_archive_store",
+                        "version": 2,
+                        "objects": [],
+                        "written_at": "1970-01-01T00:00:00+00:00",
+                    },
+                }
+                return dict(payloads[snapshot_kind])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            prompt_state = _CacheAwareFakeRemoteState(
+                {
+                    "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                    "user_context": {"schema": "managed_context", "entries": []},
+                    "personality_context": {"schema": "managed_context", "entries": []},
+                }
+            )
+            object_state = _CacheAwareFakeRemoteState(
+                {
+                    "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                    "conflicts": {"schema": "conflicts", "conflicts": []},
+                    "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+                }
+            )
+            graph_state = _CacheAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+            midterm_state = _CacheAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+            object_store = _ReadinessObjectStore(object_state)
+            service = LongTermMemoryService(
+                config=config,
+                prompt_context_store=_PromptContextStoreDouble(prompt_state),
+                graph_store=_GraphStoreDouble(graph_state),
+                object_store=object_store,
+                midterm_store=_MidtermStoreDouble(midterm_state),
+                query_rewriter=SimpleNamespace(),
+                retriever=SimpleNamespace(),
+                extractor=SimpleNamespace(),
+                multimodal_extractor=SimpleNamespace(),
+                truth_maintainer=SimpleNamespace(),
+                consolidator=SimpleNamespace(),
+                conflict_resolver=SimpleNamespace(),
+                reflector=SimpleNamespace(),
+                sensor_memory=SimpleNamespace(),
+                ops_backfiller=SimpleNamespace(),
+                planner=SimpleNamespace(),
+                proactive_policy=SimpleNamespace(),
+                retention_policy=SimpleNamespace(),
+            )
+
+            result = service.probe_remote_ready()
+
+        self.assertTrue(result.ready)
+        self.assertEqual(object_store.readiness_bootstrap_calls, 1)
+        self.assertEqual(object_store.legacy_bootstrap_calls, 0)
+        assert result.warm_result is not None
+        selected_sources = {check.snapshot_kind: check.selected_source for check in result.warm_result.checks}
+        self.assertEqual(selected_sources["objects"], "object_store_current_contract")
+        self.assertEqual(selected_sources["conflicts"], "object_store_current_contract")
+        self.assertEqual(selected_sources["archive"], "object_store_current_contract")
+
+    def test_probe_remote_ready_bootstrap_prefers_midterm_readiness_bootstrap_contract(self) -> None:
+        class _ReadinessMidtermStore:
+            def __init__(self, remote_state: _CacheAwareFakeRemoteState) -> None:
+                self.remote_state = remote_state
+                self.readiness_bootstrap_calls = 0
+                self.legacy_bootstrap_calls = 0
+
+            def ensure_remote_snapshot_for_readiness(self) -> bool:
+                self.readiness_bootstrap_calls += 1
+                return False
+
+            def ensure_remote_snapshot(self) -> bool:
+                self.legacy_bootstrap_calls += 1
+                raise AssertionError("readiness bootstrap must not seed empty midterm state")
+
+            def probe_remote_current_head_for_readiness(self) -> dict[str, object]:
+                return {
+                    "schema": "twinr_memory_midterm_store",
+                    "version": 2,
+                    "packets": [],
+                    "written_at": "1970-01-01T00:00:00+00:00",
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            prompt_state = _CacheAwareFakeRemoteState(
+                {
+                    "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                    "user_context": {"schema": "managed_context", "entries": []},
+                    "personality_context": {"schema": "managed_context", "entries": []},
+                }
+            )
+            object_state = _CacheAwareFakeRemoteState(
+                {
+                    "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                    "conflicts": {"schema": "conflicts", "conflicts": []},
+                    "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+                }
+            )
+            graph_state = _CacheAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+            midterm_state = _CacheAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+            midterm_store = _ReadinessMidtermStore(midterm_state)
+            service = LongTermMemoryService(
+                config=config,
+                prompt_context_store=_PromptContextStoreDouble(prompt_state),
+                graph_store=_GraphStoreDouble(graph_state),
+                object_store=_ObjectStoreDouble(object_state),
+                midterm_store=midterm_store,
+                query_rewriter=SimpleNamespace(),
+                retriever=SimpleNamespace(),
+                extractor=SimpleNamespace(),
+                multimodal_extractor=SimpleNamespace(),
+                truth_maintainer=SimpleNamespace(),
+                consolidator=SimpleNamespace(),
+                conflict_resolver=SimpleNamespace(),
+                reflector=SimpleNamespace(),
+                sensor_memory=SimpleNamespace(),
+                ops_backfiller=SimpleNamespace(),
+                planner=SimpleNamespace(),
+                proactive_policy=SimpleNamespace(),
+                retention_policy=SimpleNamespace(),
+            )
+
+            result = service.probe_remote_ready()
+
+        self.assertTrue(result.ready)
+        self.assertEqual(midterm_store.readiness_bootstrap_calls, 1)
+        self.assertEqual(midterm_store.legacy_bootstrap_calls, 0)
+        assert result.warm_result is not None
+        selected_sources = {check.snapshot_kind: check.selected_source for check in result.warm_result.checks}
+        self.assertEqual(selected_sources["midterm"], "catalog_current_head")
+
     def test_remote_snapshot_save_and_load_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)

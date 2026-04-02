@@ -43,13 +43,11 @@ from twinr.orchestrator.contracts import (
     OrchestratorToolRequest,
     OrchestratorTurnCompleteEvent,
 )
+from twinr.orchestrator.remote_tool_timeout import read_remote_tool_timeout_seconds
 from twinr.providers.openai import OpenAIBackend, OpenAISupervisorDecisionProvider, OpenAIToolCallingAgentProvider
 
 
 LOGGER = logging.getLogger(__name__)
-
-_DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS = 90.0
-_REMOTE_TOOL_TIMEOUT_ENV = "TWINR_REMOTE_TOOL_TIMEOUT_SECONDS"
 
 _DEFAULT_REMOTE_TOOL_REQUEST_MAX_BYTES = 128 * 1024
 _REMOTE_TOOL_REQUEST_MAX_BYTES_ENV = "TWINR_REMOTE_TOOL_REQUEST_MAX_BYTES"
@@ -70,23 +68,6 @@ _DEFAULT_TURN_FAILURE_TEXT = "Sorry, I had trouble finishing that. Please try ag
 
 _DEFAULT_MAX_ROUNDS = 6
 _MAX_ROUNDS_ENV = "TWINR_ORCHESTRATOR_MAX_ROUNDS"
-
-
-def _read_positive_float_env(name: str, default: float) -> float:
-    """Read a positive float from the environment or fall back to ``default``."""
-
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        parsed = float(raw_value)
-    except ValueError:
-        LOGGER.warning("Invalid %s=%r; using default %.1f", name, raw_value, default)
-        return default
-    if parsed <= 0:
-        LOGGER.warning("Non-positive %s=%r; using default %.1f", name, raw_value, default)
-        return default
-    return parsed
 
 
 def _read_positive_int_env(name: str, default: int) -> int:
@@ -447,7 +428,7 @@ class RemoteToolBridge:
         """Resolve the blocking wait budget for remote tool results."""
 
         if timeout_seconds is None:
-            return _read_positive_float_env(_REMOTE_TOOL_TIMEOUT_ENV, _DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS)
+            return read_remote_tool_timeout_seconds(logger=LOGGER)
         if timeout_seconds <= 0:
             raise ValueError("tool_result_timeout_seconds must be > 0")
         return timeout_seconds

@@ -80,6 +80,32 @@ class StructuredStoreSnapshotMixin:
             results = tuple(ensure_one(request) for request in snapshot_requests)
             return tuple(snapshot_kind for snapshot_kind, ensured in results if ensured)
 
+    def ensure_remote_snapshots_for_readiness(self) -> tuple[str, ...]:
+        """Bootstrap remote snapshots without seeding a fresh empty namespace."""
+
+        with self._lock:
+            if self.remote_state is None or not self.remote_state.enabled:
+                return ()
+            snapshot_requests = (
+                ("objects", self.objects_path, self._empty_objects_payload()),
+                ("conflicts", self.conflicts_path, self._empty_conflicts_payload()),
+                ("archive", self.archive_path, self._empty_archive_payload()),
+            )
+
+            def ensure_one(
+                request: tuple[str, Path, dict[str, object]],
+            ) -> tuple[str, bool]:
+                snapshot_kind, local_path, empty_payload = request
+                ensured = self._ensure_remote_snapshot_payload_for_readiness(
+                    snapshot_kind=snapshot_kind,
+                    local_path=local_path,
+                    empty_payload=empty_payload,
+                )
+                return snapshot_kind, ensured
+
+            results = tuple(ensure_one(request) for request in snapshot_requests)
+            return tuple(snapshot_kind for snapshot_kind, ensured in results if ensured)
+
     def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load long-term memory objects from the current object snapshot."""
 
@@ -277,6 +303,20 @@ class StructuredStoreSnapshotMixin:
                 snapshot_kind=snapshot_kind,
             )
             return dict(payload) if isinstance(payload, Mapping) else None
+
+    def probe_remote_current_snapshot_for_readiness(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Probe the current remote snapshot contract, accepting a fresh empty namespace."""
+
+        with self._lock:
+            payload = self.probe_remote_current_snapshot(snapshot_kind=snapshot_kind)
+            if isinstance(payload, dict):
+                return dict(payload)
+            return self._synthetic_empty_snapshot_payload_for_readiness(snapshot_kind=snapshot_kind)
+
+    def load_remote_current_snapshot_for_readiness(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Load the current remote snapshot contract, accepting a fresh empty namespace."""
+
+        return self.probe_remote_current_snapshot_for_readiness(snapshot_kind=snapshot_kind)
 
     def get_object(self, memory_id: str) -> LongTermMemoryObjectV1 | None:
         """Return one stored memory object by canonical memory ID."""
@@ -876,6 +916,75 @@ class StructuredStoreSnapshotMixin:
             return False
         raise ValueError(f"Remote structured snapshot {snapshot_kind!r} has an invalid schema.")
 
+    def _ensure_remote_snapshot_payload_for_readiness(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path: Path,
+        empty_payload: dict[str, object],
+    ) -> bool:
+        """Repair missing remote heads only when authoritative local state exists."""
+
+        if self.remote_state is None:
+            raise RuntimeError("Remote state store is required to ensure remote snapshots.")
+        local_path = self._validated_local_path(local_path)
+        remote_catalog = self._remote_catalog
+        head_probe = None if remote_catalog is None else getattr(remote_catalog, "probe_catalog_payload", None)
+        if (
+            snapshot_kind in {"objects", "conflicts", "archive"}
+            and remote_catalog is not None
+            and callable(head_probe)
+        ):
+            head_result_loader = getattr(remote_catalog, "_load_catalog_head_result", None)
+            if callable(head_result_loader):
+                head_result = head_result_loader(snapshot_kind=snapshot_kind, metadata_only=True)
+                head_status = str(getattr(head_result, "status", "") or "")
+                head_payload = getattr(head_result, "payload", None)
+            else:
+                head_status = ""
+                head_payload = head_probe(snapshot_kind=snapshot_kind)
+            if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
+                return False
+            probe = self._probe_remote_state_snapshot(
+                remote_state=self.remote_state,
+                snapshot_kind=snapshot_kind,
+                prefer_metadata_only=True,
+                fast_fail=True,
+            )
+            probe_payload = getattr(probe, "payload", None)
+            if remote_catalog.is_catalog_payload(
+                snapshot_kind=snapshot_kind,
+                payload=probe_payload if isinstance(probe_payload, Mapping) else None,
+            ):
+                return False
+            if getattr(probe, "status", None) == "unavailable":
+                detail = str(getattr(probe, "detail", "") or "")
+                raise LongTermRemoteUnavailableError(
+                    detail or f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
+                )
+            if head_status in {"invalid", "unavailable"}:
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
+                )
+            local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+            if (
+                local_payload is None
+                or not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
+                or self._is_effectively_empty_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
+            ):
+                return False
+            self._persist_snapshot_payload(
+                snapshot_kind=snapshot_kind,
+                local_path=local_path,
+                payload=local_payload,
+            )
+            return True
+        return self._ensure_remote_snapshot_payload(
+            snapshot_kind=snapshot_kind,
+            local_path=local_path,
+            empty_payload=empty_payload,
+        )
+
     def _remote_snapshot_exists_via_probe(self, *, snapshot_kind: str) -> bool:
         """Return whether a light remote probe already proves the snapshot exists.
 
@@ -1027,6 +1136,49 @@ class StructuredStoreSnapshotMixin:
             "version": _ARCHIVE_STORE_VERSION,
             "objects": [],
         }
+
+    def _is_effectively_empty_snapshot_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object] | None,
+    ) -> bool:
+        """Return whether one valid snapshot payload contains no stored items."""
+
+        if not isinstance(payload, Mapping):
+            return False
+        if not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=payload):
+            return False
+        item_key = self._items_key_for_snapshot(snapshot_kind)
+        items = payload.get(item_key)
+        return isinstance(items, list) and not items
+
+    def _synthetic_empty_snapshot_payload_for_readiness(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        """Return one read-only empty payload for fresh required namespaces."""
+
+        local_path = {
+            "objects": self.objects_path,
+            "conflicts": self.conflicts_path,
+            "archive": self.archive_path,
+        }.get(snapshot_kind)
+        if local_path is None:
+            return None
+        local_payload = self._read_local_snapshot_payload(
+            snapshot_kind=snapshot_kind,
+            local_path=self._validated_local_path(local_path),
+        )
+        if isinstance(local_payload, Mapping):
+            if not self._is_effectively_empty_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload):
+                return None
+            return dict(local_payload)
+        empty_payload = {
+            "objects": self._empty_objects_payload,
+            "conflicts": self._empty_conflicts_payload,
+            "archive": self._empty_archive_payload,
+        }[snapshot_kind]()
+        synthetic_payload = dict(empty_payload)
+        synthetic_payload[_SNAPSHOT_WRITTEN_AT_KEY] = "1970-01-01T00:00:00+00:00"
+        return synthetic_payload
 
     def _stamp_snapshot_payload(self, payload: dict[str, object]) -> dict[str, object]:
         stamped = dict(payload)

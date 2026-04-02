@@ -9,6 +9,7 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, unified 
 - execution of synthetic, multimodal, unified-retrieval, and live subtext evals
 - execution of live midterm write/read/usage attestations against the real OpenAI and ChonkyDB path in an isolated namespace, with remote proof taken from the authoritative midterm current head instead of a legacy snapshot blob
 - execution of live synthetic-memory acceptance matrices covering earlier memory, conflict resolution, restart persistence, and control-query containment against the real OpenAI and ChonkyDB path in an isolated namespace
+- seed live synthetic-memory acceptance fixtures through active-delta current-head writes instead of whole-state `write_snapshot(...)` rewrites, so the acceptance harness exercises the same bounded remote-write contract as the runtime paths it is attesting
 - execution of fixed unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources
 - execution of live writer/fresh-reader unified-retrieval acceptance against the real ChonkyDB path using the same fixed goldset cases as the local goldset runner
 - execution of a unified-retrieval benchmark over the same fixed goldset cases, reporting source-wise precision/recall, selected-id precision/recall, join-anchor quality, and path-safety metrics

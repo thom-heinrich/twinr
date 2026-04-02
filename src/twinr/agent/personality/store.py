@@ -34,6 +34,7 @@ from typing import Protocol, TypeVar, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality._remote_state_utils import (
+    clone_remote_state_with_capped_read_timeout as _clone_remote_state_with_capped_read_timeout,
     resolve_remote_state as _resolve_remote_state,
 )
 from twinr.agent.personality.models import (
@@ -62,6 +63,7 @@ _DEFAULT_MAX_COMPRESSED_BYTES = 2 * 1024 * 1024
 _DEFAULT_COMPRESSION_THRESHOLD_BYTES = 16 * 1024
 _DEFAULT_MAX_LIST_ITEMS = 4096
 _DEFAULT_REVISION_ID_LENGTH = 16
+_OPTIONAL_PROMPT_READ_TIMEOUT_S = 2.0
 _HMAC_CONFIG_ATTRS = (
     "remote_state_hmac_key",
     "snapshot_hmac_key",
@@ -558,17 +560,35 @@ def _load_raw_snapshot_payload(
     resolved_remote_state = _resolve_remote_state(config=config, remote_state=remote_state)
     if resolved_remote_state is None:
         return None, None, None
+    prompt_remote_state = _clone_remote_state_with_capped_read_timeout(
+        config=config,
+        remote_state=resolved_remote_state,
+        timeout_s=_OPTIONAL_PROMPT_READ_TIMEOUT_S,
+    )
+    if prompt_remote_state is None:
+        return None, None, None
 
-    current_records = LongTermRemoteCurrentRecordStore(resolved_remote_state)
-    payload = current_records.load_single_payload(snapshot_kind=snapshot_kind)
-    if isinstance(payload, Mapping):
-        payload_dict = dict(payload)
-        return resolved_remote_state, payload_dict, _sha256_hex(_canonical_json_bytes(payload_dict))
+    current_records = LongTermRemoteCurrentRecordStore(prompt_remote_state)
+    current_head = current_records.probe_current_head(snapshot_kind=snapshot_kind)
+    if isinstance(current_head, Mapping):
+        payloads = current_records.load_collection_payloads(
+            snapshot_kind=snapshot_kind,
+            head_payload=current_head,
+        )
+        if payloads:
+            payload_dict = dict(payloads[0])
+            return prompt_remote_state, payload_dict, _sha256_hex(_canonical_json_bytes(payload_dict))
+    legacy_head = current_records.probe_legacy_collection_head(
+        snapshot_kind=snapshot_kind,
+        prefer_metadata_only=True,
+    )
+    if not isinstance(legacy_head, Mapping):
+        return prompt_remote_state, None, None
 
     with _snapshot_lock(snapshot_kind):
-        raw_payload = resolved_remote_state.load_snapshot(snapshot_kind=snapshot_kind)
+        raw_payload = prompt_remote_state.load_snapshot(snapshot_kind=snapshot_kind)
         if raw_payload is None:
-            return resolved_remote_state, None, None
+            return prompt_remote_state, None, None
         if not isinstance(raw_payload, Mapping):
             raise ValueError(f"{snapshot_kind} must decode to a mapping payload.")
 
@@ -581,13 +601,13 @@ def _load_raw_snapshot_payload(
         )
         snapshot_fingerprint = _snapshot_fingerprint(raw_payload)
         _set_cached_snapshot_fingerprint(
-            resolved_remote_state=resolved_remote_state,
+            resolved_remote_state=prompt_remote_state,
             snapshot_kind=snapshot_kind,
             snapshot_fingerprint=snapshot_fingerprint,
         )
         # Keep prompt-time snapshot loads read-only. Legacy-head promotion can
         # trigger remote writes and job polling, which blocks live Pi turns.
-        return resolved_remote_state, payload, payload_hash
+        return prompt_remote_state, payload, payload_hash
 
 
 def _save_raw_snapshot_payload(

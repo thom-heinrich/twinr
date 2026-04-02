@@ -377,12 +377,15 @@ def _resolve_remote_collection_head(
     remote_records: object,
     remote_snapshot_kind: str | None,
     local_entries: tuple[object, ...],
+    allow_legacy_probe: bool = True,
 ) -> dict[str, object] | None:
     """Resolve one prompt/managed current head without forcing a bootstrap write.
 
     The fixed `.../catalog/current` document is authoritative when present.
-    When it is missing, readiness/render paths first reuse the read-only legacy
-    snapshot probe. Only when both remote heads are absent and the local
+    When it is missing, compatibility callers may still reuse the read-only
+    legacy snapshot probe. Live prompt assembly can disable that path so the
+    hot path stays on current-head records only. Only when all allowed remote
+    heads are absent and the local
     collection is empty do we synthesize the canonical empty catalog head
     locally, because writing an empty current head during watchdog bootstrap
     has proven slow enough to strand the Pi display on ERROR despite a healthy
@@ -397,7 +400,7 @@ def _resolve_remote_collection_head(
         if isinstance(direct_head, Mapping):
             return dict(direct_head)
     probe_legacy_collection_head = getattr(remote_records, "probe_legacy_collection_head", None)
-    if callable(probe_legacy_collection_head):
+    if allow_legacy_probe and callable(probe_legacy_collection_head):
         legacy_head = probe_legacy_collection_head(
             snapshot_kind=remote_snapshot_kind,
             prefer_metadata_only=True,
@@ -412,6 +415,30 @@ def _resolve_remote_collection_head(
         if isinstance(empty_head, Mapping):
             return dict(empty_head)
     return None
+
+
+def _probe_remote_collection_head_status(
+    *,
+    remote_records: object,
+    remote_snapshot_kind: str | None,
+) -> tuple[str, dict[str, object] | None]:
+    """Return the fixed current-head probe status for one prompt collection."""
+
+    if remote_snapshot_kind is None:
+        return "disabled", None
+    probe_current_head_result = getattr(remote_records, "probe_current_head_result", None)
+    if callable(probe_current_head_result):
+        status, payload = probe_current_head_result(snapshot_kind=remote_snapshot_kind)
+        normalized_status = _normalize_text(status, limit=32).lower() or "unavailable"
+        if isinstance(payload, Mapping):
+            return normalized_status, dict(payload)
+        return normalized_status, None
+    probe_current_head = getattr(remote_records, "probe_current_head", None)
+    if callable(probe_current_head):
+        payload = probe_current_head(snapshot_kind=remote_snapshot_kind)
+        if isinstance(payload, Mapping):
+            return "found", dict(payload)
+    return "missing", None
 
 
 class ManagedContextFileStore:
@@ -429,6 +456,7 @@ class ManagedContextFileStore:
         section_title: str,
         remote_state: "LongTermRemoteStateStore | None" = None,
         remote_snapshot_kind: str | None = None,
+        allow_legacy_head_reads: bool = True,
         root_dir: str | Path | None = None,
     ) -> None:
         # AUDIT-FIX(#1): Resolve and constrain storage paths eagerly so later file ops hit a canonical location.
@@ -439,6 +467,7 @@ class ManagedContextFileStore:
 
         self._remote_records = LongTermRemoteCurrentRecordStore(remote_state)
         self.remote_snapshot_kind = _normalize_text(remote_snapshot_kind or "", limit=80) or None
+        self.allow_legacy_head_reads = bool(allow_legacy_head_reads)
         # AUDIT-FIX(#5): Share locks across instances that target the same file or snapshot kind.
         self._lock_names = [f"path::{self.path}"]
         if self.remote_snapshot_kind:
@@ -576,10 +605,9 @@ class ManagedContextFileStore:
             local_entries = self._load_local_entries()
 
             try:
-                probe_payload = _resolve_remote_collection_head(
+                probe_status, probe_payload = _probe_remote_collection_head_status(
                     remote_records=self._remote_records,
                     remote_snapshot_kind=self.remote_snapshot_kind,
-                    local_entries=local_entries,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
@@ -592,6 +620,11 @@ class ManagedContextFileStore:
                 return False
             if isinstance(probe_payload, Mapping):
                 return False
+            if probe_status == "invalid":
+                return self._try_save_remote_entries(
+                    local_entries,
+                    replace_invalid_current_head=True,
+                )
             if not local_entries:
                 return False
             return self._try_save_remote_entries(local_entries)
@@ -605,6 +638,7 @@ class ManagedContextFileStore:
             remote_records=self._remote_records,
             remote_snapshot_kind=self.remote_snapshot_kind,
             local_entries=self._load_local_entries(),
+            allow_legacy_probe=self.allow_legacy_head_reads,
         )
 
     def load_remote_current_head(self) -> dict[str, object] | None:
@@ -616,6 +650,7 @@ class ManagedContextFileStore:
             remote_records=self._remote_records,
             remote_snapshot_kind=self.remote_snapshot_kind,
             local_entries=self._load_local_entries(),
+            allow_legacy_probe=self.allow_legacy_head_reads,
         )
 
     def _split_document(self) -> tuple[str, tuple[ManagedContextEntry, ...], str]:
@@ -698,11 +733,19 @@ class ManagedContextFileStore:
             entries.append(entry)
         return "ok", tuple(entries)
 
-    def _try_save_remote_entries(self, entries: tuple[ManagedContextEntry, ...]) -> bool:
+    def _try_save_remote_entries(
+        self,
+        entries: tuple[ManagedContextEntry, ...],
+        *,
+        replace_invalid_current_head: bool = False,
+    ) -> bool:
         if not self._remote_enabled():
             return False
         try:
-            self._save_remote_entries(entries)
+            self._save_remote_entries(
+                entries,
+                replace_invalid_current_head=replace_invalid_current_head,
+            )
             return True
         except Exception as exc:
             if _is_remote_unavailable_error(exc):
@@ -726,9 +769,17 @@ class ManagedContextFileStore:
             LOGGER.warning("Failed to mirror managed context to %s: %s", self.path, exc)
             return False
 
-    def _save_remote_entries(self, entries: tuple[ManagedContextEntry, ...]) -> None:
+    def _save_remote_entries(
+        self,
+        entries: tuple[ManagedContextEntry, ...],
+        *,
+        replace_invalid_current_head: bool = False,
+    ) -> None:
         if self.remote_state is None or self.remote_snapshot_kind is None:
             raise RuntimeError("Remote managed-context storage is not configured.")
+        if not entries:
+            self._remote_records.save_empty_collection_head(snapshot_kind=self.remote_snapshot_kind)
+            return
         written_at = max((_coerce_utc(entry.updated_at).isoformat() for entry in entries), default=None)
         self._remote_records.save_collection(
             snapshot_kind=self.remote_snapshot_kind,
@@ -737,6 +788,7 @@ class ManagedContextFileStore:
             metadata_builder=_managed_context_entry_metadata,
             content_builder=_managed_context_entry_content,
             written_at=written_at,
+            replace_invalid_current_head=replace_invalid_current_head,
         )
 
     def _write_document(
@@ -780,6 +832,7 @@ class PersistentMemoryMarkdownStore:
         max_entries: int = 24,
         remote_state: "LongTermRemoteStateStore | None" = None,
         remote_snapshot_kind: str = "prompt_memory",
+        allow_legacy_head_reads: bool = True,
         root_dir: str | Path | None = None,
     ) -> None:
         # AUDIT-FIX(#1): Canonicalize the target path before any read/write operation.
@@ -790,6 +843,7 @@ class PersistentMemoryMarkdownStore:
 
         self._remote_records = LongTermRemoteCurrentRecordStore(remote_state)
         self.remote_snapshot_kind = _normalize_text(remote_snapshot_kind, limit=80) or "prompt_memory"
+        self.allow_legacy_head_reads = bool(allow_legacy_head_reads)
         # AUDIT-FIX(#5): Use shared named locks to prevent lost updates under concurrent access.
         self._lock_names = [f"path::{self.path}", f"snapshot::{self.remote_snapshot_kind}"]
 
@@ -822,6 +876,7 @@ class PersistentMemoryMarkdownStore:
         return cls(
             config.memory_markdown_path,
             remote_state=remote_state,
+            allow_legacy_head_reads=False,
             root_dir=config.project_root,
         )
 
@@ -850,10 +905,9 @@ class PersistentMemoryMarkdownStore:
             local_entries = self._load_local_entries()
 
             try:
-                probe_payload = _resolve_remote_collection_head(
+                probe_status, probe_payload = _probe_remote_collection_head_status(
                     remote_records=self._remote_records,
                     remote_snapshot_kind=self.remote_snapshot_kind,
-                    local_entries=local_entries,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
@@ -866,6 +920,11 @@ class PersistentMemoryMarkdownStore:
                 return False
             if isinstance(probe_payload, Mapping):
                 return False
+            if probe_status == "invalid":
+                return self._try_save_remote_entries(
+                    local_entries,
+                    replace_invalid_current_head=True,
+                )
             if not local_entries:
                 return False
             return self._try_save_remote_entries(local_entries)
@@ -879,6 +938,7 @@ class PersistentMemoryMarkdownStore:
             remote_records=self._remote_records,
             remote_snapshot_kind=self.remote_snapshot_kind,
             local_entries=self._load_local_entries(),
+            allow_legacy_probe=self.allow_legacy_head_reads,
         )
 
     def load_remote_current_head(self) -> dict[str, object] | None:
@@ -890,6 +950,7 @@ class PersistentMemoryMarkdownStore:
             remote_records=self._remote_records,
             remote_snapshot_kind=self.remote_snapshot_kind,
             local_entries=self._load_local_entries(),
+            allow_legacy_probe=self.allow_legacy_head_reads,
         )
 
     def _load_local_entries(self) -> tuple[PersistentMemoryEntry, ...]:
@@ -1085,11 +1146,19 @@ class PersistentMemoryMarkdownStore:
             entries.append(entry)
         return "ok", tuple(entries)
 
-    def _try_save_remote_entries(self, entries: tuple[PersistentMemoryEntry, ...]) -> bool:
+    def _try_save_remote_entries(
+        self,
+        entries: tuple[PersistentMemoryEntry, ...],
+        *,
+        replace_invalid_current_head: bool = False,
+    ) -> bool:
         if not self._remote_enabled():
             return False
         try:
-            self._save_remote_entries(entries)
+            self._save_remote_entries(
+                entries,
+                replace_invalid_current_head=replace_invalid_current_head,
+            )
             return True
         except Exception as exc:
             if _is_remote_unavailable_error(exc):
@@ -1113,9 +1182,17 @@ class PersistentMemoryMarkdownStore:
             LOGGER.warning("Failed to mirror prompt memory to %s: %s", self.path, exc)
             return False
 
-    def _save_remote_entries(self, entries: tuple[PersistentMemoryEntry, ...]) -> None:
+    def _save_remote_entries(
+        self,
+        entries: tuple[PersistentMemoryEntry, ...],
+        *,
+        replace_invalid_current_head: bool = False,
+    ) -> None:
         if self.remote_state is None:
             raise RuntimeError("Remote prompt-memory storage is not configured.")
+        if not entries:
+            self._remote_records.save_empty_collection_head(snapshot_kind=self.remote_snapshot_kind)
+            return
         written_at = max((_coerce_utc(entry.updated_at).isoformat() for entry in entries), default=None)
         self._remote_records.save_collection(
             snapshot_kind=self.remote_snapshot_kind,
@@ -1124,6 +1201,7 @@ class PersistentMemoryMarkdownStore:
             metadata_builder=_persistent_memory_entry_metadata,
             content_builder=_persistent_memory_entry_content,
             written_at=written_at,
+            replace_invalid_current_head=replace_invalid_current_head,
         )
 
     def _entry_from_mapping(self, data: dict[str, str]) -> PersistentMemoryEntry | None:
@@ -1175,6 +1253,7 @@ class PromptContextStore:
                 section_title="Twinr managed user updates",
                 remote_state=remote_state,
                 remote_snapshot_kind="user_context",
+                allow_legacy_head_reads=False,
                 root_dir=config.project_root,
             ),
             personality_store=ManagedContextFileStore(
@@ -1182,6 +1261,7 @@ class PromptContextStore:
                 section_title="Twinr managed personality updates",
                 remote_state=remote_state,
                 remote_snapshot_kind="personality_context",
+                allow_legacy_head_reads=False,
                 root_dir=config.project_root,
             ),
         )

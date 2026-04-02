@@ -25,6 +25,11 @@ from twinr.orchestrator.acks import ack_text_for_id
 from twinr.orchestrator.client import OrchestratorWebSocketClient
 from twinr.orchestrator.contracts import OrchestratorToolResponse, OrchestratorTurnCompleteEvent
 from twinr.orchestrator.contracts import OrchestratorTurnRequest
+from twinr.orchestrator.remote_tool_timeout import (
+    DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS,
+    REMOTE_TOOL_TIMEOUT_ENV,
+    read_remote_tool_timeout_seconds,
+)
 from twinr.orchestrator.remote_asr import RemoteAsrBackendAdapter, _encode_multipart_form
 from twinr.orchestrator.remote_asr_service import (
     RemoteAsrHttpService,
@@ -984,6 +989,21 @@ class OrchestratorSessionTests(unittest.TestCase):
         self.assertEqual(result.text, "Morgen wird es sonnig.")
         self.assertTrue(result.used_web_search)
 
+    def test_remote_tool_bridge_uses_shared_default_timeout_budget(self) -> None:
+        bridge = RemoteToolBridge(lambda payload: None)
+
+        self.assertEqual(
+            bridge._tool_result_timeout_seconds,
+            DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS,
+        )
+
+    def test_remote_tool_timeout_env_applies_to_bridge_budget(self) -> None:
+        with patch.dict("os.environ", {REMOTE_TOOL_TIMEOUT_ENV: "123"}, clear=False):
+            self.assertEqual(read_remote_tool_timeout_seconds(), 123.0)
+            bridge = RemoteToolBridge(lambda payload: None)
+
+        self.assertEqual(bridge._tool_result_timeout_seconds, 123.0)
+
 
 class OrchestratorServerTests(unittest.TestCase):
     def test_server_websocket_bridges_tool_request_and_result(self) -> None:
@@ -1101,6 +1121,18 @@ class OrchestratorServerTests(unittest.TestCase):
                 create_orchestrator_app(env_path)
 
 class OrchestratorClientTests(unittest.TestCase):
+    def test_client_uses_shared_default_tool_timeout_budget(self) -> None:
+        client = OrchestratorWebSocketClient(
+            "ws://127.0.0.1/ws",
+            connector=lambda *args, **kwargs: None,
+            require_tls=False,
+        )
+
+        self.assertEqual(
+            client.tool_timeout_seconds,
+            DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS,
+        )
+
     def test_voice_audio_frame_round_trips_embedded_runtime_state(self) -> None:
         frame = OrchestratorVoiceAudioFrame(
             sequence=7,

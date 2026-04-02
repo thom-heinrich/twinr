@@ -68,6 +68,17 @@ files:
     role: Blocking and asyncio-safe websocket client
     exports:
       - OrchestratorWebSocketClient
+  - path: local_bridge_target.py
+    role: Host-side probe target resolver that rewrites stale self-LAN websocket URLs to the authoritative loopback bridge when available
+    exports:
+      - LocalOrchestratorBridgeTarget
+      - resolve_local_orchestrator_probe_target
+  - path: remote_tool_timeout.py
+    role: Shared timeout policy for remote tool waits across the websocket client and server bridge
+    exports:
+      - DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS
+      - REMOTE_TOOL_TIMEOUT_ENV
+      - read_remote_tool_timeout_seconds
   - path: probe_turn.py
     role: Lightweight text-only websocket probe bootstrap with stage timing evidence
   - path: non_voice_acceptance.py

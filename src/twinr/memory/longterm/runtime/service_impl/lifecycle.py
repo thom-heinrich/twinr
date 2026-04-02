@@ -84,6 +84,14 @@ class LongTermMemoryServiceLifecycleMixin(ServiceMixinBase):
         """Request bounded shutdown for all configured background writers."""
 
         resolved_timeout_s = _coerce_timeout_s(timeout_s, default=2.0)
+        query_rewriter = getattr(self, "query_rewriter", None)
+        if query_rewriter is not None:
+            shutdown = getattr(query_rewriter, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown(wait=False)
+                except Exception:
+                    logger.exception("Failed to shutdown long-term query rewriter cleanly.")
         retriever = getattr(self, "retriever", None)
         subtext_builder = getattr(retriever, "subtext_builder", None)
         if subtext_builder is not None:

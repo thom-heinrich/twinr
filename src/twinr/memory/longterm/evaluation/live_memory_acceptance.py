@@ -401,10 +401,9 @@ def _seed_synthetic_memory(service: LongTermMemoryService) -> str:
         question="Welche Marmelade stimmt gerade?",
         reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
     )
-    service.object_store.write_snapshot(
-        objects=(thermos, jam_generic, jam_old, jam_new),
-        conflicts=(conflict,),
-        archived_objects=(),
+    service.object_store.commit_active_delta(
+        object_upserts=(thermos, jam_generic, jam_old, jam_new),
+        conflict_upserts=(conflict,),
     )
     return jam_new.memory_id
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import json
-import math
 import time
 from uuid import uuid4
 
@@ -48,7 +47,18 @@ from .shared import (
 )
 
 _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES = 16_384
-_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset({"conflicts"})
+_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
+    {
+        "conflicts",
+    }
+)
+_PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
+    {
+        "objects",
+        "conflicts",
+        "archive",
+    }
+)
 
 
 class RemoteCatalogWriteMixin:
@@ -60,6 +70,7 @@ class RemoteCatalogWriteMixin:
         item_id_getter,
         metadata_builder,
         content_builder,
+        replace_invalid_current_head: bool = False,
     ) -> dict[str, object]:
         """Persist individual remote items and return the small current catalog."""
 
@@ -67,14 +78,22 @@ class RemoteCatalogWriteMixin:
         remote_state = self._require_remote_state()
         write_client = self._require_client(getattr(remote_state, "write_client", None), operation="write")
         definition = self._require_definition(snapshot_kind)
-        existing_entries = (
-            {}
-            if definition.snapshot_kind in {"graph_nodes", "graph_edges"}
-            else {
-                entry.item_id: entry
-                for entry in self._load_catalog_entries_for_write(snapshot_kind=snapshot_kind)
-            }
-        )
+        try:
+            existing_entries = (
+                {}
+                if definition.snapshot_kind in {"graph_nodes", "graph_edges"}
+                else {
+                    entry.item_id: entry
+                    for entry in self._load_catalog_entries_for_write(snapshot_kind=snapshot_kind)
+                }
+            )
+        except LongTermRemoteUnavailableError:
+            if not replace_invalid_current_head:
+                raise
+            head_status, _payload = self.probe_catalog_payload_result(snapshot_kind=snapshot_kind)
+            if head_status != "invalid":
+                raise
+            existing_entries = {}
         record_items: list[ChonkyDBRecordItem] = []
         staged: list[tuple[str, dict[str, object], str, dict[str, object]]] = []
         catalog_entries: list[dict[str, object]] = []
@@ -129,6 +148,7 @@ class RemoteCatalogWriteMixin:
                     metadata=metadata,
                     content=content_text,
                     uri=uri,
+                    target_indexes=self._searchable_write_target_indexes(),
                     enable_chunking=False,
                     include_insights_in_response=False,
                 )
@@ -232,6 +252,7 @@ class RemoteCatalogWriteMixin:
         *,
         snapshot_kind: str,
         payload: Mapping[str, object],
+        attest_readback: bool = True,
     ) -> dict[str, object]:
         """Persist the authoritative current catalog head as one fixed-URI record."""
 
@@ -264,10 +285,12 @@ class RemoteCatalogWriteMixin:
                     metadata=metadata,
                     content=json.dumps(payload_dict, ensure_ascii=False),
                     uri=self._catalog_head_uri(snapshot_kind=definition.snapshot_kind),
+                    target_indexes=self._control_plane_write_target_indexes(),
                     enable_chunking=False,
                     include_insights_in_response=False,
                 )
             ],
+            attest_readback=attest_readback,
         )
         self._store_recent_catalog_head_payload(snapshot_kind=definition.snapshot_kind, payload=payload_dict)
         return payload_dict
@@ -581,6 +604,7 @@ class RemoteCatalogWriteMixin:
         remote_state = self._require_remote_state()
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        allowed_indexes = self._selection_hydration_allowed_indexes()
         if supports_topk_records and callable(topk_records):
             started_monotonic = time.monotonic()
             try:
@@ -601,6 +625,7 @@ class RemoteCatalogWriteMixin:
                             include_content=True,
                             include_metadata=True,
                             max_content_chars=self._max_content_chars(),
+                            allowed_indexes=allowed_indexes,
                             allowed_doc_ids=batch,
                         )
                     ),
@@ -659,6 +684,7 @@ class RemoteCatalogWriteMixin:
                         include_content=True,
                         include_metadata=True,
                         max_content_chars=self._max_content_chars(),
+                        allowed_indexes=allowed_indexes,
                         allowed_doc_ids=batch,
                     )
                 ),
@@ -911,6 +937,7 @@ class RemoteCatalogWriteMixin:
                 "segment_index": segment_index,
                 "items": list(segment_entries),
             }
+            segment_token = self._payload_sha256(segment_payload)[:24]
             record_items.append(
                 ChonkyDBRecordItem(
                     payload=segment_payload,
@@ -918,9 +945,15 @@ class RemoteCatalogWriteMixin:
                         "twinr_snapshot_kind": definition.snapshot_kind,
                         "twinr_catalog_segment_index": segment_index,
                         "twinr_catalog_segment_items": len(segment_entries),
+                        "twinr_catalog_segment_token": segment_token,
                     },
                     content=json.dumps(segment_payload, ensure_ascii=False),
-                    uri=self._catalog_segment_uri(snapshot_kind=definition.snapshot_kind, segment_index=segment_index),
+                    uri=self._catalog_segment_uri(
+                        snapshot_kind=definition.snapshot_kind,
+                        segment_index=segment_index,
+                        segment_token=segment_token,
+                    ),
+                    target_indexes=self._control_plane_write_target_indexes(),
                     enable_chunking=False,
                     include_insights_in_response=False,
                 )
@@ -932,6 +965,14 @@ class RemoteCatalogWriteMixin:
         )
         refs: list[dict[str, object]] = []
         for segment_index, segment_entries in enumerate(segment_batches):
+            segment_payload = {
+                "schema": definition.segment_schema,
+                "version": _SEGMENT_VERSION,
+                "snapshot_kind": definition.snapshot_kind,
+                "segment_index": segment_index,
+                "items": list(segment_entries),
+            }
+            segment_token = self._payload_sha256(segment_payload)[:24]
             refs.append(
                 {
                     "segment_index": segment_index,
@@ -939,6 +980,7 @@ class RemoteCatalogWriteMixin:
                     "uri": self._catalog_segment_uri(
                         snapshot_kind=definition.snapshot_kind,
                         segment_index=segment_index,
+                        segment_token=segment_token,
                     ),
                     "entry_count": len(segment_entries),
                 }
@@ -987,6 +1029,7 @@ class RemoteCatalogWriteMixin:
         *,
         snapshot_kind: str,
         record_items: list[ChonkyDBRecordItem],
+        attest_readback: bool = True,
     ) -> tuple[str | None, ...]:
         if not record_items:
             return ()
@@ -1002,6 +1045,7 @@ class RemoteCatalogWriteMixin:
                     batch_index=index + 1,
                     batch_count=total_batches,
                     finalize_vector_segments=index + 1 >= len(batches),
+                    attest_readback=attest_readback,
                 )
             )
         return tuple(document_ids)
@@ -1015,6 +1059,7 @@ class RemoteCatalogWriteMixin:
         batch_index: int,
         batch_count: int,
         finalize_vector_segments: bool,
+        attest_readback: bool,
     ) -> tuple[str | None, ...]:
         retry_attempts = max(1, self._remote_retry_attempts())
         retry_backoff_s = self._remote_retry_backoff_s()
@@ -1047,15 +1092,40 @@ class RemoteCatalogWriteMixin:
                         response_json=dict(result) if isinstance(result, Mapping) else None,
                     )
                 extracted_document_ids = self._extract_document_ids(result, expected=len(batch))
-                job_document_ids = self._await_async_job_document_ids(
-                    write_client,
-                    result=result,
-                    expected=len(batch),
+                fine_grained_attestation_optional = self._can_defer_fine_grained_readback_attestation(
                     snapshot_kind=snapshot_kind,
+                    batch=batch,
+                    document_ids=extracted_document_ids,
                 )
+                async_job_resolution_budget_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
+                async_job_poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+                async_job_resolution_available = bool(
+                    self._normalize_text(result.get("job_id")) if isinstance(result, Mapping) else None
+                ) and callable(getattr(write_client, "job_status", None))
+                if (
+                    self._can_skip_async_job_document_id_wait(
+                        snapshot_kind=snapshot_kind,
+                        batch=batch,
+                        document_ids=extracted_document_ids,
+                    )
+                    or (fine_grained_attestation_optional and async_job_resolution_budget_s < async_job_poll_interval_s)
+                    or not async_job_resolution_available
+                ):
+                    job_document_ids = None
+                else:
+                    job_document_ids = self._await_async_job_document_ids(
+                        write_client,
+                        result=result,
+                        expected=len(batch),
+                        snapshot_kind=snapshot_kind,
+                    )
                 if job_document_ids is not None:
                     extracted_document_ids = job_document_ids
-                if all(isinstance(value, str) and value for value in extracted_document_ids):
+                if not attest_readback:
+                    resolved_document_ids = extracted_document_ids
+                elif all(isinstance(value, str) and value for value in extracted_document_ids):
+                    resolved_document_ids = extracted_document_ids
+                elif fine_grained_attestation_optional and async_job_resolution_available:
                     resolved_document_ids = extracted_document_ids
                 else:
                     resolved_document_ids = self._attest_record_batch_readback(
@@ -1161,6 +1231,51 @@ class RemoteCatalogWriteMixin:
             return "catalog_current_head_write"
         return "record_bulk_write"
 
+    def _can_defer_fine_grained_readback_attestation(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        document_ids: tuple[str | None, ...],
+    ) -> bool:
+        """Return whether one accepted batch may skip per-item readback attestation.
+
+        Live ChonkyDB can finish async writes without exposing stable payload ids.
+        In that shape the fallback `documents/full?origin_uri=...` path is not an
+        indexed exact lookup; it can 404 on large stores even though the later
+        catalog/segment/current-head writes that Twinr actually serves from are
+        valid. Objects/conflicts/archive keep the bounded runtime projection on
+        catalog entries, so their authoritative proof is the catalog write path,
+        not a URI-only item-document reread. Other snapshot kinds still require
+        strict item-document attestation because readers depend on those records.
+        """
+
+        if snapshot_kind not in _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS:
+            return False
+        if self._record_batch_payload_kind(batch=batch) != "fine_grained_record_batch":
+            return False
+        return not all(isinstance(value, str) and value for value in document_ids)
+
+    def _can_skip_async_job_document_id_wait(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        document_ids: tuple[str | None, ...],
+    ) -> bool:
+        """Return whether one accepted batch may skip async job-status doc-id polling.
+
+        Exact document ids from ``job_status(...)`` are useful even for mutable
+        current heads: they let same-URI attestation distinguish the newly
+        accepted document from older history without trusting the exact-id read
+        alone as authoritative visibility. Only batches that already carry exact
+        ids may skip the jobs endpoint entirely.
+        """
+
+        del snapshot_kind
+        del batch
+        return all(isinstance(value, str) and value for value in document_ids)
+
     def _bulk_execution_mode(
         self,
         *,
@@ -1171,10 +1286,12 @@ class RemoteCatalogWriteMixin:
         """Choose sync only for tiny one-item control-plane batches.
 
         Conflicts stay small enough that the async job overhead can dominate the
-        actual write. Graph writes used to share that path, but live Pi evidence
-        now shows even tiny graph item and segment batches can exceed the 15 s
-        transport timeout when forced through sync `/records/bulk`. Graph
-        current-view persistence therefore stays on the async job contract.
+        actual write. Prompt/context current-head and segment writes are also
+        tiny, but live ChonkyDB evidence shows the sync `/records/bulk` path can
+        still trigger heavyweight fulltext index loads in the request thread for
+        those batches. That stalls the caller long enough to produce transport
+        timeouts and backend lock contention, so only conflicts remain on the
+        sync fast path. Graph writes already stay async for the same reason.
         """
 
         if snapshot_kind not in _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS or len(batch) != 1:
@@ -1306,25 +1423,29 @@ class RemoteCatalogWriteMixin:
             raise LongTermRemoteUnavailableError(
                 f"Accepted remote long-term {snapshot_kind!r} write cannot be attested without document id or uri."
             )
-        resolved_attempts = max(1, self._remote_retry_attempts())
         poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
         visibility_timeout_s = self._attestation_visibility_timeout_s(
             snapshot_kind=snapshot_kind,
             record_item=record_item,
         )
-        if poll_interval_s > 0.0:
-            resolved_attempts = max(
-                resolved_attempts,
-                int(math.ceil(visibility_timeout_s / poll_interval_s)),
-            )
         last_detail = "Remote write attestation did not observe the accepted payload."
-        for attempt in range(resolved_attempts):
-            for probe_document_id, probe_uri in self._attestation_probe_targets(
-                document_id=document_id,
-                resolved_uri=resolved_uri or None,
-            ):
+        probe_targets = self._attestation_probe_targets(
+            document_id=document_id,
+            resolved_uri=resolved_uri or None,
+            exact_document_id_authoritative=bool(document_id) and not self._is_mutable_catalog_record(record_item),
+        )
+        deadline = time.monotonic() + visibility_timeout_s
+        while True:
+            remaining_timeout_s = deadline - time.monotonic()
+            if remaining_timeout_s <= 0.0:
+                break
+            for probe_document_id, probe_uri in probe_targets:
+                remaining_timeout_s = deadline - time.monotonic()
+                if remaining_timeout_s <= 0.0:
+                    break
+                capped_read_client = clone_client_with_capped_timeout(read_client, timeout_s=remaining_timeout_s)
                 try:
-                    envelope = read_client.fetch_full_document(
+                    envelope = capped_read_client.fetch_full_document(
                         document_id=probe_document_id,
                         origin_uri=probe_uri,
                         include_content=True,
@@ -1340,10 +1461,11 @@ class RemoteCatalogWriteMixin:
                 if matched_document_id is not None:
                     return matched_document_id
                 last_detail = "Remote write attestation read back a different same-uri document."
-            if attempt + 1 >= resolved_attempts:
+            remaining_sleep_s = deadline - time.monotonic()
+            if remaining_sleep_s <= 0.0:
                 break
             if poll_interval_s > 0.0:
-                time.sleep(poll_interval_s)
+                time.sleep(min(poll_interval_s, remaining_sleep_s))
         raise LongTermRemoteUnavailableError(
             f"Accepted remote long-term {snapshot_kind!r} write could not be read back: {last_detail}"
         )
@@ -1356,50 +1478,69 @@ class RemoteCatalogWriteMixin:
     ) -> float:
         """Return the visibility window for one accepted-write attestation.
 
-        Mutable fixed heads like ``.../catalog/current`` can lag on same-URI
-        visibility longer than ordinary item records even after the async job is
-        already accepted. When the backend has not produced a stable exact
-        document id for that head yet, retrying the whole write after the
-        smaller generic attestation window just republishes the same moving head
-        and can make the lag worse. Current heads therefore inherit the broader
-        accepted-job visibility budget before we declare the write unavailable.
+        Mutable fixed catalog URIs like ``.../catalog/current`` and
+        ``.../catalog/segment/<n>`` can lag on same-URI visibility longer than
+        ordinary item records even after the async job is already accepted.
+        When the backend has not produced a stable exact document id for those
+        mutable URIs yet, retrying the whole write after the smaller generic
+        attestation window just republishes the same moving catalog surface and
+        can make the lag worse. Mutable catalog records therefore inherit the
+        broader accepted-job visibility budget before we declare the write
+        unavailable.
         """
 
         visibility_timeout_s = self._async_attestation_visibility_timeout_s()
-        if not self._is_mutable_current_head_record(record_item):
+        if not self._is_mutable_catalog_record(record_item):
             return visibility_timeout_s
         return max(
             visibility_timeout_s,
             self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind),
         )
 
-    def _is_mutable_current_head_record(self, record_item: ChonkyDBRecordItem) -> bool:
-        """Return whether one record item targets a fixed mutable current head."""
+    def _is_mutable_catalog_record(self, record_item: ChonkyDBRecordItem) -> bool:
+        """Return whether one record item targets a fixed mutable catalog URI."""
 
         resolved_uri = self._normalize_text(getattr(record_item, "uri", None))
+        metadata = getattr(record_item, "metadata", None)
+        metadata_mapping = metadata if isinstance(metadata, Mapping) else None
+        if isinstance(metadata_mapping, Mapping) and metadata_mapping.get("twinr_catalog_current_head") is True:
+            return True
+        if isinstance(metadata_mapping, Mapping) and metadata_mapping.get("twinr_catalog_segment_token") is not None:
+            return False
         if resolved_uri.endswith("/catalog/current"):
             return True
-        metadata = getattr(record_item, "metadata", None)
-        return isinstance(metadata, Mapping) and metadata.get("twinr_catalog_current_head") is True
+        if "/catalog/segment/" in resolved_uri:
+            suffix = resolved_uri.rsplit("/catalog/segment/", 1)[-1]
+            return len([part for part in suffix.split("/") if part]) <= 1
+        return bool(
+            isinstance(metadata_mapping, Mapping)
+            and metadata_mapping.get("twinr_catalog_segment_index") is not None
+        )
 
     def _attestation_probe_targets(
         self,
         *,
         document_id: str | None,
         resolved_uri: str | None,
+        exact_document_id_authoritative: bool = False,
     ) -> tuple[tuple[str | None, str | None], ...]:
         """Return the bounded probe order for one accepted record attestation.
 
         ChonkyDB can acknowledge an async batch and even advertise the final
         ``document_id`` before that exact-id lookup becomes readable. Polling
         only once on the advertised id produces false-negative write failures on
-        otherwise healthy backends. Keep the exact-id probe first, then fall
-        back to the stable same-URI lookup when available.
+        otherwise healthy backends. For immutable item/segment documents, that
+        exact id is still the authoritative proof once it exists; a same-URI
+        follow-up only burns visibility budget on a weaker surface. Mutable
+        current heads keep the exact-id probe first, then fall back to the
+        stable same-URI lookup when available.
         """
 
         targets: list[tuple[str | None, str | None]] = []
         if document_id:
             targets.append((document_id, None))
+            if exact_document_id_authoritative:
+                return tuple(targets)
         if resolved_uri:
             targets.append((None, resolved_uri))
         if not targets:

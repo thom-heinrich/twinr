@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import inspect
 from typing import TypeVar, cast
 
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1
@@ -16,6 +17,7 @@ from twinr.memory.longterm.core.models import LongTermMemoryObjectV1
 T = TypeVar("T")
 
 _DISCOVERY_OBJECT_QUERY_LIMIT = 8
+_DISCOVERY_OBJECT_QUERY_TIMEOUT_S = 2.0
 _PROACTIVE_OBJECT_QUERY_LIMIT = 16
 _REFLECTION_SUMMARY_QUERY_LIMIT = 24
 _REFLECTION_SOURCE_QUERY_LIMIT = 32
@@ -52,6 +54,7 @@ def _select_fast_topic_union(
     object_store: object | None,
     *,
     selections: tuple[_FastTopicSelection, ...],
+    timeout_s: float | None = None,
 ) -> tuple[T, ...]:
     """Run a bounded union of fast-topic queries without snapshot hydration."""
 
@@ -60,12 +63,20 @@ def _select_fast_topic_union(
     fast_selector = getattr(object_store, "select_fast_topic_objects", None)
     if not callable(fast_selector):
         return ()
+    try:
+        selector_parameters = inspect.signature(fast_selector).parameters
+    except (TypeError, ValueError):
+        selector_parameters = {}
+    supports_timeout = "timeout_s" in selector_parameters
     selected_by_id: dict[str, T] = {}
     for selection in selections:
-        for item in fast_selector(
-            query_text=selection.query_text,
-            limit=_bounded_limit(selection.limit, default=1),
-        ):
+        selector_kwargs = {
+            "query_text": selection.query_text,
+            "limit": _bounded_limit(selection.limit, default=1),
+        }
+        if supports_timeout and timeout_s is not None:
+            selector_kwargs["timeout_s"] = timeout_s
+        for item in fast_selector(**selector_kwargs):
             memory_id = getattr(item, "memory_id", None)
             if not isinstance(memory_id, str) or not memory_id or memory_id in selected_by_id:
                 continue
@@ -517,13 +528,21 @@ _RESTART_RECALL_SOURCE_SELECTIONS = (
 def select_discovery_basics_objects(object_store: object | None) -> tuple[LongTermMemoryObjectV1, ...]:
     """Return the bounded object slice that can satisfy the discovery basics topic."""
 
-    return _select_fast_topic_union(object_store, selections=_DISCOVERY_BASICS_SELECTIONS)
+    return _select_fast_topic_union(
+        object_store,
+        selections=_DISCOVERY_BASICS_SELECTIONS,
+        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S,
+    )
 
 
 def select_discovery_companion_style_objects(object_store: object | None) -> tuple[LongTermMemoryObjectV1, ...]:
     """Return the bounded object slice that can satisfy companion-style discovery."""
 
-    return _select_fast_topic_union(object_store, selections=_DISCOVERY_COMPANION_STYLE_SELECTIONS)
+    return _select_fast_topic_union(
+        object_store,
+        selections=_DISCOVERY_COMPANION_STYLE_SELECTIONS,
+        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S,
+    )
 
 
 def select_proactive_planner_objects(object_store: object | None) -> tuple[LongTermMemoryObjectV1, ...]:

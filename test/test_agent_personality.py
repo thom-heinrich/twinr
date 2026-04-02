@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -68,6 +69,20 @@ class _InMemorySnapshotStore:
         return self.snapshot
 
 
+class _CountingServiceSnapshotStore:
+    """Count service-level snapshot loads for cache-key regression tests."""
+
+    def __init__(self, snapshot: PersonalitySnapshot | None) -> None:
+        self.snapshot = snapshot
+        self.calls: list[str | None] = []
+
+    def load_snapshot(self, *, config: TwinrConfig, remote_state=None) -> PersonalitySnapshot | None:
+        del config
+        namespace = getattr(remote_state, "namespace", None)
+        self.calls.append(namespace if isinstance(namespace, str) else None)
+        return self.snapshot
+
+
 class _FakeRemoteState:
     """Mimic the remote snapshot adapter used by the store seam."""
 
@@ -77,6 +92,7 @@ class _FakeRemoteState:
         self.namespace = "test-namespace"
         self.payload = payload
         self.calls: list[str] = []
+        self.probe_calls: list[dict[str, object]] = []
         self.load_error: Exception | None = None
         self.client = _FakeCatalogClient(remote_state=self)
         self.read_client = self.client
@@ -97,6 +113,41 @@ class _FakeRemoteState:
             return None
         return dict(self.payload)
 
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        """Report whether a legacy snapshot head exists without forcing a load."""
+
+        del local_path, fast_fail
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+            }
+        )
+        if self.load_error is not None:
+            raise self.load_error
+        saved_payload = self.snapshots.get(snapshot_kind)
+        payload = saved_payload if saved_payload is not None else self.payload
+        if isinstance(payload, dict) and snapshot_kind == DEFAULT_PERSONALITY_SNAPSHOT_KIND:
+            payload = {
+                "schema": "twinr_agent_personality_snapshot_catalog_v2",
+                "version": 2,
+                "items": [{"item_id": "current"}],
+            }
+        return SimpleNamespace(
+            status="found" if isinstance(payload, dict) else "not_found",
+            payload=dict(payload) if isinstance(payload, dict) else None,
+            detail=None,
+        )
+
     def save_snapshot(self, *, snapshot_kind: str, payload):
         """Persist a snapshot payload in memory for round-trip tests."""
 
@@ -104,11 +155,31 @@ class _FakeRemoteState:
 
 
 class _FakeCatalogClient:
-    def __init__(self, *, remote_state: _FakeRemoteState) -> None:
+    def __init__(
+        self,
+        *,
+        remote_state: _FakeRemoteState,
+        timeout_s: float = 8.0,
+        clone_timeout_history: list[float] | None = None,
+    ) -> None:
         self._remote_state = remote_state
         self._next_document_id = 1
         self.records_by_document_id: dict[str, dict[str, object]] = {}
         self.records_by_uri: dict[str, dict[str, object]] = {}
+        self.config = SimpleNamespace(timeout_s=timeout_s)
+        self.clone_timeout_history = clone_timeout_history if clone_timeout_history is not None else []
+
+    def clone_with_timeout(self, timeout_s: float):
+        self.clone_timeout_history.append(float(timeout_s))
+        clone = _FakeCatalogClient(
+            remote_state=self._remote_state,
+            timeout_s=float(timeout_s),
+            clone_timeout_history=self.clone_timeout_history,
+        )
+        clone._next_document_id = self._next_document_id
+        clone.records_by_document_id = self.records_by_document_id
+        clone.records_by_uri = self.records_by_uri
+        return clone
 
     def _maybe_raise(self) -> None:
         error = self._remote_state.load_error
@@ -133,6 +204,12 @@ class _FakeCatalogClient:
             uri = record.get("uri")
             if isinstance(uri, str) and uri:
                 self.records_by_uri[uri] = record
+            metadata = record.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("twinr_catalog_current_head") is True:
+                snapshot_kind = metadata.get("twinr_snapshot_kind")
+                payload = metadata.get("twinr_payload")
+                if isinstance(snapshot_kind, str) and snapshot_kind and isinstance(payload, dict):
+                    self._remote_state.snapshots[snapshot_kind] = dict(payload)
             response_items.append({"document_id": document_id})
         return {"items": response_items}
 
@@ -179,6 +256,42 @@ class AgentPersonalityTests(unittest.TestCase):
                 ("USER", "User context"),
             ),
         )
+
+    def test_service_cache_reuses_equivalent_remote_state_namespaces(self) -> None:
+        snapshot = PersonalitySnapshot(generated_at="2026-04-01T12:00:00+00:00")
+        store = _CountingServiceSnapshotStore(snapshot)
+        service = PersonalityContextService(store=store, runtime_cache_ttl_seconds=60.0)
+        config = TwinrConfig(project_root=".")
+
+        first = service.load_snapshot(
+            config=config,
+            remote_state=SimpleNamespace(namespace="shared-namespace"),
+        )
+        second = service.load_snapshot(
+            config=config,
+            remote_state=SimpleNamespace(namespace="shared-namespace"),
+        )
+
+        self.assertIs(first, snapshot)
+        self.assertIs(second, snapshot)
+        self.assertEqual(store.calls, ["shared-namespace"])
+
+    def test_service_cache_separates_distinct_remote_state_namespaces(self) -> None:
+        snapshot = PersonalitySnapshot(generated_at="2026-04-01T12:00:00+00:00")
+        store = _CountingServiceSnapshotStore(snapshot)
+        service = PersonalityContextService(store=store, runtime_cache_ttl_seconds=60.0)
+        config = TwinrConfig(project_root=".")
+
+        service.load_snapshot(
+            config=config,
+            remote_state=SimpleNamespace(namespace="namespace-a"),
+        )
+        service.load_snapshot(
+            config=config,
+            remote_state=SimpleNamespace(namespace="namespace-b"),
+        )
+
+        self.assertEqual(store.calls, ["namespace-a", "namespace-b"])
 
     def test_builder_renders_structured_personality_layers_in_expected_order(self) -> None:
         builder = PersonalityContextBuilder()
@@ -910,6 +1023,57 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(remote_state.client.records_by_document_id, {})
         self.assertEqual(remote_state.client.records_by_uri, {})
+
+    def test_remote_state_store_caps_optional_prompt_read_timeout(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "generated_at": "2026-03-20T10:00:00+00:00",
+            "core_traits": [
+                {
+                    "name": "steady companion",
+                    "summary": "Stay calm.",
+                    "weight": 0.7,
+                }
+            ],
+        }
+        store = RemoteStatePersonalitySnapshotStore()
+        remote_state = _FakeRemoteState(payload)
+
+        snapshot = store.load_snapshot(
+            config=TwinrConfig(project_root="."),
+            remote_state=remote_state,
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertIn(2.0, remote_state.client.clone_timeout_history)
+
+    def test_remote_state_store_load_snapshot_skips_legacy_blob_read_when_no_head_exists(self) -> None:
+        store = RemoteStatePersonalitySnapshotStore()
+        remote_state = _FakeRemoteState(None)
+
+        def fail_load_snapshot(*, snapshot_kind: str, local_path=None):
+            del snapshot_kind, local_path
+            raise AssertionError("load_snapshot should not run without a current or legacy head")
+
+        remote_state.load_snapshot = fail_load_snapshot  # type: ignore[method-assign]
+
+        snapshot = store.load_snapshot(
+            config=TwinrConfig(project_root="."),
+            remote_state=remote_state,
+        )
+
+        self.assertIsNone(snapshot)
+        self.assertEqual(remote_state.calls, [])
+        self.assertEqual(
+            remote_state.probe_calls,
+            [
+                {
+                    "snapshot_kind": DEFAULT_PERSONALITY_SNAPSHOT_KIND,
+                    "prefer_cached_document_id": True,
+                    "prefer_metadata_only": True,
+                }
+            ],
+        )
 
     def test_evolution_store_round_trips_signals_and_deltas(self) -> None:
         remote_state = _FakeRemoteState(None)

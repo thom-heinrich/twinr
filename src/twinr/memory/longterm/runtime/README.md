@@ -11,6 +11,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
 - Maintain a remote-authoritative materialized answer-front for the live provider path so transcript-first turns can consume ChonkyDB-backed prompt sections instead of synchronously rebuilding the broad retriever package on every answer
+- Seed that materialized live-provider front from compatibility `build_provider_context(...)` callers only through deduplicated background persistence, so non-live/eval provider builds do not block foreground answer/context assembly on remote current-head writes
 - Keep the older in-process prepared full-context front only for tool context and compatibility provider callers while the live voice/runtime path migrates to the materialized answer-front contract
 - Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without launching a second independent remote recall
 - Prime and refresh those prepared full-context fronts from transcript-first interim or endpoint transcripts plus post-write invalidations, so the first live answer can reuse already-started long-term retrieval work without shrinking the memory surface
@@ -36,6 +37,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Verify remote-primary snapshot readiness before runtime loops start
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
 - Probe graph and midterm readiness through their store-owned current-view/current-head contracts so health attestation checks the same remote authority path used at runtime
+- Keep graph/object/midterm bootstrap on dedicated `*_for_readiness` contracts so a fresh empty required namespace stays strictly read-only during startup instead of blocking on empty remote seed writes
 - Let graph/midterm readiness fall back from a lagging direct fixed-URI head to the small loadable compatibility current-head contract, so fresh runtime roots stay fail-closed without reintroducing whole-snapshot blob reads or duplicate bootstrap writes
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Propagate successful external watchdog attestations back into every owned remote-state adapter so stale local cooldown state cannot contradict the Pi's required-remote gate

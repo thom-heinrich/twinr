@@ -221,7 +221,9 @@ class ToolCallingStreamingLoop:
             next_tool_results_list: list[AgentToolResult] = []
             for call in tool_calls:
                 _raise_if_should_stop(should_stop, context=f"tool_execution_{call.name}")
-                next_tool_results_list.append(self._execute_tool_call(call))
+                tool_result = self._execute_tool_call(call)
+                used_web_search = used_web_search or _tool_result_used_web_search(tool_result)
+                next_tool_results_list.append(tool_result)
             _raise_if_should_stop(should_stop, context=f"tool_round_{round_index}_complete")
             next_tool_results = tuple(next_tool_results_list)
             all_tool_results.extend(next_tool_results)
@@ -405,6 +407,15 @@ def _extract_continuation_token(response: ToolCallingTurnResponse) -> str | None
     if isinstance(response_id, str) and response_id:
         return response_id
     return None
+
+
+def _tool_result_used_web_search(tool_result: AgentToolResult) -> bool:
+    """Return whether one tool result attests live web-search usage."""
+
+    output = getattr(tool_result, "output", None)
+    if not isinstance(output, dict):
+        return False
+    return bool(output.get("used_web_search", False))
 
 
 def _collect_tool_schema_names(tool_schemas: Sequence[dict[str, Any]]) -> tuple[str, ...]:

@@ -815,13 +815,91 @@ def test_external_topk_payload_blob_loader_contract_mismatch_fails_closed(
     with TestClient(app) as client:
         response = client.post(
             "/v1/external/retrieve/topk_records",
-            json={"query_text": "contract check"},
+            json={"query_text": "contract check", "include_content": True},
         )
 
     assert response.status_code == 503, response.text
     assert _response_detail_mapping(response)["error"] == (
         "docid_mapping.read_document_data must accept allow_header_reload_on_miss for top-k payload blob loads"
     )
+
+
+def test_external_topk_metadata_only_skips_payload_blob_loader(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+
+    class _LegacyTopKDM:
+        @staticmethod
+        def get_doc_id_for_uuid(value: str) -> int | None:
+            return 7001 if str(value) == "payload-advanced-1" else None
+
+        @staticmethod
+        def read_document_data(  # noqa: ANN205 - test stub
+            doc_id: int,
+            subindex_key: str,
+            *,
+            raise_on_not_found: bool = True,
+        ):
+            raise AssertionError(
+                f"metadata-only topk_records should not hit payload blob loader: {doc_id=} {subindex_key=} {raise_on_not_found=}"
+            )
+
+    class _TopKMetadataOnlyService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            engine = SimpleNamespace(
+                chonk_router=SimpleNamespace(),
+                docid_mapping_manager=_LegacyTopKDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _resolve_doc_int_for_payload_ref(dm, *, payload_id, chonky_id):  # noqa: ANN001
+            _ = dm
+            for raw in (payload_id, chonky_id):
+                if str(raw) == "payload-advanced-1":
+                    return 7001
+            return None
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
+        async def query_payloads_advanced(self, **kwargs):  # noqa: ANN003
+            self.calls["advanced"].append(dict(kwargs))
+            return {
+                "success": True,
+                "results": [{"payload_id": "payload-advanced-1", "score": 0.75}],
+                "indexes_used": ["fulltext"],
+            }
+
+    fake = _TopKMetadataOnlyService()
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/external/retrieve/topk_records",
+            json={"query_text": "metadata only", "include_content": False, "include_metadata": True},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["results"][0]["payload_id"] == "payload-advanced-1"
+    assert "payload" not in body["results"][0]
+    assert "payload_source" not in body["results"][0]
 
 
 def test_single_item_bulk_result_or_http_error_raises_for_failed_item() -> None:
@@ -1062,6 +1140,116 @@ def test_external_instance_avoids_slow_system_stats_on_cold_cache_miss(
     assert elapsed_s < 0.5
 
 
+def test_external_instance_uses_stale_process_stats_snapshot_without_live_refresh(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    fake = _FacadeFakeService()
+    monkeypatch.setenv("CHONKY_EXTERNAL_INSTANCE_COMPONENT_TIMEOUT_S", "0.1")
+    monkeypatch.setattr(
+        admin_router,
+        "_STATS_CACHE",
+        {
+            "success": True,
+            "backend": "cached",
+            "data_dir": "/tmp/cached",
+            "disk": {"total_bytes": 10, "used_bytes": 4, "free_bytes": 6},
+            "index_files": {"graph_index.chonk": {"bytes": 222}},
+            "indexes": {},
+        },
+    )
+    monkeypatch.setattr(admin_router, "_STATS_TS", time.time() - 600.0)
+    monkeypatch.setattr(admin_router, "_shared_read_stats_cache", lambda _ttl: None)
+    monkeypatch.setattr(admin_router, "_shared_read_stats_cache_any", lambda: None)
+
+    async def _unexpected_cached_stats(*_args, **_kwargs):
+        raise AssertionError("instance route should not wait for live stats refresh when a stale cache exists")
+
+    monkeypatch.setattr(
+        admin_router,
+        "_cached_system_stats_payload",
+        _unexpected_cached_stats,
+    )
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    started = time.perf_counter()
+    with TestClient(app) as client:
+        response = client.get("/v1/external/instance")
+    elapsed_s = time.perf_counter() - started
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is True
+    assert body["ready"] is True
+    assert body["degraded"] is False
+    assert body.get("degraded_components") is None
+    assert body["system_stats"]["success"] is True
+    assert body["system_stats"]["backend"] == "cached"
+    assert body["system_stats"]["stats_cache_stale"] is True
+    assert body["system_stats"]["stats_cache_source"] == "process"
+    assert body["system_stats"]["stats_refresh_error"] == "instance_overview_deferred_stats_refresh"
+    assert body["system_stats"]["stats_refresh_error_type"] == "DeferredRefresh"
+    assert body["indexes"]["success"] is True
+    assert body["basic_metrics"]["success"] is True
+    assert body["component_timeout_seconds"] == pytest.approx(0.1)
+    assert elapsed_s < 0.5
+
+
+def test_external_instance_recovers_timed_out_system_stats_via_bootstrap_cache(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    fake = _FacadeFakeService()
+    monkeypatch.setenv("CHONKY_EXTERNAL_INSTANCE_COMPONENT_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("CHONKDB_DATA_DIR", "/tmp/chonkydb-bootstrap-timeout")
+    monkeypatch.setattr(admin_router, "_STATS_CACHE", None)
+    monkeypatch.setattr(admin_router, "_STATS_TS", None)
+    monkeypatch.setattr(admin_router, "_shared_read_stats_cache", lambda _ttl: None)
+    monkeypatch.setattr(admin_router, "_shared_read_stats_cache_any", lambda: None)
+
+    async def _slow_cached_stats(*_args, **_kwargs):
+        await asyncio.sleep(0.25)
+        return {
+            "success": True,
+            "backend": "slow",
+            "data_dir": "/tmp/slow",
+            "disk": {},
+            "index_files": {},
+            "indexes": {},
+        }
+
+    monkeypatch.setattr(
+        admin_router,
+        "_cached_system_stats_payload",
+        _slow_cached_stats,
+    )
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    started = time.perf_counter()
+    with TestClient(app) as client:
+        response = client.get("/v1/external/instance")
+    elapsed_s = time.perf_counter() - started
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is True
+    assert body["ready"] is True
+    assert body["degraded"] is False
+    assert body.get("degraded_components") is None
+    assert body["system_stats"]["success"] is True
+    assert body["system_stats"]["backend"] == "bootstrap_cache"
+    assert body["system_stats"]["stats_bootstrap"] is True
+    assert body["system_stats"]["stats_bootstrap_reason"] == "instance_component_timeout"
+    assert body["indexes"]["success"] is True
+    assert body["basic_metrics"]["success"] is True
+    assert body["component_timeout_seconds"] == pytest.approx(0.1)
+    assert elapsed_s < 0.5
+
+
 def test_external_admin_ready_fails_closed_when_service_not_ready(monkeypatch) -> None:
     _disable_startup_warmups(monkeypatch)
     fake = _FacadeFakeService()
@@ -1240,6 +1428,196 @@ def test_external_topk_scope_ref_uses_scope_cache_and_reports_hits(monkeypatch) 
     assert fake.calls["full_document"][1]["document_id"] == "segment-doc-1"
     assert fake.calls["full_document"][1]["origin_uri"] is None
     assert fake.calls["full_document"][1]["max_content_chars"] == 512_000
+
+
+def test_external_topk_scope_ref_component_text_fastpath_caps_scope_loads(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    _clear_external_router_caches()
+    monkeypatch.setenv("CHONKY_SCOPE_DOC_IDS_CACHE_TTL_S", "120")
+    case = _load_behavior_freeze_case("external", "topk_scope_ref")
+    request_meta = dict(case["http_request"])
+    request_payload = dict(case["input"])
+
+    current_head_uri = external_router._catalog_current_origin_uri(
+        namespace="acme",
+        uri_segment="objects",
+    )
+    segment_uri = external_router._segment_origin_uri(
+        namespace="acme",
+        uri_segment="objects",
+        segment_index=0,
+    )
+    current_head_payload = {
+        "schema": "twinr_memory_object_catalog_v3",
+        "version": 3,
+        "segments": [{"segment_index": 0, "document_id": "segment-doc-1"}],
+    }
+    segment_payload = {
+        "schema": "twinr_memory_object_catalog_segment_v1",
+        "version": 1,
+        "snapshot_kind": "objects",
+        "items": [
+            {"document_id": "doc-a"},
+            {"document_id": "doc-b"},
+        ],
+    }
+
+    class _ScopeLookupRouter:
+        @staticmethod
+        def _origin_lookup_payload_key(value: str) -> str:
+            digest = hashlib.sha256(
+                str(value).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return f"origin_lookup_{digest}"
+
+        def __init__(self) -> None:
+            self.payload_store = {
+                self._origin_lookup_payload_key(current_head_uri): {
+                    "doc_ids": [2002],
+                }
+            }
+
+        def read_payload(self, *, key: str, allow_header_reload_on_miss: bool = True):  # noqa: ANN201
+            _ = allow_header_reload_on_miss
+            if key not in self.payload_store:
+                raise KeyError(key)
+            return self.payload_store[key]
+
+    class _ScopeLookupDM:
+        @staticmethod
+        def get_uuid_for_doc_ids_batch(doc_ids: list[int]) -> dict[int, str | None]:
+            return {
+                int(doc_id): "current-head-doc-1" if int(doc_id) == 2002 else None
+                for doc_id in list(doc_ids or [])
+            }
+
+        @staticmethod
+        def read_document_data(  # noqa: ANN205 - test stub
+            doc_id: int,
+            subindex_key: str,
+            *,
+            raise_on_not_found: bool = True,
+            allow_header_reload_on_miss: bool = True,
+            **_kwargs,
+        ):
+            _ = (raise_on_not_found, allow_header_reload_on_miss)
+            if int(doc_id) in {2002, 2003} and str(subindex_key) == "payload":
+                return {"schema": "plain_payload", "metadata": {"note": "non_cacheable"}}
+            return None
+
+    class _ScopeFastPathService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.component_reads: list[dict[str, object]] = []
+            engine = SimpleNamespace(
+                chonk_router=_ScopeLookupRouter(),
+                docid_mapping_manager=_ScopeLookupDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _resolve_doc_int_for_payload_ref(dm, *, payload_id, chonky_id):  # noqa: ANN001
+            _ = dm
+            for raw in (payload_id, chonky_id):
+                if str(raw) == "current-head-doc-1":
+                    return 2002
+                if str(raw) == "segment-doc-1":
+                    return 2003
+            return None
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
+        def _read_payload_components_fast(  # noqa: ANN001
+            self,
+            *,
+            dm,
+            router,
+            doc_int,
+            include_content,
+            content_mode=None,
+            content_char_limit=None,
+        ):
+            _ = (dm, router)
+            self.component_reads.append(
+                {
+                    "doc_int": int(doc_int),
+                    "include_content": bool(include_content),
+                    "content_mode": content_mode,
+                    "content_char_limit": content_char_limit,
+                }
+            )
+            if int(doc_int) == 2002:
+                return (
+                    {"origin_uri": current_head_uri},
+                    json.dumps(current_head_payload),
+                )
+            if int(doc_int) == 2003:
+                return (
+                    {"origin_uri": segment_uri},
+                    json.dumps(segment_payload),
+                )
+            raise AssertionError(f"unexpected doc_int for fastpath test: {doc_int}")
+
+        async def get_full_document(self, **kwargs):  # noqa: ANN003
+            self.calls["full_document"].append(dict(kwargs))
+            raise AssertionError(
+                f"component text fastpath should bypass get_full_document for topk scope loads: {kwargs}"
+            )
+
+        async def query_payloads_advanced(self, **kwargs):  # noqa: ANN003
+            self.calls["advanced"].append(dict(kwargs))
+            return {
+                "success": True,
+                "results": [],
+                "indexes_used": ["fulltext"],
+                "debug": {"latency_breakdown_ms": {"fulltext": 1.2}},
+            }
+
+    fake = _ScopeFastPathService()
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    with TestClient(app) as client:
+        first = client.post(str(request_meta["path"]), json=request_payload)
+        assert first.status_code == 200, first.text
+        assert first.json()["query_plan"]["scope_cache_hit"] is False
+
+        second = client.post(str(request_meta["path"]), json=request_payload)
+        assert second.status_code == 200, second.text
+        assert second.json()["query_plan"]["scope_cache_hit"] is True
+
+    assert fake.calls["advanced"][0]["allowed_doc_ids"] == list(case["doc_id_list"])
+    assert fake.calls["advanced"][1]["allowed_doc_ids"] == list(case["doc_id_list"])
+    assert fake.calls["full_document"] == []
+    assert fake.component_reads == [
+        {
+            "doc_int": 2002,
+            "include_content": True,
+            "content_mode": "full",
+            "content_char_limit": 512_000,
+        },
+        {
+            "doc_int": 2003,
+            "include_content": True,
+            "content_mode": "full",
+            "content_char_limit": 512_000,
+        },
+    ]
 
 
 def test_external_get_full_document_caps_twinr_pointer_origin_reads(monkeypatch) -> None:
@@ -1933,6 +2311,7 @@ def test_external_get_full_document_reads_snapshot_head_via_payload_blob_fastpat
     class _BlobFastPathService(_FacadeFakeService):
         def __init__(self) -> None:
             super().__init__()
+            self.component_reads: list[dict[str, object]] = []
             engine = SimpleNamespace(
                 chonk_router=_BlobRouter(),
                 docid_mapping_manager=_BlobDM(),
@@ -1960,6 +2339,29 @@ def test_external_get_full_document_reads_snapshot_head_via_payload_blob_fastpat
             _ = on_error_reload
             return raw
 
+        def _read_payload_components_fast(  # noqa: ANN001
+            self,
+            *,
+            dm,
+            router,
+            doc_int,
+            include_content,
+            content_mode=None,
+            content_char_limit=None,
+        ):
+            _ = (dm, router)
+            self.component_reads.append(
+                {
+                    "doc_int": int(doc_int),
+                    "include_content": bool(include_content),
+                    "content_mode": content_mode,
+                    "content_char_limit": content_char_limit,
+                }
+            )
+            raise AssertionError(
+                f"payload blob fastpath should not call component reads for snapshot heads: {doc_int}"
+            )
+
         async def get_full_document(self, **kwargs):  # noqa: ANN003
             self.calls["full_document"].append(dict(kwargs))
             raise AssertionError(f"payload blob fastpath should bypass get_full_document: {kwargs}")
@@ -1975,8 +2377,11 @@ def test_external_get_full_document_reads_snapshot_head_via_payload_blob_fastpat
         assert response.json()["document_id"] == "snapshot-doc-blob"
         assert response.json()["origin_uri"] == snapshot_uri
         assert json.loads(response.json()["content"]) == snapshot_payload
+        assert response.json()["chunk_count"] == 1
+        assert json.loads(response.json()["chunks"][0]["content"]) == snapshot_payload
 
     assert fake.calls["full_document"] == []
+    assert fake.component_reads == []
 
 
 def test_external_parse_twinr_scope_origin_uri_maps_current_head_uri_segments() -> None:
@@ -2249,9 +2654,339 @@ def test_external_get_full_document_reads_snapshot_head_via_component_text_fastp
             "doc_int": 5003,
             "include_content": True,
             "content_mode": "full",
-            "content_char_limit": None,
+            "content_char_limit": 4000,
         }
     ]
+
+
+def test_external_get_full_document_reads_catalog_current_head_via_component_text_fastpath(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    _clear_external_router_caches()
+
+    current_head_uri = external_router._catalog_current_origin_uri(
+        namespace="acme",
+        uri_segment="graph_nodes",
+    )
+    current_head_payload = {
+        "schema": "twinr_graph_node_catalog_v3",
+        "version": 3,
+        "items_count": 1,
+        "segments": [
+            {
+                "segment_index": 0,
+                "document_id": "graph-segment-0",
+                "uri": external_router._segment_origin_uri(
+                    namespace="acme",
+                    uri_segment="graph_nodes",
+                    segment_index=0,
+                ),
+                "entry_count": 1,
+            }
+        ],
+        "subject_node_id": "user:main",
+        "graph_id": "graph:user_main",
+    }
+
+    class _ComponentRouter:
+        @staticmethod
+        def _origin_lookup_payload_key(value: str) -> str:
+            digest = hashlib.sha256(
+                str(value).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return f"origin_lookup_{digest}"
+
+        def __init__(self) -> None:
+            self.payload_store = {
+                self._origin_lookup_payload_key(current_head_uri): {
+                    "doc_ids": [5005],
+                }
+            }
+
+        def read_payload(self, *, key: str, allow_header_reload_on_miss: bool = True):  # noqa: ANN201
+            _ = allow_header_reload_on_miss
+            if key not in self.payload_store:
+                raise KeyError(key)
+            return self.payload_store[key]
+
+    class _ComponentDM:
+        def get_uuid_for_doc_ids_batch(self, doc_ids: list[int]) -> dict[int, str | None]:  # noqa: D401
+            return {
+                int(doc_id): "current-head-doc-components"
+                if int(doc_id) == 5005
+                else None
+                for doc_id in list(doc_ids or [])
+            }
+
+        @staticmethod
+        def get_doc_id_for_uuid(value: str) -> int | None:
+            return 5005 if str(value) == "current-head-doc-components" else None
+
+        @staticmethod
+        def read_document_data(  # noqa: ANN205 - test stub
+            doc_id: int,
+            subindex_key: str,
+            *,
+            raise_on_not_found: bool = True,
+            allow_header_reload_on_miss: bool = True,
+            **_kwargs,
+        ):
+            _ = (raise_on_not_found, allow_header_reload_on_miss)
+            if int(doc_id) == 5005 and str(subindex_key) == "payload":
+                return {"schema": "plain_payload", "metadata": {"note": "non_cacheable"}}
+            return None
+
+    class _CurrentHeadComponentFastPathService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.component_reads: list[dict[str, object]] = []
+            engine = SimpleNamespace(
+                chonk_router=_ComponentRouter(),
+                docid_mapping_manager=_ComponentDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _resolve_doc_int_for_payload_ref(dm, *, payload_id, chonky_id):  # noqa: ANN001
+            _ = dm
+            for raw in (payload_id, chonky_id):
+                if str(raw) == "current-head-doc-components":
+                    return 5005
+            return None
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
+        def _read_payload_components_fast(  # noqa: ANN001
+            self,
+            *,
+            dm,
+            router,
+            doc_int,
+            include_content,
+            content_mode=None,
+            content_char_limit=None,
+        ):
+            _ = (dm, router)
+            self.component_reads.append(
+                {
+                    "doc_int": int(doc_int),
+                    "include_content": bool(include_content),
+                    "content_mode": content_mode,
+                    "content_char_limit": content_char_limit,
+                }
+            )
+            return (
+                {
+                    "origin_uri": current_head_uri,
+                    "twinr_snapshot_kind": "graph_nodes",
+                    "twinr_catalog_current_head": True,
+                },
+                json.dumps(current_head_payload),
+            )
+
+        async def get_full_document(self, **kwargs):  # noqa: ANN003
+            self.calls["full_document"].append(dict(kwargs))
+            raise AssertionError(
+                f"catalog current-head component fastpath should bypass get_full_document: {kwargs}"
+            )
+
+    fake = _CurrentHeadComponentFastPathService()
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get(f"/v1/external/documents/full?origin_uri={current_head_uri}")
+        assert response.status_code == 200, response.text
+        assert response.json()["document_id"] == "current-head-doc-components"
+        assert response.json()["origin_uri"] == current_head_uri
+        assert response.json()["metadata"] == {
+            "origin_uri": current_head_uri,
+            "twinr_snapshot_kind": "graph_nodes",
+            "twinr_catalog_current_head": True,
+        }
+        assert json.loads(response.json()["content"]) == current_head_payload
+        assert response.json()["chunk_count"] == 1
+        assert json.loads(response.json()["chunks"][0]["content"]) == current_head_payload
+
+    assert fake.calls["full_document"] == []
+    assert fake.component_reads == [
+        {
+            "doc_int": 5005,
+            "include_content": True,
+            "content_mode": "full",
+            "content_char_limit": 4000,
+        }
+    ]
+
+
+def test_external_get_full_document_reads_catalog_current_head_via_payload_blob_fastpath(
+    monkeypatch,
+) -> None:
+    _disable_startup_warmups(monkeypatch)
+    _clear_external_router_caches()
+
+    current_head_uri = external_router._catalog_current_origin_uri(
+        namespace="acme",
+        uri_segment="graph_edges",
+    )
+    current_head_payload = {
+        "schema": "twinr_graph_edge_catalog_v3",
+        "version": 3,
+        "items_count": 1,
+        "segments": [
+            {
+                "segment_index": 0,
+                "document_id": "graph-edge-segment-0",
+                "uri": external_router._segment_origin_uri(
+                    namespace="acme",
+                    uri_segment="graph_edges",
+                    segment_index=0,
+                ),
+                "entry_count": 1,
+            }
+        ],
+        "graph_id": "graph:user_main",
+    }
+
+    class _BlobRouter:
+        @staticmethod
+        def _origin_lookup_payload_key(value: str) -> str:
+            digest = hashlib.sha256(
+                str(value).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return f"origin_lookup_{digest}"
+
+        def __init__(self) -> None:
+            self.payload_store = {
+                self._origin_lookup_payload_key(current_head_uri): {
+                    "doc_ids": [5006],
+                }
+            }
+
+        def read_payload(self, *, key: str, allow_header_reload_on_miss: bool = True):  # noqa: ANN201
+            _ = allow_header_reload_on_miss
+            if key not in self.payload_store:
+                raise KeyError(key)
+            return self.payload_store[key]
+
+    class _BlobDM:
+        def get_uuid_for_doc_ids_batch(self, doc_ids: list[int]) -> dict[int, str | None]:  # noqa: D401
+            return {
+                int(doc_id): "current-head-doc-blob"
+                if int(doc_id) == 5006
+                else None
+                for doc_id in list(doc_ids or [])
+            }
+
+        @staticmethod
+        def get_doc_id_for_uuid(value: str) -> int | None:
+            return 5006 if str(value) == "current-head-doc-blob" else None
+
+        @staticmethod
+        def read_document_data(  # noqa: ANN205 - test stub
+            doc_id: int,
+            subindex_key: str,
+            *,
+            raise_on_not_found: bool = True,
+            allow_header_reload_on_miss: bool = True,
+            **_kwargs,
+        ):
+            _ = (raise_on_not_found, allow_header_reload_on_miss)
+            if int(doc_id) == 5006 and str(subindex_key) == "payload":
+                return dict(current_head_payload)
+            return None
+
+    class _CurrentHeadBlobFastPathService(_FacadeFakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.component_reads: list[dict[str, object]] = []
+            engine = SimpleNamespace(
+                chonk_router=_BlobRouter(),
+                docid_mapping_manager=_BlobDM(),
+            )
+            self._api = SimpleNamespace(_engine=engine)
+
+        def _ensure_api_server_main_api_for_request(self, *, timeout_seconds=None):  # noqa: ANN001
+            _ = timeout_seconds
+            return self._api
+
+        @staticmethod
+        def _ensure_engine_docid_router_ready(api, require_router=True):  # noqa: ANN001
+            _ = require_router
+            return (api._engine, api._engine.docid_mapping_manager, api._engine.chonk_router)
+
+        @staticmethod
+        def _resolve_doc_int_for_payload_ref(dm, *, payload_id, chonky_id):  # noqa: ANN001
+            _ = dm
+            for raw in (payload_id, chonky_id):
+                if str(raw) == "current-head-doc-blob":
+                    return 5006
+            return None
+
+        @staticmethod
+        def _decode_payload_object(raw, *, on_error_reload=None):  # noqa: ANN001
+            _ = on_error_reload
+            return raw
+
+        def _read_payload_components_fast(  # noqa: ANN001
+            self,
+            *,
+            dm,
+            router,
+            doc_int,
+            include_content,
+            content_mode=None,
+            content_char_limit=None,
+        ):
+            _ = (dm, router)
+            self.component_reads.append(
+                {
+                    "doc_int": int(doc_int),
+                    "include_content": bool(include_content),
+                    "content_mode": content_mode,
+                    "content_char_limit": content_char_limit,
+                }
+            )
+            raise AssertionError(
+                f"payload blob fastpath should not call component reads for current heads: {doc_int}"
+            )
+
+        async def get_full_document(self, **kwargs):  # noqa: ANN003
+            self.calls["full_document"].append(dict(kwargs))
+            raise AssertionError(
+                f"catalog current-head payload blob fastpath should bypass get_full_document: {kwargs}"
+            )
+
+    fake = _CurrentHeadBlobFastPathService()
+    monkeypatch.setattr(indexes_router, "svc", fake)
+    monkeypatch.setattr(external_router, "_get_svc", lambda _request=None: fake)
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get(f"/v1/external/documents/full?origin_uri={current_head_uri}")
+        assert response.status_code == 200, response.text
+        assert response.json()["document_id"] == "current-head-doc-blob"
+        assert response.json()["origin_uri"] == current_head_uri
+        assert json.loads(response.json()["content"]) == current_head_payload
+        assert response.json()["chunk_count"] == 1
+        assert json.loads(response.json()["chunks"][0]["content"]) == current_head_payload
+
+    assert fake.calls["full_document"] == []
+    assert fake.component_reads == []
 
 
 def test_external_get_full_document_retries_snapshot_origin_during_warmup(

@@ -400,6 +400,44 @@ class LongTermQueryRewriter:
         self._rewrite_backoff_until = 0.0
         return _extract_canonical_query(payload)
 
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Stop background rewrite work and release backend resources.
+
+        The query rewriter owns a private single-worker executor that can stay
+        alive after isolated acceptance runs unless callers shut it down
+        explicitly. ``wait=False`` requests a bounded stop during generic
+        service shutdown, while a later ``wait=True`` call can still finish the
+        cleanup deterministically for acceptance helpers.
+        """
+
+        pending_rewrites: tuple[Future[str | None], ...]
+        executor = self._rewrite_executor
+        with self._cache_lock:
+            pending_rewrites = tuple(self._pending_rewrites.values())
+            self._pending_rewrites.clear()
+            if wait:
+                self._rewrite_executor = None
+
+        for pending in pending_rewrites:
+            if not pending.done():
+                pending.cancel()
+
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
+
+        if not wait:
+            return
+
+        self._rewrite_executor = None
+        backend = self.backend
+        self.backend = None
+        if backend is None:
+            return
+        client = getattr(backend, "_client", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()  # pylint: disable=not-callable
+
 
 __all__ = [
     "LongTermQueryProfile",

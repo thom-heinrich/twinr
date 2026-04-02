@@ -7,6 +7,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.orchestrator.local_bridge_target import LocalOrchestratorBridgeTarget
+from twinr.orchestrator.remote_tool_timeout import DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS
 from twinr.orchestrator.probe_turn import run_orchestrator_probe_turn
 
 
@@ -44,10 +46,12 @@ class _FakeOrchestratorClient:
         url: str,
         *,
         shared_secret: str | None = None,
+        tool_timeout_seconds: float | None = None,
         require_tls: bool = True,
     ) -> None:
         self.url = url
         self.shared_secret = shared_secret
+        self.tool_timeout_seconds = tool_timeout_seconds
         self.require_tls = require_tls
         self.run_calls: list[dict[str, object]] = []
         type(self).last_instance = self
@@ -128,13 +132,21 @@ class OrchestratorProbeTurnTests(unittest.TestCase):
         with patch("twinr.orchestrator.probe_turn.build_streaming_provider_bundle", return_value=fake_bundle):
             with patch("twinr.orchestrator.probe_turn.TwinrRealtimeHardwareLoop", _FakeProbeLoop):
                 with patch("twinr.orchestrator.probe_turn.OrchestratorWebSocketClient", _FakeOrchestratorClient):
-                    outcome = run_orchestrator_probe_turn(
-                        config=config,
-                        runtime=runtime,
-                        backend=object(),
-                        prompt="Wie gehts dir denn",
-                        emit_line=lines.append,
-                    )
+                    with patch(
+                        "twinr.orchestrator.probe_turn.resolve_local_orchestrator_probe_target",
+                        return_value=LocalOrchestratorBridgeTarget(
+                            url="ws://127.0.0.1:8797/ws/orchestrator",
+                            rewritten=True,
+                            reason="host_loopback_bridge_override",
+                        ),
+                    ):
+                        outcome = run_orchestrator_probe_turn(
+                            config=config,
+                            runtime=runtime,
+                            backend=object(),
+                            prompt="Wie gehts dir denn",
+                            emit_line=lines.append,
+                        )
 
         self.assertEqual(outcome.deltas, ("Teil ", "Antwort"))
         self.assertEqual(outcome.result.text, "Teil Antwort")
@@ -149,11 +161,17 @@ class OrchestratorProbeTurnTests(unittest.TestCase):
         )
         self.assertTrue(_FakeOrchestratorClient.last_instance.require_tls)
         self.assertEqual(
+            _FakeOrchestratorClient.last_instance.tool_timeout_seconds,
+            DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
             set(_FakeOrchestratorClient.last_instance.run_calls[0]["tool_handlers"]),
             {"search_live_info"},
         )
         self.assertTrue(any(line.startswith("probe_decision=lightweight_realtime_runtime") for line in lines))
         self.assertIn("probe_tool_handler_count=1", lines)
+        self.assertIn("probe_orchestrator_target=ws://127.0.0.1:8797/ws/orchestrator", lines)
+        self.assertIn("probe_orchestrator_target_reason=host_loopback_bridge_override", lines)
         self.assertTrue(any(line.startswith("probe_stage=provider_bundle status=ok") for line in lines))
         self.assertTrue(any(line.startswith("probe_stage=tool_runtime_bootstrap status=ok") for line in lines))
         self.assertTrue(any(line.startswith("probe_stage=ws_connect status=ok") for line in lines))
@@ -193,13 +211,19 @@ class OrchestratorProbeTurnTests(unittest.TestCase):
         with patch("twinr.orchestrator.probe_turn.build_streaming_provider_bundle", return_value=fake_bundle):
             with patch("twinr.orchestrator.probe_turn.TwinrRealtimeHardwareLoop", _FakeProbeLoop):
                 with patch("twinr.orchestrator.probe_turn.OrchestratorWebSocketClient", _FakeOrchestratorClient):
-                    run_orchestrator_probe_turn(
-                        config=config,
-                        runtime=runtime,
-                        backend=object(),
-                        prompt="Ping",
-                        emit_line=lambda line: None,
-                    )
+                    with patch(
+                        "twinr.orchestrator.probe_turn.resolve_local_orchestrator_probe_target",
+                        return_value=LocalOrchestratorBridgeTarget(
+                            url="ws://192.168.1.154:8797/ws/orchestrator",
+                        ),
+                    ):
+                        run_orchestrator_probe_turn(
+                            config=config,
+                            runtime=runtime,
+                            backend=object(),
+                            prompt="Ping",
+                            emit_line=lambda line: None,
+                        )
 
         self.assertIsNotNone(_FakeOrchestratorClient.last_instance)
         self.assertFalse(_FakeOrchestratorClient.last_instance.require_tls)
