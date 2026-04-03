@@ -12,10 +12,15 @@ import json
 import logging
 import tempfile
 from pathlib import Path
+import shutil
+import time
 from typing import Any, Literal
 
-from twinr import TwinrConfig, TwinrRuntime
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
+from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.providers.openai import OpenAIBackend
+from twinr.providers.openai.core.client import close_openai_client, openai_client_with_options
 from twinr.text_utils import extract_json_object, folded_lookup_text
 
 
@@ -45,6 +50,16 @@ _JUDGE_REQUEST_MAX_RETRIES = 1
 # AUDIT-FIX(#1): Clip untrusted model text before embedding it into grader prompts.
 _MAX_JUDGE_FIELD_CHARS = 4_000
 _MAX_ERROR_TEXT_CHARS = 512
+_MAX_CONTEXT_PREVIEW_CHARS = 1_200
+_CONTEXT_SECTION_MARKERS: dict[str, tuple[str, ...]] = {
+    "subtext": ("twinr_silent_personalization_context_v1", "twinr_silent_personalization_program_v3"),
+    "topic": ("twinr_fast_topic_context_v1",),
+    "midterm": ("twinr_long_term_midterm_context_v1",),
+    "durable": ("twinr_long_term_durable_context_v1",),
+    "episodic": ("twinr_long_term_episodic_context_v1",),
+    "graph": ("twinr_graph_memory_context_v1",),
+    "conflict": ("twinr_long_term_conflict_context_v1",),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,14 +103,63 @@ class SubtextEvalCaseResult:
     case_id: str
     category: str
     query_text: str
+    should_use_personal_context: bool
     response_text: str
     explicit_memory_announcement: bool
+    response_seed_hits: tuple[str, ...]
     judge: SubtextJudgeResult
     model: str | None
     request_id: str | None
     response_id: str | None
     prompt_tokens: int | None
     output_tokens: int | None
+    diagnostics: "SubtextEvalDiagnostics"
+
+
+@dataclass(frozen=True, slots=True)
+class SubtextEvalDiagnostics:
+    """Expose bounded per-case execution diagnostics for root-cause analysis."""
+
+    stage_timings_s: dict[str, float]
+    system_message_count: int
+    system_message_chars: int
+    query_profile_original_text: str | None
+    query_profile_canonical_english_text: str | None
+    query_profile_retrieval_text: str | None
+    has_subtext_context: bool
+    has_topic_context: bool
+    has_midterm_context: bool
+    has_durable_context: bool
+    has_episodic_context: bool
+    has_graph_context: bool
+    has_conflict_context: bool
+    subtext_context_chars: int
+    durable_context_chars: int
+    episodic_context_chars: int
+    graph_context_chars: int
+    subtext_context_preview: str | None
+    durable_context_preview: str | None
+    episodic_context_preview: str | None
+    graph_context_preview: str | None
+    subtext_seed_hits: tuple[str, ...]
+    durable_seed_hits: tuple[str, ...]
+    episodic_seed_hits: tuple[str, ...]
+    graph_seed_hits: tuple[str, ...]
+    live_front_primed: bool
+    live_front_prime_source: str | None
+    provider_context_source: str | None
+    execution_error_text: str | None = None
+    execution_root_cause_text: str | None = None
+    execution_remote_write_context: dict[str, object] | None = None
+    failure_stage: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveProviderFrontPrimeResult:
+    """Capture how one case prepared the strict live provider-answer front."""
+
+    primed: bool
+    source: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +174,17 @@ class SubtextEvalSummary:
     category_accuracy: dict[str, float]
     explicit_memory_violations: int
     average_naturalness: float
+    execution_failed_cases: int
+    judge_failed_cases: int
+    judged_cases: int
+    failure_stage_counts: dict[str, int]
+    personalization_expected_cases: int
+    personalization_expected_with_context_cases: int
+    personalization_expected_with_seed_grounding_cases: int
+    personalization_expected_with_response_seed_hits: int
+    personalization_expected_helpful_cases: int
+    control_cases: int
+    control_cases_without_leak: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +443,11 @@ def _run_case(
     response: Any | None = None
     runtime: TwinrRuntime | None = None
     backend: OpenAIBackend | None = None
+    conversation: tuple[tuple[str, str], ...] = ()
+    stage_timings_s: dict[str, float] = {}
+    failure_stage: str | None = None
+    live_front_prime = _LiveProviderFrontPrimeResult(primed=False, source=None)
+    stage_started_at = time.monotonic()
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -381,16 +461,38 @@ def _run_case(
                 timeout_s=_MODEL_REQUEST_TIMEOUT_S,
                 max_retries=_MODEL_REQUEST_MAX_RETRIES,
             )
+            stage_timings_s["backend_init"] = _elapsed_s(stage_started_at)
+            failure_stage = "runtime_init"
+            stage_started_at = time.monotonic()
             runtime = TwinrRuntime(config)
+            stage_timings_s["runtime_init"] = _elapsed_s(stage_started_at)
+            failure_stage = "seed_actions"
+            stage_started_at = time.monotonic()
             _apply_seed_actions(runtime, case.seed_actions)
+            stage_timings_s["seed_actions"] = _elapsed_s(stage_started_at)
             # AUDIT-FIX(#4): Fail closed if background persistence did not complete before the query.
+            failure_stage = "seed_flush"
+            stage_started_at = time.monotonic()
             _flush_seed_memory(runtime)
+            stage_timings_s["seed_flush"] = _elapsed_s(stage_started_at)
+            failure_stage = "live_front_prime"
+            stage_started_at = time.monotonic()
+            live_front_prime = _prime_live_provider_front(runtime, case.query_text)
+            stage_timings_s["live_front_prime"] = _elapsed_s(stage_started_at)
             runtime.last_transcript = case.query_text
+            failure_stage = "provider_context"
+            stage_started_at = time.monotonic()
+            conversation = runtime.provider_conversation_context()
+            stage_timings_s["provider_context"] = _elapsed_s(stage_started_at)
+            failure_stage = "model_response"
+            stage_started_at = time.monotonic()
             response = backend.respond_with_metadata(
                 case.query_text,
-                conversation=runtime.provider_conversation_context(),
+                conversation=conversation,
                 allow_web_search=False,
             )
+            stage_timings_s["model_response"] = _elapsed_s(stage_started_at)
+            failure_stage = None
     except Exception as exc:
         # AUDIT-FIX(#2): Convert per-case execution failures into deterministic failed case results instead of crashing the suite.
         return _failed_case_result(
@@ -404,6 +506,15 @@ def _run_case(
             request_id=getattr(response, "request_id", None),
             response_id=getattr(response, "response_id", None),
             token_usage=getattr(response, "token_usage", None),
+            diagnostics=_build_case_diagnostics(
+                case=case,
+                conversation=conversation,
+                stage_timings_s=stage_timings_s,
+                runtime=runtime,
+                live_front_prime=live_front_prime,
+                failure_exception=exc,
+                failure_stage=failure_stage,
+            ),
         )
     finally:
         # AUDIT-FIX(#2): Shutdown must never mask the original case error.
@@ -414,12 +525,14 @@ def _run_case(
     response_text = _safe_response_text(response)
     explicit_memory = contains_explicit_memory_announcement(response_text)
     try:
+        stage_started_at = time.monotonic()
         judge = _judge_case(
             case=case,
             response_text=response_text,
             explicit_memory_announcement=explicit_memory,
             judge_backend=judge_backend,
         )
+        stage_timings_s["judge"] = _elapsed_s(stage_started_at)
     except Exception as exc:
         # AUDIT-FIX(#3): A single grader failure must not abort the whole eval run.
         return _failed_case_result(
@@ -431,35 +544,67 @@ def _run_case(
             request_id=getattr(response, "request_id", None),
             response_id=getattr(response, "response_id", None),
             token_usage=getattr(response, "token_usage", None),
+            diagnostics=_build_case_diagnostics(
+                case=case,
+                conversation=conversation,
+                stage_timings_s=stage_timings_s,
+                runtime=runtime,
+                live_front_prime=live_front_prime,
+                failure_exception=exc,
+                failure_stage="judge",
+            ),
         )
 
     token_usage = getattr(response, "token_usage", None)
+    response_seed_hits = _matching_seed_terms(
+        _safe_response_text(response),
+        terms=_case_seed_terms(case),
+    )
     return SubtextEvalCaseResult(
         case_id=case.case_id,
         category=case.category,
         query_text=case.query_text,
+        should_use_personal_context=case.should_use_personal_context,
         response_text=response_text,
         explicit_memory_announcement=explicit_memory,
+        response_seed_hits=response_seed_hits,
         judge=judge,
         model=getattr(response, "model", None),
         request_id=getattr(response, "request_id", None),
         response_id=getattr(response, "response_id", None),
         prompt_tokens=getattr(token_usage, "input_tokens", None),
         output_tokens=getattr(token_usage, "output_tokens", None),
+        diagnostics=_build_case_diagnostics(
+            case=case,
+            conversation=conversation,
+            stage_timings_s=stage_timings_s,
+            runtime=runtime,
+            live_front_prime=live_front_prime,
+            failure_stage=None,
+        ),
     )
 
 
 def _build_case_config(*, base_config: TwinrConfig, temp_root: Path) -> TwinrConfig:
     """Build an isolated runtime config for a single subtext case."""
 
-    personality_dir = _resolve_personality_dir(base_config)
+    source_personality_dir = _resolve_personality_dir(base_config)
+    personality_dir = temp_root / "personality"
     state_dir = temp_root / "state"
+    shutil.copytree(source_personality_dir, personality_dir, dirs_exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    runtime_state_path = state_dir / "runtime-state.json"
     return replace(
         base_config,
         project_root=str(temp_root),
-        # AUDIT-FIX(#5): Preserve the actual Twinr personality assets instead of pointing the runtime at an empty temp directory.
-        personality_dir=str(personality_dir),
+        # AUDIT-FIX(#5): Preserve the real personality assets inside the isolated temp runtime root.
+        personality_dir="personality",
+        runtime_state_path=str(runtime_state_path),
         memory_markdown_path=str(state_dir / "MEMORY.md"),
+        reminder_store_path=str(state_dir / "reminders.json"),
+        automation_store_path=str(state_dir / "automations.json"),
+        voice_profile_store_path=str(state_dir / "voice_profile.json"),
+        adaptive_timing_store_path=str(state_dir / "adaptive_timing.json"),
         long_term_memory_enabled=True,
         long_term_memory_path=str(state_dir / "chonkydb"),
         long_term_memory_recall_limit=4,
@@ -511,6 +656,27 @@ def _flush_seed_memory(runtime: TwinrRuntime) -> None:
         raise TimeoutError(
             f"Timed out while flushing seeded long-term memory after {_SEED_FLUSH_TIMEOUT_S:.1f}s."
         )
+
+
+def _prime_live_provider_front(
+    runtime: TwinrRuntime,
+    query_text: str,
+) -> _LiveProviderFrontPrimeResult:
+    """Synchronously prepare the strict live provider-answer front for one case."""
+
+    long_term_memory = getattr(runtime, "long_term_memory", None)
+    if long_term_memory is None:
+        raise RuntimeError("Runtime long-term memory is unavailable for live-front priming.")
+    materialize = getattr(long_term_memory, "materialize_live_provider_context", None)
+    if not callable(materialize):
+        raise RuntimeError("Runtime long-term memory cannot materialize live provider context explicitly.")
+    resolution = materialize(query_text)
+    source = getattr(resolution, "source", None)
+    normalized_source = str(source).strip() if source is not None else None
+    return _LiveProviderFrontPrimeResult(
+        primed=True,
+        source=normalized_source or None,
+    )
 
 
 def _judge_case(
@@ -637,7 +803,7 @@ def _create_judge_response(*, judge_backend: OpenAIBackend, request: dict[str, A
     client = getattr(judge_backend, "_client", None)
     if client is None or not hasattr(client, "responses"):
         raise RuntimeError("Judge backend client is not available.")
-    configured_client = _client_with_options(
+    configured_client = openai_client_with_options(
         client,
         timeout_s=_JUDGE_REQUEST_TIMEOUT_S,
         max_retries=_JUDGE_REQUEST_MAX_RETRIES,
@@ -734,6 +900,188 @@ def _format_exception(exc: Exception | None) -> str:
     return _clip_text(f"{type(exc).__name__}: {exc}", _MAX_ERROR_TEXT_CHARS)
 
 
+def _format_base_exception(exc: BaseException | None) -> str | None:
+    """Format one arbitrary exception into a clipped diagnostics field."""
+
+    if exc is None:
+        return None
+    return _clip_text(f"{type(exc).__name__}: {exc}", _MAX_ERROR_TEXT_CHARS)
+
+
+def _exception_chain(exc: BaseException | None) -> tuple[BaseException, ...]:
+    """Return the causal chain for one exception without looping forever."""
+
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _root_cause_exception(exc: BaseException | None) -> BaseException | None:
+    """Return the deepest cause in one causal exception chain."""
+
+    chain = _exception_chain(exc)
+    if not chain:
+        return None
+    return chain[-1]
+
+
+def _exception_remote_write_context(exc: BaseException | None) -> dict[str, object] | None:
+    """Extract the first attached remote-write correlation payload from a failure chain."""
+
+    for item in _exception_chain(exc):
+        context = extract_remote_write_context(item)
+        if isinstance(context, dict) and context:
+            return dict(context)
+    return None
+
+
+def _elapsed_s(started_at: float) -> float:
+    """Return a rounded positive stage duration in seconds."""
+
+    return round(max(0.0, time.monotonic() - started_at), 6)
+
+
+def _build_case_diagnostics(
+    *,
+    case: SubtextEvalCase,
+    conversation: tuple[tuple[str, str], ...],
+    stage_timings_s: dict[str, float],
+    runtime: TwinrRuntime | None,
+    live_front_prime: _LiveProviderFrontPrimeResult,
+    failure_exception: BaseException | None = None,
+    failure_stage: str | None,
+) -> SubtextEvalDiagnostics:
+    """Summarize provider-context structure and execution timings for one case."""
+
+    system_messages = tuple(str(content) for role, content in conversation if str(role) == "system")
+    flattened_messages = "\n".join(system_messages)
+    snapshot = _latest_provider_context_snapshot(runtime)
+    context = getattr(snapshot, "context", None)
+    subtext_context = _context_text(getattr(context, "subtext_context", None))
+    topic_context = _context_text(getattr(context, "topic_context", None))
+    midterm_context = _context_text(getattr(context, "midterm_context", None))
+    durable_context = _context_text(getattr(context, "durable_context", None))
+    episodic_context = _context_text(getattr(context, "episodic_context", None))
+    graph_context = _context_text(getattr(context, "graph_context", None))
+    conflict_context = _context_text(getattr(context, "conflict_context", None))
+    seed_terms = _case_seed_terms(case)
+    provider_context_source = _provider_context_source(runtime)
+    return SubtextEvalDiagnostics(
+        stage_timings_s=dict(stage_timings_s),
+        system_message_count=len(system_messages),
+        system_message_chars=len(flattened_messages),
+        query_profile_original_text=_context_text(getattr(getattr(snapshot, "query_profile", None), "original_text", None)) or None,
+        query_profile_canonical_english_text=_context_text(
+            getattr(getattr(snapshot, "query_profile", None), "canonical_english_text", None)
+        )
+        or None,
+        query_profile_retrieval_text=_context_text(getattr(getattr(snapshot, "query_profile", None), "retrieval_text", None))
+        or None,
+        has_subtext_context=bool(subtext_context) or _context_marker_present(flattened_messages, "subtext"),
+        has_topic_context=bool(topic_context) or _context_marker_present(flattened_messages, "topic"),
+        has_midterm_context=bool(midterm_context) or _context_marker_present(flattened_messages, "midterm"),
+        has_durable_context=bool(durable_context) or _context_marker_present(flattened_messages, "durable"),
+        has_episodic_context=bool(episodic_context) or _context_marker_present(flattened_messages, "episodic"),
+        has_graph_context=bool(graph_context) or _context_marker_present(flattened_messages, "graph"),
+        has_conflict_context=bool(conflict_context) or _context_marker_present(flattened_messages, "conflict"),
+        subtext_context_chars=len(subtext_context),
+        durable_context_chars=len(durable_context),
+        episodic_context_chars=len(episodic_context),
+        graph_context_chars=len(graph_context),
+        subtext_context_preview=_context_preview(subtext_context),
+        durable_context_preview=_context_preview(durable_context),
+        episodic_context_preview=_context_preview(episodic_context),
+        graph_context_preview=_context_preview(graph_context),
+        subtext_seed_hits=_matching_seed_terms(subtext_context, terms=seed_terms),
+        durable_seed_hits=_matching_seed_terms(durable_context, terms=seed_terms),
+        episodic_seed_hits=_matching_seed_terms(episodic_context, terms=seed_terms),
+        graph_seed_hits=_matching_seed_terms(graph_context, terms=seed_terms),
+        live_front_primed=live_front_prime.primed,
+        live_front_prime_source=live_front_prime.source,
+        provider_context_source=provider_context_source,
+        execution_error_text=_format_base_exception(failure_exception),
+        execution_root_cause_text=_format_base_exception(_root_cause_exception(failure_exception)),
+        execution_remote_write_context=_exception_remote_write_context(failure_exception),
+        failure_stage=failure_stage,
+    )
+
+
+def _latest_provider_context_snapshot(runtime: TwinrRuntime | None) -> Any | None:
+    """Return the latest provider-context snapshot when one is available."""
+
+    if runtime is None:
+        return None
+    long_term_memory = getattr(runtime, "long_term_memory", None)
+    if long_term_memory is None:
+        return None
+    latest_context_snapshot = getattr(long_term_memory, "latest_context_snapshot", None)
+    if not callable(latest_context_snapshot):
+        return None
+    try:
+        return latest_context_snapshot(profile="provider")
+    except Exception:
+        return None
+
+
+def _provider_context_source(runtime: TwinrRuntime | None) -> str | None:
+    """Return the newest provider-context snapshot source for one runtime."""
+
+    snapshot = _latest_provider_context_snapshot(runtime)
+    if snapshot is None:
+        return None
+    source = getattr(snapshot, "source", None)
+    if source is None:
+        return None
+    return str(source).strip() or None
+
+
+def _context_marker_present(flattened_messages: str, section: str) -> bool:
+    """Return whether one known long-term context marker appears in the system prompt."""
+
+    markers = _CONTEXT_SECTION_MARKERS.get(section, ())
+    return any(marker in flattened_messages for marker in markers)
+
+
+def _context_text(value: Any) -> str:
+    """Normalize one optional context fragment to a plain string."""
+
+    return str(value or "")
+
+
+def _context_preview(text: str) -> str | None:
+    """Return one bounded preview for a possibly long context fragment."""
+
+    compact = str(text or "").strip()
+    if not compact:
+        return None
+    return _clip_text(compact, _MAX_CONTEXT_PREVIEW_CHARS)
+
+
+def _case_seed_terms(case: SubtextEvalCase) -> tuple[str, ...]:
+    """Extract one bounded unique set of visible seed terms for diagnostics."""
+
+    terms: list[str] = []
+    for action in case.seed_actions:
+        for key in ("value", "for_product", "given_name", "family_name", "role", "summary"):
+            normalized = _normalize_lookup_text(action.args.get(key))
+            if normalized and len(normalized) >= 3 and normalized not in terms:
+                terms.append(normalized)
+    return tuple(terms)
+
+
+def _matching_seed_terms(text: str, *, terms: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the visible seed terms that appear in one text fragment."""
+
+    normalized_text = f" {_normalize_lookup_text(text)} "
+    matches = [term for term in terms if f" {term} " in normalized_text]
+    return tuple(matches)
+
+
 def _failed_case_result(
     *,
     case: SubtextEvalCase,
@@ -744,6 +1092,7 @@ def _failed_case_result(
     request_id: str | None,
     response_id: str | None,
     token_usage: Any,
+    diagnostics: SubtextEvalDiagnostics,
 ) -> SubtextEvalCaseResult:
     """Build a deterministic failed result for a case-level error."""
 
@@ -751,8 +1100,10 @@ def _failed_case_result(
         case_id=case.case_id,
         category=case.category,
         query_text=case.query_text,
+        should_use_personal_context=case.should_use_personal_context,
         response_text=response_text,
         explicit_memory_announcement=explicit_memory_announcement,
+        response_seed_hits=_matching_seed_terms(response_text, terms=_case_seed_terms(case)),
         judge=SubtextJudgeResult(
             helpful_context_used=False,
             subtle_not_explicit=not explicit_memory_announcement,
@@ -767,6 +1118,7 @@ def _failed_case_result(
         response_id=response_id,
         prompt_tokens=getattr(token_usage, "input_tokens", None),
         output_tokens=getattr(token_usage, "output_tokens", None),
+        diagnostics=diagnostics,
     )
 
 
@@ -781,7 +1133,7 @@ def _configure_openai_backend_client(
     client = getattr(backend, "_client", None)
     if client is None:
         return
-    configured_client = _client_with_options(
+    configured_client = openai_client_with_options(
         client,
         timeout_s=timeout_s,
         max_retries=max_retries,
@@ -789,22 +1141,9 @@ def _configure_openai_backend_client(
     try:
         setattr(backend, "_client", configured_client)
     except Exception:
+        if configured_client is not client:
+            close_openai_client(configured_client)
         _LOGGER.debug("Could not replace backend client with bounded options.", exc_info=True)
-
-
-def _client_with_options(client: Any, *, timeout_s: float, max_retries: int) -> Any:
-    """Return a client clone with timeout/retry options when supported."""
-
-    with_options = getattr(client, "with_options", None)
-    if not callable(with_options):
-        return client
-    try:
-        return with_options(timeout=timeout_s, max_retries=max_retries)
-    except TypeError:
-        try:
-            return with_options(timeout=timeout_s)
-        except TypeError:
-            return client
 
 
 def _shutdown_runtime(runtime: TwinrRuntime | None) -> None:
@@ -824,12 +1163,10 @@ def _close_openai_backend(backend: OpenAIBackend | None) -> None:
     if backend is None:
         return
     client = getattr(backend, "_client", None)
-    close = getattr(client, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            _LOGGER.warning("OpenAI backend client close failed during subtext eval cleanup.", exc_info=True)
+    try:
+        close_openai_client(client)
+    except Exception:
+        _LOGGER.warning("OpenAI backend client close failed during subtext eval cleanup.", exc_info=True)
 
 
 def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSummary:
@@ -853,6 +1190,52 @@ def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSu
     average_naturalness = (
         sum(item.judge.naturalness_score for item in case_results) / total if total else 0.0
     )
+    failure_stage_counts: dict[str, int] = {}
+    execution_failed_cases = 0
+    judge_failed_cases = 0
+    personalization_expected_cases = 0
+    personalization_expected_with_context_cases = 0
+    personalization_expected_with_seed_grounding_cases = 0
+    personalization_expected_with_response_seed_hits = 0
+    personalization_expected_helpful_cases = 0
+    control_cases = 0
+    control_cases_without_leak = 0
+    for item in case_results:
+        diagnostics = item.diagnostics
+        failure_stage = diagnostics.failure_stage
+        if failure_stage:
+            failure_stage_counts[failure_stage] = failure_stage_counts.get(failure_stage, 0) + 1
+            if failure_stage == "judge":
+                judge_failed_cases += 1
+            else:
+                execution_failed_cases += 1
+        diagnostics_has_personal_context = bool(
+            diagnostics.has_subtext_context
+            or diagnostics.has_durable_context
+            or diagnostics.has_episodic_context
+            or diagnostics.has_graph_context
+        )
+        diagnostics_has_seed_grounding = bool(
+            diagnostics.subtext_seed_hits
+            or diagnostics.durable_seed_hits
+            or diagnostics.episodic_seed_hits
+            or diagnostics.graph_seed_hits
+        )
+        if item.should_use_personal_context:
+            personalization_expected_cases += 1
+            if diagnostics_has_personal_context:
+                personalization_expected_with_context_cases += 1
+            if diagnostics_has_seed_grounding:
+                personalization_expected_with_seed_grounding_cases += 1
+            if item.response_seed_hits:
+                personalization_expected_with_response_seed_hits += 1
+            if item.judge.helpful_context_used:
+                personalization_expected_helpful_cases += 1
+        else:
+            control_cases += 1
+            if not item.explicit_memory_announcement and not item.response_seed_hits:
+                control_cases_without_leak += 1
+    judged_cases = max(0, total - execution_failed_cases - judge_failed_cases)
     return SubtextEvalSummary(
         total_cases=total,
         passed_cases=passed,
@@ -862,6 +1245,17 @@ def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSu
         category_accuracy=category_accuracy,
         explicit_memory_violations=explicit_violations,
         average_naturalness=average_naturalness,
+        execution_failed_cases=execution_failed_cases,
+        judge_failed_cases=judge_failed_cases,
+        judged_cases=judged_cases,
+        failure_stage_counts=failure_stage_counts,
+        personalization_expected_cases=personalization_expected_cases,
+        personalization_expected_with_context_cases=personalization_expected_with_context_cases,
+        personalization_expected_with_seed_grounding_cases=personalization_expected_with_seed_grounding_cases,
+        personalization_expected_with_response_seed_hits=personalization_expected_with_response_seed_hits,
+        personalization_expected_helpful_cases=personalization_expected_helpful_cases,
+        control_cases=control_cases,
+        control_cases_without_leak=control_cases_without_leak,
     )
 
 

@@ -90,6 +90,9 @@ LAN websocket URLs back to the authoritative local `ws://127.0.0.1:8797`
 bridge when that loopback bridge is actually reachable. That keeps host-side
 non-voice acceptance from depending on a DHCP-stable self-IP while leaving the
 Pi acceptance instance on `/twinr` untouched.
+The `/twinr` acceptance instance must keep its live voice-gateway URLs pointed
+at the development-host LAN bridge or mDNS name; `127.0.0.1` on the Pi is the
+Pi itself, not the host-side transcript-first gateway.
 
 The probe client and the server-side remote-tool bridge also share one timeout
 policy from [`remote_tool_timeout.py`](./remote_tool_timeout.py). That keeps

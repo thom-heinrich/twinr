@@ -22,6 +22,8 @@ subpackages.
 - overlap independent prompt/user/personality remote current-head bootstrap reads so required-remote readiness is bounded by the slowest prompt-context check instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
 - keep live long-term recall from blocking on cold query-rewrite misses by returning an immediate fallback profile and filling the rewrite cache asynchronously in the background
+- let later wait-capable callers keep waiting on an in-flight canonical rewrite even after a fallback profile was cached, so one cold miss does not lock the whole runtime onto the untranslated query until a later cache refresh
+- let synchronous provider-context and live-front materialization callers wait a bounded first-turn window sized for real rewrite latency, so multilingual graph/subtext recall does not miss just because canonical English arrives around one to three seconds later
 - host the `on_device`, `chonkydb`, and `longterm` subpackages
 
 `memory` does **not** own:

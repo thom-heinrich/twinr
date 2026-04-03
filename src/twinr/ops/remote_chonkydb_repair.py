@@ -725,7 +725,7 @@ def _require_query_surface_ready(
 ) -> ChonkyDBHttpProbeResult:
     """Only mark ChonkyDB ready when the query surface works after `/instance`."""
 
-    if query_probe.ok:
+    if query_probe.ok or _query_probe_empty_but_healthy(query_probe):
         return instance_probe
     return ChonkyDBHttpProbeResult(
         label=instance_probe.label,
@@ -737,6 +737,29 @@ def _require_query_surface_ready(
         payload=query_probe.payload,
         error=query_probe.error,
     )
+
+
+def _query_probe_empty_but_healthy(query_probe: ChonkyDBHttpProbeResult) -> bool:
+    """Return whether one query probe proved an empty but healthy current scope.
+
+    A fresh namespace or a snapshot kind without a current head can
+    legitimately return `404 document_not_found` even though the public query
+    surface and backend are healthy. Treat that exact contract as green so
+    operator repair/stabilization tools do not trigger blind restarts on empty
+    scopes.
+    """
+
+    if int(query_probe.status_code or 0) != 404:
+        return False
+    payload = dict(query_probe.payload or {})
+    detail_candidates = (
+        str(query_probe.detail or "").strip().lower(),
+        str(payload.get("detail") or "").strip().lower(),
+        str(payload.get("error") or "").strip().lower(),
+        str(payload.get("title") or "").strip().lower(),
+        str(payload.get("error_type") or "").strip().lower(),
+    )
+    return "document_not_found" in detail_candidates
 
 
 def _probe_detail(

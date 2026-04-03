@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from typing import Mapping
+from uuid import uuid4
 
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
 from twinr.memory.longterm.storage._remote_retry import (
     clone_client_with_capped_timeout,
     remote_write_retry_delay_s,
+    raise_if_remote_operation_cancelled,
     retryable_remote_write_attempts,
+    sleep_with_remote_operation_abort,
     should_fallback_async_job_resolution_error,
     should_retry_remote_write_error,
 )
@@ -80,6 +84,7 @@ class LongTermRemoteStateWriteMixin:
         attested_payload: dict[str, object] | None = None
         attested_source = "saved_snapshot"
         for attempt in range(retry_attempts):
+            raise_if_remote_operation_cancelled(operation="Remote snapshot write")
             try:
                 document_id = self._store_snapshot_record(
                     write_client,
@@ -93,7 +98,10 @@ class LongTermRemoteStateWriteMixin:
                 if attempt + 1 >= retry_attempts:
                     raise
                 if retry_backoff_s > 0:
-                    time.sleep(retry_backoff_s)
+                    sleep_with_remote_operation_abort(
+                        retry_backoff_s,
+                        operation="Remote snapshot write retry",
+                    )
                 continue
             break
         if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
@@ -197,6 +205,7 @@ class LongTermRemoteStateWriteMixin:
         namespace = self.namespace or "twinr_longterm_v1"
         updated_at = _utcnow_iso()
         started = time.monotonic()
+        request_correlation_id = f"ltsw-{uuid4().hex[:12]}"
         snapshot_document = {
             "schema": _SNAPSHOT_SCHEMA,
             "namespace": namespace,
@@ -225,13 +234,20 @@ class LongTermRemoteStateWriteMixin:
             include_insights_in_response=False,
             execution_mode="async",
         )
+        request_bytes = len(json.dumps(record.to_payload(), ensure_ascii=False).encode("utf-8"))
         last_error: Exception | None = None
         resolved_attempts = max(1, int(attempts or self._retry_attempts()))
         resolved_backoff_s = max(0.0, float(backoff_s if backoff_s is not None else self._retry_backoff_s()))
         attempt = 0
         while attempt < resolved_attempts:
+            raise_if_remote_operation_cancelled(operation="Remote snapshot write")
+            store_transport_ms: float | None = None
+            async_job_wait_ms: float | None = None
+            async_job_resolution_source: str | None = None
+            attempt_started = time.monotonic()
             try:
                 result = write_client.store_record(record)
+                store_transport_ms = max(0.0, (time.monotonic() - attempt_started) * 1000.0)
                 failure_detail = _store_result_failure_detail(result)
                 if failure_detail:
                     raise ChonkyDBError(
@@ -243,8 +259,19 @@ class LongTermRemoteStateWriteMixin:
                 resolved_document_id = (
                     document_id
                     if document_id is not None
-                    else self._await_async_store_document_id(write_client, result=result)
+                    else None
                 )
+                if resolved_document_id is not None:
+                    async_job_resolution_source = "response"
+                elif document_id is None:
+                    async_wait_started = time.monotonic()
+                    try:
+                        resolved_document_id = self._await_async_store_document_id(write_client, result=result)
+                    finally:
+                        async_job_wait_ms = max(0.0, (time.monotonic() - async_wait_started) * 1000.0)
+                    async_job_resolution_source = (
+                        "job_status" if resolved_document_id is not None else "job_status_no_document_id"
+                    )
                 record_remote_write_observation(
                     remote_state=self,
                     context=LongTermRemoteWriteContext(
@@ -260,6 +287,12 @@ class LongTermRemoteStateWriteMixin:
                         uri_hint=record.uri,
                         attempt_count=attempt + 1,
                         request_item_count=1,
+                        request_correlation_id=request_correlation_id,
+                        request_bytes=request_bytes,
+                        request_execution_mode="async",
+                        async_job_resolution_source=async_job_resolution_source,
+                        store_transport_ms=store_transport_ms,
+                        async_job_wait_ms=async_job_wait_ms,
                     ),
                     latency_ms=max(0.0, (time.monotonic() - started) * 1000.0),
                     outcome="ok",
@@ -267,6 +300,8 @@ class LongTermRemoteStateWriteMixin:
                 )
                 return resolved_document_id
             except Exception as exc:
+                if store_transport_ms is None:
+                    store_transport_ms = max(0.0, (time.monotonic() - attempt_started) * 1000.0)
                 last_error = exc
                 self._note_remote_failure()
                 resolved_attempts = retryable_remote_write_attempts(resolved_attempts, exc=exc)
@@ -278,7 +313,10 @@ class LongTermRemoteStateWriteMixin:
                     attempt_index=attempt,
                 )
                 if delay_s > 0:
-                    time.sleep(delay_s)
+                    sleep_with_remote_operation_abort(
+                        delay_s,
+                        operation="Remote snapshot write retry",
+                    )
                 attempt += 1
                 continue
             attempt += 1
@@ -297,6 +335,11 @@ class LongTermRemoteStateWriteMixin:
                     uri_hint=record.uri,
                     attempt_count=attempt + 1,
                     request_item_count=1,
+                    request_correlation_id=request_correlation_id,
+                    request_bytes=request_bytes,
+                    request_execution_mode="async",
+                    store_transport_ms=store_transport_ms,
+                    async_job_wait_ms=async_job_wait_ms,
                 ),
                 exc=last_error,
                 started_monotonic=started,
@@ -327,6 +370,7 @@ class LongTermRemoteStateWriteMixin:
         total_timeout_s = self._async_job_visibility_timeout_s()
         deadline = time.monotonic() + total_timeout_s
         while True:
+            raise_if_remote_operation_cancelled(operation="Remote snapshot async-job wait")
             remaining_timeout_s = deadline - time.monotonic()
             if remaining_timeout_s <= 0.0:
                 break
@@ -366,7 +410,10 @@ class LongTermRemoteStateWriteMixin:
             if remaining_sleep_s <= 0.0:
                 break
             if poll_interval_s > 0.0:
-                time.sleep(min(poll_interval_s, remaining_sleep_s))
+                sleep_with_remote_operation_abort(
+                    min(poll_interval_s, remaining_sleep_s),
+                    operation="Remote snapshot async-job wait",
+                )
         return None
 
     def _attest_saved_snapshot_readback(
@@ -445,6 +492,7 @@ class LongTermRemoteStateWriteMixin:
             )
         last_fetch: _RemoteSnapshotFetchResult | None = None
         for attempt in range(resolved_attempts):
+            raise_if_remote_operation_cancelled(operation="Remote snapshot readback attestation")
             result = self._load_snapshot_via_uri(
                 read_client,
                 snapshot_kind=snapshot_kind,
@@ -470,7 +518,10 @@ class LongTermRemoteStateWriteMixin:
             if attempt + 1 >= resolved_attempts:
                 break
             if poll_interval_s > 0:
-                time.sleep(poll_interval_s)
+                sleep_with_remote_operation_abort(
+                    poll_interval_s,
+                    operation="Remote snapshot readback attestation",
+                )
         detail = mismatch_detail if last_fetch is None else (last_fetch.detail or mismatch_detail)
         return LongTermRemoteSnapshotProbe(
             snapshot_kind=snapshot_kind,
@@ -495,6 +546,7 @@ class LongTermRemoteStateWriteMixin:
         retry_attempts = self._retry_attempts()
         retry_backoff_s = self._retry_backoff_s()
         for attempt in range(retry_attempts):
+            raise_if_remote_operation_cancelled(operation="Remote snapshot pointer write")
             pointer_document_id = self._save_snapshot_pointer(
                 write_client,
                 snapshot_kind=snapshot_kind,
@@ -517,7 +569,10 @@ class LongTermRemoteStateWriteMixin:
                     )
                 )
             if retry_backoff_s > 0:
-                time.sleep(retry_backoff_s)
+                sleep_with_remote_operation_abort(
+                    retry_backoff_s,
+                    operation="Remote snapshot pointer write retry",
+                )
 
     def _save_snapshot_pointer(
         self,

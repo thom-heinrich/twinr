@@ -525,23 +525,31 @@ _RESTART_RECALL_SOURCE_SELECTIONS = (
 )
 
 
-def select_discovery_basics_objects(object_store: object | None) -> tuple[LongTermMemoryObjectV1, ...]:
+def select_discovery_basics_objects(
+    object_store: object | None,
+    *,
+    timeout_s: float | None = None,
+) -> tuple[LongTermMemoryObjectV1, ...]:
     """Return the bounded object slice that can satisfy the discovery basics topic."""
 
     return _select_fast_topic_union(
         object_store,
         selections=_DISCOVERY_BASICS_SELECTIONS,
-        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S,
+        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S if timeout_s is None else timeout_s,
     )
 
 
-def select_discovery_companion_style_objects(object_store: object | None) -> tuple[LongTermMemoryObjectV1, ...]:
+def select_discovery_companion_style_objects(
+    object_store: object | None,
+    *,
+    timeout_s: float | None = None,
+) -> tuple[LongTermMemoryObjectV1, ...]:
     """Return the bounded object slice that can satisfy companion-style discovery."""
 
     return _select_fast_topic_union(
         object_store,
         selections=_DISCOVERY_COMPANION_STYLE_SELECTIONS,
-        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S,
+        timeout_s=_DISCOVERY_OBJECT_QUERY_TIMEOUT_S if timeout_s is None else timeout_s,
     )
 
 

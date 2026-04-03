@@ -166,6 +166,7 @@ class UnifiedRetrievalGoldsetCase:
     case_id: str
     query_text: str
     canonical_query_text: str
+    memory_types: tuple[str, ...] = ()
     required_candidate_sources: tuple[str, ...] = ()
     required_selected_ids: tuple[tuple[str, tuple[str, ...]], ...] = ()
     required_join_anchors: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -180,6 +181,7 @@ class UnifiedRetrievalGoldsetCase:
         object.__setattr__(self, "case_id", _normalize_text(self.case_id))
         object.__setattr__(self, "query_text", _normalize_text(self.query_text))
         object.__setattr__(self, "canonical_query_text", _normalize_text(self.canonical_query_text))
+        object.__setattr__(self, "memory_types", _coerce_text_tuple(self.memory_types))
         object.__setattr__(self, "required_candidate_sources", _coerce_text_tuple(self.required_candidate_sources))
         object.__setattr__(self, "required_selected_ids", _coerce_pair_tuple(self.required_selected_ids))
         object.__setattr__(self, "required_join_anchors", _coerce_pair_tuple(self.required_join_anchors))
@@ -197,6 +199,7 @@ class UnifiedRetrievalGoldsetCase:
             "case_id": self.case_id,
             "query_text": self.query_text,
             "canonical_query_text": self.canonical_query_text,
+            "memory_types": list(self.memory_types),
             "required_candidate_sources": list(self.required_candidate_sources),
             "required_selected_ids": {
                 key: list(values) for key, values in self.required_selected_ids
@@ -332,95 +335,254 @@ class UnifiedRetrievalGoldsetCaseResult:
         }
 
 
-def default_unified_retrieval_goldset_cases() -> tuple[UnifiedRetrievalGoldsetCase, ...]:
-    """Return the fixed unified-retrieval quality cases shared by both runners."""
+_FULL_STACK_ACCESS_PATH = ("structured_query_first", *_REMOTE_GRAPH_QUERY_FIRST_ACCESS_PATH)
+_GRAPH_ONLY_ACCESS_PATH = _REMOTE_GRAPH_QUERY_FIRST_ACCESS_PATH
+_UNIFIED_RETRIEVAL_CASE_PROFILES = frozenset({"core", "expanded"})
+_FULL_STACK_MEMORY_TYPES = ("adaptive", "conflict", "durable", "episodic", "graph", "midterm")
+_CONTINUITY_MEMORY_TYPES = ("episodic", "graph", "midterm")
+_GRAPH_ONLY_MEMORY_TYPES = ("graph",)
+_EXPANDED_CORINNA_PHONE_VARIANTS = (
+    "Can you tell me Corinna Maier's phone number?",
+    "I need Corinna Maier's number.",
+    "Which phone number should I use for Corinna Maier?",
+    "What number does Corinna Maier use now?",
+    "Do you know Corinna Maier's current number?",
+    "How can I reach Corinna Maier by phone?",
+    "Please remind me of Corinna Maier's mobile number.",
+    "I need the confirmed number for Corinna Maier.",
+    "What is the latest phone number for Corinna Maier?",
+    "Welche Telefonnummer hat Corinna Maier?",
+    "Wie lautet Corinna Maiers Telefonnummer?",
+    "Ich brauche Corinna Maiers Telefonnummer.",
+    "Welche Nummer soll ich fuer Corinna Maier verwenden?",
+    "Was ist Corinna Maiers aktuelle Telefonnummer?",
+    "Kennst du Corinna Maiers aktuelle Nummer?",
+    "Unter welcher Nummer erreiche ich Corinna Maier?",
+    "Bitte erinnere mich an Corinna Maiers Telefonnummer.",
+    "Welche Nummer ist bei Corinna Maier bestaetigt?",
+    "Welche Handynummer von Corinna Maier soll ich nehmen?",
+    "Sag mir bitte Corinna Maiers Telefonnummer.",
+    "Mit welcher Nummer kann ich Corinna Maier anrufen?",
+    "Welche Telefonnummer gilt gerade fuer Corinna Maier?",
+    "Ich suche Corinna Maiers aktuelle Rufnummer.",
+    "Which number is confirmed for Corinna Maier?",
+    "What phone number is on file for Corinna Maier?",
+    "I need Corinna's current phone contact.",
+    "Which Corinna Maier number is the right one?",
+    "What number should I dial for Corinna Maier?",
+    "Give me Corinna Maier's phone contact.",
+)
+_EXPANDED_CORINNA_CONTINUITY_VARIANTS = (
+    "Did Corinna call today?",
+    "Has Corinna already called today?",
+    "Did I hear from Corinna today?",
+    "Was there a call from Corinna earlier today?",
+    "Hat Corinna heute angerufen?",
+    "Hat Corinna heute schon angerufen?",
+    "Gab es heute schon einen Anruf von Corinna?",
+    "Hat sich Corinna heute gemeldet?",
+    "War Corinna heute schon am Telefon?",
+)
+_EXPANDED_ANNA_EMAIL_VARIANTS = (
+    "How can I reach Anna Becker by email?",
+    "Do you know Anna Becker's email?",
+    "I need Anna Becker's email contact.",
+    "What email address does Anna Becker use?",
+    "Wie lautet Anna Beckers E-Mail-Adresse?",
+    "Wie erreiche ich Anna Becker per E-Mail?",
+    "Ich brauche Anna Beckers E-Mail-Adresse.",
+    "Unter welcher E-Mail-Adresse erreiche ich Anna Becker?",
+    "Welche E-Mail-Adresse hat Anna Becker?",
+)
 
-    full_stack_access = ("structured_query_first", *_REMOTE_GRAPH_QUERY_FIRST_ACCESS_PATH)
-    graph_only_access = _REMOTE_GRAPH_QUERY_FIRST_ACCESS_PATH
-    return (
-        UnifiedRetrievalGoldsetCase(
-            case_id="corinna_phone_full_stack",
-            query_text="What is Corinna Maier's phone number?",
-            canonical_query_text="What is Corinna Maier's phone number?",
-            required_candidate_sources=("adaptive", "conflict", "durable", "episodic", "graph", "midterm"),
-            required_selected_ids={
-                "episodic_entry_ids": ("episode:corinna_called",),
-                "durable_memory_ids": ("fact:corinna_phone_current", "fact:corinna_phone_old"),
-                "conflict_slot_keys": (_CONFLICT_SLOT_KEY,),
-                "midterm_packet_ids": ("midterm:corinna_today",),
-                "adaptive_packet_ids": ("adaptive:confirmed:fact_corinna_phone_current",),
-                "graph_node_ids": ("person:corinna_maier",),
-            },
-            required_join_anchors={
-                "person_ref:person:corinna_maier": ("adaptive", "conflict", "durable", "episodic", "graph", "midterm"),
-            },
-            required_access_path=full_stack_access,
-            forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
-            required_sections=(
-                "subtext_context",
-                "midterm_context",
-                "durable_context",
-                "episodic_context",
-                "graph_context",
-                "conflict_context",
-            ),
-            required_context_terms={
-                "midterm_context": ("recent_contact_bundle",),
-                "durable_context": (_CORINNA_PHONE_CURRENT,),
-                "episodic_context": ("Corinna called earlier today",),
-                "graph_context": ("Corinna Maier",),
-                "conflict_context": (_CONFLICT_SLOT_KEY,),
-            },
+
+def _normalize_unified_retrieval_case_profile(profile: str | None) -> str:
+    """Return a supported unified-retrieval case profile identifier."""
+
+    normalized = _normalize_text(profile or "core").lower() or "core"
+    if normalized not in _UNIFIED_RETRIEVAL_CASE_PROFILES:
+        supported = ", ".join(sorted(_UNIFIED_RETRIEVAL_CASE_PROFILES))
+        raise ValueError(f"Unsupported unified retrieval case profile {profile!r}; expected one of: {supported}.")
+    return normalized
+
+
+def _full_stack_case(*, case_id: str, query_text: str) -> UnifiedRetrievalGoldsetCase:
+    """Build one full-stack Corinna phone recall case."""
+
+    return UnifiedRetrievalGoldsetCase(
+        case_id=case_id,
+        query_text=query_text,
+        canonical_query_text="What is Corinna Maier's phone number?",
+        memory_types=_FULL_STACK_MEMORY_TYPES,
+        required_candidate_sources=("adaptive", "conflict", "durable", "episodic", "graph", "midterm"),
+        required_selected_ids={
+            "episodic_entry_ids": ("episode:corinna_called",),
+            "durable_memory_ids": ("fact:corinna_phone_current", "fact:corinna_phone_old"),
+            "conflict_slot_keys": (_CONFLICT_SLOT_KEY,),
+            "midterm_packet_ids": ("midterm:corinna_today",),
+            "adaptive_packet_ids": ("adaptive:confirmed:fact_corinna_phone_current",),
+            "graph_node_ids": ("person:corinna_maier",),
+        },
+        required_join_anchors={
+            "person_ref:person:corinna_maier": ("adaptive", "conflict", "durable", "episodic", "graph", "midterm"),
+        },
+        required_access_path=_FULL_STACK_ACCESS_PATH,
+        forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
+        required_sections=(
+            "subtext_context",
+            "midterm_context",
+            "durable_context",
+            "episodic_context",
+            "graph_context",
+            "conflict_context",
         ),
-        UnifiedRetrievalGoldsetCase(
-            case_id="corinna_recent_call_continuity",
-            query_text="Did Corinna call earlier today?",
-            canonical_query_text="Did Corinna call earlier today?",
-            required_candidate_sources=("episodic", "graph", "midterm"),
-            required_selected_ids={
-                "episodic_entry_ids": ("episode:corinna_called",),
-                "midterm_packet_ids": ("midterm:corinna_today",),
-                "graph_node_ids": ("person:corinna_maier",),
-            },
-            required_join_anchors={
-                "person_ref:person:corinna_maier": ("episodic", "graph", "midterm"),
-            },
-            required_access_path=full_stack_access,
-            forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
-            required_sections=(
-                "subtext_context",
-                "midterm_context",
-                "episodic_context",
-                "graph_context",
-            ),
-            required_context_terms={
-                "midterm_context": ("recent_contact_bundle",),
-                "episodic_context": ("Corinna called earlier today",),
-                "graph_context": ("Corinna Maier",),
-            },
+        required_context_terms={
+            "midterm_context": ("recent_contact_bundle",),
+            "durable_context": (_CORINNA_PHONE_CURRENT,),
+            "episodic_context": ("Corinna called earlier today",),
+            "graph_context": ("Corinna Maier",),
+            "conflict_context": (_CONFLICT_SLOT_KEY,),
+        },
+    )
+
+
+def _continuity_case(*, case_id: str, query_text: str) -> UnifiedRetrievalGoldsetCase:
+    """Build one Corinna continuity recall case."""
+
+    return UnifiedRetrievalGoldsetCase(
+        case_id=case_id,
+        query_text=query_text,
+        canonical_query_text="Did Corinna call earlier today?",
+        memory_types=_CONTINUITY_MEMORY_TYPES,
+        required_candidate_sources=("episodic", "graph", "midterm"),
+        required_selected_ids={
+            "episodic_entry_ids": ("episode:corinna_called",),
+            "midterm_packet_ids": ("midterm:corinna_today",),
+            "graph_node_ids": ("person:corinna_maier",),
+        },
+        required_join_anchors={
+            "person_ref:person:corinna_maier": ("episodic", "graph", "midterm"),
+        },
+        required_access_path=_FULL_STACK_ACCESS_PATH,
+        forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
+        required_sections=(
+            "subtext_context",
+            "midterm_context",
+            "episodic_context",
+            "graph_context",
         ),
-        UnifiedRetrievalGoldsetCase(
-            case_id="anna_email_graph_only",
-            query_text="What is Anna Becker's email address?",
-            canonical_query_text="What is Anna Becker's email address?",
-            required_candidate_sources=("graph",),
-            required_selected_ids={
-                "graph_node_ids": ("person:anna_becker",),
-            },
-            required_access_path=graph_only_access,
-            forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
-            required_sections=("graph_context",),
-            required_context_terms={
-                "graph_context": ("Anna Becker", _ANNA_EMAIL),
-            },
-            forbidden_sections=(
-                "midterm_context",
-                "durable_context",
-                "episodic_context",
-                "conflict_context",
-            ),
+        required_context_terms={
+            "midterm_context": ("recent_contact_bundle",),
+            "episodic_context": ("Corinna called earlier today",),
+            "graph_context": ("Corinna Maier",),
+        },
+    )
+
+
+def _graph_only_case(*, case_id: str, query_text: str) -> UnifiedRetrievalGoldsetCase:
+    """Build one graph-only Anna email recall case."""
+
+    return UnifiedRetrievalGoldsetCase(
+        case_id=case_id,
+        query_text=query_text,
+        canonical_query_text="What is Anna Becker's email address?",
+        memory_types=_GRAPH_ONLY_MEMORY_TYPES,
+        required_candidate_sources=("graph",),
+        required_selected_ids={
+            "graph_node_ids": ("person:anna_becker",),
+        },
+        required_access_path=_GRAPH_ONLY_ACCESS_PATH,
+        forbidden_access_path=_FORBIDDEN_REMOTE_ACCESS_PATH,
+        required_sections=("graph_context",),
+        required_context_terms={
+            "graph_context": ("Anna Becker", _ANNA_EMAIL),
+        },
+        forbidden_sections=(
+            "midterm_context",
+            "durable_context",
+            "episodic_context",
+            "conflict_context",
         ),
     )
+
+
+def _core_unified_retrieval_goldset_cases() -> tuple[UnifiedRetrievalGoldsetCase, ...]:
+    """Return the narrow always-on live acceptance case set."""
+
+    return (
+        _full_stack_case(
+            case_id="corinna_phone_full_stack",
+            query_text="What is Corinna Maier's phone number?",
+        ),
+        _continuity_case(
+            case_id="corinna_recent_call_continuity",
+            query_text="Did Corinna call earlier today?",
+        ),
+        _graph_only_case(
+            case_id="anna_email_graph_only",
+            query_text="What is Anna Becker's email address?",
+        ),
+    )
+
+
+def unified_retrieval_goldset_cases(
+    *,
+    profile: str = "core",
+) -> tuple[UnifiedRetrievalGoldsetCase, ...]:
+    """Return one named unified-retrieval case profile.
+
+    The `core` profile stays intentionally small for live writer/fresh-reader
+    acceptance, while `expanded` adds many natural-language query variants so
+    recall/precision KPIs can be measured against a materially broader suite
+    without slowing down the operational e2e smoke.
+    """
+
+    normalized_profile = _normalize_unified_retrieval_case_profile(profile)
+    core_cases = _core_unified_retrieval_goldset_cases()
+    if normalized_profile == "core":
+        return core_cases
+    expanded_cases = list(core_cases)
+    expanded_cases.extend(
+        _full_stack_case(
+            case_id=f"corinna_phone_full_stack_variant_{index:02d}",
+            query_text=query_text,
+        )
+        for index, query_text in enumerate(_EXPANDED_CORINNA_PHONE_VARIANTS, start=1)
+    )
+    expanded_cases.extend(
+        _continuity_case(
+            case_id=f"corinna_recent_call_continuity_variant_{index:02d}",
+            query_text=query_text,
+        )
+        for index, query_text in enumerate(_EXPANDED_CORINNA_CONTINUITY_VARIANTS, start=1)
+    )
+    expanded_cases.extend(
+        _graph_only_case(
+            case_id=f"anna_email_graph_only_variant_{index:02d}",
+            query_text=query_text,
+        )
+        for index, query_text in enumerate(_EXPANDED_ANNA_EMAIL_VARIANTS, start=1)
+    )
+    return tuple(expanded_cases)
+
+
+def unified_retrieval_case_profile_memory_type_coverage(
+    *,
+    profile: str = "core",
+) -> tuple[tuple[str, int], ...]:
+    """Return case counts per memory type for one named case profile."""
+
+    counts: dict[str, int] = {}
+    for case in unified_retrieval_goldset_cases(profile=profile):
+        for memory_type in case.memory_types:
+            counts[memory_type] = counts.get(memory_type, 0) + 1
+    return tuple(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def default_unified_retrieval_goldset_cases() -> tuple[UnifiedRetrievalGoldsetCase, ...]:
+    """Return the narrow default case set kept for compatibility and live acceptance."""
+
+    return unified_retrieval_goldset_cases(profile="core")
 
 
 def seed_unified_retrieval_fixture(service: LongTermMemoryService) -> UnifiedRetrievalFixtureSeedStats:
@@ -606,15 +768,39 @@ def wait_for_unified_retrieval_cases(
     timeout_s: float,
     poll_interval_s: float = 2.0,
 ) -> tuple[UnifiedRetrievalGoldsetCaseResult, ...]:
-    """Poll unified-retrieval cases until all pass or the deadline expires."""
+    """Poll unified-retrieval cases until all pass or the deadline expires.
+
+    Re-run only the cases that are still failing. The remote namespace is fresh
+    but can still need a short visibility window after writes; there is no
+    value in repeatedly reloading already-passing cases and doubling the
+    current-head plus top-k traffic while we wait for the laggards.
+    """
 
     case_list = tuple(cases)
     deadline = time.monotonic() + max(0.1, float(timeout_s))
     last_results = run_unified_retrieval_cases(service=service, cases=case_list, phase=phase)
-    while time.monotonic() < deadline and any(not item.passed for item in last_results):
+    result_by_case_id = {item.case_id: item for item in last_results}
+    pending_case_ids = {item.case_id for item in last_results if not item.passed}
+    while time.monotonic() < deadline and pending_case_ids:
         time.sleep(max(0.1, float(poll_interval_s)))
-        last_results = run_unified_retrieval_cases(service=service, cases=case_list, phase=phase)
-    return last_results
+        rerun_results = run_unified_retrieval_cases(
+            service=service,
+            cases=tuple(case for case in case_list if case.case_id in pending_case_ids),
+            phase=phase,
+        )
+        for item in rerun_results:
+            result_by_case_id[item.case_id] = item
+        pending_case_ids = {
+            case.case_id
+            for case in case_list
+            if not result_by_case_id.get(case.case_id, UnifiedRetrievalGoldsetCaseResult(
+                case_id=case.case_id,
+                phase=phase,
+                query_text=case.query_text,
+                error="missing_case_result",
+            )).passed
+        }
+    return tuple(result_by_case_id[case.case_id] for case in case_list)
 
 
 def _run_unified_retrieval_case(
@@ -623,7 +809,12 @@ def _run_unified_retrieval_case(
     case: UnifiedRetrievalGoldsetCase,
     phase: str,
 ) -> UnifiedRetrievalGoldsetCaseResult:
-    """Execute one unified-retrieval case against one service instance."""
+    """Execute one unified-retrieval case against one service instance.
+
+    Build the query plan and rendered context from one shared retrieval pass so
+    the goldset harness does not pay for the same remote current-head plus
+    top-k selectors twice per case.
+    """
 
     try:
         query = LongTermQueryProfile.from_text(
@@ -637,7 +828,12 @@ def _run_unified_retrieval_case(
             query_texts=query_texts,
             retrieval_text=retrieval_text,
         )
-        context = retriever.build_context(query=query, original_query_text=case.query_text)
+        context = retriever._build_context_from_inputs(  # pylint: disable=protected-access
+            context_inputs=context_inputs,
+            retrieval_text=retrieval_text,
+            original_query_text=case.query_text,
+            tool_context=False,
+        )
     except Exception as exc:
         return UnifiedRetrievalGoldsetCaseResult(
             case_id=case.case_id,
@@ -799,8 +995,10 @@ __all__ = [
     "UnifiedRetrievalGoldsetCase",
     "UnifiedRetrievalGoldsetCaseResult",
     "default_unified_retrieval_goldset_cases",
+    "unified_retrieval_case_profile_memory_type_coverage",
     "run_unified_retrieval_cases",
     "seed_unified_retrieval_fixture",
+    "unified_retrieval_goldset_cases",
     "unified_retrieval_case_summary",
     "wait_for_unified_retrieval_cases",
 ]

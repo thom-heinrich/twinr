@@ -8,6 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -17,10 +18,12 @@ from twinr.memory.longterm import (
     LongTermConversationTurn,
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
+    LongTermMidtermPacketV1,
     LongTermMidtermStore,
     LongTermReflectionResultV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.core.cooperative_abort import LongTermOperationCancelledError
 from twinr.memory.longterm.reasoning.midterm import (
     _memory_object_to_prompt_payload,
     _midterm_reflection_schema,
@@ -153,12 +156,34 @@ class _FakeRemoteState:
         )
         self.snapshots: dict[str, dict[str, object]] = {}
         self.load_calls: list[dict[str, object]] = []
+        self.probe_calls: list[dict[str, object]] = []
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
         self.load_calls.append({"snapshot_kind": snapshot_kind, "local_path": local_path})
         del local_path
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+        prefer_metadata_only: bool = False,
+        fast_fail: bool = False,
+    ):
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "local_path": local_path,
+                "prefer_cached_document_id": prefer_cached_document_id,
+                "prefer_metadata_only": prefer_metadata_only,
+                "fast_fail": fast_fail,
+            }
+        )
+        payload = self.snapshots.get(snapshot_kind)
+        return SimpleNamespace(payload=(dict(payload) if isinstance(payload, dict) else None))
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
@@ -247,6 +272,25 @@ class LongTermMidtermTests(unittest.TestCase):
         self.assertEqual(properties["details"]["anyOf"][1]["type"], "null")
         self.assertEqual(properties["valid_from"]["anyOf"][1]["type"], "null")
         self.assertEqual(properties["valid_to"]["anyOf"][1]["type"], "null")
+
+    def test_save_packets_reraises_shutdown_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = SimpleNamespace(enabled=True, required=False)
+            store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            packet = LongTermMidtermPacketV1(
+                packet_id="midterm:test",
+                kind="recent_life_bundle",
+                summary="Corinna kommt heute vorbei.",
+                source_memory_ids=("fact:corinna",),
+            )
+
+            with patch.object(
+                store._remote_midterm,
+                "save_packets",
+                side_effect=LongTermOperationCancelledError("shutdown requested"),
+            ):
+                with self.assertRaises(LongTermOperationCancelledError):
+                    store.save_packets(packets=(packet,))
 
     def test_reflector_can_compile_midterm_packets(self) -> None:
         reflector = LongTermMemoryReflector(program=StubReflectionProgram(), midterm_packet_limit=3)
@@ -506,6 +550,31 @@ class LongTermMidtermTests(unittest.TestCase):
             remote_state.client.records_by_uri,
         )
 
+    def test_midterm_readiness_bootstrap_uses_probe_mode_for_empty_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot_for_readiness()
+
+        self.assertFalse(created)
+        self.assertEqual(remote_state.load_calls, [])
+        self.assertEqual(
+            remote_state.probe_calls,
+            [
+                {
+                    "snapshot_kind": "midterm",
+                    "local_path": None,
+                    "prefer_cached_document_id": False,
+                    "prefer_metadata_only": True,
+                    "fast_fail": True,
+                }
+            ],
+        )
+
     def test_ensure_remote_snapshot_uses_compatible_current_head_when_direct_head_lags(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             remote_state = _FakeRemoteState()
@@ -594,6 +663,38 @@ class LongTermMidtermTests(unittest.TestCase):
 
         self.assertEqual([item.packet_id for item in german_packets], ["midterm:turn:remote_recap"])
         self.assertEqual([item.packet_id for item in english_packets], ["midterm:turn:remote_recap"])
+        self.assertEqual(control_packets, ())
+
+    def test_remote_midterm_results_are_relevance_filtered_before_early_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            primary_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            packet = primary_store.packet_type(
+                packet_id="midterm:jam_restart",
+                kind="adaptive_restart_recall_policy",
+                summary="Persistent restart recall for this stable durable memory: Inzwischen magst du lieber Aprikosenmarmelade.",
+                details="Use this packet as direct grounding after fresh runtime restarts when the current turn overlaps the same topic.",
+                source_memory_ids=("fact:jam_preference_new",),
+                query_hints=("preference:breakfast:jam", "bestaetigt"),
+                attributes={"persistence_scope": "restart_recall"},
+            )
+            primary_store.save_packets(packets=(packet,))
+            fresh_store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "fresh" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            with patch.object(fresh_store._remote_midterm, "select_relevant_packets", return_value=(packet,)):
+                jam_packets = fresh_store.select_relevant_packets(
+                    "Welche Marmelade ist jetzt als bestaetigt gespeichert?",
+                    limit=2,
+                )
+                control_packets = fresh_store.select_relevant_packets("Was ist ein Regenbogen?", limit=2)
+
+        self.assertEqual([item.packet_id for item in jam_packets], ["midterm:jam_restart"])
         self.assertEqual(control_packets, ())
 
     def test_load_packets_uses_catalog_entry_projection_when_midterm_item_documents_lag(self) -> None:

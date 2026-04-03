@@ -220,15 +220,18 @@ class StreamingSemanticRouterRuntime:
                     first_word_enabled=policy.first_word_enabled,
                     trace_enabled=policy.trace_enabled,
                 )
-                resolution = LocalSemanticRouteResolution(
-                    route_decision=decision,
-                    user_intent_decision=user_intent_decision,
-                    supervisor_decision=_synthesize_supervisor_decision(
+                synthesized_decision = None
+                if _normalized_label(getattr(decision, "label", "")) != "tool":
+                    synthesized_decision = _synthesize_supervisor_decision(
                         route_decision=decision,
                         bridge_reply=bridge_reply,
                         transcript_hash=_short_hash(cleaned),
                         scope_token=_decision_scope_token(self._loop) or self._instance_scope_token,
-                    ),
+                    )
+                resolution = LocalSemanticRouteResolution(
+                    route_decision=decision,
+                    user_intent_decision=user_intent_decision,
+                    supervisor_decision=synthesized_decision,
                     bridge_reply=bridge_reply,
                 )
             else:

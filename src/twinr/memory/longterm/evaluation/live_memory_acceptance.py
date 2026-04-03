@@ -19,8 +19,14 @@ import os
 from pathlib import Path
 import tempfile
 
-from twinr import TwinrConfig
-from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.agent.base_agent.conversation.language import memory_and_response_contract
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.longterm.core.models import (
+    LongTermConflictQueueItemV1,
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermSourceRefV1,
+)
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.providers.openai import OpenAIBackend
 from twinr.text_utils import folded_lookup_text
@@ -29,7 +35,6 @@ from twinr.memory.longterm.evaluation.live_midterm_acceptance import (
     _close_openai_backend,
     _configure_openai_backend_client,
     _normalize_base_project_root,
-    _provider_conversation,
     _shutdown_service,
 )
 
@@ -173,6 +178,7 @@ class _AcceptanceCase:
     forbidden_terms: tuple[str, ...] = ()
     required_context_terms: tuple[str, ...] = ()
     forbidden_context_terms: tuple[str, ...] = ()
+    include_conflict_queue_context: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +431,7 @@ def _default_cases() -> tuple[_AcceptanceCase, ...]:
             query_text="Welche Marmeladen stehen gerade im Widerspruch?",
             required_terms=("Erdbeermarmelade", "Aprikosenmarmelade"),
             required_context_terms=("Erdbeermarmelade", "Aprikosenmarmelade"),
+            include_conflict_queue_context=True,
         ),
         _AcceptanceCase(
             case_id="control_before",
@@ -483,7 +490,11 @@ def _run_case(
 ) -> LiveMemoryAcceptanceCaseResult:
     """Execute one live query case against the current isolated runtime."""
 
-    conversation = _provider_conversation(service=service, config=config, query_text=case.query_text)
+    conversation = _acceptance_provider_conversation(
+        service=service,
+        config=config,
+        case=case,
+    )
     context_text = "\n".join(content for role, content in conversation if str(role) == "system")
     response = backend.respond_with_metadata(
         case.query_text,
@@ -512,6 +523,77 @@ def _run_case(
         request_id=getattr(response, "request_id", None),
         response_id=getattr(response, "response_id", None),
     )
+
+
+def _acceptance_provider_conversation(
+    *,
+    service: LongTermMemoryService,
+    config: TwinrConfig,
+    case: _AcceptanceCase,
+) -> tuple[tuple[str, str], ...]:
+    """Build a bounded provider conversation focused on memory recall proof.
+
+    The live synthetic-memory acceptance must prove earlier-memory recall and
+    conflict resolution without dragging in unrelated graph/world-state
+    full-document reads. Compose the low-latency fast-topic lane with the
+    tool-safe durable context without graph fallback, and only add an explicit
+    conflict-queue block for the cases that actually need it.
+    """
+
+    messages: list[tuple[str, str]] = []
+    try:
+        contract = memory_and_response_contract(config.openai_realtime_language)
+    except Exception:
+        contract = None
+    if contract:
+        messages.append(("system", contract))
+
+    seen_system_messages: set[str] = set()
+    fast_context = service.build_fast_provider_context(case.query_text)
+    for item in fast_context.system_messages():
+        text = str(item or "").strip()
+        if text and text not in seen_system_messages:
+            messages.append(("system", text))
+            seen_system_messages.add(text)
+
+    tool_context = service.build_tool_provider_context(
+        case.query_text,
+        include_graph_fallback=False,
+    )
+    for item in tool_context.system_messages():
+        text = str(item or "").strip()
+        if text and text not in seen_system_messages:
+            messages.append(("system", text))
+            seen_system_messages.add(text)
+
+    if case.include_conflict_queue_context:
+        conflict_context = _render_conflict_queue_context(
+            service.select_conflict_queue(case.query_text),
+        )
+        if conflict_context and conflict_context not in seen_system_messages:
+            messages.append(("system", conflict_context))
+    return tuple(messages)
+
+
+def _render_conflict_queue_context(queue: tuple[LongTermConflictQueueItemV1, ...]) -> str | None:
+    """Render one compact conflict-queue system block for acceptance prompts."""
+
+    if not queue:
+        return None
+    lines = [
+        "twinr_acceptance_conflict_queue_v1",
+        "Open memory conflicts relevant to this turn. Use them only when the user is explicitly asking about conflicting memories.",
+    ]
+    for item in queue:
+        lines.append(f"- question: {item.question}")
+        lines.append(f"  reason: {item.reason}")
+        for option in item.options:
+            lines.append(
+                "  option: "
+                + str(option.summary)
+                + f" [memory_id={option.memory_id}; status={option.status}]"
+            )
+    return "\n".join(lines)
 
 
 def _assert_ready_result(result: LiveMemoryAcceptanceResult) -> None:

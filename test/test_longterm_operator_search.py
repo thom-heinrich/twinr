@@ -20,7 +20,13 @@ from twinr.memory.query_normalization import LongTermQueryProfile
 
 
 class _FakeQueryRewriter:
-    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+    def profile(
+        self,
+        query_text: str | None,
+        *,
+        wait_for_rewrite_s: float = 0.0,
+    ) -> LongTermQueryProfile:
+        del wait_for_rewrite_s
         return LongTermQueryProfile.from_text(query_text, canonical_english_text="lea lentil soup")
 
 
@@ -112,8 +118,14 @@ class _FakeGraphStore:
 
 
 class _FailingQueryRewriter:
-    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+    def profile(
+        self,
+        query_text: str | None,
+        *,
+        wait_for_rewrite_s: float = 0.0,
+    ) -> LongTermQueryProfile:
         del query_text
+        del wait_for_rewrite_s
         raise AssertionError("conversation recap operator search must not call the query rewriter")
 
 

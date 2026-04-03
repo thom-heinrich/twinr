@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import inspect
 
 from twinr.memory.chonkydb.models import ChonkyDBRecordItem
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
 from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogEntry
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 from .shared import (
     _ARCHIVE_STORE_SCHEMA,
@@ -297,11 +299,12 @@ class StructuredStoreActiveDeltaMixin:
         remote_catalog = self._remote_catalog
         if remote_catalog is None:
             raise RuntimeError("Fine-grained remote catalog store is required for active delta commits.")
+        projection_complete_remote_write = snapshot_kind in {"objects", "conflicts", "archive"}
         definition = remote_catalog._require_definition(snapshot_kind)
-        existing_entries = {
-            entry.item_id: entry
-            for entry in remote_catalog._load_catalog_entries_for_write(snapshot_kind=snapshot_kind)
-        }
+        existing_entries = self._load_remote_collection_entries_for_active_delta(
+            remote_catalog=remote_catalog,
+            snapshot_kind=snapshot_kind,
+        )
         delete_ids = {
             normalized
             for normalized in (_normalize_text(value) for value in delete_item_ids)
@@ -401,6 +404,7 @@ class StructuredStoreActiveDeltaMixin:
                 write_client,
                 snapshot_kind=snapshot_kind,
                 record_items=record_items,
+                skip_async_document_id_wait=projection_complete_remote_write,
             )
             for index, (item_id, metadata, payload) in enumerate(staged):
                 existing_entries[item_id] = LongTermRemoteCatalogEntry(
@@ -426,4 +430,46 @@ class StructuredStoreActiveDeltaMixin:
             snapshot_kind=snapshot_kind,
             entries=ordered_entries,
             written_at=written_at,
+            skip_async_document_id_wait=projection_complete_remote_write,
         )
+
+    @staticmethod
+    def _load_remote_collection_entries_for_active_delta(
+        *,
+        remote_catalog: object,
+        snapshot_kind: str,
+    ) -> dict[str, LongTermRemoteCatalogEntry]:
+        """Load reusable current entries, treating a proven-missing head as empty.
+
+        Active-delta writes can be the first structured-memory write on a fresh
+        namespace. The ordinary current-head load keeps remote failures
+        fail-closed, but a fast probe may still prove that the fixed
+        ``catalog/current`` document is genuinely absent rather than unhealthy.
+        In that narrow case, start from an empty collection instead of aborting
+        the first live delta write.
+        """
+
+        try:
+            load_entries = getattr(remote_catalog, "_load_catalog_entries_for_write")
+            entries = load_entries(snapshot_kind=snapshot_kind)
+        except LongTermRemoteUnavailableError:
+            probe_catalog_payload_result = getattr(remote_catalog, "probe_catalog_payload_result", None)
+            if not callable(probe_catalog_payload_result):
+                raise
+            probe_kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
+            try:
+                parameters = inspect.signature(probe_catalog_payload_result).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "fast_fail" in parameters:
+                probe_kwargs["fast_fail"] = True
+            head_status, _payload = probe_catalog_payload_result(**probe_kwargs)
+            if _normalize_text(head_status) == "not_found":
+                entries = ()
+            else:
+                raise
+        return {
+            entry.item_id: entry
+            for entry in entries
+            if isinstance(entry, LongTermRemoteCatalogEntry)
+        }

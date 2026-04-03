@@ -1666,7 +1666,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_recall_limit, 3)
         self.assertTrue(config.long_term_memory_fast_topic_enabled)
         self.assertEqual(config.long_term_memory_fast_topic_limit, 3)
-        self.assertEqual(config.long_term_memory_fast_topic_timeout_s, 0.6)
+        self.assertEqual(config.long_term_memory_fast_topic_timeout_s, 1.2)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
@@ -1728,6 +1728,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.proactive_quiet_hours_visual_only_enabled)
         self.assertEqual(config.proactive_quiet_hours_start_local, "21:00")
         self.assertEqual(config.proactive_quiet_hours_end_local, "07:00")
+
+    def test_default_fast_topic_timeout_tracks_required_remote_budget_floor(self) -> None:
+        config = TwinrConfig()
+
+        self.assertEqual(config.long_term_memory_fast_topic_timeout_s, 1.2)
 
     def test_from_env_defaults_long_term_memory_path_to_project_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1917,3 +1922,47 @@ class TwinrConfigTests(unittest.TestCase):
                 "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL",
             ):
                 TwinrConfig.from_env(env_path)
+
+    def test_pi_runtime_rejects_loopback_voice_orchestrator_ws_url(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Pi runtime TWINR_VOICE_ORCHESTRATOR_WS_URL must not target loopback",
+        ):
+            TwinrConfig(
+                project_root="/twinr",
+                voice_orchestrator_enabled=True,
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_allow_insecure_ws=True,
+                voice_orchestrator_remote_asr_url="http://voice-gateway.local:8797",
+            )
+
+    def test_pi_runtime_rejects_loopback_voice_remote_asr_url(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Pi runtime TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL must not target loopback",
+        ):
+            TwinrConfig(
+                project_root="/twinr",
+                voice_orchestrator_enabled=True,
+                voice_orchestrator_ws_url="ws://voice-gateway.local:8797/ws/orchestrator/voice",
+                voice_orchestrator_allow_insecure_ws=True,
+                voice_orchestrator_remote_asr_url="http://127.0.0.1:8797",
+            )
+
+    def test_pi_runtime_accepts_non_loopback_voice_gateway_urls(self) -> None:
+        config = TwinrConfig(
+            project_root="/twinr",
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://voice-gateway.local:8797/ws/orchestrator/voice",
+            voice_orchestrator_allow_insecure_ws=True,
+            voice_orchestrator_remote_asr_url="http://voice-gateway.local:8797",
+        )
+
+        self.assertEqual(
+            config.voice_orchestrator_ws_url,
+            "ws://voice-gateway.local:8797/ws/orchestrator/voice",
+        )
+        self.assertEqual(
+            config.voice_orchestrator_remote_asr_url,
+            "http://voice-gateway.local:8797",
+        )

@@ -27,6 +27,12 @@ MATRIX_GROUP_TOOL_NAMES: dict[str, tuple[str, ...]] = {
         "search_live_info",
         "inspect_camera",
         "end_conversation",
+        "manage_voice_quiet_mode",
+    ),
+    "browser_channels": (
+        "browser_automation",
+        "connect_service_integration",
+        "send_whatsapp_message",
     ),
     "reminder_automation": (
         "schedule_reminder",

@@ -129,9 +129,15 @@ class _StaticQueryRewriter:
 
     canonical_queries: Mapping[str, str]
 
-    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+    def profile(
+        self,
+        query_text: str | None,
+        *,
+        wait_for_rewrite_s: float = 0.0,
+    ) -> LongTermQueryProfile:
         """Build a query profile with the pre-seeded canonical English text."""
 
+        del wait_for_rewrite_s
         original = " ".join(str(query_text or "").split()).strip()
         return LongTermQueryProfile.from_text(
             original,

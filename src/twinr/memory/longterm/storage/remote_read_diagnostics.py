@@ -86,6 +86,13 @@ class LongTermRemoteWriteContext:
     batch_index: int | None = None
     batch_count: int | None = None
     request_bytes: int | None = None
+    request_execution_mode: str | None = None
+    async_job_resolution_source: str | None = None
+    attestation_mode: str | None = None
+    readback_required: bool | None = None
+    store_transport_ms: float | None = None
+    async_job_wait_ms: float | None = None
+    readback_attestation_ms: float | None = None
 
 
 def extract_remote_write_context(exc: BaseException | None) -> dict[str, object] | None:
@@ -99,6 +106,13 @@ def extract_remote_write_context(exc: BaseException | None) -> dict[str, object]
     context = {
         "snapshot_kind": _normalize_text(raw_context.get("snapshot_kind")),
         "operation": _normalize_text(raw_context.get("operation")),
+        "request_path": _normalize_text(raw_context.get("request_path")),
+        "request_payload_kind": _normalize_text(raw_context.get("request_payload_kind")),
+        "request_execution_mode": _normalize_text(raw_context.get("request_execution_mode")),
+        "timeout_s": _normalize_float(raw_context.get("timeout_s")),
+        "attestation_mode": _normalize_text(raw_context.get("attestation_mode")),
+        "readback_required": _normalize_bool(raw_context.get("readback_required")),
+        "attempt_count": _normalize_int(raw_context.get("attempt_count")),
         "request_correlation_id": _normalize_text(raw_context.get("request_correlation_id")),
         "batch_index": _normalize_int(raw_context.get("batch_index")),
         "batch_count": _normalize_int(raw_context.get("batch_count")),
@@ -478,6 +492,13 @@ def _build_remote_request_diagnostic_data(
         "batch_index": _normalize_int(getattr(context, "batch_index", None)),
         "batch_count": _normalize_int(getattr(context, "batch_count", None)),
         "request_bytes": _normalize_int(getattr(context, "request_bytes", None)),
+        "request_execution_mode": _normalize_text(getattr(context, "request_execution_mode", None)),
+        "async_job_resolution_source": _normalize_text(getattr(context, "async_job_resolution_source", None)),
+        "attestation_mode": _normalize_text(getattr(context, "attestation_mode", None)),
+        "readback_required": _normalize_bool(getattr(context, "readback_required", None)),
+        "store_transport_ms": _normalize_float(getattr(context, "store_transport_ms", None)),
+        "async_job_wait_ms": _normalize_float(getattr(context, "async_job_wait_ms", None)),
+        "readback_attestation_ms": _normalize_float(getattr(context, "readback_attestation_ms", None)),
         "query_sha256": _query_sha256(getattr(context, "query_text", None)),
         "query_term_count": _query_term_count(getattr(context, "query_text", None)),
         "query_chars": len(str(getattr(context, "query_text", None) or "")),

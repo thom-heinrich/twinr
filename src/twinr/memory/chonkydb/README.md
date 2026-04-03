@@ -10,6 +10,7 @@ used by Twinr's long-term memory flows.
 - call the ChonkyDB external API through a validated client boundary
 - keep that client on a pooled, redirect-fail-closed transport so repeated Pi memory reads/writes do not pay a fresh DNS/TLS setup every call
 - preserve HTTP error metadata such as `Retry-After` on `ChonkyDBError`, so higher storage layers can treat transient `429 queue_saturated` write pressure as bounded retryable backend overload instead of a generic opaque failure
+- keep `ChonkyDBError` compatible with normal Python exception chaining and traceback reassignment, so readiness/probe context managers surface the real backend failure instead of masking it with a secondary runtime error
 - define typed request and response models for record, retrieve, and graph endpoints
 - expose typed `graph/store_many` requests so Twinr can persist versioned graph generations without falling back to whole-graph snapshot blobs
 - expose a one-shot `topk_records` retrieval contract that returns structured payloads from ChonkyDB in a single roundtrip
@@ -29,11 +30,14 @@ used by Twinr's long-term memory flows.
 - expose graph selection and graph rendering as separate steps so the long-term retriever can reuse one bounded query-first subgraph inside a larger mixed-source query plan instead of reselecting the graph during rendering
 - support adding and deleting graph-backed contacts, preferences, and plans so discovery corrections can keep structured memory consistent
 - build prompt-context and subtext payloads from persisted graph memory
+- keep final prompt/subtext overlap checks permissive enough for exact short domain tokens such as `tea` or `sms`, so query-first graph selection is not nullified by an over-strict length filter on the last ranking step
 - probe graph readiness through the current-view heads so required-remote watchdog recovery does not depend on legacy graph snapshot blobs
+- cap readiness-only direct graph current-head probes to a small fail-closed timeout instead of the colder origin-resolution budget, so unhealthy remote memory surfaces quickly and does not drag service shutdown behind a long same-URI head read
 - let fresh-reader bootstrap fall back from a lagging fixed-URI graph head to the already-written small compatibility current-head payload in a strictly read-only way, so cross-process readiness does not reseed or re-promote the whole graph just because direct head visibility lags
 - treat a real fixed-URI graph-head `404` on a fresh empty namespace as a legitimate read-only bootstrap state, and synthesize the canonical empty current-view summary instead of forcing an empty remote seed write during required readiness
 - keep compatible graph current-head fallback on the mutable snapshot URI instead of pinned exact document IDs, so fresh readers do not stick to superseded heads or drag startup through slow full-document recovery
 - treat generic `graph_nodes` / `graph_edges` `catalog/current` payloads as insufficient for current-view readiness unless they also carry the graph generation metadata, and let graph repair writes proceed from a valid local cache even when the advertised current view is broken
+- treat the direct fixed-URI `graph_nodes` / `graph_edges` head envelope itself as authoritative during repair/readiness checks; do not let a hidden `metadata.twinr_payload` shadow make an already generic/incomplete current-head record look healthy
 - keep graph current-view `probe` and `load` semantics distinct: metadata-only probes may return `None` for incomplete `graph_edges` heads, but authoritative load paths must still perform the full fixed-URI current-head read before failing closed
 
 `chonkydb` does **not** own:

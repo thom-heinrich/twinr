@@ -49,12 +49,16 @@ class LongTermRemoteCurrentRecordStore:
         self,
         *,
         snapshot_kind: str,
+        fast_fail: bool = False,
     ) -> tuple[str, dict[str, object] | None]:
         """Probe one current head while preserving missing-vs-invalid status."""
 
         if not self.enabled():
             return "disabled", None
-        return self._catalog.probe_catalog_payload_result(snapshot_kind=snapshot_kind)
+        return self._catalog.probe_catalog_payload_result(
+            snapshot_kind=snapshot_kind,
+            fast_fail=fast_fail,
+        )
 
     def load_current_head(self, *, snapshot_kind: str) -> dict[str, object] | None:
         """Load one current-head payload through the fixed-URI catalog contract."""
@@ -281,6 +285,7 @@ class LongTermRemoteCurrentRecordStore:
         head_fields: Mapping[str, object] | None = None,
         written_at: str | None = None,
         replace_invalid_current_head: bool = False,
+        attest_readback: bool = True,
     ) -> dict[str, object] | None:
         """Persist a typed collection and publish its authoritative current head."""
 
@@ -293,6 +298,7 @@ class LongTermRemoteCurrentRecordStore:
             metadata_builder=metadata_builder,
             content_builder=content_builder,
             replace_invalid_current_head=replace_invalid_current_head,
+            attest_readback=attest_readback,
         )
         if isinstance(written_at, str) and written_at.strip():
             catalog_payload["written_at"] = written_at.strip()
@@ -300,7 +306,11 @@ class LongTermRemoteCurrentRecordStore:
             for key, value in head_fields.items():
                 if value is not None:
                     catalog_payload[str(key)] = value
-        self._catalog.persist_catalog_payload(snapshot_kind=snapshot_kind, payload=catalog_payload)
+        self._catalog.persist_catalog_payload(
+            snapshot_kind=snapshot_kind,
+            payload=catalog_payload,
+            attest_readback=attest_readback,
+        )
         return catalog_payload
 
     def save_single_payload(
@@ -314,6 +324,7 @@ class LongTermRemoteCurrentRecordStore:
         head_fields: Mapping[str, object] | None = None,
         written_at: str | None = None,
         replace_invalid_current_head: bool = False,
+        attest_readback: bool = True,
     ) -> dict[str, object] | None:
         """Persist one typed current state as a one-item collection."""
 
@@ -326,4 +337,5 @@ class LongTermRemoteCurrentRecordStore:
             head_fields=head_fields,
             written_at=written_at,
             replace_invalid_current_head=replace_invalid_current_head,
+            attest_readback=attest_readback,
         )

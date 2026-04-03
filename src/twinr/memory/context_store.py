@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -421,6 +422,7 @@ def _probe_remote_collection_head_status(
     *,
     remote_records: object,
     remote_snapshot_kind: str | None,
+    fast_fail: bool = False,
 ) -> tuple[str, dict[str, object] | None]:
     """Return the fixed current-head probe status for one prompt collection."""
 
@@ -428,7 +430,14 @@ def _probe_remote_collection_head_status(
         return "disabled", None
     probe_current_head_result = getattr(remote_records, "probe_current_head_result", None)
     if callable(probe_current_head_result):
-        status, payload = probe_current_head_result(snapshot_kind=remote_snapshot_kind)
+        probe_kwargs: dict[str, object] = {"snapshot_kind": remote_snapshot_kind}
+        try:
+            parameters = inspect.signature(probe_current_head_result).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "fast_fail" in parameters:
+            probe_kwargs["fast_fail"] = fast_fail
+        status, payload = probe_current_head_result(**probe_kwargs)
         normalized_status = _normalize_text(status, limit=32).lower() or "unavailable"
         if isinstance(payload, Mapping):
             return normalized_status, dict(payload)
@@ -591,6 +600,12 @@ class ManagedContextFileStore:
             rendered = "\n\n".join(part for part in parts if part).strip()
             return rendered or None
 
+    def has_local_remote_seed_entries(self) -> bool:
+        """Return whether remote bootstrap can publish managed entries from disk."""
+
+        with self._locked():
+            return bool(self._load_local_entries())
+
     def ensure_remote_snapshot(self) -> bool:
         """Seed the remote snapshot when remote-primary storage is enabled.
 
@@ -608,6 +623,7 @@ class ManagedContextFileStore:
                 probe_status, probe_payload = _probe_remote_collection_head_status(
                     remote_records=self._remote_records,
                     remote_snapshot_kind=self.remote_snapshot_kind,
+                    fast_fail=True,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
@@ -908,6 +924,7 @@ class PersistentMemoryMarkdownStore:
                 probe_status, probe_payload = _probe_remote_collection_head_status(
                     remote_records=self._remote_records,
                     remote_snapshot_kind=self.remote_snapshot_kind,
+                    fast_fail=True,
                 )
             except Exception as exc:
                 if _is_remote_unavailable_error(exc):
@@ -928,6 +945,12 @@ class PersistentMemoryMarkdownStore:
             if not local_entries:
                 return False
             return self._try_save_remote_entries(local_entries)
+
+    def has_local_remote_seed_entries(self) -> bool:
+        """Return whether remote bootstrap has durable local entries to publish."""
+
+        with self._locked():
+            return bool(self._load_local_entries())
 
     def probe_remote_current_head(self) -> dict[str, object] | None:
         """Expose the prompt-memory current-head probe for readiness checks."""
@@ -1277,9 +1300,12 @@ class PromptContextStore:
 
         def ensure_one(request: tuple[str, object]) -> tuple[str, bool]:
             default_kind, component = request
+            snapshot_kind = str(getattr(component, "remote_snapshot_kind", "") or default_kind)
+            has_local_remote_seed_entries = getattr(component, "has_local_remote_seed_entries", None)
+            if callable(has_local_remote_seed_entries) and not bool(has_local_remote_seed_entries()):
+                return snapshot_kind, False
             ensure_remote_snapshot = getattr(component, "ensure_remote_snapshot")
             created = bool(ensure_remote_snapshot())
-            snapshot_kind = str(getattr(component, "remote_snapshot_kind", "") or default_kind)
             return snapshot_kind, created
 
         # Keep prompt/user/personality seeding serialized. Live readiness runs

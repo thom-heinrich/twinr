@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math  # AUDIT-FIX(#5): reject non-finite numeric values inside JSON-like scope payloads.
 from collections.abc import Mapping, Sequence
@@ -397,8 +398,16 @@ def _optional_text(
 def _require_mapping(raw_value: object, *, field_name: str) -> dict[str, object]:
     if raw_value is None:
         return {}
+    if isinstance(raw_value, (str, bytes, bytearray)):
+        encoded_mapping = _coerce_text(raw_value, field_name=field_name, max_length=_MAX_TEXT_LENGTH)
+        if encoded_mapping is None:
+            return {}
+        try:
+            raw_value = json.loads(encoded_mapping)
+        except json.JSONDecodeError as exc:
+            raise _SelfCodingToolInputError(f"{field_name} must be a JSON object or a JSON-encoded object string") from exc
     if not isinstance(raw_value, Mapping):
-        raise _SelfCodingToolInputError(f"{field_name} must be a JSON object")
+        raise _SelfCodingToolInputError(f"{field_name} must be a JSON object or a JSON-encoded object string")
     return _sanitize_mapping(raw_value, field_name=field_name, depth=0)  # AUDIT-FIX(#5): recursively sanitize nested values instead of accepting arbitrary objects verbatim.
 
 

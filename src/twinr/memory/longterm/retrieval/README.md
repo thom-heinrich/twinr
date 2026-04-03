@@ -24,6 +24,7 @@ personalization cues for a single user turn.
 - keep that unified plan on a minimal kept-evidence contract: reorder candidates, prune non-focus components, drop non-dominant source families when a query clearly resolves to continuity vs practical recall, and expose dropped-candidate reasons in the internal plan for debugging
 - treat broad semantic domains such as `memory_domain:*` as explainability hints only, not as candidate-connectivity edges, so unrelated memories in the same domain cannot collapse into one giant retrieval component
 - reuse the graph selected by that unified plan for subtext compilation so one turn does not issue a second graph-selection pass just to render silent personalization
+- suppress raw graph prompt blocks in the normal provider path when unified subtext planning found no relevant graph payload and no other recall sections survived, so graph-only control queries do not over-personalize replies with irrelevant person/preference context
 - derive tool-facing redacted context from that same already-loaded retrieval input set instead of repeating conflict or durable remote reads after the main selection pass
 - keep tool-facing recall bounded by dropping silent subtext entirely and only fetching graph context as a fallback when visible structured recall would otherwise be empty
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
@@ -45,7 +46,7 @@ dumps.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package marker |
-| `retriever.py` | Context assembly, including environment-aware durable/midterm rendering and unified-plan attachment of adaptive/subtext metadata |
+| `retriever.py` | Context assembly, including environment-aware durable/midterm rendering, unified-plan attachment of adaptive/subtext metadata, and fail-closed graph-context suppression when no relevant graph payload survived |
 | `unified_plan.py` | Internal candidate normalization, focus-component pruning, semantic join-anchor selection, and explainable mixed graph+structured+episodic+midterm query plans |
 | `fast_topic.py` | One-shot current-topic hint builder for low-latency answer paths |
 | `adaptive_policy.py` | Adaptive prompt-policy compiler from stored long-term signals, including confirmed response-channel preference packets |

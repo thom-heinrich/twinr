@@ -206,6 +206,29 @@ def _normalize_images(raw_images: object) -> list[Any]:
     return [raw_images] if raw_images is not None else []
 
 
+def _tool_runtime_conversation_context(owner: Any) -> tuple[tuple[str, str], ...]:
+    """Return the bounded runtime context intended for local tool turns.
+
+    Output-generation tools run inside the active streaming tool lane. They must
+    stay on the compact tool context instead of re-entering the strict
+    transcript-first live-provider front, which may not be materialized for
+    immediate local tool execution yet.
+    """
+
+    runtime = getattr(owner, "runtime", None)
+    if runtime is None:
+        return ()
+    for attribute_name in (
+        "tool_provider_tiny_recent_conversation_context",
+        "tool_provider_conversation_context",
+        "provider_conversation_context",
+    ):
+        builder = getattr(runtime, attribute_name, None)
+        if callable(builder):
+            return builder()
+    return ()
+
+
 # AUDIT-FIX(#4): Strip control characters from emitted values so user/model text cannot inject fake events into logs or SSE-like streams.
 def _sanitize_emit_value(value: object) -> str:
     text = _stringify_text(value)
@@ -380,7 +403,7 @@ def handle_print_receipt(owner: Any, arguments: dict[str, object]) -> dict[str, 
                 default=None,
             )
             composed = owner.print_backend.compose_print_job_with_metadata(
-                conversation=owner.runtime.provider_conversation_context(),
+                conversation=_tool_runtime_conversation_context(owner),
                 focus_hint=focus_hint or None,
                 direct_text=direct_text or None,
                 request_source="tool",
@@ -731,7 +754,7 @@ def handle_inspect_camera(owner: Any, arguments: dict[str, object]) -> dict[str,
         response = owner.print_backend.respond_to_images_with_metadata(
             owner._build_vision_prompt(question, include_reference=len(images) > 1),
             images=images,
-            conversation=owner.runtime.provider_conversation_context(),
+            conversation=_tool_runtime_conversation_context(owner),
             allow_web_search=False,
         )
         # AUDIT-FIX(#9): Empty vision text is a failed inspection, not a valid answer.

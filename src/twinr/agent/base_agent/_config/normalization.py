@@ -8,8 +8,11 @@ Purpose and boundaries:
 
 from __future__ import annotations
 
+import ipaddress
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from .constants import (
     SUPPORTED_DISPLAY_DRIVERS,
@@ -36,6 +39,9 @@ from .topology_validation import (
 
 if TYPE_CHECKING:
     from .schema import TwinrConfig
+
+
+_PI_RUNTIME_ROOT = Path("/twinr").resolve()
 
 
 def normalize_twinr_config(config: "TwinrConfig") -> None:
@@ -803,6 +809,9 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
     normalized_voice_orchestrator_ws_url = str(
         config.voice_orchestrator_ws_url or ""
     ).strip()
+    normalized_voice_orchestrator_remote_asr_url = str(
+        config.voice_orchestrator_remote_asr_url or ""
+    ).strip()
     normalized_camera_host_mode = _parse_camera_host_mode(
         config.camera_host_mode, default="onboard"
     )
@@ -836,6 +845,21 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
             "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL; "
             "Twinr must not fall back to an implicit voice gateway endpoint."
         )
+    if _project_root_targets_pi_runtime(config.project_root):
+        if config.voice_orchestrator_enabled and _url_targets_loopback(
+            normalized_voice_orchestrator_ws_url
+        ):
+            raise ValueError(
+                "Pi runtime TWINR_VOICE_ORCHESTRATOR_WS_URL must not target loopback; "
+                "use the development-host LAN bridge instead, for example "
+                "ws://<dev-host>.local:8797/ws/orchestrator/voice."
+            )
+        if _url_targets_loopback(normalized_voice_orchestrator_remote_asr_url):
+            raise ValueError(
+                "Pi runtime TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL must not target loopback; "
+                "use the development-host LAN bridge instead, for example "
+                "http://<dev-host>.local:8797."
+            )
     validate_supported_camera_topology(
         camera_host_mode=normalized_camera_host_mode,
         camera_second_pi_base_url=normalized_camera_second_pi_base_url,
@@ -853,3 +877,30 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
     apply_general_updates(config, normalized_values)
     apply_display_updates(config, normalized_values)
     apply_attention_servo_updates(config, normalized_values)
+
+
+def _project_root_targets_pi_runtime(project_root: str | Path | None) -> bool:
+    """Return whether the config is being built for the Pi acceptance tree."""
+
+    try:
+        resolved = Path(project_root or ".").expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    return resolved == _PI_RUNTIME_ROOT or _PI_RUNTIME_ROOT in resolved.parents
+
+
+def _url_targets_loopback(url: str | None) -> bool:
+    """Return whether a configured HTTP/WebSocket URL points back to localhost."""
+
+    normalized = str(url or "").strip()
+    if not normalized:
+        return False
+    hostname = (urlsplit(normalized).hostname or "").strip().lower()
+    if not hostname:
+        return False
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False

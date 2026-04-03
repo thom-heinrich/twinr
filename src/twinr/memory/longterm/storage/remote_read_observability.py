@@ -133,6 +133,13 @@ def record_remote_request_observation(
         "result_limit": _normalize_int(getattr(context, "result_limit", None)),
         "batch_size": _normalize_int(getattr(context, "batch_size", None)),
         "catalog_entry_count": _normalize_int(getattr(context, "catalog_entry_count", None)),
+        "request_execution_mode": _normalize_text(getattr(context, "request_execution_mode", None)),
+        "async_job_resolution_source": _normalize_text(getattr(context, "async_job_resolution_source", None)),
+        "attestation_mode": _normalize_text(getattr(context, "attestation_mode", None)),
+        "readback_required": _normalize_bool(getattr(context, "readback_required", None)),
+        "store_transport_ms": _normalize_float(getattr(context, "store_transport_ms", None)),
+        "async_job_wait_ms": _normalize_float(getattr(context, "async_job_wait_ms", None)),
+        "readback_attestation_ms": _normalize_float(getattr(context, "readback_attestation_ms", None)),
     }
 
     histogram_path = project_root / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
@@ -274,6 +281,28 @@ def _normalize_int(value: object | None) -> int | None:
         return None
 
 
+def _normalize_float(value: object | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_bool(value: object | None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    lowered = " ".join(str(value).split()).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _latency_bucket(latency_ms: float) -> str:
     for upper_bound, bucket_name in _HISTOGRAM_BUCKETS_MS:
         if latency_ms < upper_bound:
@@ -393,6 +422,9 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
             "latency_buckets_ms": {},
             "request_endpoint_counts": {},
             "request_payload_kind_counts": {},
+            "request_execution_mode_counts": {},
+            "attestation_mode_counts": {},
+            "async_job_resolution_source_counts": {},
             "last_latency_ms": 0.0,
             "last_updated_at": _utc_now_iso(),
         }
@@ -405,9 +437,15 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
     latency_buckets = dict(entry.get("latency_buckets_ms") or {})
     request_endpoint_counts = dict(entry.get("request_endpoint_counts") or {})
     request_payload_kind_counts = dict(entry.get("request_payload_kind_counts") or {})
+    request_execution_mode_counts = dict(entry.get("request_execution_mode_counts") or {})
+    attestation_mode_counts = dict(entry.get("attestation_mode_counts") or {})
+    async_job_resolution_source_counts = dict(entry.get("async_job_resolution_source_counts") or {})
     outcome = str(data.get("outcome") or "ok")
     classification = str(data.get("classification") or "ok")
     latency_bucket = str(data.get("latency_bucket") or _latency_bucket(float(data.get("latency_ms") or 0.0)))
+    request_execution_mode = _normalize_text(data.get("request_execution_mode"))
+    attestation_mode = _normalize_text(data.get("attestation_mode"))
+    async_job_resolution_source = _normalize_text(data.get("async_job_resolution_source"))
     outcome_counts[outcome] = int(outcome_counts.get(outcome, 0)) + 1
     classification_counts[classification] = int(classification_counts.get(classification, 0)) + 1
     request_kind_counts[request_kind] = int(request_kind_counts.get(request_kind, 0)) + 1
@@ -420,6 +458,16 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
         request_endpoint_counts[request_endpoint] = int(request_endpoint_counts.get(request_endpoint, 0)) + 1
     if request_payload_kind is not None:
         request_payload_kind_counts[request_payload_kind] = int(request_payload_kind_counts.get(request_payload_kind, 0)) + 1
+    if request_execution_mode is not None:
+        request_execution_mode_counts[request_execution_mode] = int(
+            request_execution_mode_counts.get(request_execution_mode, 0)
+        ) + 1
+    if attestation_mode is not None:
+        attestation_mode_counts[attestation_mode] = int(attestation_mode_counts.get(attestation_mode, 0)) + 1
+    if async_job_resolution_source is not None:
+        async_job_resolution_source_counts[async_job_resolution_source] = int(
+            async_job_resolution_source_counts.get(async_job_resolution_source, 0)
+        ) + 1
     entry["outcome_counts"] = outcome_counts
     entry["classification_counts"] = classification_counts
     entry["request_kind_counts"] = request_kind_counts
@@ -427,6 +475,9 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
     entry["latency_buckets_ms"] = latency_buckets
     entry["request_endpoint_counts"] = request_endpoint_counts
     entry["request_payload_kind_counts"] = request_payload_kind_counts
+    entry["request_execution_mode_counts"] = request_execution_mode_counts
+    entry["attestation_mode_counts"] = attestation_mode_counts
+    entry["async_job_resolution_source_counts"] = async_job_resolution_source_counts
     entry["last_latency_ms"] = float(data.get("latency_ms") or 0.0)
     entry["last_request_kind"] = request_kind
     entry["last_access_classification"] = access_classification
@@ -436,6 +487,13 @@ def _update_histogram_payload(payload: dict[str, object], data: Mapping[str, obj
     entry["last_request_path"] = request_path
     entry["last_request_endpoint"] = request_endpoint
     entry["last_request_payload_kind"] = request_payload_kind
+    entry["last_request_execution_mode"] = request_execution_mode
+    entry["last_attestation_mode"] = attestation_mode
+    entry["last_async_job_resolution_source"] = async_job_resolution_source
+    entry["last_readback_required"] = _normalize_bool(data.get("readback_required"))
+    entry["last_store_transport_ms"] = _normalize_float(data.get("store_transport_ms"))
+    entry["last_async_job_wait_ms"] = _normalize_float(data.get("async_job_wait_ms"))
+    entry["last_readback_attestation_ms"] = _normalize_float(data.get("readback_attestation_ms"))
     entry["last_updated_at"] = _utc_now_iso()
     payload["updated_at"] = entry["last_updated_at"]
 

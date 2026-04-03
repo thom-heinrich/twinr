@@ -93,7 +93,10 @@ def load_runtime_memory_config(context: ConfigLoadContext) -> dict[str, object]:
             get_value("TWINR_LONG_TERM_MEMORY_FAST_TOPIC_LIMIT", "3") or "3"
         ),
         "long_term_memory_fast_topic_timeout_s": _parse_float(
-            get_value("TWINR_LONG_TERM_MEMORY_FAST_TOPIC_TIMEOUT_S"), 0.6, minimum=0.05
+            # ChonkyDB's advanced scope-query path keeps ~0.75 s internal headroom,
+            # so Twinr's required fast-topic budget must stay above that floor or
+            # the effective compute window collapses into deterministic 504s/503s.
+            get_value("TWINR_LONG_TERM_MEMORY_FAST_TOPIC_TIMEOUT_S"), 1.2, minimum=0.05
         ),
         "long_term_memory_query_rewrite_enabled": _parse_bool(
             get_value("TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED"), True

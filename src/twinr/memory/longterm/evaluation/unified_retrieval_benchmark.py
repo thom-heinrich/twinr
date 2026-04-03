@@ -21,7 +21,8 @@ from typing import Mapping
 from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     UnifiedRetrievalGoldsetCase,
     UnifiedRetrievalGoldsetCaseResult,
-    default_unified_retrieval_goldset_cases,
+    unified_retrieval_case_profile_memory_type_coverage,
+    unified_retrieval_goldset_cases,
 )
 from twinr.memory.longterm.evaluation.unified_retrieval_goldset import (
     UnifiedRetrievalGoldsetResult,
@@ -32,6 +33,7 @@ from twinr.memory.longterm.evaluation.unified_retrieval_goldset import (
 _SCHEMA_VERSION = 1
 _OPS_ARTIFACT_NAME = "unified_retrieval_benchmark.json"
 _REPORT_DIR_NAME = "unified_retrieval_benchmark"
+_DEFAULT_CASE_PROFILE = "expanded"
 
 
 def _utc_now_iso() -> str:
@@ -274,6 +276,8 @@ class UnifiedRetrievalBenchmarkResult:
     finished_at: str
     env_path: str
     base_project_root: str
+    case_profile: str = _DEFAULT_CASE_PROFILE
+    profile_memory_type_coverage: tuple[tuple[str, int], ...] = ()
     goldset_result: UnifiedRetrievalGoldsetResult | None = None
     analysis: UnifiedRetrievalBenchmarkAnalysis | None = None
     artifact_path: str | None = None
@@ -301,6 +305,10 @@ class UnifiedRetrievalBenchmarkResult:
             "finished_at": self.finished_at,
             "env_path": self.env_path,
             "base_project_root": self.base_project_root,
+            "case_profile": self.case_profile,
+            "profile_memory_type_coverage": {
+                key: value for key, value in self.profile_memory_type_coverage
+            },
             "goldset_result": self.goldset_result.to_dict() if self.goldset_result is not None else None,
             "analysis": self.analysis.to_dict() if self.analysis is not None else None,
             "artifact_path": self.artifact_path,
@@ -588,6 +596,7 @@ def run_unified_retrieval_benchmark(
     *,
     env_path: str | Path = ".env",
     probe_id: str | None = None,
+    case_profile: str = _DEFAULT_CASE_PROFILE,
     write_artifacts: bool = True,
 ) -> UnifiedRetrievalBenchmarkResult:
     """Run the fixed unified-retrieval benchmark atop a fresh goldset execution."""
@@ -603,17 +612,20 @@ def run_unified_retrieval_benchmark(
         finished_at=started_at,
         env_path=str(Path(env_path).expanduser().resolve(strict=False)),
         base_project_root="",
+        case_profile=case_profile,
+        profile_memory_type_coverage=unified_retrieval_case_profile_memory_type_coverage(profile=case_profile),
     )
     try:
         goldset_result = run_unified_retrieval_goldset(
             env_path=env_path,
             probe_id=effective_probe_id,
+            case_profile=case_profile,
             write_artifacts=write_artifacts,
         )
         if not goldset_result.ready:
             raise RuntimeError(goldset_result.error_message or "Unified retrieval goldset benchmark preflight failed.")
         analysis = benchmark_unified_retrieval_cases(
-            cases=default_unified_retrieval_goldset_cases(),
+            cases=unified_retrieval_goldset_cases(profile=case_profile),
             case_results=goldset_result.case_results,
         )
         result = replace(
@@ -649,6 +661,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=".env", help="Path to the Twinr env file with ChonkyDB credentials.")
     parser.add_argument("--probe-id", default=None, help="Optional stable probe id / namespace suffix.")
     parser.add_argument(
+        "--case-profile",
+        default=_DEFAULT_CASE_PROFILE,
+        choices=("core", "expanded"),
+        help="Which unified-retrieval case profile to benchmark.",
+    )
+    parser.add_argument(
         "--no-write-artifacts",
         action="store_true",
         help="Skip writing the rolling ops artifact and per-run report snapshot.",
@@ -663,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_unified_retrieval_benchmark(
         env_path=args.env_file,
         probe_id=args.probe_id,
+        case_profile=args.case_profile,
         write_artifacts=not args.no_write_artifacts,
     )
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))

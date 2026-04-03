@@ -47,102 +47,98 @@ class UserDiscoveryQueryMixin:
     _authoritative_coverage_cache: UserDiscoveryAuthoritativeCoverage | None
 
     def build_invitation(self, *, now: datetime | None = None) -> UserDiscoveryInvite | None:
-        self._authoritative_coverage_cache = None
         effective_now = (now or _utc_now()).astimezone(timezone.utc)
         state = self._refresh_phase(self.store.load(), now=effective_now)
-        try:
-            if state.session_state == "active":
-                return None
-            next_invite_after = _parse_timestamp(state.next_invite_after)
-            if next_invite_after is not None and effective_now < next_invite_after:
-                return None
+        if state.session_state == "active":
+            return None
+        next_invite_after = _parse_timestamp(state.next_invite_after)
+        if next_invite_after is not None and effective_now < next_invite_after:
+            return None
 
-            if state.phase != "initial_setup" and self._review_due(state, now=effective_now):
-                review_topic_id = self._select_review_topic(state, now=effective_now) or "basics"
-                return UserDiscoveryInvite(
-                    invite_kind="review_profile",
-                    phase=state.phase,
-                    topic_id=review_topic_id,
-                    topic_label="Profile Review",
-                    display_topic_label="Gelerntes",
-                    session_minutes=self.lifelong_session_minutes,
-                    headline="Ich kann dir zeigen, was ich schon ueber dich gelernt habe.",
-                    body="Dann kannst du bestaetigen, aendern oder loeschen, was nicht mehr passt.",
-                    salience=0.9,
-                    reason="user_discovery_review_due",
-                    display_prompt_stage="review",
-                )
+        if state.phase != "initial_setup" and self._review_due(state, now=effective_now):
+            review_topic_id = self._select_review_topic(state, now=effective_now) or "basics"
+            return UserDiscoveryInvite(
+                invite_kind="review_profile",
+                phase=state.phase,
+                topic_id=review_topic_id,
+                topic_label="Profile Review",
+                display_topic_label="Gelerntes",
+                session_minutes=self.lifelong_session_minutes,
+                headline="Ich kann dir zeigen, was ich schon ueber dich gelernt habe.",
+                body="Dann kannst du bestaetigen, aendern oder loeschen, was nicht mehr passt.",
+                salience=0.9,
+                reason="user_discovery_review_due",
+                display_prompt_stage="review",
+            )
 
-            if state.phase == "initial_setup":
-                topic_id = state.active_topic_id or self._select_initial_topic(state)
-                if topic_id is None:
-                    return None
-                definition = _TOPICS_BY_ID[topic_id]
-                display_prompt_stage = self._display_prompt_stage(state, topic_id)
-                if state.accepted_session_count <= 0:
-                    return UserDiscoveryInvite(
-                        invite_kind="start_setup",
-                        phase=state.phase,
-                        topic_id=topic_id,
-                        topic_label=definition.label,
-                        display_topic_label=definition.display_label,
-                        session_minutes=self.initial_session_minutes,
-                        headline="Hast du 15 Minuten? Lass uns die Einrichtung starten.",
-                        body=_compact_text(
-                            f"Wir koennen jederzeit pausieren. Ich beginne mit {definition.display_label}.",
-                            max_len=112,
-                        ),
-                        salience=0.98,
-                        reason="user_discovery_initial_setup_due",
-                        display_prompt_stage=display_prompt_stage,
-                    )
+        if state.phase == "initial_setup":
+            topic_id = state.active_topic_id or self._select_initial_topic(state)
+            if topic_id is None:
+                return None
+            definition = _TOPICS_BY_ID[topic_id]
+            display_prompt_stage = self._display_prompt_stage(state, topic_id)
+            if state.accepted_session_count <= 0:
                 return UserDiscoveryInvite(
-                    invite_kind="resume_setup",
+                    invite_kind="start_setup",
                     phase=state.phase,
                     topic_id=topic_id,
                     topic_label=definition.label,
                     display_topic_label=definition.display_label,
                     session_minutes=self.initial_session_minutes,
-                    headline="Wollen wir bei deiner Einrichtung weitermachen?",
+                    headline="Hast du 15 Minuten? Lass uns die Einrichtung starten.",
                     body=_compact_text(
-                        f"Als Naechstes waere {definition.display_label} dran. Das geht in kleinen Schritten.",
+                        f"Wir koennen jederzeit pausieren. Ich beginne mit {definition.display_label}.",
                         max_len=112,
                     ),
-                    salience=0.94,
-                    reason="user_discovery_resume_due",
+                    salience=0.98,
+                    reason="user_discovery_initial_setup_due",
                     display_prompt_stage=display_prompt_stage,
                 )
-
-            topic_id = state.active_topic_id or self._select_lifelong_topic(state, now=effective_now)
-            if topic_id is None:
-                return None
-            definition = _TOPICS_BY_ID[topic_id]
-            policy = self._topic_policy(state, topic_id, now=effective_now)
-            display_prompt_stage = self._display_prompt_stage(state, topic_id)
-            if policy.question_style == "gentle_optional":
-                body = (
-                    f"Nur wenn es fuer dich gerade passt. Ich haette heute ein paar leichte Fragen zu "
-                    f"{definition.display_label}."
-                )
-            elif policy.question_style == "deeper_follow_up":
-                body = f"Ich haette heute ein paar kurze Folgefragen zu {definition.display_label}."
-            else:
-                body = f"Ich haette heute ein paar kurze Fragen zu {definition.display_label}."
             return UserDiscoveryInvite(
-                invite_kind="lifelong_learning",
+                invite_kind="resume_setup",
                 phase=state.phase,
                 topic_id=topic_id,
                 topic_label=definition.label,
                 display_topic_label=definition.display_label,
-                session_minutes=self.lifelong_session_minutes,
-                headline="Ich wuerde dich gern noch besser kennenlernen. Hast du 5 Minuten?",
-                body=_compact_text(body, max_len=112),
-                salience=max(0.62, min(0.94, 0.84 + policy.invite_salience_adjustment)),
-                reason="user_discovery_lifelong_due",
+                session_minutes=self.initial_session_minutes,
+                headline="Wollen wir bei deiner Einrichtung weitermachen?",
+                body=_compact_text(
+                    f"Als Naechstes waere {definition.display_label} dran. Das geht in kleinen Schritten.",
+                    max_len=112,
+                ),
+                salience=0.94,
+                reason="user_discovery_resume_due",
                 display_prompt_stage=display_prompt_stage,
             )
-        finally:
-            self._authoritative_coverage_cache = None
+
+        topic_id = state.active_topic_id or self._select_lifelong_topic(state, now=effective_now)
+        if topic_id is None:
+            return None
+        definition = _TOPICS_BY_ID[topic_id]
+        policy = self._topic_policy(state, topic_id, now=effective_now)
+        display_prompt_stage = self._display_prompt_stage(state, topic_id)
+        if policy.question_style == "gentle_optional":
+            body = (
+                f"Nur wenn es fuer dich gerade passt. Ich haette heute ein paar leichte Fragen zu "
+                f"{definition.display_label}."
+            )
+        elif policy.question_style == "deeper_follow_up":
+            body = f"Ich haette heute ein paar kurze Folgefragen zu {definition.display_label}."
+        else:
+            body = f"Ich haette heute ein paar kurze Fragen zu {definition.display_label}."
+        return UserDiscoveryInvite(
+            invite_kind="lifelong_learning",
+            phase=state.phase,
+            topic_id=topic_id,
+            topic_label=definition.label,
+            display_topic_label=definition.display_label,
+            session_minutes=self.lifelong_session_minutes,
+            headline="Ich wuerde dich gern noch besser kennenlernen. Hast du 5 Minuten?",
+            body=_compact_text(body, max_len=112),
+            salience=max(0.62, min(0.94, 0.84 + policy.invite_salience_adjustment)),
+            reason="user_discovery_lifelong_due",
+            display_prompt_stage=display_prompt_stage,
+        )
 
     def _build_status_result(
         self,

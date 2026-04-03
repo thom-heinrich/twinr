@@ -25,6 +25,69 @@ if TYPE_CHECKING:
 class LongTermMemoryServiceIngestionMixin(ServiceMixinBase):
     """Foreground enqueue, import, and dry-run analysis helpers."""
 
+    def _persist_conversation_turn_sync(
+        self,
+        *,
+        item: LongTermConversationTurn,
+    ) -> LongTermEnqueueResult:
+        """Persist one conversation turn immediately when no background writer exists.
+
+        Evaluation and foreground service modes can disable background writers
+        intentionally. In that configuration enqueue-style callers still mean
+        "store this turn now", so failing closed with ``None`` would silently
+        drop episodic memory writes.
+        """
+
+        self._persist_longterm_turn(
+            config=self.config,
+            store=self.prompt_context_store,
+            graph_store=self.graph_store,
+            object_store=self.object_store,
+            midterm_store=self.midterm_store,
+            extractor=self.extractor,
+            consolidator=self.consolidator,
+            reflector=self.reflector,
+            turn_continuity_compiler=self.turn_continuity_compiler,
+            sensor_memory=self.sensor_memory,
+            retention_policy=self.retention_policy,
+            personality_learning=self.personality_learning,
+            prepared_context_invalidator=self._invalidate_prepared_contexts,
+            store_lock=self._store_lock,
+            timezone_name=self.config.local_timezone_name,
+            item=item,
+        )
+        return LongTermEnqueueResult(
+            accepted=True,
+            pending_count=0,
+            dropped_count=0,
+        )
+
+    def _persist_multimodal_evidence_sync(
+        self,
+        *,
+        evidence,
+    ) -> LongTermEnqueueResult:
+        """Persist one multimodal evidence item immediately without a worker."""
+
+        self._persist_multimodal_evidence(
+            object_store=self.object_store,
+            midterm_store=self.midterm_store,
+            multimodal_extractor=self.multimodal_extractor,
+            consolidator=self.consolidator,
+            reflector=self.reflector,
+            sensor_memory=self.sensor_memory,
+            retention_policy=self.retention_policy,
+            prepared_context_invalidator=self._invalidate_prepared_contexts,
+            store_lock=self._store_lock,
+            timezone_name=self.config.local_timezone_name,
+            item=evidence,
+        )
+        return LongTermEnqueueResult(
+            accepted=True,
+            pending_count=0,
+            dropped_count=0,
+        )
+
     def enqueue_conversation_turn(
         self,
         *,
@@ -48,30 +111,12 @@ class LongTermMemoryServiceIngestionMixin(ServiceMixinBase):
             modality=clean_modality,
         )
         if self.writer is None:
-            return None
+            return self._persist_conversation_turn_sync(item=item)
         try:
             return self.writer.enqueue(item)
         except Exception:
             logger.exception("Failed to enqueue conversation turn; persisting synchronously.")
-            self._persist_longterm_turn(
-                config=self.config,
-                store=self.prompt_context_store,
-                graph_store=self.graph_store,
-                object_store=self.object_store,
-                midterm_store=self.midterm_store,
-                extractor=self.extractor,
-                consolidator=self.consolidator,
-                reflector=self.reflector,
-                turn_continuity_compiler=self.turn_continuity_compiler,
-                sensor_memory=self.sensor_memory,
-                retention_policy=self.retention_policy,
-                personality_learning=self.personality_learning,
-                prepared_context_invalidator=self._invalidate_prepared_contexts,
-                store_lock=self._store_lock,
-                timezone_name=self.config.local_timezone_name,
-                item=item,
-            )
-            return None
+            return self._persist_conversation_turn_sync(item=item)
 
     def import_external_conversation_turn(
         self,
@@ -249,21 +294,10 @@ class LongTermMemoryServiceIngestionMixin(ServiceMixinBase):
             message=message,
             data=data,
         )
+        if self.multimodal_writer is None:
+            return self._persist_multimodal_evidence_sync(evidence=evidence)
         try:
             return self.multimodal_writer.enqueue(evidence)
         except Exception:
             logger.exception("Failed to enqueue multimodal evidence; persisting synchronously.")
-            self._persist_multimodal_evidence(
-                object_store=self.object_store,
-                midterm_store=self.midterm_store,
-                multimodal_extractor=self.multimodal_extractor,
-                consolidator=self.consolidator,
-                reflector=self.reflector,
-                sensor_memory=self.sensor_memory,
-                retention_policy=self.retention_policy,
-                prepared_context_invalidator=self._invalidate_prepared_contexts,
-                store_lock=self._store_lock,
-                timezone_name=self.config.local_timezone_name,
-                item=evidence,
-            )
-            return None
+            return self._persist_multimodal_evidence_sync(evidence=evidence)

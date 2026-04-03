@@ -6,6 +6,7 @@ from threading import Lock
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -21,6 +22,7 @@ class _FakeCatalogClient:
         self._next_document_id = 1
         self.bulk_calls = 0
         self.bulk_execution_modes: list[str] = []
+        self.fetch_calls: list[dict[str, object]] = []
         self.records_by_document_id: dict[str, dict[str, object]] = {}
         self.records_by_uri: dict[str, dict[str, object]] = {}
 
@@ -63,7 +65,14 @@ class _FakeCatalogClient:
         return {"items": response_items}
 
     def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
-        del include_content, max_content_chars
+        self.fetch_calls.append(
+            {
+                "document_id": document_id,
+                "origin_uri": origin_uri,
+                "include_content": include_content,
+                "max_content_chars": max_content_chars,
+            }
+        )
         self._maybe_raise()
         if isinstance(document_id, str) and document_id:
             record = self.records_by_document_id.get(document_id)
@@ -344,6 +353,30 @@ class ContextStoreTests(unittest.TestCase):
         self.assertEqual(remote_state.snapshots, {})
         self.assertEqual(remote_state.client.bulk_calls, 0)
 
+    def test_managed_context_store_ensure_remote_snapshot_uses_fast_fail_current_head_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "USER.md"
+            path.write_text("Base user facts.\n", encoding="utf-8")
+            remote_state = _FakeRemoteState()
+            store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("missing", None),
+            ) as probe:
+                created = store.ensure_remote_snapshot()
+
+        self.assertFalse(created)
+        probe.assert_called_once_with(
+            remote_records=store._remote_records,
+            remote_snapshot_kind="user_context",
+            fast_fail=True,
+        )
+
     def test_managed_context_store_ensure_remote_snapshot_repairs_invalid_blank_current_head(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "USER.md"
@@ -439,6 +472,54 @@ class ContextStoreTests(unittest.TestCase):
             {"schema": "twinr_prompt_memory_catalog_v3", "version": 3, "items_count": 0, "segments": []},
         )
         self.assertEqual(remote_state.snapshots, {})
+        self.assertEqual(remote_state.client.bulk_calls, 0)
+
+    def test_memory_store_ensure_remote_snapshot_uses_fast_fail_current_head_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "MEMORY.md"
+            remote_state = _FakeRemoteState()
+            store = PersistentMemoryMarkdownStore(path, remote_state=remote_state)
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("missing", None),
+            ) as probe:
+                created = store.ensure_remote_snapshot()
+
+        self.assertFalse(created)
+        probe.assert_called_once_with(
+            remote_records=store._remote_records,
+            remote_snapshot_kind="prompt_memory",
+            fast_fail=True,
+        )
+
+    def test_prompt_context_store_bootstrap_skips_empty_remote_seed_components(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            personality_dir = root / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("Base user facts.\n", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Base personality text.\n", encoding="utf-8")
+            remote_state = _FailingRemoteState()
+            store = PromptContextStore(
+                memory_store=PersistentMemoryMarkdownStore(root / "MEMORY.md", remote_state=remote_state),
+                user_store=ManagedContextFileStore(
+                    personality_dir / "USER.md",
+                    section_title="Twinr managed user updates",
+                    remote_state=remote_state,
+                    remote_snapshot_kind="user_context",
+                ),
+                personality_store=ManagedContextFileStore(
+                    personality_dir / "PERSONALITY.md",
+                    section_title="Twinr managed personality updates",
+                    remote_state=remote_state,
+                    remote_snapshot_kind="personality_context",
+                ),
+            )
+
+            created = store.ensure_remote_snapshots()
+
+        self.assertEqual(created, ())
+        self.assertEqual(remote_state.client.fetch_calls, [])
         self.assertEqual(remote_state.client.bulk_calls, 0)
 
     def test_memory_store_ensure_remote_snapshot_repairs_invalid_blank_current_head(self) -> None:

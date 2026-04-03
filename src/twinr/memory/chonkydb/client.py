@@ -7,7 +7,6 @@ remote long-term memory code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
@@ -135,15 +134,23 @@ def _default_urlopen(request: Request, timeout_s: float) -> _ResponseLike:
     # refuse redirects, and reuse resolved connections across repeated ChonkyDB calls.
     return _PooledTransport()(request, timeout_s)
 
-@dataclass(frozen=True, slots=True)
 class ChonkyDBError(RuntimeError):
     """Represent a ChonkyDB request or payload failure."""
 
-    message: str
-    status_code: int | None = None
-    response_text: str | None = None
-    response_json: JsonDict | None = None
-    response_headers: Mapping[str, str] | None = None
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_text: str | None = None,
+        response_json: JsonDict | None = None,
+        response_headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.message = str(message)
+        self.status_code = status_code
+        self.response_text = response_text
+        self.response_json = dict(response_json) if isinstance(response_json, dict) else response_json
+        self.response_headers = dict(response_headers) if response_headers is not None else None
+        super().__init__(self.message)
 
     def __str__(self) -> str:
         if self.status_code is None:

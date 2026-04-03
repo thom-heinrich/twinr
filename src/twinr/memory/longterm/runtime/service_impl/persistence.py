@@ -10,6 +10,10 @@ import threading
 
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
+from twinr.memory.longterm.core.cooperative_abort import (
+    LongTermOperationCancelledError,
+    raise_if_longterm_operation_cancelled,
+)
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
@@ -87,6 +91,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
 
         try:
             with effective_store_lock:
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 continuity_packet = effective_turn_continuity_compiler.compile_packet(turn=item)
                 if continuity_packet is not None:
                     midterm_store.save_packets_preserving_attribute(
@@ -94,6 +99,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         attribute_key="persistence_scope",
                         attribute_value="restart_recall",
                     )
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 extraction = extractor.extract_conversation_turn(
                     transcript=item.transcript,
                     response=item.response,
@@ -118,6 +124,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     existing_conflicts=existing_conflicts,
                     result=result,
                 )
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 try:
                     reflection = reflector.reflect(
                         objects=tuple(
@@ -127,6 +134,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                             )
                         )
                     )
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Long-term reflection failed during conversation-turn persistence.")
                 else:
@@ -145,6 +154,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         ),
                         now=occurred_at,
                     )
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Sensor-memory compilation failed during conversation-turn persistence.")
                 else:
@@ -154,6 +165,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                             current_objects=current_objects,
                             reflection=sensor_reflection,
                         )
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 retention = LongTermMemoryServicePersistenceMixin._apply_retention_or_keep(
                     retention_policy=retention_policy,
                     objects=current_objects,
@@ -167,8 +179,11 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     conflict_upserts=current_conflicts,
                     archive_upserts=retention.archived_objects,
                 )
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 try:
                     graph_store.apply_candidate_edges(result.graph_edges)
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Graph-store update failed after conversation-turn snapshot commit.")
                 try:
@@ -176,8 +191,11 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         midterm_store.apply_reflection(reflection)
                     if sensor_reflection.midterm_packets:
                         midterm_store.apply_reflection(sensor_reflection)
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Midterm-store update failed after conversation-turn snapshot commit.")
+                raise_if_longterm_operation_cancelled("Long-term conversation persistence aborted because shutdown was requested.")
                 if personality_learning is not None:
                     learning_consolidation = LongTermMemoryServicePersistenceMixin._merge_reflection_into_consolidation(
                         result=result,
@@ -191,6 +209,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     prepared_context_invalidator(reason="conversation_turn_persisted")
                 if config.long_term_memory_mode == "remote_primary":
                     return None
+        except LongTermOperationCancelledError:
+            raise
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -223,6 +243,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
 
         try:
             with effective_store_lock:
+                raise_if_longterm_operation_cancelled("Long-term multimodal persistence aborted because shutdown was requested.")
                 extraction = multimodal_extractor.extract_evidence(item)
                 working_set = object_store.load_active_working_set(
                     candidate_objects=(extraction.episode, *extraction.candidate_objects),
@@ -240,6 +261,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     existing_conflicts=existing_conflicts,
                     result=result,
                 )
+                raise_if_longterm_operation_cancelled("Long-term multimodal persistence aborted because shutdown was requested.")
                 try:
                     reflection = reflector.reflect(
                         objects=tuple(
@@ -250,6 +272,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         ),
                         include_midterm=LongTermMemoryServicePersistenceMixin._should_include_midterm_in_multimodal_reflection(result),
                     )
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Long-term reflection failed during multimodal persistence.")
                 else:
@@ -268,6 +292,8 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                         ),
                         now=created_at,
                     )
+                except LongTermOperationCancelledError:
+                    raise
                 except Exception:
                     logger.exception("Sensor-memory compilation failed during multimodal persistence.")
                 else:
@@ -277,6 +303,7 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                             current_objects=current_objects,
                             reflection=sensor_reflection,
                         )
+                raise_if_longterm_operation_cancelled("Long-term multimodal persistence aborted because shutdown was requested.")
                 retention = LongTermMemoryServicePersistenceMixin._apply_retention_or_keep(
                     retention_policy=retention_policy,
                     objects=current_objects,
@@ -290,12 +317,16 @@ class LongTermMemoryServicePersistenceMixin(ServiceMixinBase):
                     conflict_upserts=current_conflicts,
                     archive_upserts=retention.archived_objects,
                 )
+                raise_if_longterm_operation_cancelled("Long-term multimodal persistence aborted because shutdown was requested.")
                 if LongTermMemoryServicePersistenceMixin._has_reflection_payload(reflection):
                     midterm_store.apply_reflection(reflection)
                 if LongTermMemoryServicePersistenceMixin._has_reflection_payload(sensor_reflection):
                     midterm_store.apply_reflection(sensor_reflection)
+                raise_if_longterm_operation_cancelled("Long-term multimodal persistence aborted because shutdown was requested.")
                 if callable(prepared_context_invalidator):
                     prepared_context_invalidator(reason="multimodal_evidence_persisted")
+        except LongTermOperationCancelledError:
+            raise
         except LongTermRemoteUnavailableError:
             raise
         except Exception:

@@ -22,6 +22,7 @@ from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.context_store import PromptContextStore
+from twinr.memory.longterm.core.cooperative_abort import LongTermOperationCancelledError
 from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
@@ -36,17 +37,14 @@ from twinr.memory.longterm import (
     LongTermSourceRefV1,
     LongTermStructuredStore,
 )
-from twinr.memory.longterm.storage.remote_state import (
-    LongTermRemoteReadFailedError,
-    LongTermRemoteUnavailableError,
-)
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
 from twinr.memory.longterm.runtime.provider_answer_front import MaterializedProviderAnswerFront
 from twinr.memory.longterm.evaluation.live_memory_acceptance import _seed_synthetic_memory
 from twinr.memory.longterm.storage.provider_answer_front_store import MaterializedProviderAnswerFrontRecord
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever, _LongTermContextInputs
-from twinr.memory.query_normalization import LongTermQueryProfile
+from twinr.memory.query_normalization import LongTermQueryProfile, LongTermQueryRewriter
 from test.test_longterm_store import _FakeRemoteState
 
 _TEST_CORINNA_PHONE_OLD = "+15555551234"
@@ -57,7 +55,13 @@ class _StaticQueryRewriter:
     def __init__(self, mapping: dict[str, str]) -> None:
         self._mapping = mapping
 
-    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+    def profile(
+        self,
+        query_text: str | None,
+        *,
+        wait_for_rewrite_s: float = 0.0,
+    ) -> LongTermQueryProfile:
+        del wait_for_rewrite_s
         canonical = self._mapping.get(str(query_text or ""))
         return LongTermQueryProfile.from_text(query_text, canonical_english_text=canonical)
 
@@ -479,6 +483,33 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn('Twinr answered: "Heute ist es sonnig und mild."', entries[0].details or "")
         self.assertTrue(any(item.kind == "episode" for item in stored_objects))
 
+    def test_sync_ingest_persists_episodic_turns_without_background_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_background_store_turns=False,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            result = service.enqueue_conversation_turn(
+                transcript="Wie wird das Wetter heute?",
+                response="Heute ist es sonnig und mild.",
+            )
+            entries = service.prompt_context_store.memory_store.load_entries()
+            stored_objects = service.object_store.load_objects()
+            service.shutdown(timeout_s=1.0)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.pending_count, 0)
+        self.assertEqual(result.dropped_count, 0)
+        self.assertEqual(entries[0].kind, "episodic_turn")
+        self.assertIn('Conversation about "Wie wird das Wetter heute?"', entries[0].summary)
+        self.assertTrue(any(item.kind == "episode" for item in stored_objects))
+
     def test_background_multimodal_writer_invalidates_prepared_contexts_without_worker_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -552,6 +583,42 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 extractor.release.set()
                 service.flush(timeout_s=2.0)
                 service.shutdown()
+
+    def test_async_writer_shutdown_uses_one_total_deadline(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking_write(_item: LongTermConversationTurn) -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        writer = AsyncLongTermMemoryWriter(
+            write_callback=_blocking_write,
+            max_queue_size=1,
+            poll_interval_s=0.01,
+        )
+        try:
+            result = writer.enqueue(
+                LongTermConversationTurn(
+                    transcript="Bitte merk dir das.",
+                    response="Ich habe es aufgenommen.",
+                )
+            )
+            self.assertTrue(result.accepted)
+            self.assertTrue(started.wait(timeout=1.0))
+
+            started_at = time.monotonic()
+            writer.shutdown(timeout_s=0.2)
+            elapsed_s = time.monotonic() - started_at
+
+            self.assertLess(elapsed_s, 0.35)
+            self.assertTrue(writer.snapshot_state().worker_alive)
+            self.assertEqual(writer.last_error_message, "background writer did not stop within shutdown timeout")
+        finally:
+            release.set()
+            writer.shutdown(timeout_s=1.0)
+
+        self.assertFalse(writer.snapshot_state().worker_alive)
 
     def test_build_provider_context_uses_remote_probe_cache_within_one_turn(self) -> None:
         remote_state = _CountingRemoteState()
@@ -758,6 +825,119 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         finally:
             service.shutdown()
 
+    def test_materialize_live_provider_context_builds_front_synchronously_for_non_streaming_callers(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = None
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
+        service._store_lock = threading.RLock()
+        build_calls: list[str] = []
+
+        def _build_context(*, query: LongTermQueryProfile, original_query_text: str | None = None) -> LongTermMemoryContext:
+            del original_query_text
+            build_calls.append(query.retrieval_text)
+            return LongTermMemoryContext(durable_context=f"durable:{len(build_calls)}")
+
+        retriever.build_context = _build_context  # type: ignore[method-assign]
+
+        try:
+            resolution = service.materialize_live_provider_context("Wer ist Janina?")
+
+            self.assertEqual(resolution.source, "materialized_built_sync")
+            self.assertEqual(resolution.context.durable_context, "durable:1")
+            self.assertEqual(build_calls, ["Wer ist Janina?"])
+            self.assertEqual(
+                service.build_live_provider_context("Wer ist Janina?").durable_context,
+                "durable:1",
+            )
+            self.assertEqual(build_calls, ["Wer ist Janina?"])
+        finally:
+            service.shutdown()
+
+    def test_materialize_live_provider_context_waits_for_canonical_rewrite(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+
+        class _CapturingQueryRewriter:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str | None, float]] = []
+
+            def profile(
+                self,
+                query_text: str | None,
+                *,
+                wait_for_rewrite_s: float = 0.0,
+            ) -> LongTermQueryProfile:
+                self.calls.append((query_text, wait_for_rewrite_s))
+                return LongTermQueryProfile.from_text(
+                    query_text,
+                    canonical_english_text="Who is Janina?",
+                )
+
+        query_rewriter = _CapturingQueryRewriter()
+        service.query_rewriter = query_rewriter
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = None
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
+        service._store_lock = threading.RLock()
+        build_calls: list[str] = []
+
+        def _build_context(*, query: LongTermQueryProfile, original_query_text: str | None = None) -> LongTermMemoryContext:
+            del original_query_text
+            build_calls.append(query.retrieval_text)
+            return LongTermMemoryContext(subtext_context="subtext:janina")
+
+        retriever.build_context = _build_context  # type: ignore[method-assign]
+
+        try:
+            resolution = service.materialize_live_provider_context("Wer ist Janina?")
+
+            self.assertEqual(resolution.source, "materialized_built_sync")
+            self.assertEqual(build_calls, ["Who is Janina?"])
+            self.assertEqual(len(query_rewriter.calls), 1)
+            self.assertEqual(query_rewriter.calls[0][0], "Wer ist Janina?")
+            self.assertGreater(query_rewriter.calls[0][1], 0.0)
+        finally:
+            service.shutdown()
+
     def test_build_provider_context_does_not_block_on_materialized_front_persist(self) -> None:
         remote_state = _CountingRemoteState()
         retriever = _ProbeCachingRetriever(remote_state)
@@ -876,6 +1056,43 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertEqual(query_rewriter_shutdown_calls, [False])
         self.assertEqual(shutdown_calls, [False])
+
+    def test_invalidate_prepared_contexts_after_shutdown_skips_late_executor_submit(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+        service.query_rewriter = LongTermQueryRewriter(config=service.config, backend=object())
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = PreparedLongTermContextFront()
+        service.provider_answer_front = MaterializedProviderAnswerFront(_InMemoryProviderAnswerFrontStore())
+        service._store_lock = threading.RLock()
+
+        try:
+            self.assertTrue(service.prewarm_provider_context("Wer ist Janina?", rewrite_query=False))
+
+            service.shutdown(timeout_s=1.0)
+            service._invalidate_prepared_contexts(reason="test_shutdown", refresh_recent=True)
+        finally:
+            service.query_rewriter.shutdown(wait=True)
+            service.prepared_context_front.shutdown(wait=True)
+            service.provider_answer_front.shutdown(wait=True)
 
     def test_confirm_memory_invalidates_prepared_provider_context_front(self) -> None:
         remote_state = _CountingRemoteState()
@@ -1116,6 +1333,54 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(context.graph_context, "graph:fallback")
         self.assertIsNone(context.subtext_context)
 
+    def test_longterm_retriever_suppresses_irrelevant_graph_context_without_subtext_payload(self) -> None:
+        retriever = LongTermRetriever(
+            config=TwinrConfig(project_root=".", personality_dir="personality"),
+            prompt_context_store=SimpleNamespace(),
+            graph_store=SimpleNamespace(render_prompt_context_selection=lambda *_args, **_kwargs: "graph:irrelevant"),
+            object_store=SimpleNamespace(),
+            midterm_store=SimpleNamespace(),
+            conflict_resolver=SimpleNamespace(),
+            subtext_builder=SimpleNamespace(),
+        )
+        context_inputs = _LongTermContextInputs(
+            episodic_entries=[],
+            midterm_packets=(),
+            adaptive_packets=(),
+            durable_objects=(),
+            conflict_queue=(),
+            graph_selection=SimpleNamespace(document="graph-doc", query_plan={"source": "test"}),
+            graph_context="graph:irrelevant",
+            unified_query_plan={
+                "source": "test",
+                "subtext": {
+                    "graph_payload_source": "none",
+                    "rendered": False,
+                },
+            },
+        )
+        query = LongTermQueryProfile.from_text("Was ist 27 mal 14?")
+
+        with (
+            patch.object(LongTermRetriever, "_load_context_inputs", return_value=context_inputs),
+            patch.object(LongTermRetriever, "_render_durable_context", return_value=None),
+            patch.object(LongTermRetriever, "_render_episodic_context", return_value=None),
+            patch.object(LongTermRetriever, "_render_conflict_context", return_value=None),
+            patch.object(LongTermRetriever, "_render_midterm_context", return_value=None),
+            patch.object(LongTermRetriever, "_build_subtext_context", return_value=None),
+        ):
+            context = retriever.build_context(query=query, original_query_text=query.original_text)
+
+        self.assertIsNone(context.graph_context)
+        self.assertEqual(
+            context_inputs.unified_query_plan["graph_context"],
+            {
+                "schema": "twinr_unified_graph_context_plan_v1",
+                "rendered": False,
+                "suppressed_reason": "no_relevant_graph_payload",
+            },
+        )
+
     def test_prewarm_foreground_read_cache_primes_lightweight_remote_indexes(self) -> None:
         object_store = _PrewarmObjectStore()
         graph_calls: list[str] = []
@@ -1320,6 +1585,50 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertFalse(memory_path.exists())
         self.assertTrue(any(item.kind == "episode" for item in objects))
+
+    def test_persist_longterm_turn_reraises_shutdown_cancellation_without_episodic_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                with (
+                    patch.object(
+                        type(service.midterm_store),
+                        "save_packets_preserving_attribute",
+                        side_effect=LongTermOperationCancelledError("shutdown requested"),
+                    ),
+                    patch.object(
+                        LongTermMemoryService,
+                        "_persist_episodic_turn",
+                        side_effect=AssertionError("shutdown cancellation must not fall back to episodic memory"),
+                    ),
+                ):
+                    with self.assertRaises(LongTermOperationCancelledError):
+                        LongTermMemoryService._persist_longterm_turn(
+                            config=config,
+                            store=service.prompt_context_store,
+                            graph_store=service.graph_store,
+                            object_store=service.object_store,
+                            midterm_store=service.midterm_store,
+                            extractor=service.extractor,
+                            consolidator=service.consolidator,
+                            reflector=service.reflector,
+                            sensor_memory=service.sensor_memory,
+                            retention_policy=service.retention_policy,
+                            item=LongTermConversationTurn(
+                                transcript="Ich habe heute Schulterschmerzen.",
+                                response="Dann ruhe dich bitte etwas aus.",
+                            ),
+                        )
+            finally:
+                service.shutdown(timeout_s=1.0)
 
     def test_persist_longterm_turn_uses_fine_grained_current_state_without_snapshot_blob_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2000,7 +2309,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIsNotNone(context.topic_context)
         self.assertIn("Janina is the user's wife.", context.topic_context or "")
 
-    def test_fast_provider_context_raises_remote_read_failed_when_fast_topic_builder_times_out(self) -> None:
+    def test_fast_provider_context_skips_quick_memory_when_fast_topic_builder_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 project_root=temp_dir,
@@ -2019,18 +2328,10 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                     raise ChonkyDBError("timed out")
 
             service.fast_topic_builder = _TimeoutingFastTopicBuilder()  # type: ignore[assignment]
-            with self.assertRaises(LongTermRemoteReadFailedError) as raised:
-                service.build_fast_provider_context("Was weisst du ueber Janina?")
+            context = service.build_fast_provider_context("Was weisst du ueber Janina?")
             service.shutdown()
 
-        self.assertEqual(dict(raised.exception.details), {
-            "operation": "fast_provider_context",
-            "request_kind": "read",
-            "outcome": "failed",
-            "classification": "unexpected_error",
-            "error_type": "ChonkyDBError",
-            "error_message": "timed out",
-        })
+        self.assertIsNone(context.topic_context)
 
     def test_provider_context_skips_quick_memory_when_fast_topic_builder_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

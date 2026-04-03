@@ -63,7 +63,7 @@ _ASYNC_JOB_TIMEOUT_FLOOR_S = 180.0
 _SELECTION_SEARCH_ALLOWED_INDEXES = ("fulltext", "temporal", "tags")
 _SELECTION_HYDRATION_ALLOWED_INDEXES = ("fulltext",)
 _SEARCHABLE_WRITE_TARGET_INDEXES = ("fulltext", "temporal", "tags")
-_CONTROL_PLANE_WRITE_TARGET_INDEXES = ("fulltext",)
+_CONTROL_PLANE_WRITE_TARGET_INDEXES: tuple[str, ...] = ()
 _ASYNC_JOB_TIMEOUT_FLOORED_SNAPSHOT_KINDS = frozenset(
     {
         "objects",
@@ -233,12 +233,15 @@ class LongTermRemoteCatalogStoreBase(
         *,
         snapshot_kind: str,
         metadata_only: bool = False,
+        fast_fail: bool = False,
     ) -> _CatalogHeadLoadResult:
         """Read one current-head document while preserving not-found semantics."""
 
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
-        effective_read_client = self._catalog_head_read_client(read_client=read_client)
+        retry_attempts = 1 if fast_fail else max(1, self._remote_retry_attempts())
+        retry_backoff_s = 0.0 if fast_fail else self._remote_retry_backoff_s()
+        effective_read_client = read_client if fast_fail else self._catalog_head_read_client(read_client=read_client)
         context = LongTermRemoteReadContext(
             snapshot_kind=snapshot_kind,
             operation="load_catalog_current_head",
@@ -248,14 +251,12 @@ class LongTermRemoteCatalogStoreBase(
             request_path="/v1/external/documents/full",
             namespace=self._normalize_text(getattr(remote_state, "namespace", None)),
             access_classification="catalog_current_head",
-            attempt_count=self._remote_retry_attempts(),
+            attempt_count=retry_attempts,
             retry_attempts_configured=self._remote_retry_attempts(),
-            retry_backoff_s=self._remote_retry_backoff_s(),
-            retry_mode="bounded_transient_retry",
+            retry_backoff_s=retry_backoff_s,
+            retry_mode="single_probe" if fast_fail else "bounded_transient_retry",
         )
         started_monotonic = time.monotonic()
-        retry_attempts = max(1, self._remote_retry_attempts())
-        retry_backoff_s = self._remote_retry_backoff_s()
         attempt_index = 0
         while True:
             try:
@@ -566,8 +567,9 @@ class LongTermRemoteCatalogStoreBase(
         Live incidents show that accepted current-head/catalog writes can
         legitimately outlive the generic flush budget while ChonkyDB is still
         warming payload/fulltext indexes for fresh namespaces or post-restart
-        cold paths. Keep the transport timeout unchanged, but give the heavier
-        current-head collections a larger bounded server-side execution window.
+        cold paths. The HTTP transport timeout is handled separately by the
+        write path; this value only controls the server-side execution window
+        attached to accepted async jobs.
         """
 
         transport_timeout_s = self._remote_write_timeout_s()
@@ -692,7 +694,7 @@ class LongTermRemoteCatalogStoreBase(
 
     @staticmethod
     def _control_plane_write_target_indexes() -> tuple[str, ...]:
-        """Persist fixed-URI catalog control-plane docs without vector indexing."""
+        """Persist fixed-URI catalog control-plane docs off the search/index lanes."""
 
         return _CONTROL_PLANE_WRITE_TARGET_INDEXES
 
@@ -735,7 +737,7 @@ class LongTermRemoteCatalogStoreBase(
         )
 
     def _client_with_timeout(self, client: object, *, timeout_s: float | None) -> object:
-        """Clone a client with a smaller transport timeout when supported."""
+        """Clone a client with one specific transport timeout when supported."""
 
         if timeout_s is None:
             return client
@@ -745,6 +747,14 @@ class LongTermRemoteCatalogStoreBase(
             return client
         if not math.isfinite(resolved_timeout_s) or resolved_timeout_s <= 0.0:
             return client
+        current_config = getattr(client, "config", None)
+        try:
+            current_timeout_s = float(getattr(current_config, "timeout_s"))
+        except (AttributeError, TypeError, ValueError):
+            current_timeout_s = None
+        if current_timeout_s is not None and math.isfinite(current_timeout_s):
+            if abs(current_timeout_s - resolved_timeout_s) <= 1e-9:
+                return client
         clone = getattr(client, "clone_with_timeout", None)
         if not callable(clone):
             return client
@@ -902,12 +912,9 @@ class LongTermRemoteCatalogStoreBase(
             current = current.__cause__ or current.__context__
         return None
 
-    def _should_disable_scope_search_from_exception(self, exc: BaseException) -> bool:
-        """Return whether one scope-search failure proves the current backend contract is unusable here."""
+    def _response_bits_from_exception(self, exc: BaseException) -> tuple[str, ...]:
+        """Collect compact response fragments from one exception chain."""
 
-        status_code = self._status_code_from_exception(exc)
-        if status_code not in {400, 404}:
-            return False
         response_bits: list[str] = []
         seen: set[int] = set()
         current: BaseException | None = exc
@@ -922,10 +929,31 @@ class LongTermRemoteCatalogStoreBase(
                         if value is not None:
                             response_bits.append(str(value))
             current = current.__cause__ or current.__context__
-        compact_bits = " ".join(response_bits).strip().lower()
-        if status_code == 400:
-            return "unsupported scope_ref" in compact_bits
-        return "document_not_found" in compact_bits
+        return tuple(response_bits)
+
+    def _scope_search_failure_mode(self, *, snapshot_kind: str, exc: BaseException) -> str:
+        """Classify one scope-search failure without conflating fresh empty heads and bad contracts."""
+
+        status_code = self._status_code_from_exception(exc)
+        if status_code not in {400, 404}:
+            return "other"
+        compact_bits = " ".join(self._response_bits_from_exception(exc)).strip().lower()
+        if "unsupported scope_ref" in compact_bits:
+            return "unsupported_scope_search"
+        if status_code != 404 or "document_not_found" not in compact_bits:
+            return "other"
+        head_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind, metadata_only=True)
+        if head_result.status == "not_found":
+            return "missing_current_head"
+        if head_result.status == "found" and isinstance(head_result.payload, Mapping):
+            self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=head_result.payload)
+            return "unsupported_scope_search"
+        return "other"
+
+    def _should_disable_scope_search_from_exception(self, *, snapshot_kind: str, exc: BaseException) -> bool:
+        """Return whether one scope-search failure proves the current backend contract is unusable here."""
+
+        return self._scope_search_failure_mode(snapshot_kind=snapshot_kind, exc=exc) == "unsupported_scope_search"
 
 
 __all__ = [

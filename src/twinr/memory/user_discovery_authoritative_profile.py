@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
@@ -43,6 +44,19 @@ _COMPANION_STYLE_PREDICATES = frozenset(
     }
 )
 _COMPANION_STYLE_FEEDBACK_TARGETS = frozenset({"humor"})
+_DEFAULT_DISCOVERY_QUERY_TIMEOUT_S = 2.0
+
+
+def _resolve_discovery_query_timeout_s(value: object) -> float:
+    try:
+        timeout_s = float(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_DISCOVERY_QUERY_TIMEOUT_S
+    if not math.isfinite(timeout_s):
+        return _DEFAULT_DISCOVERY_QUERY_TIMEOUT_S
+    return max(_DEFAULT_DISCOVERY_QUERY_TIMEOUT_S, timeout_s)
+
+
 def _normalize_token(value: object | None, *, limit: int = 80) -> str:
     text = " ".join(str(value or "").split()).strip().lower().replace("-", "_").replace(" ", "_")
     if len(text) <= limit:
@@ -74,6 +88,7 @@ class UserDiscoveryAuthoritativeProfileReader:
     graph_store: TwinrPersonalGraphStore | None = None
     object_store: LongTermStructuredStore | None = None
     user_node_id: str = "user:main"
+    discovery_query_timeout_s: float = _DEFAULT_DISCOVERY_QUERY_TIMEOUT_S
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "UserDiscoveryAuthoritativeProfileReader":
@@ -82,12 +97,25 @@ class UserDiscoveryAuthoritativeProfileReader:
             graph_store=graph_store,
             object_store=LongTermStructuredStore.from_config(config),
             user_node_id=graph_store.user_node_id,
+            discovery_query_timeout_s=_resolve_discovery_query_timeout_s(
+                getattr(config, "long_term_memory_remote_read_timeout_s", _DEFAULT_DISCOVERY_QUERY_TIMEOUT_S)
+            ),
         )
 
     def load(self) -> UserDiscoveryAuthoritativeCoverage:
         covered_topics: set[str] = set()
-        basics_objects = tuple(select_discovery_basics_objects(self.object_store))
-        companion_style_objects = tuple(select_discovery_companion_style_objects(self.object_store))
+        basics_objects = tuple(
+            select_discovery_basics_objects(
+                self.object_store,
+                timeout_s=self.discovery_query_timeout_s,
+            )
+        )
+        companion_style_objects = tuple(
+            select_discovery_companion_style_objects(
+                self.object_store,
+                timeout_s=self.discovery_query_timeout_s,
+            )
+        )
         basics_covered_by_objects = self._objects_cover_basics(basics_objects)
         companion_style_covered_by_objects = self._objects_cover_companion_style(companion_style_objects)
         document = None

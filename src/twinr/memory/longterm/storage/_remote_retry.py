@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.longterm.core.cooperative_abort import (
+    raise_if_longterm_operation_cancelled,
+    sleep_with_longterm_operation_abort,
+)
 
 _MAX_TRANSIENT_WRITE_ATTEMPTS = 6
 _MAX_TRANSIENT_WRITE_BACKOFF_S = 8.0
@@ -15,6 +19,13 @@ _RETRYABLE_DETAIL_MARKERS = frozenset(
         "serverbusy",
     }
 )
+
+
+def _looks_like_timeout_error(exc: BaseException) -> bool:
+    """Return whether one wrapped exception still clearly describes a timeout."""
+
+    message = " ".join(str(exc).lower().split())
+    return "timed out" in message or "timeout" in message
 
 
 def exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
@@ -47,6 +58,8 @@ def should_retry_remote_write_error(exc: BaseException) -> bool:
         if isinstance(item, ChonkyDBError):
             saw_chonky_error = True
             if item.status_code is None:
+                if _looks_like_timeout_error(item):
+                    return True
                 continue
             try:
                 status_code = int(item.status_code)
@@ -69,6 +82,8 @@ def should_retry_remote_read_error(exc: BaseException) -> bool:
         if isinstance(item, ChonkyDBError):
             saw_chonky_error = True
             if item.status_code is None:
+                if _looks_like_timeout_error(item):
+                    return True
                 continue
             try:
                 status_code = int(item.status_code)
@@ -177,13 +192,30 @@ def is_rate_limited_remote_write_error(exc: BaseException) -> bool:
     return False
 
 
+def raise_if_remote_operation_cancelled(*, operation: str) -> None:
+    """Abort one remote operation when the surrounding worker is shutting down."""
+
+    raise_if_longterm_operation_cancelled(f"{operation} aborted because shutdown was requested.")
+
+
+def sleep_with_remote_operation_abort(delay_s: float, *, operation: str) -> None:
+    """Sleep between retries while honoring a cooperative shutdown signal."""
+
+    sleep_with_longterm_operation_abort(
+        delay_s,
+        reason=f"{operation} aborted because shutdown was requested.",
+    )
+
+
 __all__ = [
     "clone_client_with_capped_timeout",
     "exception_chain",
     "remote_read_retry_delay_s",
     "remote_write_retry_delay_s",
+    "raise_if_remote_operation_cancelled",
     "should_retry_remote_read_error",
     "retryable_remote_write_attempts",
+    "sleep_with_remote_operation_abort",
     "should_fallback_async_job_resolution_error",
     "should_retry_remote_write_error",
 ]

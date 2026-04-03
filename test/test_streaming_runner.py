@@ -28,7 +28,6 @@ from twinr.agent.base_agent.conversation.follow_up_context import (
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
-from twinr.agent.workflows.streaming_semantic_router import _synthesize_supervisor_decision
 from twinr.agent.workflows.streaming_turn_coordinator import (
     StreamingTurnCoordinator,
     StreamingTurnCoordinatorHooks,
@@ -1036,6 +1035,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                whatsapp_allow_from="+15555550100",
             )
             tool_agent = FakeToolAgentProvider(config)
             support_provider = FakePrintBackend(config)
@@ -1166,6 +1166,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                whatsapp_allow_from="+15555550100",
             )
             loop = TwinrStreamingHardwareLoop(
                 config=config,
@@ -1212,6 +1213,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                whatsapp_allow_from="+15555550100",
             )
             recorder = FailIfCalledRecorder()
             loop = TwinrStreamingHardwareLoop(
@@ -1299,6 +1301,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 project_root=temp_dir,
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
+                whatsapp_allow_from="+15555550100",
             )
             recorder = FailIfCalledRecorder()
             loop = TwinrStreamingHardwareLoop(
@@ -1522,6 +1525,60 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertIn("transcript=Streaming Hallo Twinr", lines)
         self.assertIn("stt_streaming_early=true", lines)
         self.assertIn("stt_streaming_deferred_until_finalize=true", lines)
+
+    def test_authorize_realtime_sensitive_tools_refreshes_streaming_tool_schemas(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            auth_dir = root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            worker_root.mkdir(parents=True, exist_ok=True)
+            (auth_dir / "creds.json").write_text("{\"me\":{}}\n", encoding="utf-8")
+            (worker_root / "package.json").write_text("{\"name\":\"worker\"}\n", encoding="utf-8")
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+                whatsapp_allow_from="+15555550100",
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            initial_tool_schema_names = {
+                str(schema.get("name"))
+                for schema in loop.streaming_turn_loop.tool_schemas
+                if isinstance(schema, dict)
+            }
+
+            loop.authorize_realtime_sensitive_tools("test")
+
+            refreshed_tool_schema_names = {
+                str(schema.get("name"))
+                for schema in loop.streaming_turn_loop.tool_schemas
+                if isinstance(schema, dict)
+            }
+
+        self.assertNotIn("inspect_camera", initial_tool_schema_names)
+        self.assertNotIn("print_receipt", initial_tool_schema_names)
+        self.assertNotIn("send_whatsapp_message", initial_tool_schema_names)
+        self.assertIn("inspect_camera", refreshed_tool_schema_names)
+        self.assertIn("print_receipt", refreshed_tool_schema_names)
+        self.assertIn("send_whatsapp_message", refreshed_tool_schema_names)
 
     def test_audio_turn_prefers_finalize_result_after_early_speech_final_snapshot(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -5593,20 +5650,59 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(dual_lane.run_handoff_calls[0]["specialist_conversation"], tiny_recent_context)
         self.assertEqual(len(dual_lane.run_calls), 0)
 
-    def test_local_semantic_router_tool_route_synthesizes_tiny_recent_handoff(self) -> None:
-        decision = _synthesize_supervisor_decision(
-            SimpleNamespace(
-                label="tool",
-                confidence=0.93,
-                margin=0.41,
-                model_id="router-v1",
-            ),
-            FirstWordReply(mode="filler", spoken_text="Ich kuemmere mich darum."),
-        )
+    def test_local_semantic_router_tool_route_keeps_bridge_reply_but_defers_supervisor_decision(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                local_semantic_router_mode="gated",
+                streaming_first_word_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop._streaming_semantic_router._router = SimpleNamespace(  # type: ignore[attr-defined]
+                classify=lambda transcript: SimpleNamespace(
+                    label="tool",
+                    confidence=0.96,
+                    margin=0.34,
+                    authoritative=True,
+                    fallback_reason=None,
+                    model_id="router-v1",
+                    latency_ms=1.7,
+                )
+            )
+            loop._streaming_semantic_router._router_epoch = 1  # type: ignore[attr-defined]
+            loop._streaming_semantic_router._build_bridge_reply = lambda *args, **kwargs: FirstWordReply(  # type: ignore[attr-defined]
+                mode="filler",
+                spoken_text="Ich kuemmere mich darum.",
+            )
 
-        self.assertEqual(decision.action, "handoff")
-        self.assertEqual(decision.kind, "general")
-        self.assertEqual(decision.context_scope, "tiny_recent")
+            resolution = loop._streaming_semantic_router.resolve_transcript("Druck das bitte aus.")  # type: ignore[attr-defined]
+
+        self.assertIsNotNone(resolution)
+        assert resolution is not None
+        self.assertEqual(resolution.route_decision.label, "tool")
+        self.assertIsNone(resolution.supervisor_decision)
+        self.assertIsNotNone(resolution.bridge_reply)
+        assert resolution.bridge_reply is not None
+        self.assertEqual(resolution.bridge_reply.spoken_text, "Ich kuemmere mich darum.")
 
     def test_local_semantic_router_memory_route_preserves_full_context_handoff(self) -> None:
         with TemporaryDirectory() as temp_dir:

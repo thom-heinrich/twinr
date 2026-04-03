@@ -40,6 +40,14 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentTextProvider
 from twinr.agent.personality.evolution import PersonalityEvolutionResult
 from twinr.agent.personality.intelligence.models import SituationalAwarenessThread, WorldIntelligenceRefreshResult
+from twinr.agent.workflows.realtime_runtime.nightly_digest_refinement import (
+    NightlyDigestRefinement,
+    build_nightly_digest_refinement,
+)
+from twinr.agent.workflows.realtime_runtime.nightly_insights import (
+    NightlyInsightBundle,
+    build_nightly_insight_bundle,
+)
 from twinr.memory.longterm.core.models import LongTermReflectionResultV1
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.reminders import ReminderEntry
@@ -290,6 +298,8 @@ class NightlyPreparedDigest:
     weather_summary: str | None = None
     reminder_lines: tuple[str, ...] = ()
     headline_lines: tuple[str, ...] = ()
+    new_insights: tuple[str, ...] = ()
+    continuity_shifts: tuple[str, ...] = ()
     live_news_summary: str | None = None
     weather_sources: tuple[str, ...] = ()
     news_sources: tuple[str, ...] = ()
@@ -316,6 +326,20 @@ class NightlyPreparedDigest:
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
+            new_insights=_bounded_text_tuple(
+                tuple(payload.get("new_insights", ()) if isinstance(payload.get("new_insights"), list) else ()),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
+            continuity_shifts=_bounded_text_tuple(
+                tuple(
+                    payload.get("continuity_shifts", ())
+                    if isinstance(payload.get("continuity_shifts"), list)
+                    else ()
+                ),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
             live_news_summary=_bounded_optional_text(payload.get("live_news_summary"), max_len=1200),
             weather_sources=_bounded_text_tuple(
                 tuple(payload.get("weather_sources", ()) if isinstance(payload.get("weather_sources"), list) else ()),
@@ -335,6 +359,8 @@ class NightlyPreparedDigest:
         payload = asdict(self)
         payload["reminder_lines"] = list(self.reminder_lines)
         payload["headline_lines"] = list(self.headline_lines)
+        payload["new_insights"] = list(self.new_insights)
+        payload["continuity_shifts"] = list(self.continuity_shifts)
         payload["weather_sources"] = list(self.weather_sources)
         payload["news_sources"] = list(self.news_sources)
         return payload
@@ -344,7 +370,7 @@ class NightlyPreparedDigest:
 class NightlyConsolidationSummary:
     """Persist one bounded summary of the overnight consolidation stages."""
 
-    schema_version: int = 1
+    schema_version: int = 2
     target_local_day: str = ""
     prepared_at: str = ""
     long_term_flush_ok: bool = True
@@ -356,6 +382,10 @@ class NightlyConsolidationSummary:
     due_reminder_count: int = 0
     target_day_reminder_count: int = 0
     accepted_personality_delta_count: int = 0
+    new_insights: tuple[str, ...] = ()
+    continuity_shifts: tuple[str, ...] = ()
+    operator_new_insights: tuple[str, ...] = ()
+    operator_continuity_shifts: tuple[str, ...] = ()
     live_search_queries: int = 0
     weather_sources: tuple[str, ...] = ()
     news_sources: tuple[str, ...] = ()
@@ -388,6 +418,38 @@ class NightlyConsolidationSummary:
             accepted_personality_delta_count=max(
                 0, int(payload.get("accepted_personality_delta_count", 0) or 0)
             ),
+            new_insights=_bounded_text_tuple(
+                tuple(payload.get("new_insights", ()) if isinstance(payload.get("new_insights"), list) else ()),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
+            continuity_shifts=_bounded_text_tuple(
+                tuple(
+                    payload.get("continuity_shifts", ())
+                    if isinstance(payload.get("continuity_shifts"), list)
+                    else ()
+                ),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
+            operator_new_insights=_bounded_text_tuple(
+                tuple(
+                    payload.get("operator_new_insights", ())
+                    if isinstance(payload.get("operator_new_insights"), list)
+                    else ()
+                ),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
+            operator_continuity_shifts=_bounded_text_tuple(
+                tuple(
+                    payload.get("operator_continuity_shifts", ())
+                    if isinstance(payload.get("operator_continuity_shifts"), list)
+                    else ()
+                ),
+                max_items=_DEFAULT_HEADLINE_LIMIT,
+                max_len=_MAX_LINE,
+            ),
             live_search_queries=max(0, int(payload.get("live_search_queries", 0) or 0)),
             weather_sources=_bounded_text_tuple(
                 tuple(payload.get("weather_sources", ()) if isinstance(payload.get("weather_sources"), list) else ()),
@@ -412,6 +474,10 @@ class NightlyConsolidationSummary:
         payload = asdict(self)
         payload["weather_sources"] = list(self.weather_sources)
         payload["news_sources"] = list(self.news_sources)
+        payload["new_insights"] = list(self.new_insights)
+        payload["continuity_shifts"] = list(self.continuity_shifts)
+        payload["operator_new_insights"] = list(self.operator_new_insights)
+        payload["operator_continuity_shifts"] = list(self.operator_continuity_shifts)
         payload["errors"] = list(self.errors)
         return payload
 
@@ -820,6 +886,21 @@ class TwinrNightlyOrchestrator:
                     digest_inputs["weather_sources"] = weather_sources
                     digest_inputs["live_news_summary"] = live_news_summary
                     digest_inputs["news_sources"] = news_sources
+                nightly_insights = build_nightly_insight_bundle(
+                    reflection_result=reflection_result,
+                    world_refresh_result=world_refresh_result,
+                    personality_results=personality_results,
+                )
+                digest_refinement = self._refine_digest_inputs(
+                    target_day_text=target_day_text,
+                    digest_inputs=digest_inputs,
+                    nightly_insights=nightly_insights,
+                )
+                digest_inputs["headline_lines"] = digest_refinement.headline_lines
+                digest_inputs["live_news_summary"] = digest_refinement.live_news_summary
+                digest_inputs["news_sources"] = digest_refinement.news_sources
+                digest_inputs["new_insights"] = digest_refinement.new_insights
+                digest_inputs["continuity_shifts"] = digest_refinement.continuity_shifts
                 digest = self._prepare_digest(
                     target_day_text=target_day_text,
                     prepared_at=attempted_at,
@@ -839,6 +920,7 @@ class TwinrNightlyOrchestrator:
                         digest_inputs.get("target_day_reminder_count", 0) or 0
                     ),
                     personality_results=personality_results,
+                    nightly_insights=nightly_insights,
                     live_search_queries=live_search_queries,
                     errors=errors,
                 )
@@ -1189,6 +1271,24 @@ class TwinrNightlyOrchestrator:
             return _bounded_text(f"{title}: {summary}", max_len=_MAX_LINE)
         return title or summary
 
+    def _render_world_news_sources(
+        self,
+        refresh_result: WorldIntelligenceRefreshResult | None,
+    ) -> tuple[str, ...]:
+        """Collect bounded source URLs from the refreshed world-intelligence set."""
+
+        if refresh_result is None:
+            return ()
+        candidates: list[str] = []
+        for subscription in tuple(getattr(refresh_result, "subscriptions", ())):
+            source_page_url = _bounded_optional_text(getattr(subscription, "source_page_url", None), max_len=512)
+            feed_url = _bounded_optional_text(getattr(subscription, "feed_url", None), max_len=512)
+            if source_page_url:
+                candidates.append(source_page_url)
+            if feed_url:
+                candidates.append(feed_url)
+        return _bounded_text_tuple(candidates, max_items=12, max_len=512)
+
     def _build_digest_inputs(
         self,
         *,
@@ -1214,6 +1314,7 @@ class TwinrNightlyOrchestrator:
             "target_local_day": target_day.isoformat(),
             "reminders": reminder_lines,
             "headline_lines": headline_lines,
+            "world_news_sources": self._render_world_news_sources(world_refresh_result),
             "weather_summary": None,
             "live_news_summary": None,
             "target_day_reminder_count": len(reminders),
@@ -1224,6 +1325,28 @@ class TwinrNightlyOrchestrator:
         """Return whether bounded live web augmentation is enabled."""
 
         return bool(getattr(self.config, "nightly_live_web_augmentation_enabled", True))
+
+    def _configured_location_hint(self) -> str | None:
+        """Return the configured approximate place context for live web search."""
+
+        parts: list[str] = []
+        seen: set[str] = set()
+        for attr_name in (
+            "openai_web_search_city",
+            "openai_web_search_region",
+            "openai_web_search_country",
+        ):
+            text = _bounded_optional_text(getattr(self.config, attr_name, None), max_len=80)
+            if text is None:
+                continue
+            key = text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            parts.append(text)
+        if not parts:
+            return None
+        return ", ".join(parts)
 
     def _augment_digest_inputs(
         self,
@@ -1246,12 +1369,18 @@ class TwinrNightlyOrchestrator:
         weather_sources: tuple[str, ...] = ()
         news_sources: tuple[str, ...] = ()
         queries_used = 0
+        location_hint = self._configured_location_hint()
 
         weather = self._search(
             question=(
-                f"Give the weather forecast for {target_day_text}. "
+                f"Give the weather forecast for {location_hint} on {target_day_text}. "
+                if location_hint
+                else f"Give the weather forecast for {target_day_text}. "
+            )
+            + (
                 f"Answer briefly in {language}."
             ),
+            location_hint=location_hint,
             date_context=target_day_text,
         )
         if weather is not None:
@@ -1264,6 +1393,13 @@ class TwinrNightlyOrchestrator:
             )
 
         headline_lines = tuple(digest_inputs.get("headline_lines", ()))
+        world_news_sources = tuple(digest_inputs.get("world_news_sources", ()))
+        if headline_lines:
+            return queries_used, weather_summary, weather_sources, None, _bounded_text_tuple(
+                world_news_sources,
+                max_items=12,
+                max_len=512,
+            )
         if queries_used >= query_limit or len(headline_lines) >= max(
             1,
             int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
@@ -1272,9 +1408,15 @@ class TwinrNightlyOrchestrator:
 
         news = self._search(
             question=(
-                f"List three to five calm, relevant local or world updates for {target_day_text}. "
+                (
+                    f"List three to five calm, relevant local or world updates for {location_hint} on {target_day_text}. "
+                    if location_hint
+                    else f"List three to five calm, relevant local or world updates for {target_day_text}. "
+                )
+                +
                 f"Answer briefly in {language}."
             ),
+            location_hint=location_hint,
             date_context=target_day_text,
         )
         if news is not None:
@@ -1287,7 +1429,7 @@ class TwinrNightlyOrchestrator:
             )
         return queries_used, weather_summary, weather_sources, live_news_summary, news_sources
 
-    def _search(self, *, question: str, date_context: str) -> object | None:
+    def _search(self, *, question: str, date_context: str, location_hint: str | None = None) -> object | None:
         """Run one bounded live-search call when the configured backend supports it."""
 
         if self.search_backend is None:
@@ -1300,11 +1442,46 @@ class TwinrNightlyOrchestrator:
             return search_fn(  # pylint: disable=not-callable
                 question,
                 conversation=None,
-                location_hint=None,
+                location_hint=location_hint,
                 date_context=date_context,
             )
         except Exception:
             return None
+
+    def _refine_digest_inputs(
+        self,
+        *,
+        target_day_text: str,
+        digest_inputs: Mapping[str, object],
+        nightly_insights: NightlyInsightBundle,
+    ) -> NightlyDigestRefinement:
+        """Refine raw nightly data into calmer user-facing morning-digest content."""
+
+        candidate_news_sources = (
+            *tuple(digest_inputs.get("world_news_sources", ())),
+            *tuple(digest_inputs.get("news_sources", ())),
+        )
+        return build_nightly_digest_refinement(
+            compose=self._compose_with_backend if self.text_backend is not None else None,
+            language=_bounded_optional_text(digest_inputs.get("language"), max_len=24),
+            target_day_text=target_day_text,
+            location_hint=self._configured_location_hint(),
+            raw_headline_lines=tuple(digest_inputs.get("headline_lines", ())),
+            raw_live_news_summary=_bounded_optional_text(digest_inputs.get("live_news_summary"), max_len=1200),
+            candidate_news_sources=_bounded_text_tuple(candidate_news_sources, max_items=12, max_len=512),
+            raw_new_insights=nightly_insights.new_insights,
+            raw_continuity_shifts=nightly_insights.continuity_shifts,
+            headline_limit=max(
+                1,
+                int(
+                    getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT)
+                    or _DEFAULT_HEADLINE_LIMIT
+                ),
+            ),
+            insight_limit=2,
+            continuity_limit=2,
+            source_limit=5,
+        )
 
     def _prepare_digest(
         self,
@@ -1335,6 +1512,22 @@ class TwinrNightlyOrchestrator:
         )
         weather_summary = _bounded_optional_text(digest_inputs.get("weather_summary"), max_len=600)
         live_news_summary = _bounded_optional_text(digest_inputs.get("live_news_summary"), max_len=1200)
+        new_insights = _bounded_text_tuple(
+            tuple(digest_inputs.get("new_insights", ())),
+            max_items=max(
+                1,
+                int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+            ),
+            max_len=_MAX_LINE,
+        )
+        continuity_shifts = _bounded_text_tuple(
+            tuple(digest_inputs.get("continuity_shifts", ())),
+            max_items=max(
+                1,
+                int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+            ),
+            max_len=_MAX_LINE,
+        )
         weather_sources = _bounded_text_tuple(
             tuple(digest_inputs.get("weather_sources", ())),
             max_items=12,
@@ -1352,6 +1545,8 @@ class TwinrNightlyOrchestrator:
                 language=language,
                 reminder_lines=reminder_lines,
                 headline_lines=headline_lines,
+                new_insights=new_insights,
+                continuity_shifts=continuity_shifts,
                 weather_summary=weather_summary,
                 live_news_summary=live_news_summary,
             ),
@@ -1363,6 +1558,8 @@ class TwinrNightlyOrchestrator:
                 target_day_text=target_day_text,
                 reminder_lines=reminder_lines,
                 headline_lines=headline_lines,
+                new_insights=new_insights,
+                continuity_shifts=continuity_shifts,
                 weather_summary=weather_summary,
                 live_news_summary=live_news_summary,
             )
@@ -1373,6 +1570,8 @@ class TwinrNightlyOrchestrator:
                 language=language,
                 reminder_lines=reminder_lines,
                 headline_lines=headline_lines,
+                new_insights=new_insights,
+                continuity_shifts=continuity_shifts,
                 weather_summary=weather_summary,
                 live_news_summary=live_news_summary,
             ),
@@ -1384,6 +1583,8 @@ class TwinrNightlyOrchestrator:
                 target_day_text=target_day_text,
                 reminder_lines=reminder_lines,
                 headline_lines=headline_lines,
+                new_insights=new_insights,
+                continuity_shifts=continuity_shifts,
                 weather_summary=weather_summary,
                 live_news_summary=live_news_summary,
             )
@@ -1401,6 +1602,8 @@ class TwinrNightlyOrchestrator:
             weather_summary=weather_summary,
             reminder_lines=reminder_lines,
             headline_lines=headline_lines,
+            new_insights=new_insights,
+            continuity_shifts=continuity_shifts,
             live_news_summary=live_news_summary,
             weather_sources=weather_sources,
             news_sources=news_sources,
@@ -1453,6 +1656,8 @@ class TwinrNightlyOrchestrator:
         language: str | None,
         reminder_lines: Sequence[str],
         headline_lines: Sequence[str],
+        new_insights: Sequence[str],
+        continuity_shifts: Sequence[str],
         weather_summary: str | None,
         live_news_summary: str | None,
     ) -> str:
@@ -1472,6 +1677,8 @@ class TwinrNightlyOrchestrator:
             f"Weather: {weather_summary or 'none'}\n"
             f"Reminders: {json.dumps(list(reminder_lines), ensure_ascii=False)}\n"
             f"Headlines: {json.dumps(list(headline_lines), ensure_ascii=False)}\n"
+            f"New insights: {json.dumps(list(new_insights), ensure_ascii=False)}\n"
+            f"Continuity shifts: {json.dumps(list(continuity_shifts), ensure_ascii=False)}\n"
             f"Fallback news summary: {live_news_summary or 'none'}\n"
             "Return only the final spoken briefing text."
         )
@@ -1483,6 +1690,8 @@ class TwinrNightlyOrchestrator:
         language: str | None,
         reminder_lines: Sequence[str],
         headline_lines: Sequence[str],
+        new_insights: Sequence[str],
+        continuity_shifts: Sequence[str],
         weather_summary: str | None,
         live_news_summary: str | None,
     ) -> str:
@@ -1501,6 +1710,8 @@ class TwinrNightlyOrchestrator:
             f"Weather: {weather_summary or 'none'}\n"
             f"Reminders: {json.dumps(list(reminder_lines), ensure_ascii=False)}\n"
             f"Headlines: {json.dumps(list(headline_lines), ensure_ascii=False)}\n"
+            f"New insights: {json.dumps(list(new_insights), ensure_ascii=False)}\n"
+            f"Continuity shifts: {json.dumps(list(continuity_shifts), ensure_ascii=False)}\n"
             f"Fallback news summary: {live_news_summary or 'none'}\n"
             "Return only the plain text that should appear on paper."
         )
@@ -1511,6 +1722,8 @@ class TwinrNightlyOrchestrator:
         target_day_text: str,
         reminder_lines: Sequence[str],
         headline_lines: Sequence[str],
+        new_insights: Sequence[str],
+        continuity_shifts: Sequence[str],
         weather_summary: str | None,
         live_news_summary: str | None,
     ) -> str:
@@ -1523,6 +1736,10 @@ class TwinrNightlyOrchestrator:
             parts.append(f"Heute wichtig: {'; '.join(reminder_lines[:3])}.")
         if headline_lines:
             parts.append(f"Außerdem relevant: {'; '.join(headline_lines[:2])}.")
+        if new_insights:
+            parts.append(f"Neu aufgefallen: {'; '.join(new_insights[:2])}.")
+        if continuity_shifts:
+            parts.append(f"Weiter im Blick: {'; '.join(continuity_shifts[:2])}.")
         elif live_news_summary:
             parts.append(live_news_summary)
         return _bounded_text(" ".join(part for part in parts if part), max_len=1200)
@@ -1533,6 +1750,8 @@ class TwinrNightlyOrchestrator:
         target_day_text: str,
         reminder_lines: Sequence[str],
         headline_lines: Sequence[str],
+        new_insights: Sequence[str],
+        continuity_shifts: Sequence[str],
         weather_summary: str | None,
         live_news_summary: str | None,
     ) -> str:
@@ -1545,6 +1764,10 @@ class TwinrNightlyOrchestrator:
             lines.extend(f"Termin: {line}" for line in reminder_lines[:3])
         if headline_lines:
             lines.extend(f"Aktuell: {line}" for line in headline_lines[:3])
+        if new_insights:
+            lines.extend(f"Neu: {line}" for line in new_insights[:2])
+        if continuity_shifts:
+            lines.extend(f"Bleibt dran: {line}" for line in continuity_shifts[:2])
         elif live_news_summary:
             lines.append(f"Aktuell: {live_news_summary}")
         return _bounded_block_text("\n".join(lines), max_len=1200)
@@ -1561,6 +1784,7 @@ class TwinrNightlyOrchestrator:
         due_reminder_count: int,
         target_day_reminder_count: int,
         personality_results: Sequence[PersonalityEvolutionResult],
+        nightly_insights: NightlyInsightBundle,
         live_search_queries: int,
         errors: Sequence[str],
     ) -> NightlyConsolidationSummary:
@@ -1585,6 +1809,10 @@ class TwinrNightlyOrchestrator:
             due_reminder_count=max(0, due_reminder_count),
             target_day_reminder_count=max(0, target_day_reminder_count),
             accepted_personality_delta_count=accepted_delta_count,
+            new_insights=digest.new_insights,
+            continuity_shifts=digest.continuity_shifts,
+            operator_new_insights=nightly_insights.new_insights,
+            operator_continuity_shifts=nightly_insights.continuity_shifts,
             live_search_queries=live_search_queries,
             weather_sources=digest.weather_sources,
             news_sources=digest.news_sources,

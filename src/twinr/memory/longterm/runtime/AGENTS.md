@@ -40,6 +40,7 @@ Out of scope:
 - `service.py` stays a thin compatibility shim. New runtime logic belongs in the appropriate `service_impl/*.py` module instead of growing the shim again.
 - Shared `_store_lock` serialization is reserved for object/graph/midterm mutation paths that truly share those stores. Prompt-context mutations keep their own store-local locking and must not wait behind unrelated background multimodal or turn persistence.
 - Runtime live-provider context assembly must consume `provider_answer_front.py` first and must not reintroduce synchronous broad retriever rebuilds inside the live answer path.
+- Compatibility provider-context and explicit materialized-front builds may wait a bounded first-turn window for the first canonical query rewrite, and later wait-capable callers must still be able to consume that in-flight rewrite even if a fallback profile was cached earlier; the strict live answer path itself must still consume only an already materialized front.
 - Compatibility provider/tool context assembly may still reuse `prepared_context.py`, but that path must not silently replace the stricter live-provider contract.
 - Operator/debug surfaces may inspect the latest built provider/tool context snapshot, but they must not trigger a second independent remote recall merely to repaint the same turn context.
 - Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
@@ -48,6 +49,8 @@ Out of scope:
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
 - `health.py` must attest graph and midterm readiness through the stores' current-view/current-head helpers, not by reintroducing generic `load_snapshot("graph"|"midterm")` checks.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
+- Prepared-context fronts, materialized provider-answer fronts, and query-rewrite helpers must reject new background work after shutdown starts, so late invalidations from draining writers cannot raise post-shutdown executor errors.
+- Normal provider-context assembly must fail closed on raw graph prompt blocks when unified subtext planning found no relevant graph payload and no other recall sections survived; do not let graph-only control queries carry irrelevant personal graph context just because query-first graph selection returned a noisy subject/person hit.
 - Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
 - Runtime restart-recall persistence stays orchestration-only here: `service.py` may trigger packet refreshes, but packet compilation logic belongs in retrieval and packet storage semantics belong in storage.
 - Live-near reserve/proactive/runtime maintenance callers must get object slices through `live_object_selectors.py`; do not add new direct `load_objects()` calls in runtime orchestration for those paths.

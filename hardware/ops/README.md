@@ -48,7 +48,7 @@ instead of treating them as supported operating modes.
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
 | [repair_remote_chonkydb.py](./repair_remote_chonkydb.py) | Diagnose the public ChonkyDB URL against the dedicated backend host and optionally repair the backend service without blind restarts |
-| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, stop non-Twinr workers that were pointed at Twinr's dedicated backend, and raise the dedicated Twinr backend CPU/IO priority before re-probing public `/instance` availability |
+| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service` plus CPU-hungry `caia-consumer-portal*.service` backends, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
 | [repair_remote_prompt_current_heads.py](./repair_remote_prompt_current_heads.py) | Force-publish canonical empty prompt-memory / managed-context current heads on one explicit remote namespace when the old heads are unreadable |
 | [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
@@ -97,6 +97,11 @@ remote-memory watchdog service is not break-glass; it is the productive owner
 for the watchdog so warm remote state survives runtime-supervisor restarts. If
 an operator wants to keep local copies of older units around during cleanup,
 they belong under the ignored top-level `__legacy__/hardware/ops/` folder.
+
+The documented Python operator wrappers in this folder now re-exec
+automatically into `/home/thh/twinr/.venv/bin/python`. That keeps
+`python3 hardware/ops/...` stable even when the host `python3` lacks Twinr's
+repo-local dependencies.
 
 ## Install
 
@@ -159,13 +164,16 @@ The third command is for the opposite failure shape: the host is up and the
 public endpoint may still answer, but shared-host boot catch-up or background
 CAIA work has made the dedicated Twinr backend slow or freeze-prone. The
 stabilizer touches the worst kill-switches, disables the curated conflict-unit
-set across both system and active user-session scope, stops proven non-Twinr
-workers that were directly wired to Twinr's dedicated `127.0.0.1:3044`
-backend, raises `caia-twinr-chonkydb-alt.service` CPU/IO priority, and then
-re-probes the public `/instance` endpoint so operators can see whether the host
-slowdown actually cleared. That is intentionally a host-availability proof; if
-you need the stricter current-scope query contract as well, follow with
-`repair_remote_chonkydb.py --no-restart`.
+set across both system and active user-session scope, runtime-masks proven
+non-Twinr workers such as `ollama-gpu.service`, now also quiesces the
+always-on `caia-consumer-portal.service` and
+`caia-consumer-portal-demo.service` uvicorn backends when they reclaim CPU,
+raises
+`caia-twinr-chonkydb-alt.service` CPU/IO priority, and then re-probes the
+public current-scope query surface with the same empty-scope-safe
+`404 document_not_found` semantics used by `repair_remote_chonkydb.py`, so
+operators can see whether the host slowdown actually cleared without
+misclassifying a fresh empty namespace as down.
 If the backend stays healthy but prompt-context reads time out on one broken
 blank `catalog/current` document, open an SSH tunnel to the backend loopback
 and run `repair_remote_prompt_current_heads.py` against that explicit namespace.

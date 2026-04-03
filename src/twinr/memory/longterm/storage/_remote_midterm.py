@@ -140,10 +140,15 @@ class LongTermRemoteMidtermState:
             item_id_getter=lambda payload: payload.get("packet_id"),
             metadata_builder=_packet_metadata,
             content_builder=_packet_search_text,
+            skip_async_document_id_wait=True,
         )
         if packets:
             catalog_payload["written_at"] = max(_packet_updated_at_text(packet) for packet in packets)
-        self._catalog.persist_catalog_payload(snapshot_kind=_MIDTERM_SNAPSHOT_KIND, payload=catalog_payload)
+        self._catalog.persist_catalog_payload(
+            snapshot_kind=_MIDTERM_SNAPSHOT_KIND,
+            payload=catalog_payload,
+            skip_async_document_id_wait=True,
+        )
         self._persist_compatibility_current_head(payload=catalog_payload)
         return catalog_payload
 

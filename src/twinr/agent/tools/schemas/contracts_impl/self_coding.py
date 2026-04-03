@@ -44,11 +44,12 @@ def build_propose_skill_learning_schema(_context: SchemaBuildContext) -> dict[st
                     string_property("Trigger condition identifier.", min_length=1),
                     unique_items=True,
                 ),
-                "scope": {
-                    "type": "object",
-                    "description": "Optional preliminary structured scope object.",
-                    "additionalProperties": True,
-                },
+                # OpenAI strict tool schemas only support explicitly enumerated object keys,
+                # so arbitrary skill scopes travel as compact JSON object strings.
+                "scope": string_property(
+                    'Optional preliminary structured scope encoded as a compact JSON object string, for example {"channel":"voice","contacts":["family"]}.',
+                    min_length=2,
+                ),
                 "constraints": array_property(
                     "Optional preliminary constraints in plain language.",
                     string_property("Constraint.", min_length=1),
@@ -93,11 +94,10 @@ def build_answer_skill_question_schema(_context: SchemaBuildContext) -> dict[str
                     string_property("Trigger condition identifier.", min_length=1),
                     unique_items=True,
                 ),
-                "scope": {
-                    "type": "object",
-                    "description": "Optional shallow scope patch to merge into the draft skill scope.",
-                    "additionalProperties": True,
-                },
+                "scope": string_property(
+                    'Optional shallow scope patch encoded as a compact JSON object string, for example {"contacts":["family"]}.',
+                    min_length=2,
+                ),
                 "constraints": array_property(
                     "Optional extra constraints to merge into the draft skill.",
                     string_property("Constraint.", min_length=1),

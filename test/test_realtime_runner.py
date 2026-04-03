@@ -3065,11 +3065,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
         loop.runtime.press_green_button()
         loop.runtime.submit_transcript("Bitte drucke das")
+        tiny_context = (("system", "Tiny tool context"), ("user", "Bitte drucke das"))
+        loop.runtime.tool_provider_tiny_recent_conversation_context = lambda: tiny_context  # type: ignore[method-assign]
+        loop.runtime.provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("full provider context must not be used for realtime print tools"))  # type: ignore[method-assign]
 
         result = loop._handle_print_tool_call({"text": "Wichtige Info"})
 
         self.assertEqual(len(print_backend.calls), 1)
-        self._assert_language_contract_only(print_backend.calls[0][0])
+        self.assertEqual(print_backend.calls[0][0], tiny_context)
         self.assertEqual(print_backend.calls[0][1:], (None, "Wichtige Info", "tool"))
         self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertEqual(result["status"], "printed")
@@ -3141,6 +3144,50 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         store = loop.runtime._self_coding_store()
         self.assertEqual(store.load_job(final["compile_job_id"]).status.value, "queued")
         self.assertIn("self_coding_tool_call=true", lines)
+
+    def test_self_coding_tool_calls_accept_scope_json_strings(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        proposed = loop._handle_propose_skill_learning_tool_call(
+            {
+                "name": "Announce Family Updates",
+                "action": "Read new family updates aloud",
+                "request_summary": "Read out new family updates.",
+                "capabilities": ["speaker", "safety", "rules"],
+                "trigger_mode": "push",
+                "trigger_conditions": ["new_message"],
+                "scope": json.dumps({"channel": "messages"}),
+                "constraints": ["not_during_night_mode"],
+            }
+        )
+
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "trigger_conditions": ["user_visible"],
+            }
+        )
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "scope": json.dumps({"contacts": ["family"]}),
+            }
+        )
+        loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "constraints": ["ask_first"],
+            }
+        )
+        final = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "confirmed": True,
+            }
+        )
+
+        self.assertEqual(final["status"], "ready_for_compile")
+        self.assertEqual(final["skill_spec"]["scope"]["contacts"], ["family"])
 
     def test_tool_provider_context_includes_active_self_coding_guidance(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
@@ -5481,6 +5528,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 config=config,
                 camera=camera,
             )
+            tiny_context = (("system", "Tiny tool context"), ("user", "Schau mich mal an"))
+            loop.runtime.tool_provider_tiny_recent_conversation_context = lambda: tiny_context  # type: ignore[method-assign]
+            loop.runtime.provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("full provider context must not be used for realtime camera tools"))  # type: ignore[method-assign]
 
             result = loop._handle_inspect_camera_tool_call({"question": "Schau mich mal an"})
 
@@ -5491,7 +5541,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         prompt, images, conversation, allow_web_search = print_backend.vision_calls[0]
         self.assertIn("Image 2 is a stored reference image of the main user.", prompt)
         self.assertEqual(len(images), 2)
-        self._assert_language_contract_only(conversation)
+        self.assertEqual(conversation, tiny_context)
         self.assertFalse(allow_web_search)
         self.assertIn("camera_tool_call=true", lines)
         self.assertIn("vision_image_count=2", lines)
@@ -5604,6 +5654,53 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
+
+    def test_search_tool_call_truncates_excess_sources_for_memory_persistence(self) -> None:
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop()
+        many_sources = tuple(f"https://example.com/source-{index}" for index in range(42))
+        print_backend.search_live_info_with_metadata = lambda *args, **kwargs: SimpleNamespace(
+            answer="Drei kurze Punkte.",
+            sources=many_sources,
+            response_id="resp_search_many_1",
+            request_id="req_search_many_1",
+            used_web_search=True,
+            model="gpt-5.4-mini",
+            requested_model="gpt-5.4-mini",
+            fallback_reason="",
+            verification_status="verified",
+            question_resolved=True,
+            site_follow_up_recommended=False,
+            site_follow_up_reason="",
+            site_follow_up_url="",
+            site_follow_up_domain="",
+            attempt_log=(),
+            token_usage=None,
+        )
+
+        result = loop._handle_search_tool_call(
+            {
+                "question": "Was sind heute die wichtigsten Nachrichten fuer Deutschland im Web?",
+            },
+        )
+
+        self.assertEqual(result["answer"], "Drei kurze Punkte.")
+        self.assertEqual(result["sources"], list(many_sources))
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not loop.runtime.memory.search_results:
+            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=40))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        recent_events = tuple(loop.runtime.ops_events.tail(limit=40))
+        self.assertEqual(len(loop.runtime.memory.search_results), 1)
+        self.assertEqual(loop.runtime.memory.search_results[0].sources, many_sources[:8])
+        self.assertFalse(any(entry["event"] == "search_memory_store_failed" for entry in recent_events))
+        search_result_events = [entry for entry in recent_events if entry["event"] == "search_result_stored"]
+        self.assertTrue(search_result_events)
+        self.assertEqual(search_result_events[-1]["data"]["sources"], 8)
 
     def test_search_tool_call_persists_requested_actual_model_and_fallback_reason(self) -> None:
         loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop()

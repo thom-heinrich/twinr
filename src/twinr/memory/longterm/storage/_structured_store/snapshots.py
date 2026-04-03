@@ -114,9 +114,17 @@ class StructuredStoreSnapshotMixin:
             return self._load_memory_objects_from_payload(payload, snapshot_kind="objects")
 
     def load_objects_fine_grained(self) -> tuple[LongTermMemoryObjectV1, ...]:
-        """Load current objects via fine-grained remote catalog reads when available."""
+        """Load current objects via fine-grained remote catalog reads when available.
 
-        payloads = self._load_current_item_payloads_fine_grained(snapshot_kind="objects")
+        Fresh required-remote namespaces legitimately have no fixed
+        ``objects/catalog/current`` head yet, so treat that explicit
+        not-found case as an empty current view instead of a remote outage.
+        """
+
+        payloads = self._load_current_item_payloads_fine_grained(
+            snapshot_kind="objects",
+            allow_missing_current_head=True,
+        )
         if payloads is None:
             return self.load_objects()
         return self._load_memory_objects_from_item_payloads(payloads, snapshot_kind="objects")
@@ -188,9 +196,17 @@ class StructuredStoreSnapshotMixin:
             return tuple(conflicts)
 
     def load_conflicts_fine_grained(self) -> tuple[LongTermMemoryConflictV1, ...]:
-        """Load current conflicts via fine-grained remote catalog reads when available."""
+        """Load current conflicts via fine-grained remote catalog reads when available.
 
-        payloads = self._load_current_item_payloads_fine_grained(snapshot_kind="conflicts")
+        Missing conflict current heads are a valid empty bootstrap state for a
+        fresh required-remote namespace, so do not escalate that explicit
+        not-found case into a remote-unavailable failure.
+        """
+
+        payloads = self._load_current_item_payloads_fine_grained(
+            snapshot_kind="conflicts",
+            allow_missing_current_head=True,
+        )
         if payloads is None:
             return self.load_conflicts()
         return self._load_conflicts_from_item_payloads(payloads)
@@ -228,9 +244,17 @@ class StructuredStoreSnapshotMixin:
             return self._load_memory_objects_from_payload(payload, snapshot_kind="archive")
 
     def load_archived_objects_fine_grained(self) -> tuple[LongTermMemoryObjectV1, ...]:
-        """Load current archived objects via fine-grained remote catalog reads when available."""
+        """Load current archived objects via fine-grained remote catalog reads when available.
 
-        payloads = self._load_current_item_payloads_fine_grained(snapshot_kind="archive")
+        Fresh required-remote namespaces may not have an archive current head
+        yet; treat that explicit not-found state as an empty archive instead
+        of failing before the first write.
+        """
+
+        payloads = self._load_current_item_payloads_fine_grained(
+            snapshot_kind="archive",
+            allow_missing_current_head=True,
+        )
         if payloads is None:
             return self.load_archived_objects()
         return self._load_memory_objects_from_item_payloads(payloads, snapshot_kind="archive")
@@ -308,6 +332,31 @@ class StructuredStoreSnapshotMixin:
         """Probe the current remote snapshot contract, accepting a fresh empty namespace."""
 
         with self._lock:
+            recent_local_payload = self._recent_local_snapshot_payloads.get(snapshot_kind)
+            remote_catalog = self._remote_catalog
+            if (
+                snapshot_kind in {"objects", "conflicts", "archive"}
+                and self._remote_catalog_enabled()
+                and remote_catalog is not None
+            ):
+                head_result_loader = getattr(remote_catalog, "_load_catalog_head_result", None)
+                if callable(head_result_loader):
+                    head_result = head_result_loader(snapshot_kind=snapshot_kind, metadata_only=True)
+                    head_status = str(getattr(head_result, "status", "") or "")
+                    head_payload = getattr(head_result, "payload", None)
+                    if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
+                        return dict(cast(Mapping[str, object], head_payload))
+                    if isinstance(recent_local_payload, Mapping) and self._is_valid_snapshot_payload(
+                        snapshot_kind=snapshot_kind,
+                        payload=recent_local_payload,
+                    ):
+                        return dict(recent_local_payload)
+                    if head_status == "not_found":
+                        return self._synthetic_empty_snapshot_payload_for_readiness(snapshot_kind=snapshot_kind)
+                    if head_status in {"invalid", "unavailable"} and self._remote_is_required():
+                        raise LongTermRemoteUnavailableError(
+                            f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
+                        )
             payload = self.probe_remote_current_snapshot(snapshot_kind=snapshot_kind)
             if isinstance(payload, dict):
                 return dict(payload)
@@ -945,23 +994,6 @@ class StructuredStoreSnapshotMixin:
                 head_payload = head_probe(snapshot_kind=snapshot_kind)
             if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
                 return False
-            probe = self._probe_remote_state_snapshot(
-                remote_state=self.remote_state,
-                snapshot_kind=snapshot_kind,
-                prefer_metadata_only=True,
-                fast_fail=True,
-            )
-            probe_payload = getattr(probe, "payload", None)
-            if remote_catalog.is_catalog_payload(
-                snapshot_kind=snapshot_kind,
-                payload=probe_payload if isinstance(probe_payload, Mapping) else None,
-            ):
-                return False
-            if getattr(probe, "status", None) == "unavailable":
-                detail = str(getattr(probe, "detail", "") or "")
-                raise LongTermRemoteUnavailableError(
-                    detail or f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
-                )
             if head_status in {"invalid", "unavailable"}:
                 raise LongTermRemoteUnavailableError(
                     f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
@@ -1344,10 +1376,15 @@ class StructuredStoreSnapshotMixin:
                     item_id_getter=lambda item: self._remote_item_id_for_payload(snapshot_kind=snapshot_kind, payload=item),
                     metadata_builder=lambda item: self._remote_item_metadata(snapshot_kind=snapshot_kind, payload=item),
                     content_builder=lambda item: self._remote_item_search_text(snapshot_kind=snapshot_kind, payload=item),
+                    skip_async_document_id_wait=True,
                 )
                 if isinstance(payload.get(_SNAPSHOT_WRITTEN_AT_KEY), str):
                     catalog_payload[_SNAPSHOT_WRITTEN_AT_KEY] = payload.get(_SNAPSHOT_WRITTEN_AT_KEY)
-                remote_catalog.persist_catalog_payload(snapshot_kind=snapshot_kind, payload=catalog_payload)
+                remote_catalog.persist_catalog_payload(
+                    snapshot_kind=snapshot_kind,
+                    payload=catalog_payload,
+                    skip_async_document_id_wait=True,
+                )
                 return
             remote_payload = {
                 key: value

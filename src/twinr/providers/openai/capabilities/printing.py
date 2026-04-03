@@ -10,6 +10,8 @@
 # IMP-3: Switched to per-request `with_options(timeout=..., max_retries=0)` where available, with compatibility fallbacks for older clients.
 # IMP-4: Added deterministic local compaction, sentence-aware segmentation, Unicode normalization, and bounded config values for safer receipt formatting.
 # IMP-5: Added optional dedicated `config.print_model` support, while remaining drop-in compatible with `config.default_model`.
+# BUG-5: Incomplete/max-output print responses now fail closed instead of leaking truncated JSON into receipt text.
+# BUG-6: Structured print composition now retries once on the plain-text request when the structured request hits a transient provider/server error.
 
 """Compose and sanitize Twinr print output through OpenAI.
 
@@ -57,6 +59,7 @@ class OpenAIPrintMixin:
     _DEFAULT_PRINT_CONTEXT_TURNS = 6
     _DEFAULT_PRINT_MODEL_TIMEOUT_SECONDS = 12.0
     _DEFAULT_PRINT_MODEL_MAX_RETRIES = 0
+    _DEFAULT_PRINT_MAX_OUTPUT_TOKENS = 320
     _DEFAULT_PRINT_INPUT_CHAR_LIMIT = 16_000
     _DEFAULT_PRINT_SCAN_ITEMS = 128
     _DEFAULT_PRINT_MODEL = "gpt-5.4-mini"
@@ -218,8 +221,8 @@ class OpenAIPrintMixin:
                 instructions=self._print_composer_instructions(),
                 allow_web_search=False,
                 model=self._print_model_name(),
-                reasoning_effort="medium",
-                max_output_tokens=180,
+                reasoning_effort="low",
+                max_output_tokens=self._print_max_output_tokens(),
             )
             request = self._prepare_print_request(request)
             response, request, structured_used = self._create_print_response(
@@ -710,6 +713,16 @@ class OpenAIPrintMixin:
             maximum=2,
         )
 
+    def _print_max_output_tokens(self) -> int:
+        """Return the output-token budget used for print composition."""
+
+        return self._bounded_int_config(
+            "print_max_output_tokens",
+            self._DEFAULT_PRINT_MAX_OUTPUT_TOKENS,
+            minimum=140,
+            maximum=1024,
+        )
+
     def _print_input_char_limit(self) -> int:
         """Return the maximum raw input characters processed by the print path."""
 
@@ -833,7 +846,10 @@ class OpenAIPrintMixin:
         try:
             return self._responses_create(structured_request), structured_request, True
         except Exception as exc:
-            if not self._looks_like_structured_output_request_issue(exc):
+            if not (
+                self._looks_like_structured_output_request_issue(exc)
+                or self._looks_like_transient_print_response_error(exc)
+            ):
                 raise
             self._log_print_failure(f"{stage}:structured_output", exc)
             plain_request = self._without_structured_print_format(request)
@@ -881,14 +897,17 @@ class OpenAIPrintMixin:
     def _extract_print_text_from_response(self, response: Any, *, structured_expected: bool) -> str:
         """Extract text from a print response, parsing structured outputs when present."""
 
+        incomplete_reason = self._print_response_incomplete_reason(response)
+        if incomplete_reason is not None:
+            raise RuntimeError(f"print response incomplete: {incomplete_reason}")
         output_text = self._response_output_text(response)
         if structured_expected:
             try:
                 payload = json.loads(output_text)
-            except json.JSONDecodeError:
-                return output_text
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("print structured output was not valid JSON") from exc
             if not isinstance(payload, dict):
-                return output_text
+                raise RuntimeError("print structured output must be a JSON object")
 
             status = self._coerce_optional_text(payload.get("status")).strip().lower()
             text = self._coerce_optional_text(payload.get("text"))
@@ -896,7 +915,9 @@ class OpenAIPrintMixin:
                 raise _NoPrintableContentError(self._EMPTY_PRINT_ERROR)
             if status not in {"", "ready"}:
                 raise RuntimeError(self._PREPARE_PRINT_ERROR)
-            return text or output_text
+            if not text:
+                raise RuntimeError("print structured output is missing text")
+            return text
 
         return output_text
 
@@ -960,3 +981,44 @@ class OpenAIPrintMixin:
             "strict",
         )
         return any(hint in message for hint in hints)
+
+    def _looks_like_transient_print_response_error(self, exc: BaseException) -> bool:
+        """Return whether a print request failed with a transient server/runtime error."""
+
+        message = self._coerce_optional_text(exc).lower()
+        error_name = exc.__class__.__name__.lower()
+        if error_name in {"internalservererror", "apitimeouterror", "apiconnectionerror"}:
+            return True
+        return any(
+            hint in message
+            for hint in (
+                "internalservererror",
+                "server error",
+                "status code: 500",
+                "status code: 502",
+                "status code: 503",
+                "status code: 504",
+                "timed out",
+                "connection error",
+            )
+        )
+
+    def _print_response_incomplete_reason(self, response: Any) -> str | None:
+        """Return the best available incomplete-response reason for one print request."""
+
+        status = self._coerce_optional_text(getattr(response, "status", None)).strip().lower()
+        if status and status != "incomplete":
+            return None
+        top_level = getattr(response, "incomplete_details", None)
+        if top_level is not None:
+            detail = self._coerce_optional_text(getattr(top_level, "reason", None) or top_level).strip()
+            if detail:
+                return detail
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) != "message" or getattr(item, "status", None) != "incomplete":
+                continue
+            detail = getattr(item, "incomplete_details", None)
+            normalized = self._coerce_optional_text(getattr(detail, "reason", None) or detail).strip()
+            if normalized:
+                return normalized
+        return "incomplete" if status == "incomplete" else None

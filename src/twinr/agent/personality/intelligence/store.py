@@ -2,6 +2,8 @@
 # BUG-1: Stop treating malformed subscription envelopes as "empty success"; corrupt payloads are now detected and quarantined instead of silently erasing subscriptions.
 # BUG-2: Stop failing the entire subscription restore on one bad item; invalid records are isolated and skipped so healthy subscriptions still load.
 # BUG-3: Stop letting malformed state payloads abort scheduler recovery; invalid state now falls back to a safe default instead of crashing restore.
+# BUG-4: Fall back to the legacy embedded subscription snapshot when a visible current head hydrates fewer item payloads than it declares, so Twinr does not silently drop feeds and skip nightly world refreshes during transient remote-catalog divergence.
+# BUG-5: Keep writing a bounded embedded subscription snapshot alongside current-head updates so fresh readers can recover from cross-process item-hydration lag immediately after new feed subscriptions are saved.
 # SEC-1: Bound remote snapshot ingestion (item count, nesting, mapping width, string size) to reduce practical Pi-4 denial-of-service risk from poisoned or corrupted remote snapshots.
 # IMP-1: Add version-aware, metadata-rich subscription envelopes (schema_version, saved_at, item_count, payload_sha256) with backward-compatible loading from legacy schema_version=1 payloads.
 # IMP-2: Add forward-compatible state-envelope loading, JSON-Schema contracts, structured logging, and process-local save locking; preserve legacy state write format for drop-in compatibility.
@@ -31,7 +33,10 @@ from twinr.agent.personality.intelligence.models import (
     WorldIntelligenceState,
 )
 from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteStateStore,
+    LongTermRemoteUnavailableError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -198,6 +203,26 @@ def _subscriptions_written_at(payloads: Sequence[Mapping[str, object]]) -> str |
     return max(candidates) if candidates else None
 
 
+def _subscription_snapshot_envelope(
+    *,
+    item_payloads: Sequence[Mapping[str, object]],
+    saved_at: str,
+) -> dict[str, object]:
+    """Build the bounded embedded fallback snapshot for subscription rescue reads."""
+
+    items = [dict(payload) for payload in item_payloads]
+    envelope: dict[str, object] = {
+        "schema_version": _SUBSCRIPTIONS_SCHEMA_VERSION,
+        "saved_at": saved_at,
+        "item_count": len(items),
+        "items": items,
+    }
+    payload_sha256 = _canonical_json_sha256(items)
+    if isinstance(payload_sha256, str) and payload_sha256:
+        envelope["payload_sha256"] = payload_sha256
+    return envelope
+
+
 def _subscription_metadata(payload: Mapping[str, object]) -> Mapping[str, object]:
     created_at = _normalized_record_text(payload.get("created_at"), limit=80)
     updated_at = _normalized_record_text(payload.get("updated_at"), limit=80) or created_at
@@ -261,6 +286,109 @@ class RemoteStateWorldIntelligenceStore:
         if self.max_nesting_depth < 1:
             raise ValueError("max_nesting_depth must be >= 1.")
 
+    def _declared_subscription_item_count(self, payload: Mapping[str, object]) -> int | None:
+        """Return the item count metadata declared by one subscription payload."""
+
+        raw_count = payload.get("items_count")
+        if raw_count is None:
+            raw_count = payload.get("item_count")
+        if isinstance(raw_count, bool):
+            return None
+        if isinstance(raw_count, int) and raw_count >= 0:
+            return raw_count
+        return None
+
+    def _decode_legacy_subscription_items(
+        self,
+        *,
+        payload: object,
+    ) -> tuple[list[object], int] | None:
+        """Decode the legacy embedded subscription envelope when present."""
+
+        try:
+            envelope = _ensure_mapping(payload, path=self.subscriptions_snapshot_kind)
+        except ValueError as exc:
+            _LOGGER.warning(
+                "Ignoring corrupt %s snapshot: %s",
+                self.subscriptions_snapshot_kind,
+                exc,
+            )
+            return None
+
+        schema_version = envelope.get("schema_version")
+        if schema_version is not None and not isinstance(schema_version, int):
+            _LOGGER.warning(
+                "Ignoring corrupt %s snapshot: schema_version must be an int.",
+                self.subscriptions_snapshot_kind,
+            )
+            return None
+        if isinstance(schema_version, int) and schema_version not in _SUPPORTED_SUBSCRIPTIONS_SCHEMA_VERSIONS:
+            _LOGGER.warning(
+                "%s uses unknown schema_version=%s; attempting best-effort decode.",
+                self.subscriptions_snapshot_kind,
+                schema_version,
+            )
+
+        if "items" not in envelope:
+            _LOGGER.warning(
+                "Ignoring corrupt %s snapshot: missing required 'items' key.",
+                self.subscriptions_snapshot_kind,
+            )
+            return None
+
+        try:
+            raw_items = _ensure_sequence(
+                envelope["items"],
+                path=f"{self.subscriptions_snapshot_kind}.items",
+            )
+        except ValueError as exc:
+            _LOGGER.warning(
+                "Ignoring corrupt %s snapshot: %s",
+                self.subscriptions_snapshot_kind,
+                exc,
+            )
+            return None
+
+        total_items = len(raw_items)
+        if total_items > self.max_subscriptions:
+            _LOGGER.warning(
+                "%s snapshot contains %d subscriptions; truncating to max_subscriptions=%d.",
+                self.subscriptions_snapshot_kind,
+                total_items,
+                self.max_subscriptions,
+            )
+            bounded_items = list(raw_items[: self.max_subscriptions])
+        else:
+            bounded_items = list(raw_items)
+
+        declared_item_count = envelope.get("item_count")
+        if declared_item_count is not None and (
+            not isinstance(declared_item_count, int) or declared_item_count < 0
+        ):
+            _LOGGER.warning(
+                "%s snapshot has invalid item_count=%r; ignoring metadata.",
+                self.subscriptions_snapshot_kind,
+                declared_item_count,
+            )
+        elif isinstance(declared_item_count, int) and declared_item_count != total_items:
+            _LOGGER.warning(
+                "%s snapshot item_count=%d but payload contains %d items.",
+                self.subscriptions_snapshot_kind,
+                declared_item_count,
+                total_items,
+            )
+
+        expected_digest = envelope.get("payload_sha256")
+        if isinstance(expected_digest, str) and len(bounded_items) == total_items:
+            actual_digest = _canonical_json_sha256(bounded_items)
+            if actual_digest is not None and actual_digest != expected_digest:
+                _LOGGER.warning(
+                    "Ignoring corrupt %s snapshot: payload_sha256 mismatch.",
+                    self.subscriptions_snapshot_kind,
+                )
+                return None
+        return bounded_items, total_items
+
     def load_subscriptions(
         self,
         *,
@@ -274,94 +402,53 @@ class RemoteStateWorldIntelligenceStore:
         current_records = LongTermRemoteCurrentRecordStore(resolved)
         head = current_records.load_current_head(snapshot_kind=self.subscriptions_snapshot_kind)
         if isinstance(head, Mapping):
-            raw_items = list(current_records.load_collection_payloads(snapshot_kind=self.subscriptions_snapshot_kind))
-            total_items = len(raw_items)
-        else:
-            payload = resolved.load_snapshot(snapshot_kind=self.subscriptions_snapshot_kind)
-            if payload is None:
-                return ()
+            hydration_error: LongTermRemoteUnavailableError | None = None
             try:
-                envelope = _ensure_mapping(payload, path=self.subscriptions_snapshot_kind)
-            except ValueError as exc:
-                _LOGGER.warning(
-                    "Ignoring corrupt %s snapshot: %s",
-                    self.subscriptions_snapshot_kind,
-                    exc,
-                )
-                return ()
-
-            schema_version = envelope.get("schema_version")
-            if schema_version is not None and not isinstance(schema_version, int):
-                _LOGGER.warning(
-                    "Ignoring corrupt %s snapshot: schema_version must be an int.",
-                    self.subscriptions_snapshot_kind,
-                )
-                return ()
-            if isinstance(schema_version, int) and schema_version not in _SUPPORTED_SUBSCRIPTIONS_SCHEMA_VERSIONS:
-                _LOGGER.warning(
-                    "%s uses unknown schema_version=%s; attempting best-effort decode.",
-                    self.subscriptions_snapshot_kind,
-                    schema_version,
-                )
-
-            if "items" not in envelope:
-                _LOGGER.warning(
-                    "Ignoring corrupt %s snapshot: missing required 'items' key.",
-                    self.subscriptions_snapshot_kind,
-                )
-                return ()
-
-            try:
-                raw_items = _ensure_sequence(
-                    envelope["items"],
-                    path=f"{self.subscriptions_snapshot_kind}.items",
-                )
-            except ValueError as exc:
-                _LOGGER.warning(
-                    "Ignoring corrupt %s snapshot: %s",
-                    self.subscriptions_snapshot_kind,
-                    exc,
-                )
-                return ()
-
+                raw_items = list(current_records.load_collection_payloads(snapshot_kind=self.subscriptions_snapshot_kind))
+            except LongTermRemoteUnavailableError as exc:
+                hydration_error = exc
+                raw_items = []
             total_items = len(raw_items)
-            if total_items > self.max_subscriptions:
-                _LOGGER.warning(
-                    "%s snapshot contains %d subscriptions; truncating to max_subscriptions=%d.",
-                    self.subscriptions_snapshot_kind,
-                    total_items,
-                    self.max_subscriptions,
-                )
-                raw_items = list(raw_items[: self.max_subscriptions])
-            else:
-                raw_items = list(raw_items)
-
-            declared_item_count = envelope.get("item_count")
-            if declared_item_count is not None and (
-                not isinstance(declared_item_count, int) or declared_item_count < 0
-            ):
-                _LOGGER.warning(
-                    "%s snapshot has invalid item_count=%r; ignoring metadata.",
-                    self.subscriptions_snapshot_kind,
-                    declared_item_count,
-                )
-            elif isinstance(declared_item_count, int) and declared_item_count != total_items:
-                _LOGGER.warning(
-                    "%s snapshot item_count=%d but payload contains %d items.",
-                    self.subscriptions_snapshot_kind,
-                    declared_item_count,
-                    total_items,
-                )
-
-            expected_digest = envelope.get("payload_sha256")
-            if isinstance(expected_digest, str) and len(raw_items) == total_items:
-                actual_digest = _canonical_json_sha256(raw_items)
-                if actual_digest is not None and actual_digest != expected_digest:
+            declared_item_count = self._declared_subscription_item_count(head)
+            if hydration_error is not None or (declared_item_count is not None and total_items < declared_item_count):
+                legacy_payload = resolved.load_snapshot(snapshot_kind=self.subscriptions_snapshot_kind)
+                fallback_items = self._decode_legacy_subscription_items(payload=legacy_payload)
+                if fallback_items is not None:
+                    if hydration_error is not None:
+                        _LOGGER.warning(
+                            "%s current head was readable but item hydration failed; falling back to embedded subscription snapshot: %s",
+                            self.subscriptions_snapshot_kind,
+                            hydration_error,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "%s current head declared %d items but hydrated %d; falling back to embedded subscription snapshot.",
+                            self.subscriptions_snapshot_kind,
+                            declared_item_count,
+                            total_items,
+                        )
+                    raw_items, total_items = fallback_items
+                else:
+                    if hydration_error is not None:
+                        _LOGGER.warning(
+                            "%s current head item hydration failed and no embedded fallback payload was readable.",
+                            self.subscriptions_snapshot_kind,
+                        )
+                        raise hydration_error
                     _LOGGER.warning(
-                        "Ignoring corrupt %s snapshot: payload_sha256 mismatch.",
+                        "%s current head declared %d items but hydrated %d and no embedded fallback payload was readable.",
                         self.subscriptions_snapshot_kind,
+                        declared_item_count,
+                        total_items,
                     )
-                    return ()
+        else:
+            legacy_payload = resolved.load_snapshot(snapshot_kind=self.subscriptions_snapshot_kind)
+            if legacy_payload is None:
+                return ()
+            decoded = self._decode_legacy_subscription_items(payload=legacy_payload)
+            if decoded is None:
+                return ()
+            raw_items, total_items = decoded
 
         loaded: list[WorldFeedSubscription] = []
         invalid_items = 0
@@ -465,14 +552,26 @@ class RemoteStateWorldIntelligenceStore:
                 f"{self.max_subscriptions} ({len(serialized_items)} provided)."
             )
 
+        written_at = _subscriptions_written_at(serialized_items) or _utc_now_iso8601()
+        fallback_snapshot = _subscription_snapshot_envelope(
+            item_payloads=serialized_items,
+            saved_at=written_at,
+        )
         with self._save_lock:
+            # Keep one attested embedded snapshot available so a fresh reader can
+            # recover the same subscription set while fixed current-head item
+            # hydration catches up across processes.
+            resolved.save_snapshot(
+                snapshot_kind=self.subscriptions_snapshot_kind,
+                payload=fallback_snapshot,
+            )
             current_records.save_collection(
                 snapshot_kind=self.subscriptions_snapshot_kind,
                 item_payloads=serialized_items,
                 item_id_getter=lambda item: item.get("subscription_id"),
                 metadata_builder=_subscription_metadata,
                 content_builder=_record_json_content,
-                written_at=_subscriptions_written_at(serialized_items) or _utc_now_iso8601(),
+                written_at=written_at,
             )
 
     def load_state(

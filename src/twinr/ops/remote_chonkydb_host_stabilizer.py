@@ -12,11 +12,14 @@ Twinr backend during live incidents.
 Outputs
 -------
 - one JSON-serializable result object with public probe latency before/after
-  the stabilization action, using the public `/instance` contract rather than
-  the stricter current-scope query-surface canary
+  the stabilization action, using the same public empty-scope-safe query
+  surface probe as the repair helper instead of a weaker `/instance`-only
+  liveness check
 - the backend service CPU/IO weights after stabilization
 - the before/after enabled/active state for the curated system- and user-unit
   conflict sets
+- the bounded stale-process cleanup summary for proven long-running
+  user-session benchmark workers that bypass systemd unit control
 """
 
 from __future__ import annotations
@@ -34,23 +37,27 @@ from twinr.ops.remote_chonkydb_repair import (
     ChonkyDBHttpProbeResult,
     RemoteChonkyDBExecutor,
     RemoteChonkyDBOpsSettings,
-    _probe_http_json,
     load_remote_chonkydb_ops_settings,
+    probe_public_chonkydb,
 )
 
 
 _DEFAULT_SETTLE_S = 8.0
+_DEFAULT_SSH_TIMEOUT_S = 180.0
 _DEFAULT_CHONKY_PROPERTIES: dict[str, str] = {
     "CPUWeight": "10000",
     "StartupCPUWeight": "10000",
     "IOWeight": "10000",
     "StartupIOWeight": "10000",
 }
+_DEFAULT_STALE_PROCESS_MIN_ELAPSED_S = 1800.0
 _DEFAULT_KILLSWITCH_PATHS = (
     "/home/thh/Desktop/tessairact_local/tessairact/state/systemd_agent/killswitch_codex_traces_pipeline",
     "/home/thh/Desktop/tessairact_local/tessairact/state/systemd_agent/killswitch_user_policy_loop",
 )
 _DEFAULT_SYSTEM_CONFLICTING_UNITS = (
+    "caia-consumer-portal.service",
+    "caia-consumer-portal-demo.service",
     "caia-codex-traces-pipeline.service",
     "caia-codex-traces-pipeline.timer",
     "caia-artifacts-stores-backup.service",
@@ -95,6 +102,8 @@ _DEFAULT_SYSTEM_CONFLICTING_UNITS = (
     "caia-bug-memory-refresh.timer",
     "caia-ops-chonkbin-writer-matrix-canary.service",
     "caia-ops-chonkbin-writer-matrix-canary.timer",
+    "caia-ops-chonky-search-guardrail.service",
+    "caia-ops-chonky-search-guardrail.timer",
     "caia-portal-kg-agent-autopilot.service",
     "caia-portal-llm-worker.service",
     "caia-repo-script-llm-enricher.service",
@@ -105,6 +114,16 @@ _DEFAULT_USER_CONFLICTING_UNITS = (
     "caia-chonkycode-chunks-posttransform.path",
     "caia-chonkycode-meta-graph-ssot.service",
     "caia-chonkycode-meta-graph-ssot.timer",
+    "ollama-gpu.service",
+)
+_DEFAULT_STALE_PROCESS_RULES = (
+    {
+        "label": "code_graph_benchmark_runner",
+        "required_substrings": (
+            "benchmarks.code_graph.benchmark",
+            "run_code_graph_benchmark",
+        ),
+    },
 )
 _REMOTE_UNIT_STATE_CODE = """
 import json
@@ -207,8 +226,10 @@ import json
 import os
 import pwd
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 payload = json.loads(sys.stdin.read() or "{}")
 backend_service = str(payload.get("backend_service", "")).strip()
@@ -223,6 +244,10 @@ property_map = {
     for key, value in dict(payload.get("property_assignments") or {}).items()
     if str(key).strip()
 }
+stale_process_rules = tuple(
+    item for item in payload.get("stale_process_rules", []) if isinstance(item, dict)
+)
+stale_process_min_elapsed_s = max(0.0, float(payload.get("stale_process_min_elapsed_s", 0.0) or 0.0))
 
 for raw_path in kill_switch_paths:
     path = Path(raw_path)
@@ -237,7 +262,15 @@ if backend_service and property_map:
 
 disabled_system_units = []
 for unit in system_units:
-    subprocess.run(["systemctl", "disable", "--now", unit], capture_output=True, text=True, check=False)
+    subprocess.run(["systemctl", "stop", unit], capture_output=True, text=True, check=False)
+    subprocess.run(["systemctl", "disable", unit], capture_output=True, text=True, check=False)
+    subprocess.run(
+        ["systemctl", "mask", "--runtime", unit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    subprocess.run(["systemctl", "reset-failed", unit], capture_output=True, text=True, check=False)
     disabled_system_units.append(unit)
 
 
@@ -260,14 +293,150 @@ def _run_user_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
 
 disabled_user_units = []
 for unit in user_units:
-    _run_user_systemctl("disable", "--now", unit)
+    _run_user_systemctl("stop", unit)
+    _run_user_systemctl("disable", unit)
+    _run_user_systemctl("mask", "--runtime", unit)
+    _run_user_systemctl("reset-failed", unit)
     disabled_user_units.append(unit)
+
+
+def _list_process_table() -> tuple[dict[int, dict[str, object]], dict[int, set[int]]]:
+    completed = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,etimes=,args="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    processes: dict[int, dict[str, object]] = {}
+    children: dict[int, set[int]] = {}
+    for raw_line in str(completed.stdout or "").splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            elapsed_s = int(parts[2])
+        except ValueError:
+            continue
+        args = str(parts[3]).strip()
+        processes[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "elapsed_s": elapsed_s,
+            "args": args,
+        }
+        children.setdefault(ppid, set()).add(pid)
+    return processes, children
+
+
+def _command_excerpt(raw_value: object, *, limit: int = 240) -> str:
+    value = str(raw_value or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _collect_stale_process_targets() -> list[dict[str, object]]:
+    if not stale_process_rules or stale_process_min_elapsed_s <= 0:
+        return []
+    processes, children = _list_process_table()
+    matched_roots: dict[int, dict[str, object]] = {}
+    for process in processes.values():
+        args = str(process.get("args", "") or "")
+        elapsed_s = int(process.get("elapsed_s", 0) or 0)
+        if elapsed_s < stale_process_min_elapsed_s:
+            continue
+        for rule in stale_process_rules:
+            label = str(rule.get("label", "") or "").strip()
+            required = tuple(
+                str(item).strip()
+                for item in rule.get("required_substrings", [])
+                if str(item).strip()
+            )
+            if required and all(marker in args for marker in required):
+                matched_roots[int(process["pid"])] = {
+                    "match_label": label,
+                    "required_substrings": required,
+                }
+                break
+    if not matched_roots:
+        return []
+    target_pids = set(matched_roots)
+    root_by_pid = {pid: pid for pid in matched_roots}
+    queue = list(matched_roots)
+    while queue:
+        current = queue.pop()
+        for child_pid in children.get(current, set()):
+            if child_pid in target_pids:
+                continue
+            target_pids.add(child_pid)
+            root_by_pid[child_pid] = root_by_pid[current]
+            queue.append(child_pid)
+    return [
+        {
+            "pid": pid,
+            "ppid": int(processes.get(pid, {}).get("ppid", 0) or 0),
+            "elapsed_s": int(processes.get(pid, {}).get("elapsed_s", 0) or 0),
+            "command_excerpt": _command_excerpt(processes.get(pid, {}).get("args", "")),
+            "scope": "matched_root" if pid in matched_roots else "descendant",
+            "match_label": str(
+                matched_roots.get(root_by_pid.get(pid, pid), {}).get("match_label", "") or ""
+            ),
+            "root_pid": int(root_by_pid.get(pid, pid)),
+        }
+        for pid in sorted(target_pids)
+    ]
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_stale_processes() -> list[dict[str, object]]:
+    targets = _collect_stale_process_targets()
+    if not targets:
+        return []
+    by_pid = {int(item["pid"]): dict(item) for item in targets}
+    for pid in tuple(by_pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            by_pid[pid]["termination_signal"] = "SIGTERM"
+        except ProcessLookupError:
+            by_pid[pid]["termination_signal"] = "already_gone"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        remaining = [pid for pid in by_pid if _process_exists(pid)]
+        if not remaining:
+            break
+        time.sleep(0.2)
+    remaining = [pid for pid in by_pid if _process_exists(pid)]
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            by_pid[pid]["termination_signal"] = "SIGKILL"
+        except ProcessLookupError:
+            by_pid[pid]["termination_signal"] = "already_gone"
+    return [by_pid[pid] for pid in sorted(by_pid)]
+
+
+terminated_processes = _terminate_stale_processes()
 
 json.dump(
     {
         "kill_switch_paths": list(kill_switch_paths),
         "disabled_system_units": disabled_system_units,
         "disabled_user_units": disabled_user_units,
+        "terminated_processes": terminated_processes,
         "property_assignments": property_map,
     },
     sys.stdout,
@@ -289,6 +458,30 @@ class RemoteHostUnitState:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteHostTerminatedProcess:
+    """Describe one stale remote process that the stabilizer terminated."""
+
+    pid: int
+    ppid: int
+    elapsed_s: int
+    command_excerpt: str
+    scope: str
+    match_label: str
+    root_pid: int
+    termination_signal: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteHostStabilizationAction:
+    """Capture the concrete remote actions executed during stabilization."""
+
+    kill_switch_paths: tuple[str, ...]
+    disabled_system_units: tuple[str, ...]
+    disabled_user_units: tuple[str, ...]
+    terminated_processes: tuple[RemoteHostTerminatedProcess, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteChonkyDBHostStabilizationResult:
     """Summarize one host-stabilization run for the Twinr backend."""
 
@@ -306,6 +499,7 @@ class RemoteChonkyDBHostStabilizationResult:
     kill_switch_paths: tuple[str, ...]
     disabled_system_units: tuple[str, ...]
     disabled_user_units: tuple[str, ...]
+    terminated_processes: tuple[RemoteHostTerminatedProcess, ...]
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-ready representation of the stabilization result."""
@@ -325,6 +519,7 @@ class RemoteChonkyDBHostStabilizationResult:
             "kill_switch_paths": list(self.kill_switch_paths),
             "disabled_system_units": list(self.disabled_system_units),
             "disabled_user_units": list(self.disabled_user_units),
+            "terminated_processes": [asdict(item) for item in self.terminated_processes],
         }
 
 
@@ -359,7 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ssh-timeout-s",
         type=float,
-        default=60.0,
+        default=_DEFAULT_SSH_TIMEOUT_S,
         help="Timeout in seconds for individual backend SSH commands.",
     )
     parser.add_argument(
@@ -431,6 +626,8 @@ def stabilize_remote_chonkydb_host(
         user_unit_owner=settings.ssh.user,
         kill_switch_paths=_DEFAULT_KILLSWITCH_PATHS,
         property_assignments=_DEFAULT_CHONKY_PROPERTIES,
+        stale_process_rules=_DEFAULT_STALE_PROCESS_RULES,
+        stale_process_min_elapsed_s=_DEFAULT_STALE_PROCESS_MIN_ELAPSED_S,
     )
     if settle_s > 0:
         time.sleep(float(settle_s))
@@ -473,9 +670,10 @@ def stabilize_remote_chonkydb_host(
         system_units_after=system_units_after,
         user_units_before=user_units_before,
         user_units_after=user_units_after,
-        kill_switch_paths=action["kill_switch_paths"],
-        disabled_system_units=action["disabled_system_units"],
-        disabled_user_units=action["disabled_user_units"],
+        kill_switch_paths=action.kill_switch_paths,
+        disabled_system_units=action.disabled_system_units,
+        disabled_user_units=action.disabled_user_units,
+        terminated_processes=action.terminated_processes,
     )
 
 
@@ -484,22 +682,10 @@ def probe_public_host_availability(
     settings: RemoteChonkyDBOpsSettings,
     timeout_s: float,
 ) -> ChonkyDBHttpProbeResult:
-    """Probe the public `/instance` surface for host-availability recovery.
+    """Probe the public query surface with empty-scope-safe readiness logic."""
 
-    The host stabilizer is about reclaiming CPU/I/O for Twinr's dedicated
-    backend. A strict current-scope query canary belongs to
-    `remote_chonkydb_repair.py`, where contract-level remote-memory readiness is
-    diagnosed separately. Here we only need a stable public liveness probe that
-    does not false-fail because one namespace/scope has no current head yet.
-    """
-
-    return _probe_http_json(
-        label="public",
-        url=settings.public_base_url.rstrip("/") + "/v1/external/instance",
-        headers={
-            "Accept": "application/json",
-            settings.public_api_key_header: settings.public_api_key,
-        },
+    return probe_public_chonkydb(
+        settings=settings,
         timeout_s=timeout_s,
     )
 
@@ -576,7 +762,9 @@ def apply_remote_host_stabilization(
     user_unit_owner: str,
     kill_switch_paths: tuple[str, ...],
     property_assignments: Mapping[str, str],
-) -> dict[str, tuple[str, ...]]:
+    stale_process_rules: tuple[Mapping[str, object], ...],
+    stale_process_min_elapsed_s: float,
+) -> RemoteHostStabilizationAction:
     """Touch kill-switches, raise backend weights, and disable conflict units."""
 
     payload = _run_remote_python_json(
@@ -589,27 +777,48 @@ def apply_remote_host_stabilization(
             "user_unit_owner": user_unit_owner,
             "kill_switch_paths": list(kill_switch_paths),
             "property_assignments": dict(property_assignments),
+            "stale_process_rules": [dict(item) for item in stale_process_rules],
+            "stale_process_min_elapsed_s": float(stale_process_min_elapsed_s),
         },
         use_sudo=True,
     )
     raw_paths = payload.get("kill_switch_paths")
     raw_system_units = payload.get("disabled_system_units")
     raw_user_units = payload.get("disabled_user_units")
+    raw_processes = payload.get("terminated_processes")
     if (
         not isinstance(raw_paths, list)
         or not isinstance(raw_system_units, list)
         or not isinstance(raw_user_units, list)
+        or not isinstance(raw_processes, list)
     ):  # pragma: no cover
         raise RuntimeError(f"invalid_remote_stabilize_payload:{payload!r}")
-    return {
-        "kill_switch_paths": tuple(str(item).strip() for item in raw_paths if str(item).strip()),
-        "disabled_system_units": tuple(
+    terminated_processes: list[RemoteHostTerminatedProcess] = []
+    for item in raw_processes:
+        if not isinstance(item, dict):  # pragma: no cover - defensive guard
+            raise RuntimeError(f"invalid_remote_terminated_process_item:{item!r}")
+        terminated_processes.append(
+            RemoteHostTerminatedProcess(
+                pid=int(item.get("pid", 0) or 0),
+                ppid=int(item.get("ppid", 0) or 0),
+                elapsed_s=int(item.get("elapsed_s", 0) or 0),
+                command_excerpt=str(item.get("command_excerpt", "")).strip(),
+                scope=str(item.get("scope", "")).strip(),
+                match_label=str(item.get("match_label", "")).strip(),
+                root_pid=int(item.get("root_pid", 0) or 0),
+                termination_signal=str(item.get("termination_signal", "")).strip(),
+            )
+        )
+    return RemoteHostStabilizationAction(
+        kill_switch_paths=tuple(str(item).strip() for item in raw_paths if str(item).strip()),
+        disabled_system_units=tuple(
             str(item).strip() for item in raw_system_units if str(item).strip()
         ),
-        "disabled_user_units": tuple(
+        disabled_user_units=tuple(
             str(item).strip() for item in raw_user_units if str(item).strip()
         ),
-    }
+        terminated_processes=tuple(terminated_processes),
+    )
 
 
 def _run_remote_python_json(

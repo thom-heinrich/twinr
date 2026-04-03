@@ -425,7 +425,7 @@ class TwinrConfig:
     long_term_memory_recall_limit: int = 3
     long_term_memory_fast_topic_enabled: bool = True
     long_term_memory_fast_topic_limit: int = 3
-    long_term_memory_fast_topic_timeout_s: float = 0.6
+    long_term_memory_fast_topic_timeout_s: float = 1.2
     long_term_memory_query_rewrite_enabled: bool = True
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0

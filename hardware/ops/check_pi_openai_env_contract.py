@@ -32,7 +32,9 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from _repo_python import PROJECT_ROOT, ensure_repo_python
+
+ensure_repo_python()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig  # noqa: E402

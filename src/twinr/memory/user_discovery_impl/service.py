@@ -80,12 +80,17 @@ class UserDiscoveryService(UserDiscoveryCommitMixin, UserDiscoveryQueryMixin):
             authoritative_profile_reader=UserDiscoveryAuthoritativeProfileReader.from_config(config),
         )
 
-    def load_state(self) -> UserDiscoveryState:
+    def _invalidate_authoritative_coverage_cache(self) -> None:
+        """Drop cached authoritative coverage before discovery mutations."""
+
         self._authoritative_coverage_cache = None
+
+    def load_state(self) -> UserDiscoveryState:
+        self._invalidate_authoritative_coverage_cache()
         try:
             return self._refresh_phase(self.store.load(), now=_utc_now())
         finally:
-            self._authoritative_coverage_cache = None
+            self._invalidate_authoritative_coverage_cache()
 
     def manage(
         self,
@@ -101,7 +106,6 @@ class UserDiscoveryService(UserDiscoveryCommitMixin, UserDiscoveryQueryMixin):
         callbacks: UserDiscoveryCommitCallbacks | None = None,
         now: datetime | None = None,
     ) -> UserDiscoveryResult:
-        self._authoritative_coverage_cache = None
         effective_now = (now or _utc_now()).astimezone(timezone.utc)
         normalized_action = _compact_text(action, max_len=32).lower().replace("-", "_").replace(" ", "_")
         normalized_topic_id = self._normalize_topic_id(topic_id)
@@ -112,47 +116,47 @@ class UserDiscoveryService(UserDiscoveryCommitMixin, UserDiscoveryQueryMixin):
             if not fact.is_empty()
         )
         state = self._refresh_phase(self.store.load(), now=effective_now)
-        try:
-            if normalized_action == "status":
-                self.store.save(state)
-                return self._build_status_result(state, topic_id=normalized_topic_id, now=effective_now)
-            if normalized_action == "start_or_resume":
-                return self._start_or_resume(state, now=effective_now, topic_id=normalized_topic_id)
-            if normalized_action == "pause_session":
-                return self._pause_session(state, now=effective_now)
-            if normalized_action == "snooze":
-                return self._snooze(state, now=effective_now, snooze_days=snooze_days)
-            if normalized_action == "skip_topic":
-                return self._skip_topic(state, now=effective_now, topic_id=normalized_topic_id)
-            if normalized_action == "answer":
-                return self._record_answer(
-                    state,
-                    now=effective_now,
-                    topic_id=normalized_topic_id,
-                    memory_routes=normalized_routes,
-                    topic_complete=_normalize_bool(topic_complete),
-                    permission_granted=permission_granted,
-                    callbacks=callbacks,
-                )
-            if normalized_action == "review_profile":
-                return self._review_profile(state, now=effective_now, topic_id=normalized_topic_id)
-            if normalized_action == "delete_fact":
-                if normalized_fact_id is None:
-                    raise ValueError("delete_fact requires a fact_id.")
-                return self._delete_fact(state, now=effective_now, fact_id=normalized_fact_id, callbacks=callbacks)
-            if normalized_action == "replace_fact":
-                if normalized_fact_id is None:
-                    raise ValueError("replace_fact requires a fact_id.")
-                return self._replace_fact(
-                    state,
-                    now=effective_now,
-                    fact_id=normalized_fact_id,
-                    replacement_routes=normalized_routes,
-                    callbacks=callbacks,
-                )
-            raise ValueError(f"Unsupported user discovery action: {action!r}")
-        finally:
-            self._authoritative_coverage_cache = None
+        if normalized_action == "status":
+            self.store.save(state)
+            return self._build_status_result(state, topic_id=normalized_topic_id, now=effective_now)
+        if normalized_action == "start_or_resume":
+            return self._start_or_resume(state, now=effective_now, topic_id=normalized_topic_id)
+        if normalized_action == "pause_session":
+            return self._pause_session(state, now=effective_now)
+        if normalized_action == "snooze":
+            return self._snooze(state, now=effective_now, snooze_days=snooze_days)
+        if normalized_action == "skip_topic":
+            return self._skip_topic(state, now=effective_now, topic_id=normalized_topic_id)
+        if normalized_action == "answer":
+            self._invalidate_authoritative_coverage_cache()
+            return self._record_answer(
+                state,
+                now=effective_now,
+                topic_id=normalized_topic_id,
+                memory_routes=normalized_routes,
+                topic_complete=_normalize_bool(topic_complete),
+                permission_granted=permission_granted,
+                callbacks=callbacks,
+            )
+        if normalized_action == "review_profile":
+            return self._review_profile(state, now=effective_now, topic_id=normalized_topic_id)
+        if normalized_action == "delete_fact":
+            if normalized_fact_id is None:
+                raise ValueError("delete_fact requires a fact_id.")
+            self._invalidate_authoritative_coverage_cache()
+            return self._delete_fact(state, now=effective_now, fact_id=normalized_fact_id, callbacks=callbacks)
+        if normalized_action == "replace_fact":
+            if normalized_fact_id is None:
+                raise ValueError("replace_fact requires a fact_id.")
+            self._invalidate_authoritative_coverage_cache()
+            return self._replace_fact(
+                state,
+                now=effective_now,
+                fact_id=normalized_fact_id,
+                replacement_routes=normalized_routes,
+                callbacks=callbacks,
+            )
+        raise ValueError(f"Unsupported user discovery action: {action!r}")
 
     def _start_or_resume(
         self,

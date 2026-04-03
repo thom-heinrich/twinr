@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from typing import Any, cast
 
+from twinr.agent.tools import realtime_tool_names
 from test.pi_tool_matrix_catalog import (
     available_matrix_groups,
     merge_tool_matrix_results,
@@ -20,6 +21,16 @@ def test_normalize_matrix_groups_defaults_and_deduplicates() -> None:
 def test_normalize_matrix_groups_rejects_unknown_names() -> None:
     with pytest.raises(ValueError, match="unknown matrix group"):
         normalize_matrix_groups(("core", "missing"))
+
+
+def test_matrix_groups_cover_the_current_runtime_tool_surface() -> None:
+    covered = {
+        tool_name
+        for tool_names in cast(dict[str, tuple[str, ...]], __import__("test.pi_tool_matrix_catalog").pi_tool_matrix_catalog.MATRIX_GROUP_TOOL_NAMES).values()
+        for tool_name in tool_names
+    }
+
+    assert covered == set(realtime_tool_names())
 
 
 def test_merge_tool_matrix_results_prefers_fail_over_pass_and_na() -> None:

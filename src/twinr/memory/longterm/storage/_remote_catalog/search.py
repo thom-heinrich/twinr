@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 import time
 
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRetrieveRequest, ChonkyDBTopKRecordsRequest
+from twinr.memory.longterm.storage._remote_retry import (
+    remote_read_retry_delay_s,
+    should_retry_remote_read_error,
+)
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteReadContext,
     build_remote_read_failure_details,
@@ -21,6 +26,8 @@ from .shared import (
     _run_timed_workflow_step,
     _trace_search_details,
 )
+
+_FAST_TOPIC_TOPK_RETRY_ATTEMPTS_CAP = 2
 
 
 def _emit_query_plan_workflow_event(
@@ -60,6 +67,20 @@ def _emit_query_plan_workflow_event(
 
 
 class RemoteCatalogSearchMixin:
+    def _fast_topic_topk_retry_attempts(self) -> tuple[int, int]:
+        """Return the effective and configured retry budget for fast-topic reads.
+
+        Fast-topic current-scope reads are latency-sensitive, so they should
+        consume the same transient-error policy as other required remote reads
+        but stop after one reattempt of the authoritative scope endpoint.
+        """
+
+        configured_attempts = self._remote_retry_attempts()
+        return (
+            min(_FAST_TOPIC_TOPK_RETRY_ATTEMPTS_CAP, configured_attempts),
+            configured_attempts,
+        )
+
     def search_current_item_payloads(
         self,
         *,
@@ -454,6 +475,9 @@ class RemoteCatalogSearchMixin:
             )
         bounded_limit = max(1, int(limit))
         definition = self._require_definition(snapshot_kind)
+        fast_retry_attempts, configured_fast_retry_attempts = self._fast_topic_topk_retry_attempts()
+        fast_retry_backoff_s = self._remote_retry_backoff_s() if fast_retry_attempts > 1 else 0.0
+        fast_retry_mode = "bounded_transient_retry" if fast_retry_attempts > 1 else "single_attempt_configured"
         fast_read_context = LongTermRemoteReadContext(
             snapshot_kind=snapshot_kind,
             operation="fast_topic_topk_search",
@@ -468,10 +492,10 @@ class RemoteCatalogSearchMixin:
             scope_ref=scope_ref,
             namespace=namespace,
             attempt_index=1,
-            attempt_count=1,
-            retry_attempts_configured=1,
-            retry_backoff_s=0.0,
-            retry_mode="disabled_for_fast_topic_budget",
+            attempt_count=fast_retry_attempts,
+            retry_attempts_configured=configured_fast_retry_attempts,
+            retry_backoff_s=fast_retry_backoff_s,
+            retry_mode=fast_retry_mode,
         )
         started_monotonic = time.monotonic()
         try:
@@ -488,8 +512,8 @@ class RemoteCatalogSearchMixin:
                         catalog_entry_count=0,
                     ),
                     "timeout_s": None if timeout_s is None else round(max(0.0, float(timeout_s)), 3),
-                    "retry_attempts_configured": 1,
-                    "retry_mode": "disabled_for_fast_topic_budget",
+                    "retry_attempts_configured": configured_fast_retry_attempts,
+                    "retry_mode": fast_retry_mode,
                 },
                 operation=lambda: self._search_remote_candidates(
                     snapshot_kind=snapshot_kind,
@@ -503,6 +527,10 @@ class RemoteCatalogSearchMixin:
                     timeout_s=timeout_s,
                     remote_read_context=fast_read_context,
                     topk_failure_outcome="failed",
+                    topk_retry_attempts=fast_retry_attempts,
+                    topk_retry_attempts_configured=configured_fast_retry_attempts,
+                    topk_retry_backoff_s=fast_retry_backoff_s,
+                    allow_missing_current_head_empty=True,
                 ),
             )
         except Exception as exc:
@@ -789,6 +817,10 @@ class RemoteCatalogSearchMixin:
         timeout_s: float | None = None,
         remote_read_context: LongTermRemoteReadContext | None = None,
         topk_failure_outcome: str = "fallback",
+        topk_retry_attempts: int = 1,
+        topk_retry_attempts_configured: int | None = None,
+        topk_retry_backoff_s: float = 0.0,
+        allow_missing_current_head_empty: bool = False,
     ) -> tuple[Mapping[str, object], ...]:
         """Run remote search, preferring one-shot structured top-k responses."""
 
@@ -850,6 +882,12 @@ class RemoteCatalogSearchMixin:
         )
         last_topk_error: Exception | None = None
         allowed_indexes = self._selection_search_allowed_indexes()
+        resolved_topk_retry_attempts = max(1, int(topk_retry_attempts))
+        resolved_topk_retry_attempts_configured = max(
+            resolved_topk_retry_attempts,
+            int(topk_retry_attempts_configured or resolved_topk_retry_attempts),
+        )
+        resolved_topk_retry_backoff_s = max(0.0, float(topk_retry_backoff_s))
         topk_context = remote_read_context or LongTermRemoteReadContext(
             snapshot_kind=snapshot_kind,
             operation="topk_search",
@@ -863,69 +901,162 @@ class RemoteCatalogSearchMixin:
             timeout_s=timeout_s,
             scope_ref=scope_ref,
             namespace=namespace,
+            attempt_index=1,
+            attempt_count=resolved_topk_retry_attempts,
+            retry_attempts_configured=resolved_topk_retry_attempts_configured,
+            retry_backoff_s=resolved_topk_retry_backoff_s,
+            retry_mode="bounded_transient_retry" if resolved_topk_retry_attempts > 1 else "single_attempt",
         )
         if supports_topk_records and callable(topk_records):
-            started_monotonic = time.monotonic()
-            try:
-                response = _run_timed_workflow_step(
-                    name="longterm_remote_catalog_topk_request",
-                    kind="http",
-                    details=_trace_search_details(
+            last_topk_context = topk_context
+            for attempt_index in range(1, resolved_topk_retry_attempts + 1):
+                attempt_context = replace(
+                    topk_context,
+                    attempt_index=attempt_index,
+                    attempt_count=resolved_topk_retry_attempts,
+                    retry_attempts_configured=resolved_topk_retry_attempts_configured,
+                    retry_backoff_s=resolved_topk_retry_backoff_s,
+                )
+                started_monotonic = time.monotonic()
+                try:
+                    response = _run_timed_workflow_step(
+                        name="longterm_remote_catalog_topk_request",
+                        kind="http",
+                        details={
+                            **_trace_search_details(
+                                snapshot_kind=snapshot_kind,
+                                query_text=query_text,
+                                result_limit=result_limit,
+                                allowed_doc_count=len(allowed_doc_ids),
+                                scope_ref=scope_ref,
+                                namespace=namespace,
+                                catalog_entry_count=catalog_entry_count,
+                            ),
+                            "attempt_index": attempt_index,
+                            "attempt_count": resolved_topk_retry_attempts,
+                        },
+                        operation=lambda: topk_records(
+                            ChonkyDBTopKRecordsRequest(
+                                query_text=query_text,
+                                result_limit=result_limit,
+                                include_content=False,
+                                include_metadata=True,
+                                allowed_indexes=allowed_indexes,
+                                allowed_doc_ids=None if scope_search else allowed_doc_ids,
+                                namespace=resolved_namespace,
+                                scope_ref=resolved_scope_ref,
+                                timeout_seconds=timeout_s,
+                            )
+                        ),
+                    )
+                    _emit_query_plan_workflow_event(
                         snapshot_kind=snapshot_kind,
+                        operation=str(getattr(attempt_context, "operation", None) or "topk_search"),
+                        response=response,
                         query_text=query_text,
                         result_limit=result_limit,
                         allowed_doc_count=len(allowed_doc_ids),
                         scope_ref=scope_ref,
                         namespace=namespace,
                         catalog_entry_count=catalog_entry_count,
-                    ),
-                    operation=lambda: topk_records(
-                        ChonkyDBTopKRecordsRequest(
-                            query_text=query_text,
-                            result_limit=result_limit,
-                            include_content=False,
-                            include_metadata=True,
-                            allowed_indexes=allowed_indexes,
-                            allowed_doc_ids=None if scope_search else allowed_doc_ids,
-                            namespace=resolved_namespace,
-                            scope_ref=resolved_scope_ref,
-                            timeout_seconds=timeout_s,
+                    )
+                    record_remote_read_observation(
+                        remote_state=remote_state,
+                        context=attempt_context,
+                        latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                        outcome="ok",
+                        classification="ok",
+                    )
+                    return tuple(self._iter_retrieve_result_candidates(response))
+                except Exception as exc:
+                    failure_mode = (
+                        self._scope_search_failure_mode(snapshot_kind=snapshot_kind, exc=exc)
+                        if scope_search
+                        else "other"
+                    )
+                    if failure_mode == "missing_current_head" and allow_missing_current_head_empty:
+                        self._clear_unsupported_scope_search(snapshot_kind=snapshot_kind)
+                        record_remote_read_observation(
+                            remote_state=remote_state,
+                            context=attempt_context,
+                            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                            outcome="missing",
+                            classification="not_found",
                         )
-                    ),
-                )
-                _emit_query_plan_workflow_event(
-                    snapshot_kind=snapshot_kind,
-                    operation=str(getattr(topk_context, "operation", None) or "topk_search"),
-                    response=response,
-                    query_text=query_text,
-                    result_limit=result_limit,
-                    allowed_doc_count=len(allowed_doc_ids),
-                    scope_ref=scope_ref,
-                    namespace=namespace,
-                    catalog_entry_count=catalog_entry_count,
-                )
-                record_remote_read_observation(
-                    remote_state=remote_state,
-                    context=topk_context,
-                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
-                    outcome="ok",
-                    classification="ok",
-                )
-                return tuple(self._iter_retrieve_result_candidates(response))
-            except Exception as exc:
-                if scope_search and self._should_disable_scope_search_from_exception(exc):
-                    self._remember_unsupported_scope_search(snapshot_kind=snapshot_kind)
-                last_topk_error = exc
-                record_remote_read_diagnostic(
-                    remote_state=remote_state,
-                    context=topk_context,
-                    exc=exc,
-                    started_monotonic=started_monotonic,
-                    outcome=topk_failure_outcome,
-                )
+                        workflow_event(
+                            kind="branch",
+                            msg="longterm_remote_catalog_scope_search_missing_current_head",
+                            details=_trace_search_details(
+                                snapshot_kind=snapshot_kind,
+                                query_text=query_text,
+                                result_limit=result_limit,
+                                allowed_doc_count=len(allowed_doc_ids),
+                                scope_ref=scope_ref,
+                                namespace=namespace,
+                                catalog_entry_count=catalog_entry_count,
+                            ),
+                        )
+                        return ()
+                    retryable = should_retry_remote_read_error(exc)
+                    if retryable and attempt_index < resolved_topk_retry_attempts:
+                        delay_s = remote_read_retry_delay_s(
+                            exc,
+                            default_backoff_s=resolved_topk_retry_backoff_s,
+                            attempt_index=attempt_index - 1,
+                        )
+                        workflow_event(
+                            kind="retrieval",
+                            msg="longterm_remote_catalog_topk_retry",
+                            details={
+                                **_trace_search_details(
+                                    snapshot_kind=snapshot_kind,
+                                    query_text=query_text,
+                                    result_limit=result_limit,
+                                    allowed_doc_count=len(allowed_doc_ids),
+                                    scope_ref=scope_ref,
+                                    namespace=namespace,
+                                    catalog_entry_count=catalog_entry_count,
+                                ),
+                                "operation": str(getattr(attempt_context, "operation", None) or "topk_search"),
+                                "attempt_index": attempt_index,
+                                "attempt_count": resolved_topk_retry_attempts,
+                                "retry_delay_s": delay_s,
+                                "status_code": self._status_code_from_exception(exc),
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                        if delay_s > 0.0:
+                            time.sleep(delay_s)
+                        continue
+                    if failure_mode == "unsupported_scope_search":
+                        self._remember_unsupported_scope_search(snapshot_kind=snapshot_kind)
+                    last_topk_error = exc
+                    last_topk_context = attempt_context
+                    record_remote_read_diagnostic(
+                        remote_state=remote_state,
+                        context=attempt_context,
+                        exc=exc,
+                        started_monotonic=started_monotonic,
+                        outcome=topk_failure_outcome,
+                    )
+                    break
 
         if not retrieve_fallback_allowed:
             if last_topk_error is not None:
+                if (
+                    remote_read_context is not None
+                    and str(getattr(remote_read_context, "operation", "") or "") == "fast_topic_topk_search"
+                ):
+                    raise LongTermRemoteReadFailedError(
+                        "Required remote long-term fast-topic retrieval failed.",
+                        details=build_remote_read_failure_details(
+                            remote_state=remote_state,
+                            context=last_topk_context,
+                            exc=last_topk_error,
+                            started_monotonic=time.monotonic(),
+                            outcome=topk_failure_outcome,
+                        ),
+                    ) from last_topk_error
                 raise last_topk_error
             raise ChonkyDBError(
                 "ChonkyDB topk_records is required for current-scope remote retrieval",

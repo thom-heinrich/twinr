@@ -33,6 +33,7 @@ _GRAPH_EDGE_SNAPSHOT_KIND = "graph_edges"
 _MIN_GRAPH_STORE_TIMEOUT_S = 10
 _MAX_GRAPH_QUERY_RETRY_ATTEMPTS = 2
 _MAX_GRAPH_QUERY_RETRY_BACKOFF_S = 0.25
+_READINESS_CURRENT_HEAD_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,73 @@ def _edge_item_id_from_payload(payload: Mapping[str, object]) -> str | None:
     if not source or not edge_type or not target:
         return None
     return f"{source}|{edge_type}|{target}"
+
+
+def _parse_json_mapping(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _iter_direct_graph_head_candidates(
+    payload: Mapping[str, object],
+    *,
+    _seen: set[int] | None = None,
+):
+    """Yield payload/body/content candidates without trusting metadata shadows.
+
+    Graph current-head repair must look at the advertised fixed-URI head
+    document itself. Metadata-carried ``twinr_payload`` shadows can preserve a
+    stale complete head behind an already generic/incomplete direct
+    ``catalog/current`` record and would therefore suppress the repair path we
+    need when the compatible snapshot head is also missing.
+    """
+
+    seen = _seen if _seen is not None else set()
+    payload_id = id(payload)
+    if payload_id in seen:
+        return
+    seen.add(payload_id)
+    yield payload
+    for field_name in ("body", "payload", "record", "document"):
+        nested = payload.get(field_name)
+        if isinstance(nested, Mapping):
+            yield from _iter_direct_graph_head_candidates(nested, _seen=seen)
+    parsed_content = _parse_json_mapping(payload.get("content"))
+    if isinstance(parsed_content, Mapping):
+        yield from _iter_direct_graph_head_candidates(parsed_content, _seen=seen)
+    chunks = payload.get("chunks")
+    if isinstance(chunks, list):
+        for chunk in chunks:
+            if isinstance(chunk, Mapping):
+                yield from _iter_direct_graph_head_candidates(chunk, _seen=seen)
+
+
+def _looks_like_graph_catalog_payload(
+    *,
+    snapshot_kind: str,
+    payload: Mapping[str, object],
+    catalog: object,
+) -> bool:
+    definition_getter = getattr(catalog, "_definition", None)
+    if not callable(definition_getter):
+        return False
+    definition = definition_getter(snapshot_kind)
+    if definition is None:
+        return False
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return False
+    try:
+        version = int(payload.get("version"))
+        int(payload.get("items_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return payload.get("schema") == definition.catalog_schema and version == 3
 
 
 def _node_content(node_payload: Mapping[str, object]) -> str:
@@ -238,6 +306,7 @@ class TwinrRemoteGraphState:
             item_id_getter=lambda payload: payload.get("id"),
             metadata_builder=lambda payload, document=document: _node_metadata(document, payload),
             content_builder=_node_content,
+            skip_async_document_id_wait=True,
         )
         node_head.update(
             {
@@ -250,7 +319,11 @@ class TwinrRemoteGraphState:
                 "topology_refs": topology_refs,
             }
         )
-        self._catalog.persist_catalog_payload(snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND, payload=node_head)
+        self._catalog.persist_catalog_payload(
+            snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
+            payload=node_head,
+            skip_async_document_id_wait=True,
+        )
 
         edge_head = self._catalog.build_catalog_payload(
             snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND,
@@ -258,6 +331,7 @@ class TwinrRemoteGraphState:
             item_id_getter=_edge_item_id_from_payload,
             metadata_builder=lambda payload, document=document: _edge_metadata(document, payload),
             content_builder=_edge_content,
+            skip_async_document_id_wait=True,
         )
         edge_head.update(
             {
@@ -269,7 +343,11 @@ class TwinrRemoteGraphState:
                 "topology_index_name": index_name,
             }
         )
-        self._catalog.persist_catalog_payload(snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND, payload=edge_head)
+        self._catalog.persist_catalog_payload(
+            snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND,
+            payload=edge_head,
+            skip_async_document_id_wait=True,
+        )
         return dict(node_head)
 
     def load_document(self) -> TwinrGraphDocumentV1 | None:
@@ -1404,8 +1482,20 @@ class TwinrRemoteGraphState:
         if use_probe:
             if readiness_mode:
                 return self._probe_direct_current_head_payload_read_only(snapshot_kind=snapshot_kind)
+            strict_payload = self._fetch_strict_direct_current_head_payload(
+                snapshot_kind=snapshot_kind,
+                metadata_only=True,
+            )
+            if isinstance(strict_payload, Mapping):
+                return dict(strict_payload)
             payload = self._catalog.probe_catalog_payload(snapshot_kind=snapshot_kind)
             return dict(payload) if isinstance(payload, Mapping) else None
+        strict_payload = self._fetch_strict_direct_current_head_payload(
+            snapshot_kind=snapshot_kind,
+            metadata_only=False,
+        )
+        if isinstance(strict_payload, Mapping):
+            return dict(strict_payload)
         load_head_payload = getattr(self._catalog, "_load_catalog_head_payload", None)
         if callable(load_head_payload):
             payload = load_head_payload(snapshot_kind=snapshot_kind, metadata_only=False)
@@ -1413,12 +1503,91 @@ class TwinrRemoteGraphState:
         payload = self._catalog.load_catalog_payload(snapshot_kind=snapshot_kind)
         return dict(payload) if isinstance(payload, Mapping) else None
 
+    def _fetch_strict_direct_current_head_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        metadata_only: bool,
+    ) -> dict[str, object] | None:
+        """Read one graph current-head envelope and ignore metadata-only shadows.
+
+        The fixed-URI `graph_nodes` / `graph_edges` heads must describe the
+        current generation in their own payload/body/content. Accepting only a
+        hidden `metadata.twinr_payload` would let a broken direct head masquerade
+        as healthy and prevent `ensure_remote_snapshot()` from repairing the
+        advertised current view from a valid local graph cache.
+        """
+
+        remote_state = self.remote_state
+        if remote_state is None:
+            return None
+        require_client = getattr(self._catalog, "_require_client", None)
+        fetch_catalog_head_envelope = getattr(self._catalog, "_fetch_catalog_head_envelope", None)
+        if not callable(require_client) or not callable(fetch_catalog_head_envelope):
+            return None
+        read_client = require_client(getattr(remote_state, "read_client", None), operation="read")
+        effective_read_client = read_client
+        if not metadata_only:
+            catalog_head_read_client = getattr(self._catalog, "_catalog_head_read_client", None)
+            if callable(catalog_head_read_client):
+                try:
+                    effective_read_client = catalog_head_read_client(read_client=read_client)
+                except Exception:
+                    effective_read_client = read_client
+        try:
+            envelope = fetch_catalog_head_envelope(
+                read_client=effective_read_client,
+                snapshot_kind=snapshot_kind,
+                metadata_only=metadata_only,
+            )
+        except Exception:
+            return None
+        return self._strict_catalog_payload_from_direct_head_envelope(
+            snapshot_kind=snapshot_kind,
+            envelope=envelope,
+        )
+
+    def _strict_catalog_payload_from_direct_head_envelope(
+        self,
+        *,
+        snapshot_kind: str,
+        envelope: object,
+    ) -> dict[str, object] | None:
+        if not isinstance(envelope, Mapping):
+            return None
+        is_catalog_payload = getattr(self._catalog, "is_catalog_payload", None)
+        if not callable(is_catalog_payload):
+            extract_catalog_payload = getattr(self._catalog, "_extract_catalog_payload_from_document", None)
+            if callable(extract_catalog_payload):
+                payload = extract_catalog_payload(snapshot_kind=snapshot_kind, payload=envelope)
+                return dict(payload) if isinstance(payload, Mapping) else None
+            return None
+        for candidate in _iter_direct_graph_head_candidates(envelope):
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate_dict = dict(candidate)
+            if is_catalog_payload(snapshot_kind=snapshot_kind, payload=candidate_dict) or _looks_like_graph_catalog_payload(
+                snapshot_kind=snapshot_kind,
+                payload=candidate_dict,
+                catalog=self._catalog,
+            ):
+                return candidate_dict
+        return None
+
     def _probe_direct_current_head_payload_read_only(
         self,
         *,
         snapshot_kind: str,
     ) -> dict[str, object] | None:
-        """Probe one graph current head without upgrading 400s into full reads."""
+        """Probe one graph current head with a strict readiness-only timeout cap.
+
+        Readiness must fail closed quickly. The generic catalog-head helper
+        inflates fixed-URI reads to the cold bootstrap/origin-resolution
+        timeout, which is appropriate for foreground recovery but too slow for
+        the read-only readiness contract and can keep shutdown drains pinned on
+        already unhealthy remote memory. Read this head with the normal
+        fail-closed client and cap it to a small probe budget instead.
+        """
 
         remote_state = self.remote_state
         if remote_state is None:
@@ -1428,9 +1597,12 @@ class TwinrRemoteGraphState:
         if not callable(require_client):
             return None
         effective_read_client = require_client(read_client, operation="read")
-        catalog_head_read_client = getattr(self._catalog, "_catalog_head_read_client", None)
-        if callable(catalog_head_read_client):
-            effective_read_client = catalog_head_read_client(read_client=effective_read_client)
+        from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
+
+        effective_read_client = clone_client_with_capped_timeout(
+            effective_read_client,
+            timeout_s=_READINESS_CURRENT_HEAD_TIMEOUT_S,
+        )
         try:
             envelope = effective_read_client.fetch_full_document(
                 origin_uri=self._catalog._catalog_head_uri(snapshot_kind=snapshot_kind),
@@ -1441,10 +1613,10 @@ class TwinrRemoteGraphState:
             if int(exc.status_code or 0) == 400:
                 return None
             raise
-        extract_catalog_payload = getattr(self._catalog, "_extract_catalog_payload_from_document", None)
-        if not callable(extract_catalog_payload):
-            return None
-        payload = extract_catalog_payload(snapshot_kind=snapshot_kind, payload=envelope)
+        payload = self._strict_catalog_payload_from_direct_head_envelope(
+            snapshot_kind=snapshot_kind,
+            envelope=envelope,
+        )
         return dict(payload) if isinstance(payload, Mapping) else None
 
     def _probe_compatible_snapshot_head_payload(self, *, snapshot_kind: str) -> dict[str, object] | None:

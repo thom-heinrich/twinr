@@ -21,6 +21,7 @@ from contextlib import suppress
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
+from twinr.memory.longterm.core.cooperative_abort import LongTermOperationCancelledError
 from twinr.memory.longterm.core.models import LongTermMidtermPacketV1, LongTermReflectionResultV1
 from twinr.memory.longterm.reasoning.turn_continuity import turn_continuity_recall_hints
 from twinr.memory.longterm.storage._remote_midterm import LongTermRemoteMidtermState
@@ -303,7 +304,7 @@ class LongTermMidtermStore:
         )
         if local_packets:
             return self._remote_midterm.ensure_seeded(packets=local_packets)
-        current_head = self._remote_midterm.current_head_payload()
+        current_head = self._remote_midterm.probe_current_head()
         if isinstance(current_head, Mapping):
             return False
         return False
@@ -373,6 +374,8 @@ class LongTermMidtermStore:
                 try:
                     # AUDIT-FIX(#2): The remote midterm authority now lives in typed packet records plus a fixed current head.
                     self._remote_midterm.save_packets(packets=packets)
+                except LongTermOperationCancelledError:
+                    raise
                 except LongTermRemoteUnavailableError:
                     if self.remote_state.required:
                         raise
@@ -569,8 +572,18 @@ class LongTermMidtermStore:
             except Exception:
                 LOGGER.warning("Remote midterm packet selection failed; falling back to hydrated packet ordering", exc_info=True)
             else:
-                if remote_selected or not clean_query:
+                if not clean_query:
                     return remote_selected
+                if remote_selected:
+                    filtered_remote = tuple(
+                        self._filter_query_relevant_packets(
+                            clean_query,
+                            selected=list(remote_selected),
+                            limit=normalized_limit,
+                        )
+                    )
+                    if filtered_remote:
+                        return filtered_remote
 
         packets = self.load_packets()
         if not packets:

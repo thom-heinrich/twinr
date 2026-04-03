@@ -236,11 +236,23 @@ class WorldIntelligenceTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema"],
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["schema_version"],
+            2,
+        )
+        self.assertEqual(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["item_count"],
+            1,
+        )
+        self.assertEqual(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["items"][0]["subscription_id"],
+            "feed:hamburg_local",
+        )
+        self.assertEqual(
+            store.probe_remote_current_subscriptions(config=config, remote_state=remote_state)["schema"],
             "twinr_world_intelligence_subscription_catalog_v3",
         )
         self.assertEqual(
-            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]["schema"],
+            store.probe_remote_current_state(config=config, remote_state=remote_state)["schema"],
             "twinr_world_intelligence_state_catalog_v3",
         )
         self.assertEqual(loaded_subscriptions[0].label, "Hamburg local politics")
@@ -255,6 +267,47 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(loaded_state.interest_signals[0].co_attention_state, "forming")
         self.assertAlmostEqual(loaded_state.interest_signals[0].co_attention_score, 0.66)
         self.assertEqual(loaded_state.interest_signals[0].co_attention_count, 1)
+
+    def test_store_falls_back_to_saved_subscription_snapshot_when_fresh_current_head_hydration_is_incomplete(self) -> None:
+        remote_state = _FakeRemoteState()
+        store = RemoteStateWorldIntelligenceStore()
+        config = TwinrConfig(project_root=".")
+        subscription = WorldFeedSubscription(
+            subscription_id="feed:hamburg_local",
+            label="Hamburg local politics",
+            feed_url="https://example.com/hamburg/rss.xml",
+            scope="local",
+            region="Hamburg",
+            topics=("local politics", "transit"),
+            priority=0.84,
+            refresh_interval_hours=72,
+            created_by="installer",
+            created_at="2026-03-20T08:00:00+00:00",
+        )
+        store.save_subscriptions(
+            config=config,
+            subscriptions=(subscription,),
+            remote_state=remote_state,
+        )
+        item_uri = next(
+            uri
+            for uri in remote_state.client.records_by_uri
+            if "/catalog/" not in uri
+        )
+        item_record = remote_state.client.records_by_uri.pop(item_uri)
+        remote_state.client.records_by_document_id.pop(item_record["document_id"], None)
+
+        loaded = store.load_subscriptions(
+            config=config,
+            remote_state=remote_state,
+        )
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].subscription_id, subscription.subscription_id)
+        self.assertEqual(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND]["items"][0]["subscription_id"],
+            subscription.subscription_id,
+        )
 
     def test_legacy_interest_signals_backfill_engagement_defaults(self) -> None:
         state = WorldIntelligenceState.from_payload(

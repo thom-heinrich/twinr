@@ -14,13 +14,35 @@ from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, Thread, current_thread
 import logging
 import math
+import sys
 import time
+import traceback
 
 from twinr.memory.longterm.core.models import LongTermConversationTurn, LongTermEnqueueResult, LongTermMultimodalEvidence
+from twinr.memory.longterm.core.cooperative_abort import (
+    LongTermOperationCancelledError,
+    longterm_operation_abort_scope,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 TLongTermItem = TypeVar("TLongTermItem")
+
+
+def _thread_stack_summary(thread: Thread, *, frame_limit: int = 12) -> str | None:
+    """Return a bounded formatted stack for one live worker thread."""
+
+    ident = getattr(thread, "ident", None)
+    if ident is None:
+        return None
+    current_frames = getattr(sys, "_current_frames", None)
+    if not callable(current_frames):
+        return None
+    frame = current_frames().get(ident)
+    if frame is None:
+        return None
+    rendered = "".join(traceback.format_stack(frame, limit=max(1, int(frame_limit)))).strip()
+    return rendered or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,23 +262,30 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
             LOGGER.error("%s shutdown() called from its own worker thread; stop requested without join", self._worker.name)
             return
 
-        self.flush(timeout_s=timeout_s)
-        join_timeout_s = max(timeout_s, 0.1)
+        deadline = shutdown_started_at + timeout_s
+        self.flush(timeout_s=max(0.0, deadline - time.monotonic()))
+        join_timeout_s = max(0.0, deadline - time.monotonic())
         self._worker.join(timeout=join_timeout_s)
         if self._worker.is_alive():
             # AUDIT-FIX(#8): Expose stalled shutdown so the service can fail closed instead of
             # pretending persistence drained cleanly.
+            state = self.snapshot_state()
+            stack_summary = _thread_stack_summary(self._worker)
             with self._drain_condition:
                 if self._last_error_message is None:
                     self._last_error_message = "background writer did not stop within shutdown timeout"
                 self._drain_condition.notify_all()
             elapsed_s = time.monotonic() - shutdown_started_at
             LOGGER.error(
-                "%s did not stop within %.2fs (elapsed %.2fs)",
+                "%s did not stop within %.2fs (elapsed %.2fs, pending=%d, inflight=%d)",
                 self._worker.name,
-                join_timeout_s,
+                timeout_s,
                 elapsed_s,
+                state.pending_count,
+                state.inflight_count,
             )
+            if stack_summary:
+                LOGGER.error("%s stall stack:\n%s", self._worker.name, stack_summary)
 
     def _run(self) -> None:
         """Consume queued items until shutdown is requested and drained."""
@@ -274,9 +303,19 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
                 with self._drain_condition:
                     self._inflight += 1
                 try:
-                    self._write_callback(item)
+                    with longterm_operation_abort_scope(
+                        should_abort=self._stop_event.is_set,
+                        wait_for_abort=self._stop_event.wait,
+                        label=self._worker.name,
+                    ):
+                        self._write_callback(item)
                     with self._drain_condition:
                         self._last_error_message = None
+                except LongTermOperationCancelledError as exc:
+                    with self._drain_condition:
+                        self._dropped_count += 1
+                        self._last_error_message = f"{type(exc).__name__}: {exc}"
+                    LOGGER.warning("%s aborted an in-flight long-term item during shutdown", self._worker.name)
                 except Exception as exc:
                     # AUDIT-FIX(#5): Count permanently failed writes as dropped data, keep the
                     # error latched, and emit a structured log without leaking the item payload.

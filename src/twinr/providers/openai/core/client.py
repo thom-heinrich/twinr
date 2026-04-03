@@ -63,6 +63,8 @@ _WS_BASE_URL_SCHEMES = frozenset({"ws", "wss"})
 
 _CLIENT_CACHE: dict["_ClientSettings", Any] = {}
 _CLIENT_CACHE_LOCK = Lock()
+_CACHED_HTTP_CLIENT_IDS: set[int] = set()
+_BORROWED_HTTP_CLIENT_ATTR = "_twinr_borrowed_http_client"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,9 @@ def _default_client_factory(config: TwinrConfig) -> Any:
             return cached_client
 
         client = _create_openai_client(settings)
+        http_client = _extract_http_client(client)
+        if http_client is not None:
+            _CACHED_HTTP_CLIENT_IDS.add(id(http_client))
         _CLIENT_CACHE[settings] = client
         return client
 
@@ -115,11 +120,69 @@ def close_cached_openai_clients() -> None:
     with _CLIENT_CACHE_LOCK:
         clients = list(_CLIENT_CACHE.values())
         _CLIENT_CACHE.clear()
+        for client in clients:
+            http_client = _extract_http_client(client)
+            if http_client is not None:
+                _CACHED_HTTP_CLIENT_IDS.discard(id(http_client))
 
     for client in clients:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+        close_openai_client(client, allow_cached_transport=True)
+
+
+def openai_client_with_options(client: Any, *, timeout_s: float, max_retries: int) -> Any:
+    """Return an option-adjusted client while preserving shared-transport ownership."""
+
+    with_options = getattr(client, "with_options", None)
+    if not callable(with_options):
+        return client
+    try:
+        configured = with_options(timeout=timeout_s, max_retries=max_retries)
+    except TypeError:
+        try:
+            configured = with_options(timeout=timeout_s)
+        except TypeError:
+            return client
+
+    if configured is client:
+        return client
+
+    base_http_client = _extract_http_client(client)
+    configured_http_client = _extract_http_client(configured)
+    if base_http_client is not None and base_http_client is configured_http_client:
+        try:
+            setattr(configured, _BORROWED_HTTP_CLIENT_ATTR, True)
+        except Exception:
+            pass
+    return configured
+
+
+def close_openai_client(client: Any, *, allow_cached_transport: bool = False) -> bool:
+    """Close one OpenAI client when Twinr owns its underlying HTTP transport."""
+
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return False
+
+    if getattr(client, _BORROWED_HTTP_CLIENT_ATTR, False):
+        try:
+            setattr(client, _BORROWED_HTTP_CLIENT_ATTR, False)
+        except Exception:
+            pass
+        return False
+
+    with _CLIENT_CACHE_LOCK:
+        http_client = _extract_http_client(client)
+        if http_client is not None and id(http_client) in _CACHED_HTTP_CLIENT_IDS and not allow_cached_transport:
+            return False
+
+    close()
+    return True
+
+
+def _extract_http_client(client: Any) -> Any | None:
+    """Return the underlying HTTP client used by one OpenAI SDK wrapper."""
+
+    return getattr(client, "_client", None)
 
 
 def _create_openai_client(settings: _ClientSettings) -> Any:

@@ -106,6 +106,14 @@ def _query_match_terms(query_terms: set[str]) -> set[str]:
 def _has_query_overlap(*, query_terms: set[str], document_terms: set[str]) -> bool:
     """Return whether document terms overlap one query through exact or compound matches."""
 
+    exact_query_terms = {term for term in query_terms if isinstance(term, str) and term}
+    exact_document_terms = {
+        term for term in document_terms if isinstance(term, str) and term
+    }
+    # Keep exact overlap on shorter domain words such as "tea" or "sms" before
+    # the broader informative-term filter drops them as too short.
+    if exact_query_terms.intersection(exact_document_terms):
+        return True
     informative_query_terms = _query_match_terms(query_terms)
     informative_document_terms = _query_match_terms(document_terms)
     if not informative_query_terms or not informative_document_terms:
@@ -309,13 +317,34 @@ class TwinrPersonalGraphStore:
             return False
         with self._document_lock():
             document = self._load_local_document_locked()
+            current_view_probe = getattr(self._remote_graph, "probe_current_view_for_readiness", None)
             if document is None:
-                current_view = self._remote_graph.current_view_summary()
+                try:
+                    current_view = (
+                        current_view_probe()
+                        if callable(current_view_probe)
+                        else self._remote_graph.current_view_summary()
+                    )
+                except Exception as exc:
+                    if isinstance(exc, _remote_unavailable_error_type()) or _is_remote_not_found_error(exc):
+                        current_view = None
+                    else:
+                        raise
                 if isinstance(current_view, Mapping):
                     self._remote_graph.validate_current_view()
                 return False
             if self._document_is_effectively_empty(document):
-                current_view = self._remote_graph.current_view_summary()
+                try:
+                    current_view = (
+                        current_view_probe()
+                        if callable(current_view_probe)
+                        else self._remote_graph.current_view_summary()
+                    )
+                except Exception as exc:
+                    if isinstance(exc, _remote_unavailable_error_type()) or _is_remote_not_found_error(exc):
+                        current_view = None
+                    else:
+                        raise
                 if isinstance(current_view, Mapping):
                     self._remote_graph.validate_current_view()
                     return False
@@ -1150,7 +1179,7 @@ class TwinrPersonalGraphStore:
                 selected.append(items[index])
                 seen_indices.add(index)
         if fallback_limit <= 0:
-            query_terms = _query_match_terms(set(_tokenize(clean_query)))
+            query_terms = set(_tokenize(clean_query))
             filtered = [
                 item
                 for item in selected
@@ -1472,6 +1501,7 @@ class TwinrPersonalGraphStore:
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
+            exact_identity = bool(exact_contact_match or requested_contact_label or family_name)
             if requested_contact_label and requested_contact_label not in normalized_labels:
                 continue
             if family_name:
@@ -1494,7 +1524,7 @@ class TwinrPersonalGraphStore:
             if family_tokens and family_tokens <= label_tokens:
                 score += 3
             role_detail = (self._contact_role(document, node.node_id) or "").lower()
-            if requested_role and requested_role not in role_detail and not exact_contact_match and role_detail:
+            if requested_role and requested_role not in role_detail and not exact_identity and role_detail:
                 # AUDIT-FIX(#4): A requested role is a disambiguator, not a soft preference.
                 continue
             if requested_role:
@@ -1529,6 +1559,7 @@ class TwinrPersonalGraphStore:
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
+            exact_identity = bool(exact_contact_match or requested_contact_label or family_name)
             if requested_contact_label:
                 normalized_labels = {
                     label.lower()
@@ -1547,7 +1578,7 @@ class TwinrPersonalGraphStore:
                     or (family_tokens and family_tokens <= label_tokens)
                 ):
                     return None
-            if role and option.role and role.lower() not in option.role.lower():
+            if role and option.role and role.lower() not in option.role.lower() and not exact_identity:
                 return None
             if (phone and option.phones and phone not in option.phones) or (
                 email and option.emails and email not in option.emails

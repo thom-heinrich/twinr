@@ -10,11 +10,16 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, unified 
 - execution of live midterm write/read/usage attestations against the real OpenAI and ChonkyDB path in an isolated namespace, with remote proof taken from the authoritative midterm current head instead of a legacy snapshot blob
 - execution of live synthetic-memory acceptance matrices covering earlier memory, conflict resolution, restart persistence, and control-query containment against the real OpenAI and ChonkyDB path in an isolated namespace
 - seed live synthetic-memory acceptance fixtures through active-delta current-head writes instead of whole-state `write_snapshot(...)` rewrites, so the acceptance harness exercises the same bounded remote-write contract as the runtime paths it is attesting
-- execution of fixed unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources
-- execution of live writer/fresh-reader unified-retrieval acceptance against the real ChonkyDB path using the same fixed goldset cases as the local goldset runner
-- execution of a unified-retrieval benchmark over the same fixed goldset cases, reporting source-wise precision/recall, selected-id precision/recall, join-anchor quality, and path-safety metrics
+- synchronously materialize the strict live provider-answer front for subtext cases before the answer turn, so the eval measures the real live-provider contract instead of failing on a missing transcript-first prewarm side effect
+- keep live synthetic-memory acceptance focused on the low-latency memory surface by composing fast-topic hints, tool-safe durable context without graph fallback, and explicit conflict-queue rendering, so the proof does not trigger unrelated graph/world-state full-document reads while attesting memory recall
+- execution of profiled unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources, with a narrow `core` suite for live acceptance and an `expanded` KPI suite with 50 natural-language recall cases
+- execution of live writer/fresh-reader unified-retrieval acceptance against the real ChonkyDB path using the narrow `core` case profile by default
+- execution of a unified-retrieval benchmark over the broader `expanded` case profile by default, reporting source-wise precision/recall, selected-id precision/recall, join-anchor quality, and path-safety metrics
 - execution of a bounded live retention canary that seeds a fresh namespace, forbids broad object/snapshot hydration on the writer path, runs the real `run_retention()` flow, and proves the resulting current/archive heads from a fresh reader rooted at a separate runtime directory
 - execution of latency profiling runs that capture forensic workflow evidence for remote long-term retrieval bottlenecks, including fast pre-answer topic-hint reads, while bootstrapping required remote snapshot heads before the timed iterations when a fresh namespace has not yet been provisioned
+- isolate per-case writable runtime state inside each temporary subtext-eval workspace so graph/runtime locks cannot bleed onto the shared repo state during live evaluation
+- persist richer per-case subtext diagnostics, including query-profile variants, section previews, and seeded-term presence across subtext/durable/episodic/graph context, so answer-quality regressions can be separated from retrieval/bootstrap failures
+- summarize live subtext runs with explicit execution-failure vs judge-failure counts plus personalization-context/seed-grounding coverage, so a `0/x` score can be classified as backend/bootstrap breakage, retrieval miss, or real answer-use weakness instead of collapsing into one opaque number
 - structured result payloads and persisted artifact snapshots
 
 `evaluation` does **not** own:
@@ -28,10 +33,10 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, unified 
 |---|---|
 | `eval.py` | Synthetic recall eval |
 | `multimodal_eval.py` | Multimodal retrieval eval |
-| `_unified_retrieval_shared.py` | Shared fixed fixture, cases, and case-evaluation helpers for unified retrieval quality checks |
-| `unified_retrieval_goldset.py` | Deterministic unified-retrieval goldset runner against an isolated namespace |
-| `live_unified_retrieval_acceptance.py` | Live writer/fresh-reader acceptance for unified retrieval against real ChonkyDB |
-| `unified_retrieval_benchmark.py` | Precision/recall benchmark over the fixed unified-retrieval goldset |
+| `_unified_retrieval_shared.py` | Shared fixture, profiled case catalogs, and case-evaluation helpers for unified retrieval quality checks |
+| `unified_retrieval_goldset.py` | Deterministic unified-retrieval goldset runner against an isolated namespace, defaulting to the expanded KPI profile |
+| `live_unified_retrieval_acceptance.py` | Live writer/fresh-reader acceptance for unified retrieval against real ChonkyDB, defaulting to the narrow core profile |
+| `unified_retrieval_benchmark.py` | Precision/recall benchmark over the expanded unified-retrieval KPI profile |
 | `subtext_eval.py` | Live subtext eval |
 | `live_midterm_acceptance.py` | Live midterm memory E2E attestation runner |
 | `live_midterm_attest.py` | Artifact/result contract for the live midterm attestation |
@@ -80,19 +85,19 @@ PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptan
 Unified retrieval goldset command:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.unified_retrieval_goldset --env-file .env
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.unified_retrieval_goldset --env-file .env --case-profile expanded
 ```
 
 Unified retrieval live acceptance command:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.live_unified_retrieval_acceptance --env-file .env
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.live_unified_retrieval_acceptance --env-file .env --case-profile core
 ```
 
 Unified retrieval benchmark command:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.unified_retrieval_benchmark --env-file .env
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.unified_retrieval_benchmark --env-file .env --case-profile expanded
 ```
 
 Latency profiling command:
@@ -118,6 +123,10 @@ The unified benchmark persists the latest benchmark summary to
 under `artifacts/reports/unified_retrieval_benchmark/`. It is intended to make
 over-selection and join-quality regressions visible even when the pass/fail
 goldset still succeeds.
+
+The unified-retrieval profiles expose two operational tiers:
+- `core`: 3 high-signal cases for bounded live writer/fresh-reader acceptance.
+- `expanded`: 50 natural-language recall cases with per-memory-type coverage of at least 30 cases for adaptive, conflict, durable, episodic, graph, and midterm sources.
 
 The latency profiler persists a condensed summary to
 `artifacts/reports/longterm_latency_profile/<profile_id>/profile.json` and the

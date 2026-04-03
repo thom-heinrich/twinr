@@ -14,6 +14,7 @@ import time
 from typing import Iterator, Self
 
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError, chonkydb_data_path
+from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
 
 from .shared import (
     LongTermRemoteSnapshotProbe,
@@ -171,10 +172,15 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             )
         if self.read_client is None or self.write_client is None:
             return LongTermRemoteStatus(mode="remote_primary", ready=False, detail="ChonkyDB is not configured.")
+        probe_client = self._status_probe_client(self.read_client)
+        deadline = time.monotonic() + self._status_probe_timeout_s()
         try:
-            instance = self._status_probe_client(self.read_client).instance()
+            instance = probe_client.instance()
         except Exception as exc:
-            if self._status_probe_document_liveness():
+            if self._status_probe_document_liveness(
+                client=probe_client,
+                timeout_s=deadline - time.monotonic(),
+            ):
                 self._note_remote_success()
                 return LongTermRemoteStatus(mode="remote_primary", ready=True)
             self._note_remote_failure()
@@ -193,7 +199,12 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             )
         return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
-    def _status_probe_document_liveness(self) -> bool:
+    def _status_probe_document_liveness(
+        self,
+        *,
+        client: ChonkyDBClient | None = None,
+        timeout_s: float | None = None,
+    ) -> bool:
         """Return whether one bounded full-document probe proves the backend is live.
 
         The public ``/v1/external/instance`` route can occasionally stall while the
@@ -206,11 +217,24 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         prove the real Twinr snapshot namespace afterwards.
         """
 
-        if self.read_client is None:
-            return False
-        client = self._status_probe_client(self.read_client)
+        probe_client = client
+        if probe_client is None:
+            if self.read_client is None:
+                return False
+            probe_client = self._status_probe_client(self.read_client)
+        if timeout_s is not None:
+            try:
+                resolved_timeout_s = float(timeout_s)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(resolved_timeout_s) or resolved_timeout_s <= 0.0:
+                return False
+            probe_client = clone_client_with_capped_timeout(
+                probe_client,
+                timeout_s=resolved_timeout_s,
+            )
         try:
-            client.fetch_full_document(
+            probe_client.fetch_full_document(
                 document_id=_STATUS_PROBE_SENTINEL_DOCUMENT_ID,
                 include_content=False,
                 max_content_chars=1,

@@ -71,7 +71,7 @@ tools.
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend |
-| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that disables known conflicting shared-host system units plus user-session units, protects Twinr from non-Twinr workers pointed at `127.0.0.1:3044`, raises backend CPU/IO priority, and validates public `/instance` recovery without conflating it with stricter current-scope query readiness |
+| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that runtime-masks known conflicting shared-host system units plus user-session units, quiesces heavyweight non-Twinr workers such as `ollama-gpu.service`, `caia-ops-chonky-search-guardrail.service`, and CPU-hogging `caia-consumer-portal*.service` backends, bounded-kills proven stale user-session code-graph benchmark runners that bypass systemd unit control, raises backend CPU/IO priority, and validates the public empty-scope-safe current-scope query surface instead of a weaker `/instance` liveness-only check |
 | [remote_prompt_current_head_repair.py](./remote_prompt_current_head_repair.py) | Operator-facing forced empty-head publisher for prompt-memory, user-context, and personality-context `catalog/current` repair on one explicit remote namespace |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr` and reseeding bootstrap attestation when the owner PID changes |
@@ -186,13 +186,16 @@ dedicated backend host is reclaiming CPU or I/O for unrelated CAIA work, use
 `hardware/ops/stabilize_remote_chonkydb_host.py`. That command touches the
 host-side kill-switches for the worst reoffenders, disables the curated
 conflict-unit set across both systemd system scope and the active `thh`
-user-session scope, quiesces non-Twinr CAIA workers that were explicitly
-rewired onto Twinr's dedicated `127.0.0.1:3044` backend, raises
-`caia-twinr-chonkydb-alt.service` CPU/IO weights to the highest priority, and
-then re-probes the live public `/instance` endpoint.
-That probe is intentionally host-availability focused; use
-`hardware/ops/repair_remote_chonkydb.py` when you need the stricter
-current-scope query-surface contract too.
+user-session scope, runtime-masks heavyweight non-Twinr workers such as
+`ollama-gpu.service`, now also quiesces the always-on
+`caia-consumer-portal.service`, `caia-consumer-portal-demo.service`, and
+`caia-ops-chonky-search-guardrail.service` when they reclaim CPU from Twinr's
+dedicated backend, bounded-kills proven stale long-running code-graph
+benchmark runners that bypass those unit lists through interactive user
+sessions, raises `caia-twinr-chonkydb-alt.service` CPU/IO weights
+to the highest priority, and then re-probes the live public current-scope query
+surface with the same empty-scope-safe `404 document_not_found` semantics used
+by the repair helper.
 After a healing sync, the watchdog also retries one extra sync+verify pass if
 the checksum audit still sees source-managed drift, which absorbs brief
 shared-worktree churn without hiding persistent Pi-side divergence.

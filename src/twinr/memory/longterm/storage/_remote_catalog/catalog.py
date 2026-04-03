@@ -26,6 +26,7 @@ class RemoteCatalogCatalogMixin:
         self,
         *,
         snapshot_kind: str,
+        fast_fail: bool = False,
     ) -> tuple[str, dict[str, object] | None]:
         """Probe one fixed current head and preserve missing-vs-invalid status.
 
@@ -35,7 +36,11 @@ class RemoteCatalogCatalogMixin:
         harmless empty namespace forever.
         """
 
-        result = self._load_catalog_head_result(snapshot_kind=snapshot_kind, metadata_only=True)
+        result = self._load_catalog_head_result(
+            snapshot_kind=snapshot_kind,
+            metadata_only=True,
+            fast_fail=fast_fail,
+        )
         if isinstance(result.payload, Mapping):
             payload = dict(result.payload)
             self._store_recent_catalog_head_payload(snapshot_kind=snapshot_kind, payload=payload)

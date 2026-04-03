@@ -26,7 +26,10 @@ from twinr.memory.user_discovery import (
     UserDiscoveryStoredFact,
     UserDiscoveryTopicState,
 )
-from twinr.memory.user_discovery_authoritative_profile import UserDiscoveryAuthoritativeProfileReader
+from twinr.memory.user_discovery_authoritative_profile import (
+    UserDiscoveryAuthoritativeCoverage,
+    UserDiscoveryAuthoritativeProfileReader,
+)
 from twinr.memory.user_discovery_impl.store import UserDiscoveryStateStore
 from twinr.proactive.runtime.display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
 
@@ -111,6 +114,154 @@ class UserDiscoveryTests(unittest.TestCase):
         self.assertTrue(any("preference_type name" in str(query) for query, _limit, _timeout in object_store.queries))
         self.assertTrue(any("preference_type initiative" in str(query) for query, _limit, _timeout in object_store.queries))
         self.assertTrue(all(timeout_s == 2.0 for _query, _limit, timeout_s in object_store.queries))
+
+    def test_authoritative_profile_reader_applies_configured_discovery_timeout_budget(self) -> None:
+        basics_object = _active_preference_object(
+            memory_id="fact:user:main:prefers_name:thom",
+            summary="The user wants to be called Thom.",
+            attributes={
+                "subject_ref": "user:main",
+                "predicate": "prefers_name",
+                "preference_type": "name",
+                "preference_value": "Thom",
+            },
+        )
+
+        class QueryOnlyObjectStore:
+            def __init__(self) -> None:
+                self.queries: list[tuple[str | None, int, float | None]] = []
+
+            def select_fast_topic_objects(
+                self,
+                *,
+                query_text: str | None,
+                limit: int = 4,
+                timeout_s: float | None = None,
+            ) -> tuple[LongTermMemoryObjectV1, ...]:
+                self.queries.append((query_text, limit, timeout_s))
+                normalized_query = str(query_text or "")
+                if "preference_type name" in normalized_query and "prefers_name" in normalized_query:
+                    return (basics_object,)
+                return ()
+
+            def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+                raise AssertionError("Full structured object snapshot loads are forbidden here.")
+
+        object_store = QueryOnlyObjectStore()
+        reader = UserDiscoveryAuthoritativeProfileReader(
+            graph_store=None,
+            object_store=object_store,
+            discovery_query_timeout_s=8.0,
+        )
+
+        coverage = reader.load()
+
+        self.assertTrue(coverage.covers("basics"))
+        self.assertEqual(len(object_store.queries), 2)
+        self.assertTrue(all(timeout_s == 8.0 for _query, _limit, timeout_s in object_store.queries))
+
+    def test_authoritative_profile_reader_from_config_uses_remote_read_timeout_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_remote_read_timeout_s=7.5,
+            )
+
+            reader = UserDiscoveryAuthoritativeProfileReader.from_config(config)
+
+        self.assertEqual(reader.discovery_query_timeout_s, 7.5)
+
+    def test_authoritative_profile_reader_treats_fresh_required_remote_namespace_as_empty(self) -> None:
+        from test.test_longterm_store import _FakeRemoteState, _NoDocumentsFullScope404ChonkyClient
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.client = _NoDocumentsFullScope404ChonkyClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            reader = UserDiscoveryAuthoritativeProfileReader(
+                graph_store=None,
+                object_store=store,
+            )
+
+            coverage = reader.load()
+
+        self.assertFalse(coverage.covers("basics"))
+        self.assertFalse(coverage.covers("companion_style"))
+        self.assertEqual(remote_state.client.topk_records_calls, 2)
+        self.assertTrue(remote_catalog._scope_search_supported(snapshot_kind="objects"))
+
+    def test_read_only_invitation_and_status_reuse_authoritative_coverage_cache(self) -> None:
+        class CountingReader:
+            def __init__(self) -> None:
+                self.load_calls = 0
+
+            def load(self) -> UserDiscoveryAuthoritativeCoverage:
+                self.load_calls += 1
+                return UserDiscoveryAuthoritativeCoverage()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = UserDiscoveryStateStore(Path(temp_dir) / "state" / "user_discovery.json")
+            reader = CountingReader()
+            service = UserDiscoveryService(store=store, authoritative_profile_reader=reader)
+            now = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+
+            invite = service.build_invitation(now=now)
+            status = service.manage(action="status", now=now + timedelta(minutes=1))
+
+        self.assertIsNotNone(invite)
+        self.assertEqual(status.response_mode, "status")
+        self.assertEqual(reader.load_calls, 1)
+
+    def test_answer_invalidates_authoritative_coverage_cache_for_follow_up_selection(self) -> None:
+        class SequencedReader:
+            def __init__(self, *responses: UserDiscoveryAuthoritativeCoverage) -> None:
+                self._responses = responses
+                self.load_calls = 0
+
+            def load(self) -> UserDiscoveryAuthoritativeCoverage:
+                index = min(self.load_calls, len(self._responses) - 1)
+                self.load_calls += 1
+                return self._responses[index]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = UserDiscoveryStateStore(Path(temp_dir) / "state" / "user_discovery.json")
+            reader = SequencedReader(
+                UserDiscoveryAuthoritativeCoverage(),
+                UserDiscoveryAuthoritativeCoverage(covered_topics=frozenset({"basics"})),
+            )
+            service = UserDiscoveryService(store=store, authoritative_profile_reader=reader)
+            now = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+
+            first_invite = service.build_invitation(now=now)
+            start = service.manage(action="start_or_resume", topic_id="basics", now=now)
+            answer = service.manage(
+                action="answer",
+                topic_id="basics",
+                learned_facts=(UserDiscoveryFact(storage="user_profile", text="User prefers to be called Thom."),),
+                topic_complete=True,
+                callbacks=UserDiscoveryCommitCallbacks(
+                    update_user_profile=lambda _category, _text: None,
+                    delete_user_profile=lambda _category: None,
+                ),
+                now=now + timedelta(minutes=1),
+            )
+            paused = service.manage(action="pause_session", now=now + timedelta(minutes=2))
+            status_after_pause = service.manage(action="status", now=now + timedelta(minutes=3))
+
+        self.assertIsNotNone(first_invite)
+        assert first_invite is not None
+        self.assertEqual(first_invite.topic_id, "basics")
+        self.assertEqual(start.topic_id, "basics")
+        self.assertEqual(answer.topic_id, "companion_style")
+        self.assertEqual(paused.response_mode, "wrap_up")
+        self.assertEqual(status_after_pause.response_mode, "status")
+        self.assertEqual(reader.load_calls, 2)
 
     def test_runtime_user_discovery_commits_high_value_user_profile_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

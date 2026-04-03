@@ -94,11 +94,19 @@ class PreparedLongTermContextFront:
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="twinr-longterm-front",
         )
+        self._accepting_work = True
 
     def shutdown(self, *, wait: bool = True) -> None:
-        """Release background resources for prepared-context builds."""
+        """Release background resources and reject new prepared-context builds."""
 
-        self._executor.shutdown(wait=wait, cancel_futures=True)
+        executor: ThreadPoolExecutor | None
+        with self._lock:
+            self._accepting_work = False
+            executor = self._executor
+            if wait:
+                self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
 
     def generation(self) -> int:
         """Return the current invalidation generation."""
@@ -171,6 +179,8 @@ class PreparedLongTermContextFront:
         if self._lookup_cached(alias_keys) is not None:
             return False
         with self._lock:
+            if not self._accepting_work:
+                return False
             if self._lookup_inflight_unlocked(alias_keys) is not None:
                 return False
             if not sticky:
@@ -186,7 +196,14 @@ class PreparedLongTermContextFront:
                     )
                     return False
             generation = self._generation
-            future = self._executor.submit(build_context)
+            executor = self._executor
+            if executor is None:
+                return False
+            try:
+                future = executor.submit(build_context)
+            except RuntimeError:
+                self._accepting_work = False
+                return False
             self._inflight[primary_key] = future
             self._inflight_aliases[primary_key] = alias_keys
             if not sticky:
@@ -223,6 +240,8 @@ class PreparedLongTermContextFront:
         """Request eager refreshes for the remembered sticky queries."""
 
         with self._lock:
+            if not self._accepting_work:
+                return 0
             recent_queries = tuple(self._recent_queries.items())
         for (profile, _normalized_key), query_text in recent_queries:
             build_for_query(profile, query_text)

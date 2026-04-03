@@ -86,9 +86,9 @@ ALL_TOOL_NAMES = (
 )
 
 _EXPECTED_GOLDEN_DIGESTS = {
-    "canonical": "562cd07dc43784a3c8236d61eede07f778ebf24653354d05244ef08aa6a76dca",
-    "compact": "4c6b93736df1daa6f2bd3ca1a51a7fc38b7fbb41a1fe1475a89f0f02a217a39a",
-    "realtime": "eabf9e2d42252d7480030a90c9824c0fc85dedaaf09afad6778025962e5c8627",
+    "canonical": "a136e2537f58f407c519d700dbe30447e6cc276e2b36618749495e8b52ade136",
+    "compact": "e719f9f336f4b1f9629da3851670397b6631f2206221e5632c0037c9650a4706",
+    "realtime": "5fd2587aa63047bc2b1c2809b4a8a3151e85039be88bf21754b9e285b6b18362",
 }
 
 _EXPECTED_TIME_RULES = [
@@ -217,6 +217,7 @@ class ToolSchemaContractsRefactorParityTests(unittest.TestCase):
                 "unknown",
             ],
         )
+
         self.assertEqual(
             smart_home["parameters"]["properties"]["aggregate_by"]["items"]["enum"],
             ["area", "controllable", "entity_class", "online", "provider", "readable"],
@@ -291,6 +292,29 @@ class ToolSchemaContractsRefactorParityTests(unittest.TestCase):
             ["status", "enroll_face", "enroll_voice", "confirm_identity", "deny_identity"],
         )
         self.assertEqual(household_identity["parameters"]["required"], ["action"])
+
+    def test_self_coding_scope_fields_use_json_string_transport(self) -> None:
+        schemas = self._schema_by_name("propose_skill_learning", "answer_skill_question")
+
+        propose_skill_learning = schemas["propose_skill_learning"]
+        self.assertEqual(
+            propose_skill_learning["parameters"]["properties"]["scope"]["type"],
+            "string",
+        )
+        self.assertIn(
+            "JSON object string",
+            propose_skill_learning["parameters"]["properties"]["scope"]["description"],
+        )
+
+        answer_skill_question = schemas["answer_skill_question"]
+        self.assertEqual(
+            answer_skill_question["parameters"]["properties"]["scope"]["type"],
+            "string",
+        )
+        self.assertIn(
+            "JSON object string",
+            answer_skill_question["parameters"]["properties"]["scope"]["description"],
+        )
 
     def test_public_wrapper_matches_internal_implementation(self) -> None:
         if (

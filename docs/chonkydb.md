@@ -154,6 +154,9 @@ restarts the backend when the backend itself is unhealthy; if the backend
 loopback is already healthy and only the public URL is down, it reports that
 as a public proxy/routing outage instead of causing extra downtime with a blind
 restart.
+The current-scope query canary now treats `404 document_not_found` on an empty
+namespace or empty current head as healthy query-surface proof, so operator
+repair does not misclassify a fresh namespace as an outage.
 
 In `remote_primary` mode:
 

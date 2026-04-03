@@ -4,15 +4,20 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     UnifiedRetrievalGoldsetCase,
+    UnifiedRetrievalGoldsetCaseResult,
     run_unified_retrieval_cases,
     seed_unified_retrieval_fixture,
+    unified_retrieval_case_profile_memory_type_coverage,
+    unified_retrieval_goldset_cases,
     unified_retrieval_case_summary,
+    wait_for_unified_retrieval_cases,
 )
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
@@ -30,6 +35,14 @@ def _config(root: str) -> TwinrConfig:
 
 
 class UnifiedRetrievalGoldsetSharedTests(unittest.TestCase):
+    def test_expanded_profile_has_50_cases_and_memory_type_coverage(self) -> None:
+        cases = unified_retrieval_goldset_cases(profile="expanded")
+        coverage = dict(unified_retrieval_case_profile_memory_type_coverage(profile="expanded"))
+
+        self.assertEqual(len(cases), 50)
+        for memory_type in ("adaptive", "conflict", "durable", "episodic", "graph", "midterm"):
+            self.assertGreaterEqual(coverage.get(memory_type, 0), 30)
+
     def test_local_fixture_covers_full_stack_and_graph_only_cases(self) -> None:
         local_cases = (
             UnifiedRetrievalGoldsetCase(
@@ -104,6 +117,67 @@ class UnifiedRetrievalGoldsetSharedTests(unittest.TestCase):
         self.assertEqual(total_cases, 2)
         self.assertEqual(passed_cases, 2, failed_case_ids)
         self.assertFalse(failed_case_ids)
+
+    def test_wait_for_unified_retrieval_cases_reruns_only_pending_cases(self) -> None:
+        cases = (
+            UnifiedRetrievalGoldsetCase(
+                case_id="case_a",
+                query_text="A",
+                canonical_query_text="A",
+            ),
+            UnifiedRetrievalGoldsetCase(
+                case_id="case_b",
+                query_text="B",
+                canonical_query_text="B",
+            ),
+        )
+        initial_results = (
+            UnifiedRetrievalGoldsetCaseResult(
+                case_id="case_a",
+                phase="writer",
+                query_text="A",
+            ),
+            UnifiedRetrievalGoldsetCaseResult(
+                case_id="case_b",
+                phase="writer",
+                query_text="B",
+                missing_sections=("graph_context",),
+            ),
+        )
+        rerun_results = (
+            UnifiedRetrievalGoldsetCaseResult(
+                case_id="case_b",
+                phase="writer",
+                query_text="B",
+            ),
+        )
+        observed_case_ids: list[tuple[str, ...]] = []
+
+        def _fake_run(*, service, cases, phase):
+            del service, phase
+            observed_case_ids.append(tuple(case.case_id for case in cases))
+            if len(observed_case_ids) == 1:
+                return initial_results
+            return rerun_results
+
+        with (
+            patch(
+                "twinr.memory.longterm.evaluation._unified_retrieval_shared.run_unified_retrieval_cases",
+                side_effect=_fake_run,
+            ),
+            patch("twinr.memory.longterm.evaluation._unified_retrieval_shared.time.sleep"),
+        ):
+            results = wait_for_unified_retrieval_cases(
+                service=object(),
+                cases=cases,
+                phase="writer",
+                timeout_s=5.0,
+                poll_interval_s=0.1,
+            )
+
+        self.assertEqual(observed_case_ids, [("case_a", "case_b"), ("case_b",)])
+        self.assertEqual(tuple(item.case_id for item in results), ("case_a", "case_b"))
+        self.assertTrue(all(item.passed for item in results))
 
 
 if __name__ == "__main__":

@@ -219,6 +219,9 @@ class LongTermProviderAnswerFrontStore:
             item_id_getter=lambda payload: str(payload["item_id"]),
             metadata_builder=self._metadata_builder,
             content_builder=self._content_builder,
+            # Provider fronts are rebuildable cache surfaces; the live path must
+            # not wait for same-URI visibility attestation after acceptance.
+            attest_readback=False,
             head_fields={
                 "generation": generation,
                 "front_order": list(kept_front_ids),
@@ -248,6 +251,7 @@ class LongTermProviderAnswerFrontStore:
             item_id_getter=lambda payload: str(payload["item_id"]),
             metadata_builder=self._metadata_builder,
             content_builder=self._content_builder,
+            attest_readback=False,
             head_fields={
                 "generation": next_generation,
                 "front_order": [],
@@ -395,4 +399,3 @@ class LongTermProviderAnswerFrontStore:
         if isinstance(aliases, Sequence) and not isinstance(aliases, (str, bytes, bytearray)):
             return " ".join(str(value or "").strip() for value in aliases if str(value or "").strip())
         return str(payload.get("front_key") or "").strip()
-

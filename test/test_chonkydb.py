@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from io import BytesIO
 import json
 from pathlib import Path
@@ -125,6 +126,18 @@ class FakePoolManager:
 
 
 class ChonkyDBClientTests(unittest.TestCase):
+    def test_chonkydb_error_can_reraise_through_generator_contextmanager(self) -> None:
+        @contextmanager
+        def guard():
+            yield
+
+        with self.assertRaises(ChonkyDBError) as raised:
+            with guard():
+                raise ChonkyDBError("backend unavailable", status_code=503)
+
+        self.assertEqual(str(raised.exception), "backend unavailable (status=503)")
+        self.assertEqual(raised.exception.status_code, 503)
+
     def test_instance_and_auth_use_x_api_key_header(self) -> None:
         opener = FakeOpener()
         opener.queue_json(

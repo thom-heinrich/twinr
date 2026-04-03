@@ -10,6 +10,9 @@ This module keeps those deterministic matrix-only backends in one place:
 - local portrait-profile enrollment and status
 - shared household identity state
 - smart-home entity, control, and event-stream state
+- optional browser-automation workspace bridge
+- bounded service-connect pairing state
+- bounded WhatsApp outbound dispatch state
 - self-coding compile artifacts
 - world-intelligence remote-state snapshots
 
@@ -23,8 +26,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 import json
+import textwrap
 from typing import cast
 
 from twinr.agent.personality.intelligence.models import WorldFeedItem
@@ -35,6 +40,8 @@ from twinr.agent.self_coding.codex_driver import (
     CodexCompileResult,
 )
 from twinr.agent.self_coding.status import ArtifactKind
+from twinr.channels.onboarding import ChannelPairingSnapshot
+from twinr.channels.whatsapp import WhatsAppOutboundResult
 from twinr.hardware.household_identity import (
     HouseholdIdentityFeedbackEvent,
     HouseholdIdentityMemberStatus,
@@ -60,6 +67,155 @@ def _utc_iso() -> str:
     """Return one current UTC ISO timestamp for matrix fixture payloads."""
 
     return datetime.now(UTC).isoformat()
+
+
+_MATRIX_BROWSER_ADAPTER = textwrap.dedent(
+    """
+    from twinr.browser_automation import (
+        BrowserAutomationAvailability,
+        BrowserAutomationArtifact,
+        BrowserAutomationRequest,
+        BrowserAutomationResult,
+    )
+
+
+    class MatrixBrowserDriver:
+        def availability(self) -> BrowserAutomationAvailability:
+            return BrowserAutomationAvailability(
+                enabled=True,
+                available=True,
+                reason="matrix-ready",
+            )
+
+        def execute(self, request: BrowserAutomationRequest) -> BrowserAutomationResult:
+            domain = request.allowed_domains[0] if request.allowed_domains else "example.org"
+            final_url = request.start_url or f"https://{domain}/"
+            return BrowserAutomationResult(
+                ok=True,
+                status="completed",
+                summary=f"Checked visible site state on {domain}.",
+                final_url=final_url,
+                artifacts=(
+                    BrowserAutomationArtifact(
+                        kind="screenshot",
+                        path="artifacts/browser_matrix.png",
+                        content_type="image/png",
+                    ),
+                ),
+                data={
+                    "task_id": request.task_id,
+                    "goal": request.goal,
+                    "allowed_domains": list(request.allowed_domains),
+                },
+            )
+
+
+    def create_browser_automation_driver(*, config, project_root):
+        del config, project_root
+        return MatrixBrowserDriver()
+    """
+).lstrip()
+
+
+def write_matrix_browser_workspace(root: Path) -> Path:
+    """Create one deterministic local browser workspace for matrix runs."""
+
+    workspace = root / "browser_automation"
+    workspace.mkdir(parents=True, exist_ok=True)
+    adapter_path = workspace / "adapter.py"
+    adapter_path.write_text(_MATRIX_BROWSER_ADAPTER, encoding="utf-8")
+    return adapter_path
+
+
+def install_matrix_whatsapp_runtime(root: Path) -> tuple[Path, Path]:
+    """Create the minimal WhatsApp files needed to expose the tool locally."""
+
+    auth_dir = root / "state" / "channels" / "whatsapp" / "auth"
+    worker_root = root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    worker_root.mkdir(parents=True, exist_ok=True)
+    (auth_dir / "creds.json").write_text("{\"me\":{}}\n", encoding="utf-8")
+    (worker_root / "package.json").write_text("{\"name\":\"worker\"}\n", encoding="utf-8")
+    return auth_dir, worker_root
+
+
+def matrix_service_connect_probe() -> SimpleNamespace:
+    """Return one ready WhatsApp runtime probe for service-connect tests."""
+
+    return SimpleNamespace(
+        node_ready=True,
+        node_detail="Node ok",
+        worker_ready=True,
+        worker_detail="Worker ok",
+        paired=False,
+        pair_detail="No linked session yet.",
+    )
+
+
+class MatrixServiceConnectCoordinator:
+    """Keep one deterministic pairing coordinator for service-connect runs."""
+
+    def __init__(self, *, store, registry, snapshot_observer=None, pairing_window_s: float = 90.0) -> None:
+        del store, registry
+        self._snapshot_observer = snapshot_observer
+        self.pairing_window_s = pairing_window_s
+
+    def load_snapshot(self) -> ChannelPairingSnapshot:
+        """Return the initial unpaired onboarding snapshot."""
+
+        return ChannelPairingSnapshot.initial("whatsapp")
+
+    def start_pairing(self, _config) -> bool:
+        """Pretend pairing started and optionally emit one starting snapshot."""
+
+        if callable(self._snapshot_observer):
+            self._snapshot_observer(
+                ChannelPairingSnapshot(
+                    channel_id="whatsapp",
+                    phase="starting",
+                    summary="Starting pairing",
+                    detail="Twinr is preparing the WhatsApp QR on the right info panel.",
+                    running=True,
+                    qr_needed=True,
+                    worker_ready=True,
+                    updated_at=_utc_iso(),
+                )
+            )
+        return True
+
+
+@dataclass(slots=True)
+class MatrixWhatsAppDispatch:
+    """Capture one bounded WhatsApp send surface for matrix scenarios."""
+
+    sent_messages: list[dict[str, str | None]]
+
+    def __init__(self) -> None:
+        self.sent_messages = []
+
+    def dispatch(
+        self,
+        *,
+        chat_jid: str,
+        text: str,
+        recipient_label: str,
+        reply_to_message_id: str | None = None,
+    ) -> WhatsAppOutboundResult:
+        """Record one sent WhatsApp and return a successful outbound result."""
+
+        self.sent_messages.append(
+            {
+                "chat_jid": chat_jid,
+                "text": text,
+                "recipient_label": recipient_label,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        index = len(self.sent_messages)
+        return WhatsAppOutboundResult.sent(
+            request_id=f"matrix-wa-{index}",
+            message_id=f"wa-msg-{index}",
+        )
 
 
 @dataclass(slots=True)
@@ -582,8 +738,13 @@ def matrix_world_feed_items() -> tuple[WorldFeedItem, ...]:
 __all__ = [
     "MatrixHouseholdIdentityManager",
     "MatrixPortraitProvider",
+    "MatrixServiceConnectCoordinator",
     "MatrixSelfCodingCompileDriver",
     "MatrixSmartHomeProvider",
+    "MatrixWhatsAppDispatch",
     "MatrixWorldRemoteState",
+    "install_matrix_whatsapp_runtime",
+    "matrix_service_connect_probe",
     "matrix_world_feed_items",
+    "write_matrix_browser_workspace",
 ]

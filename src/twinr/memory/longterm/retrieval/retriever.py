@@ -337,6 +337,16 @@ class LongTermRetriever:
             kind="retrieval",
         ):
             midterm_context = self._render_midterm_context(tuple((*adaptive_packets, *midterm_packets)))
+        if not tool_context:
+            graph_context = self._finalize_provider_graph_context(
+                graph_context=graph_context,
+                subtext_context=subtext_context,
+                durable_context=durable_context,
+                episodic_context=episodic_context,
+                midterm_context=midterm_context,
+                conflict_context=conflict_context,
+                unified_query_plan=unified_query_plan,
+            )
         workflow_event(
             kind="retrieval",
             msg=f"longterm_retriever_{context_name}_sections_built",
@@ -968,6 +978,80 @@ class LongTermRetriever:
                 details={"query_plan": dict(unified_query_plan)},
             )
         return subtext_context
+
+    def _finalize_provider_graph_context(
+        self,
+        *,
+        graph_context: str | None,
+        subtext_context: str | None,
+        durable_context: str | None,
+        episodic_context: str | None,
+        midterm_context: str | None,
+        conflict_context: str | None,
+        unified_query_plan: dict[str, object] | None,
+    ) -> str | None:
+        """Fail closed on raw graph context when no relevant graph payload survived."""
+
+        if not graph_context:
+            self._update_unified_query_plan_graph_context(
+                unified_query_plan=unified_query_plan,
+                rendered=False,
+                suppressed_reason="no_graph_context_built",
+            )
+            return None
+        if subtext_context or durable_context or episodic_context or midterm_context or conflict_context:
+            self._update_unified_query_plan_graph_context(
+                unified_query_plan=unified_query_plan,
+                rendered=True,
+                suppressed_reason=None,
+            )
+            return graph_context
+        if self._subtext_graph_payload_source(unified_query_plan) != "none":
+            self._update_unified_query_plan_graph_context(
+                unified_query_plan=unified_query_plan,
+                rendered=True,
+                suppressed_reason=None,
+            )
+            return graph_context
+        self._update_unified_query_plan_graph_context(
+            unified_query_plan=unified_query_plan,
+            rendered=False,
+            suppressed_reason="no_relevant_graph_payload",
+        )
+        workflow_event(
+            kind="branch",
+            msg="longterm_retriever_graph_context_suppressed",
+            details={"reason": "no_relevant_graph_payload"},
+        )
+        return None
+
+    def _subtext_graph_payload_source(self, unified_query_plan: dict[str, object] | None) -> str:
+        """Return the graph-payload source recorded by subtext planning."""
+
+        if not isinstance(unified_query_plan, Mapping):
+            return "none"
+        subtext_plan = unified_query_plan.get("subtext")
+        if not isinstance(subtext_plan, Mapping):
+            return "none"
+        value = self._normalize_text(subtext_plan.get("graph_payload_source"), limit=64)
+        return value or "none"
+
+    def _update_unified_query_plan_graph_context(
+        self,
+        *,
+        unified_query_plan: dict[str, object] | None,
+        rendered: bool,
+        suppressed_reason: str | None,
+    ) -> None:
+        """Attach graph-context render/suppression metadata to the query plan."""
+
+        if not isinstance(unified_query_plan, dict):
+            return
+        unified_query_plan["graph_context"] = {
+            "schema": "twinr_unified_graph_context_plan_v1",
+            "rendered": bool(rendered),
+            "suppressed_reason": self._normalize_text(suppressed_reason, limit=96) or None,
+        }
 
     def _update_unified_query_plan_subtext(
         self,

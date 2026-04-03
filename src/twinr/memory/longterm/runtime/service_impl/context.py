@@ -31,6 +31,13 @@ from .compat import (
     logger,
 )
 
+# Bound the first non-English provider-context build long enough for the
+# background canonical rewrite to finish in the common case. Live probes on
+# April 3, 2026 showed real rewrite latency around 1.1s to 2.8s; the previous
+# 350ms budget systematically missed first-turn graph/subtext personalization.
+_PROVIDER_QUERY_REWRITE_WAIT_S = 3.0
+_PREWARM_QUERY_REWRITE_WAIT_S = 3.0
+
 
 class LongTermMemoryServiceContextMixin(ServiceMixinBase):
     """Build normal, fast, and tool-facing provider contexts."""
@@ -93,7 +100,10 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
 
         started_at = time.monotonic()
         try:
-            query = self.query_rewriter.profile(query_text)
+            query = self.query_rewriter.profile(
+                query_text,
+                wait_for_rewrite_s=_PROVIDER_QUERY_REWRITE_WAIT_S,
+            )
             writer_details = _writer_state_details(getattr(self, "writer", None))
             multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
             with workflow_span(
@@ -237,6 +247,64 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                 duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
             )
 
+    def materialize_live_provider_context(
+        self,
+        query_text: str | None,
+    ) -> PreparedLongTermContextResolution:
+        """Synchronously build and persist one live provider front for non-live callers.
+
+        The transcript-first runtime path must stay strict and consume only an
+        already materialized provider-answer front. Non-streaming callers such
+        as evaluations can use this explicit helper to build that front ahead of
+        `build_live_provider_context(...)` without weakening the live path into
+        a hidden synchronous retriever fallback.
+        """
+
+        query = self.query_rewriter.profile(
+            query_text,
+            wait_for_rewrite_s=_PROVIDER_QUERY_REWRITE_WAIT_S,
+        )
+        resolution = self._consume_materialized_provider_context(
+            query=query,
+            strict_missing=False,
+        )
+        if resolution is not None:
+            return resolution
+        provider_answer_front = getattr(self, "provider_answer_front", None)
+        if provider_answer_front is None or not provider_answer_front.enabled():
+            raise LongTermRemoteUnavailableError(
+                "Required materialized provider answer front is unavailable for explicit materialization."
+            )
+        context = self._build_provider_context_uncached(
+            query=query,
+            original_query_text=query_text,
+        )
+        materialized = provider_answer_front.persist_built_context(
+            query_keys=self._prepared_context_key_texts(query),
+            sticky_query_text=query.original_text or query.retrieval_text,
+            context=context,
+        )
+        resolved = PreparedLongTermContextResolution(
+            context=materialized.context,
+            source=materialized.source,
+        )
+        self._remember_context_snapshot(
+            profile="provider",
+            query=query,
+            context=resolved.context,
+            source=resolved.source,
+        )
+        workflow_event(
+            kind="cache",
+            msg="longterm_materialized_provider_front_built_sync",
+            details={
+                **_context_details(resolved.context),
+                "prepared_source": resolved.source,
+                "query_present": bool(str(query_text or "").strip()),
+            },
+        )
+        return resolved
+
     def build_fast_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build a tiny topic-memory context for latency-sensitive answer paths."""
 
@@ -256,10 +324,18 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                     "multimodal_writer": multimodal_writer_details,
                 },
             ):
-                topic_context = self._build_quick_topic_context(
-                    query_text=query.original_text or query.retrieval_text,
-                    workflow_event_name="longterm_fast_provider_context_remote_read_failed",
-                )
+                try:
+                    topic_context = self._build_quick_topic_context(
+                        query_text=query.original_text or query.retrieval_text,
+                        workflow_event_name="longterm_fast_provider_context_remote_read_failed",
+                    )
+                except LongTermRemoteReadFailedError as exc:
+                    workflow_event(
+                        kind="warning",
+                        msg="longterm_fast_provider_context_quick_memory_skipped",
+                        details=dict(exc.details),
+                    )
+                    topic_context = None
                 context = LongTermMemoryContext(topic_context=topic_context)
                 workflow_event(
                     kind="retrieval",
@@ -410,7 +486,14 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
         if not normalized_text:
             return False
         profile_name: PreparedContextProfile = "tool" if tool_context else "provider"
-        query = self.query_rewriter.profile(query_text) if rewrite_query else LongTermQueryProfile.from_text(query_text)
+        query = (
+            self.query_rewriter.profile(
+                query_text,
+                wait_for_rewrite_s=_PREWARM_QUERY_REWRITE_WAIT_S,
+            )
+            if rewrite_query
+            else LongTermQueryProfile.from_text(query_text)
+        )
         key_texts = self._prepared_context_key_texts(query)
         if not key_texts:
             return False

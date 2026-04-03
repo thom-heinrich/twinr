@@ -9,9 +9,10 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.tools.schemas.contracts import build_agent_tool_schemas
 from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
-from twinr.providers.openai.api.adapters import _SUPERVISOR_DECISION_SCHEMA
-from twinr.providers.openai.core.client import _default_client_factory
+from twinr.providers.openai.api.adapters import _SUPERVISOR_DECISION_SCHEMA, _normalize_openai_tool_schema
+from twinr.providers.openai.core.client import _default_client_factory, close_cached_openai_clients
 
 
 def _search_voice_payload(
@@ -80,20 +81,29 @@ class FakeResponsesAPI:
         self.output_text = "Backend answer"
         self.output = [SimpleNamespace(type="web_search_call")]
         self.queued_output_texts: list[str] = []
+        self.queued_exceptions: list[Exception] = []
+        self.queued_payloads: list[dict] = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        if self.queued_exceptions:
+            raise self.queued_exceptions.pop(0)
+        payload = self.queued_payloads.pop(0) if self.queued_payloads else {}
         output_text = self.queued_output_texts.pop(0) if self.queued_output_texts else self.output_text
         response_format = ((kwargs.get("text") or {}).get("format") or {})
         if response_format.get("name") == "twinr_live_search_spoken_answer":
             output_text = _search_voice_payload(output_text)
+        elif response_format.get("name") == "twinr_print_receipt":
+            output_text = json.dumps({"status": "ready", "text": output_text})
         return SimpleNamespace(
-            id="resp_123",
-            _request_id="req_123",
-            model=kwargs["model"],
-            usage=_fake_usage(),
-            output_text=output_text,
-            output=self.output,
+            id=payload.get("id", "resp_123"),
+            _request_id=payload.get("_request_id", "req_123"),
+            model=payload.get("model", kwargs["model"]),
+            usage=payload.get("usage", _fake_usage()),
+            output_text=payload.get("output_text", output_text),
+            output=payload.get("output", self.output),
+            status=payload.get("status", "completed"),
+            incomplete_details=payload.get("incomplete_details"),
         )
 
     def stream(self, **kwargs):
@@ -130,6 +140,10 @@ class FakeTranscriptionsAPI:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         return "Transcribed speech"
+
+
+class InternalServerError(RuntimeError):
+    pass
 
 
 class FakeModelAccessError(Exception):
@@ -216,6 +230,40 @@ class FakeChatCompletionsAPI:
 
 
 class OpenAIBackendTests(unittest.TestCase):
+    def test_self_coding_scope_schema_survives_openai_normalization_without_freeform_objects(self) -> None:
+        schemas = {
+            schema["name"]: _normalize_openai_tool_schema(schema)
+            for schema in build_agent_tool_schemas(("propose_skill_learning", "answer_skill_question"))
+        }
+
+        self.assertEqual(
+            schemas["propose_skill_learning"]["parameters"]["properties"]["scope"]["type"],
+            ["string", "null"],
+        )
+        self.assertEqual(
+            schemas["answer_skill_question"]["parameters"]["properties"]["scope"]["type"],
+            ["string", "null"],
+        )
+
+    def test_openai_normalization_makes_optional_tool_fields_nullable_in_strict_mode(self) -> None:
+        schemas = {
+            schema["name"]: _normalize_openai_tool_schema(schema)
+            for schema in build_agent_tool_schemas(("print_receipt", "send_whatsapp_message"))
+        }
+
+        print_schema = schemas["print_receipt"]["parameters"]["properties"]
+        self.assertEqual(print_schema["focus_hint"]["type"], ["string", "null"])
+        self.assertEqual(print_schema["text"]["type"], ["string", "null"])
+
+        whatsapp_schema = schemas["send_whatsapp_message"]["parameters"]["properties"]
+        self.assertEqual(whatsapp_schema["family_name"]["type"], ["string", "null"])
+        self.assertEqual(whatsapp_schema["role"]["type"], ["string", "null"])
+        self.assertEqual(whatsapp_schema["contact_label"]["type"], ["string", "null"])
+        self.assertEqual(whatsapp_schema["phone_last4"]["type"], ["string", "null"])
+        self.assertEqual(whatsapp_schema["message"]["type"], ["string", "null"])
+        self.assertEqual(whatsapp_schema["confirmed"]["type"], ["boolean", "null"])
+        self.assertEqual(whatsapp_schema["name"]["type"], "string")
+
     def setUp(self) -> None:
         self.responses = FakeResponsesAPI()
         self.transcriptions = FakeTranscriptionsAPI()
@@ -1179,13 +1227,46 @@ class OpenAIBackendTests(unittest.TestCase):
 
         request = self.responses.calls[0]
         self.assertEqual(response.text, "TERMINE\nMontag 14 Uhr\nAdresse Praxis")
-        self.assertEqual(request["reasoning"], {"effort": "medium"})
-        self.assertEqual(request["max_output_tokens"], 180)
+        self.assertEqual(request["reasoning"], {"effort": "low"})
+        self.assertEqual(request["max_output_tokens"], 320)
         self.assertNotIn("tools", request)
         self.assertIn("Request source: button", request["input"][-1]["content"][0]["text"])
         self.assertIn("Focus hint: appointment details", request["input"][-1]["content"][0]["text"])
         self.assertIn("Latest user message: Wann ist der Termin?", request["input"][-1]["content"][0]["text"])
         self.assertIn("Latest assistant message: Montag 14 Uhr.", request["input"][-1]["content"][0]["text"])
+
+    def test_compose_print_job_falls_back_to_plain_request_after_structured_internal_server_error(self) -> None:
+        self.responses.queued_exceptions = [InternalServerError("provider 500")]
+        self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"
+
+        response = self.backend.compose_print_job_with_metadata(
+            direct_text="Montag 14 Uhr bei Dr. Meyer",
+            request_source="button",
+        )
+
+        self.assertEqual(response.text, "TERMINE\nMontag 14 Uhr\nAdresse Praxis")
+        self.assertEqual(len(self.responses.calls), 2)
+        self.assertIn("format", self.responses.calls[0]["text"])
+        self.assertNotIn("format", self.responses.calls[1]["text"])
+
+    def test_compose_print_job_rejects_incomplete_truncated_structured_output_and_uses_fallback(self) -> None:
+        self.responses.queued_payloads = [
+            {
+                "status": "incomplete",
+                "incomplete_details": SimpleNamespace(reason="max_output_tokens"),
+                "output_text": '{"status":"ready","text":"Morgen-Digest | 03.04.2026\\nWetter Berlin',
+            }
+        ]
+
+        response = self.backend.compose_print_job_with_metadata(
+            direct_text="Morgen-Digest | 03.04.2026\nWetter Berlin: ruhig und kuehl",
+            request_source="button",
+        )
+
+        self.assertEqual(
+            response.text,
+            "Morgen-Digest | 03.04.2026\nWetter Berlin: ruhig und kuehl",
+        )
 
     def test_compose_print_job_uses_literal_tool_text_without_llm_rewrite(self) -> None:
         response = self.backend.compose_print_job_with_metadata(
@@ -1262,6 +1343,7 @@ class OpenAIBackendTests(unittest.TestCase):
         original_module = sys.modules.get("openai")
         fake_openai_module = ModuleType("openai")
         setattr(fake_openai_module, "OpenAI", FakeOpenAI)
+        close_cached_openai_clients()
         sys.modules["openai"] = fake_openai_module
         try:
             _default_client_factory(
@@ -1271,6 +1353,7 @@ class OpenAIBackendTests(unittest.TestCase):
                 )
             )
         finally:
+            close_cached_openai_clients()
             if original_module is None:
                 sys.modules.pop("openai", None)
             else:

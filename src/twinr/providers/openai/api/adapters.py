@@ -641,7 +641,35 @@ def _model_supports_tool_search(model: str) -> bool:
     return major > 5 or (major == 5 and minor >= 4)
 
 
-def _normalize_strict_json_schema(schema: Any, *, root: bool = False) -> Any:
+def _make_nullable_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Represent one optional strict-schema property as nullable."""
+
+    normalized = copy.deepcopy(schema)
+    schema_type = normalized.get("type")
+    if isinstance(schema_type, str):
+        normalized["type"] = [schema_type, "null"] if schema_type != "null" else "null"
+        enum_values = normalized.get("enum")
+        if isinstance(enum_values, list) and None not in enum_values:
+            normalized["enum"] = [*enum_values, None]
+        return normalized
+    if isinstance(schema_type, list):
+        updated_types = list(schema_type)
+        if "null" not in updated_types:
+            updated_types.append("null")
+        normalized["type"] = updated_types
+        enum_values = normalized.get("enum")
+        if isinstance(enum_values, list) and None not in enum_values:
+            normalized["enum"] = [*enum_values, None]
+        return normalized
+    enum_values = normalized.get("enum")
+    if isinstance(enum_values, list):
+        if None not in enum_values:
+            normalized["enum"] = [*enum_values, None]
+        return normalized
+    return {"anyOf": [normalized, {"type": "null"}]}
+
+
+def _normalize_strict_json_schema(schema: Any, *, root: bool = False, optional: bool = False) -> Any:
     """Normalize one JSON Schema to OpenAI strict-mode requirements.
 
     The 2026 Structured Outputs subset supports nested ``anyOf`` and ``enum``
@@ -657,13 +685,19 @@ def _normalize_strict_json_schema(schema: Any, *, root: bool = False) -> Any:
         return copy.deepcopy(schema)
 
     normalized: dict[str, Any] = {}
+    required_names = schema.get("required")
+    required_set = {str(item) for item in required_names} if isinstance(required_names, list) else set()
     for key, value in schema.items():
         if key in _STRICT_SCHEMA_UNSUPPORTED_KEYWORDS:
             continue
         if key == "properties" and isinstance(value, Mapping):
             properties: dict[str, Any] = {}
             for prop_name, prop_schema in value.items():
-                properties[str(prop_name)] = _normalize_strict_json_schema(prop_schema)
+                property_name = str(prop_name)
+                properties[property_name] = _normalize_strict_json_schema(
+                    prop_schema,
+                    optional=property_name not in required_set,
+                )
             normalized[key] = properties
             continue
         if key in {"items", "additionalProperties"}:
@@ -692,6 +726,8 @@ def _normalize_strict_json_schema(schema: Any, *, root: bool = False) -> Any:
             property_names = [str(name) for name in properties]
             normalized["required"] = property_names
         normalized["additionalProperties"] = False
+    if optional:
+        return _make_nullable_strict_json_schema(normalized)
     return normalized
 
 

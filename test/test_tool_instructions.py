@@ -9,6 +9,7 @@ from twinr.agent.tools.prompting.instructions import (
     build_compact_tool_agent_instructions,
     build_first_word_instructions,
     build_local_route_first_word_instructions,
+    build_specialist_tool_agent_instructions,
     build_supervisor_decision_instructions,
     build_supervisor_tool_agent_instructions,
     build_tool_agent_instructions,
@@ -59,6 +60,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("right info panel shows the QR", instructions)
         self.assertIn("send_whatsapp_message tool", instructions)
         self.assertIn("confirmation_required", instructions)
+        self.assertIn("tool explicitly present in the current tool surface", instructions)
+        self.assertIn("Do not tell the user that printing, camera inspection, WhatsApp sending", instructions)
 
     def test_compact_tool_instructions_prevent_repeated_search_calls_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -79,6 +82,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("right info panel shows the QR", instructions)
         self.assertIn("send_whatsapp_message", instructions)
         self.assertIn("confirmation_required", instructions)
+        self.assertIn("tool explicitly present in the current tool surface", instructions)
+        self.assertIn("do not claim that printing, camera inspection, WhatsApp sending", instructions)
 
     def test_tool_instructions_require_exact_retrieval_tools_before_answering(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -272,6 +277,10 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("manage_voice_quiet_mode", instructions)
         self.assertIn('{"action":"status"}', instructions)
         self.assertIn('{"action":"clear"}', instructions)
+        self.assertIn("runtime_tool_name to print_receipt", instructions)
+        self.assertIn("runtime_tool_name to inspect_camera", instructions)
+        self.assertIn("runtime_tool_name to send_whatsapp_message", instructions)
+        self.assertIn("confirmed true", instructions)
         self.assertIn("location_hint", instructions)
         self.assertIn("date_context", instructions)
         self.assertIn("plain spoken language only", instructions)
@@ -319,6 +328,17 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("everyday how or why questions", supervisor_tool_instructions)
         self.assertIn("built-in model knowledge", supervisor_decision_instructions)
         self.assertIn("everyday how or why questions", supervisor_decision_instructions)
+
+    def test_specialist_instructions_prefer_local_tool_execution_over_limitation_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instructions = build_specialist_tool_agent_instructions(
+                TwinrConfig(openai_api_key="test-key", project_root=temp_dir, personality_dir="personality")
+            )
+
+        self.assertIn("print exact text", instructions)
+        self.assertIn("inspect the current camera view", instructions)
+        self.assertIn("send a WhatsApp message to a remembered contact", instructions)
+        self.assertIn("instead of explaining limitations", instructions)
 
 
 if __name__ == "__main__":

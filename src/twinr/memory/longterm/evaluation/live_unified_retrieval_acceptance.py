@@ -23,10 +23,11 @@ from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     UnifiedRetrievalFixtureSeedStats,
     UnifiedRetrievalGoldsetCaseResult,
-    default_unified_retrieval_goldset_cases,
     ensure_unified_retrieval_remote_ready,
     seed_unified_retrieval_fixture,
+    unified_retrieval_case_profile_memory_type_coverage,
     unified_retrieval_case_summary,
+    unified_retrieval_goldset_cases,
     wait_for_unified_retrieval_cases,
 )
 from twinr.memory.longterm.evaluation.live_midterm_acceptance import (
@@ -44,6 +45,7 @@ _REPORT_DIR_NAME = "unified_retrieval_live_acceptance"
 _WRITER_CASE_TIMEOUT_S = 90.0
 _FRESH_READER_CASE_TIMEOUT_S = 120.0
 _CASE_POLL_INTERVAL_S = 2.0
+_DEFAULT_CASE_PROFILE = "core"
 
 
 def _utc_now_iso() -> str:
@@ -78,6 +80,8 @@ class LiveUnifiedRetrievalAcceptanceResult:
     env_path: str
     base_project_root: str
     runtime_namespace: str
+    case_profile: str = _DEFAULT_CASE_PROFILE
+    profile_memory_type_coverage: tuple[tuple[str, int], ...] = ()
     writer_root: str | None = None
     fresh_reader_root: str | None = None
     seed_stats: UnifiedRetrievalFixtureSeedStats | None = None
@@ -119,6 +123,10 @@ class LiveUnifiedRetrievalAcceptanceResult:
             "env_path": self.env_path,
             "base_project_root": self.base_project_root,
             "runtime_namespace": self.runtime_namespace,
+            "case_profile": self.case_profile,
+            "profile_memory_type_coverage": {
+                key: value for key, value in self.profile_memory_type_coverage
+            },
             "writer_root": self.writer_root,
             "fresh_reader_root": self.fresh_reader_root,
             "seed_stats": self.seed_stats.to_dict() if self.seed_stats is not None else None,
@@ -171,6 +179,7 @@ def run_live_unified_retrieval_acceptance(
     *,
     env_path: str | Path = ".env",
     probe_id: str | None = None,
+    case_profile: str = _DEFAULT_CASE_PROFILE,
     write_artifacts: bool = True,
 ) -> LiveUnifiedRetrievalAcceptanceResult:
     """Run the live unified-retrieval acceptance against real ChonkyDB state."""
@@ -192,6 +201,8 @@ def run_live_unified_retrieval_acceptance(
         env_path=str(resolved_env_path),
         base_project_root=str(base_project_root),
         runtime_namespace=runtime_namespace,
+        case_profile=case_profile,
+        profile_memory_type_coverage=unified_retrieval_case_profile_memory_type_coverage(profile=case_profile),
     )
     writer_service: LongTermMemoryService | None = None
     fresh_reader_service: LongTermMemoryService | None = None
@@ -231,16 +242,17 @@ def run_live_unified_retrieval_acceptance(
             ensure_unified_retrieval_remote_ready(fresh_reader_service)
 
             seed_stats = seed_unified_retrieval_fixture(writer_service)
+            selected_cases = unified_retrieval_goldset_cases(profile=case_profile)
             writer_results = wait_for_unified_retrieval_cases(
                 service=writer_service,
-                cases=default_unified_retrieval_goldset_cases(),
+                cases=selected_cases,
                 phase="writer",
                 timeout_s=_WRITER_CASE_TIMEOUT_S,
                 poll_interval_s=_CASE_POLL_INTERVAL_S,
             )
             fresh_reader_results = wait_for_unified_retrieval_cases(
                 service=fresh_reader_service,
-                cases=default_unified_retrieval_goldset_cases(),
+                cases=selected_cases,
                 phase="fresh_reader",
                 timeout_s=_FRESH_READER_CASE_TIMEOUT_S,
                 poll_interval_s=_CASE_POLL_INTERVAL_S,
@@ -285,6 +297,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=".env", help="Path to the Twinr env file.")
     parser.add_argument("--probe-id", default=None, help="Optional stable probe id / namespace suffix.")
     parser.add_argument(
+        "--case-profile",
+        default=_DEFAULT_CASE_PROFILE,
+        choices=("core", "expanded"),
+        help="Which unified-retrieval case profile to run live against ChonkyDB.",
+    )
+    parser.add_argument(
         "--no-write-artifacts",
         action="store_true",
         help="Skip writing the rolling ops artifact and per-run report snapshot.",
@@ -299,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_live_unified_retrieval_acceptance(
         env_path=args.env_file,
         probe_id=args.probe_id,
+        case_profile=args.case_profile,
         write_artifacts=not args.no_write_artifacts,
     )
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))

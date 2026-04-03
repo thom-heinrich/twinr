@@ -1,6 +1,8 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Explicit durable-memory writes now force a durable flush before returning success.
 # BUG-2: Added retry-safe recent-write journaling so persist/flush retries do not duplicate memories.
+# BUG-3: Search-result source normalization now truncates overlong source lists to the bounded persisted set
+#        instead of aborting successful tool turns.
 # SEC-1: Suspicious untrusted memory writes are blocked by default unless explicitly user-confirmed.
 # SEC-2: Added hard bounds for payload sizes, metadata, and source lists to prevent practical Pi-side
 #        memory/disk exhaustion from oversized inputs.
@@ -28,7 +30,8 @@ from typing import Any
 
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.personality.intelligence import WorldIntelligenceConfigRequest
-from twinr.memory import ManagedContextEntry, MemoryLedgerItem, PersistentMemoryEntry, SearchMemoryEntry
+from twinr.memory.context_store import ManagedContextEntry, PersistentMemoryEntry
+from twinr.memory.on_device import MemoryLedgerItem, SearchMemoryEntry
 from twinr.ops.events import compact_text
 
 
@@ -371,11 +374,10 @@ class TwinrRuntimeMemoryMixin:
         except TypeError as exc:
             raise TypeError("sources must be an iterable of strings") from exc
 
+        max_sources = self._search_source_limit()
         normalized: list[str] = []
         seen: set[str] = set()
         for index, item in enumerate(iterator):
-            if index >= _MAX_SOURCES:
-                raise ValueError(f"sources must contain at most {_MAX_SOURCES} items")
             source = self._normalize_optional_text(
                 f"sources[{index}]",
                 item,
@@ -385,7 +387,17 @@ class TwinrRuntimeMemoryMixin:
                 continue
             normalized.append(source)
             seen.add(source)
+            if len(normalized) >= max_sources:
+                break
         return tuple(normalized)
+
+    def _search_source_limit(self) -> int:
+        memory_limit = getattr(getattr(self, "memory", None), "_MAX_SOURCE_COUNT", _MAX_SOURCES)
+        try:
+            limit = int(memory_limit)
+        except (TypeError, ValueError):
+            return _MAX_SOURCES
+        return max(1, min(limit, _MAX_SOURCES))
 
     def _normalize_timeout(self, timeout_s: float) -> float:
         try:
@@ -746,13 +758,13 @@ class TwinrRuntimeMemoryMixin:
                 location_hint=location_hint,
                 date_context=date_context,
             ),
-            after_persist=lambda _entry: self._append_memory_ops_event(
+            after_persist=lambda entry: self._append_memory_ops_event(
                 event="search_result_stored",
                 message="Search result stored in structured on-device memory.",
                 data={
                     "question_chars": len(question),
                     "answer_chars": len(answer),
-                    "sources": len(normalized_sources),
+                    "sources": len(entry.sources),
                     "trust_tier": trust_tier,
                     "confirmed_by_user": confirmed_by_user,
                     "risk_tags": ",".join(risk_tags),

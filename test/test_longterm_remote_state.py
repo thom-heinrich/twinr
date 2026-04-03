@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 import socket
+from threading import Event
 import sys
 import tempfile
 import time
@@ -22,6 +23,10 @@ from test.longterm_test_program import make_test_extractor
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig
 from twinr.memory.context_store import PersistentMemoryMarkdownStore
+from twinr.memory.longterm.core.cooperative_abort import (
+    LongTermOperationCancelledError,
+    longterm_operation_abort_scope,
+)
 from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteSnapshotProbe,
     LongTermRemoteStateStore,
@@ -2377,6 +2382,59 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
         self.assertEqual(len(write_opener.calls), 6)
 
+    def test_remote_snapshot_save_aborts_retry_when_shutdown_requested(self) -> None:
+        class _AbortAfterFirstWriteOpener(FakeOpener):
+            def __init__(self, stop_event: Event) -> None:
+                super().__init__()
+                self._stop_event = stop_event
+
+            def __call__(self, request, timeout: float):
+                self._stop_event.set()
+                return super().__call__(request, timeout)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=4,
+                long_term_memory_remote_retry_backoff_s=5.0,
+            )
+            stop_event = Event()
+            read_opener = FakeOpener()
+            write_opener = _AbortAfterFirstWriteOpener(stop_event)
+            write_opener.queue_http_error(
+                429,
+                {
+                    "type": "about:blank",
+                    "title": "RuntimeError",
+                    "status": 429,
+                    "detail": "queue_saturated",
+                    "error_type": "RuntimeError",
+                    "error": "queue_saturated",
+                },
+                headers={"Retry-After": "0"},
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            with self.assertRaises(LongTermOperationCancelledError):
+                with longterm_operation_abort_scope(
+                    should_abort=stop_event.is_set,
+                    wait_for_abort=stop_event.wait,
+                    label="test_remote_snapshot_save_aborts_retry_when_shutdown_requested",
+                ):
+                    state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
+
+        self.assertEqual(len(write_opener.calls), 1)
+
     def test_remote_snapshot_save_retries_when_attested_readback_is_malformed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = replace(
@@ -3615,6 +3673,11 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(data["write_timeout_s"], 17.0)
         self.assertEqual(data["error_type"], "ChonkyDBError")
         self.assertEqual(data["root_cause_type"], "gaierror")
+        self.assertEqual(data["request_execution_mode"], "async")
+        self.assertTrue(data["request_correlation_id"])
+        self.assertGreater(data["request_bytes"], 0)
+        self.assertIsNotNone(data["store_transport_ms"])
+        self.assertIsNone(data["async_job_wait_ms"])
 
     def test_remote_snapshot_timeout_records_endpoint_payload_type_and_histogram(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4146,7 +4209,8 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertIsNone(status.detail)
         self.assertEqual(len(opener.calls), 2)
         self.assertEqual(opener.calls[0]["timeout"], 20.0)
-        self.assertEqual(opener.calls[1]["timeout"], 20.0)
+        self.assertLessEqual(opener.calls[1]["timeout"], 20.0)
+        self.assertGreater(opener.calls[1]["timeout"], 19.0)
         self.assertIn("/v1/external/instance", str(opener.calls[0]["full_url"]))
         self.assertIn("/v1/external/documents/full", str(opener.calls[1]["full_url"]))
         self.assertIn("document_id=00000000-0000-0000-0000-000000000000", str(opener.calls[1]["full_url"]))
@@ -4187,6 +4251,48 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertTrue(status.ready)
         self.assertIsNone(status.detail)
         self.assertEqual(len(opener.calls), 2)
+
+    def test_status_shares_one_deadline_with_document_liveness_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            opener = FakeOpener()
+            opener.queue_exception(socket.timeout("instance slow"))
+            opener.queue_http_error(404, {"detail": "document_not_found"})
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+                chonkydb_base_url="https://memory.test",
+                chonkydb_api_key="secret-key",
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(
+                        base_url="https://memory.test",
+                        api_key="secret-key",
+                        timeout_s=8.0,
+                    ),
+                    opener=opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            with patch(
+                "twinr.memory.longterm.storage._remote_state.state.time.monotonic",
+                side_effect=[99.0, 100.0, 111.75],
+            ):
+                status = state.status()
+
+        self.assertTrue(status.ready)
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(opener.calls[0]["timeout"], 20.0)
+        self.assertAlmostEqual(opener.calls[1]["timeout"], 8.25)
 
     def test_status_probe_clamps_an_overlarge_client_timeout_to_the_probe_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

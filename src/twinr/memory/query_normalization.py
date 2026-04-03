@@ -7,7 +7,7 @@ LLM-backed cache.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import logging
 from collections import OrderedDict
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.llm_json import request_structured_json_object
+from twinr.providers.openai.core.client import close_openai_client
 from twinr.text_utils import retrieval_terms, truncate_text
 
 if TYPE_CHECKING:
@@ -201,6 +202,7 @@ class LongTermQueryRewriter:
     _rewrite_backoff_until: float = field(default=0.0, init=False, repr=False)
     _rewrite_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
     _pending_rewrites: dict[str, Future[str | None]] = field(default_factory=dict, init=False, repr=False)
+    _accepting_rewrites: bool = field(default=True, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # AUDIT-FIX(#1): Resolve a bounded cache size from config with a safe default so
@@ -277,11 +279,18 @@ class LongTermQueryRewriter:
                 backend = None
         return cls(config=config, backend=backend)
 
-    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+    def profile(
+        self,
+        query_text: str | None,
+        *,
+        wait_for_rewrite_s: float = 0.0,
+    ) -> LongTermQueryProfile:
         """Return the normalized retrieval profile for one query string.
 
         Args:
             query_text: Raw user query text.
+            wait_for_rewrite_s: Optional bounded wait for one in-flight
+                canonical rewrite before returning the profile.
 
         Returns:
             A ``LongTermQueryProfile`` containing the original text and, when
@@ -291,6 +300,54 @@ class LongTermQueryRewriter:
         clean_query = _normalize_text(query_text)
         if not clean_query:
             return LongTermQueryProfile.from_text("")
+        wait_timeout_s = _resolve_non_negative_float(wait_for_rewrite_s, default=0.0)
+
+        with self._cache_lock:
+            self._drain_completed_rewrite_locked(clean_query)
+            cached = self._cache.get(clean_query)
+            pending_rewrite = self._pending_rewrites.get(clean_query)
+            if cached is not None:
+                self._cache.move_to_end(clean_query)
+                if (
+                    cached.canonical_english_text is not None
+                    or wait_timeout_s <= 0.0
+                    or pending_rewrite is None
+                ):
+                    return cached
+
+        fallback_profile: LongTermQueryProfile
+        pending_rewrite = None
+        with self._cache_lock:
+            self._drain_completed_rewrite_locked(clean_query)
+            cached = self._cache.get(clean_query)
+            pending_rewrite = self._pending_rewrites.get(clean_query)
+            if cached is not None:
+                self._cache.move_to_end(clean_query)
+                if (
+                    cached.canonical_english_text is not None
+                    or wait_timeout_s <= 0.0
+                    or pending_rewrite is None
+                ):
+                    return cached
+                fallback_profile = cached
+            else:
+                fallback_profile = LongTermQueryProfile.from_text(clean_query)
+                self._cache[clean_query] = fallback_profile
+                self._cache.move_to_end(clean_query)
+                self._evict_cache_if_needed_locked()
+                self._ensure_background_rewrite_locked(clean_query)
+                if wait_timeout_s > 0.0:
+                    pending_rewrite = self._pending_rewrites.get(clean_query)
+
+        if wait_timeout_s <= 0.0 or pending_rewrite is None:
+            return fallback_profile
+
+        try:
+            pending_rewrite.result(timeout=wait_timeout_s)
+        except FutureTimeoutError:
+            return fallback_profile
+        except Exception:
+            return fallback_profile
 
         with self._cache_lock:
             self._drain_completed_rewrite_locked(clean_query)
@@ -298,20 +355,7 @@ class LongTermQueryRewriter:
             if cached is not None:
                 self._cache.move_to_end(clean_query)
                 return cached
-
-        with self._cache_lock:
-            self._drain_completed_rewrite_locked(clean_query)
-            cached = self._cache.get(clean_query)
-            if cached is not None:
-                self._cache.move_to_end(clean_query)
-                return cached
-
-            profile = LongTermQueryProfile.from_text(clean_query)
-            self._cache[clean_query] = profile
-            self._cache.move_to_end(clean_query)
-            self._evict_cache_if_needed_locked()
-            self._ensure_background_rewrite_locked(clean_query)
-            return profile
+        return fallback_profile
 
     def _evict_cache_if_needed_locked(self) -> None:
         # AUDIT-FIX(#1): Evict least-recently-used entries first to cap memory while preserving
@@ -323,17 +367,21 @@ class LongTermQueryRewriter:
                 pending.cancel()
 
     def _ensure_background_rewrite_locked(self, clean_query: str) -> None:
-        if self.backend is None or self._rewrite_executor is None:
+        if self.backend is None or self._rewrite_executor is None or not self._accepting_rewrites:
             return
         pending = self._pending_rewrites.get(clean_query)
         if pending is not None:
             if pending.done():
                 self._drain_completed_rewrite_locked(clean_query)
             return
-        self._pending_rewrites[clean_query] = self._rewrite_executor.submit(
-            self._canonicalize_query,
-            clean_query,
-        )
+        try:
+            self._pending_rewrites[clean_query] = self._rewrite_executor.submit(
+                self._canonicalize_query,
+                clean_query,
+            )
+        except RuntimeError:
+            _LOGGER.debug("Long-term query rewriter ignored one late submit after shutdown.")
+            self._accepting_rewrites = False
 
     def _drain_completed_rewrite_locked(self, clean_query: str) -> None:
         pending = self._pending_rewrites.get(clean_query)
@@ -415,6 +463,7 @@ class LongTermQueryRewriter:
         with self._cache_lock:
             pending_rewrites = tuple(self._pending_rewrites.values())
             self._pending_rewrites.clear()
+            self._accepting_rewrites = False
             if wait:
                 self._rewrite_executor = None
 
@@ -434,9 +483,7 @@ class LongTermQueryRewriter:
         if backend is None:
             return
         client = getattr(backend, "_client", None)
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()  # pylint: disable=not-callable
+        close_openai_client(client)
 
 
 __all__ = [

@@ -654,12 +654,12 @@ TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES=8
 TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=4
 TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=12.0
 TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.2
-TWINR_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator
+TWINR_ORCHESTRATOR_WS_URL=ws://thh-acer.local:8797/ws/orchestrator
 TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=true
 TWINR_VOICE_ORCHESTRATOR_ENABLED=true
-TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://192.168.1.154:8797/ws/orchestrator/voice
+TWINR_VOICE_ORCHESTRATOR_WS_URL=ws://thh-acer.local:8797/ws/orchestrator/voice
 TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true
-TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://192.168.1.154:8797
+TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://thh-acer.local:8797
 TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET=twinr-voice-gateway-20260322
 ```
 
@@ -684,6 +684,7 @@ The active realtime and streaming loops can also trigger the camera automaticall
 With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
 With `TWINR_VOICE_ORCHESTRATOR_ENABLED=true`, the Pi keeps one live websocket stream open to the transcript-first voice gateway and leaves wake detection there. The same remote stream stays authoritative for wake, transcript commit, continuation, and follow-up closure. Twinr has no separate local wake or STT path in the live product flow.
+On `/twinr`, those voice-gateway URLs must point to the development-host LAN bridge or mDNS name, not `127.0.0.1`; loopback there only points back to the Pi itself and will break live wake/reconnect.
 When the current development-host `:8797` bridge is used, both the text orchestrator probe path and the live voice gateway still run over plain `ws://` transport without TLS termination. Set `TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for the text `/ws/orchestrator` endpoint and `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for `/ws/orchestrator/voice` on that attested LAN bridge; prefer `wss://` whenever a TLS terminator is available.
 Remove any retired local voice-selector env from current deployments. The live runtime contract is remote-only and fails closed on legacy local-selector config.
 

@@ -255,6 +255,30 @@ class TwinrRuntimeTests(unittest.TestCase):
             self.assertEqual(restarted.memory.search_results[0].answer, "Am Montag um 14 Uhr.")
             self.assertIn("Verified web lookup", restarted.memory.turns[0].content)
 
+    def test_runtime_remember_search_result_truncates_excess_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+            many_sources = tuple(f"https://example.com/source-{index}" for index in range(42))
+
+            runtime.remember_search_result(
+                question="Was sind heute die wichtigsten Nachrichten fuer Deutschland im Web?",
+                answer="Drei kurze Punkte.",
+                sources=many_sources,
+            )
+
+            self.assertEqual(len(runtime.memory.search_results), 1)
+            self.assertEqual(runtime.memory.search_results[0].sources, many_sources[:8])
+
+            restarted = TwinrRuntime(
+                config=TwinrConfig(
+                    runtime_state_path=str(snapshot_path),
+                    restore_runtime_state_on_startup=True,
+                )
+            )
+
+            self.assertEqual(restarted.memory.search_results[0].sources, many_sources[:8])
+
     def test_runtime_persists_generic_memory_notes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "runtime-state.json"

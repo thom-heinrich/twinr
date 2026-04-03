@@ -93,6 +93,7 @@ class MaterializedProviderAnswerFront:
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="twinr-provider-front",
         )
+        self._accepting_work = True
 
     def enabled(self) -> bool:
         """Return whether remote-authoritative provider fronts are usable."""
@@ -100,9 +101,16 @@ class MaterializedProviderAnswerFront:
         return self.store.enabled()
 
     def shutdown(self, *, wait: bool = True) -> None:
-        """Release background resources for answer-front prewarms."""
+        """Release background resources and reject new answer-front jobs."""
 
-        self._executor.shutdown(wait=wait, cancel_futures=True)
+        executor: ThreadPoolExecutor | None
+        with self._lock:
+            self._accepting_work = False
+            executor = self._executor
+            if wait:
+                self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
 
     def generation(self) -> int:
         """Return the newest known current-head generation."""
@@ -186,6 +194,8 @@ class MaterializedProviderAnswerFront:
         if self._lookup_cached(normalized_keys) is not None:
             return False
         with self._lock:
+            if not self._accepting_work:
+                return False
             if primary_key in self._inflight:
                 return False
             if not sticky and self._speculative_inflight is not None and self._speculative_inflight != primary_key:
@@ -196,12 +206,19 @@ class MaterializedProviderAnswerFront:
                     sticky=sticky,
                 )
                 return False
-            future = self._executor.submit(
-                self._build_and_materialize_context,
-                query_keys=normalized_keys,
-                sticky_query_text=sticky_query_text,
-                build_context=build_context,
-            )
+            executor = self._executor
+            if executor is None:
+                return False
+            try:
+                future = executor.submit(
+                    self._build_and_materialize_context,
+                    query_keys=normalized_keys,
+                    sticky_query_text=sticky_query_text,
+                    build_context=build_context,
+                )
+            except RuntimeError:
+                self._accepting_work = False
+                return False
             self._inflight[primary_key] = future
             if not sticky:
                 self._speculative_inflight = primary_key
@@ -236,14 +253,23 @@ class MaterializedProviderAnswerFront:
         primary_key = normalized_keys[0]
         self._remember_sticky_query(normalized_keys=normalized_keys, sticky_query_text=sticky_query_text)
         with self._lock:
+            if not self._accepting_work:
+                return False
             if primary_key in self._inflight:
                 return False
-            future = self._executor.submit(
-                self._materialize_context,
-                query_keys=normalized_keys,
-                sticky_query_text=sticky_query_text,
-                context=context,
-            )
+            executor = self._executor
+            if executor is None:
+                return False
+            try:
+                future = executor.submit(
+                    self._materialize_context,
+                    query_keys=normalized_keys,
+                    sticky_query_text=sticky_query_text,
+                    context=context,
+                )
+            except RuntimeError:
+                self._accepting_work = False
+                return False
             self._inflight[primary_key] = future
             future.add_done_callback(
                 lambda finished, *, callback_keys=normalized_keys: self._complete_async_materialization(
@@ -276,6 +302,8 @@ class MaterializedProviderAnswerFront:
         """Request eager rebuilds for sticky queries after invalidation/startup."""
 
         with self._lock:
+            if not self._accepting_work:
+                return 0
             recent_queries = tuple(self._recent_queries.values())
         for query_text in recent_queries:
             build_for_query(query_text)

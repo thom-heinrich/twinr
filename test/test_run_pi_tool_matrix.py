@@ -76,6 +76,47 @@ def test_tool_matrix_context_uses_unique_remote_memory_namespace() -> None:
     assert "TWINR_LONG_TERM_MEMORY_REMOTE_NAMESPACE=pi_tool_matrix_" in env_text
 
 
+def test_tool_matrix_context_make_loop_authorizes_sensitive_tools_by_default(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "personality").mkdir()
+        env_path = root / ".env"
+        env_path.write_text("OPENAI_API_KEY=test\n", encoding="utf-8")
+
+        authorizations: list[str] = []
+
+        class FakeRuntime:
+            def __init__(self, *, config) -> None:
+                self.config = config
+
+            def update_user_voice_assessment(self, **kwargs) -> None:
+                del kwargs
+
+        class FakeLoop:
+            def __init__(self, **kwargs) -> None:
+                self.config = kwargs["config"]
+                self.runtime = kwargs["runtime"]
+                self._runtime_tool_names = ()
+                self._tool_handlers = {}
+                self.realtime_session = SimpleNamespace(_tool_handlers={})
+
+            def authorize_realtime_sensitive_tools(self, reason: str = "explicit") -> tuple[str, ...]:
+                authorizations.append(reason)
+                return ()
+
+        monkeypatch.setattr(matrix, "TwinrRuntime", FakeRuntime)
+        monkeypatch.setattr(matrix, "TwinrStreamingHardwareLoop", FakeLoop)
+
+        context = matrix.ToolMatrixContext(base_env_path=env_path)
+        try:
+            loop = context.make_loop(emitted=[])
+        finally:
+            context.close()
+
+    assert authorizations == ["pi_tool_matrix"]
+    assert isinstance(loop, FakeLoop)
+
+
 def test_seed_conflict_reuses_existing_loop_without_booting_a_second_runtime() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)

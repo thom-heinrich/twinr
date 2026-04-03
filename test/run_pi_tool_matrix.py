@@ -10,7 +10,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,20 +35,27 @@ from twinr.agent.tools import (
     realtime_tool_names,
 )
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+from twinr.display.service_connect_cues import DisplayServiceConnectCueStore
 from twinr.memory.longterm.core.models import (
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+import twinr.channels.whatsapp.pairing as whatsapp_pairing
 import twinr.agent.tools.handlers.smarthome as smart_home_handlers
 import twinr.agent.workflows.realtime_runner as realtime_runner_module
 from test.pi_tool_matrix_support import (
     MatrixHouseholdIdentityManager,
     MatrixPortraitProvider,
+    MatrixServiceConnectCoordinator,
     MatrixSelfCodingCompileDriver,
     MatrixSmartHomeProvider,
+    MatrixWhatsAppDispatch,
     MatrixWorldRemoteState,
+    install_matrix_whatsapp_runtime,
+    matrix_service_connect_probe,
     matrix_world_feed_items,
+    write_matrix_browser_workspace,
 )
 from test.pi_tool_matrix_catalog import available_matrix_groups, normalize_matrix_groups
 
@@ -204,6 +211,7 @@ class ToolMatrixContext:
             "TWINR_PROACTIVE_ENABLED=false",
             "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=false",
             "TWINR_SEARCH_FEEDBACK_TONES_ENABLED=false",
+            "TWINR_WHATSAPP_ALLOW_FROM=+15555550100",
         ]
         self.env_path.write_text(base_env_text.rstrip() + "\n" + "\n".join(overrides) + "\n", encoding="utf-8")
         self.printer = CapturingPrinter()
@@ -215,12 +223,36 @@ class ToolMatrixContext:
         self.smart_home_adapter = self.smart_home_provider.build_adapter()
         self.world_remote_state = MatrixWorldRemoteState()
         self.self_coding_compile_driver = MatrixSelfCodingCompileDriver()
+        self.whatsapp_dispatch = MatrixWhatsAppDispatch()
 
     def close(self) -> None:
         self.temp_dir.cleanup()
 
-    def make_loop(self, *, emitted: list[str]) -> TwinrStreamingHardwareLoop:
+    def prepare_browser_workspace(self) -> None:
+        """Create the optional browser workspace used by browser scenarios."""
+
+        write_matrix_browser_workspace(self.root)
+
+    def prepare_whatsapp_runtime(self) -> None:
+        """Create the minimal local WhatsApp runtime files for matrix runs."""
+
+        install_matrix_whatsapp_runtime(self.root)
+
+    def make_loop(
+        self,
+        *,
+        emitted: list[str],
+        enable_browser_automation: bool = False,
+        enable_whatsapp_tools: bool = False,
+        authorize_sensitive_tools: bool = True,
+    ) -> TwinrStreamingHardwareLoop:
+        if enable_browser_automation:
+            self.prepare_browser_workspace()
+        if enable_whatsapp_tools:
+            self.prepare_whatsapp_runtime()
         config = TwinrConfig.from_env(self.env_path)
+        if enable_browser_automation:
+            config = replace(config, browser_automation_enabled=True)
         runtime = TwinrRuntime(config=config)
         runtime.update_user_voice_assessment(
             status="likely_user",
@@ -239,6 +271,13 @@ class ToolMatrixContext:
         )
         loop._portrait_identity_tool_provider = self.portrait_provider
         loop.household_identity_manager = self.household_identity_manager
+        if enable_whatsapp_tools:
+            loop.dispatch_whatsapp_outbound_message = self.whatsapp_dispatch.dispatch  # type: ignore[attr-defined]
+        if authorize_sensitive_tools:
+            # The live matrix validates the full runtime tool surface, including
+            # camera, printer, and outbound messaging paths that are normally
+            # identity-gated in ambient voice mode.
+            loop.authorize_realtime_sensitive_tools("pi_tool_matrix")
         return loop
 
     def install_self_coding_driver(self, loop: TwinrStreamingHardwareLoop) -> None:
@@ -297,6 +336,24 @@ class ToolMatrixContext:
 
         smart_home_handlers.build_smart_home_hub_adapter = originals[0]
         realtime_runner_module.build_smart_home_hub_adapter = originals[1]
+
+    def patch_service_connect_helpers(self) -> tuple[object, object]:
+        """Route service-connect WhatsApp helpers to deterministic matrix stubs."""
+
+        originals = (
+            whatsapp_pairing.probe_whatsapp_runtime,
+            whatsapp_pairing.WhatsAppPairingCoordinator,
+        )
+        whatsapp_pairing.probe_whatsapp_runtime = lambda *args, **kwargs: matrix_service_connect_probe()
+        whatsapp_pairing.WhatsAppPairingCoordinator = MatrixServiceConnectCoordinator
+        return originals
+
+    @staticmethod
+    def restore_service_connect_helpers(originals: tuple[object, object]) -> None:
+        """Restore the original service-connect WhatsApp helpers."""
+
+        whatsapp_pairing.probe_whatsapp_runtime = originals[0]
+        whatsapp_pairing.WhatsAppPairingCoordinator = originals[1]
 
     def seed_conflict(
         self,
@@ -604,6 +661,7 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
     selected_groups = normalize_matrix_groups(groups)
     context = ToolMatrixContext(base_env_path=base_env_path)
     smart_home_builder_originals = context.patch_smart_home_builders()
+    service_connect_originals = context.patch_service_connect_helpers()
     try:
         def group_enabled(group_name: str) -> bool:
             return group_name in selected_groups
@@ -671,6 +729,131 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
                 _pass(entries, "end_conversation", "single_turn", detail)
             else:
                 _fail(entries, "end_conversation", "single_turn", detail or "conversation did not end")
+
+            loop = context.make_loop(emitted=[])
+            artifact = run_text_turn(
+                loop,
+                "Bitte sei jetzt fuer 20 Minuten ruhig, damit der Fernseher dich nicht dauernd wieder aktiviert.",
+            )
+            record("manage_voice_quiet_mode_set_single", artifact)
+            ok, detail = _assert_tools(artifact, required=("manage_voice_quiet_mode",))
+            if ok and loop.runtime.voice_quiet_active():
+                _pass(entries, "manage_voice_quiet_mode", "single_turn", detail)
+            else:
+                _fail(entries, "manage_voice_quiet_mode", "single_turn", detail or "quiet mode did not activate")
+
+            artifact = run_text_turn(loop, "Bist du gerade ruhig oder hoerst du normal zu?")
+            record("manage_voice_quiet_mode_status_multi", artifact)
+            ok, detail = _assert_tools(artifact, required=("manage_voice_quiet_mode",))
+            if ok and loop.runtime.voice_quiet_active():
+                _pass(entries, "manage_voice_quiet_mode", "multi_turn", detail)
+            else:
+                _fail(entries, "manage_voice_quiet_mode", "multi_turn", detail or "quiet mode status follow-up failed")
+
+            loop = context.make_loop(emitted=[])
+            artifact = run_text_turn(loop, "Bist du gerade ruhig oder hoerst du normal zu?")
+            record("manage_voice_quiet_mode_status_persistence", artifact)
+            ok, detail = _assert_tools(artifact, required=("manage_voice_quiet_mode",))
+            if ok and loop.runtime.voice_quiet_active():
+                _pass(entries, "manage_voice_quiet_mode", "persistence", "quiet mode survived runtime restart")
+            else:
+                _fail(entries, "manage_voice_quiet_mode", "persistence", detail or "quiet mode did not survive restart")
+
+            artifact = run_text_turn(loop, "Bitte hoer jetzt wieder normal zu.")
+            record("manage_voice_quiet_mode_clear_multi", artifact)
+            ok, detail = _assert_tools(artifact, required=("manage_voice_quiet_mode",))
+            if ok and not loop.runtime.voice_quiet_active():
+                _pass(entries, "manage_voice_quiet_mode", "multi_turn", "clear succeeded after follow-up")
+            else:
+                _fail(entries, "manage_voice_quiet_mode", "multi_turn", detail or "quiet mode did not clear")
+
+            loop = context.make_loop(emitted=[])
+            artifact = run_text_turn(loop, "Bist du gerade ruhig oder hoerst du normal zu?")
+            record("manage_voice_quiet_mode_clear_persistence", artifact)
+            ok, detail = _assert_tools(artifact, required=("manage_voice_quiet_mode",))
+            if ok and not loop.runtime.voice_quiet_active():
+                _pass(entries, "manage_voice_quiet_mode", "persistence", "cleared quiet mode stayed cleared after restart")
+            else:
+                _fail(entries, "manage_voice_quiet_mode", "persistence", detail or "cleared quiet mode reappeared")
+
+        if group_enabled("browser_channels"):
+            loop = context.make_loop(emitted=[], enable_browser_automation=True)
+            artifact = run_text_turn(
+                loop,
+                "Bitte pruefe direkt auf example.org auf der Website selbst, ob dort aktuell Oeffnungszeiten sichtbar sind. Nutze die Website direkt und nicht nur eine normale Websuche.",
+            )
+            record("browser_automation_single", artifact)
+            ok, detail = _assert_tools(
+                artifact,
+                required=("browser_automation",),
+                allowed=("search_live_info", "browser_automation"),
+            )
+            browser_call = next(
+                (call for call in artifact.raw_tool_calls if call.get("name") == "browser_automation"),
+                None,
+            )
+            browser_arguments = browser_call.get("arguments", {}) if isinstance(browser_call, dict) else {}
+            browser_domains = tuple(
+                str(item).strip().lower()
+                for item in browser_arguments.get("allowed_domains", ())
+                if str(item).strip()
+            )
+            if ok and "example.org" in browser_domains and bool(artifact.answer.strip()):
+                _pass(entries, "browser_automation", "single_turn", detail)
+            else:
+                _fail(entries, "browser_automation", "single_turn", detail or "browser automation did not target example.org")
+
+            loop = context.make_loop(emitted=[])
+            artifact = run_text_turn(loop, "Bitte verbinde jetzt WhatsApp mit Twinr.")
+            record("connect_service_integration_single", artifact)
+            ok, detail = _assert_tools(artifact, required=("connect_service_integration",))
+            cue = DisplayServiceConnectCueStore.from_config(loop.config).load()
+            if ok and cue is not None and cue.service_id == "whatsapp" and cue.phase == "starting":
+                _pass(entries, "connect_service_integration", "single_turn", detail)
+            else:
+                _fail(entries, "connect_service_integration", "single_turn", detail or "service-connect cue missing")
+
+            loop = context.make_loop(emitted=[], enable_whatsapp_tools=True)
+            loop._handle_remember_contact_tool_call(
+                {
+                    "given_name": "Anna",
+                    "family_name": "Schulz",
+                    "phone": "+15555552233",
+                    "role": "Tochter",
+                    "confirmed": True,
+                }
+            )
+            artifact = run_text_turn(
+                loop,
+                "Schreib bitte meiner Tochter Anna Schulz per WhatsApp genau: Ich komme spaeter.",
+            )
+            record("send_whatsapp_message_single", artifact)
+            ok, detail = _assert_tools(
+                artifact,
+                required=("send_whatsapp_message",),
+                allowed=("lookup_contact", "send_whatsapp_message"),
+            )
+            if ok and not context.whatsapp_dispatch.sent_messages:
+                _pass(entries, "send_whatsapp_message", "single_turn", detail)
+            else:
+                _fail(entries, "send_whatsapp_message", "single_turn", detail or "WhatsApp confirmation step missing")
+
+            artifact = run_text_turn(loop, "Ja, sende diese WhatsApp an Anna Schulz jetzt genau so.")
+            record("send_whatsapp_message_multi", artifact)
+            ok, detail = _assert_tools(
+                artifact,
+                required=("send_whatsapp_message",),
+                allowed=("lookup_contact", "send_whatsapp_message"),
+            )
+            if (
+                ok
+                and context.whatsapp_dispatch.sent_messages
+                and context.whatsapp_dispatch.sent_messages[-1]["recipient_label"] == "Anna Schulz"
+                and context.whatsapp_dispatch.sent_messages[-1]["text"] == "Ich komme spaeter."
+            ):
+                _pass(entries, "send_whatsapp_message", "multi_turn", detail)
+            else:
+                _fail(entries, "send_whatsapp_message", "multi_turn", detail or "WhatsApp send did not complete")
 
         if group_enabled("reminder_automation"):
             loop = context.make_loop(emitted=[])
@@ -1457,6 +1640,7 @@ def run_matrix(base_env_path: Path, *, groups: tuple[str, ...] | None = None) ->
 
     finally:
         ToolMatrixContext.restore_smart_home_builders(smart_home_builder_originals)
+        ToolMatrixContext.restore_service_connect_helpers(service_connect_originals)
         project_root = str(context.root)
         memory_markdown_path = str(context.state_dir / "MEMORY.md")
         reminder_store_path = str(context.state_dir / "reminders.json")

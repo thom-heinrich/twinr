@@ -26,10 +26,11 @@ Outputs
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from _repo_python import PROJECT_ROOT, ensure_repo_python
+
+ensure_repo_python()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from twinr.ops.remote_chonkydb_host_stabilizer import main  # noqa: E402

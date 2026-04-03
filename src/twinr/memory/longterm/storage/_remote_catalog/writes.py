@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 import time
 from uuid import uuid4
@@ -17,8 +18,11 @@ from twinr.memory.chonkydb.models import (
 )
 from twinr.memory.longterm.storage._remote_retry import (
     clone_client_with_capped_timeout,
+    is_rate_limited_remote_write_error,
     remote_write_retry_delay_s,
+    raise_if_remote_operation_cancelled,
     retryable_remote_write_attempts,
+    sleep_with_remote_operation_abort,
     should_fallback_async_job_resolution_error,
     should_retry_remote_write_error,
 )
@@ -52,13 +56,38 @@ _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
         "conflicts",
     }
 )
+_SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
+    {
+        "archive",
+        "conflicts",
+        "graph_edges",
+        "graph_nodes",
+        "midterm",
+        "objects",
+    }
+)
 _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
     {
         "objects",
         "conflicts",
         "archive",
+        "graph_edges",
+        "graph_nodes",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _AttestedRecordMatch:
+    """Represent one successful record attestation candidate.
+
+    Same-URI ChonkyDB reads can return the expected Twinr payload without an
+    exact `document_id`. The attestation path must treat that as a successful
+    visibility proof instead of overloading `None` as both "matched without an
+    id" and "no matching payload was found".
+    """
+
+    document_id: str | None
 
 
 class RemoteCatalogWriteMixin:
@@ -71,6 +100,8 @@ class RemoteCatalogWriteMixin:
         metadata_builder,
         content_builder,
         replace_invalid_current_head: bool = False,
+        attest_readback: bool = True,
+        skip_async_document_id_wait: bool = False,
     ) -> dict[str, object]:
         """Persist individual remote items and return the small current catalog."""
 
@@ -158,6 +189,8 @@ class RemoteCatalogWriteMixin:
             write_client,
             snapshot_kind=definition.snapshot_kind,
             record_items=record_items,
+            attest_readback=attest_readback,
+            skip_async_document_id_wait=skip_async_document_id_wait,
         )
         for index, (item_id, metadata, _payload_sha256, payload) in enumerate(staged):
             catalog_entries.append(
@@ -171,6 +204,8 @@ class RemoteCatalogWriteMixin:
             write_client,
             definition=definition,
             catalog_entries=catalog_entries,
+            attest_readback=attest_readback,
+            skip_async_document_id_wait=skip_async_document_id_wait,
         )
         self._store_catalog_entries(
             snapshot_kind=definition.snapshot_kind,
@@ -202,6 +237,7 @@ class RemoteCatalogWriteMixin:
         snapshot_kind: str,
         entries: Iterable[LongTermRemoteCatalogEntry],
         written_at: str | None = None,
+        skip_async_document_id_wait: bool = False,
     ) -> dict[str, object]:
         """Persist only the current catalog head/segments for existing item docs."""
 
@@ -222,6 +258,7 @@ class RemoteCatalogWriteMixin:
             write_client,
             definition=definition,
             catalog_entries=catalog_entries,
+            skip_async_document_id_wait=skip_async_document_id_wait,
         )
         self._store_catalog_entries(
             snapshot_kind=definition.snapshot_kind,
@@ -244,7 +281,11 @@ class RemoteCatalogWriteMixin:
         }
         if isinstance(written_at, str) and written_at.strip():
             payload["written_at"] = written_at
-        self.persist_catalog_payload(snapshot_kind=snapshot_kind, payload=payload)
+        self.persist_catalog_payload(
+            snapshot_kind=snapshot_kind,
+            payload=payload,
+            skip_async_document_id_wait=skip_async_document_id_wait,
+        )
         return payload
 
     def persist_catalog_payload(
@@ -253,6 +294,7 @@ class RemoteCatalogWriteMixin:
         snapshot_kind: str,
         payload: Mapping[str, object],
         attest_readback: bool = True,
+        skip_async_document_id_wait: bool = False,
     ) -> dict[str, object]:
         """Persist the authoritative current catalog head as one fixed-URI record."""
 
@@ -291,6 +333,7 @@ class RemoteCatalogWriteMixin:
                 )
             ],
             attest_readback=attest_readback,
+            skip_async_document_id_wait=skip_async_document_id_wait,
         )
         self._store_recent_catalog_head_payload(snapshot_kind=definition.snapshot_kind, payload=payload_dict)
         return payload_dict
@@ -924,6 +967,8 @@ class RemoteCatalogWriteMixin:
         *,
         definition: _RemoteCollectionDefinition,
         catalog_entries: list[dict[str, object]],
+        attest_readback: bool = True,
+        skip_async_document_id_wait: bool = False,
     ) -> tuple[dict[str, object], ...]:
         segment_batches = self._split_catalog_segment_entries(catalog_entries)
         if not segment_batches:
@@ -962,6 +1007,8 @@ class RemoteCatalogWriteMixin:
             write_client,
             snapshot_kind=definition.snapshot_kind,
             record_items=record_items,
+            attest_readback=attest_readback,
+            skip_async_document_id_wait=skip_async_document_id_wait,
         )
         refs: list[dict[str, object]] = []
         for segment_index, segment_entries in enumerate(segment_batches):
@@ -1030,6 +1077,7 @@ class RemoteCatalogWriteMixin:
         snapshot_kind: str,
         record_items: list[ChonkyDBRecordItem],
         attest_readback: bool = True,
+        skip_async_document_id_wait: bool = False,
     ) -> tuple[str | None, ...]:
         if not record_items:
             return ()
@@ -1046,6 +1094,7 @@ class RemoteCatalogWriteMixin:
                     batch_count=total_batches,
                     finalize_vector_segments=index + 1 >= len(batches),
                     attest_readback=attest_readback,
+                    skip_async_document_id_wait=skip_async_document_id_wait,
                 )
             )
         return tuple(document_ids)
@@ -1060,19 +1109,41 @@ class RemoteCatalogWriteMixin:
         batch_count: int,
         finalize_vector_segments: bool,
         attest_readback: bool,
+        skip_async_document_id_wait: bool,
     ) -> tuple[str | None, ...]:
         retry_attempts = max(1, self._remote_retry_attempts())
         retry_backoff_s = self._remote_retry_backoff_s()
         attempt_index = 0
         while attempt_index < retry_attempts:
+            raise_if_remote_operation_cancelled(operation="Remote catalog write")
             request_correlation_id = self._new_remote_write_correlation_id()
             async_job_timeout_s = self._remote_async_job_timeout_s(snapshot_kind=snapshot_kind)
             request_payload_kind = self._record_batch_payload_kind(batch=batch)
             access_classification = self._record_batch_access_classification(batch=batch)
+            # Projection-complete callers may defer fine-grained item ids because
+            # the catalog metadata already carries the bounded follow-up proof.
+            # Immutable control-plane docs still need the jobs endpoint when it
+            # is available; otherwise repeated namespaces/retries can attach
+            # readback to stale same-URI history instead of the accepted record.
+            projection_complete_document_ids_optional = (
+                skip_async_document_id_wait
+                and request_payload_kind == "fine_grained_record_batch"
+            )
             execution_mode = self._bulk_execution_mode(
                 snapshot_kind=snapshot_kind,
                 batch=batch,
                 request_payload_kind=request_payload_kind,
+                skip_async_document_id_wait=skip_async_document_id_wait,
+            )
+            write_transport_timeout_s = self._remote_write_timeout_s()
+            if execution_mode == "async":
+                write_transport_timeout_s = max(
+                    self._remote_flush_timeout_s(),
+                    write_transport_timeout_s or 0.0,
+                )
+            effective_write_client = self._client_with_timeout(
+                write_client,
+                timeout_s=write_transport_timeout_s,
             )
             request = ChonkyDBBulkRecordRequest(
                 items=batch,
@@ -1083,8 +1154,15 @@ class RemoteCatalogWriteMixin:
             )
             request_bytes = self._bulk_request_bytes(request)
             started_monotonic = time.monotonic()
+            store_transport_ms: float | None = None
+            async_job_wait_ms: float | None = None
+            readback_attestation_ms: float | None = None
+            async_job_resolution_source: str | None = None
+            attestation_mode: str | None = None
+            readback_required: bool | None = None
             try:
-                result = getattr(write_client, "store_records_bulk")(request)
+                result = getattr(effective_write_client, "store_records_bulk")(request)
+                store_transport_ms = max(0.0, (time.monotonic() - started_monotonic) * 1000.0)
                 failure_detail = self._store_result_failure_detail(result)
                 if failure_detail:
                     raise ChonkyDBError(
@@ -1102,8 +1180,12 @@ class RemoteCatalogWriteMixin:
                 async_job_resolution_available = bool(
                     self._normalize_text(result.get("job_id")) if isinstance(result, Mapping) else None
                 ) and callable(getattr(write_client, "job_status", None))
+                if all(isinstance(value, str) and value for value in extracted_document_ids):
+                    async_job_resolution_source = "response"
                 if (
-                    self._can_skip_async_job_document_id_wait(
+                    not attest_readback
+                    or projection_complete_document_ids_optional
+                    or self._can_skip_async_job_document_id_wait(
                         snapshot_kind=snapshot_kind,
                         batch=batch,
                         document_ids=extracted_document_ids,
@@ -1112,27 +1194,58 @@ class RemoteCatalogWriteMixin:
                     or not async_job_resolution_available
                 ):
                     job_document_ids = None
+                    if async_job_resolution_source is None:
+                        if not attest_readback:
+                            async_job_resolution_source = "skipped_attestation_disabled"
+                        elif projection_complete_document_ids_optional:
+                            async_job_resolution_source = "skipped_projection_complete"
+                        elif not async_job_resolution_available:
+                            async_job_resolution_source = "unavailable"
+                        elif fine_grained_attestation_optional and async_job_resolution_budget_s < async_job_poll_interval_s:
+                            async_job_resolution_source = "skipped_projection_complete"
+                        else:
+                            async_job_resolution_source = "response"
                 else:
-                    job_document_ids = self._await_async_job_document_ids(
-                        write_client,
-                        result=result,
-                        expected=len(batch),
-                        snapshot_kind=snapshot_kind,
-                    )
+                    job_wait_started = time.monotonic()
+                    try:
+                        job_document_ids = self._await_async_job_document_ids(
+                            write_client,
+                            result=result,
+                            expected=len(batch),
+                            snapshot_kind=snapshot_kind,
+                        )
+                    finally:
+                        async_job_wait_ms = max(0.0, (time.monotonic() - job_wait_started) * 1000.0)
                 if job_document_ids is not None:
                     extracted_document_ids = job_document_ids
+                    async_job_resolution_source = "job_status"
                 if not attest_readback:
+                    attestation_mode = "disabled"
+                    readback_required = False
                     resolved_document_ids = extracted_document_ids
                 elif all(isinstance(value, str) and value for value in extracted_document_ids):
+                    attestation_mode = "exact_document_ids"
+                    readback_required = False
                     resolved_document_ids = extracted_document_ids
-                elif fine_grained_attestation_optional and async_job_resolution_available:
+                elif (
+                    projection_complete_document_ids_optional
+                    or (fine_grained_attestation_optional and async_job_resolution_available)
+                ):
+                    attestation_mode = "deferred_projection_complete"
+                    readback_required = False
                     resolved_document_ids = extracted_document_ids
                 else:
-                    resolved_document_ids = self._attest_record_batch_readback(
-                        snapshot_kind=snapshot_kind,
-                        record_items=batch,
-                        document_ids=extracted_document_ids,
-                    )
+                    attestation_mode = "readback"
+                    readback_required = True
+                    readback_started = time.monotonic()
+                    try:
+                        resolved_document_ids = self._attest_record_batch_readback(
+                            snapshot_kind=snapshot_kind,
+                            record_items=batch,
+                            document_ids=extracted_document_ids,
+                        )
+                    finally:
+                        readback_attestation_ms = max(0.0, (time.monotonic() - readback_started) * 1000.0)
                 record_remote_write_observation(
                     remote_state=self._require_remote_state(),
                     context=LongTermRemoteWriteContext(
@@ -1150,6 +1263,13 @@ class RemoteCatalogWriteMixin:
                         batch_index=batch_index,
                         batch_count=batch_count,
                         request_bytes=request_bytes,
+                        request_execution_mode=execution_mode,
+                        async_job_resolution_source=async_job_resolution_source,
+                        attestation_mode=attestation_mode,
+                        readback_required=readback_required,
+                        store_transport_ms=store_transport_ms,
+                        async_job_wait_ms=async_job_wait_ms,
+                        readback_attestation_ms=readback_attestation_ms,
                         uri_hint=self._normalize_text(getattr(batch[0], "uri", None)) if len(batch) == 1 else None,
                     ),
                     latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
@@ -1158,21 +1278,45 @@ class RemoteCatalogWriteMixin:
                 )
                 return resolved_document_ids
             except Exception as exc:
+                if (
+                    execution_mode == "async"
+                    and len(batch) > 1
+                    and is_rate_limited_remote_write_error(exc)
+                ):
+                    return self._store_rate_limited_record_subbatches(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        batch=batch,
+                        finalize_vector_segments=finalize_vector_segments,
+                        attest_readback=attest_readback,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                    )
                 retry_attempts = retryable_remote_write_attempts(retry_attempts, exc=exc)
                 if should_retry_remote_write_error(exc) and attempt_index + 1 < retry_attempts:
+                    raise_if_remote_operation_cancelled(operation="Remote catalog write")
                     delay_s = remote_write_retry_delay_s(
                         exc,
                         default_backoff_s=retry_backoff_s,
                         attempt_index=attempt_index,
                     )
                     if delay_s > 0.0:
-                        time.sleep(delay_s)
+                        sleep_with_remote_operation_abort(
+                            delay_s,
+                            operation="Remote catalog write retry",
+                        )
                     attempt_index += 1
                     continue
                 remote_state = self._require_remote_state()
                 remote_write_context = {
                     "snapshot_kind": snapshot_kind,
                     "operation": "store_records_bulk",
+                    "request_path": "/v1/external/records/bulk",
+                    "request_payload_kind": request_payload_kind,
+                    "request_execution_mode": execution_mode,
+                    "timeout_s": async_job_timeout_s,
+                    "attestation_mode": attestation_mode,
+                    "readback_required": readback_required,
+                    "attempt_count": attempt_index + 1,
                     "request_correlation_id": request_correlation_id,
                     "batch_index": batch_index,
                     "batch_count": batch_count,
@@ -1196,6 +1340,13 @@ class RemoteCatalogWriteMixin:
                         batch_index=batch_index,
                         batch_count=batch_count,
                         request_bytes=request_bytes,
+                        request_execution_mode=execution_mode,
+                        async_job_resolution_source=async_job_resolution_source,
+                        attestation_mode=attestation_mode,
+                        readback_required=readback_required,
+                        store_transport_ms=store_transport_ms,
+                        async_job_wait_ms=async_job_wait_ms,
+                        readback_attestation_ms=readback_attestation_ms,
                     ),
                     exc=exc,
                     started_monotonic=started_monotonic,
@@ -1208,6 +1359,48 @@ class RemoteCatalogWriteMixin:
                 )
                 setattr(unavailable, "remote_write_context", remote_write_context)
                 raise unavailable from exc
+
+    def _store_rate_limited_record_subbatches(
+        self,
+        write_client: object,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        finalize_vector_segments: bool,
+        attest_readback: bool,
+        skip_async_document_id_wait: bool,
+    ) -> tuple[str | None, ...]:
+        """Retry one rejected async batch by splitting it into smaller pieces.
+
+        Live ChonkyDB can reject multi-item async writes with `429 queue_saturated`
+        even when the individual items succeed immediately once the queue burden
+        per job drops. Splitting only the already rejected batch keeps the normal
+        high-throughput path unchanged while reacting to proven backend
+        backpressure with a smaller request shape.
+        """
+
+        if len(batch) <= 1:
+            raise LongTermRemoteUnavailableError(
+                "Cannot split a single-item async batch after a queue_saturated rejection."
+            )
+        midpoint = max(1, len(batch) // 2)
+        subbatches = tuple(part for part in (batch[:midpoint], batch[midpoint:]) if part)
+        document_ids: list[str | None] = []
+        subbatch_count = len(subbatches)
+        for index, subbatch in enumerate(subbatches, start=1):
+            document_ids.extend(
+                self._store_record_batch_with_retries(
+                    write_client,
+                    snapshot_kind=snapshot_kind,
+                    batch=subbatch,
+                    batch_index=index,
+                    batch_count=subbatch_count,
+                    finalize_vector_segments=finalize_vector_segments and index >= subbatch_count,
+                    attest_readback=attest_readback,
+                    skip_async_document_id_wait=skip_async_document_id_wait,
+                )
+            )
+        return tuple(document_ids)
 
     def _record_batch_payload_kind(self, *, batch: tuple[ChonkyDBRecordItem, ...]) -> str:
         """Classify one bulk-write batch by the dominant URI contract it carries."""
@@ -1272,8 +1465,8 @@ class RemoteCatalogWriteMixin:
         ids may skip the jobs endpoint entirely.
         """
 
-        del snapshot_kind
-        del batch
+        if snapshot_kind in {"graph_nodes", "graph_edges"}:
+            return True
         return all(isinstance(value, str) and value for value in document_ids)
 
     def _bulk_execution_mode(
@@ -1282,25 +1475,38 @@ class RemoteCatalogWriteMixin:
         snapshot_kind: str,
         batch: tuple[ChonkyDBRecordItem, ...],
         request_payload_kind: str,
+        skip_async_document_id_wait: bool,
     ) -> str:
-        """Choose sync only for tiny one-item control-plane batches.
+        """Choose sync only for tiny one-item current-head control-plane batches.
 
         Conflicts stay small enough that the async job overhead can dominate the
-        actual write. Prompt/context current-head and segment writes are also
-        tiny, but live ChonkyDB evidence shows the sync `/records/bulk` path can
-        still trigger heavyweight fulltext index loads in the request thread for
-        those batches. That stalls the caller long enough to produce transport
-        timeouts and backend lock contention, so only conflicts remain on the
-        sync fast path. Graph writes already stay async for the same reason.
+        actual write. Live ChonkyDB evidence also shows a sharp difference
+        between projection-complete current-head and segment writes: the fixed
+        `.../catalog/current` record stays small enough to complete on the sync
+        `/records/bulk` path, but `.../catalog/segment/...` payloads still
+        trigger enough indexing work in the request thread to hit the transport
+        read timeout even when they only carry one item. Fine-grained payloads
+        therefore remain async, and projection-complete writers only bypass the
+        async queue for the current-head document whose payload is both tiny and
+        authoritative for follow-up reads.
         """
 
-        if snapshot_kind not in _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS or len(batch) != 1:
+        if len(batch) != 1:
             return "async"
         if request_payload_kind not in {
             "fine_grained_record_batch",
             "catalog_current_head_record_batch",
             "catalog_segment_record_batch",
         }:
+            return "async"
+        sync_enabled = snapshot_kind in _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS
+        if (
+            skip_async_document_id_wait
+            and request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind in _SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS
+        ):
+            sync_enabled = True
+        if not sync_enabled:
             return "async"
         preview_request = ChonkyDBBulkRecordRequest(
             items=batch,
@@ -1369,6 +1575,7 @@ class RemoteCatalogWriteMixin:
         total_timeout_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
         deadline = time.monotonic() + total_timeout_s
         while True:
+            raise_if_remote_operation_cancelled(operation="Remote catalog async-job wait")
             remaining_timeout_s = deadline - time.monotonic()
             if remaining_timeout_s <= 0.0:
                 break
@@ -1404,7 +1611,10 @@ class RemoteCatalogWriteMixin:
             if remaining_sleep_s <= 0.0:
                 break
             if poll_interval_s > 0.0:
-                time.sleep(min(poll_interval_s, remaining_sleep_s))
+                sleep_with_remote_operation_abort(
+                    min(poll_interval_s, remaining_sleep_s),
+                    operation="Remote catalog async-job wait",
+                )
         return None
 
     def _attest_record_readback(
@@ -1436,10 +1646,12 @@ class RemoteCatalogWriteMixin:
         )
         deadline = time.monotonic() + visibility_timeout_s
         while True:
+            raise_if_remote_operation_cancelled(operation="Remote catalog readback attestation")
             remaining_timeout_s = deadline - time.monotonic()
             if remaining_timeout_s <= 0.0:
                 break
             for probe_document_id, probe_uri in probe_targets:
+                raise_if_remote_operation_cancelled(operation="Remote catalog readback attestation")
                 remaining_timeout_s = deadline - time.monotonic()
                 if remaining_timeout_s <= 0.0:
                     break
@@ -1454,18 +1666,21 @@ class RemoteCatalogWriteMixin:
                 except Exception as exc:
                     last_detail = str(exc)
                     continue
-                matched_document_id = self._match_attested_record_document_id(
+                matched_record = self._match_attested_record_document_id(
                     envelope,
                     expected_payloads=expected_payloads,
                 )
-                if matched_document_id is not None:
-                    return matched_document_id
+                if matched_record is not None:
+                    return matched_record.document_id
                 last_detail = "Remote write attestation read back a different same-uri document."
             remaining_sleep_s = deadline - time.monotonic()
             if remaining_sleep_s <= 0.0:
                 break
             if poll_interval_s > 0.0:
-                time.sleep(min(poll_interval_s, remaining_sleep_s))
+                sleep_with_remote_operation_abort(
+                    min(poll_interval_s, remaining_sleep_s),
+                    operation="Remote catalog readback attestation",
+                )
         raise LongTermRemoteUnavailableError(
             f"Accepted remote long-term {snapshot_kind!r} write could not be read back: {last_detail}"
         )
@@ -1581,12 +1796,12 @@ class RemoteCatalogWriteMixin:
         payload: object,
         *,
         expected_payloads: tuple[Mapping[str, object], ...],
-    ) -> str | None:
+    ) -> _AttestedRecordMatch | None:
         if not isinstance(payload, Mapping):
             return None
         for candidate, candidate_document_id in self._iter_attestation_candidates(payload):
             if any(candidate == expected for expected in expected_payloads):
-                return candidate_document_id
+                return _AttestedRecordMatch(document_id=candidate_document_id)
         return None
 
     def _iter_attestation_candidates(

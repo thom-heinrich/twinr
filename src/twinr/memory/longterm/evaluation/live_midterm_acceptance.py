@@ -30,6 +30,7 @@ from twinr.memory.longterm.evaluation.live_midterm_attest import (
 )
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.providers.openai import OpenAIBackend
+from twinr.providers.openai.core.client import close_openai_client, openai_client_with_options
 from twinr.text_utils import folded_lookup_text
 
 
@@ -286,19 +287,18 @@ def _configure_openai_backend_client(
     """Best-effort replace the backend client with bounded request options."""
 
     client = getattr(backend, "_client", None)
-    with_options = getattr(client, "with_options", None)
-    if client is None or not callable(with_options):
+    if client is None:
         return
-    try:
-        configured = with_options(timeout=timeout_s, max_retries=max_retries)
-    except TypeError:
-        try:
-            configured = with_options(timeout=timeout_s)
-        except TypeError:
-            return
+    configured = openai_client_with_options(
+        client,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+    )
     try:
         setattr(backend, "_client", configured)
     except Exception:
+        if configured is not client:
+            close_openai_client(configured)
         _LOGGER.debug("Could not replace OpenAI backend client for live midterm acceptance.", exc_info=True)
 
 
@@ -308,12 +308,10 @@ def _close_openai_backend(backend: OpenAIBackend | None) -> None:
     if backend is None:
         return
     client = getattr(backend, "_client", None)
-    close = getattr(client, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            _LOGGER.warning("OpenAI backend close failed during live midterm acceptance cleanup.", exc_info=True)
+    try:
+        close_openai_client(client)
+    except Exception:
+        _LOGGER.warning("OpenAI backend close failed during live midterm acceptance cleanup.", exc_info=True)
 
 
 def _shutdown_service(service: LongTermMemoryService | None) -> None:

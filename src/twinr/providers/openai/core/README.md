@@ -12,6 +12,7 @@ packages.
 
 `core` owns:
 - build validated default OpenAI SDK clients from `TwinrConfig`
+- preserve shared HTTP-transport ownership when Twinr clones SDK clients with `with_options(...)`
 - normalize shared Responses API request payloads, including role-aware conversation replay, and tool settings
 - define reusable instruction constants, fallback model lists, and typed response/image objects, including structured search-attempt metadata for runtime journaling
 - define reusable instruction constants, fallback model lists, and typed response/image objects, including structured search verification/follow-up fields for runtime search routing
@@ -27,7 +28,7 @@ packages.
 |---|---|
 | [__init__.py](./__init__.py) | Lazy shared package exports |
 | [base.py](./base.py) | Request-building backend base |
-| [client.py](./client.py) | SDK client factory |
+| [client.py](./client.py) | SDK client factory and transport lifecycle helpers |
 | [instructions.py](./instructions.py) | Prompt constants and fallbacks |
 | [types.py](./types.py) | Response and image dataclasses |
 | [component.yaml](./component.yaml) | Structured package metadata |

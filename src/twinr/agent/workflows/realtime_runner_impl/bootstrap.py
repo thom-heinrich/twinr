@@ -844,6 +844,12 @@ class TwinrRealtimeBootstrapMixin:
                 tool_names=self._runtime_tool_names,
             )
             self._sync_realtime_session_tool_handlers()
+            streaming_surface_sync = cast(
+                Callable[[], None] | None,
+                getattr(self, "_sync_streaming_turn_loop_tool_surface", None),
+            )
+            if streaming_surface_sync is not None:
+                streaming_surface_sync()
 
             policy_state = (
                 self._is_sensitive_tool_access_authorized(),

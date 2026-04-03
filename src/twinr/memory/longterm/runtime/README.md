@@ -10,12 +10,17 @@ bounded background writers into the APIs used by agent runtime loops.
 `runtime` owns:
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
+- Let synchronous provider-context, prewarm, and explicit materialized-front builds wait a bounded first-turn window sized to real rewrite latency, so non-English graph/subtext cues are present on the first built front instead of only on a later cache refresh
 - Maintain a remote-authoritative materialized answer-front for the live provider path so transcript-first turns can consume ChonkyDB-backed prompt sections instead of synchronously rebuilding the broad retriever package on every answer
 - Seed that materialized live-provider front from compatibility `build_provider_context(...)` callers only through deduplicated background persistence, so non-live/eval provider builds do not block foreground answer/context assembly on remote current-head writes
 - Keep the older in-process prepared full-context front only for tool context and compatibility provider callers while the live voice/runtime path migrates to the materialized answer-front contract
 - Expose the latest built provider/tool context snapshot so operator surfaces can inspect the real turn context without launching a second independent remote recall
 - Prime and refresh those prepared full-context fronts from transcript-first interim or endpoint transcripts plus post-write invalidations, so the first live answer can reuse already-started long-term retrieval work without shrinking the memory surface
 - Persist those live provider answer fronts as bounded current-head collections keyed by semantic query scope, so post-write invalidation and transcript-first prewarm can keep remote-authoritative prompt blocks hot across turns
+- Expose an explicit synchronous live-front materialization helper for non-streaming callers such as evals, so they can prime the strict live-provider contract without reintroducing a hidden synchronous fallback inside the live answer path
+- Fail closed on raw graph-context blocks in the normal provider path when unified subtext planning found no relevant graph payload and no other recall sections survived, so graph-only control queries do not over-personalize answers with irrelevant person/preference context
+- Reject new prepared-front or materialized-front background work after shutdown starts, so draining writers cannot poison same-process evals with post-shutdown executor submissions
+- Install a cooperative shutdown signal around each in-flight background persistence item, so remote retry/backoff loops can abort promptly instead of holding service shutdown open on stale 429 cooldown sleeps
 - Inject the bounded fast-topic quick-memory lane into the normal provider context so ordinary answer turns receive a few compact personalized topic hints before the heavier recall sections
 - Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
@@ -72,7 +77,7 @@ bounded background writers into the APIs used by agent runtime loops.
 | `service_impl/main.py` | `LongTermMemoryService` dataclass plus inherited runtime method surface, including both the compatibility prepared-context front and the materialized live provider-front dependency |
 | `service_impl/builder.py` | Runtime service assembly and background-writer construction, plus prepared-context/materialized-front wiring and persistence invalidation hooks |
 | `service_impl/readiness.py` | Required-remote readiness probes and cache helpers |
-| `service_impl/context.py` | Provider-context assembly for normal, live, fast, and tool-facing paths, with live materialized-front consumption, compatibility prepared-front fallback, transcript-first prewarm entry points, and sticky-query refresh scheduling |
+| `service_impl/context.py` | Provider-context assembly for normal, live, fast, and tool-facing paths, with bounded first-rewrite waits for sync/prewarm materialization, live materialized-front consumption, compatibility prepared-front fallback, transcript-first prewarm entry points, sticky-query refresh scheduling, and fail-closed raw-graph suppression when no relevant graph payload survived |
 | `service_impl/ingestion.py` | Conversation/multimodal enqueue and dry-run analysis entry points, with dry-run object reads sourced through storage-owned active working sets instead of broad current-state hydration |
 | `service_impl/maintenance.py` | Reflection, sensor-memory, backfill, and retention orchestration, with reflection/sensor inputs narrowed through neighborhood selectors, active backfill writes using storage-owned working-set delta commits, and remote-primary retention prefiltering candidates from catalog projections |
 | `service_impl/proactive.py` | Proactive planning and reservation state transitions using shared query-first planner-object selectors instead of inline query constants |
@@ -98,6 +103,7 @@ service = LongTermMemoryService.from_config(config)
 service.ensure_remote_ready()
 steady_state = service.probe_remote_ready(bootstrap=False, include_archive=False)
 service.prewarm_provider_context("Wie ist Janinas Termin heute?")
+service.materialize_live_provider_context("Soll ich Corinna heute noch anrufen?")
 context = service.build_provider_context(query_text)  # includes quick-memory topic hints when enabled
 fast_context = service.build_fast_provider_context(query_text)  # compact quick-memory-only context
 service.enqueue_conversation_turn(

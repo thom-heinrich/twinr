@@ -736,6 +736,19 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             return build_compact_agent_tool_schemas(tool_names)
         return build_agent_tool_schemas(tool_names)
 
+    def _sync_streaming_turn_loop_tool_surface(self) -> None:
+        """Refresh the active streaming loop after the runtime tool surface changes."""
+
+        streaming_turn_loop = getattr(self, "streaming_turn_loop", None)
+        if streaming_turn_loop is None:
+            return
+        tool_schemas = tuple(self._build_runtime_tool_schemas())
+        setattr(streaming_turn_loop, "tool_handlers", dict(self._tool_handlers))
+        setattr(streaming_turn_loop, "tool_schemas", tool_schemas)
+        reset_supervisor = getattr(self, "_reset_speculative_supervisor_decision", None)
+        if callable(reset_supervisor):
+            reset_supervisor()
+
     def _reset_speculative_supervisor_decision(self) -> None:
         with self._speculation_lock:
             self._streaming_speculation.reset()

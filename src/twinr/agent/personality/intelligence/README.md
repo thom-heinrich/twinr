@@ -12,7 +12,9 @@ threads.
 `intelligence` owns:
 - define typed subscription, calibration-state, situational-awareness, and refresh-result models for RSS/world intelligence
 - persist subscriptions and refresh/discovery timing through remote-primary current-head/state records instead of monolithic snapshots
+- dual-write subscriptions into a bounded embedded fallback snapshot so freshly saved feed sets remain readable when current-head item hydration lags behind the visible head across processes
 - keep prompt-time state reads read-only so first-turn world-intelligence loads do not stall on legacy current-head promotion
+- treat a partially hydrated subscription current head as an inconsistent remote-state view, not as proof that Twinr follows zero feeds; in that case recover from the same remote state's embedded legacy subscription snapshot until item hydration is coherent again
 - reuse the parent package's shared payload-normalization and remote-state adapter helpers so RSS state decoding stays aligned with the rest of the personality package
 - derive slow-changing topic/region interest signals from structured conversation or tool evidence
 - keep live-search tool interests as situational evidence only; only conversation-derived or explicit world-intelligence interests may seed durable feed discovery during recalibration
