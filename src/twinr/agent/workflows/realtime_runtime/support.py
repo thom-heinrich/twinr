@@ -8,6 +8,8 @@
 # IMP-2: Add dedicated playback sample-rate selection and an optional structured logger bridge for OTel-style log/trace correlation.
 # BUG-5: Prewarm the default processing media clip outside live turns so the first THINKING cue can reach the
 #        dragon MP3 path without blocking transcript submission.
+# BUG-6: Bound web-search feedback to one calm cue so long lookups do not keep
+#        alternating through repeated chirps during thinking.
 """Provide shared support helpers for realtime-style workflow loops."""
 
 from __future__ import annotations
@@ -1105,30 +1107,26 @@ class TwinrRealtimeSupportMixin:
         def worker() -> None:
             if stop_event.wait(delay_seconds):
                 return
-            pattern_index = 0
-            while not stop_event.is_set():
-                try:
-                    pattern = _SEARCH_FEEDBACK_TONE_PATTERNS[pattern_index % len(_SEARCH_FEEDBACK_TONE_PATTERNS)]
-                    pattern_index += 1
-                    for frequency_hz, duration_ms in pattern:
-                        if stop_event.is_set():
-                            return
-                        self._get_playback_coordinator().play_tone(
-                            owner=owner,
-                            priority=PlaybackPriority.FEEDBACK,
-                            frequency_hz=frequency_hz,
-                            duration_ms=duration_ms,
-                            volume=config.search_feedback_volume,
-                            sample_rate=playback_sample_rate,
-                            should_stop=stop_event.is_set,
-                        )
-                        if stop_event.wait(0.05):
-                            return
-                except Exception as exc:
-                    self._try_emit(f"search_feedback_error={self._safe_error_text(exc)}")
-                    return
-                if stop_event.wait(pause_seconds):
-                    return
+            try:
+                for frequency_hz, duration_ms in _SEARCH_FEEDBACK_TONE_PATTERNS[0]:
+                    if stop_event.is_set():
+                        return
+                    self._get_playback_coordinator().play_tone(
+                        owner=owner,
+                        priority=PlaybackPriority.FEEDBACK,
+                        frequency_hz=frequency_hz,
+                        duration_ms=duration_ms,
+                        volume=config.search_feedback_volume,
+                        sample_rate=playback_sample_rate,
+                        should_stop=stop_event.is_set,
+                    )
+                    if stop_event.wait(0.05):
+                        return
+            except Exception as exc:
+                self._try_emit(f"search_feedback_error={self._safe_error_text(exc)}")
+                return
+            if stop_event.wait(pause_seconds):
+                return
 
         thread = Thread(target=worker, name="twinr-search-feedback", daemon=True)
         thread.start()

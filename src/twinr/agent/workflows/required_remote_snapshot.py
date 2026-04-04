@@ -8,6 +8,9 @@
 # BUG-3: Malformed, missing-current, non-boolean, non-numeric, and future-dated
 #        snapshot fields now fail closed instead of crashing or being silently
 #        treated as fresh/true.
+# BUG-4: Do not fail closed immediately on synthetic watchdog-timeout samples
+#        while the same deep probe is still alive and recent successful probe
+#        latencies prove a larger bounded inflight bridge is normal.
 # SEC-1: Hardened process-identity checks. Plain kill(pid, 0) is now augmented
 #        with pidfd-based existence checks and optional boot-id / process-start
 #        attestation to reduce PID-reuse confusion.
@@ -89,6 +92,9 @@ _PROBE_STARTED_MONOTONIC_PATHS = (
     ("probe_started_mono_ns",),
     ("probe_monotonic_ns",),
 )
+_RECENT_SUCCESS_TIMEOUT_HEADROOM_RATIO = 0.5
+_RECENT_SUCCESS_TIMEOUT_MIN_HEADROOM_S = 2.0
+_RECENT_SUCCESS_TIMEOUT_MAX_HEADROOM_S = 10.0
 
 
 def _normalize_text(value: Any) -> str:
@@ -359,6 +365,57 @@ def _current_latency_s(snapshot: RemoteMemoryWatchdogSnapshot) -> float:
 
     latency_ms = _coerce_float(_deep_get(snapshot, "current", "latency_ms"))
     return max(0.0, (latency_ms or 0.0) / 1000.0)
+
+
+def _recent_success_latency_s(snapshot: RemoteMemoryWatchdogSnapshot) -> float | None:
+    """Return the slowest persisted successful watchdog latency in seconds."""
+
+    latencies_s: list[float] = []
+    for sample in tuple(_deep_get(snapshot, "recent_samples") or ()):
+        if _normalize_text(_deep_get(sample, "status")).lower() != "ok":
+            continue
+        if _coerce_bool(_deep_get(sample, "ready")) is not True:
+            continue
+        latency_ms = _coerce_float(_deep_get(sample, "latency_ms"))
+        if latency_ms is None:
+            continue
+        latency_s = max(0.0, float(latency_ms) / 1000.0)
+        if latency_s <= 0.0 or not math.isfinite(latency_s):
+            continue
+        latencies_s.append(latency_s)
+    if not latencies_s:
+        return None
+    return max(latencies_s)
+
+
+def _recent_success_timeout_budget_s(snapshot: RemoteMemoryWatchdogSnapshot) -> float | None:
+    """Return the learned inflight budget from persisted successful probes."""
+
+    recent_success_latency_s = _recent_success_latency_s(snapshot)
+    if recent_success_latency_s is None:
+        return None
+    headroom_s = max(
+        _RECENT_SUCCESS_TIMEOUT_MIN_HEADROOM_S,
+        min(
+            _RECENT_SUCCESS_TIMEOUT_MAX_HEADROOM_S,
+            recent_success_latency_s * _RECENT_SUCCESS_TIMEOUT_HEADROOM_RATIO,
+        ),
+    )
+    return recent_success_latency_s + headroom_s
+
+
+def _sample_is_watchdog_timeout_failure(snapshot: RemoteMemoryWatchdogSnapshot) -> bool:
+    """Return whether the current failure is a synthetic watchdog timeout sample."""
+
+    if _sample_status_text(snapshot) != "fail":
+        return False
+    if _sample_ready_value(snapshot) is not False:
+        return False
+    watchdog_timeout = _deep_get(snapshot, "current", "probe", "watchdog_timeout")
+    if isinstance(watchdog_timeout, dict):
+        return True
+    detail = _normalize_text(_deep_get(snapshot, "current", "detail")).lower()
+    return "remote readiness probe exceeded" in detail and "assumed stuck" in detail
 
 
 def _snapshot_boot_id(snapshot: RemoteMemoryWatchdogSnapshot) -> str | None:
@@ -680,7 +737,13 @@ def _max_allowed_inflight_probe_age_s(
     snapshot: RemoteMemoryWatchdogSnapshot,
     max_sample_age_s: float,
 ) -> float:
-    """Return the maximum bounded age for one still-running deep probe."""
+    """Return the maximum bounded age for one still-running deep probe.
+
+    Synthetic watchdog timeout samples are emitted early as an operator signal,
+    not as proof that the deep probe is irrecoverably dead. The runtime-facing
+    bridge therefore needs to honor the larger bounded watchdog/startup budgets
+    that still allow the same probe to finish successfully under real Pi load.
+    """
 
     keepalive_floor_s = _keepalive_floor_s(config)
     timeout_budget_s = max(
@@ -688,9 +751,22 @@ def _max_allowed_inflight_probe_age_s(
         _coerce_float(getattr(config, "long_term_memory_remote_read_timeout_s", 8.0)) or 8.0,
         _coerce_float(getattr(config, "long_term_memory_remote_write_timeout_s", 15.0)) or 15.0,
     )
+    flush_timeout_s = max(
+        timeout_budget_s,
+        _coerce_float(getattr(config, "long_term_memory_remote_flush_timeout_s", 60.0)) or 60.0,
+    )
+    startup_probe_timeout_s = max(
+        timeout_budget_s,
+        _coerce_float(getattr(config, "long_term_memory_remote_watchdog_startup_probe_timeout_s", 180.0))
+        or 180.0,
+    )
+    learned_budget_s = _recent_success_timeout_budget_s(snapshot) or 0.0
     return max(
         max_sample_age_s + keepalive_floor_s,
         timeout_budget_s * 2.0 + keepalive_floor_s,
+        flush_timeout_s * 2.0 + keepalive_floor_s,
+        startup_probe_timeout_s,
+        learned_budget_s,
     )
 
 
@@ -1103,6 +1179,11 @@ def assess_required_remote_watchdog_snapshot(
         and math.isfinite(sample_age_s)
         and sample_age_s <= max_steady_state_sample_age_s
     )
+    synthetic_timeout_bridge_active = (
+        inflight_heartbeat_fresh
+        and _sample_is_watchdog_timeout_failure(snapshot)
+        and _recent_success_timeout_budget_s(snapshot) is not None
+    )
     snapshot_stale = (
         sample_age_s is None or not math.isfinite(sample_age_s) or sample_age_s > max_sample_age_s
     ) and not inflight_heartbeat_fresh and not steady_state_heartbeat_fresh
@@ -1124,6 +1205,21 @@ def assess_required_remote_watchdog_snapshot(
         )
 
     if sample_status != "ok" or sample_ready is not True:
+        if synthetic_timeout_bridge_active:
+            return _assessment_with_current(
+                ready=True,
+                detail=(
+                    "Remote memory watchdog deep probe is still inflight after its current timeout "
+                    "budget; keeping the last recent ready sample authoritative within the bounded bridge."
+                ),
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                sample_age_s=sample_age_s,
+                max_sample_age_s=max_sample_age_s,
+                snapshot_stale=False,
+                heartbeat_age_s=heartbeat_age_s,
+                probe_age_s=inflight_probe_age_s,
+            )
         detail = _normalize_text(_deep_get(snapshot, "current", "detail")) or (
             "Remote memory watchdog reports unavailable."
         )

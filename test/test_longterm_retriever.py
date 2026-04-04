@@ -1348,6 +1348,104 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("Flurschrank", context.durable_context or "")
         self.assertIn("Thermoskanne", context.durable_context or "")
 
+    def test_build_context_ignores_numeric_distractors_across_query_variants(self) -> None:
+        distractor_fourteen = LongTermMemoryObjectV1(
+            memory_id="episode:distractor_14",
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details='User said: "I talked about distractor topic 14 and a routine unrelated to buttons." Assistant answered: "Twinr answered distractor topic 14 in a calm way."',
+            source=_source("turn:math_14"),
+            status="active",
+            confidence=1.0,
+            attributes={
+                "raw_transcript": "I talked about distractor topic 14 and a routine unrelated to buttons.",
+                "raw_response": "Twinr answered distractor topic 14 in a calm way.",
+            },
+        )
+        distractor_twenty_seven = LongTermMemoryObjectV1(
+            memory_id="episode:distractor_27",
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details='User said: "I talked about distractor topic 27 and a routine unrelated to buttons." Assistant answered: "Twinr answered distractor topic 27 in a calm way."',
+            source=_source("turn:math_27"),
+            status="active",
+            confidence=1.0,
+            attributes={
+                "raw_transcript": "I talked about distractor topic 27 and a routine unrelated to buttons.",
+                "raw_response": "Twinr answered distractor topic 27 in a calm way.",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(distractor_fourteen, distractor_twenty_seven),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Was ist 27 mal 14?",
+                    canonical_english_text="27 14 multiplication",
+                ),
+                original_query_text="Was ist 27 mal 14?",
+            )
+
+        self.assertIsNone(context.episodic_context)
+
+    def test_build_context_keeps_practical_support_for_connected_continuity_query(self) -> None:
+        weather_episode = LongTermMemoryObjectV1(
+            memory_id="episode:weather_morning",
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details='User said: "After breakfast I usually ask Twinr about the weather before I start my day." Assistant answered: "I can keep that morning weather routine in mind."',
+            source=_source("turn:weather"),
+            status="active",
+            confidence=1.0,
+            attributes={
+                "raw_transcript": "After breakfast I usually ask Twinr about the weather before I start my day.",
+                "raw_response": "I can keep that morning weather routine in mind.",
+                "daypart": "morning",
+            },
+        )
+        button_pattern = LongTermMemoryObjectV1(
+            memory_id="pattern:button:green:start_listening:morning",
+            kind="summary",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            source=_source("event:button"),
+            status="active",
+            confidence=0.86,
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={
+                "button": "green",
+                "action": "start_listening",
+                "daypart": "morning",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(weather_episode, button_pattern),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+                    canonical_english_text="weather routine after breakfast morning twinr",
+                ),
+                original_query_text="Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+            )
+
+        self.assertIn("After breakfast I usually ask Twinr about the weather", context.episodic_context or "")
+        self.assertIn("The green button was used to start a conversation in the morning.", context.durable_context or "")
+
     def test_build_subtext_context_uses_preselected_graph_payload_and_updates_unified_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, _prompt_context_store, graph_store, _midterm_store = self._make_retriever(temp_dir)

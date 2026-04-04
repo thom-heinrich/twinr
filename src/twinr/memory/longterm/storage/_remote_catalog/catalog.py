@@ -8,6 +8,7 @@ import time
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
+from ._typing import RemoteCatalogMixinBase
 from .shared import (
     LongTermRemoteCatalogAssemblyResult,
     LongTermRemoteCatalogEntry,
@@ -21,7 +22,7 @@ from .shared import (
 )
 
 
-class RemoteCatalogCatalogMixin:
+class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
     def probe_catalog_payload_result(
         self,
         *,
@@ -309,9 +310,8 @@ class RemoteCatalogCatalogMixin:
         segments = payload.get("segments")
         if not isinstance(segments, list):
             return False
-        try:
-            items_count = int(payload.get("items_count") or 0)
-        except (TypeError, ValueError):
+        items_count = self._normalize_segment_index(payload.get("items_count"))
+        if items_count is None:
             return False
         return (
             payload.get("schema") == definition.catalog_schema
@@ -376,9 +376,8 @@ class RemoteCatalogCatalogMixin:
         if not isinstance(payload, Mapping):
             return None
         raw_count = payload.get("items_count")
-        try:
-            parsed = int(raw_count)
-        except (TypeError, ValueError):
+        parsed = self._normalize_segment_index(raw_count)
+        if parsed is None:
             return None
         return max(0, parsed)
 

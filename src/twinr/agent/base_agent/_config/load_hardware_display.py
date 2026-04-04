@@ -15,6 +15,7 @@ from .parsing import (
     _parse_csv_strings,
     _parse_float,
     _parse_optional_bool,
+    _parse_optional_float,
     _parse_optional_int,
 )
 
@@ -376,6 +377,9 @@ def load_hardware_display_config(context: ConfigLoadContext) -> dict[str, object
             get_value("TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES"),
             270.0,
             minimum=30.0,
+        ),
+        "attention_servo_position_follow_max_degrees": _parse_optional_float(
+            get_value("TWINR_ATTENTION_SERVO_POSITION_FOLLOW_MAX_DEGREES")
         ),
         "attention_servo_exit_follow_max_degrees": _parse_float(
             get_value("TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES"),

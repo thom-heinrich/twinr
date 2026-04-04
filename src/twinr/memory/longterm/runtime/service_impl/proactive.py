@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from twinr.agent.workflows.forensics import workflow_event
 from twinr.memory.longterm.core.models import (
     LongTermProactiveCandidateV1,
     LongTermProactivePlanV1,
@@ -15,7 +16,10 @@ from twinr.memory.longterm.proactive.state import LongTermProactiveReservationV1
 from twinr.memory.longterm.runtime.live_object_selectors import (
     select_proactive_planner_objects as _select_proactive_planner_objects,
 )
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteUnavailableError,
+)
 
 from ._typing import ServiceMixinBase
 from .compat import _normalize_datetime, logger
@@ -23,6 +27,23 @@ from .compat import _normalize_datetime, logger
 
 class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
     """Plan and track proactive candidates under policy control."""
+
+    @staticmethod
+    def _record_fast_topic_proactive_skip(
+        *,
+        action: str,
+        exc: LongTermRemoteReadFailedError,
+    ) -> None:
+        """Record one non-fatal proactive fast-topic failure."""
+
+        workflow_event(
+            kind="warning",
+            msg="longterm_proactive_fast_topic_skipped",
+            details={
+                "action": action,
+                **dict(getattr(exc, "details", {}) or {}),
+            },
+        )
 
     def plan_proactive_candidates(
         self,
@@ -40,6 +61,9 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
                     now=normalized_now,
                     live_facts=live_facts,
                 )
+        except LongTermRemoteReadFailedError as exc:
+            self._record_fast_topic_proactive_skip(action="plan", exc=exc)
+            return LongTermProactivePlanV1(candidates=())
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -63,6 +87,9 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
                     live_facts=live_facts,
                 )
                 return self.proactive_policy.reserve_candidate(plan=plan, now=normalized_now)
+        except LongTermRemoteReadFailedError as exc:
+            self._record_fast_topic_proactive_skip(action="reserve", exc=exc)
+            return None
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -98,6 +125,9 @@ class LongTermMemoryServiceProactiveMixin(ServiceMixinBase):
                     live_facts=live_facts,
                 )
                 return self.proactive_policy.preview_candidate(plan=plan, now=normalized_now)
+        except LongTermRemoteReadFailedError as exc:
+            self._record_fast_topic_proactive_skip(action="preview", exc=exc)
+            return None
         except LongTermRemoteUnavailableError:
             raise
         except Exception:

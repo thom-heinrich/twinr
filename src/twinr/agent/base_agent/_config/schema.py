@@ -418,6 +418,7 @@ class TwinrConfig:
     long_term_memory_backend: str = "chonkydb"
     long_term_memory_mode: str = "local_first"
     long_term_memory_remote_required: bool = False
+    long_term_memory_remote_required_failure_threshold: int | None = None
     long_term_memory_remote_namespace: str | None = None
     long_term_memory_path: str = "state/chonkydb"
     long_term_memory_background_store_turns: bool = True
@@ -634,6 +635,7 @@ class TwinrConfig:
     attention_servo_visible_recenter_interval_s: float = 30.0
     attention_servo_visible_recenter_center_tolerance: float = 0.12
     attention_servo_mechanical_range_degrees: float = 270.0
+    attention_servo_position_follow_max_degrees: float | None = None
     attention_servo_exit_follow_max_degrees: float = 60.0
     attention_servo_exit_activation_delay_s: float = 0.75
     attention_servo_exit_settle_hold_s: float = 0.6

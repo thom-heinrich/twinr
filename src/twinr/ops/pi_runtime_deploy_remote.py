@@ -2013,18 +2013,184 @@ def run_retention_canary_probe(
             shlex.quote(probe_id),
         )
     )
-    completed = remote.run_ssh(
-        "retention_output=$("
-        + command
-        + " 2>&1) || true; printf '%s\\n' \"$retention_output\""
-    )
-    payload = json.loads((completed.stdout or "").strip() or "{}")
-    if not bool(payload.get("ready")):
-        raise RuntimeError(
-            "retention canary failed: "
-            + summarize_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    try:
+        completed = remote.run_ssh(
+            "\n".join(
+                (
+                    "set +e",
+                    "retention_output=$(" + command + " 2>&1)",
+                    "retention_status=$?",
+                    "printf '__TWINR_RETENTION_EXIT_STATUS__=%s\\n' \"$retention_status\"",
+                    "printf '%s\\n' \"$retention_output\"",
+                )
+            )
         )
+    except subprocess.TimeoutExpired as exc:
+        payload = _wait_for_remote_retention_canary_report(
+            remote=remote,
+            remote_root=remote_root,
+            probe_id=probe_id,
+        )
+        if isinstance(payload, dict) and payload:
+            if not bool(payload.get("ready")):
+                raise RuntimeError(
+                    "retention canary timed out waiting for stdout but completed on the Pi: "
+                    + _summarize_retention_canary_failure_payload(payload)
+                ) from exc
+            return payload
+        raise RuntimeError(
+            "retention canary timed out waiting for stdout and no final Pi report was available: "
+            f"probe_id={probe_id} timeout_s={exc.timeout}"
+        ) from exc
+    exit_status, raw_output = _parse_remote_retention_canary_stdout(completed.stdout or "")
+    payload = _parse_retention_canary_payload(raw_output)
+    if payload is None:
+        report_payload = _wait_for_remote_retention_canary_report(
+            remote=remote,
+            remote_root=remote_root,
+            probe_id=probe_id,
+            wait_timeout_s=5.0,
+            poll_interval_s=1.0,
+        )
+        if isinstance(report_payload, dict) and report_payload:
+            if not bool(report_payload.get("ready")):
+                raise RuntimeError(
+                    "retention canary exited without inline JSON but produced a Pi report: "
+                    + _summarize_retention_canary_failure_payload(report_payload)
+                )
+            return report_payload
+        raw_detail = summarize_text(raw_output) if raw_output.strip() else "no stdout/stderr payload"
+        raise RuntimeError(
+            "retention canary exited without JSON output: "
+            f"probe_id={probe_id} exit_status={exit_status} detail={raw_detail}"
+        )
+    if not bool(payload.get("ready")):
+        raise RuntimeError("retention canary failed: " + _summarize_retention_canary_failure_payload(payload))
     return payload
+
+
+def _parse_remote_retention_canary_stdout(stdout_text: str) -> tuple[int | None, str]:
+    """Split the retention-canary wrapper marker from the raw command output."""
+
+    marker_prefix = "__TWINR_RETENTION_EXIT_STATUS__="
+    lines = stdout_text.splitlines()
+    if not lines:
+        return None, ""
+    first_line = lines[0].strip()
+    exit_status: int | None = None
+    if first_line.startswith(marker_prefix):
+        raw_status = first_line.removeprefix(marker_prefix).strip()
+        try:
+            exit_status = int(raw_status)
+        except ValueError:
+            exit_status = None
+        return exit_status, "\n".join(lines[1:]).strip()
+    return None, stdout_text.strip()
+
+
+def _parse_retention_canary_payload(raw_output: str) -> dict[str, object] | None:
+    """Return the structured canary payload when the remote command emitted JSON."""
+
+    stripped = raw_output.strip()
+    if not stripped:
+        return None
+    payload = json.loads(stripped)
+    return payload if isinstance(payload, dict) else None
+
+
+def _wait_for_remote_retention_canary_report(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    probe_id: str,
+    wait_timeout_s: float = 120.0,
+    poll_interval_s: float = 5.0,
+) -> dict[str, object] | None:
+    """Poll the Pi for one completed per-probe canary report after SSH timeout."""
+
+    deadline = time.monotonic() + max(0.0, wait_timeout_s)
+    report_path = (
+        Path(remote_root)
+        / "artifacts"
+        / "reports"
+        / "retention_live_canary"
+        / f"{str(probe_id).strip()}.json"
+    )
+    while True:
+        payload = _load_remote_json_artifact(remote=remote, remote_path=str(report_path))
+        if isinstance(payload, dict) and payload.get("probe_id") == probe_id:
+            status = str(payload.get("status") or "").strip().lower()
+            if status in {"ok", "failed"}:
+                return payload
+        if time.monotonic() >= deadline:
+            return payload if isinstance(payload, dict) else None
+        time.sleep(max(0.1, poll_interval_s))
+
+
+def _load_remote_json_artifact(
+    *,
+    remote: PiRemoteExecutor,
+    remote_path: str,
+) -> dict[str, object] | None:
+    """Return one remote JSON artifact when present."""
+
+    script = "\n".join(
+        (
+            f"artifact_path={shlex.quote(remote_path)}",
+            "if [ ! -f \"$artifact_path\" ]; then",
+            "  printf '{}\\n'",
+            "  exit 0",
+            "fi",
+            "cat \"$artifact_path\"",
+        )
+    )
+    completed = remote.run_ssh(script)
+    raw_text = (completed.stdout or "").strip()
+    if not raw_text or raw_text == "{}":
+        return None
+    payload = json.loads(raw_text)
+    return payload if isinstance(payload, dict) else None
+
+
+def _summarize_retention_canary_failure_payload(payload: dict[str, object]) -> str:
+    """Return one compact operator summary for a failed retention canary."""
+
+    if not isinstance(payload, dict):
+        return summarize_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    parts: list[str] = []
+    status = str(payload.get("status") or "").strip()
+    if status:
+        parts.append(f"status={status}")
+    failure_stage = str(payload.get("failure_stage") or "").strip()
+    if failure_stage:
+        parts.append(f"failure_stage={failure_stage}")
+    consistency = payload.get("consistency_assessment")
+    if isinstance(consistency, dict):
+        relation = str(consistency.get("relation") or "").strip()
+        if relation:
+            parts.append(f"relation={relation}")
+        summary = str(consistency.get("summary") or "").strip()
+        if summary:
+            parts.append(summary)
+    watchdog_observations = payload.get("watchdog_observations")
+    if isinstance(watchdog_observations, list) and watchdog_observations:
+        latest = watchdog_observations[-1]
+        if isinstance(latest, dict):
+            sample_status = str(latest.get("sample_status") or "").strip()
+            if sample_status:
+                parts.append(f"watchdog_status={sample_status}")
+            sample_ready = latest.get("sample_ready")
+            if isinstance(sample_ready, bool):
+                parts.append(f"watchdog_ready={'true' if sample_ready else 'false'}")
+            sample_detail = str(latest.get("sample_detail") or "").strip()
+            if sample_detail:
+                parts.append(f"watchdog_detail={sample_detail}")
+    error_message = str(payload.get("error_message") or "").strip()
+    if error_message:
+        parts.append(f"error={error_message}")
+    if parts:
+        return summarize_text(" | ".join(parts))
+    return summarize_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def parse_optional_int(value: object) -> int | None:

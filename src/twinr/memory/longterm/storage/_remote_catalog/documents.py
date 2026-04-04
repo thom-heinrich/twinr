@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import json
 import time
+from typing import Any
 
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event
 from twinr.memory.chonkydb.models import ChonkyDBRetrieveRequest, ChonkyDBTopKRecordsRequest
@@ -22,6 +23,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
 from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
+from ._typing import RemoteCatalogMixinBase
 from .shared import (
     LongTermRemoteCatalogEntry,
     _ALLOWED_DOC_IDS_RETRIEVE_QUERY,
@@ -33,7 +35,7 @@ from .shared import (
 )
 
 
-class RemoteCatalogDocumentMixin:
+class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
     def load_item_payload(
         self,
         *,
@@ -401,7 +403,7 @@ class RemoteCatalogDocumentMixin:
         self,
         *,
         snapshot_kind: str,
-        read_client: object,
+        read_client: Any,
         batches: tuple[tuple[str, ...], ...],
     ) -> tuple[tuple[tuple[str, ...], tuple[Mapping[str, object], ...]], ...]:
         """Load retrieve batches with bounded parallel reads."""
@@ -430,7 +432,7 @@ class RemoteCatalogDocumentMixin:
         self,
         *,
         snapshot_kind: str,
-        read_client: object,
+        read_client: Any,
         batch: tuple[str, ...],
     ) -> tuple[Mapping[str, object], ...]:
         """Load one document-id batch, preferring one-shot structured reads."""
@@ -718,6 +720,13 @@ class RemoteCatalogDocumentMixin:
             )
             if normalized is not None:
                 return normalized
+            metadata_payload = self._extract_current_record_metadata_payload(
+                definition=definition,
+                item_id=item_id,
+                candidate=candidate,
+            )
+            if metadata_payload is not None:
+                return metadata_payload
             metadata_only = self._extract_legacy_metadata_only_item_payload(
                 definition=definition,
                 item_id=item_id,
@@ -773,6 +782,40 @@ class RemoteCatalogDocumentMixin:
                 return None
             return packet.to_payload()
         return None
+
+    def _extract_current_record_metadata_payload(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        item_id: str,
+        candidate: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Accept live current-record metadata payloads for non-core memory types.
+
+        The remote current-record write contract stores the authoritative public
+        Twinr payload under `twinr_payload` inside document metadata. Live
+        ChonkyDB reads may surface only that metadata, including in chunked
+        `documents/full` responses where no top-level record wrapper survives.
+        Older extraction only trusted envelope-shaped item records or legacy
+        metadata-only objects, so personality/world-state collections hydrated
+        zero payloads even though the live item metadata still carried the full
+        public payload.
+        """
+
+        if definition.snapshot_kind in {"objects", "archive", "conflicts", "midterm"}:
+            return None
+        normalized_item_id = self._normalize_item_id(item_id)
+        if not normalized_item_id:
+            return None
+        candidate_item_id = self._normalize_item_id(candidate.get("twinr_memory_item_id"))
+        if candidate_item_id != normalized_item_id:
+            return None
+        if self._normalize_text(candidate.get("twinr_snapshot_kind")) != definition.snapshot_kind:
+            return None
+        nested_payload = candidate.get("twinr_payload")
+        if not isinstance(nested_payload, Mapping):
+            return None
+        return dict(nested_payload)
 
     def _conflict_doc_id(self, conflict: LongTermMemoryConflictV1) -> str:
         """Return the canonical remote item id for one conflict payload."""
@@ -938,8 +981,9 @@ class RemoteCatalogDocumentMixin:
         conflicts_with = list(raw_conflicts_with) if isinstance(raw_conflicts_with, list) else None
         raw_supersedes = projection.get("supersedes")
         supersedes = list(raw_supersedes) if isinstance(raw_supersedes, list) else None
+        raw_confidence = projection.get("confidence", 0.5)
         try:
-            confidence = float(projection.get("confidence", 0.5) or 0.5)
+            confidence = float(raw_confidence if isinstance(raw_confidence, (int, float, str)) else 0.5)
         except (TypeError, ValueError):
             confidence = 0.5
         try:

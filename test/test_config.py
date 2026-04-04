@@ -409,6 +409,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_INTERVAL_S=42.5",
                         "TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_CENTER_TOLERANCE=0.11",
                         "TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES=270.0",
+                        "TWINR_ATTENTION_SERVO_POSITION_FOLLOW_MAX_DEGREES=60.0",
                         "TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES=60.0",
                         "TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S=0.45",
                         "TWINR_ATTENTION_SERVO_EXIT_SETTLE_HOLD_S=0.85",
@@ -465,6 +466,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_visible_recenter_interval_s, 42.5)
         self.assertEqual(config.attention_servo_visible_recenter_center_tolerance, 0.11)
         self.assertEqual(config.attention_servo_mechanical_range_degrees, 270.0)
+        self.assertEqual(config.attention_servo_position_follow_max_degrees, 60.0)
         self.assertEqual(config.attention_servo_exit_follow_max_degrees, 60.0)
         self.assertEqual(config.attention_servo_exit_activation_delay_s, 0.45)
         self.assertEqual(config.attention_servo_exit_settle_hold_s, 0.85)

@@ -388,13 +388,13 @@ def _fit_sections_to_canvas(
     visible_slots = max_fit
     if visible_slots <= 1:
         hidden_titles = [title for title, _ in section_list]
-        summary_lines = tuple(hidden_titles[:3])
+        summary_lines = hidden_titles[:3]
         if len(hidden_titles) > 3:
-            summary_lines += (f"+{len(hidden_titles) - 3} more sections",)
+            summary_lines.append(f"+{len(hidden_titles) - 3} more sections")
         return (
             (
                 f"+{len(hidden_titles)} sections",
-                summary_lines or ("Hidden due to limited space.",),
+                tuple(summary_lines) or ("Hidden due to limited space.",),
             ),
         )
 

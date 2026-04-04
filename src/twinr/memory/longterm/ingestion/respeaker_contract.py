@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
+from numbers import Integral, Real
 
 
 RESPEAKER_EPHEMERAL_STATE = "ephemeral_state"
@@ -30,9 +31,14 @@ def _coerce_optional_float(value: object | None) -> float | None:
 
     if value is None or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, Real):
         numeric = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, (str, bytes, bytearray)):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
         return None
     if not math.isfinite(numeric):
         return None
@@ -44,9 +50,13 @@ def _coerce_optional_int(value: object | None) -> int | None:
 
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, Integral):
+        return int(value)
+    if not isinstance(value, (str, bytes, bytearray)):
+        return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -70,18 +80,16 @@ def _coerce_mapping(value: object | None) -> dict[str, object]:
 
     if isinstance(value, Mapping):
         return {str(key): item for key, item in value.items()}
-    try:
-        return dict(value or {})
-    except (TypeError, ValueError):
-        return {}
+    return {}
 
 
 def _string_tuple(value: object | None) -> tuple[str, ...]:
     """Normalize one optional scalar or sequence into a string tuple."""
 
+    raw_items: tuple[object, ...]
     if value is None:
-        return ()
-    if isinstance(value, (str, bytes, bytearray)):
+        raw_items = ()
+    elif isinstance(value, (str, bytes, bytearray)):
         raw_items = (value,)
     elif isinstance(value, Sequence):
         raw_items = tuple(value)

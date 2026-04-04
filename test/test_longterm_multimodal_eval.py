@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import sys
 import unittest
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.evaluation.multimodal_eval import run_multimodal_longterm_eval
+from twinr.memory.longterm.evaluation.multimodal_eval import (
+    _fixture_base_date,
+    run_multimodal_longterm_eval,
+)
 
 
 class LongTermMultimodalEvalTests(unittest.TestCase):
+    def test_fixture_base_date_tracks_recent_run_day(self) -> None:
+        timezone = ZoneInfo("Europe/Berlin")
+        reference_now = datetime(2026, 4, 4, 10, 0, 0, tzinfo=timezone)
+
+        self.assertEqual(
+            _fixture_base_date(timezone=timezone, reference_now=reference_now).isoformat(),
+            "2026-04-03",
+        )
+
     def test_multimodal_eval_runs_with_expected_shape(self) -> None:
         result = run_multimodal_longterm_eval()
         failed_cases = [case.case_id for case in result.cases if not case.passed]

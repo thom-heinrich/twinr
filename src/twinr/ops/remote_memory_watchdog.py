@@ -3,6 +3,7 @@
 # BUG-2: Fix watchdog blindness during hung probes by detecting probe time-budget overruns, persisting synthetic fail snapshots, and exposing stall state to systemd/watchdog consumers.
 # BUG-3: Fix crash-on-observability-failure paths so snapshot/event-store write errors (for example on full/read-only SD cards) no longer kill the watchdog loop.
 # BUG-4: Add a first-success startup timeout budget so cold-start remote probes do not false-fail before the first healthy sample lands.
+# BUG-5: Persist monotonic freshness and PID attestation fields in watchdog snapshots so supervisor startup gating survives Pi wall-clock jumps without false restart blocks.
 # SEC-1: Redact secret-bearing and content-bearing fields from probe payloads / remote_write_context before persisting to logs or ops artifacts.
 # IMP-1: Add optional systemd sd_notify integration (READY/STATUS/WATCHDOG/STOPPING) for Raspberry Pi deployments managed by systemd.
 # IMP-2: Add adaptive exponential backoff with jitter after failures/degradation to avoid synchronized probe storms against the remote backend.
@@ -56,6 +57,10 @@ from twinr.ops.remote_memory_watchdog_state import (
     coerce_history_limit as _coerce_history_limit,
     coerce_interval_s as _coerce_interval_s,
     compact_history_sample as _compact_history_sample,
+    current_boot_id as _current_boot_id,
+    monotonic_seconds_to_ns as _monotonic_seconds_to_ns,
+    read_proc_create_time_s as _read_proc_create_time_s,
+    read_proc_stat_start_ticks as _read_proc_stat_start_ticks,
     utc_now_iso as _utc_now_iso,
 )
 
@@ -448,6 +453,9 @@ class RemoteMemoryWatchdog:
         self._started_at = _utc_now_iso()
         self._hostname = socket.gethostname()
         self._pid = os.getpid()
+        self._boot_id = _current_boot_id()
+        self._pid_starttime_ticks = _read_proc_stat_start_ticks(self._pid)
+        self._pid_create_time_s = _read_proc_create_time_s(self._pid)
 
         self._sample_count = 0
         self._failure_count = 0
@@ -1039,15 +1047,19 @@ class RemoteMemoryWatchdog:
         """Emit one heartbeat line while the deep probe runs."""
 
         captured_at = _utc_now_iso()
+        now_monotonic = self._monotonic()
+        heartbeat_monotonic_ns = self._current_monotonic_ns(now_monotonic=now_monotonic)
         probe_age_s: float | None = None
         probe_timeout_s: float | None = None
         if probe_inflight and probe_started_monotonic is not None:
-            probe_age_s = round(max(0.0, self._monotonic() - probe_started_monotonic), 1)
+            probe_age_s = round(max(0.0, now_monotonic - probe_started_monotonic), 1)
             probe_timeout_s = round(self._effective_probe_timeout_s(), 1)
         self._persist_heartbeat_snapshot(
             heartbeat_at=captured_at,
+            heartbeat_monotonic_ns=heartbeat_monotonic_ns,
             probe_inflight=probe_inflight,
             probe_started_at=probe_started_at,
+            probe_started_monotonic_ns=_monotonic_seconds_to_ns(probe_started_monotonic),
             probe_age_s=probe_age_s,
         )
         last_sample = self._recent_samples[-1] if self._recent_samples else None
@@ -1116,6 +1128,7 @@ class RemoteMemoryWatchdog:
             latency_ms=latency_ms,
             consecutive_ok=self._consecutive_ok,
             consecutive_fail=self._consecutive_fail,
+            captured_monotonic_ns=self._current_monotonic_ns(),
             detail=detail,
             probe=probe,
         )
@@ -1138,9 +1151,15 @@ class RemoteMemoryWatchdog:
             artifact_path=str(self.artifact_path),
             current=current,
             recent_samples=self._persisted_recent_samples(),
+            updated_monotonic_ns=current.captured_monotonic_ns,
             heartbeat_at=current.captured_at,
+            heartbeat_monotonic_ns=current.captured_monotonic_ns,
+            boot_id=self._boot_id,
+            pid_starttime_ticks=self._pid_starttime_ticks,
+            pid_create_time_s=self._pid_create_time_s,
             probe_inflight=False,
             probe_started_at=None,
+            probe_started_monotonic_ns=None,
             probe_age_s=None,
         )
 
@@ -1148,14 +1167,19 @@ class RemoteMemoryWatchdog:
         self,
         *,
         heartbeat_at: str,
+        heartbeat_monotonic_ns: int | None,
         probe_inflight: bool,
         probe_started_at: str | None,
+        probe_started_monotonic_ns: int | None,
         probe_age_s: float | None,
     ) -> None:
         """Persist liveness metadata even while a deep probe is still running."""
 
         last_sample = self._recent_samples[-1] if self._recent_samples else None
-        current = last_sample or self._starting_sample(captured_at=heartbeat_at)
+        current = last_sample or self._starting_sample(
+            captured_at=heartbeat_at,
+            captured_monotonic_ns=heartbeat_monotonic_ns,
+        )
         snapshot = RemoteMemoryWatchdogSnapshot(
             schema_version=_SNAPSHOT_SCHEMA_VERSION,
             started_at=self._started_at,
@@ -1171,17 +1195,38 @@ class RemoteMemoryWatchdog:
             artifact_path=str(self.artifact_path),
             current=current,
             recent_samples=self._persisted_recent_samples(),
+            updated_monotonic_ns=current.captured_monotonic_ns,
             heartbeat_at=heartbeat_at,
+            heartbeat_monotonic_ns=heartbeat_monotonic_ns,
+            boot_id=self._boot_id,
+            pid_starttime_ticks=self._pid_starttime_ticks,
+            pid_create_time_s=self._pid_create_time_s,
             probe_inflight=probe_inflight,
             probe_started_at=probe_started_at,
+            probe_started_monotonic_ns=probe_started_monotonic_ns,
             probe_age_s=probe_age_s,
         )
         self._safe_store_save(snapshot)
 
-    def _starting_sample(self, *, captured_at: str) -> RemoteMemoryWatchdogSample:
+    def _starting_sample(
+        self,
+        *,
+        captured_at: str,
+        captured_monotonic_ns: int | None = None,
+    ) -> RemoteMemoryWatchdogSample:
         """Synthesize the startup state before the first real probe sample exists."""
 
-        return _build_starting_sample(self.config, captured_at=captured_at)
+        return _build_starting_sample(
+            self.config,
+            captured_at=captured_at,
+            captured_monotonic_ns=captured_monotonic_ns,
+        )
+
+    def _current_monotonic_ns(self, *, now_monotonic: float | None = None) -> int | None:
+        """Return the injected monotonic clock as integer nanoseconds."""
+
+        resolved_now = self._monotonic() if now_monotonic is None else now_monotonic
+        return _monotonic_seconds_to_ns(resolved_now)
 
     def _emit_transition_event(self, sample: RemoteMemoryWatchdogSample) -> None:
         previous_status = self._last_status

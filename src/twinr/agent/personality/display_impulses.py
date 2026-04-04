@@ -11,6 +11,8 @@ Selection and wording stay generic:
 - no topic, place, or benchmark-specific hardcoding
 - only positive or gently inviting impulses
 - bounded actions derived from existing appetite / co-attention state
+- fresh continuity threads may become low-pressure ambient hints even when the
+  stricter spoken-turn policy still stays silent
 - light tone variation from learned verbosity and humor, not from ad-hoc
   randomness in the runtime loop
 """
@@ -92,6 +94,7 @@ _MAX_HEADLINE_LEN: Final[int] = 96
 _MAX_BODY_LEN: Final[int] = 160
 _MAX_REASON_LEN: Final[int] = 160
 _MAX_CONTEXT_STR_LEN: Final[int] = 160
+_AMBIENT_CONTINUITY_FRESHNESS: Final[frozenset[str]] = frozenset({"current", "recent"})
 
 _TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"\w+", re.UNICODE)
 _STRIP_TEXT_CODEPOINTS: Final[frozenset[int]] = frozenset(
@@ -634,6 +637,45 @@ def _candidate_for_item(
     )
 
 
+def _ambient_policy_for_item(
+    item: CompanionMindshareItem,
+    *,
+    engagement_signals: Sequence[WorldInterestSignal],
+) -> PositiveEngagementTopicPolicy:
+    """Return the display-lane policy for one current mindshare item.
+
+    The ambient reserve is a quieter surface than a spoken turn. Fresh
+    continuity threads may therefore appear as one light hint even when the
+    stricter spoken-turn policy still stays `silent` because no durable
+    engagement signal has formed yet.
+    """
+
+    policy = derive_positive_engagement_policy(
+        item,
+        engagement_signals=engagement_signals,
+    )
+    if _topic_key(policy.action) != "silent":
+        return policy
+
+    appetite = getattr(item, "appetite", None)
+    appetite_state = _topic_key(getattr(appetite, "state", None))
+    if appetite_state in {"avoid", "cooling"}:
+        return policy
+
+    if _topic_key(getattr(item, "source", None)) != "continuity":
+        return policy
+    if _topic_key(getattr(item, "freshness", None)) not in _AMBIENT_CONTINUITY_FRESHNESS:
+        return policy
+
+    return PositiveEngagementTopicPolicy(
+        title=policy.title,
+        salience=policy.salience,
+        attention_state="growing",
+        action="hint",
+        reason="ambient_continuity_hint",
+    )
+
+
 def build_ambient_display_impulse_candidates(
     snapshot: PersonalitySnapshot | None,
     *,
@@ -669,7 +711,7 @@ def build_ambient_display_impulse_candidates(
     candidates: list[tuple[float, AmbientDisplayImpulseCandidate]] = []
     for item in items:
         try:
-            policy = derive_positive_engagement_policy(
+            policy = _ambient_policy_for_item(
                 item,
                 engagement_signals=engagement_signals,
             )

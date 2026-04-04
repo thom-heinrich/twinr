@@ -4,6 +4,10 @@
 # BUG-3: Missing-checker bug fixed: direct mode previously treated a missing runtime checker as healthy, silently bypassing required-remote enforcement.
 # BUG-4: Poll scheduling bug fixed: next_check_at was previously computed from check start time, causing near-immediate rechecks after long blocking checks/timeouts.
 # BUG-5: Error-ownership bug fixed: recovery logic previously relied on exact snapshot error-text equality and could misclassify required-remote errors as foreign on snapshot read/format drift.
+# BUG-6: Single watchdog-artifact failures with a recent ready proof no longer
+# flip the runtime straight into visible error; entry now honors a bounded
+# failure threshold so transient deep-probe stalls can recover without a user-
+# visible fail-close while repeated failures still fail closed quickly.
 # SEC-1: Output/log injection fixed: untrusted exception text and correlation IDs are now control-character-neutralized before emission to line-oriented control-plane channels.
 # SEC-2: Telemetry minimization added: raw remote exception details and remote_write_context are now redacted/canonicalized before tracing/emission to avoid leaking tokens/PII.
 # IMP-1: Frontier readiness model: required-remote now follows startup/readiness semantics with fail-closed startup, recovery hysteresis, and conservative ownership handling.
@@ -313,6 +317,74 @@ def required_remote_dependency_recovery_hold_seconds(loop: Any, *, default_inter
         minimum=0.0,
     )
     return max(interval_s * 3.0, keepalive_s)
+
+
+def required_remote_dependency_failure_threshold(loop: Any) -> int:
+    """Return how many consecutive failures must accrue before visible fail-close."""
+
+    explicit_threshold = getattr(
+        getattr(loop, "config", None),
+        "long_term_memory_remote_required_failure_threshold",
+        None,
+    )
+    if explicit_threshold is not None:
+        try:
+            return max(1, int(explicit_threshold))
+        except (TypeError, ValueError):
+            pass
+    if required_remote_dependency_uses_watchdog_artifact(loop):
+        return 2
+    return 1
+
+
+def _had_recent_required_remote_ready_proof(loop: Any) -> bool:
+    """Return whether this runtime instance recently proved required-remote readiness."""
+
+    cached_ready = getattr(loop, "_required_remote_dependency_cached_ready", None)
+    if cached_ready is not None:
+        return bool(cached_ready)
+    return getattr(loop, "_required_remote_dependency_last_success_at", None) is not None
+
+
+def _defer_required_remote_error_entry_if_transient(
+    loop: Any,
+    *,
+    detail_text: str,
+    default_interval_s: float,
+    observed_at_monotonic_s: float,
+) -> int | None:
+    """Keep the runtime visibly ready through one bounded transient watchdog failure."""
+
+    failure_threshold = required_remote_dependency_failure_threshold(loop)
+    if failure_threshold <= 1:
+        return None
+
+    with loop._get_lock("_required_remote_dependency_lock"):
+        if bool(getattr(loop, "_required_remote_dependency_error_active", False)):
+            return None
+        if not _had_recent_required_remote_ready_proof(loop):
+            return None
+        failure_streak = max(
+            1,
+            int(getattr(loop, "_required_remote_dependency_failure_streak", 0) or 0) + 1,
+        )
+        if failure_streak >= failure_threshold:
+            return None
+        loop._required_remote_dependency_failure_streak = failure_streak
+        loop._required_remote_dependency_cached_ready = True
+        loop._required_remote_dependency_checked_once = True
+        loop._required_remote_dependency_recovery_started_at = None
+        loop._required_remote_dependency_last_failure_at = observed_at_monotonic_s
+        loop._required_remote_dependency_last_error_detail = detail_text
+        loop._required_remote_dependency_next_check_at = (
+            observed_at_monotonic_s
+            + _required_remote_next_delay_seconds(
+                loop,
+                default_interval_s=default_interval_s,
+                failure=True,
+            )
+        )
+    return failure_streak
 
 
 def remote_dependency_is_required(loop: Any) -> bool:
@@ -710,6 +782,31 @@ def refresh_required_remote_dependency(
         )
         with loop._get_lock("_required_remote_dependency_lock"):
             loop._required_remote_dependency_refresh_inflight = False
+        deferred_failure_streak = _defer_required_remote_error_entry_if_transient(
+            loop,
+            detail_text=getattr(loop, "_safe_error_text", str)(check_error),
+            default_interval_s=default_interval_s,
+            observed_at_monotonic_s=completed_at,
+        )
+        if deferred_failure_streak is not None:
+            _trace_required_remote_event(
+                loop,
+                "required_remote_error_deferred",
+                kind="cache",
+                level="WARN",
+                details={
+                    "force": force,
+                    "force_sync": force_sync,
+                    "failure_streak": deferred_failure_streak,
+                    "failure_threshold": required_remote_dependency_failure_threshold(loop),
+                    "runtime_status": getattr(getattr(getattr(loop, "runtime", None), "status", None), "value", None)
+                    or "unknown",
+                    "detail": getattr(loop, "_safe_error_text", str)(check_error),
+                    "assessment_detail": getattr(watchdog_failure_assessment, "detail", None),
+                },
+                kpi={"duration_ms": duration_ms},
+            )
+            return False
         enter_required_remote_error(
             loop,
             check_error,

@@ -1,7 +1,10 @@
 from pathlib import Path
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -107,6 +110,57 @@ class LoopLockTests(unittest.TestCase):
                 self.assertEqual(recorded[0][1], 0o600)
             finally:
                 os.close(fd)
+
+    def test_forked_child_does_not_keep_lock_alive_after_parent_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_state = root / "runtime-state.json"
+            child_script = textwrap.dedent(
+                f"""
+                import os
+                import sys
+                import time
+                from pathlib import Path
+
+                sys.path.insert(0, {str((Path(__file__).resolve().parents[1] / "src"))!r})
+
+                from twinr.agent.base_agent.config import TwinrConfig
+                from twinr.ops.locks import loop_instance_lock
+
+                config = TwinrConfig(
+                    project_root={str(root)!r},
+                    runtime_state_path={str(runtime_state)!r},
+                )
+
+                with loop_instance_lock(config, "realtime-loop"):
+                    pid = os.fork()
+                    if pid == 0:
+                        time.sleep(2.0)
+                        os._exit(0)
+                    os._exit(0)
+                """
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+            proc = subprocess.Popen(
+                [sys.executable, "-c", child_script],
+                cwd=str(root),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            proc.wait(timeout=1.0)
+            self.assertEqual(proc.returncode, 0)
+
+            time.sleep(0.2)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(runtime_state),
+            )
+
+            with loop_instance_lock(config, "realtime-loop"):
+                self.assertTrue(loop_lock_path(config, "realtime-loop").exists())
 
 
 if __name__ == "__main__":

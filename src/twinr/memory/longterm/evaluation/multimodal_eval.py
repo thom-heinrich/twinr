@@ -8,7 +8,7 @@ can be inspected after the temporary run directory is cleaned up.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 import shutil
@@ -34,6 +34,7 @@ from twinr.memory.query_normalization import LongTermQueryProfile
 _FIXED_SEED_TARGET = 500
 _FIXED_CASE_TARGET = 50
 _FALLBACK_TIMEZONE_NAME = "Europe/Berlin"
+_FIXTURE_RETENTION_SAFE_OFFSET_DAYS = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +363,7 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
     """Seed deterministic multimodal evidence and episodic turns."""
 
     timezone = _resolve_eval_timezone(service)
+    fixture_date = _fixture_base_date(timezone=timezone)
     total_multimodal = 0
     total_turns = 0
 
@@ -405,7 +407,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
     }
 
     for index in range(70):
-        created_at = datetime(2026, 3, 14, 8, 0 + (index % 55), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=8,
+            minute=0 + (index % 55),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -420,7 +427,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     for index in range(40):
-        created_at = datetime(2026, 3, 14, 14, 0 + (index % 50), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=14,
+            minute=0 + (index % 50),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -435,7 +447,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     for index in range(25):
-        created_at = datetime(2026, 3, 14, 8, 5 + (index % 30), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=8,
+            minute=5 + (index % 30),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -450,7 +467,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     for index in range(25):
-        created_at = datetime(2026, 3, 14, 15, 5 + (index % 30), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=15,
+            minute=5 + (index % 30),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -465,7 +487,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     for index in range(20):
-        created_at = datetime(2026, 3, 14, 15, 10 + (index % 25), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=15,
+            minute=10 + (index % 25),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -480,7 +507,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     for index in range(20):
-        created_at = datetime(2026, 3, 14, 13, 0 + (index % 40), 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=13,
+            minute=0 + (index % 40),
+            timezone=timezone,
+        )
         _persist_multimodal(
             service,
             LongTermMultimodalEvidence(
@@ -494,7 +526,7 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         )
         total_multimodal += 1
 
-    targeted_episodes = _targeted_episodes(timezone)
+    targeted_episodes = _targeted_episodes(timezone, fixture_date=fixture_date)
     if len(targeted_episodes) > 300:
         raise AssertionError("Targeted episodes exceed the fixed 300-turn episodic budget.")  # AUDIT-FIX(#7): Guard against silent fixture drift.
     for episode in targeted_episodes:
@@ -509,7 +541,12 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_turns += 1
 
     for index in range(300 - len(targeted_episodes)):
-        created_at = datetime(2026, 3, 14, 9 + (index % 8), index % 60, 0, tzinfo=timezone)
+        created_at = _fixture_datetime(
+            fixture_date=fixture_date,
+            hour=9 + (index % 8),
+            minute=index % 60,
+            timezone=timezone,
+        )
         _persist_turn(
             service,
             LongTermConversationTurn(
@@ -545,6 +582,41 @@ def _resolve_eval_timezone(service: LongTermMemoryService) -> ZoneInfo:
         return ZoneInfo(_FALLBACK_TIMEZONE_NAME)  # AUDIT-FIX(#6): Keep the fixed eval dataset usable even when local_timezone_name is absent or invalid.
 
 
+def _fixture_base_date(*, timezone: ZoneInfo, reference_now: datetime | None = None) -> date:
+    """Return one rolling fixture day that stays inside episodic retention.
+
+    The multimodal goldset asserts combined durable+episodic recall. Hard-coded
+    historical conversation-turn timestamps eventually age out of the default
+    episodic retention horizon, which makes the suite drift from green to red
+    without any retrieval-code change. Anchor the fixture day relative to the
+    current run so the dataset stays semantically identical while remaining
+    eligible for structured episodic recall.
+    """
+
+    reference = reference_now.astimezone(timezone) if reference_now is not None else datetime.now(timezone)
+    return (reference - timedelta(days=_FIXTURE_RETENTION_SAFE_OFFSET_DAYS)).date()
+
+
+def _fixture_datetime(
+    *,
+    fixture_date: date,
+    hour: int,
+    minute: int,
+    timezone: ZoneInfo,
+) -> datetime:
+    """Build one timezone-aware fixture timestamp on the shared fixture day."""
+
+    return datetime(
+        fixture_date.year,
+        fixture_date.month,
+        fixture_date.day,
+        hour,
+        minute,
+        0,
+        tzinfo=timezone,
+    )
+
+
 def _count_loaded_items(items: object) -> int:
     """Count objects loaded from stores that may return multiple container types."""
 
@@ -558,39 +630,43 @@ def _count_loaded_items(items: object) -> int:
         return sum(1 for _ in iterator)
 
 
-def _targeted_episodes(timezone: ZoneInfo) -> tuple[_TargetEpisode, ...]:
+def _targeted_episodes(
+    timezone: ZoneInfo,
+    *,
+    fixture_date: date,
+) -> tuple[_TargetEpisode, ...]:
     """Return the hand-authored episodic fixtures used in recall assertions."""
 
     return (
         _TargetEpisode(
             transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
             response="I can keep that morning weather routine in mind.",
-            occurred_at=datetime(2026, 3, 14, 8, 12, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=8, minute=12, timezone=timezone),
         ),
         _TargetEpisode(
             transcript="In the morning I often start by asking Twinr for my appointments.",
             response="Then morning schedule checks are a useful routine for you.",
-            occurred_at=datetime(2026, 3, 14, 8, 18, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=8, minute=18, timezone=timezone),
         ),
         _TargetEpisode(
             transcript="After lunch I usually print my shopping list with Twinr.",
             response="I can keep that afternoon shopping-list print routine in mind.",
-            occurred_at=datetime(2026, 3, 14, 15, 22, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=15, minute=22, timezone=timezone),
         ),
         _TargetEpisode(
             transcript="When I ask about recipes, I often print the answer later in the afternoon.",
             response="That sounds like an afternoon print routine for recipes.",
-            occurred_at=datetime(2026, 3, 14, 15, 28, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=15, minute=28, timezone=timezone),
         ),
         _TargetEpisode(
             transcript="If something looks odd, I use the camera to inspect it with Twinr in the afternoon.",
             response="Then camera inspection is part of your afternoon routine.",
-            occurred_at=datetime(2026, 3, 14, 13, 18, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=13, minute=18, timezone=timezone),
         ),
         _TargetEpisode(
             transcript="When I stand close to the device in the morning, I usually ask my first question right away.",
             response="That morning presence cue can help start the day calmly.",
-            occurred_at=datetime(2026, 3, 14, 8, 25, 0, tzinfo=timezone),
+            occurred_at=_fixture_datetime(fixture_date=fixture_date, hour=8, minute=25, timezone=timezone),
         ),
     )
 

@@ -22,8 +22,10 @@ tools.
 - keep fresh watchdog heartbeats authoritative during bounded steady-state idle gaps so the supervisor does not false-fail a healthy remote watchdog between deep probes
 - persist only compact recent-sample summaries in watchdog artifacts so Pi heartbeats stay cheap instead of fsyncing multi-megabyte historical probe payloads every tick
 - keep watchdog attestation tiers explicit so current-only probes stay degraded and only archive-safe probes become green/ready
+- keep the watchdog proof contract explicit inside the persisted probe payload so `ready=true` is documented as configured-namespace archive-inclusive warm-read health, not as a blanket proof for isolated-namespace write/retention/fresh-reader transactions
+- recover the structured per-probe retention-canary report when the remote canary outlives the SSH stdout timeout, so deploy output still surfaces `failure_stage` plus the watchdog/canary relation instead of collapsing the mismatch into a generic timeout
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, including exact endpoint and request-payload type, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
-- diagnose the public Twinr-facing ChonkyDB URL against the dedicated backend service and its loopback `127.0.0.1:3044` surface so P0 incidents can be repaired without blind backend restarts
+- diagnose the public Twinr-facing ChonkyDB URL against the dedicated backend service, its loopback `127.0.0.1:3044` surface, and any foreign non-Twinr consumers still pointed at that dedicated backend so P0 incidents can be repaired without blind backend restarts
 - stabilize the dedicated ChonkyDB host itself when shared-host systemd system units, user-session units, or non-Twinr workers directly wired to `127.0.0.1:3044` reclaim CPU/I/O from Twinr's required backend
 - force-repair unreadable prompt-memory and managed-context `catalog/current` heads on an explicit remote namespace when a broken blank head times out before the normal probe-first repair path can publish the canonical empty head
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
@@ -70,8 +72,8 @@ tools.
 | [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
-| [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend |
-| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that runtime-masks known conflicting shared-host system units plus user-session units, quiesces heavyweight non-Twinr workers such as `ollama-gpu.service`, `caia-ops-chonky-search-guardrail.service`, and CPU-hogging `caia-consumer-portal*.service` backends, bounded-kills proven stale user-session code-graph benchmark runners that bypass systemd unit control, raises backend CPU/IO priority, and validates the public empty-scope-safe current-scope query surface instead of a weaker `/instance` liveness-only check |
+| [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend, including detection of active foreign services still pointed at `127.0.0.1:3044` |
+| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that runtime-masks known conflicting shared-host system units plus user-session units, quiesces heavyweight non-Twinr workers such as `ollama-gpu.service`, `caia-ops-chonky-search-guardrail.service`, and CPU-hogging `caia-consumer-portal*.service` backends, bounded-kills proven stale user-session code-graph benchmark runners plus direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path that bypass systemd unit control, raises backend CPU/IO priority, and validates the public empty-scope-safe current-scope query surface instead of a weaker `/instance` liveness-only check |
 | [remote_prompt_current_head_repair.py](./remote_prompt_current_head_repair.py) | Operator-facing forced empty-head publisher for prompt-memory, user-context, and personality-context `catalog/current` repair on one explicit remote namespace |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr` and reseeding bootstrap attestation when the owner PID changes |
@@ -173,8 +175,13 @@ When the live remote-memory endpoint is unhealthy on the development host, use
 `hardware/ops/repair_remote_chonkydb.py` before restarting anything by hand.
 That command proves whether the public `https://tessairact.com:2149` URL, the
 dedicated backend service, or the backend loopback `127.0.0.1:3044` is the
-actual failing layer and only restarts the backend when the backend itself is
-unhealthy.
+actual failing layer, surfaces active foreign consumers still pointed at the
+dedicated backend, now also surfaces dedicated data-dir owner/group drift
+against the service account so root-owned WAL/index files do not masquerade as
+"backend needs restart", hardens the remote systemd env when `FT_REBUILD_ON_OPEN`
+was left active without the matching query-surface warmup gate, and only
+restarts the backend when the backend itself is unhealthy instead of when
+shared-host contention or permission drift is the proven root cause.
 If the backend is up but one prompt `catalog/current` head itself is a broken
 blank document that times out on every read, use
 `hardware/ops/repair_remote_prompt_current_heads.py` with an explicit namespace
@@ -191,8 +198,10 @@ user-session scope, runtime-masks heavyweight non-Twinr workers such as
 `caia-consumer-portal.service`, `caia-consumer-portal-demo.service`, and
 `caia-ops-chonky-search-guardrail.service` when they reclaim CPU from Twinr's
 dedicated backend, bounded-kills proven stale long-running code-graph
-benchmark runners that bypass those unit lists through interactive user
-sessions, raises `caia-twinr-chonkydb-alt.service` CPU/IO weights
+benchmark runners and direct non-systemd writers against the dedicated
+`twinr_dedicated_<port>/data` store path when they bypass those unit lists
+through interactive user sessions, raises `caia-twinr-chonkydb-alt.service`
+CPU/IO weights
 to the highest priority, and then re-probes the live public current-scope query
 surface with the same empty-scope-safe `404 document_not_found` semantics used
 by the repair helper.

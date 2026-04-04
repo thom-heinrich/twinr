@@ -43,7 +43,11 @@ from twinr.memory.longterm.core.models import (
     LongTermReflectionResultV1,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteReadFailedError,
+    LongTermRemoteStatus,
+    LongTermRemoteUnavailableError,
+)
 from twinr.memory.reminders import now_in_timezone
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
@@ -4568,6 +4572,42 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             lines,
         )
 
+    def test_idle_longterm_proactive_fast_topic_read_failure_is_skipped_without_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.reset_error()
+            loop.runtime.long_term_memory.object_store.select_fast_topic_objects = mock.Mock(  # type: ignore[method-assign]
+                side_effect=LongTermRemoteReadFailedError(
+                    "Required remote long-term fast-topic retrieval failed.",
+                    details={
+                        "operation": "fast_topic_topk_search",
+                        "classification": "client_contract_error",
+                        "status_code": 400,
+                    },
+                )
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+
+        self.assertFalse(delivered)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+        self.assertFalse(getattr(loop, "_required_remote_dependency_error_active", False))
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertNotIn("status=error", lines)
+        self.assertNotIn("required_remote_dependency=false", lines)
+        self.assertNotIn("error=Required remote long-term memory is unavailable.", lines)
+
     def test_idle_loop_delivers_due_reminder_with_generic_backend_fallback(self) -> None:
         class LegacyReminderBackend(FakePrintBackend):
             phrase_due_reminder_with_metadata = None
@@ -5655,6 +5695,31 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
 
+    def test_search_feedback_loop_plays_one_calm_cue_then_stops(self) -> None:
+        config = TwinrConfig(
+            search_feedback_delay_ms=0,
+            search_feedback_pause_ms=0,
+        )
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+        coordinator = loop._get_playback_coordinator()
+        calls: list[dict[str, object]] = []
+        first_pattern_done = Event()
+
+        def fake_play_tone(**kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) >= 3:
+                first_pattern_done.set()
+
+        with mock.patch.object(coordinator, "play_tone", side_effect=fake_play_tone):
+            stop = loop._start_search_feedback_loop()
+            try:
+                self.assertTrue(first_pattern_done.wait(0.3))
+                time.sleep(0.12)
+            finally:
+                stop()
+
+        self.assertEqual(len(calls), 3)
+
     def test_search_tool_call_truncates_excess_sources_for_memory_persistence(self) -> None:
         loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop()
         many_sources = tuple(f"https://example.com/source-{index}" for index in range(42))
@@ -6649,6 +6714,90 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.status.value, "error")
         self.assertIn("status=error", lines)
         self.assertEqual(button_monitor.poll_calls, 0)
+
+    def test_watchdog_artifact_refresh_defers_first_failure_after_recent_ready_proof(self) -> None:
+        startup_ready_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            sample_age_s=0.0,
+            max_sample_age_s=45.0,
+            pid_alive=True,
+        )
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=startup_ready_assessment,
+        ):
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=TwinrConfig(
+                    long_term_memory_enabled=True,
+                    long_term_memory_mode="remote_primary",
+                    long_term_memory_remote_required=True,
+                    long_term_memory_remote_required_failure_threshold=2,
+                    long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                    long_term_memory_remote_watchdog_interval_s=0.01,
+                ),
+            )
+
+        class _RemoteStillRequired:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _RemoteStillRequired()
+        ready_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            sample_age_s=1.0,
+            max_sample_age_s=45.0,
+            pid_alive=True,
+        )
+        failing_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            detail="Remote memory watchdog snapshot is stale.",
+            sample_age_s=91.0,
+            max_sample_age_s=45.0,
+            pid_alive=False,
+            sample_status="fail",
+            sample_ready=False,
+        )
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=ready_assessment,
+        ):
+            self.assertTrue(loop._refresh_required_remote_dependency(force=True))
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            side_effect=LongTermRemoteUnavailableError(failing_assessment.detail),
+        ):
+            with mock.patch(
+                "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
+                return_value=failing_assessment,
+            ):
+                first_refresh = loop._refresh_required_remote_dependency(force=True)
+                self.assertFalse(first_refresh)
+                self.assertEqual(loop.runtime.status.value, "waiting")
+                self.assertTrue(loop._required_remote_dependency_current_ready())
+                self.assertFalse(loop._required_remote_dependency_error_active)
+                self.assertEqual(
+                    getattr(loop, "_required_remote_dependency_failure_streak", None),
+                    1,
+                )
+
+                second_refresh = loop._refresh_required_remote_dependency(force=True)
+
+        self.assertFalse(second_refresh)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertTrue(loop._required_remote_dependency_error_active)
+        self.assertEqual(
+            getattr(loop, "_required_remote_dependency_failure_streak", None),
+            2,
+        )
+        self.assertIn("status=error", lines)
 
     def test_run_watchdog_artifact_does_not_restore_on_transient_ready_blip(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

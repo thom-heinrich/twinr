@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # mypy: ignore-errors
 
@@ -22,6 +22,7 @@ from twinr.proactive.runtime.perception_orchestrator import (
     PerceptionRuntimeSnapshot,
 )
 from twinr.proactive.runtime.speaker_association import ReSpeakerSpeakerAssociationSnapshot
+from twinr.proactive.runtime import service_attention_helpers
 from twinr.proactive.runtime import service as proactive_service_mod
 from twinr.proactive.runtime.service import (
     ProactiveCoordinator,
@@ -379,6 +380,94 @@ class ProactiveCoordinatorTests(unittest.TestCase):
             attention_target.to_automation_facts(),
         )
         self.assertEqual(result.action, "published")
+
+    def test_non_authoritative_offline_automation_tick_does_not_release_servo(self) -> None:
+        controller = SimpleNamespace(update=Mock())
+        coordinator = SimpleNamespace(
+            attention_servo_controller=controller,
+            config=TwinrConfig(project_root="."),
+            vision_observer=SimpleNamespace(supports_attention_refresh=True),
+        )
+        camera_snapshot = SimpleNamespace(
+            camera_online=False,
+            camera_ready=False,
+            camera_ai_ready=False,
+            camera_error=None,
+            last_camera_frame_at=None,
+            person_visible=False,
+            primary_person_box=None,
+        )
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service_attention_helpers.display_attention_refresh_supported",
+                return_value=True,
+            ),
+            patch.object(
+                service_attention_helpers,
+                "record_attention_servo_follow_if_changed",
+            ) as record_follow,
+            patch.object(
+                service_attention_helpers,
+                "record_attention_servo_forensic_tick",
+            ) as record_forensic,
+        ):
+            service_attention_helpers.update_attention_servo_follow(
+                coordinator,
+                source="automation_observation",
+                observed_at=10.0,
+                camera_snapshot=camera_snapshot,
+                attention_target=None,
+            )
+
+        controller.update.assert_not_called()
+        record_follow.assert_called_once()
+        self.assertEqual(record_follow.call_args.kwargs["decision"].reason, "ignored_non_authoritative_source")
+        record_forensic.assert_called_once()
+
+    def test_authoritative_offline_display_tick_still_fail_closes_servo(self) -> None:
+        controller = SimpleNamespace(update=Mock())
+        coordinator = SimpleNamespace(
+            attention_servo_controller=controller,
+            config=TwinrConfig(project_root="."),
+            vision_observer=SimpleNamespace(supports_attention_refresh=True),
+        )
+        camera_snapshot = SimpleNamespace(
+            camera_online=False,
+            camera_ready=False,
+            camera_ai_ready=False,
+            camera_error=None,
+            last_camera_frame_at=None,
+            person_visible=False,
+            primary_person_box=None,
+        )
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service_attention_helpers.display_attention_refresh_supported",
+                return_value=True,
+            ),
+            patch.object(
+                service_attention_helpers,
+                "record_attention_servo_follow_if_changed",
+            ) as record_follow,
+            patch.object(
+                service_attention_helpers,
+                "record_attention_servo_forensic_tick",
+            ) as record_forensic,
+        ):
+            service_attention_helpers.update_attention_servo_follow(
+                coordinator,
+                source="display_attention_refresh",
+                observed_at=10.0,
+                camera_snapshot=camera_snapshot,
+                attention_target=None,
+            )
+
+        controller.update.assert_not_called()
+        record_follow.assert_called_once()
+        self.assertEqual(record_follow.call_args.kwargs["decision"].reason, "camera_offline")
+        record_forensic.assert_called_once()
 
     def test_display_gesture_refresh_consumes_perception_orchestrator(self) -> None:
         service = object.__new__(ProactiveCoordinator)

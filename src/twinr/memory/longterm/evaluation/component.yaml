@@ -3,10 +3,11 @@ name: evaluation
 path: src/twinr/memory/longterm/evaluation
 kind: python-package
 visibility: internal
-summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, profiled unified-retrieval quality and benchmarking, live subtext-response behavior, live midterm memory attestation, live synthetic-memory acceptance, and forensic long-term retrieval latency profiling without mutating production local state paths.
+summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, large messy mixed-corpus remote-memory stress, profiled unified-retrieval quality and benchmarking, live subtext-response behavior, live midterm memory attestation, live synthetic-memory acceptance, and forensic long-term retrieval latency profiling without mutating production local state paths.
 owned_concerns:
   - Seed deterministic evaluation fixtures and build fixed evaluation case sets
   - Execute recall, multimodal, unified-retrieval, and live subtext evaluations against the real Twinr services/backends
+  - Execute one large messy mixed-corpus evaluation that composes synthetic, multimodal, and unified-retrieval fixtures inside one shared remote namespace and compares writer vs fresh-reader quality
   - Execute live midterm write/persist/read/LLM-usage attestations against real OpenAI and ChonkyDB in isolated temp roots and namespaces
   - Execute live synthetic-memory acceptance matrices for earlier memory, conflict confirmation, restart persistence, and control-query containment against real OpenAI and ChonkyDB in isolated temp roots and namespaces
   - Execute profiled unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources
@@ -39,6 +40,17 @@ files:
       - MultimodalEvalSummary
       - MultimodalEvalResult
       - run_multimodal_longterm_eval
+  - path: messy_memory_eval.py
+    role: Large mixed-corpus remote-memory evaluation with writer/fresh-reader comparison over synthetic, multimodal, and unified suites
+    exports:
+      - MessyMemoryEvalResult
+      - MessyMemoryEvalSeedStats
+      - MessyMemoryPhaseResult
+      - MessyMemoryRestartSummary
+      - default_messy_memory_eval_path
+      - default_messy_memory_eval_report_dir
+      - run_messy_memory_eval
+      - write_messy_memory_eval_artifacts
   - path: _unified_retrieval_shared.py
     role: Shared fixture, profiled case definitions, and case-evaluation helpers for unified retrieval quality checks
     exports:
@@ -142,6 +154,7 @@ primary_callers:
   - path: src/twinr/memory/longterm/__init__.py
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_messy_memory_eval.py
   - path: test/test_unified_retrieval_goldset.py
   - path: test/test_live_unified_retrieval_acceptance.py
   - path: test/test_unified_retrieval_benchmark.py
@@ -150,6 +163,7 @@ primary_callers:
 tests:
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_messy_memory_eval.py
   - path: test/test_unified_retrieval_goldset.py
   - path: test/test_live_unified_retrieval_acceptance.py
   - path: test/test_unified_retrieval_benchmark.py

@@ -10,6 +10,7 @@ from twinr.ops.remote_chonkydb_host_stabilizer import (
     RemoteHostTerminatedProcess,
     RemoteHostUnitState,
     apply_remote_host_stabilization,
+    build_stale_process_rules,
     build_parser,
     fetch_remote_unit_states,
     probe_public_host_availability,
@@ -45,6 +46,17 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
     def test_build_parser_uses_longer_default_ssh_timeout(self) -> None:
         args = build_parser().parse_args([])
         self.assertEqual(args.ssh_timeout_s, 180.0)
+
+    def test_build_stale_process_rules_adds_dedicated_backend_data_dir_matcher(self) -> None:
+        rules = build_stale_process_rules(_SETTINGS)
+
+        self.assertEqual(rules[0]["label"], "code_graph_benchmark_runner")
+        data_rule = next(rule for rule in rules if rule["label"] == "dedicated_backend_data_path_writer")
+        self.assertEqual(
+            data_rule["required_substrings"],
+            ("/home/thh/tessairact/state/offload/chonkydb/twinr_dedicated_3044/data",),
+        )
+        self.assertEqual(data_rule["minimum_elapsed_s"], 60.0)
 
     def test_stabilize_remote_host_reports_recovery_and_uses_curated_units(self) -> None:
         system_before_state = (
@@ -223,6 +235,15 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         )
         self.assertEqual(mock_apply.call_args.kwargs["user_unit_owner"], "thh")
         self.assertEqual(mock_apply.call_args.kwargs["stale_process_min_elapsed_s"], 1800.0)
+        self.assertTrue(
+            any(
+                rule["label"] == "dedicated_backend_data_path_writer"
+                and rule["minimum_elapsed_s"] == 60.0
+                and rule["required_substrings"]
+                == ("/home/thh/tessairact/state/offload/chonkydb/twinr_dedicated_3044/data",)
+                for rule in mock_apply.call_args.kwargs["stale_process_rules"]
+            )
+        )
 
     def test_apply_remote_host_stabilization_passes_payload_to_remote_helper(self) -> None:
         with patch(

@@ -166,7 +166,7 @@ class LongTermRemoteMidtermState:
             return None
         payload: object | None = None
         probe_snapshot_load = getattr(remote_state, "probe_snapshot_load", None)
-        if use_probe and callable(probe_snapshot_load):
+        if callable(probe_snapshot_load):
             probe_kwargs: dict[str, object] = {
                 "snapshot_kind": _MIDTERM_SNAPSHOT_KIND,
                 "prefer_cached_document_id": False,
@@ -177,9 +177,23 @@ class LongTermRemoteMidtermState:
             except (TypeError, ValueError):
                 parameters = {}
             if "fast_fail" in parameters:
-                probe_kwargs["fast_fail"] = True
+                # Foreground current-head loads may spend the normal bounded
+                # retry budget on the compatibility bridge. The single-attempt
+                # readiness probe is only appropriate for explicit probe flows.
+                probe_kwargs["fast_fail"] = use_probe
             probe = probe_snapshot_load(**probe_kwargs)
             payload = getattr(probe, "payload", None)
+            if isinstance(payload, Mapping):
+                payload_dict = dict(payload)
+                if self._catalog.is_catalog_payload(snapshot_kind=_MIDTERM_SNAPSHOT_KIND, payload=payload_dict):
+                    return payload_dict
+            if use_probe:
+                return None
+            probe_status = _normalize_text(getattr(probe, "status", None)).lower()
+            if probe_status == "not_found":
+                return None
+        if use_probe:
+            return None
         else:
             load_snapshot = getattr(remote_state, "load_snapshot")
             load_kwargs: dict[str, object] = {"snapshot_kind": _MIDTERM_SNAPSHOT_KIND}

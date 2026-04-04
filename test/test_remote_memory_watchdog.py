@@ -208,6 +208,9 @@ class _StructuredProbeRemoteService:
                             "warm_result": {
                                 "ready": False,
                                 "failed_snapshot_kind": "prompt_memory",
+                                "proof_contract": {
+                                    "contract_id": "configured_namespace_archive_inclusive_readiness",
+                                },
                                 "checks": [
                                     {
                                         "store": "prompt_context",
@@ -227,6 +230,13 @@ class _StructuredProbeRemoteService:
                             },
                         },
                     ),
+                    "warm_result": {
+                        "ready": False,
+                        "failed_snapshot_kind": "prompt_memory",
+                        "proof_contract": {
+                            "contract_id": "configured_namespace_archive_inclusive_readiness",
+                        },
+                    },
                 }
 
         return _ProbeResult()
@@ -364,12 +374,19 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                         latency_ms=42.0,
                         consecutive_ok=2,
                         consecutive_fail=0,
+                        captured_monotonic_ns=1_800_000_000,
                         detail=None,
                     ),
                     recent_samples=(),
+                    updated_monotonic_ns=1_800_000_000,
                     heartbeat_at="2026-03-16T18:00:05Z",
+                    heartbeat_monotonic_ns=1_900_000_000,
+                    boot_id="boot-123",
+                    pid_starttime_ticks=456789,
+                    pid_create_time_s=1710000000.5,
                     probe_inflight=False,
                     probe_started_at=None,
+                    probe_started_monotonic_ns=None,
                     probe_age_s=None,
                 )
             )
@@ -382,6 +399,12 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(loaded.sample_count, 5)
         self.assertEqual(loaded.failure_count, 1)
         self.assertEqual(loaded.heartbeat_at, "2026-03-16T18:00:05Z")
+        self.assertEqual(loaded.current.captured_monotonic_ns, 1_800_000_000)
+        self.assertEqual(loaded.updated_monotonic_ns, 1_800_000_000)
+        self.assertEqual(loaded.heartbeat_monotonic_ns, 1_900_000_000)
+        self.assertEqual(loaded.boot_id, "boot-123")
+        self.assertEqual(loaded.pid_starttime_ticks, 456789)
+        self.assertEqual(loaded.pid_create_time_s, 1710000000.5)
         self.assertFalse(loaded.probe_inflight)
 
     def test_store_save_makes_snapshot_world_readable_for_cross_service_health(self) -> None:
@@ -640,6 +663,52 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertTrue(snapshot.probe_inflight)
         self.assertEqual(snapshot.current.seq, 0)
         self.assertIsNotNone(snapshot.heartbeat_at)
+
+    def test_heartbeat_snapshot_persists_monotonic_and_pid_attestation_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            with mock.patch(
+                "twinr.ops.remote_memory_watchdog._current_boot_id",
+                return_value="boot-xyz",
+            ), mock.patch(
+                "twinr.ops.remote_memory_watchdog._read_proc_stat_start_ticks",
+                return_value=12345,
+            ), mock.patch(
+                "twinr.ops.remote_memory_watchdog._read_proc_create_time_s",
+                return_value=67890.5,
+            ):
+                watchdog = RemoteMemoryWatchdog(
+                    config=config,
+                    service_factory=lambda: _SlowReadyRemoteService(sleep_s=0.03),
+                    store=store,
+                    event_store=TwinrOpsEventStore.from_config(config),
+                    emit=lambda _line: None,
+                )
+
+            watchdog._emit_heartbeat(
+                probe_started_at="2026-03-16T18:00:00Z",
+                probe_started_monotonic=watchdog._monotonic(),
+                probe_inflight=True,
+            )
+            snapshot = store.load()
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertIsNotNone(snapshot.current.captured_monotonic_ns)
+        self.assertEqual(snapshot.updated_monotonic_ns, snapshot.current.captured_monotonic_ns)
+        self.assertIsNotNone(snapshot.heartbeat_monotonic_ns)
+        self.assertEqual(snapshot.boot_id, "boot-xyz")
+        self.assertEqual(snapshot.pid_starttime_ticks, 12345)
+        self.assertEqual(snapshot.pid_create_time_s, 67890.5)
+        self.assertIsNotNone(snapshot.probe_started_monotonic_ns)
+        self.assertTrue(snapshot.probe_inflight)
 
     def test_stalled_probe_uses_startup_timeout_before_first_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1040,9 +1109,12 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         assert snapshot.current.probe is not None
         steps = cast(list[dict[str, object]], snapshot.current.probe["steps"])
         warm_result = _object_dict(steps[0]["warm_result"])
+        top_level_warm_result = _object_dict(snapshot.current.probe["warm_result"])
+        proof_contract = _object_dict(top_level_warm_result["proof_contract"])
         self.assertEqual(steps[0]["status"], "fail")
         self.assertEqual(warm_result["failed_snapshot_kind"], "[TRUNCATED]")
         self.assertEqual(warm_result["checks"], "[TRUNCATED]")
+        self.assertEqual(proof_contract["contract_id"], "configured_namespace_archive_inclusive_readiness")
 
     def test_heartbeat_snapshot_compacts_historical_probe_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

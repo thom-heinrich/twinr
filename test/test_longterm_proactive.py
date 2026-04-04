@@ -19,6 +19,7 @@ from twinr.memory.longterm import (
     LongTermSourceRefV1,
 )
 from twinr.memory.longterm.runtime.service_impl.proactive import _select_proactive_planner_objects
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError
 from twinr.memory.longterm.proactive.state import _write_json_atomic
 
 
@@ -101,6 +102,52 @@ class LongTermProactiveIntegrationTests(unittest.TestCase):
             {"event:doctor", "thread:walk_weather", "routine:print_offer"},
         )
         self.assertEqual(len(object_store.queries), 3)
+
+    def test_preview_proactive_candidate_skips_fast_topic_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = LongTermMemoryService.from_config(_config(temp_dir))
+
+            def _fail_fast_topic(**_kwargs):
+                raise LongTermRemoteReadFailedError(
+                    "Required remote long-term fast-topic retrieval failed.",
+                    details={
+                        "operation": "fast_topic_topk_search",
+                        "classification": "client_contract_error",
+                        "status_code": 400,
+                    },
+                )
+
+            service.object_store.select_fast_topic_objects = _fail_fast_topic  # type: ignore[method-assign]
+
+            candidate = service.preview_proactive_candidate(
+                now=datetime(2026, 3, 14, 9, 0, tzinfo=timezone.utc)
+            )
+            service.shutdown()
+
+        self.assertIsNone(candidate)
+
+    def test_plan_proactive_candidates_skips_fast_topic_read_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = LongTermMemoryService.from_config(_config(temp_dir))
+
+            def _fail_fast_topic(**_kwargs):
+                raise LongTermRemoteReadFailedError(
+                    "Required remote long-term fast-topic retrieval failed.",
+                    details={
+                        "operation": "fast_topic_topk_search",
+                        "classification": "client_contract_error",
+                        "status_code": 400,
+                    },
+                )
+
+            service.object_store.select_fast_topic_objects = _fail_fast_topic  # type: ignore[method-assign]
+
+            plan = service.plan_proactive_candidates(
+                now=datetime(2026, 3, 14, 9, 0, tzinfo=timezone.utc)
+            )
+            service.shutdown()
+
+        self.assertEqual(plan.candidates, ())
 
     def test_proactive_state_atomic_write_survives_concurrent_writers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

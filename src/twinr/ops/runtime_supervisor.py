@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import errno
 import inspect
 import json
 import logging
@@ -253,6 +254,7 @@ class TwinrRuntimeSupervisor:
         self._last_streaming_gate_reason: str | None = None
         self._run_started_at_monotonic: float = -1.0
         self._last_external_watchdog_recovery_at_monotonic: float = -1.0
+        self._required_remote_recovery_ready_since_monotonic: float = -1.0
         self._terminate_requested = False
         self._shutdown_signal: int | None = None
         self._previous_signal_handlers: dict[int, object] = {}
@@ -624,6 +626,7 @@ class TwinrRuntimeSupervisor:
         exit_code = process.poll()
         if exit_code is None:
             return
+        self._reap_direct_child_pid(getattr(process, "pid", None))
         self._emit_payload(
             "runtime_supervisor_child_exited",
             child=child.key,
@@ -648,6 +651,27 @@ class TwinrRuntimeSupervisor:
             reason=f"child_exit:{exit_code}",
         )
         self._release_child_identity(child)
+
+    @staticmethod
+    def _reap_direct_child_pid(pid: int | None) -> None:
+        """Best-effort reap for one exited direct child PID.
+
+        Some process-handle paths only detect child exit by identity/liveness.
+        Explicitly calling ``waitpid(WNOHANG)`` closes the loop for direct
+        children so exited leaders cannot remain as lock-owning zombies under
+        the active supervisor.
+        """
+
+        if os.name != "posix" or pid is None or pid <= 0:
+            return
+        try:
+            os.waitpid(int(pid), os.WNOHANG)
+        except ChildProcessError:
+            return
+        except OSError as exc:
+            if exc.errno in {errno.ECHILD, errno.ESRCH}:
+                return
+            raise
 
     def _start_child(
         self,
@@ -693,6 +717,8 @@ class TwinrRuntimeSupervisor:
         child.last_restart_at_monotonic = now_monotonic
         child.restart_count += 1
         child.clear_health_issue()
+        if child.key == self._streaming.key:
+            self._clear_required_remote_recovery_hold()
 
         self._child_next_start_at_monotonic[child.key] = -1.0
         self._child_last_start_defer_reason[child.key] = None
@@ -778,6 +804,8 @@ class TwinrRuntimeSupervisor:
         if process.poll() is not None:
             child.process = None
             child.clear_health_issue()
+            if child.key == self._streaming.key:
+                self._clear_required_remote_recovery_hold()
             self._release_child_identity(child)
             return
         self._emit_payload(
@@ -806,6 +834,8 @@ class TwinrRuntimeSupervisor:
                 )
         child.process = None
         child.clear_health_issue()
+        if child.key == self._streaming.key:
+            self._clear_required_remote_recovery_hold()
         self._release_child_identity(child)
 
     def _restart_child(
@@ -950,7 +980,11 @@ class TwinrRuntimeSupervisor:
                 issue="streaming_startup_stalled",
             )
             return
-        snapshot_issue = self._snapshot_health_issue(snapshot, assessment=assessment)
+        snapshot_issue = self._snapshot_health_issue(
+            snapshot,
+            assessment=assessment,
+            now_monotonic=now_monotonic,
+        )
         if snapshot_issue is not None:
             self._restart_streaming_if_persistent(
                 now_monotonic=now_monotonic,
@@ -1024,28 +1058,72 @@ class TwinrRuntimeSupervisor:
             return False
         return updated_at >= started_at_utc
 
+    def _required_remote_uses_watchdog_artifact(self) -> bool:
+        mode = str(
+            getattr(self.config, "long_term_memory_remote_runtime_check_mode", "direct") or "direct"
+        ).strip().lower()
+        return mode == "watchdog_artifact"
+
+    def _required_remote_recovery_hold_seconds(self) -> float:
+        if not self._required_remote_uses_watchdog_artifact():
+            return 0.0
+        try:
+            interval_s = max(0.1, float(getattr(self.config, "long_term_memory_remote_watchdog_interval_s", 1.0)))
+        except (TypeError, ValueError):
+            interval_s = 1.0
+        try:
+            keepalive_s = max(
+                0.0,
+                float(getattr(self.config, "long_term_memory_remote_keepalive_interval_s", interval_s)),
+            )
+        except (TypeError, ValueError):
+            keepalive_s = interval_s
+        return max(interval_s * 3.0, keepalive_s)
+
+    def _clear_required_remote_recovery_hold(self) -> None:
+        self._required_remote_recovery_ready_since_monotonic = -1.0
+
     def _snapshot_health_issue(
         self,
         snapshot: RuntimeSnapshot | None,
         *,
         assessment: RequiredRemoteWatchdogAssessment,
+        now_monotonic: float,
     ) -> str | None:
         if snapshot is None:
+            self._clear_required_remote_recovery_hold()
             return "runtime_snapshot_missing"
         updated_at = _parse_utc_timestamp(getattr(snapshot, "updated_at", None))
         if updated_at is None:
+            self._clear_required_remote_recovery_hold()
             return "runtime_snapshot_missing"
         runtime_status = str(getattr(snapshot, "status", "") or "").strip().lower()
         if runtime_status == "waiting":
+            self._clear_required_remote_recovery_hold()
             return None
         if runtime_status == "error" and not assessment.ready:
+            self._clear_required_remote_recovery_hold()
             return None
         if runtime_status == "error" and self._snapshot_error_is_required_remote(snapshot):
             # Required-remote failures can strand the child inside the top-level
             # runtime error hold, which never self-recovers. Once the watchdog
-            # is healthy again, recycle the child promptly instead of waiting
-            # for generic snapshot staleness.
+            # is durably healthy again, recycle the child instead of waiting
+            # for generic snapshot staleness. A single ready blip is not
+            # sufficient because the runtime gate itself already requires a
+            # bounded stable-ready window before clearing required-remote.
+            recovery_hold_s = self._required_remote_recovery_hold_seconds()
+            if recovery_hold_s > 0.0:
+                if self._required_remote_recovery_ready_since_monotonic < 0.0:
+                    self._required_remote_recovery_ready_since_monotonic = now_monotonic
+                    return None
+                stable_ready_s = max(
+                    0.0,
+                    now_monotonic - self._required_remote_recovery_ready_since_monotonic,
+                )
+                if stable_ready_s < recovery_hold_s:
+                    return None
             return "required_remote_recovered"
+        self._clear_required_remote_recovery_hold()
         age_s = max(0.0, (self._utcnow() - updated_at).total_seconds())
         if age_s > self.max_snapshot_age_s:
             return "runtime_snapshot_stale"

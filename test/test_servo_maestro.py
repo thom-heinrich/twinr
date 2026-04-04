@@ -14,8 +14,18 @@ from twinr.hardware.servo_maestro import (
 
 
 class FakePololuMaestroServoPulseWriter(PololuMaestroServoPulseWriter):
-    def __init__(self, *, device_path: str) -> None:
-        super().__init__(device_path=device_path)
+    def __init__(
+        self,
+        *,
+        device_path: str,
+        speed_limit_us_per_s: float | None = None,
+        acceleration_limit_us_per_s2: float | None = None,
+    ) -> None:
+        super().__init__(
+            device_path=device_path,
+            speed_limit_us_per_s=speed_limit_us_per_s,
+            acceleration_limit_us_per_s2=acceleration_limit_us_per_s2,
+        )
         self.opened_paths: list[str] = []
         self.written_payloads: list[bytes] = []
         self.read_responses: list[bytes] = []
@@ -134,7 +144,35 @@ class PololuMaestroServoPulseWriterTests(unittest.TestCase):
         self.assertEqual(writer.opened_paths, [str(device_path)])
         self.assertEqual(
             writer.written_payloads,
-            [bytes((0xAA,)), bytes((0x84, 0x00, 0x70, 0x2E))],
+            [
+                bytes((0xAA,)),
+                bytes((0x87, 0x00, 0x00, 0x00)),
+                bytes((0x89, 0x00, 0x00, 0x00)),
+                bytes((0x84, 0x00, 0x70, 0x2E)),
+            ],
+        )
+
+    def test_write_applies_configured_speed_and_acceleration_before_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            device_path = Path(temp_dir) / "ttyACM0"
+            device_path.write_text("", encoding="utf-8")
+            writer = FakePololuMaestroServoPulseWriter(
+                device_path=str(device_path),
+                speed_limit_us_per_s=100.0,
+                acceleration_limit_us_per_s2=625.0,
+            )
+            writer._resolved_device_path = str(device_path)
+
+            writer.write(gpio_chip="ignored", gpio=1, pulse_width_us=1600)
+
+        self.assertEqual(
+            writer.written_payloads,
+            [
+                bytes((0xAA,)),
+                bytes((0x87, 0x01, 0x04, 0x00)),
+                bytes((0x89, 0x01, 0x02, 0x00)),
+                bytes((0x84, 0x01, 0x00, 0x32)),
+            ],
         )
 
     def test_probe_requires_command_port_response(self) -> None:
@@ -165,7 +203,12 @@ class PololuMaestroServoPulseWriterTests(unittest.TestCase):
 
         self.assertEqual(
             writer.written_payloads,
-            [bytes((0xAA,)), bytes((0x84, 0x00, 0x00, 0x00))],
+            [
+                bytes((0xAA,)),
+                bytes((0x87, 0x00, 0x00, 0x00)),
+                bytes((0x89, 0x00, 0x00, 0x00)),
+                bytes((0x84, 0x00, 0x00, 0x00)),
+            ],
         )
 
     def test_current_pulse_width_reads_channel_position(self) -> None:

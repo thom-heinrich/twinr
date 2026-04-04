@@ -24,10 +24,16 @@ import termios
 _DEFAULT_READ_TIMEOUT_S = 0.25
 _MAESTRO_AUTODETECT_BAUD_BYTE = 0xAA
 _MAESTRO_COMMAND_SET_TARGET = 0x84
+_MAESTRO_COMMAND_SET_SPEED = 0x87
+_MAESTRO_COMMAND_SET_ACCELERATION = 0x89
 _MAESTRO_COMMAND_GET_POSITION = 0x90
 _MAESTRO_MAX_CHANNEL = 23
 _MAESTRO_TARGET_SCALE = 4
 _MAESTRO_MAX_TARGET_QUARTER_US = 0x3FFF
+_MAESTRO_MAX_SPEED = 3968
+_MAESTRO_MAX_ACCELERATION = 255
+_MAESTRO_SPEED_UNIT_US_PER_S = 25.0
+_MAESTRO_ACCELERATION_UNIT_US_PER_S2 = 312.5
 _POLOLU_VENDOR_ID = "1ffb"
 _MAESTRO_PRODUCT_IDS = frozenset(
     {
@@ -152,11 +158,28 @@ class PololuMaestroServoPulseWriter:
         *,
         device_path: str | Path | None = None,
         read_timeout_s: float = _DEFAULT_READ_TIMEOUT_S,
+        speed_limit_us_per_s: float | None = None,
+        acceleration_limit_us_per_s2: float | None = None,
     ) -> None:
         self._configured_device_path = None if device_path is None else str(device_path).strip() or None
         self._read_timeout_s = max(0.01, float(read_timeout_s))
         self._resolved_device_path: str | None = None
         self._fd: int | None = None
+        self._speed_limit = self._encode_speed_limit(speed_limit_us_per_s)
+        self._acceleration_limit = self._encode_acceleration_limit(acceleration_limit_us_per_s2)
+        self._configured_motion_profile_by_channel: dict[int, tuple[int, int]] = {}
+
+    @property
+    def hardware_motion_profile_enabled(self) -> bool:
+        """Return whether the writer owns motion smoothing inside the Maestro."""
+
+        return self._speed_limit > 0 or self._acceleration_limit > 0
+
+    @property
+    def reports_live_position(self) -> bool:
+        """Return whether `current_pulse_width_us` reflects the live emitted pulse."""
+
+        return True
 
     @property
     def resolved_device_path(self) -> str:
@@ -231,6 +254,7 @@ class PololuMaestroServoPulseWriter:
 
         self._write_bytes(fd, bytes((_MAESTRO_AUTODETECT_BAUD_BYTE,)))
         self._flush_input(fd)
+        self._configured_motion_profile_by_channel.clear()
 
     def _write_bytes(self, fd: int, payload: bytes) -> None:
         view = memoryview(payload)
@@ -286,13 +310,82 @@ class PololuMaestroServoPulseWriter:
             )
         )
 
+    def _encode_speed_command(self, *, channel: int, speed_limit: int) -> bytes:
+        checked_channel = _validate_channel(channel)
+        checked_speed = max(0, min(_MAESTRO_MAX_SPEED, int(speed_limit)))
+        return bytes(
+            (
+                _MAESTRO_COMMAND_SET_SPEED,
+                checked_channel,
+                checked_speed & 0x7F,
+                (checked_speed >> 7) & 0x7F,
+            )
+        )
+
+    def _encode_acceleration_command(self, *, channel: int, acceleration_limit: int) -> bytes:
+        checked_channel = _validate_channel(channel)
+        checked_acceleration = max(0, min(_MAESTRO_MAX_ACCELERATION, int(acceleration_limit)))
+        return bytes(
+            (
+                _MAESTRO_COMMAND_SET_ACCELERATION,
+                checked_channel,
+                checked_acceleration & 0x7F,
+                (checked_acceleration >> 7) & 0x7F,
+            )
+        )
+
+    def _encode_speed_limit(self, speed_limit_us_per_s: float | None) -> int:
+        if speed_limit_us_per_s is None:
+            return 0
+        checked_speed = max(0.0, float(speed_limit_us_per_s))
+        if checked_speed <= 0.0:
+            return 0
+        return max(
+            1,
+            min(_MAESTRO_MAX_SPEED, int(round(checked_speed / _MAESTRO_SPEED_UNIT_US_PER_S))),
+        )
+
+    def _encode_acceleration_limit(self, acceleration_limit_us_per_s2: float | None) -> int:
+        if acceleration_limit_us_per_s2 is None:
+            return 0
+        checked_acceleration = max(0.0, float(acceleration_limit_us_per_s2))
+        if checked_acceleration <= 0.0:
+            return 0
+        return max(
+            1,
+            min(
+                _MAESTRO_MAX_ACCELERATION,
+                int(round(checked_acceleration / _MAESTRO_ACCELERATION_UNIT_US_PER_S2)),
+            ),
+        )
+
+    def _ensure_motion_profile(self, *, fd: int, channel: int) -> None:
+        checked_channel = _validate_channel(channel)
+        desired_profile = (self._speed_limit, self._acceleration_limit)
+        if self._configured_motion_profile_by_channel.get(checked_channel) == desired_profile:
+            return
+        self._write_bytes(
+            fd,
+            self._encode_speed_command(channel=checked_channel, speed_limit=self._speed_limit),
+        )
+        self._write_bytes(
+            fd,
+            self._encode_acceleration_command(
+                channel=checked_channel,
+                acceleration_limit=self._acceleration_limit,
+            ),
+        )
+        self._configured_motion_profile_by_channel[checked_channel] = desired_profile
+
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         del gpio_chip
         fd = self._ensure_fd()
+        checked_channel = _validate_channel(int(gpio))
+        self._ensure_motion_profile(fd=fd, channel=checked_channel)
         self._write_bytes(
             fd,
             self._encode_target_command(
-                channel=int(gpio),
+                channel=checked_channel,
                 target_quarter_us=int(pulse_width_us) * _MAESTRO_TARGET_SCALE,
             ),
         )
@@ -300,9 +393,11 @@ class PololuMaestroServoPulseWriter:
     def disable(self, *, gpio_chip: str, gpio: int) -> None:
         del gpio_chip
         fd = self._ensure_fd()
+        checked_channel = _validate_channel(int(gpio))
+        self._ensure_motion_profile(fd=fd, channel=checked_channel)
         self._write_bytes(
             fd,
-            self._encode_target_command(channel=int(gpio), target_quarter_us=0),
+            self._encode_target_command(channel=checked_channel, target_quarter_us=0),
         )
 
     def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:

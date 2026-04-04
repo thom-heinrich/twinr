@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Real
 
 
 def _ensure_non_empty_text(field_name: str, value: object) -> str:
@@ -32,10 +33,15 @@ def _ensure_positive_number(field_name: str, value: object) -> float:
 
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must be a positive number.")
-    try:
+    if isinstance(value, Real):
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{field_name} must be a positive number.") from exc
+    elif isinstance(value, (str, bytes, bytearray)):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError(f"{field_name} must be a positive number.") from exc
+    else:
+        raise TypeError(f"{field_name} must be a positive number.")
     if not math.isfinite(parsed) or parsed <= 0.0:
         raise ValueError(f"{field_name} must be a positive finite number.")
     return parsed

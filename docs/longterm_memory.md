@@ -206,13 +206,17 @@ This harness seeds a realistic mixed store with:
 
 It exercises the full provider-context path with canonical-English retrieval queries, rather than checking only raw extractor outputs.
 
+The fixture day is anchored relative to the run date so the conversation-turn
+half remains inside the active episodic-retention window; the goldset should
+not drift red just because the wall clock moved past a hard-coded calendar day.
+
 Repro:
 
 ```bash
 PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.multimodal_eval
 ```
 
-Current validated run on 2026-03-14:
+Current validated run on 2026-04-04:
 
 - 500 seeded entries
 - 50/50 cases passed
@@ -222,6 +226,61 @@ This eval also guards against two subtle quality regressions:
 
 - internal machine metadata like `slot_key` or `support_count` leaking into retrieval ranking
 - irrelevant episodic fallback context appearing on unrelated user questions
+
+## Messy mixed-corpus eval
+
+Twinr also carries one larger remote-memory stress eval under
+`src/twinr/memory/longterm/evaluation/messy_memory_eval.py`.
+
+This harness intentionally combines the existing fixed fixtures into one shared
+remote namespace instead of running them in isolation:
+
+- the synthetic recall corpus (`500` seeded entries, `50` cases)
+- the multimodal routine corpus (`500` seeded entries, `50` cases)
+- the expanded unified-retrieval goldset (`50` natural-language cases)
+
+The purpose is different from the individual suites: it measures whether the
+same recall quality still holds once graph contacts, plans, preferences,
+episodic turns, multimodal routines, durable conflicts, graph joins, and
+midterm packets all coexist in the same ChonkyDB namespace.
+
+It also runs both phases:
+
+- `writer`
+  - immediately after seeding the messy corpus
+- `fresh_reader`
+  - from a separate isolated runtime root against the same remote namespace
+
+That makes restart regressions visible with explicit case-level deltas instead
+of only one blended score.
+
+Covered dimensions in the shared corpus:
+
+- exact contact lookup
+- contact disambiguation
+- shopping recall
+- temporal multihop recall
+- episodic conversation recall
+- multimodal presence routine recall
+- button / print routine recall
+- camera interaction recall
+- combined episodic + multimodal context
+- negative controls / irrelevant-query containment
+- unified source/id/join/access-path precision and recall across adaptive, conflict, durable, episodic, graph, and midterm sources
+- writer vs fresh-reader restart drift
+
+Repro:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.messy_memory_eval --env-file .env --unified-case-profile expanded
+```
+
+Artifacts:
+
+- rolling ops artifact:
+  - `artifacts/stores/ops/messy_memory_eval.json`
+- per-run snapshot:
+  - `artifacts/reports/messy_memory_eval/`
 
 ## Structured persistence
 

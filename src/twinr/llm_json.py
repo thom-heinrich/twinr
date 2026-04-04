@@ -24,7 +24,7 @@ import operator
 import re
 import time
 from functools import lru_cache
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, SupportsIndex
 
 # BREAKING: Standard-compliant local validation now depends on jsonschema>=4.26.
 try:
@@ -237,6 +237,8 @@ def _validated_max_output_tokens(value: object) -> int:
 
     if isinstance(value, bool):
         raise TypeError("max_output_tokens must be an integer >= 1, not bool")
+    if not isinstance(value, SupportsIndex):
+        raise TypeError("max_output_tokens must be an integer >= 1")
     try:
         normalized_value = operator.index(value)
     except TypeError as exc:

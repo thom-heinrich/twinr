@@ -1,6 +1,6 @@
 # evaluation
 
-Isolated long-term memory evaluations for recall, multimodal retrieval, unified retrieval quality, unified retrieval benchmarking, subtext behavior, live midterm memory attestation, live synthetic-memory acceptance, deploy-time live retention attestation, and forensic latency profiling of the remote long-term retrieval path.
+Isolated long-term memory evaluations for recall, multimodal retrieval, messy mixed-corpus recall/restart stress, unified retrieval quality, unified retrieval benchmarking, subtext behavior, live midterm memory attestation, live synthetic-memory acceptance, deploy-time live retention attestation, and forensic latency profiling of the remote long-term retrieval path.
 
 ## Responsibility
 
@@ -13,9 +13,12 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, unified 
 - synchronously materialize the strict live provider-answer front for subtext cases before the answer turn, so the eval measures the real live-provider contract instead of failing on a missing transcript-first prewarm side effect
 - keep live synthetic-memory acceptance focused on the low-latency memory surface by composing fast-topic hints, tool-safe durable context without graph fallback, and explicit conflict-queue rendering, so the proof does not trigger unrelated graph/world-state full-document reads while attesting memory recall
 - execution of profiled unified-retrieval goldset cases that assert selected ids, join anchors, rendered sections, and access-path classes across durable, conflict, midterm, episodic, adaptive, and graph sources, with a narrow `core` suite for live acceptance and an `expanded` KPI suite with 50 natural-language recall cases
+- execution of one large mixed-corpus remote-memory evaluation that composes the synthetic recall fixture, multimodal routine fixture, and expanded unified-retrieval goldset inside one shared ChonkyDB namespace, then reruns the same corpus from a fresh reader to expose restart regressions under messy cross-source distractors
+- seed the large messy synthetic graph fixture locally and publish the finished graph once through the real remote graph persist path, so the benchmark measures retrieval quality under one shared corpus instead of spending most of its budget replaying 150 incremental full-graph rewrites
 - execution of live writer/fresh-reader unified-retrieval acceptance against the real ChonkyDB path using the narrow `core` case profile by default
 - execution of a unified-retrieval benchmark over the broader `expanded` case profile by default, reporting source-wise precision/recall, selected-id precision/recall, join-anchor quality, and path-safety metrics
 - execution of a bounded live retention canary that seeds a fresh namespace, forbids broad object/snapshot hydration on the writer path, runs the real `run_retention()` flow, and proves the resulting current/archive heads from a fresh reader rooted at a separate runtime directory
+- persist per-stage retention-canary evidence plus the latest watchdog observation so operators can tell whether a failing canary is contradicting the watchdog or simply proving a stricter isolated-namespace write/retention/readback contract
 - execution of latency profiling runs that capture forensic workflow evidence for remote long-term retrieval bottlenecks, including fast pre-answer topic-hint reads, while bootstrapping required remote snapshot heads before the timed iterations when a fresh namespace has not yet been provisioned
 - isolate per-case writable runtime state inside each temporary subtext-eval workspace so graph/runtime locks cannot bleed onto the shared repo state during live evaluation
 - persist richer per-case subtext diagnostics, including query-profile variants, section previews, and seeded-term presence across subtext/durable/episodic/graph context, so answer-quality regressions can be separated from retrieval/bootstrap failures
@@ -33,6 +36,7 @@ Isolated long-term memory evaluations for recall, multimodal retrieval, unified 
 |---|---|
 | `eval.py` | Synthetic recall eval |
 | `multimodal_eval.py` | Multimodal retrieval eval |
+| `messy_memory_eval.py` | Large mixed-corpus remote-memory evaluation with writer/fresh-reader comparison |
 | `_unified_retrieval_shared.py` | Shared fixture, profiled case catalogs, and case-evaluation helpers for unified retrieval quality checks |
 | `unified_retrieval_goldset.py` | Deterministic unified-retrieval goldset runner against an isolated namespace, defaulting to the expanded KPI profile |
 | `live_unified_retrieval_acceptance.py` | Live writer/fresh-reader acceptance for unified retrieval against real ChonkyDB, defaulting to the narrow core profile |
@@ -54,6 +58,7 @@ from twinr.memory.longterm.evaluation.live_memory_acceptance import run_live_mem
 from twinr.memory.longterm.evaluation.live_midterm_acceptance import run_live_midterm_acceptance
 from twinr.memory.longterm.evaluation.live_unified_retrieval_acceptance import run_live_unified_retrieval_acceptance
 from twinr.memory.longterm.evaluation.live_retention_canary import run_live_retention_canary
+from twinr.memory.longterm.evaluation.messy_memory_eval import run_messy_memory_eval
 from twinr.memory.longterm.evaluation.multimodal_eval import run_multimodal_longterm_eval
 from twinr.memory.longterm.evaluation.subtext_eval import run_subtext_response_eval
 from twinr.memory.longterm.evaluation.unified_retrieval_benchmark import run_unified_retrieval_benchmark
@@ -61,6 +66,7 @@ from twinr.memory.longterm.evaluation.unified_retrieval_goldset import run_unifi
 
 synthetic = run_synthetic_longterm_eval()
 multimodal = run_multimodal_longterm_eval()
+messy = run_messy_memory_eval(env_path=".env")
 goldset = run_unified_retrieval_goldset(env_path=".env")
 benchmark = run_unified_retrieval_benchmark(env_path=".env")
 subtext = run_subtext_response_eval(env_path=".env")
@@ -75,6 +81,10 @@ profile = run_longterm_latency_profile(
     target="fast_provider_context",
 )
 ```
+
+The multimodal eval keeps its fixture day relative to the run date so the
+conversation-turn half stays inside the default episodic retention horizon
+instead of silently aging out over calendar time.
 
 Standard ops command:
 
@@ -100,6 +110,12 @@ Unified retrieval benchmark command:
 PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.unified_retrieval_benchmark --env-file .env --case-profile expanded
 ```
 
+Messy mixed-corpus evaluation command:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.messy_memory_eval --env-file .env --unified-case-profile expanded
+```
+
 Latency profiling command:
 
 ```bash
@@ -116,13 +132,27 @@ The standard command persists the latest result to
 
 The retention canary persists a bounded per-run snapshot under
 `artifacts/reports/retention_live_canary/` and is intended to be called by the
-Pi deploy helper as a post-restart remote-memory proof.
+Pi deploy helper as a post-restart remote-memory proof. The report now records
+`failure_stage`, per-step latencies, and the latest watchdog observation so a
+green watchdog plus a red canary reads as “different proof surfaces” instead of
+two contradictory truths.
+When the remote canary itself takes longer than the caller's SSH stdout budget,
+the deploy path can recover this per-run report by `probe_id` and keep the
+operator-facing error aligned with the Pi-side structured result.
 
 The unified benchmark persists the latest benchmark summary to
 `artifacts/stores/ops/unified_retrieval_benchmark.json` and a per-run snapshot
 under `artifacts/reports/unified_retrieval_benchmark/`. It is intended to make
 over-selection and join-quality regressions visible even when the pass/fail
 goldset still succeeds.
+
+The messy mixed-corpus runner persists the latest result to
+`artifacts/stores/ops/messy_memory_eval.json` and a per-run snapshot under
+`artifacts/reports/messy_memory_eval/`. It is intended to answer a stricter
+question than the individual suites: whether the same retrieval quality still
+holds once synthetic graph clutter, multimodal routines, and unified
+multi-source conflicts all coexist in one remote namespace and are then read
+back by a fresh runtime.
 
 The unified-retrieval profiles expose two operational tiers:
 - `core`: 3 high-signal cases for bounded live writer/fresh-reader acceptance.

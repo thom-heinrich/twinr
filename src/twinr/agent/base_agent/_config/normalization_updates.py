@@ -502,6 +502,11 @@ def apply_attention_servo_updates(
     )
     object.__setattr__(
         config,
+        "attention_servo_position_follow_max_degrees",
+        updates["normalized_attention_servo_position_follow_max_degrees"],
+    )
+    object.__setattr__(
+        config,
         "attention_servo_exit_follow_max_degrees",
         updates["normalized_attention_servo_exit_follow_max_degrees"],
     )

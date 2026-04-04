@@ -1,3 +1,8 @@
+# CHANGELOG: 2026-04-04
+# BUG-4: Keep productive direct-guard aplay processes inside the supervisor-owned
+# streaming-loop session. Starting a separate session let /dev/zero keepalive
+# helpers survive loop restarts as PPID=1 orphans, leaving twinr_playback_softvol
+# busy for the next foreground thinking/TTS playback.
 # CHANGELOG: 2026-03-28
 # BUG-1: Detect ReSpeaker ALSA devices referenced as numeric/symbolic hw/plughw/sysdefault cards via /proc/asound/cards; official Seeed examples use plughw:<card>,0 and were previously missed.
 # BUG-2: Prevent helper hangs and false positives by using non-blocking open, startup settling, shared ref-counted guards, and multi-rate fallback/caching.
@@ -14,6 +19,11 @@ Twinr-owned playback stream is already active. The productive voice
 orchestrator solves this with a long-lived playback coordinator keepalive. This
 module provides the equivalent bounded helper for short-lived hardware probes,
 ambient samplers, and self-tests that run outside that orchestrator.
+
+For the productive voice path, the supervisor already launches each streaming
+loop in its own dedicated POSIX session. The guard therefore must not detach
+again into a second session, or its silent ``aplay /dev/zero`` helper can
+survive a loop restart and strand the productive playback device as an orphan.
 """
 
 from __future__ import annotations
@@ -378,7 +388,9 @@ def _spawn_aplay_handle(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             close_fds=True,
-            start_new_session=True,
+            # Keep the guard inside the streaming-loop child session so the
+            # runtime supervisor can reap it together with the old loop during
+            # internal restarts instead of leaving an orphaned aplay behind.
         )
     except OSError as exc:
         raise RuntimeError(

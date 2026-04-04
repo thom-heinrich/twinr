@@ -32,6 +32,22 @@ def _completed(stdout: str = "") -> subprocess.CompletedProcess[str]:
     )
 
 
+def _failed_completed(
+    *,
+    returncode: int = 1,
+    stdout: str = "",
+    stderr: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Return one failed fake SSH command result."""
+
+    return subprocess.CompletedProcess(
+        args=["ssh"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 class RemoteSystemdRestartGuardTests(unittest.TestCase):
     """Cover the remote manual-restart protection helper."""
 
@@ -104,7 +120,7 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
         self.assertIn("daemon-reload", scripts[0])
         self.assertIn("systemctl show", scripts[2])
 
-    def test_guarded_restart_always_removes_temp_override(self) -> None:
+    def test_guarded_restart_uses_bounded_stop_kill_start_sequence(self) -> None:
         executor = Mock()
         executor.run_sudo_ssh.side_effect = [
             _completed(
@@ -112,11 +128,40 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
                 '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
                 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-temp-manual-restart-override.conf"}'
             ),
-            RuntimeError("restart failed"),
+            _completed('{"ok": true, "phase": "start", "actions": ["stop", "kill_all_sigkill", "start"]}'),
             _completed('{"changed": true, "path": "/tmp/removed.conf"}'),
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "restart failed"):
+        guarded_restart_remote_service(
+            executor=executor,
+            service_name="caia-twinr-chonkydb-alt.service",
+        )
+
+        scripts = [call.args[0] for call in executor.run_sudo_ssh.call_args_list]
+        self.assertIn("temp-manual-restart-override.conf", scripts[0])
+        self.assertIn("'systemctl', 'stop', service_name", scripts[1])
+        self.assertIn("'systemctl', 'kill', '--kill-who=all', '--signal=SIGKILL', service_name", scripts[1])
+        self.assertIn("'systemctl', 'start', service_name", scripts[1])
+        self.assertIn("reset-failed", scripts[1])
+        self.assertIn("caia-twinr-chonkydb-alt.service", scripts[1])
+        self.assertIn("temp-manual-restart-override.conf", scripts[2])
+
+    def test_guarded_restart_raises_on_nonzero_remote_command_and_still_removes_override(self) -> None:
+        executor = Mock()
+        executor.run_sudo_ssh.side_effect = [
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
+                'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-temp-manual-restart-override.conf"}'
+            ),
+            _failed_completed(
+                stdout='{"ok": false, "phase": "kill_timeout"}',
+                stderr="systemctl stop timed out",
+            ),
+            _completed('{"changed": true, "path": "/tmp/removed.conf"}'),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "remote_guarded_restart_failed"):
             guarded_restart_remote_service(
                 executor=executor,
                 service_name="caia-twinr-chonkydb-alt.service",
@@ -124,8 +169,7 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
 
         scripts = [call.args[0] for call in executor.run_sudo_ssh.call_args_list]
         self.assertIn("temp-manual-restart-override.conf", scripts[0])
-        self.assertIn("systemctl restart", scripts[1])
-        self.assertIn("caia-twinr-chonkydb-alt.service", scripts[1])
+        self.assertIn("'systemctl', 'stop', service_name", scripts[1])
         self.assertIn("temp-manual-restart-override.conf", scripts[2])
 
 
@@ -197,6 +241,14 @@ class RemoteChonkyDBRepairProtectionIntegrationTests(unittest.TestCase):
                     action="none",
                     reason="public_ready",
                 ),
+            ),
+            patch(
+                "twinr.ops.remote_chonkydb_repair.inspect_backend_data_ownership",
+                return_value=None,
+            ),
+            patch(
+                "twinr.ops.remote_chonkydb_repair.inspect_foreign_backend_consumers",
+                return_value=(),
             ),
         ):
             result = repair_remote_chonkydb(

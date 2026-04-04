@@ -100,7 +100,7 @@ def _dedupe(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
-def _normalize_capability_mapping(raw_mapping: Mapping[object, object]) -> dict[str, tuple[str, ...]]:
+def _normalize_capability_mapping(raw_mapping: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
     normalized_mapping: dict[str, tuple[str, ...]] = {}
     for capability_name, raw_methods in raw_mapping.items():
         normalized_name = _normalize_capability_name(capability_name, field_name="capability_name")
@@ -184,20 +184,24 @@ class CapabilityBrokerManifest:
     def allowed_methods(self) -> tuple[str, ...]:
         """Return the sorted union of all methods permitted by this manifest."""
 
+        capability_methods = self.capability_methods
+        if capability_methods is None:
+            return ()
         ordered: set[str] = set()
-        for methods in self.capability_methods.values():
+        for methods in capability_methods.values():
             ordered.update(methods)
         return tuple(sorted(ordered))
 
     def to_payload(self) -> dict[str, Any]:
         """Return a JSON-safe payload for persistence in skill artifacts."""
 
+        capability_methods = self.capability_methods or {}
         return {
             "schema": self.schema,
             "required_capabilities": list(self.required_capabilities),
             "allowed_methods": list(self.allowed_methods),
             "capability_methods": {
-                capability_name: list(self.capability_methods[capability_name])  # AUDIT-FIX(#1): Serialize from the frozen canonical mapping.
+                capability_name: list(capability_methods[capability_name])  # AUDIT-FIX(#1): Serialize from the frozen canonical mapping.
                 for capability_name in self.required_capabilities
             },
         }

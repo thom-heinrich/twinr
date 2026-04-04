@@ -83,16 +83,50 @@ twinr = [
 
 [tool.mypy]
 python_version = "3.11"
-ignore_errors = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
 module = [
+    "test.*",
+    "twinr.__main__",
+    "twinr.agent.base_agent.runtime.*",
+    "twinr.agent.base_agent.settings.*",
+    "twinr.agent.base_agent.state.*",
+    "twinr.agent.personality.*",
+    "twinr.agent.routing.*",
+    "twinr.agent.self_coding.*",
+    "twinr.agent.tools.runtime.*",
+    "twinr.agent.workflows.*",
+    "twinr.automations.*",
+    "twinr.channels.*",
+    "twinr.display.*",
+    "twinr.hardware.*",
+    "twinr.integrations.*",
+    "twinr.memory.*",
+    "twinr.ops.*",
+    "twinr.orchestrator.*",
+    "twinr.proactive.*",
+    "twinr.providers.*",
+    "twinr.web.*",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
     "test.test_channels_whatsapp",
+    "twinr.agent.self_coding.sandbox.policy",
     "twinr.channels.pending_whatsapp_followup",
     "twinr.channels.tool_runtime",
+    "twinr.display.layouts",
+    "twinr.hardware.respeaker.led_profiles",
+    "twinr.integrations.smarthome.hue.models",
+    "twinr.memory.longterm.evaluation.live_midterm_attest",
+    "twinr.memory.longterm.ingestion.respeaker_contract",
     "twinr.orchestrator.voice_session_impl.scanner",
     "twinr.orchestrator.voice_session_impl.transcription",
+    "twinr.proactive.runtime.claim_metadata",
+    "twinr.proactive.social.camera_surface_impl.validation",
     "twinr.providers.groq.adapters",
+    "twinr.web.presenters.conversation_lab",
 ]
 ignore_errors = false

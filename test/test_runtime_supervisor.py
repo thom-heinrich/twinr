@@ -181,11 +181,12 @@ def _build_health(
 
 
 class RuntimeSupervisorTests(unittest.TestCase):
-    def _build_config(self, root: Path) -> TwinrConfig:
+    def _build_config(self, root: Path, **overrides) -> TwinrConfig:
         return TwinrConfig(
             project_root=str(root),
             runtime_state_path=str(root / "runtime-state.json"),
             display_wayland_runtime_dir="/run/user/1000",
+            **overrides,
         )
 
     def test_default_external_watchdog_starter_disallows_raw_spawn(self) -> None:
@@ -267,6 +268,34 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertEqual(snapshot.current.status, "starting")
         self.assertTrue(snapshot.probe_inflight)
         self.assertEqual(snapshot.pid, factory.calls[0]["process"].pid)
+
+    def test_clear_dead_child_best_effort_reaps_direct_child_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=_RecordingProcessFactory(clock),
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+            )
+            process = _FakeProcess("streaming")
+            process.exit_code = 1
+            supervisor._streaming.process = process
+
+            with mock.patch("twinr.ops.runtime_supervisor.os.waitpid", return_value=(process.pid, 0)) as waitpid:
+                supervisor._clear_dead_child(supervisor._streaming, now_monotonic=clock.monotonic())
+
+        waitpid.assert_called_once_with(process.pid, os.WNOHANG)
+        self.assertIsNone(supervisor._streaming.process)
 
     def test_run_primes_audio_session_env_before_spawning_children(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1163,6 +1192,106 @@ class RuntimeSupervisorTests(unittest.TestCase):
             )
 
             supervisor.run(duration_s=1.5)
+
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 2)
+
+    def test_required_remote_error_waits_for_stable_watchdog_recovery_in_watchdog_artifact_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(
+                root,
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                long_term_memory_remote_watchdog_interval_s=0.05,
+                long_term_memory_remote_keepalive_interval_s=0.2,
+            )
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+
+            snapshot_store = _RuntimeSnapshotStore(
+                lambda: RuntimeSnapshot(
+                    status="error",
+                    updated_at=clock.utcnow().isoformat(),
+                    error_message="LongTermRemoteUnavailableError: Remote long-term memory is temporarily cooling down after recent failures.",
+                )
+            )
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=snapshot_store,
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: (
+                    next(
+                        (
+                            process.pid
+                            for process in reversed(factory.processes)
+                            if process.key == "streaming"
+                        ),
+                        None,
+                    )
+                    if name == "streaming-loop"
+                    else None
+                ),
+                poll_interval_s=0.05,
+                streaming_health_grace_s=0.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=0.16)
+
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
+
+    def test_required_remote_error_restarts_streaming_after_watchdog_recovery_hold_in_watchdog_artifact_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(
+                root,
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                long_term_memory_remote_watchdog_interval_s=0.05,
+                long_term_memory_remote_keepalive_interval_s=0.2,
+            )
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+
+            snapshot_store = _RuntimeSnapshotStore(
+                lambda: RuntimeSnapshot(
+                    status="error",
+                    updated_at=clock.utcnow().isoformat(),
+                    error_message="LongTermRemoteUnavailableError: Remote long-term memory is temporarily cooling down after recent failures.",
+                )
+            )
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=snapshot_store,
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: (
+                    next(
+                        (
+                            process.pid
+                            for process in reversed(factory.processes)
+                            if process.key == "streaming"
+                        ),
+                        None,
+                    )
+                    if name == "streaming-loop"
+                    else None
+                ),
+                poll_interval_s=0.05,
+                streaming_health_grace_s=0.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=0.55)
 
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 2)
 

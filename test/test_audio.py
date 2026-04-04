@@ -15,6 +15,7 @@ from twinr.hardware.audio_env import (
     build_audio_subprocess_env,
     build_audio_subprocess_env_for_mode,
 )
+from twinr.hardware import respeaker_duplex_playback
 from twinr.hardware.audio import (
     AmbientAudioSampler,
     AudioCaptureReadinessError,
@@ -326,7 +327,7 @@ class ReSpeakerCaptureRecoveryTests(unittest.TestCase):
                 "twinr.hardware.audio.build_audio_subprocess_env_for_mode",
                 return_value={"KEEP_ME": "1"},
             ) as env_builder,
-            mock.patch("twinr.hardware.audio.subprocess.Popen", return_value=fake_process) as popen,
+            mock.patch("twinr.hardware.audio.subprocess.Popen", return_value=fake_process),
         ):
             process = __import__("twinr.hardware.audio", fromlist=["_spawn_audio_process"])._spawn_audio_process(
                 ["arecord", "-D", "default"],
@@ -338,7 +339,33 @@ class ReSpeakerCaptureRecoveryTests(unittest.TestCase):
 
         self.assertIs(process, fake_process)
         env_builder.assert_called_once_with(allow_root_borrowed_session_audio=True)
-        self.assertEqual(popen.call_args.kwargs["env"], {"KEEP_ME": "1"})
+
+    def test_respeaker_duplex_guard_spawn_stays_in_parent_session(self) -> None:
+        fake_process = _FakeCaptureProcess()
+        with (
+            mock.patch(
+                "twinr.hardware.respeaker_duplex_playback._resolve_aplay_executable",
+                return_value="/usr/bin/aplay",
+            ),
+            mock.patch(
+                "twinr.hardware.respeaker_duplex_playback._start_stderr_drain_thread",
+            ) as start_drain,
+            mock.patch(
+                "twinr.hardware.respeaker_duplex_playback.subprocess.Popen",
+                return_value=fake_process,
+            ) as popen,
+        ):
+            handle = respeaker_duplex_playback._spawn_aplay_handle(
+                playback_device="twinr_playback_softvol",
+                sample_rate_hz=24000,
+                env={"PATH": "/usr/bin"},
+            )
+
+        self.assertIs(handle.process, fake_process)
+        start_drain.assert_called_once_with(handle)
+        self.assertTrue(popen.call_args.kwargs["close_fds"])
+        self.assertNotIn("start_new_session", popen.call_args.kwargs)
+        self.assertEqual(popen.call_args.kwargs["env"], {"PATH": "/usr/bin"})
 
 
 class _FakePlaybackProcess:

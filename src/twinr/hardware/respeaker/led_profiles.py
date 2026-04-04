@@ -26,7 +26,12 @@ class ReSpeakerLedProfile:
         else:
             wave = 0.5 - (0.5 * math.cos((2.0 * math.pi * pulse_hz) * max(0.0, float(timestamp_s))))
             scale = self.min_scale + ((self.max_scale - self.min_scale) * (wave**self.gamma))
-        return tuple(_scale_channel(channel, scale) for channel in self.color_rgb)
+        red, green, blue = self.color_rgb
+        return (
+            _scale_channel(red, scale),
+            _scale_channel(green, scale),
+            _scale_channel(blue, scale),
+        )
 
 
 def _scale_channel(channel: int, scale: float) -> int:

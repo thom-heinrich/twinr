@@ -567,6 +567,21 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
         30.0,
         min(360.0, normalized_attention_servo_mechanical_range_degrees),
     )
+    normalized_attention_servo_position_follow_max_degrees = (
+        None
+        if config.attention_servo_position_follow_max_degrees is None
+        else float(config.attention_servo_position_follow_max_degrees)
+    )
+    if normalized_attention_servo_position_follow_max_degrees is not None:
+        if not math.isfinite(normalized_attention_servo_position_follow_max_degrees):
+            raise ValueError("attention_servo_position_follow_max_degrees must be finite")
+        normalized_attention_servo_position_follow_max_degrees = max(
+            0.0,
+            min(
+                normalized_attention_servo_mechanical_range_degrees * 0.5,
+                normalized_attention_servo_position_follow_max_degrees,
+            ),
+        )
     normalized_attention_servo_exit_follow_max_degrees = float(
         config.attention_servo_exit_follow_max_degrees
     )

@@ -1308,7 +1308,7 @@ class EdgeVoiceOrchestrator:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            start_new_session=True,
+            close_fds=True,
         )
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("Voice orchestrator capture process did not expose stdout/stderr")

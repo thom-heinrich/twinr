@@ -25,10 +25,11 @@ lightweight fallback for internal and hot-path code.
 from __future__ import annotations
 
 import math
-from typing import Final, SupportsIndex, SupportsInt, TypeAlias
+from numbers import Real
+from typing import Final, TypeAlias
 
-IntLike: TypeAlias = str | bytes | bytearray | SupportsInt | SupportsIndex
 NumericText: TypeAlias = str | bytes | bytearray
+IntLike: TypeAlias = NumericText | Real
 
 __all__ = [
     "IntLike",
@@ -81,18 +82,12 @@ def _parse_exact_int(value: object) -> int | None:
         except (TypeError, ValueError, OverflowError):
             return None
 
-    try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
+    if not isinstance(value, Real):
         return None
-
-    try:
-        if value != number:
-            return None
-    except Exception:
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer():
         return None
-
-    return number
+    return int(numeric)
 
 
 def _parse_finite_float(value: object) -> float | None:
@@ -109,7 +104,7 @@ def _parse_finite_float(value: object) -> float | None:
             number = float(text)
         except (TypeError, ValueError, OverflowError):
             return None
-    else:
+    elif isinstance(value, Real):
         try:
             if _FLOAT_FROM_NUMBER is not None:
                 number = _FLOAT_FROM_NUMBER(value)
@@ -117,6 +112,8 @@ def _parse_finite_float(value: object) -> float | None:
                 number = float(value)
         except (TypeError, ValueError, OverflowError):
             return None
+    else:
+        return None
 
     if not math.isfinite(number):
         return None

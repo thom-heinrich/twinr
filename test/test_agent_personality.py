@@ -161,9 +161,10 @@ class _FakeCatalogClient:
         remote_state: _FakeRemoteState,
         timeout_s: float = 8.0,
         clone_timeout_history: list[float] | None = None,
+        next_document_id_ref: list[int] | None = None,
     ) -> None:
         self._remote_state = remote_state
-        self._next_document_id = 1
+        self._next_document_id_ref = next_document_id_ref if next_document_id_ref is not None else [1]
         self.records_by_document_id: dict[str, dict[str, object]] = {}
         self.records_by_uri: dict[str, dict[str, object]] = {}
         self.config = SimpleNamespace(timeout_s=timeout_s)
@@ -175,8 +176,8 @@ class _FakeCatalogClient:
             remote_state=self._remote_state,
             timeout_s=float(timeout_s),
             clone_timeout_history=self.clone_timeout_history,
+            next_document_id_ref=self._next_document_id_ref,
         )
-        clone._next_document_id = self._next_document_id
         clone.records_by_document_id = self.records_by_document_id
         clone.records_by_uri = self.records_by_uri
         return clone
@@ -191,8 +192,8 @@ class _FakeCatalogClient:
         items = tuple(getattr(request, "items", ()))
         response_items: list[dict[str, object]] = []
         for item in items:
-            document_id = f"doc-{self._next_document_id}"
-            self._next_document_id += 1
+            document_id = f"doc-{self._next_document_id_ref[0]}"
+            self._next_document_id_ref[0] += 1
             record = {
                 "document_id": document_id,
                 "payload": dict(getattr(item, "payload", {}) or {}),
@@ -225,6 +226,38 @@ class _FakeCatalogClient:
             if record is not None:
                 return dict(record)
         raise LongTermRemoteUnavailableError("remote document unavailable")
+
+
+def _rewrite_current_item_records_as_live_chunk_documents(
+    remote_state: _FakeRemoteState,
+    *,
+    uri_segment: str,
+) -> None:
+    """Rewrite saved item records into the Pi live fetch shape used by ChonkyDB."""
+
+    client = remote_state.client
+    for uri, record in tuple(client.records_by_uri.items()):
+        if f"/{uri_segment}/" not in uri or "/catalog/" in uri:
+            continue
+        metadata = dict(record.get("metadata", {}) or {})
+        metadata.setdefault("document_id", record.get("document_id"))
+        metadata.setdefault("origin_uri", uri)
+        metadata.setdefault("payload_id", record.get("document_id"))
+        live_document = {
+            "success": True,
+            "document_id": record.get("document_id"),
+            "origin_uri": uri,
+            "chunk_count": 1,
+            "chunks": [
+                {
+                    "metadata": metadata,
+                }
+            ],
+        }
+        document_id = record.get("document_id")
+        if isinstance(document_id, str) and document_id:
+            client.records_by_document_id[document_id] = live_document
+        client.records_by_uri[uri] = live_document
 
 
 class AgentPersonalityTests(unittest.TestCase):
@@ -1024,6 +1057,38 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(remote_state.client.records_by_document_id, {})
         self.assertEqual(remote_state.client.records_by_uri, {})
 
+    def test_remote_state_store_load_snapshot_accepts_live_chunk_metadata_payload(self) -> None:
+        config = TwinrConfig(project_root=".")
+        remote_state = _FakeRemoteState(None)
+        store = RemoteStatePersonalitySnapshotStore()
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T10:00:00+00:00",
+            core_traits=(
+                PersonalityTrait(
+                    name="attentive companion",
+                    summary="Stay warm and practically useful.",
+                    weight=0.88,
+                ),
+            ),
+        )
+        store.save_snapshot(
+            config=config,
+            remote_state=remote_state,
+            snapshot=snapshot,
+        )
+        _rewrite_current_item_records_as_live_chunk_documents(
+            remote_state,
+            uri_segment="agent_personality_context",
+        )
+
+        loaded = store.load_snapshot(
+            config=config,
+            remote_state=remote_state,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.core_traits[0].name, "attentive companion")
+
     def test_remote_state_store_caps_optional_prompt_read_timeout(self) -> None:
         payload = {
             "schema_version": 1,
@@ -1166,6 +1231,38 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(loaded_place[0].place_name, "Hamburg region")
         self.assertEqual(loaded_world[0].topic, "Local election")
         self.assertEqual(loaded_deltas[0].status, "accepted")
+
+    def test_evolution_store_load_world_signals_accepts_live_chunk_metadata_payloads(self) -> None:
+        config = TwinrConfig(project_root=".")
+        remote_state = _FakeRemoteState(None)
+        store = RemoteStatePersonalityEvolutionStore()
+        signal = WorldSignal(
+            topic="Local election",
+            summary="Municipal decisions affect day-to-day life for the user.",
+            region="Hamburg",
+            source="local_news",
+            salience=0.73,
+            fresh_until="2026-03-21T00:00:00+00:00",
+            evidence_count=2,
+            source_event_ids=("news:1", "news:2"),
+        )
+        store.save_world_signals(
+            config=config,
+            remote_state=remote_state,
+            signals=(signal,),
+        )
+        _rewrite_current_item_records_as_live_chunk_documents(
+            remote_state,
+            uri_segment="agent_personality_world_signals",
+        )
+
+        loaded = store.load_world_signals(
+            config=config,
+            remote_state=remote_state,
+        )
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].topic, "Local election")
 
     def test_evolution_loop_rejects_single_signal_personality_drift(self) -> None:
         loop = PersonalityEvolutionLoop(

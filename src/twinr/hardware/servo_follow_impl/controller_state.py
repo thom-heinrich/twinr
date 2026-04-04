@@ -29,6 +29,50 @@ from .constants import (
 
 from .controller_geometry import ControllerGeometryMixin
 class ControllerStateMixin(ControllerGeometryMixin):
+    def _writer_reports_live_position(self) -> bool:
+        """Return whether the active writer exposes the live emitted pulse width."""
+
+        return bool(getattr(self._pulse_writer, "reports_live_position", False))
+
+    def _hardware_position_ramp_enabled(self) -> bool:
+        """Return whether visible positional tracking should delegate smoothing to hardware."""
+
+        return (
+            self._continuous_planner is None
+            and bool(getattr(self._pulse_writer, "hardware_motion_profile_enabled", False))
+        )
+
+    def _refresh_last_physical_pulse_width_from_writer(self) -> None:
+        """Refresh the live physical pulse when the writer can report it accurately."""
+
+        if not self._writer_reports_live_position() or self.config.gpio is None:
+            return
+        current_pulse_reader = getattr(self._pulse_writer, "current_pulse_width_us", None)
+        if not callable(current_pulse_reader):
+            return
+        try:
+            pulse_width_us = current_pulse_reader(
+                gpio_chip=self.config.gpio_chip,
+                gpio=self.config.gpio,
+            )
+        except Exception:
+            return
+        if pulse_width_us is None:
+            if self._last_commanded_pulse_width_us is None:
+                self._last_physical_pulse_width_us = self.config.center_pulse_width_us
+                self._released_pulse_width_us = self.config.center_pulse_width_us
+                self._reset_motion_state(self.config.center_pulse_width_us)
+            return
+        checked_pulse_width_us = max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, int(pulse_width_us)),
+        )
+        self._last_physical_pulse_width_us = checked_pulse_width_us
+        if self._last_commanded_pulse_width_us is None:
+            self._released_pulse_width_us = checked_pulse_width_us
+        if self._hardware_position_ramp_enabled():
+            self._reset_motion_state(checked_pulse_width_us)
+
     def _build_continuous_planner(self) -> ContinuousRotationServoPlanner | None:
         if not self.config.uses_continuous_rotation:
             return None
@@ -455,6 +499,12 @@ class ControllerStateMixin(ControllerGeometryMixin):
             return
         if self.config.gpio is None:
             return
+        if self._writer_reports_live_position():
+            self._refresh_last_physical_pulse_width_from_writer()
+            if self._last_physical_pulse_width_us is not None:
+                if self._last_physical_pulse_width_us != self.config.center_pulse_width_us:
+                    self._startup_rest_alignment_pending = True
+                return
         current_pulse_reader = getattr(self._pulse_writer, "current_pulse_width_us", None)
         if not callable(current_pulse_reader):
             return

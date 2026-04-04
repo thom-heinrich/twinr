@@ -313,6 +313,12 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         self.assertEqual(result.health_tier, "ready")
         self.assertTrue(result.archive_checked)
         self.assertTrue(result.archive_safe)
+        proof_contract = result.proof_contract()
+        self.assertEqual(proof_contract["contract_id"], "configured_namespace_archive_inclusive_readiness")
+        self.assertIn(
+            "fresh-reader item lookups after retention",
+            proof_contract["operations_not_proved"],
+        )
         for state in (prompt_state, object_state):
             self.assertTrue(all(call["prefer_cached_document_id"] for call in state.probe_calls))
             self.assertTrue(all(call["prefer_metadata_only"] for call in state.probe_calls))
@@ -486,6 +492,9 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         self.assertEqual(result.health_tier, "degraded")
         self.assertFalse(result.archive_checked)
         self.assertFalse(result.archive_safe)
+        proof_contract = result.proof_contract()
+        self.assertEqual(proof_contract["contract_id"], "configured_namespace_current_only_readiness")
+        self.assertEqual(proof_contract["mutation_scope"], "read_only")
         self.assertNotIn("archive", result.checked_snapshots)
         self.assertEqual(
             [call["snapshot_kind"] for call in object_state.probe_calls],

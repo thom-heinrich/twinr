@@ -190,6 +190,21 @@ def _section_marker(title: str, authority: str) -> str:
 
 
 class PersonalityTests(unittest.TestCase):
+    def test_default_system_prompt_declares_twinr_name_and_name_variants(self) -> None:
+        system_prompt = (
+            Path(__file__).resolve().parents[1] / "personality" / "SYSTEM.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Your name is Twinr.", system_prompt)
+        self.assertIn(
+            'Treat minor pronunciation drift or ASR spelling variants of "Twinr" as the user addressing you.',
+            system_prompt,
+        )
+        self.assertIn(
+            "If the user asks your name, answer simply that your name is Twinr.",
+            system_prompt,
+        )
+
     def test_load_personality_instructions_orders_sections_for_stable_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             personality_dir = Path(tmpdir) / "personality"

@@ -22,6 +22,8 @@ _TEMP_OVERRIDE_DROPIN_NAME = (
 )
 _PROTECTED_DROPIN_CONTENT = "[Unit]\nRefuseManualStart=yes\nRefuseManualStop=yes\n"
 _TEMP_OVERRIDE_DROPIN_CONTENT = "[Unit]\nRefuseManualStart=no\nRefuseManualStop=no\n"
+_RESTART_STOP_WAIT_S = 12.0
+_RESTART_KILL_WAIT_S = 8.0
 
 
 class RemoteSudoExecutor(Protocol):
@@ -94,7 +96,13 @@ def guarded_restart_remote_service(
     executor: RemoteSudoExecutor,
     service_name: str,
 ) -> None:
-    """Restart one protected remote unit via a temporary allow-manual override."""
+    """Restart one protected remote unit via a temporary allow-manual override.
+
+    A plain ``systemctl restart`` can trap Twinr in a long outage when the
+    dedicated ChonkyDB service hangs in ``stop-sigterm`` while shutting down its
+    docid mapping. Use a bounded stop/kill/start sequence instead so operator
+    repairs fail fast instead of burning the full systemd stop timeout.
+    """
 
     temp_override_path = _dropin_path(
         service_name=service_name,
@@ -106,7 +114,17 @@ def guarded_restart_remote_service(
         contents=_TEMP_OVERRIDE_DROPIN_CONTENT,
     )
     try:
-        executor.run_sudo_ssh("systemctl restart " + shlex.quote(service_name))
+        completed = executor.run_sudo_ssh(
+            _python_bounded_restart_script(
+                service_name=service_name,
+                graceful_stop_wait_s=_RESTART_STOP_WAIT_S,
+                kill_wait_s=_RESTART_KILL_WAIT_S,
+            )
+        )
+        _raise_for_remote_command_failure(
+            completed=completed,
+            failure_prefix="remote_guarded_restart_failed",
+        )
     finally:
         _remove_remote_dropin(
             executor=executor,
@@ -211,6 +229,22 @@ def _parse_json_stdout(stdout: str) -> dict[str, object]:
     return payload
 
 
+def _raise_for_remote_command_failure(
+    *,
+    completed: subprocess.CompletedProcess[str],
+    failure_prefix: str,
+) -> None:
+    """Raise a compact error when one remote command exits non-zero."""
+
+    if int(completed.returncode) == 0:
+        return
+    stdout = str(completed.stdout or "").strip()
+    stderr = str(completed.stderr or "").strip()
+    raise RuntimeError(
+        f"{failure_prefix}:returncode={completed.returncode}:stdout={stdout!r}:stderr={stderr!r}"
+    )
+
+
 def _python_dropin_sync_script(*, dropin_path: str, contents: str) -> str:
     """Return the remote Python snippet that syncs one drop-in file."""
 
@@ -245,6 +279,168 @@ def _python_dropin_sync_script(*, dropin_path: str, contents: str) -> str:
         "if changed:\n"
         "    subprocess.run(['systemctl', 'daemon-reload'], check=True)\n"
         "print(json.dumps({'changed': changed, 'path': str(path)}))\n"
+        "PY"
+    )
+
+
+def _python_bounded_restart_script(
+    *,
+    service_name: str,
+    graceful_stop_wait_s: float,
+    kill_wait_s: float,
+) -> str:
+    """Return the remote Python snippet for a bounded stop/kill/start bounce."""
+
+    return (
+        "python3 - <<'PY'\n"
+        "import json\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        f"service_name = {service_name!r}\n"
+        f"graceful_stop_wait_s = float({float(graceful_stop_wait_s)!r})\n"
+        f"kill_wait_s = float({float(kill_wait_s)!r})\n"
+        "poll_interval_s = 0.5\n"
+        "\n"
+        "def _show() -> dict[str, str]:\n"
+        "    completed = subprocess.run(\n"
+        "        [\n"
+        "            'systemctl',\n"
+        "            'show',\n"
+        "            service_name,\n"
+        "            '--no-pager',\n"
+        "            '-p', 'ActiveState',\n"
+        "            '-p', 'SubState',\n"
+        "            '-p', 'Result',\n"
+        "            '-p', 'MainPID',\n"
+        "        ],\n"
+        "        capture_output=True,\n"
+        "        text=True,\n"
+        "        check=False,\n"
+        "    )\n"
+        "    values: dict[str, str] = {}\n"
+        "    for raw_line in str(completed.stdout or '').splitlines():\n"
+        "        key, separator, value = raw_line.partition('=')\n"
+        "        if separator:\n"
+        "            values[str(key).strip()] = str(value).strip()\n"
+        "    return values\n"
+        "\n"
+        "def _main_pid(state: dict[str, str]) -> int:\n"
+        "    raw_value = str(state.get('MainPID', '0') or '0').strip()\n"
+        "    try:\n"
+        "        return int(raw_value)\n"
+        "    except ValueError:\n"
+        "        return 0\n"
+        "\n"
+        "def _stopped(state: dict[str, str]) -> bool:\n"
+        "    return str(state.get('ActiveState', '')).strip() in {'inactive', 'failed'} and _main_pid(state) <= 0\n"
+        "\n"
+        "def _wait_stopped(timeout_s: float) -> tuple[bool, dict[str, str]]:\n"
+        "    deadline = time.monotonic() + max(0.0, float(timeout_s))\n"
+        "    latest = _show()\n"
+        "    while True:\n"
+        "        if _stopped(latest):\n"
+        "            return True, latest\n"
+        "        if time.monotonic() >= deadline:\n"
+        "            return False, latest\n"
+        "        time.sleep(poll_interval_s)\n"
+        "        latest = _show()\n"
+        "\n"
+        "actions: list[str] = []\n"
+        "state = _show()\n"
+        "if str(state.get('ActiveState', '')).strip() in {'active', 'activating', 'reloading', 'deactivating'} or _main_pid(state) > 0:\n"
+        "    stop_completed = subprocess.run(\n"
+        "        ['systemctl', 'stop', service_name],\n"
+        "        capture_output=True,\n"
+        "        text=True,\n"
+        "        check=False,\n"
+        "    )\n"
+        "    actions.append('stop')\n"
+        "    if stop_completed.returncode != 0:\n"
+        "        json.dump(\n"
+        "            {\n"
+        "                'ok': False,\n"
+        "                'phase': 'stop_failed',\n"
+        "                'actions': actions,\n"
+        "                'state': _show(),\n"
+        "                'stdout': str(stop_completed.stdout or ''),\n"
+        "                'stderr': str(stop_completed.stderr or ''),\n"
+        "            },\n"
+        "            sys.stdout,\n"
+        "        )\n"
+        "        raise SystemExit(int(stop_completed.returncode) or 1)\n"
+        "    stopped, state = _wait_stopped(graceful_stop_wait_s)\n"
+        "    if not stopped:\n"
+        "        kill_completed = subprocess.run(\n"
+        "            ['systemctl', 'kill', '--kill-who=all', '--signal=SIGKILL', service_name],\n"
+        "            capture_output=True,\n"
+        "            text=True,\n"
+        "            check=False,\n"
+        "        )\n"
+        "        actions.append('kill_all_sigkill')\n"
+        "        if kill_completed.returncode != 0:\n"
+        "            json.dump(\n"
+        "                {\n"
+        "                    'ok': False,\n"
+        "                    'phase': 'kill_failed',\n"
+        "                    'actions': actions,\n"
+        "                    'state': _show(),\n"
+        "                    'stdout': str(kill_completed.stdout or ''),\n"
+        "                    'stderr': str(kill_completed.stderr or ''),\n"
+        "                },\n"
+        "                sys.stdout,\n"
+        "            )\n"
+        "            raise SystemExit(int(kill_completed.returncode) or 1)\n"
+        "        stopped, state = _wait_stopped(kill_wait_s)\n"
+        "        if not stopped:\n"
+        "            json.dump(\n"
+        "                {\n"
+        "                    'ok': False,\n"
+        "                    'phase': 'kill_timeout',\n"
+        "                    'actions': actions,\n"
+        "                    'state': state,\n"
+        "                },\n"
+        "                sys.stdout,\n"
+        "            )\n"
+        "            raise SystemExit(1)\n"
+        "if str(state.get('Result', '')).strip() == 'failed' or str(state.get('ActiveState', '')).strip() == 'failed':\n"
+        "    reset_completed = subprocess.run(\n"
+        "        ['systemctl', 'reset-failed', service_name],\n"
+        "        capture_output=True,\n"
+        "        text=True,\n"
+        "        check=False,\n"
+        "    )\n"
+        "    actions.append('reset_failed')\n"
+        "    if reset_completed.returncode != 0:\n"
+        "        json.dump(\n"
+        "            {\n"
+        "                'ok': False,\n"
+        "                'phase': 'reset_failed_error',\n"
+        "                'actions': actions,\n"
+        "                'state': _show(),\n"
+        "                'stdout': str(reset_completed.stdout or ''),\n"
+        "                'stderr': str(reset_completed.stderr or ''),\n"
+        "            },\n"
+        "            sys.stdout,\n"
+        "        )\n"
+        "        raise SystemExit(int(reset_completed.returncode) or 1)\n"
+        "start_completed = subprocess.run(\n"
+        "    ['systemctl', 'start', service_name],\n"
+        "    capture_output=True,\n"
+        "    text=True,\n"
+        "    check=False,\n"
+        ")\n"
+        "actions.append('start')\n"
+        "payload = {\n"
+        "    'ok': start_completed.returncode == 0,\n"
+        "    'phase': 'start',\n"
+        "    'actions': actions,\n"
+        "    'state': _show(),\n"
+        "    'stdout': str(start_completed.stdout or ''),\n"
+        "    'stderr': str(start_completed.stderr or ''),\n"
+        "}\n"
+        "json.dump(payload, sys.stdout)\n"
+        "raise SystemExit(int(start_completed.returncode))\n"
         "PY"
     )
 

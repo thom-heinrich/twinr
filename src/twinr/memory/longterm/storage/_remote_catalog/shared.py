@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import time
+from typing import TypeVar
 
 from twinr.agent.workflows.forensics import workflow_event
 from twinr.memory.fulltext import FullTextSelector
@@ -28,6 +29,8 @@ _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S = 20.0
 _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 180.0
 _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S = 240.0
 _DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
+
+_ResultT = TypeVar("_ResultT")
 _ALLOWED_DOC_IDS_RETRIEVE_QUERY = "__allowed_doc_ids__"
 _CATALOG_ENTRY_TEXT_FIELDS = (
     "kind",
@@ -68,8 +71,8 @@ def _run_timed_workflow_step(
     name: str,
     kind: str,
     details: dict[str, object],
-    operation: Callable[[], object],
-) -> object:
+    operation: Callable[[], _ResultT],
+) -> _ResultT:
     """Emit timing events for one remote-catalog step without contextmanager rethrow issues."""
 
     workflow_event(kind="span_start", msg=name, details={"kind": kind, **details})

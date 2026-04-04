@@ -12,6 +12,7 @@ import logging
 import math
 from threading import RLock
 import time
+from typing import Any
 from urllib.parse import quote
 
 from twinr.memory.chonkydb.client import ChonkyDBError
@@ -19,6 +20,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteReadContext,
     record_remote_read_diagnostic,
 )
+from twinr.memory.longterm.storage._remote_state.shared import _coerce_float, _coerce_int
 from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage._remote_retry import (
@@ -51,6 +53,7 @@ from .shared import (
     _DEFAULT_RETRIEVE_BATCH_SIZE,
     _DEFINITIONS,
     _RemoteCollectionDefinition,
+    LongTermRemoteCatalogEntry,
 )
 from .writes import RemoteCatalogWriteMixin
 
@@ -128,7 +131,7 @@ class LongTermRemoteCatalogStoreBase(
 
         return _RECENT_CATALOG_ENTRIES_TTL_S
 
-    def _payload_sha256(self, payload) -> str:
+    def _payload_sha256(self, payload: Mapping[str, object]) -> str:
         serialized = json.dumps(
             dict(payload),
             ensure_ascii=False,
@@ -172,7 +175,7 @@ class LongTermRemoteCatalogStoreBase(
 
     def _load_catalog_payload(self, *, snapshot_kind: str):
         recent_head = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
-        if self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
+        if isinstance(recent_head, Mapping) and self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
             return dict(recent_head)
         if self._catalog_head_known_invalid(snapshot_kind=snapshot_kind):
             payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
@@ -200,7 +203,7 @@ class LongTermRemoteCatalogStoreBase(
         self,
         *,
         snapshot_kind: str,
-    ) -> object:
+    ) -> Any:
         """Load one mutable current head without pinning reads to a stale document id.
 
         Structured-memory current heads mutate behind a stable URI. Reusing an
@@ -213,6 +216,7 @@ class LongTermRemoteCatalogStoreBase(
 
         remote_state = self._require_remote_state()
         load_snapshot = getattr(remote_state, "load_snapshot")
+        parameters: Mapping[str, inspect.Parameter]
         try:
             parameters = inspect.signature(load_snapshot).parameters
         except (TypeError, ValueError):
@@ -258,6 +262,7 @@ class LongTermRemoteCatalogStoreBase(
         )
         started_monotonic = time.monotonic()
         attempt_index = 0
+        envelope: Mapping[str, object] | None = None
         while True:
             try:
                 envelope = self._fetch_catalog_head_envelope(
@@ -295,6 +300,7 @@ class LongTermRemoteCatalogStoreBase(
                     outcome="fallback",
                 )
                 return _CatalogHeadLoadResult(status="unavailable")
+        assert envelope is not None
         payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
         if payload is None and metadata_only:
             # Metadata-only current-head reads are an optimization. Non-empty
@@ -424,10 +430,10 @@ class LongTermRemoteCatalogStoreBase(
     def _fetch_catalog_head_envelope(
         self,
         *,
-        read_client: object,
+        read_client: Any,
         snapshot_kind: str,
         metadata_only: bool,
-    ) -> object:
+    ) -> Mapping[str, object]:
         """Read one fixed current head, retrying metadata-only contract rejects once.
 
         Some live ChonkyDB builds reject metadata-only ``documents/full``
@@ -459,7 +465,7 @@ class LongTermRemoteCatalogStoreBase(
         self,
         *,
         snapshot_kind: str,
-    ) -> tuple[object, ...]:
+    ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         """Return reusable current entries without reviving legacy snapshot heads.
 
         Write paths may reuse the fixed-URI current head and same-process
@@ -539,10 +545,11 @@ class LongTermRemoteCatalogStoreBase(
         """Return the HTTP transport timeout for write-bound ChonkyDB calls."""
 
         config = getattr(getattr(self, "remote_state", None), "config", None)
-        try:
-            timeout_s = float(getattr(config, "long_term_memory_remote_write_timeout_s", None))
-        except (TypeError, ValueError):
-            return None
+        timeout_s = _coerce_float(
+            getattr(config, "long_term_memory_remote_write_timeout_s", None),
+            default=0.0,
+            minimum=0.0,
+        )
         return timeout_s if timeout_s > 0.0 else None
 
     def _remote_flush_timeout_s(self) -> float:
@@ -639,29 +646,17 @@ class LongTermRemoteCatalogStoreBase(
     def _max_content_chars(self) -> int:
         remote_state = self._require_remote_state()
         value = getattr(getattr(remote_state, "config", None), "long_term_memory_remote_max_content_chars", None)
-        try:
-            resolved = int(value)
-        except (TypeError, ValueError):
-            return _DEFAULT_MAX_ITEM_CONTENT_CHARS
-        return max(1, resolved)
+        return _coerce_int(value, default=_DEFAULT_MAX_ITEM_CONTENT_CHARS, minimum=1)
 
     def _bulk_write_batch_size(self) -> int:
         remote_state = self._require_remote_state()
         value = getattr(getattr(remote_state, "config", None), "long_term_memory_migration_batch_size", None)
-        try:
-            resolved = int(value)
-        except (TypeError, ValueError):
-            return _DEFAULT_BULK_BATCH_SIZE
-        return max(1, resolved)
+        return _coerce_int(value, default=_DEFAULT_BULK_BATCH_SIZE, minimum=1)
 
     def _bulk_request_max_bytes(self) -> int:
         remote_state = self._require_remote_state()
         value = getattr(getattr(remote_state, "config", None), "long_term_memory_remote_bulk_request_max_bytes", None)
-        try:
-            resolved = int(value)
-        except (TypeError, ValueError):
-            return _DEFAULT_BULK_REQUEST_MAX_BYTES
-        return max(1, resolved)
+        return _coerce_int(value, default=_DEFAULT_BULK_REQUEST_MAX_BYTES, minimum=1)
 
     def _retrieve_batch_size(self) -> int:
         return _DEFAULT_RETRIEVE_BATCH_SIZE
@@ -699,7 +694,10 @@ class LongTermRemoteCatalogStoreBase(
         return _CONTROL_PLANE_WRITE_TARGET_INDEXES
 
     def _definition(self, snapshot_kind: str) -> _RemoteCollectionDefinition | None:
-        return _DEFINITIONS.get(self._normalize_text(snapshot_kind))
+        normalized_kind = self._normalize_text(snapshot_kind)
+        if normalized_kind is None:
+            return None
+        return _DEFINITIONS.get(normalized_kind)
 
     def _require_definition(self, snapshot_kind: str) -> _RemoteCollectionDefinition:
         definition = self._definition(snapshot_kind)
@@ -729,14 +727,14 @@ class LongTermRemoteCatalogStoreBase(
             return True
         return bool(required)
 
-    def _require_client(self, client: object | None, *, operation: str) -> object:
+    def _require_client(self, client: object | None, *, operation: str) -> Any:
         if client is not None:
             return client
         raise LongTermRemoteUnavailableError(
             f"Remote-primary long-term memory is enabled but ChonkyDB is not configured for {operation} operations."
         )
 
-    def _client_with_timeout(self, client: object, *, timeout_s: float | None) -> object:
+    def _client_with_timeout(self, client: Any, *, timeout_s: float | None) -> Any:
         """Clone a client with one specific transport timeout when supported."""
 
         if timeout_s is None:
@@ -763,7 +761,7 @@ class LongTermRemoteCatalogStoreBase(
         except Exception:
             return client
 
-    def _catalog_entry_metadata_from_mapping(self, payload) -> dict[str, object]:
+    def _catalog_entry_metadata_from_mapping(self, payload: Mapping[str, object]) -> dict[str, object]:
         metadata: dict[str, object] = {}
         for field_name in (*self._catalog_entry_text_fields(), "payload_sha256"):
             value = self._normalize_text(payload.get(field_name))
@@ -774,9 +772,9 @@ class LongTermRemoteCatalogStoreBase(
             if values:
                 metadata[field_name] = list(values)
         for field_name in self._catalog_entry_object_fields():
-            value = payload.get(field_name)
-            if isinstance(value, Mapping):
-                metadata[field_name] = dict(value)
+            object_value = payload.get(field_name)
+            if isinstance(object_value, Mapping):
+                metadata[field_name] = dict(object_value)
         return metadata
 
     def _current_scope_request_context(self, *, snapshot_kind: str) -> tuple[str | None, str | None]:
@@ -808,10 +806,7 @@ class LongTermRemoteCatalogStoreBase(
             return None
         if self._normalize_text(candidate.get("twinr_catalog_schema")) != definition.catalog_schema:
             return None
-        try:
-            items_count = int(candidate.get("twinr_catalog_items_count") or 0)
-        except (TypeError, ValueError):
-            items_count = 0
+        items_count = self._normalize_segment_index(candidate.get("twinr_catalog_items_count")) or 0
         if items_count > 0:
             return None
         payload: dict[str, object] = {
@@ -891,10 +886,7 @@ class LongTermRemoteCatalogStoreBase(
 
     @staticmethod
     def _normalize_segment_index(value: object) -> int | None:
-        try:
-            resolved = int(value)
-        except (TypeError, ValueError):
-            return None
+        resolved = _coerce_int(value, default=-1, minimum=-1)
         return resolved if resolved >= 0 else None
 
     def _status_code_from_exception(self, exc: BaseException) -> int | None:
@@ -940,7 +932,17 @@ class LongTermRemoteCatalogStoreBase(
         compact_bits = " ".join(self._response_bits_from_exception(exc)).strip().lower()
         if "unsupported scope_ref" in compact_bits:
             return "unsupported_scope_search"
-        if status_code != 404 or "document_not_found" not in compact_bits:
+        should_probe_current_head = False
+        if status_code == 404 and "document_not_found" in compact_bits:
+            should_probe_current_head = True
+        elif status_code == 400 and snapshot_kind in _MUTABLE_CURRENT_HEAD_SNAPSHOT_KINDS:
+            # Mutable current heads are same-URI moving targets. When the
+            # backend rejects one current-scope top-k request with a 400 while
+            # the fixed current head itself is still readable, treat that as a
+            # scope-search contract drift and fall back to the authoritative
+            # current catalog instead of fail-closing the whole runtime.
+            should_probe_current_head = True
+        if not should_probe_current_head:
             return "other"
         head_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind, metadata_only=True)
         if head_result.status == "not_found":

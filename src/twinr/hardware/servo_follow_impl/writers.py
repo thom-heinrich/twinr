@@ -556,7 +556,7 @@ class TwinrKernelServoPulseWriter:
 def _default_pulse_writer_for_config(config: "AttentionServoConfig") -> ServoPulseWriter:
     _assert_servo_gpio_environment_ready(config)
     driver = str(config.driver or _DEFAULT_SERVO_DRIVER).strip().lower() or _DEFAULT_SERVO_DRIVER
-    if driver == "pololu_maestro":
+    if driver == "pololu_maestro" or (driver == "auto" and config.maestro_transport_requested):
         # Keep Maestro startup lazy so transient USB re-enumeration or a stale
         # by-id path does not permanently disable the servo until a full restart.
         writer_class = cast(
@@ -566,7 +566,15 @@ def _default_pulse_writer_for_config(config: "AttentionServoConfig") -> ServoPul
                 PololuMaestroServoPulseWriter,
             ),
         )
-        return writer_class(device_path=config.maestro_device)
+        return writer_class(
+            device_path=config.maestro_device,
+            speed_limit_us_per_s=(
+                config.max_velocity_us_per_s if not config.uses_continuous_rotation else None
+            ),
+            acceleration_limit_us_per_s2=(
+                config.max_acceleration_us_per_s2 if not config.uses_continuous_rotation else None
+            ),
+        )
     if driver == "peer_pololu_maestro":
         writer_class = cast(
             Callable[..., ServoPulseWriter],

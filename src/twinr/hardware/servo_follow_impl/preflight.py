@@ -79,7 +79,7 @@ def _assert_servo_gpio_environment_ready(config: "AttentionServoConfig") -> None
     """Fail closed when a proven conflicting GPIO overlay/process state is present."""
 
     driver = str(config.driver or _DEFAULT_SERVO_DRIVER).strip().lower() or _DEFAULT_SERVO_DRIVER
-    if driver in {"pololu_maestro", "peer_pololu_maestro"}:
+    if driver in {"pololu_maestro", "peer_pololu_maestro"} or getattr(config, "maestro_transport_requested", False):
         return
     if not config.enabled or config.gpio is None:
         return

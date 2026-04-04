@@ -23,7 +23,28 @@ class ControllerGeometryMixin(ControllerAttrsMixin):
     def _maximum_target_heading_degrees(self) -> float:
         if self.config.follow_exit_only:
             return max(1.0, float(self.config.exit_follow_max_degrees))
-        return max(1.0, float(self.config.mechanical_range_degrees) * 0.5)
+        return self.config.resolved_position_follow_max_degrees
+
+    def _pulse_width_for_heading_degrees(self, heading_degrees: float) -> int:
+        """Convert one bounded heading request into the calibrated pulse envelope."""
+
+        bounded_heading_degrees = _clamp(
+            float(heading_degrees),
+            minimum=-self._maximum_target_heading_degrees(),
+            maximum=self._maximum_target_heading_degrees(),
+        )
+        mechanical_half_range_degrees = max(1.0, float(self.config.mechanical_range_degrees) * 0.5)
+        normalized_heading = _clamp(
+            bounded_heading_degrees / mechanical_half_range_degrees,
+            minimum=-1.0,
+            maximum=1.0,
+        )
+        if normalized_heading >= 0.0:
+            span = self.config.safe_max_pulse_width_us - self.config.center_pulse_width_us
+        else:
+            span = self.config.center_pulse_width_us - self.config.safe_min_pulse_width_us
+        pulse_width = int(round(self.config.center_pulse_width_us + (normalized_heading * span)))
+        return max(self.config.safe_min_pulse_width_us, min(self.config.safe_max_pulse_width_us, pulse_width))
 
     def _desired_heading_degrees_for_center_x(self, center_x: float) -> float:
         normalized_center_x = self._clamped_follow_center_x(center_x)
@@ -35,18 +56,22 @@ class ControllerGeometryMixin(ControllerAttrsMixin):
         return normalized_offset * self._maximum_target_heading_degrees()
 
     def _pulse_width_for_center_x(self, center_x: float) -> int:
-        normalized_center_x = self._clamped_follow_center_x(center_x)
-        normalized_offset = (normalized_center_x - 0.5) * 2.0
-        if self.config.invert_direction:
-            normalized_offset *= -1.0
-        if abs(normalized_offset) <= self.config.deadband:
-            normalized_offset = 0.0
-        if normalized_offset >= 0.0:
-            span = self.config.safe_max_pulse_width_us - self.config.center_pulse_width_us
-        else:
-            span = self.config.center_pulse_width_us - self.config.safe_min_pulse_width_us
-        pulse_width = int(round(self.config.center_pulse_width_us + (normalized_offset * span)))
-        return max(self.config.safe_min_pulse_width_us, min(self.config.safe_max_pulse_width_us, pulse_width))
+        if self.config.follow_exit_only:
+            normalized_center_x = self._clamped_follow_center_x(center_x)
+            normalized_offset = (normalized_center_x - 0.5) * 2.0
+            if self.config.invert_direction:
+                normalized_offset *= -1.0
+            if abs(normalized_offset) <= self.config.deadband:
+                normalized_offset = 0.0
+            if normalized_offset >= 0.0:
+                span = self.config.safe_max_pulse_width_us - self.config.center_pulse_width_us
+            else:
+                span = self.config.center_pulse_width_us - self.config.safe_min_pulse_width_us
+            pulse_width = int(round(self.config.center_pulse_width_us + (normalized_offset * span)))
+            return max(self.config.safe_min_pulse_width_us, min(self.config.safe_max_pulse_width_us, pulse_width))
+        return self._pulse_width_for_heading_degrees(
+            self._desired_heading_degrees_for_center_x(center_x)
+        )
 
     def _continuous_tracking_pulse_width_for_center_x(self, center_x: float) -> int:
         """Map live image error to one bounded continuous-servo speed command."""

@@ -81,6 +81,9 @@ class LongTermRemoteWriteContext:
     document_id_hint: str | None = None
     uri_hint: str | None = None
     attempt_count: int | None = None
+    retry_attempts_configured: int | None = None
+    retry_backoff_s: float | None = None
+    retry_mode: str | None = None
     request_item_count: int | None = None
     request_correlation_id: str | None = None
     batch_index: int | None = None

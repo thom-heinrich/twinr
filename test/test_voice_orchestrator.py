@@ -815,6 +815,8 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         build_env.assert_called_once_with(allow_root_borrowed_session_audio=True)
         popen.assert_called_once()
         self.assertEqual(popen.call_args.kwargs["env"], sanitized_env)
+        self.assertTrue(popen.call_args.kwargs["close_fds"])
+        self.assertNotIn("start_new_session", popen.call_args.kwargs)
         self.assertIn("voice_orchestrator_capture=started", lines)
 
 

@@ -469,12 +469,29 @@ class TwinrInstanceLock:
     path: Path
     label: str
     _handle: TextIO | None = field(default=None, init=False, repr=False)
+    _fork_guard_registered: bool = field(default=False, init=False, repr=False)
+
+    def _close_inherited_handle_after_fork(self) -> None:
+        """Drop one inherited lock handle in a forked child process.
+
+        ``flock`` is tied to the open file description, so a forked child can
+        unintentionally keep the parent lock alive even after the leader exits.
+        Closing only the child's inherited descriptor preserves the parent's
+        authoritative lock while preventing descendant lock leaks.
+        """
+
+        handle = self._handle
+        self._handle = None
+        _close_quietly(handle)
 
     def acquire(self) -> "TwinrInstanceLock":
         """Acquire the lock without waiting and record the current PID."""
 
         if self._handle is not None:
             raise RuntimeError(f"The Twinr {self.label} lock is already acquired.")
+        if not self._fork_guard_registered and hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=self._close_inherited_handle_after_fork)
+            self._fork_guard_registered = True
 
         _ensure_lock_directory(self.path.parent)
         handle = _open_lock_file(self.path, create=True)

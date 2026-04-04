@@ -118,6 +118,38 @@ class _FakeCatalogClient:
         raise LongTermRemoteUnavailableError("remote document unavailable")
 
 
+def _rewrite_current_item_records_as_live_chunk_documents(
+    remote_state: _FakeRemoteState,
+    *,
+    uri_segment: str,
+) -> None:
+    """Rewrite saved item records into the Pi live fetch shape used by ChonkyDB."""
+
+    client = remote_state.client
+    for uri, record in tuple(client.records_by_uri.items()):
+        if f"/{uri_segment}/" not in uri or "/catalog/" in uri:
+            continue
+        metadata = dict(record.get("metadata", {}) or {})
+        metadata.setdefault("document_id", record.get("document_id"))
+        metadata.setdefault("origin_uri", uri)
+        metadata.setdefault("payload_id", record.get("document_id"))
+        live_document = {
+            "success": True,
+            "document_id": record.get("document_id"),
+            "origin_uri": uri,
+            "chunk_count": 1,
+            "chunks": [
+                {
+                    "metadata": metadata,
+                }
+            ],
+        }
+        document_id = record.get("document_id")
+        if isinstance(document_id, str) and document_id:
+            client.records_by_document_id[document_id] = live_document
+        client.records_by_uri[uri] = live_document
+
+
 @dataclass(frozen=True, slots=True)
 class _FakeSearchResult:
     """Expose the minimal metadata surface used by discovery."""
@@ -677,6 +709,47 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(loaded.last_refreshed_at, "2026-03-20T12:00:00Z")
         self.assertEqual(remote_state.client.records_by_document_id, {})
         self.assertEqual(remote_state.client.records_by_uri, {})
+
+    def test_load_state_accepts_live_chunk_metadata_payload(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        store = RemoteStateWorldIntelligenceStore()
+        state = WorldIntelligenceState(
+            last_recalibrated_at="2026-03-20T12:00:00Z",
+            last_discovery_query="Find RSS, Atom, or JSON feeds for local politics relevant to Hamburg.",
+            interest_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:hamburg_local",
+                    topic="local politics",
+                    summary="The user keeps engaging with Hamburg local politics.",
+                    region="Hamburg",
+                    scope="local",
+                    salience=0.84,
+                    confidence=0.82,
+                    engagement_score=0.91,
+                    evidence_count=3,
+                    engagement_count=5,
+                    updated_at="2026-03-20T09:30:00+00:00",
+                ),
+            ),
+        )
+        store.save_state(
+            config=config,
+            state=state,
+            remote_state=remote_state,
+        )
+        _rewrite_current_item_records_as_live_chunk_documents(
+            remote_state,
+            uri_segment="agent_world_intelligence_state",
+        )
+
+        loaded = store.load_state(
+            config=config,
+            remote_state=remote_state,
+        )
+
+        self.assertEqual(loaded.last_recalibrated_at, "2026-03-20T12:00:00Z")
+        self.assertEqual(loaded.interest_signals[0].signal_id, "interest:hamburg_local")
 
     def test_refresh_builds_and_updates_situational_awareness_threads(self) -> None:
         remote_state = _FakeRemoteState()

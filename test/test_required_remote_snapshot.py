@@ -215,6 +215,68 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertFalse(assessment.ready)
         self.assertIn("stale", assessment.detail.lower())
 
+    def test_assess_accepts_future_dated_wall_timestamps_when_monotonic_fields_are_trusted(self) -> None:
+        now = datetime(2026, 4, 4, 17, 3, 3, tzinfo=timezone.utc)
+        sample = RemoteMemoryWatchdogSample(
+            seq=1,
+            captured_at="2026-04-04T17:03:10Z",
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=1200.0,
+            consecutive_ok=1,
+            consecutive_fail=0,
+            captured_monotonic_ns=1_000_000_000,
+            detail=None,
+        )
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at="2026-04-04T17:02:00Z",
+            updated_at="2026-04-04T17:03:10Z",
+            hostname="picarx",
+            pid=os.getpid(),
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=1,
+            failure_count=0,
+            last_ok_at="2026-04-04T17:03:10Z",
+            last_failure_at=None,
+            artifact_path="/tmp/remote-memory-watchdog.json",
+            current=sample,
+            recent_samples=(sample,),
+            updated_monotonic_ns=1_000_000_000,
+            heartbeat_at="2026-04-04T17:03:11Z",
+            heartbeat_monotonic_ns=2_000_000_000,
+            boot_id="boot-123",
+            pid_starttime_ticks=None,
+            pid_create_time_s=None,
+            probe_inflight=False,
+            probe_started_at=None,
+            probe_started_monotonic_ns=None,
+            probe_age_s=None,
+        )
+        config = TwinrConfig()
+
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._current_boot_id",
+            return_value="boot-123",
+        ), mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot.time.monotonic_ns",
+            return_value=4_000_000_000,
+        ):
+            assessment = assess_required_remote_watchdog_snapshot(
+                config,
+                now_wall=now,
+                store=_FakeStore(snapshot),
+            )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertEqual(assessment.sample_status, "ok")
+        self.assertEqual(assessment.sample_age_s, 3.0)
+        self.assertEqual(assessment.heartbeat_age_s, 2.0)
+
     def test_assess_accepts_recent_heartbeat_between_steady_state_samples(self) -> None:
         now = datetime(2026, 3, 20, 17, 35, 0, tzinfo=timezone.utc)
         snapshot = _build_snapshot(
@@ -477,9 +539,9 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
             pid=os.getpid(),
             age_s=9.0,
             latency_ms=1015.4,
-            heartbeat_age_s=13.2,
+            heartbeat_age_s=181.2,
             probe_inflight=True,
-            probe_age_s=13.2,
+            probe_age_s=181.2,
         )
         config = TwinrConfig()
 
@@ -491,6 +553,210 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
 
         self.assertFalse(assessment.ready)
         self.assertTrue(assessment.snapshot_stale)
+        self.assertIn("stale", assessment.detail.lower())
+
+    def test_assess_accepts_synthetic_timeout_sample_while_recent_long_success_still_bridges(self) -> None:
+        now = datetime(2026, 4, 4, 11, 15, 36, tzinfo=timezone.utc)
+        recent_ok = RemoteMemoryWatchdogSample(
+            seq=1,
+            captured_at=_iso_utc(now - timedelta(seconds=75.0)),
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=150997.2,
+            consecutive_ok=1,
+            consecutive_fail=0,
+            detail=None,
+        )
+        timed_out = RemoteMemoryWatchdogSample(
+            seq=2,
+            captured_at=_iso_utc(now - timedelta(seconds=1.0)),
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=15374.9,
+            consecutive_ok=0,
+            consecutive_fail=1,
+            detail="Remote readiness probe exceeded 15.0s and is assumed stuck.",
+            probe={
+                "watchdog_timeout": {
+                    "probe_started_at": _iso_utc(now - timedelta(seconds=55.0)),
+                    "probe_age_s": 55.0,
+                    "probe_timeout_s": 15.0,
+                }
+            },
+        )
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at=_iso_utc(now - timedelta(seconds=120.0)),
+            updated_at=_iso_utc(now - timedelta(seconds=1.0)),
+            hostname="test-host",
+            pid=os.getpid(),
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=2,
+            failure_count=1,
+            last_ok_at=recent_ok.captured_at,
+            last_failure_at=timed_out.captured_at,
+            artifact_path="/tmp/remote-memory-watchdog.json",
+            current=timed_out,
+            recent_samples=(recent_ok, timed_out),
+            heartbeat_at=_iso_utc(now - timedelta(seconds=1.0)),
+            probe_inflight=True,
+            probe_started_at=_iso_utc(now - timedelta(seconds=55.0)),
+            probe_age_s=55.0,
+        )
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            TwinrConfig(),
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertEqual(assessment.sample_status, "fail")
+        self.assertTrue(assessment.probe_inflight)
+        self.assertIn("still inflight", assessment.detail.lower())
+
+    def test_assess_accepts_synthetic_timeout_sample_under_startup_probe_budget_without_recent_long_success(
+        self,
+    ) -> None:
+        """Pi repro 2026-04-04: the same timed-out probe later succeeded after 143.3s."""
+
+        now = datetime(2026, 4, 4, 12, 51, 46, tzinfo=timezone.utc)
+        recent_ok = RemoteMemoryWatchdogSample(
+            seq=25782,
+            captured_at="2026-04-04T12:50:32Z",
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=5228.2,
+            consecutive_ok=1,
+            consecutive_fail=0,
+            detail=None,
+        )
+        timed_out = RemoteMemoryWatchdogSample(
+            seq=25783,
+            captured_at="2026-04-04T12:50:55Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=15794.8,
+            consecutive_ok=0,
+            consecutive_fail=1,
+            detail="Remote readiness probe exceeded 15.0s and is assumed stuck.",
+            probe={
+                "watchdog_timeout": {
+                    "probe_started_at": "2026-04-04T12:50:39Z",
+                    "probe_age_s": 67.0,
+                    "probe_timeout_s": 15.0,
+                }
+            },
+        )
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at="2026-04-04T12:30:00Z",
+            updated_at=timed_out.captured_at,
+            hostname="picarx",
+            pid=os.getpid(),
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=25783,
+            failure_count=741,
+            last_ok_at=recent_ok.captured_at,
+            last_failure_at=timed_out.captured_at,
+            artifact_path="/tmp/remote-memory-watchdog.json",
+            current=timed_out,
+            recent_samples=(recent_ok, timed_out),
+            heartbeat_at="2026-04-04T12:51:46Z",
+            probe_inflight=True,
+            probe_started_at="2026-04-04T12:50:39Z",
+            probe_age_s=67.0,
+        )
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            TwinrConfig(),
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertEqual(assessment.sample_status, "fail")
+        self.assertTrue(assessment.probe_inflight)
+        self.assertIn("still inflight", assessment.detail.lower())
+
+    def test_assess_rejects_synthetic_timeout_sample_once_inflight_probe_exceeds_startup_probe_budget(
+        self,
+    ) -> None:
+        now = datetime(2026, 4, 4, 12, 53, 46, tzinfo=timezone.utc)
+        recent_ok = RemoteMemoryWatchdogSample(
+            seq=25782,
+            captured_at="2026-04-04T12:50:32Z",
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=5228.2,
+            consecutive_ok=1,
+            consecutive_fail=0,
+            detail=None,
+        )
+        timed_out = RemoteMemoryWatchdogSample(
+            seq=25783,
+            captured_at="2026-04-04T12:50:55Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=15794.8,
+            consecutive_ok=0,
+            consecutive_fail=1,
+            detail="Remote readiness probe exceeded 15.0s and is assumed stuck.",
+            probe={
+                "watchdog_timeout": {
+                    "probe_started_at": "2026-04-04T12:50:39Z",
+                    "probe_age_s": 187.0,
+                    "probe_timeout_s": 15.0,
+                }
+            },
+        )
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=1,
+            started_at="2026-04-04T12:30:00Z",
+            updated_at=timed_out.captured_at,
+            hostname="picarx",
+            pid=os.getpid(),
+            interval_s=1.0,
+            history_limit=3600,
+            sample_count=25783,
+            failure_count=741,
+            last_ok_at=recent_ok.captured_at,
+            last_failure_at=timed_out.captured_at,
+            artifact_path="/tmp/remote-memory-watchdog.json",
+            current=timed_out,
+            recent_samples=(recent_ok, timed_out),
+            heartbeat_at="2026-04-04T12:53:46Z",
+            probe_inflight=True,
+            probe_started_at="2026-04-04T12:50:39Z",
+            probe_age_s=187.0,
+        )
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            TwinrConfig(),
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertFalse(assessment.ready)
+        self.assertTrue(assessment.snapshot_stale)
+        self.assertEqual(assessment.sample_status, "fail")
+        self.assertTrue(assessment.probe_inflight)
         self.assertIn("stale", assessment.detail.lower())
 
     def test_ensure_raises_long_term_remote_unavailable_when_snapshot_fails(self) -> None:

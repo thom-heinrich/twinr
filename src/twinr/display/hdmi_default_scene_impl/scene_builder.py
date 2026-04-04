@@ -67,7 +67,9 @@ _HEALTHY_SYSTEM_STATES = frozenset(
 )
 _WARNING_SYSTEM_STATES = frozenset(
     {
+        "achtung",
         "warn",
+        "warnung",
         "warning",
         "degraded",
         "starting",
@@ -83,6 +85,7 @@ _ERROR_SYSTEM_STATES = frozenset(
     {
         "error",
         "err",
+        "fehler",
         "failed",
         "fail",
         "fault",

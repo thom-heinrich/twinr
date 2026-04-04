@@ -68,6 +68,7 @@ class AttentionServoConfig:
     driver: str = _DEFAULT_SERVO_DRIVER
     control_mode: str = _DEFAULT_CONTROL_MODE
     maestro_device: str | None = None
+    maestro_transport_requested: bool = False
     peer_base_url: str | None = None
     peer_timeout_s: float = 1.5
     state_path: str = _DEFAULT_STATE_PATH
@@ -108,6 +109,7 @@ class AttentionServoConfig:
     visible_recenter_interval_s: float = _DEFAULT_VISIBLE_RECENTER_INTERVAL_S
     visible_recenter_center_tolerance: float = _DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE
     mechanical_range_degrees: float = _DEFAULT_MECHANICAL_RANGE_DEGREES
+    position_follow_max_degrees: float | None = None
     exit_follow_max_degrees: float = _DEFAULT_EXIT_FOLLOW_MAX_DEGREES
     exit_activation_delay_s: float = _DEFAULT_EXIT_ACTIVATION_DELAY_S
     exit_settle_hold_s: float = _DEFAULT_EXIT_SETTLE_HOLD_S
@@ -156,13 +158,33 @@ class AttentionServoConfig:
         half_range_degrees = max(1.0, self.mechanical_range_degrees * 0.5)
         return max(0.0, min(1.0, self.exit_follow_max_degrees / half_range_degrees))
 
+    @property
+    def resolved_position_follow_max_degrees(self) -> float:
+        """Return the bounded visible-follow envelope for positional servos."""
+
+        mechanical_half_range_degrees = max(1.0, self.mechanical_range_degrees * 0.5)
+        configured_limit = self.position_follow_max_degrees
+        if configured_limit is None:
+            return mechanical_half_range_degrees
+        return max(
+            1.0,
+            min(mechanical_half_range_degrees, float(configured_limit)),
+        )
+
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "AttentionServoConfig":
         """Build one bounded servo config from the global Twinr config."""
 
         driver = str(getattr(config, "attention_servo_driver", _DEFAULT_SERVO_DRIVER) or _DEFAULT_SERVO_DRIVER)
         control_mode = str(getattr(config, "attention_servo_control_mode", _DEFAULT_CONTROL_MODE) or _DEFAULT_CONTROL_MODE)
-        maestro_device = getattr(config, "attention_servo_maestro_device", None)
+        normalized_driver = str(driver).strip().lower() or _DEFAULT_SERVO_DRIVER
+        raw_maestro_device = getattr(config, "attention_servo_maestro_device", None)
+        maestro_device = None if raw_maestro_device is None else (str(raw_maestro_device).strip() or None)
+        configured_maestro_channel = getattr(config, "attention_servo_maestro_channel", None)
+        maestro_transport_requested = normalized_driver in {"pololu_maestro", "peer_pololu_maestro"} or (
+            normalized_driver == "auto"
+            and (configured_maestro_channel is not None or maestro_device is not None)
+        )
         peer_base_url = getattr(config, "attention_servo_peer_base_url", None)
         peer_timeout_s = getattr(config, "attention_servo_peer_timeout_s", 1.5)
         raw_state_path = getattr(config, "attention_servo_state_path", _DEFAULT_STATE_PATH)
@@ -171,8 +193,8 @@ class AttentionServoConfig:
             project_root = Path(str(getattr(config, "project_root", ".") or ".")).expanduser().resolve(strict=False)
             resolved_state_path = (project_root / resolved_state_path).resolve(strict=False)
         configured_gpio = getattr(config, "attention_servo_gpio", None)
-        if str(driver).strip().lower() in {"pololu_maestro", "peer_pololu_maestro"}:
-            configured_gpio = getattr(config, "attention_servo_maestro_channel", None)
+        if maestro_transport_requested:
+            configured_gpio = configured_maestro_channel
         min_pulse = _bounded_int(
             getattr(config, "attention_servo_min_pulse_width_us", _DEFAULT_MIN_PULSE_WIDTH_US),
             default=_DEFAULT_MIN_PULSE_WIDTH_US,
@@ -213,7 +235,8 @@ class AttentionServoConfig:
             enabled=bool(getattr(config, "attention_servo_enabled", False)),
             driver=driver,
             control_mode=control_mode,
-            maestro_device=None if maestro_device is None else (str(maestro_device).strip() or None),
+            maestro_device=maestro_device,
+            maestro_transport_requested=maestro_transport_requested,
             peer_base_url=None if peer_base_url is None else (str(peer_base_url).strip().rstrip("/") or None),
             peer_timeout_s=_bounded_float(
                 peer_timeout_s,
@@ -462,6 +485,16 @@ class AttentionServoConfig:
                 maximum=0.3,
             ),
             mechanical_range_degrees=mechanical_range_degrees,
+            position_follow_max_degrees=(
+                None
+                if getattr(config, "attention_servo_position_follow_max_degrees", None) is None
+                else _bounded_float(
+                    getattr(config, "attention_servo_position_follow_max_degrees"),
+                    default=mechanical_range_degrees * 0.5,
+                    minimum=0.0,
+                    maximum=max(1.0, mechanical_range_degrees * 0.5),
+                )
+            ),
             exit_follow_max_degrees=_bounded_float(
                 getattr(
                     config,

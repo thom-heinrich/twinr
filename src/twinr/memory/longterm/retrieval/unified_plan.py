@@ -30,6 +30,7 @@ _ANCHOR_ATTRIBUTE_KEYS: tuple[str, ...] = (
     "graph_node_id",
     "environment_id",
     "memory_domain",
+    "daypart",
 )
 _GRAPH_NODE_TYPE_TO_ANCHORS: dict[str, tuple[str, ...]] = {
     "person": ("person_ref",),
@@ -683,11 +684,20 @@ def _select_support_candidates(
         return ()
     continuity_candidates = sorted(continuity_candidates, key=_candidate_sort_key)
     if mode == "continuity":
-        return tuple(
+        kept = [
             candidate
             for candidate in continuity_candidates
             if candidate.direct_match or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
-        )
+        ]
+        practical_support = [
+            candidate
+            for candidate in candidates
+            if candidate.family == "practical"
+            and candidate.query_score > 0.0
+            and any(source in {"episodic", "midterm"} for source in candidate.support_sources)
+        ]
+        kept.extend(sorted(practical_support, key=_candidate_sort_key)[:1])
+        return tuple(kept)
     kept: list[_Candidate] = []
     episodic_candidates = [
         candidate

@@ -117,6 +117,43 @@ class PersonalityDisplayImpulseTests(unittest.TestCase):
         self.assertIn("Arzttermin", first.headline)
         self.assertTrue(first.body)
 
+    def test_fresh_continuity_thread_can_surface_as_ambient_hint_without_matching_interest_signal(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-04-04T08:30:00+00:00",
+            style_profile=ConversationStyleProfile(verbosity=0.54, initiative=0.57),
+            continuity_threads=(
+                ContinuityThread(
+                    title="The Verge AI",
+                    summary="Keep a calm watch on The Verge AI around global; 4 relevant feed update(s) are being tracked.",
+                    salience=0.69,
+                    updated_at="2026-04-04T08:00:00+00:00",
+                ),
+            ),
+        )
+        unrelated_signal = WorldInterestSignal(
+            signal_id="world:weather_black",
+            topic="Wie ist das Wetter in schwarzen?",
+            summary="Unrelated recent voice residue.",
+            engagement_score=0.58,
+            engagement_state="uncertain",
+            ongoing_interest="peripheral",
+            co_attention_state="latent",
+        )
+
+        candidates = build_ambient_display_impulse_candidates(
+            snapshot,
+            engagement_signals=(unrelated_signal,),
+            local_now=datetime(2026, 4, 4, 10, 15),
+        )
+
+        self.assertTrue(candidates)
+        first = candidates[0]
+        self.assertEqual(first.title, "The Verge AI")
+        self.assertEqual(first.action, "hint")
+        self.assertEqual(first.reason, "ambient_continuity_hint")
+        self.assertEqual(first.attention_state, "growing")
+        self.assertIn("The Verge AI", first.headline)
+
     def test_cooling_topic_does_not_surface_as_ambient_impulse(self) -> None:
         snapshot = PersonalitySnapshot(
             style_profile=ConversationStyleProfile(verbosity=0.55, initiative=0.55),

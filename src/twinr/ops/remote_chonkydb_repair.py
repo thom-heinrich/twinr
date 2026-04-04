@@ -102,6 +102,113 @@ class ChonkyDBRemoteServiceState:
 
 
 @dataclass(frozen=True, slots=True)
+class ForeignBackendConsumer:
+    """Describe one non-Twinr unit still pointed at the dedicated backend."""
+
+    unit_name: str
+    active_state: str
+    sub_state: str
+    configured_base_url: str = ""
+    fragment_path: str = ""
+    coupled_to_backend_service: bool = False
+
+    @property
+    def active(self) -> bool:
+        """Return whether the foreign consumer is currently live."""
+
+        return self.active_state == "active" and self.sub_state in _SYSTEMD_HEALTHY_SUBSTATES
+
+
+@dataclass(frozen=True, slots=True)
+class BackendDataOwnershipState:
+    """Describe whether the dedicated backend data dir has owner/group drift."""
+
+    data_dir: str
+    expected_user: str
+    expected_group: str
+    mismatched_entry_count: int
+    sample_entries: tuple[str, ...] = ()
+    truncated: bool = False
+    error: str | None = None
+
+    @property
+    def has_drift(self) -> bool:
+        """Return whether at least one data-dir entry uses the wrong owner/group."""
+
+        return int(self.mismatched_entry_count) > 0
+
+
+@dataclass(frozen=True, slots=True)
+class BackendQuerySurfaceReadinessContract:
+    """Describe whether the backend startup contract can prove query readiness.
+
+    The dedicated Twinr backend currently relies on `CHONKY_FT_REBUILD_ON_OPEN`
+    for correctness. If rebuild-on-open stays enabled while the query-surface
+    fulltext gate is disabled, the systemd unit can look healthy long before
+    `/v1/external/retrieve/topk_records` is actually usable. That exact
+    mismatch recreates the observed `active/running` + `backend 504` +
+    `public 503` outage shape.
+    """
+
+    fulltext_rebuild_on_open: bool
+    warmup_fulltext_gate: bool
+    warmup_wait_for_ready: bool
+    warmup_wait_ready_timeout_s: float | None = None
+
+    @property
+    def unsafe_reason(self) -> str | None:
+        """Return the proven unsafe startup mismatch when present."""
+
+        if self.fulltext_rebuild_on_open and not self.warmup_fulltext_gate:
+            return "fulltext_rebuild_on_open_without_query_gate"
+        if self.fulltext_rebuild_on_open and not self.warmup_wait_for_ready:
+            return "fulltext_rebuild_on_open_without_ready_wait"
+        if (
+            self.fulltext_rebuild_on_open
+            and self.warmup_wait_ready_timeout_s is not None
+            and float(self.warmup_wait_ready_timeout_s) <= 0.0
+        ):
+            return "fulltext_rebuild_on_open_without_ready_timeout"
+        return None
+
+    @property
+    def unsafe(self) -> bool:
+        """Return whether Twinr has proven the startup contract unsafe."""
+
+        return self.unsafe_reason is not None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "fulltext_rebuild_on_open": self.fulltext_rebuild_on_open,
+            "warmup_fulltext_gate": self.warmup_fulltext_gate,
+            "warmup_wait_for_ready": self.warmup_wait_for_ready,
+            "warmup_wait_ready_timeout_s": self.warmup_wait_ready_timeout_s,
+            "unsafe": self.unsafe,
+            "unsafe_reason": self.unsafe_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendQuerySurfaceReadinessRepairStatus:
+    """Describe whether Twinr had to harden the backend readiness contract."""
+
+    dropin_path: str
+    changed: bool
+    contract: BackendQuerySurfaceReadinessContract
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "dropin_path": self.dropin_path,
+            "changed": self.changed,
+            "contract": self.contract.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteChonkyDBRepairPlan:
     """Describe the bounded action Twinr should take for one outage state."""
 
@@ -125,6 +232,9 @@ class RemoteChonkyDBRepairResult:
     backend_service_after: ChonkyDBRemoteServiceState
     backend_after: ChonkyDBHttpProbeResult
     plan: RemoteChonkyDBRepairPlan
+    foreign_consumers: tuple[ForeignBackendConsumer, ...] = ()
+    backend_data_ownership: BackendDataOwnershipState | None = None
+    foreign_consumer_inspection_error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-ready representation of the nested repair result."""
@@ -142,6 +252,13 @@ class RemoteChonkyDBRepairResult:
             "backend_service_after": asdict(self.backend_service_after),
             "backend_after": asdict(self.backend_after),
             "plan": asdict(self.plan),
+            "foreign_consumers": [asdict(consumer) for consumer in self.foreign_consumers],
+            "backend_data_ownership": (
+                asdict(self.backend_data_ownership)
+                if self.backend_data_ownership is not None
+                else None
+            ),
+            "foreign_consumer_inspection_error": self.foreign_consumer_inspection_error,
         }
 
 
@@ -339,15 +456,27 @@ def plan_remote_chonkydb_repair(
     public_probe: ChonkyDBHttpProbeResult,
     backend_service: ChonkyDBRemoteServiceState,
     backend_probe: ChonkyDBHttpProbeResult,
+    foreign_consumers: tuple[ForeignBackendConsumer, ...] = (),
+    backend_data_ownership: BackendDataOwnershipState | None = None,
 ) -> RemoteChonkyDBRepairPlan:
     """Return the bounded repair action for the current outage evidence."""
 
     if public_probe.ready:
         return RemoteChonkyDBRepairPlan(action="none", reason="public_ready")
+    if backend_data_ownership is not None and backend_data_ownership.has_drift:
+        return RemoteChonkyDBRepairPlan(
+            action="none",
+            reason="backend_data_permission_drift",
+        )
     if not backend_service.healthy:
         return RemoteChonkyDBRepairPlan(
             action="restart_backend_service",
             reason="backend_service_inactive",
+        )
+    if not backend_probe.ready and any(consumer.active for consumer in foreign_consumers):
+        return RemoteChonkyDBRepairPlan(
+            action="none",
+            reason="backend_foreign_consumer_contention",
         )
     if backend_probe.ready:
         return RemoteChonkyDBRepairPlan(
@@ -395,10 +524,25 @@ def repair_remote_chonkydb(
         settings=settings,
         timeout_s=probe_timeout_s,
     )
+    backend_data_ownership = inspect_backend_data_ownership(
+        executor=executor,
+        service_name=settings.backend_service,
+    )
+    foreign_consumers: tuple[ForeignBackendConsumer, ...] = ()
+    foreign_consumer_inspection_error: str | None = None
+    try:
+        foreign_consumers = inspect_foreign_backend_consumers(
+            executor=executor,
+            settings=settings,
+        )
+    except Exception as exc:  # pragma: no cover - bounded live fallback
+        foreign_consumer_inspection_error = f"{type(exc).__name__}: {exc}"
     plan = plan_remote_chonkydb_repair(
         public_probe=public_before,
         backend_service=backend_service_before,
         backend_probe=backend_before,
+        foreign_consumers=foreign_consumers,
+        backend_data_ownership=backend_data_ownership,
     )
     action_taken = "none"
     public_after = public_before
@@ -407,6 +551,10 @@ def repair_remote_chonkydb(
 
     if plan.action == "restart_backend_service":
         if restart_if_needed:
+            ensure_backend_query_surface_readiness_contract(
+                executor=executor,
+                service_name=settings.backend_service,
+            )
             restart_backend_service(
                 executor=executor,
                 service_name=settings.backend_service,
@@ -427,6 +575,8 @@ def repair_remote_chonkydb(
     diagnosis = plan.reason
     if plan.reason == "public_proxy_unhealthy" and not public_after.ready:
         diagnosis = "public_proxy_unhealthy"
+    elif plan.reason == "backend_foreign_consumer_contention":
+        diagnosis = "backend_foreign_consumer_contention"
     elif action_taken == "restart_required_but_skipped":
         diagnosis = "backend_restart_required"
     elif action_taken == "restart_backend_service" and not public_after.ready:
@@ -444,6 +594,9 @@ def repair_remote_chonkydb(
         backend_service_after=backend_service_after,
         backend_after=backend_after,
         plan=plan,
+        foreign_consumers=foreign_consumers,
+        backend_data_ownership=backend_data_ownership,
+        foreign_consumer_inspection_error=foreign_consumer_inspection_error,
     )
 
 
@@ -569,6 +722,158 @@ def probe_backend_local_chonkydb(
     )
     query_probe = _probe_result_from_remote_payload(json.loads(query_completed.stdout))
     return _require_query_surface_ready(instance_probe=instance_probe, query_probe=query_probe)
+
+
+def inspect_backend_data_ownership(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendDataOwnershipState | None:
+    """Inspect the backend data dir for owner/group drift versus the service account."""
+
+    completed = executor.run_sudo_ssh(
+        "systemctl show -p User -p Group -p Environment --no-pager " + shlex.quote(service_name)
+    )
+    values = _parse_key_value_lines(completed.stdout)
+    env_map = _parse_systemd_environment_output(str(values.get("Environment", "")))
+    data_dir = str(
+        env_map.get("CHONKDB_DATA_DIR")
+        or env_map.get("CHONKYDB_DATA_PATH")
+        or env_map.get("CCODEX_MEMORY_DATA_DIR")
+        or ""
+    ).strip()
+    expected_user = str(values.get("User", "")).strip() or "root"
+    expected_group = str(values.get("Group", "")).strip() or expected_user
+    if not data_dir:
+        return BackendDataOwnershipState(
+            data_dir="",
+            expected_user=expected_user,
+            expected_group=expected_group,
+            mismatched_entry_count=0,
+            error="missing_backend_data_dir",
+        )
+    payload = {
+        "data_dir": data_dir,
+        "expected_user": expected_user,
+        "expected_group": expected_group,
+        "sample_limit": 12,
+    }
+    probe_completed = executor.run_ssh(
+        "python3 -c " + shlex.quote(_REMOTE_DATA_OWNERSHIP_PROBE_CODE),
+        input_text=json.dumps(payload, ensure_ascii=False),
+    )
+    parsed = json.loads(probe_completed.stdout)
+    sample_entries = parsed.get("sample_entries")
+    return BackendDataOwnershipState(
+        data_dir=str(parsed.get("data_dir") or data_dir).strip(),
+        expected_user=str(parsed.get("expected_user") or expected_user).strip() or expected_user,
+        expected_group=str(parsed.get("expected_group") or expected_group).strip() or expected_group,
+        mismatched_entry_count=int(parsed.get("mismatched_entry_count") or 0),
+        sample_entries=tuple(
+            str(entry).strip()
+            for entry in (sample_entries if isinstance(sample_entries, list) else [])
+            if str(entry).strip()
+        ),
+        truncated=bool(parsed.get("truncated")),
+        error=str(parsed.get("error") or "").strip() or None,
+    )
+
+
+def inspect_foreign_backend_consumers(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    settings: RemoteChonkyDBOpsSettings,
+) -> tuple[ForeignBackendConsumer, ...]:
+    """Return active or configured non-Twinr units still pointed at the backend."""
+
+    payload = {
+        "backend_service": settings.backend_service,
+        "backend_local_base_url": settings.backend_local_base_url,
+    }
+    completed = executor.run_ssh(
+        "python3 -c " + shlex.quote(_REMOTE_FOREIGN_CONSUMER_CODE),
+        input_text=json.dumps(payload, ensure_ascii=False),
+    )
+    parsed = json.loads(completed.stdout)
+    consumers_payload = parsed.get("consumers")
+    if not isinstance(consumers_payload, list):
+        return ()
+    consumers: list[ForeignBackendConsumer] = []
+    for raw_entry in consumers_payload:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        consumers.append(
+            ForeignBackendConsumer(
+                unit_name=str(raw_entry.get("unit_name") or "").strip(),
+                active_state=str(raw_entry.get("active_state") or "").strip(),
+                sub_state=str(raw_entry.get("sub_state") or "").strip(),
+                configured_base_url=str(raw_entry.get("configured_base_url") or "").strip(),
+                fragment_path=str(raw_entry.get("fragment_path") or "").strip(),
+                coupled_to_backend_service=bool(raw_entry.get("coupled_to_backend_service")),
+            )
+        )
+    return tuple(
+        sorted(
+            consumers,
+            key=lambda consumer: (
+                not consumer.active,
+                consumer.unit_name,
+            ),
+        )
+    )
+
+
+def ensure_backend_query_surface_readiness_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendQuerySurfaceReadinessRepairStatus:
+    """Repair the proven unsafe fulltext-startup mismatch on the remote host.
+
+    Twinr observed repeated outages where systemd reported the dedicated
+    ChonkyDB unit as `active/running`, yet both the local loopback probe and
+    the public URL timed out or returned `503 Upstream unavailable or
+    restarting`. Remote evidence showed the service still running fulltext
+    rebuild/open work under `CHONKY_FT_REBUILD_ON_OPEN=1` while the query gate
+    remained disabled. This helper writes one persistent drop-in only when that
+    exact mismatch is present, then relies on the guarded restart path to make
+    the corrected env contract take effect.
+    """
+
+    env_output = executor.run_sudo_ssh(
+        "systemctl show -p Environment --no-pager " + shlex.quote(service_name)
+    ).stdout
+    env_map = _parse_systemd_environment_output(env_output)
+    contract = _backend_query_surface_readiness_contract_from_env(env_map)
+    dropin_path = f"/etc/systemd/system/{service_name}.d/40-twinr-query-surface-readiness.conf"
+    if not contract.unsafe:
+        return BackendQuerySurfaceReadinessRepairStatus(
+            dropin_path=dropin_path,
+            changed=False,
+            contract=contract,
+        )
+    readiness_timeout_s = (
+        float(contract.warmup_wait_ready_timeout_s)
+        if contract.warmup_wait_ready_timeout_s is not None
+        and float(contract.warmup_wait_ready_timeout_s) > 0.0
+        else 180.0
+    )
+    dropin_content = _backend_query_surface_readiness_dropin_content(
+        readiness_timeout_s=readiness_timeout_s,
+    )
+    completed = executor.run_sudo_ssh(
+        _python_backend_query_surface_readiness_dropin_script(
+            dropin_path=dropin_path,
+            dropin_content=dropin_content,
+        )
+    )
+    payload = _parse_json_payload(completed.stdout)
+    changed = bool(payload.get("changed"))
+    return BackendQuerySurfaceReadinessRepairStatus(
+        dropin_path=str(payload.get("path") or dropin_path).strip() or dropin_path,
+        changed=changed,
+        contract=contract,
+    )
 
 
 def restart_backend_service(
@@ -822,6 +1127,91 @@ def _parse_systemd_environment_output(text: str) -> dict[str, str]:
     return env_map
 
 
+def _backend_query_surface_readiness_contract_from_env(
+    env_map: Mapping[str, str],
+) -> BackendQuerySurfaceReadinessContract:
+    """Summarize the startup env flags that govern query-surface readiness."""
+
+    return BackendQuerySurfaceReadinessContract(
+        fulltext_rebuild_on_open=_parse_env_flag(
+            env_map.get("CHONKY_FT_REBUILD_ON_OPEN"),
+            default=False,
+        ),
+        warmup_fulltext_gate=_parse_env_flag(
+            env_map.get("CHONKY_API_WARMUP_FULLTEXT_GATE"),
+            default=False,
+        ),
+        warmup_wait_for_ready=_parse_env_flag(
+            env_map.get("CHONKY_API_WARMUP_WAIT_FOR_READY"),
+            default=False,
+        ),
+        warmup_wait_ready_timeout_s=_parse_optional_float(
+            env_map.get("CHONKY_API_WARMUP_WAIT_READY_TIMEOUT_S"),
+        ),
+    )
+
+
+def _backend_query_surface_readiness_dropin_content(*, readiness_timeout_s: float) -> str:
+    """Render the hardened startup contract for the dedicated backend service."""
+
+    return (
+        "[Service]\n"
+        "# Keep the query surface fail-closed while rebuild-on-open finishes.\n"
+        "Environment=CHONKY_API_WARMUP_FULLTEXT_GATE=1\n"
+        "Environment=CHONKY_API_WARMUP_WAIT_FOR_READY=1\n"
+        f"Environment=CHONKY_API_WARMUP_WAIT_READY_TIMEOUT_S={int(max(1.0, readiness_timeout_s))}\n"
+    )
+
+
+def _python_backend_query_surface_readiness_dropin_script(
+    *,
+    dropin_path: str,
+    dropin_content: str,
+) -> str:
+    """Return one remote Python script that writes the readiness drop-in."""
+
+    return (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        "import json\n"
+        f"path = Path({dropin_path!r})\n"
+        f"content = {dropin_content!r}\n"
+        "path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "existing = path.read_text(encoding='utf-8') if path.exists() else ''\n"
+        "changed = existing != content\n"
+        "if changed:\n"
+        "    path.write_text(content, encoding='utf-8')\n"
+        "print(json.dumps({'path': str(path), 'changed': changed}, ensure_ascii=False))\n"
+        "PY\n"
+        "systemctl daemon-reload"
+    )
+
+
+def _parse_env_flag(value: object, *, default: bool) -> bool:
+    """Parse one boolean-ish env value."""
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _parse_optional_float(value: object) -> float | None:
+    """Parse one optional numeric env value into `float`."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _read_env_values(path: Path) -> dict[str, str]:
     """Parse one dotenv file into a plain mapping without shell evaluation."""
 
@@ -995,4 +1385,226 @@ for key in ("detail", "error", "title", "service", "status"):
 if not detail:
     detail = " ".join(body_text.split())[:220]
 print(json.dumps({"url": url, "status": status, "detail": detail, "payload": payload_dict}, ensure_ascii=False))
+"""
+
+
+_REMOTE_DATA_OWNERSHIP_PROBE_CODE = """
+from __future__ import annotations
+
+import grp
+import json
+import os
+from pathlib import Path
+import pwd
+import sys
+
+payload = json.load(sys.stdin)
+data_dir = str(payload.get("data_dir") or "").strip()
+expected_user = str(payload.get("expected_user") or "").strip() or "root"
+expected_group = str(payload.get("expected_group") or "").strip() or expected_user
+sample_limit = max(1, int(payload.get("sample_limit") or 12))
+result = {
+    "data_dir": data_dir,
+    "expected_user": expected_user,
+    "expected_group": expected_group,
+    "mismatched_entry_count": 0,
+    "sample_entries": [],
+    "truncated": False,
+    "error": "",
+}
+if not data_dir:
+    result["error"] = "missing_data_dir"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+path = Path(data_dir)
+if not path.exists():
+    result["error"] = "data_dir_not_found"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+try:
+    expected_uid = pwd.getpwnam(expected_user).pw_uid
+except KeyError:
+    result["error"] = f"user_not_found:{expected_user}"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+try:
+    expected_gid = grp.getgrnam(expected_group).gr_gid
+except KeyError:
+    result["error"] = f"group_not_found:{expected_group}"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+
+def _owner_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def _group_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def _record_if_mismatch(raw_path: str, stat_result: os.stat_result) -> bool:
+    owner_ok = int(stat_result.st_uid) == int(expected_uid) and int(stat_result.st_gid) == int(expected_gid)
+    if owner_ok:
+        return False
+    result["mismatched_entry_count"] += 1
+    if len(result["sample_entries"]) < sample_limit:
+        result["sample_entries"].append(
+            f"{_owner_name(int(stat_result.st_uid))}:{_group_name(int(stat_result.st_gid))} {raw_path}"
+        )
+    if len(result["sample_entries"]) >= sample_limit:
+        result["truncated"] = True
+        return True
+    return False
+
+
+try:
+    if _record_if_mismatch(data_dir, os.lstat(data_dir)):
+        print(json.dumps(result, ensure_ascii=False))
+        raise SystemExit(0)
+    stack = [data_dir]
+    while stack:
+        current = stack.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                stat_result = entry.stat(follow_symlinks=False)
+                if _record_if_mismatch(entry.path, stat_result):
+                    print(json.dumps(result, ensure_ascii=False))
+                    raise SystemExit(0)
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+except OSError as exc:
+    result["error"] = f"{type(exc).__name__}:{exc}"
+
+print(json.dumps(result, ensure_ascii=False))
+"""
+
+
+_REMOTE_FOREIGN_CONSUMER_CODE = """
+from __future__ import annotations
+
+import json
+import shlex
+import subprocess
+import sys
+
+
+def _parse_key_value_lines(text: str) -> dict[str, str]:
+    mapping = {}
+    for raw_line in str(text or "").splitlines():
+        key, separator, value = raw_line.partition("=")
+        if separator:
+            mapping[str(key).strip()] = str(value).strip()
+    return mapping
+
+
+def _parse_environment(raw_value: str) -> dict[str, str]:
+    text = str(raw_value or "").strip()
+    if text.startswith("Environment="):
+        text = text[len("Environment="):]
+    if not text:
+        return {}
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = [part for part in text.split(" ") if part]
+    mapping = {}
+    for token in tokens:
+        key, separator, value = str(token).partition("=")
+        if separator:
+            mapping[str(key)] = str(value)
+    return mapping
+
+
+payload = json.load(sys.stdin)
+backend_service = str(payload.get("backend_service") or "").strip()
+backend_local_base_url = str(payload.get("backend_local_base_url") or "").strip().rstrip("/")
+list_completed = subprocess.run(
+    ["systemctl", "list-unit-files", "--type=service", "--no-legend", "--plain"],
+    check=False,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+    errors="replace",
+)
+if list_completed.returncode != 0:
+    print(json.dumps({"consumers": []}, ensure_ascii=False))
+    raise SystemExit(0)
+
+consumers = []
+seen_units = set()
+for raw_line in list_completed.stdout.splitlines():
+    unit_name = str(raw_line.split(None, 1)[0] if raw_line.split(None, 1) else "").strip()
+    if not unit_name or not unit_name.endswith(".service") or unit_name == backend_service:
+        continue
+    if unit_name in seen_units:
+        continue
+    seen_units.add(unit_name)
+    show_completed = subprocess.run(
+        [
+            "systemctl",
+            "show",
+            "--no-pager",
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "FragmentPath",
+            "-p",
+            "Environment",
+            "-p",
+            "After",
+            "-p",
+            "Wants",
+            "-p",
+            "Requires",
+            "-p",
+            "PartOf",
+            unit_name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if show_completed.returncode != 0:
+        continue
+    values = _parse_key_value_lines(show_completed.stdout)
+    env_map = _parse_environment(values.get("Environment", ""))
+    configured_base_url = ""
+    for key, value in env_map.items():
+        if not str(key).endswith("_BASE_URL"):
+            continue
+        normalized_value = str(value).strip().rstrip("/")
+        if normalized_value == backend_local_base_url:
+            configured_base_url = str(value).strip()
+            break
+    relation_fields = " ".join(
+        str(values.get(field, "")).strip()
+        for field in ("After", "Wants", "Requires", "PartOf")
+    )
+    coupled_to_backend_service = backend_service in relation_fields.split()
+    if not configured_base_url and not coupled_to_backend_service:
+        continue
+    consumers.append(
+        {
+            "unit_name": unit_name,
+            "active_state": str(values.get("ActiveState", "")).strip(),
+            "sub_state": str(values.get("SubState", "")).strip(),
+            "configured_base_url": configured_base_url,
+            "fragment_path": str(values.get("FragmentPath", "")).strip(),
+            "coupled_to_backend_service": coupled_to_backend_service,
+        }
+    )
+
+consumers.sort(key=lambda item: (item.get("unit_name") or ""))
+print(json.dumps({"consumers": consumers}, ensure_ascii=False))
 """

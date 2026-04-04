@@ -841,6 +841,28 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(scene.panel.cards, ())
         self.assertGreater(scene.layout.panel_box[0], scene.layout.face_box[2])
 
+    def test_default_scene_header_treats_system_achtung_as_warn(self) -> None:
+        display = self.make_display()
+        renderer = display._default_scene_renderer
+
+        scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "Achtung"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+        )
+
+        self.assertEqual(scene.header.system_value, "WARN")
+
     def test_default_scene_header_only_surface_hides_network_and_ai_status(self) -> None:
         display = self.make_display()
 

@@ -48,7 +48,7 @@ instead of treating them as supported operating modes.
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
 | [repair_remote_chonkydb.py](./repair_remote_chonkydb.py) | Diagnose the public ChonkyDB URL against the dedicated backend host and optionally repair the backend service without blind restarts |
-| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service` plus CPU-hungry `caia-consumer-portal*.service` backends, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
+| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service` plus CPU-hungry `caia-consumer-portal*.service` backends, bounded-kill direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path when they bypass systemd, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
 | [repair_remote_prompt_current_heads.py](./repair_remote_prompt_current_heads.py) | Force-publish canonical empty prompt-memory / managed-context current heads on one explicit remote namespace when the old heads are unreadable |
 | [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
@@ -168,6 +168,8 @@ set across both system and active user-session scope, runtime-masks proven
 non-Twinr workers such as `ollama-gpu.service`, now also quiesces the
 always-on `caia-consumer-portal.service` and
 `caia-consumer-portal-demo.service` uvicorn backends when they reclaim CPU,
+bounded-kills direct non-systemd writers against the dedicated
+`twinr_dedicated_<port>/data` store path when they keep the backend locked,
 raises
 `caia-twinr-chonkydb-alt.service` CPU/IO priority, and then re-probes the
 public current-scope query surface with the same empty-scope-safe

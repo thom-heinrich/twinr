@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 import time
+from typing import Any
 
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
 from twinr.memory.chonkydb.client import ChonkyDBError
@@ -21,6 +22,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
 from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError
 
+from ._typing import RemoteCatalogMixinBase
 from .shared import (
     LongTermRemoteCatalogEntry,
     _run_timed_workflow_step,
@@ -66,7 +68,7 @@ def _emit_query_plan_workflow_event(
     )
 
 
-class RemoteCatalogSearchMixin:
+class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
     def _fast_topic_topk_retry_attempts(self) -> tuple[int, int]:
         """Return the effective and configured retry budget for fast-topic reads.
 
@@ -187,6 +189,18 @@ class RemoteCatalogSearchMixin:
             seen_item_ids: set[str] = set()
             while True:
                 try:
+                    def run_scope_search() -> tuple[Mapping[str, object], ...]:
+                        return self._search_remote_candidates(
+                            snapshot_kind=snapshot_kind,
+                            read_client=read_client,
+                            query_text=clean_query,
+                            result_limit=request_limit,
+                            allowed_doc_ids=(),
+                            scope_ref=scope_ref,
+                            namespace=namespace,
+                            catalog_entry_count=0,
+                        )
+
                     candidates = _run_timed_workflow_step(
                         name="longterm_remote_catalog_scope_search_attempt",
                         kind="retrieval",
@@ -198,16 +212,7 @@ class RemoteCatalogSearchMixin:
                             scope_ref=scope_ref,
                             namespace=namespace,
                         ),
-                        operation=lambda request_limit=request_limit: self._search_remote_candidates(
-                            snapshot_kind=snapshot_kind,
-                            read_client=read_client,
-                            query_text=clean_query,
-                            result_limit=request_limit,
-                            allowed_doc_ids=(),
-                            scope_ref=scope_ref,
-                            namespace=namespace,
-                            catalog_entry_count=0,
-                        ),
+                        operation=run_scope_search,
                     )
                 except ChonkyDBError:
                     scope_search_failed = True
@@ -329,14 +334,14 @@ class RemoteCatalogSearchMixin:
                 cached_catalog_entries=len(cached_entries),
             ),
         ):
-            selected_entries = self._local_search_catalog_entries(
+            cached_selected_entries = self._local_search_catalog_entries(
                 snapshot_kind=snapshot_kind,
                 entries=cached_entries,
                 query_text=clean_query,
                 limit=limit,
                 eligible=eligible,
             )
-        if not selected_entries:
+        if not cached_selected_entries:
             return ()
         with workflow_span(
             name="longterm_remote_catalog_cached_selector_hydrate",
@@ -346,12 +351,12 @@ class RemoteCatalogSearchMixin:
                 query_text=clean_query,
                 result_limit=limit,
                 cached_catalog_entries=len(cached_entries),
-                candidate_limit=len(selected_entries),
+                candidate_limit=len(cached_selected_entries),
             ),
         ):
             return self.load_selection_item_payloads(
                 snapshot_kind=snapshot_kind,
-                item_ids=(entry.item_id for entry in selected_entries),
+                item_ids=(entry.item_id for entry in cached_selected_entries),
             )
 
     def _rescue_fast_scope_search_with_current_catalog(
@@ -361,12 +366,49 @@ class RemoteCatalogSearchMixin:
         query_text: str,
         limit: int,
         failure_details: Mapping[str, object],
+        allow_cold_catalog_load: bool = False,
     ) -> tuple[dict[str, object], ...] | None:
         """Recover fast scope reads from the current remote catalog when possible."""
 
         current_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
         if current_entries is None:
             current_entries = self._recent_catalog_entries(snapshot_kind=snapshot_kind)
+        if current_entries is None:
+            if allow_cold_catalog_load:
+                try:
+                    current_entries = self.load_catalog_entries(
+                        snapshot_kind=snapshot_kind,
+                        bypass_cache=True,
+                    )
+                except Exception as exc:
+                    workflow_event(
+                        kind="branch",
+                        msg="longterm_remote_catalog_fast_scope_search_rescue_skipped",
+                        details={
+                            "snapshot_kind": snapshot_kind,
+                            "result_limit": max(1, int(limit)),
+                            "failure_classification": failure_details.get("classification"),
+                            "failure_status_code": failure_details.get("status_code"),
+                            "failure_timeout_reason": failure_details.get("timeout_reason"),
+                            "reason": "current_catalog_cold_load_failed",
+                            "cold_load_error_type": type(exc).__name__,
+                        },
+                    )
+                    return None
+            else:
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_remote_catalog_fast_scope_search_rescue_skipped",
+                    details={
+                        "snapshot_kind": snapshot_kind,
+                        "result_limit": max(1, int(limit)),
+                        "failure_classification": failure_details.get("classification"),
+                        "failure_status_code": failure_details.get("status_code"),
+                        "failure_timeout_reason": failure_details.get("timeout_reason"),
+                        "reason": "current_catalog_projection_not_cached_in_process",
+                    },
+                )
+                return None
         if current_entries is None:
             workflow_event(
                 kind="branch",
@@ -377,7 +419,7 @@ class RemoteCatalogSearchMixin:
                     "failure_classification": failure_details.get("classification"),
                     "failure_status_code": failure_details.get("status_code"),
                     "failure_timeout_reason": failure_details.get("timeout_reason"),
-                    "reason": "current_catalog_projection_not_cached_in_process",
+                    "reason": "current_catalog_projection_unavailable",
                 },
             )
             return None
@@ -549,11 +591,16 @@ class RemoteCatalogSearchMixin:
                     msg="longterm_remote_catalog_fast_scope_search_failed",
                     details=failure_details,
                 )
+            scope_failure_mode = self._scope_search_failure_mode(
+                snapshot_kind=snapshot_kind,
+                exc=exc,
+            )
             rescued = self._rescue_fast_scope_search_with_current_catalog(
                 snapshot_kind=snapshot_kind,
                 query_text=clean_query,
                 limit=bounded_limit,
                 failure_details=failure_details,
+                allow_cold_catalog_load=scope_failure_mode in {"unsupported_scope_search", "missing_current_head"},
             )
             if rescued is not None:
                 return rescued
@@ -807,7 +854,7 @@ class RemoteCatalogSearchMixin:
         self,
         *,
         snapshot_kind: str,
-        read_client: object,
+        read_client: Any,
         query_text: str,
         result_limit: int,
         allowed_doc_ids: tuple[str, ...],

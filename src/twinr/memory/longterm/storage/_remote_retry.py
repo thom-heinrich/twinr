@@ -19,6 +19,13 @@ _RETRYABLE_DETAIL_MARKERS = frozenset(
         "serverbusy",
     }
 )
+_TRANSIENT_BACKEND_UNAVAILABLE_DETAIL_MARKERS = frozenset(
+    {
+        "serviceunavailable",
+        "upstreamunavailable",
+        "restarting",
+    }
+)
 
 
 def _looks_like_timeout_error(exc: BaseException) -> bool:
@@ -45,7 +52,7 @@ def retryable_remote_write_attempts(configured_attempts: int, *, exc: BaseExcept
     """Return the bounded retry budget for one transient remote write error."""
 
     attempts = max(1, int(configured_attempts))
-    if is_rate_limited_remote_write_error(exc):
+    if is_rate_limited_remote_write_error(exc) or is_transient_backend_unavailable_write_error(exc):
         return max(attempts, _MAX_TRANSIENT_WRITE_ATTEMPTS)
     return attempts
 
@@ -144,6 +151,9 @@ def remote_write_retry_delay_s(
         retry_after_s = item.retry_after_seconds()
         if retry_after_s is not None:
             return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, max(configured_backoff_s, retry_after_s))
+    if is_transient_backend_unavailable_write_error(exc):
+        base_delay_s = max(configured_backoff_s, 1.0)
+        return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, base_delay_s * (2 ** max(0, attempt_index)))
     if is_rate_limited_remote_write_error(exc):
         base_delay_s = max(configured_backoff_s, 1.0)
         return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, base_delay_s * (2 ** max(0, attempt_index)))
@@ -188,6 +198,37 @@ def is_rate_limited_remote_write_error(exc: BaseException) -> bool:
         )
         compact_bits = detail_bits.replace(" ", "")
         if any(marker in compact_bits for marker in _RETRYABLE_DETAIL_MARKERS):
+            return True
+    return False
+
+
+def is_transient_backend_unavailable_write_error(exc: BaseException) -> bool:
+    """Return whether one write failed during a temporary backend restart window.
+
+    ChonkyDB reports brief upstream restarts as HTTP 503 with problem details
+    like ``Upstream unavailable or restarting``. Those incidents are neither
+    payload-shaped saturation nor permanent validation errors, so they deserve
+    the same bounded transient retry budget as queue-pressure responses.
+    """
+
+    for item in exception_chain(exc):
+        if not isinstance(item, ChonkyDBError):
+            continue
+        try:
+            status_code = int(item.status_code) if item.status_code is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code != 503:
+            continue
+        response_json = item.response_json if isinstance(item.response_json, dict) else {}
+        detail_bits = " ".join(
+            str(response_json.get(field) or "").strip().lower()
+            for field in ("detail", "error", "error_type", "title")
+        )
+        compact_bits = detail_bits.replace(" ", "")
+        if not compact_bits:
+            return True
+        if any(marker in compact_bits for marker in _TRANSIENT_BACKEND_UNAVAILABLE_DETAIL_MARKERS):
             return True
     return False
 

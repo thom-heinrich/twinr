@@ -7,6 +7,7 @@ from .parsing import (
     _parse_bool,
     _parse_csv_strings,
     _parse_float,
+    _parse_optional_int,
 )
 
 
@@ -68,6 +69,9 @@ def load_runtime_memory_config(context: ConfigLoadContext) -> dict[str, object]:
         .lower(),
         "long_term_memory_remote_required": _parse_bool(
             get_value("TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED"), False
+        ),
+        "long_term_memory_remote_required_failure_threshold": _parse_optional_int(
+            get_value("TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED_FAILURE_THRESHOLD")
         ),
         "long_term_memory_remote_namespace": get_value(
             "TWINR_LONG_TERM_MEMORY_REMOTE_NAMESPACE"

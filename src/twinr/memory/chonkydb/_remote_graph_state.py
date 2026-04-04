@@ -33,6 +33,7 @@ _GRAPH_EDGE_SNAPSHOT_KIND = "graph_edges"
 _MIN_GRAPH_STORE_TIMEOUT_S = 10
 _MAX_GRAPH_QUERY_RETRY_ATTEMPTS = 2
 _MAX_GRAPH_QUERY_RETRY_BACKOFF_S = 0.25
+_MAX_GRAPH_STORE_RETRY_ATTEMPTS = 10
 _READINESS_CURRENT_HEAD_TIMEOUT_S = 5.0
 
 
@@ -1055,6 +1056,36 @@ class TwinrRemoteGraphState:
             configured = _MAX_GRAPH_QUERY_RETRY_BACKOFF_S
         return min(_MAX_GRAPH_QUERY_RETRY_BACKOFF_S, max(0.0, configured))
 
+    def _graph_store_retry_attempts(self) -> int:
+        remote_state = self.remote_state
+        config = getattr(remote_state, "config", None)
+        try:
+            configured = int(
+                getattr(
+                    config,
+                    "long_term_memory_remote_retry_attempts",
+                    _MAX_GRAPH_STORE_RETRY_ATTEMPTS,
+                )
+            )
+        except (TypeError, ValueError):
+            configured = _MAX_GRAPH_STORE_RETRY_ATTEMPTS
+        return max(1, min(_MAX_GRAPH_STORE_RETRY_ATTEMPTS, configured))
+
+    def _graph_store_retry_backoff_s(self) -> float:
+        remote_state = self.remote_state
+        config = getattr(remote_state, "config", None)
+        try:
+            configured = float(
+                getattr(
+                    config,
+                    "long_term_memory_remote_retry_backoff_s",
+                    1.0,
+                )
+            )
+        except (TypeError, ValueError):
+            configured = 1.0
+        return min(30.0, max(0.0, configured))
+
     def _graph_query_context(
         self,
         *,
@@ -1244,6 +1275,13 @@ class TwinrRemoteGraphState:
             LongTermRemoteWriteContext,
             record_remote_write_diagnostic,
         )
+        from twinr.memory.longterm.storage._remote_retry import (
+            remote_write_retry_delay_s,
+            raise_if_remote_operation_cancelled,
+            retryable_remote_write_attempts,
+            sleep_with_remote_operation_abort,
+            should_retry_remote_write_error,
+        )
         from twinr.memory.longterm.storage.remote_read_observability import record_remote_write_observation
 
         remote_state = self._require_remote_state()
@@ -1251,6 +1289,8 @@ class TwinrRemoteGraphState:
         if write_client is None:
             raise _remote_unavailable_error("Remote graph topology write client is unavailable.")
         timeout_s = self._graph_store_timeout_seconds()
+        retry_attempts = self._graph_store_retry_attempts()
+        retry_backoff_s = self._graph_store_retry_backoff_s()
         nodes = tuple(
             ChonkyDBGraphStoreManyNode(label=_topology_ref(generation_id=generation_id, node_id=node.node_id))
             for node in sorted(document.nodes, key=lambda item: item.node_id)
@@ -1263,60 +1303,93 @@ class TwinrRemoteGraphState:
             )
             for edge in sorted(document.edges, key=lambda item: (item.source_node_id, item.edge_type, item.target_node_id))
         )
+        request = ChonkyDBGraphStoreManyRequest(
+            index_name=index_name,
+            nodes=nodes,
+            edges=edges,
+            assume_new=False,
+            timeout_seconds=timeout_s,
+        )
+        request_payload = request.to_payload()
+        request_bytes = len(
+            json.dumps(request_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
         started_monotonic = time.monotonic()
-        try:
-            result = getattr(write_client, "graph_store_many")(
-                ChonkyDBGraphStoreManyRequest(
-                    index_name=index_name,
-                    nodes=nodes,
-                    edges=edges,
-                    assume_new=False,
-                    timeout_seconds=timeout_s,
+        last_error: Exception | None = None
+        attempt_index = 0
+        while attempt_index < retry_attempts:
+            context = LongTermRemoteWriteContext(
+                snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
+                operation="graph_store_many",
+                request_method="POST",
+                request_payload_kind="graph_store_many_request",
+                request_path="/v1/external/graph/store_many",
+                timeout_s=timeout_s,
+                namespace=_normalize_text(getattr(remote_state, "namespace", None)),
+                access_classification="graph_topology_write",
+                attempt_count=attempt_index + 1,
+                retry_attempts_configured=retry_attempts,
+                retry_backoff_s=retry_backoff_s,
+                retry_mode="bounded_graph_topology_retry" if retry_attempts > 1 else "single_attempt",
+                request_item_count=len(nodes) + len(edges),
+                request_bytes=request_bytes,
+            )
+            try:
+                candidate = getattr(write_client, "graph_store_many")(request)
+                if isinstance(candidate, Mapping) and candidate.get("success") is False:
+                    detail = _normalize_text(candidate.get("detail")) or _normalize_text(candidate.get("error"))
+                    error_type = _normalize_text(candidate.get("error_type"))
+                    response_json = {
+                        key: value
+                        for key, value in (
+                            ("detail", detail or None),
+                            ("error", _normalize_text(candidate.get("error")) or None),
+                            ("error_type", error_type or None),
+                        )
+                        if value is not None
+                    }
+                    retryable_status = 503 if error_type == "ServiceUnavailable" else None
+                    transient_markers = ("graph_initializing", "graph_warmup_failed", "upstream unavailable")
+                    if retryable_status is None and detail and any(marker in detail.lower() for marker in transient_markers):
+                        retryable_status = 503
+                    raise ChonkyDBError(
+                        detail or "graph_store_many failed",
+                        status_code=retryable_status,
+                        response_json=response_json or None,
+                    )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc if isinstance(exc, Exception) else Exception(str(exc))
+                resolved_retry_attempts = retryable_remote_write_attempts(retry_attempts, exc=exc)
+                if should_retry_remote_write_error(exc) and attempt_index + 1 < resolved_retry_attempts:
+                    raise_if_remote_operation_cancelled(operation="Remote graph topology write")
+                    delay_s = remote_write_retry_delay_s(
+                        exc,
+                        default_backoff_s=retry_backoff_s,
+                        attempt_index=attempt_index,
+                    )
+                    if delay_s > 0.0:
+                        sleep_with_remote_operation_abort(
+                            delay_s,
+                            operation="Remote graph topology write retry",
+                        )
+                    attempt_index += 1
+                    continue
+                record_remote_write_diagnostic(
+                    remote_state=remote_state,
+                    context=context,
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="failed",
                 )
-            )
-        except Exception as exc:
-            record_remote_write_diagnostic(
-                remote_state=remote_state,
-                context=LongTermRemoteWriteContext(
-                    snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
-                    operation="graph_store_many",
-                    request_method="POST",
-                    request_payload_kind="graph_store_many_request",
-                    request_path="/v1/external/graph/store_many",
-                    timeout_s=timeout_s,
-                    namespace=_normalize_text(getattr(remote_state, "namespace", None)),
-                    access_classification="graph_topology_write",
-                    request_item_count=len(nodes) + len(edges),
-                ),
-                exc=exc,
-                started_monotonic=started_monotonic,
-                outcome="failed",
-            )
+                raise _remote_unavailable_error(
+                    f"Failed to persist graph topology generation {generation_id!r} to remote ChonkyDB."
+                ) from exc
+        if last_error is not None:
             raise _remote_unavailable_error(
                 f"Failed to persist graph topology generation {generation_id!r} to remote ChonkyDB."
-            ) from exc
-        if isinstance(result, Mapping) and result.get("success") is False:
-            detail = _normalize_text(result.get("detail")) or _normalize_text(result.get("error")) or "graph_store_many failed"
-            record_remote_write_diagnostic(
-                remote_state=remote_state,
-                context=LongTermRemoteWriteContext(
-                    snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
-                    operation="graph_store_many",
-                    request_method="POST",
-                    request_payload_kind="graph_store_many_request",
-                    request_path="/v1/external/graph/store_many",
-                    timeout_s=timeout_s,
-                    namespace=_normalize_text(getattr(remote_state, "namespace", None)),
-                    access_classification="graph_topology_write",
-                    request_item_count=len(nodes) + len(edges),
-                ),
-                exc=_remote_unavailable_error(detail),
-                started_monotonic=started_monotonic,
-                outcome="failed",
-            )
-            raise _remote_unavailable_error(
-                f"Failed to persist graph topology generation {generation_id!r}: {detail}"
-            )
+            ) from last_error
         record_remote_write_observation(
             remote_state=remote_state,
             context=LongTermRemoteWriteContext(
@@ -1328,7 +1401,12 @@ class TwinrRemoteGraphState:
                 timeout_s=timeout_s,
                 namespace=_normalize_text(getattr(remote_state, "namespace", None)),
                 access_classification="graph_topology_write",
+                attempt_count=attempt_index + 1,
+                retry_attempts_configured=retry_attempts,
+                retry_backoff_s=retry_backoff_s,
+                retry_mode="bounded_graph_topology_retry" if retry_attempts > 1 else "single_attempt",
                 request_item_count=len(nodes) + len(edges),
+                request_bytes=request_bytes,
             ),
             latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
             outcome="ok",
@@ -1346,12 +1424,18 @@ class TwinrRemoteGraphState:
             use_probe=use_probe,
             readiness_mode=readiness_mode,
         )
+        # The node head is the authoritative gate for whether a remote current
+        # view exists at all. On a fresh namespace, reading the edge head after
+        # an explicit node-head miss only adds one more remote round trip
+        # without contributing any additional state.
+        if not isinstance(node_head, Mapping):
+            return None
         edge_head = self._resolve_current_head_payload(
             snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND,
             use_probe=use_probe,
             readiness_mode=readiness_mode,
         )
-        if not isinstance(node_head, Mapping) or not isinstance(edge_head, Mapping):
+        if not isinstance(edge_head, Mapping):
             return None
         generation_id = _normalize_text(node_head.get("generation_id"))
         edge_generation_id = _normalize_text(edge_head.get("generation_id"))
@@ -1415,6 +1499,13 @@ class TwinrRemoteGraphState:
         contract.
         """
 
+        if not use_probe and self._direct_current_head_missing_fast_fail(snapshot_kind=snapshot_kind):
+            compatible_head = self._probe_compatible_snapshot_head_payload(snapshot_kind=snapshot_kind)
+            if isinstance(compatible_head, Mapping):
+                compatible_payload = dict(compatible_head)
+                if self._current_head_payload_complete(snapshot_kind=snapshot_kind, payload=compatible_payload):
+                    return compatible_payload
+            return None
         direct_head = self._read_direct_current_head_payload(
             snapshot_kind=snapshot_kind,
             use_probe=use_probe,
@@ -1469,6 +1560,18 @@ class TwinrRemoteGraphState:
         if not self._current_head_payload_complete(snapshot_kind=snapshot_kind, payload=payload_dict):
             return None
         return payload_dict
+
+    def _direct_current_head_missing_fast_fail(self, *, snapshot_kind: str) -> bool:
+        """Return whether the fixed current head is already an explicit fast-fail miss."""
+
+        probe_catalog_payload_result = getattr(self._catalog, "probe_catalog_payload_result", None)
+        if not callable(probe_catalog_payload_result):
+            return False
+        try:
+            status, _payload = probe_catalog_payload_result(snapshot_kind=snapshot_kind, fast_fail=True)
+        except Exception:
+            return False
+        return str(status or "").strip().lower() == "not_found"
 
     def _read_direct_current_head_payload(
         self,
@@ -1585,24 +1688,35 @@ class TwinrRemoteGraphState:
         inflates fixed-URI reads to the cold bootstrap/origin-resolution
         timeout, which is appropriate for foreground recovery but too slow for
         the read-only readiness contract and can keep shutdown drains pinned on
-        already unhealthy remote memory. Read this head with the normal
-        fail-closed client and cap it to a small probe budget instead.
+        already unhealthy remote memory. Reuse the remote state's own status-
+        probe timeout first so the readiness path stays aligned with the
+        watchdog/readiness contract, and only fall back to the historical small
+        hard cap when the remote-state adapter cannot provide that probe client.
         """
 
         remote_state = self.remote_state
         if remote_state is None:
+            return None
+        if self._direct_current_head_missing_fast_fail(snapshot_kind=snapshot_kind):
             return None
         read_client = getattr(remote_state, "read_client", None)
         require_client = getattr(self._catalog, "_require_client", None)
         if not callable(require_client):
             return None
         effective_read_client = require_client(read_client, operation="read")
-        from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
+        status_probe_client = getattr(remote_state, "_status_probe_client", None)
+        if callable(status_probe_client):
+            try:
+                effective_read_client = status_probe_client(effective_read_client)
+            except Exception:
+                effective_read_client = require_client(read_client, operation="read")
+        else:
+            from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
 
-        effective_read_client = clone_client_with_capped_timeout(
-            effective_read_client,
-            timeout_s=_READINESS_CURRENT_HEAD_TIMEOUT_S,
-        )
+            effective_read_client = clone_client_with_capped_timeout(
+                effective_read_client,
+                timeout_s=_READINESS_CURRENT_HEAD_TIMEOUT_S,
+            )
         try:
             envelope = effective_read_client.fetch_full_document(
                 origin_uri=self._catalog._catalog_head_uri(snapshot_kind=snapshot_kind),

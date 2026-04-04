@@ -8,6 +8,7 @@
 # SEC-3: rename-only persistence was not durable across sudden power loss; the containing directory is now fsync()'d after replace().
 # IMP-1: optional orjson fast-path enables faster, stricter JSON IO on ARM/Pi builds when installed, while preserving a stdlib fallback.
 # IMP-2: persistence now sanitizes nested JSON-ish payloads and validates snapshot shape earlier, making the watchdog state file far more self-healing in real deployments.
+# BUG-5: persisted watchdog artifacts now carry monotonic freshness plus boot/PID attestation fields so supervisor gating survives Pi wall-clock jumps without false restart blocks.
 
 """Persisted state models and storage helpers for the remote-memory watchdog."""
 
@@ -22,6 +23,7 @@ from pathlib import Path
 import socket
 import stat
 import tempfile
+import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.ops.events import compact_text
@@ -276,6 +278,21 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def monotonic_ns_now() -> int:
+    """Return the current monotonic clock in nanoseconds."""
+
+    return time.monotonic_ns()
+
+
+def monotonic_seconds_to_ns(value: object) -> int | None:
+    """Convert one monotonic-seconds reading to integer nanoseconds."""
+
+    parsed = _coerce_float_value(value, default=-1.0)
+    if parsed < 0.0:
+        return None
+    return int(round(parsed * 1_000_000_000.0))
+
+
 def coerce_interval_s(value: object, *, default: float) -> float:
     """Normalize the watchdog interval to a finite positive float."""
 
@@ -292,6 +309,15 @@ def coerce_history_limit(value: object, *, default: int) -> int:
     if history_limit <= 0:
         return default
     return history_limit
+
+
+def _coerce_optional_nonnegative_int(value: object) -> int | None:
+    """Return one optional non-negative integer."""
+
+    parsed = _coerce_int_value(value, default=-1)
+    if parsed < 0:
+        return None
+    return parsed
 
 
 def _fsync_directory(path: Path) -> None:
@@ -388,6 +414,68 @@ def _effective_long_term_memory_mode(config: TwinrConfig) -> str:
     return mode or "unknown"
 
 
+def current_boot_id() -> str | None:
+    """Return the current Linux boot ID when available."""
+
+    try:
+        text = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    boot_id = _compact_text_field(text, default=None)
+    if boot_id is None:
+        return None
+    return boot_id.lower()
+
+
+def read_proc_stat_start_ticks(pid: int | None) -> int | None:
+    """Return /proc/<pid>/stat starttime ticks for one live PID."""
+
+    resolved_pid = _coerce_optional_nonnegative_int(pid)
+    if resolved_pid is None or resolved_pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{resolved_pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    end = raw.rfind(")")
+    if end < 0 or end + 2 >= len(raw):
+        return None
+    tail = raw[end + 2 :].split()
+    if len(tail) < 20:
+        return None
+    try:
+        return int(tail[19])
+    except (TypeError, ValueError):
+        return None
+
+
+def _linux_boot_time_s() -> float | None:
+    """Return the current kernel boot time from /proc/stat."""
+
+    try:
+        with Path("/proc/stat").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_proc_create_time_s(pid: int | None) -> float | None:
+    """Return one PID start time in epoch seconds using /proc data."""
+
+    start_ticks = read_proc_stat_start_ticks(pid)
+    boot_time_s = _linux_boot_time_s()
+    try:
+        clk_tck = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, OSError, ValueError):
+        return None
+    if start_ticks is None or boot_time_s is None or not math.isfinite(clk_tck) or clk_tck <= 0.0:
+        return None
+    return boot_time_s + (float(start_ticks) / clk_tck)
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteMemoryWatchdogSample:
     """Capture one remote-memory probe result."""
@@ -401,6 +489,7 @@ class RemoteMemoryWatchdogSample:
     latency_ms: float
     consecutive_ok: int
     consecutive_fail: int
+    captured_monotonic_ns: int | None = None
     detail: str | None = None
     probe: dict[str, object] | None = None
 
@@ -419,6 +508,7 @@ class RemoteMemoryWatchdogSample:
             latency_ms=max(0.0, _coerce_float_value(payload.get("latency_ms", 0.0), default=0.0)),
             consecutive_ok=max(0, _coerce_int_value(payload.get("consecutive_ok", 0), default=0)),
             consecutive_fail=max(0, _coerce_int_value(payload.get("consecutive_fail", 0), default=0)),
+            captured_monotonic_ns=_coerce_optional_nonnegative_int(payload.get("captured_monotonic_ns")),
             detail=cls._coerce_optional_text(payload.get("detail")),
             probe=probe_payload,
         )
@@ -436,6 +526,7 @@ class RemoteMemoryWatchdogSample:
             "latency_ms": max(0.0, _coerce_float_value(self.latency_ms, default=0.0)),
             "consecutive_ok": max(0, _coerce_int_value(self.consecutive_ok, default=0)),
             "consecutive_fail": max(0, _coerce_int_value(self.consecutive_fail, default=0)),
+            "captured_monotonic_ns": _coerce_optional_nonnegative_int(self.captured_monotonic_ns),
             "detail": self._coerce_optional_text(self.detail),
             "probe": _coerce_object_dict(self.probe),
         }
@@ -471,9 +562,15 @@ class RemoteMemoryWatchdogSnapshot:
     artifact_path: str
     current: RemoteMemoryWatchdogSample
     recent_samples: tuple[RemoteMemoryWatchdogSample, ...]
+    updated_monotonic_ns: int | None = None
     heartbeat_at: str | None = None
+    heartbeat_monotonic_ns: int | None = None
+    boot_id: str | None = None
+    pid_starttime_ticks: int | None = None
+    pid_create_time_s: float | None = None
     probe_inflight: bool = False
     probe_started_at: str | None = None
+    probe_started_monotonic_ns: int | None = None
     probe_age_s: float | None = None
 
     @classmethod
@@ -522,9 +619,17 @@ class RemoteMemoryWatchdogSnapshot:
             artifact_path=str(payload.get("artifact_path", "") or ""),
             current=RemoteMemoryWatchdogSample.from_dict(current_payload),
             recent_samples=tuple(recent_samples),
+            updated_monotonic_ns=_coerce_optional_nonnegative_int(payload.get("updated_monotonic_ns")),
             heartbeat_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("heartbeat_at")),
+            heartbeat_monotonic_ns=_coerce_optional_nonnegative_int(payload.get("heartbeat_monotonic_ns")),
+            boot_id=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("boot_id")),
+            pid_starttime_ticks=_coerce_optional_nonnegative_int(payload.get("pid_starttime_ticks")),
+            pid_create_time_s=cls._coerce_optional_float(payload.get("pid_create_time_s")),
             probe_inflight=_coerce_bool_value(payload.get("probe_inflight", False), default=False),
             probe_started_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("probe_started_at")),
+            probe_started_monotonic_ns=_coerce_optional_nonnegative_int(
+                payload.get("probe_started_monotonic_ns")
+            ),
             probe_age_s=cls._coerce_optional_float(payload.get("probe_age_s")),
         )
 
@@ -549,9 +654,17 @@ class RemoteMemoryWatchdogSnapshot:
             "artifact_path": str(self.artifact_path or ""),
             "current": self.current.to_dict(),
             "recent_samples": [sample.to_dict() for sample in recent_samples],
+            "updated_monotonic_ns": _coerce_optional_nonnegative_int(self.updated_monotonic_ns),
             "heartbeat_at": RemoteMemoryWatchdogSample._coerce_optional_text(self.heartbeat_at),
+            "heartbeat_monotonic_ns": _coerce_optional_nonnegative_int(self.heartbeat_monotonic_ns),
+            "boot_id": RemoteMemoryWatchdogSample._coerce_optional_text(self.boot_id),
+            "pid_starttime_ticks": _coerce_optional_nonnegative_int(self.pid_starttime_ticks),
+            "pid_create_time_s": self._coerce_optional_float(self.pid_create_time_s),
             "probe_inflight": bool(self.probe_inflight),
             "probe_started_at": RemoteMemoryWatchdogSample._coerce_optional_text(self.probe_started_at),
+            "probe_started_monotonic_ns": _coerce_optional_nonnegative_int(
+                self.probe_started_monotonic_ns
+            ),
             "probe_age_s": self._coerce_optional_float(self.probe_age_s),
         }
         return _bound_snapshot_payload_size(payload, current=self.current)
@@ -606,7 +719,12 @@ class RemoteMemoryWatchdogStore:
             raise RuntimeError(f"Remote memory watchdog snapshot is malformed: {self.path}") from exc
 
 
-def build_starting_sample(config: TwinrConfig, *, captured_at: str) -> RemoteMemoryWatchdogSample:
+def build_starting_sample(
+    config: TwinrConfig,
+    *,
+    captured_at: str,
+    captured_monotonic_ns: int | None = None,
+) -> RemoteMemoryWatchdogSample:
     """Return the synthetic startup sample used before the first deep probe."""
 
     mode = _effective_long_term_memory_mode(config)
@@ -625,6 +743,7 @@ def build_starting_sample(config: TwinrConfig, *, captured_at: str) -> RemoteMem
         latency_ms=0.0,
         consecutive_ok=0,
         consecutive_fail=0,
+        captured_monotonic_ns=_coerce_optional_nonnegative_int(captured_monotonic_ns),
         detail=STARTING_SAMPLE_DETAIL,
     )
 
@@ -642,6 +761,7 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
 
     resolved_started_at = str(started_at or utc_now_iso())
     resolved_captured_at = str(captured_at or resolved_started_at)
+    resolved_captured_monotonic_ns = monotonic_ns_now()
     interval_s = coerce_interval_s(
         getattr(config, "long_term_memory_remote_watchdog_interval_s", DEFAULT_WATCHDOG_INTERVAL_S),
         default=DEFAULT_WATCHDOG_INTERVAL_S,
@@ -664,6 +784,9 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
         previous_failure_count = max(0, int(previous_snapshot.failure_count))
         previous_last_ok_at = RemoteMemoryWatchdogSample._coerce_optional_text(previous_snapshot.last_ok_at)
         previous_last_failure_at = RemoteMemoryWatchdogSample._coerce_optional_text(previous_snapshot.last_failure_at)
+    resolved_boot_id = current_boot_id()
+    resolved_pid_starttime_ticks = read_proc_stat_start_ticks(pid)
+    resolved_pid_create_time_s = read_proc_create_time_s(pid)
     return RemoteMemoryWatchdogSnapshot(
         schema_version=SNAPSHOT_SCHEMA_VERSION,
         started_at=resolved_started_at,
@@ -677,11 +800,21 @@ def build_remote_memory_watchdog_bootstrap_snapshot(
         last_ok_at=previous_last_ok_at,
         last_failure_at=previous_last_failure_at,
         artifact_path=str(artifact_path),
-        current=build_starting_sample(config, captured_at=resolved_captured_at),
+        current=build_starting_sample(
+            config,
+            captured_at=resolved_captured_at,
+            captured_monotonic_ns=resolved_captured_monotonic_ns,
+        ),
         recent_samples=previous_recent_samples,
+        updated_monotonic_ns=resolved_captured_monotonic_ns,
         heartbeat_at=resolved_captured_at,
+        heartbeat_monotonic_ns=resolved_captured_monotonic_ns,
+        boot_id=resolved_boot_id,
+        pid_starttime_ticks=resolved_pid_starttime_ticks,
+        pid_create_time_s=resolved_pid_create_time_s,
         probe_inflight=True,
         probe_started_at=resolved_captured_at,
+        probe_started_monotonic_ns=resolved_captured_monotonic_ns,
         probe_age_s=0.0,
     )
 
@@ -701,5 +834,10 @@ __all__ = [
     "coerce_history_limit",
     "coerce_interval_s",
     "compact_history_sample",
+    "current_boot_id",
+    "monotonic_ns_now",
+    "monotonic_seconds_to_ns",
+    "read_proc_create_time_s",
+    "read_proc_stat_start_ticks",
     "utc_now_iso",
 ]

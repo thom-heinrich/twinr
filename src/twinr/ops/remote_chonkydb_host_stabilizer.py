@@ -19,7 +19,8 @@ Outputs
 - the before/after enabled/active state for the curated system- and user-unit
   conflict sets
 - the bounded stale-process cleanup summary for proven long-running
-  user-session benchmark workers that bypass systemd unit control
+  user-session benchmark workers and direct dedicated-data-path writers that
+  bypass systemd unit control
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import shlex
 import subprocess
 import time
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from twinr.ops.remote_chonkydb_repair import (
     ChonkyDBHttpProbeResult,
@@ -44,6 +46,7 @@ from twinr.ops.remote_chonkydb_repair import (
 
 _DEFAULT_SETTLE_S = 8.0
 _DEFAULT_SSH_TIMEOUT_S = 180.0
+_DEDICATED_DATA_PATH_PROCESS_MIN_ELAPSED_S = 60.0
 _DEFAULT_CHONKY_PROPERTIES: dict[str, str] = {
     "CPUWeight": "10000",
     "StartupCPUWeight": "10000",
@@ -125,6 +128,43 @@ _DEFAULT_STALE_PROCESS_RULES = (
         ),
     },
 )
+
+
+def build_stale_process_rules(settings: RemoteChonkyDBOpsSettings) -> tuple[dict[str, object], ...]:
+    """Return the stale-process rules for one dedicated backend configuration.
+
+    Interactive repair or benchmark jobs can bypass systemd entirely and touch
+    the same dedicated Twinr ChonkyDB data directory directly. Those jobs are
+    invisible to the existing foreign-consumer-by-base-url checks, so the
+    stabilizer also matches the derived dedicated data-path substring.
+    """
+
+    rules = [dict(rule) for rule in _DEFAULT_STALE_PROCESS_RULES]
+    data_dir = _dedicated_backend_data_dir(settings.backend_local_base_url)
+    if data_dir:
+        rules.append(
+            {
+                "label": "dedicated_backend_data_path_writer",
+                "minimum_elapsed_s": _DEDICATED_DATA_PATH_PROCESS_MIN_ELAPSED_S,
+                "required_substrings": (data_dir,),
+            }
+        )
+    return tuple(rules)
+
+
+def _dedicated_backend_data_dir(backend_local_base_url: str) -> str | None:
+    """Derive the standard dedicated backend data directory from the loopback URL."""
+
+    parsed = urlsplit(str(backend_local_base_url or "").strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        return None
+    return f"/home/thh/tessairact/state/offload/chonkydb/twinr_dedicated_{port}/data"
+
+
 _REMOTE_UNIT_STATE_CODE = """
 import json
 import os
@@ -341,15 +381,13 @@ def _command_excerpt(raw_value: object, *, limit: int = 240) -> str:
 
 
 def _collect_stale_process_targets() -> list[dict[str, object]]:
-    if not stale_process_rules or stale_process_min_elapsed_s <= 0:
+    if not stale_process_rules:
         return []
     processes, children = _list_process_table()
     matched_roots: dict[int, dict[str, object]] = {}
     for process in processes.values():
         args = str(process.get("args", "") or "")
         elapsed_s = int(process.get("elapsed_s", 0) or 0)
-        if elapsed_s < stale_process_min_elapsed_s:
-            continue
         for rule in stale_process_rules:
             label = str(rule.get("label", "") or "").strip()
             required = tuple(
@@ -357,9 +395,13 @@ def _collect_stale_process_targets() -> list[dict[str, object]]:
                 for item in rule.get("required_substrings", [])
                 if str(item).strip()
             )
+            minimum_elapsed_s = float(rule.get("minimum_elapsed_s", stale_process_min_elapsed_s) or 0.0)
+            if elapsed_s < minimum_elapsed_s:
+                continue
             if required and all(marker in args for marker in required):
                 matched_roots[int(process["pid"])] = {
                     "match_label": label,
+                    "minimum_elapsed_s": minimum_elapsed_s,
                     "required_substrings": required,
                 }
                 break
@@ -626,7 +668,7 @@ def stabilize_remote_chonkydb_host(
         user_unit_owner=settings.ssh.user,
         kill_switch_paths=_DEFAULT_KILLSWITCH_PATHS,
         property_assignments=_DEFAULT_CHONKY_PROPERTIES,
-        stale_process_rules=_DEFAULT_STALE_PROCESS_RULES,
+        stale_process_rules=build_stale_process_rules(settings),
         stale_process_min_elapsed_s=_DEFAULT_STALE_PROCESS_MIN_ELAPSED_S,
     )
     if settle_s > 0:

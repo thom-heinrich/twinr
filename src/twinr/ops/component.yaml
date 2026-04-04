@@ -122,7 +122,7 @@ files:
       - RemoteMemoryWatchdogSample
       - RemoteMemoryWatchdogSnapshot
   - path: remote_chonkydb_repair.py
-    role: Diagnose the public ChonkyDB URL against the dedicated backend service and optionally restart only the unhealthy backend layer
+    role: Diagnose the public ChonkyDB URL against the dedicated backend service, its loopback query surface, and active foreign consumers still pointed at the dedicated backend; only restart when the backend layer itself is the proven fault
   - path: remote_chonkydb_host_stabilizer.py
     role: Quiesce known shared-host system/user conflict units, stop non-Twinr workers pointed at the dedicated backend, bounded-kill proven stale benchmark workers outside systemd control, and raise backend CPU/IO weights for the dedicated ChonkyDB host
   - path: remote_prompt_current_head_repair.py

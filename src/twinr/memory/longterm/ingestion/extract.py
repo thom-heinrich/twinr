@@ -55,6 +55,19 @@ _ALLOWED_IDENTIFIER_CHARS = frozenset(
 )
 
 
+def _daypart_for_datetime(value: datetime) -> str:
+    """Map a localized timestamp into the shared daypart buckets."""
+
+    hour = value.hour
+    if 5 <= hour < 11:
+        return "morning"
+    if 11 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 22:
+        return "evening"
+    return "night"
+
+
 def _strip_control_chars(value: str) -> str:
     """Replace non-printable characters with spaces."""
     return "".join(char if char.isprintable() else " " for char in value)
@@ -268,6 +281,7 @@ class LongTermTurnExtractor:
             "raw_response": clean_response,
             "request_source": clean_source,
             "input_modality": clean_modality,
+            "daypart": _daypart_for_datetime(occurred),
             "structured_extraction_status": "disabled" if self.program is None else "ready",
         }
         if episode_attributes is not None:

@@ -22,6 +22,60 @@ from twinr.memory.longterm.storage.remote_state import (
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 
+_WARM_PROOF_READINESS_PROVES = (
+    "configured namespace remote-status reachability",
+    "configured namespace prompt/user/personality current-head readability",
+    "configured namespace object/conflict current-head readability",
+    "configured namespace graph current-view readability",
+    "configured namespace midterm current-head readability",
+)
+_WARM_PROOF_ARCHIVE_ONLY_PROVES = (
+    "configured namespace archive-head readability",
+)
+_WARM_PROOF_DOES_NOT_PROVE = (
+    "isolated namespace bootstrap on a fresh runtime root",
+    "fresh-namespace active-delta writes",
+    "retention execution against newly seeded data",
+    "fresh-reader item lookups after retention",
+)
+
+
+def _warm_result_proof_contract(
+    *,
+    probe_mode: str,
+    archive_checked: bool,
+    archive_safe: bool,
+    health_tier: str,
+) -> dict[str, object]:
+    """Describe exactly which remote-memory contract one warm probe proves."""
+
+    proved = list(_WARM_PROOF_READINESS_PROVES)
+    if archive_checked:
+        proved.extend(_WARM_PROOF_ARCHIVE_ONLY_PROVES)
+    contract_id = (
+        "configured_namespace_archive_inclusive_readiness"
+        if archive_checked
+        else "configured_namespace_current_only_readiness"
+    )
+    return {
+        "contract_id": contract_id,
+        "contract_kind": "warm_read_readiness",
+        "namespace_scope": "configured_runtime_namespace",
+        "mutation_scope": "read_only",
+        "probe_mode": probe_mode,
+        "archive_checked": archive_checked,
+        "archive_safe": archive_safe,
+        "health_tier": health_tier,
+        "operations_proved": proved,
+        "operations_not_proved": list(_WARM_PROOF_DOES_NOT_PROVE),
+        "summary": (
+            "Proves archive-inclusive warm reads for the configured runtime namespace."
+            if archive_checked
+            else "Proves current-state warm reads for the configured runtime namespace only."
+        ),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermRemoteWarmCheck:
     """Capture one required remote snapshot check with pointer/origin evidence."""
@@ -68,6 +122,16 @@ class LongTermRemoteWarmResult:
     archive_safe: bool = True
     health_tier: str = "ready"
 
+    def proof_contract(self) -> dict[str, object]:
+        """Return the exact operator-facing contract this warm probe attests."""
+
+        return _warm_result_proof_contract(
+            probe_mode=self.probe_mode,
+            archive_checked=self.archive_checked,
+            archive_safe=self.archive_safe,
+            health_tier=self.health_tier,
+        )
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe summary for ops artifacts."""
 
@@ -82,6 +146,7 @@ class LongTermRemoteWarmResult:
             "archive_checked": self.archive_checked,
             "archive_safe": self.archive_safe,
             "health_tier": self.health_tier,
+            "proof_contract": self.proof_contract(),
         }
 
 

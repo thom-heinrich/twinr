@@ -123,6 +123,27 @@ class ControllerMotionMixin(ControllerStateMixin):
             return self.config.reference_interval_s
         return max(0.001, min(observed_at - previous, self.config.reference_interval_s))
 
+    def _direct_hardware_tracking_target(self, *, target_pulse_width_us: int) -> int:
+        """Return one direct target for hardware-ramped visible tracking.
+
+        The Maestro can shape motion internally with speed and acceleration
+        limits. During active visible tracking, sending only tiny software
+        increments fights that hardware ramp and produces barely visible jitter.
+        """
+
+        checked_target_us = max(
+            self.config.safe_min_pulse_width_us,
+            min(self.config.safe_max_pulse_width_us, int(target_pulse_width_us)),
+        )
+        if self._last_physical_pulse_width_us is not None:
+            self._reset_motion_state(self._last_physical_pulse_width_us)
+        previous_commanded_pulse_width_us = self._last_commanded_pulse_width_us
+        if previous_commanded_pulse_width_us is not None and abs(
+            checked_target_us - previous_commanded_pulse_width_us
+        ) < self.config.min_command_delta_us:
+            return previous_commanded_pulse_width_us
+        return checked_target_us
+
     def _stabilize_visible_target_pulse_width(self, *, target_pulse_width_us: int, reason: str) -> int:
         """Latch visible targets so servo follow ignores millimeter re-justification."""
 
@@ -289,6 +310,13 @@ class ControllerMotionMixin(ControllerStateMixin):
             self.config.safe_min_pulse_width_us,
             min(self.config.safe_max_pulse_width_us, int(target_pulse_width_us)),
         )
+        if (
+            str(motion_profile or "").strip().lower() == "tracking"
+            and self._hardware_position_ramp_enabled()
+        ):
+            return self._direct_hardware_tracking_target(
+                target_pulse_width_us=checked_target_us,
+            )
         candidate_pulse_width_us = int(round(planned_pulse_width_us))
         previous_commanded_pulse_width_us = (
             self._last_commanded_pulse_width_us
@@ -377,6 +405,7 @@ class ControllerMotionMixin(ControllerStateMixin):
         *,
         observed_at: float | None,
         active: bool,
+        visible_target_present: bool,
         reason: str,
         confidence: float,
         target_center_x: float | None,
@@ -386,9 +415,9 @@ class ControllerMotionMixin(ControllerStateMixin):
         released_pulse_width_us = self._released_pulse_width_us
         if released_pulse_width_us is None:
             return None
-        if self._continuous_planner is not None and active:
-            # A visible continuous-servo follow target must not stay parked on
-            # the last released pulse; that creates bursty move/release jitter.
+        if active and visible_target_present:
+            # A live visible target must re-engage the physical servo instead of
+            # staying parked on one previously released off-center pulse.
             self._released_pulse_width_us = None
             self._settled_since = None
             return None
@@ -471,6 +500,8 @@ class ControllerMotionMixin(ControllerStateMixin):
         self,
         *,
         observed_at: float | None,
+        active: bool,
+        visible_target_present: bool,
         target_pulse_width_us: int,
         commanded_pulse_width_us: int,
     ) -> bool:
@@ -479,6 +510,7 @@ class ControllerMotionMixin(ControllerStateMixin):
         if (
             self._continuous_planner is not None
             or observed_at is None
+            or (active and visible_target_present)
             or self.config.settled_release_s <= 0.0
             or self._last_commanded_pulse_width_us is None
         ):

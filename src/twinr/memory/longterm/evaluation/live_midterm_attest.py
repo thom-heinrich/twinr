@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
 import json
 import os
 
@@ -194,7 +193,7 @@ class LiveMidtermAttestResult:
         """Hydrate one stored attestation payload."""
 
         raw_seed_turns = payload.get("seed_turns")
-        seed_turns = ()
+        seed_turns: tuple[LiveMidtermSeedTurn, ...] = ()
         if isinstance(raw_seed_turns, list):
             seed_turns = tuple(
                 LiveMidtermSeedTurn.from_dict(dict(item))

@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-
 def build_conversation_lab_panel_context(
     *,
     state: dict[str, object] | None,
@@ -12,7 +9,7 @@ def build_conversation_lab_panel_context(
     """Return template-ready context for the interactive conversation-lab tab."""
 
     normalized_state = dict(state or {})
-    sessions = tuple(normalized_state.get("sessions", ()) or ())
+    sessions = _mapping_tuple(normalized_state.get("sessions"))
     active_session = normalized_state.get("active_session")
     missing_session = bool(normalized_state.get("missing_session", False))
 
@@ -29,12 +26,12 @@ def build_conversation_lab_panel_context(
             "status": "muted",
         }
     else:
-        turns = tuple(active_session.get("turns", ()) or ()) if isinstance(active_session, dict) else ()
-        latest_turn = turns[-1] if turns else {}
+        active_turns = _mapping_tuple(active_session.get("turns")) if isinstance(active_session, dict) else ()
+        latest_turn = active_turns[-1] if active_turns else {}
         latest_status = str(latest_turn.get("status", "ok") if isinstance(latest_turn, dict) else "ok")
         status = {
             "label": "Live session",
-            "detail": f"{len(turns)} stored turn(s) in this portal conversation.",
+            "detail": f"{len(active_turns)} stored turn(s) in this portal conversation.",
             "status": "ok" if latest_status == "ok" else "warn",
         }
 
@@ -43,7 +40,7 @@ def build_conversation_lab_panel_context(
     turns: tuple[dict[str, object], ...] = ()
     if isinstance(active_session, dict):
         active_session_id = str(active_session.get("session_id", "") or "")
-        turns = tuple(active_session.get("turns", ()) or ())
+        turns = _mapping_tuple(active_session.get("turns"))
         active_session_rows = (
             _detail_item("Title", active_session.get("title") or "Portal Conversation", wide=True),
             _detail_item("Created", active_session.get("created_at") or "—", copy=True),
@@ -56,7 +53,7 @@ def build_conversation_lab_panel_context(
             "session_id": str(item.get("session_id", "") or ""),
             "title": str(item.get("title", "") or "Portal Conversation"),
             "updated_at": str(item.get("updated_at", "") or ""),
-            "turn_count": int(item.get("turn_count", 0) or 0),
+            "turn_count": _coerce_non_negative_int(item.get("turn_count")),
             "href": f"/ops/debug?tab=conversation_lab&lab_session={item.get('session_id', '')}",
             "active": str(item.get("session_id", "") or "") == active_session_id,
             "status": str(item.get("status", "muted") or "muted"),
@@ -94,3 +91,26 @@ def _detail_item(
         "copy": copy,
         "wide": wide,
     }
+
+
+def _mapping_tuple(value: object) -> tuple[dict[str, object], ...]:
+    """Return only mapping-shaped items from one optional sequence payload."""
+
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, dict))
+
+
+def _coerce_non_negative_int(value: object) -> int:
+    """Return one non-negative integer-like display count."""
+
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return 0

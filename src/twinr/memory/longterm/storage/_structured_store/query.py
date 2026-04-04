@@ -328,13 +328,41 @@ class StructuredStoreQueryMixin:
         return informative or normalized
 
     def _semantic_query_terms(self, query_terms: Iterable[str]) -> set[str]:
-        """Return topic-bearing terms after removing memory-state-only vocabulary."""
+        """Return topic-bearing terms after removing state-only and noisy numeric cues.
 
-        return {
+        Queries that mix words and numbers should not recall episodic objects on
+        number overlap alone. Otherwise distractor memories such as "topic 14"
+        or "topic 27" leak into unrelated math/time-conversion questions that
+        merely happen to contain those digits.
+        """
+
+        normalized = {
+            str(term).strip()
+            for term in query_terms
+            if isinstance(term, str) and str(term).strip()
+        }
+        semantic_terms = {
             term
-            for term in self._query_match_terms(query_terms)
+            for term in normalized
             if term not in _OBJECT_STATE_QUERY_TERMS
         }
+        if not semantic_terms:
+            return set()
+        informative_alpha_terms = {
+            term
+            for term in semantic_terms
+            if not term.isdigit() and len(term) >= 4
+        }
+        if informative_alpha_terms:
+            return informative_alpha_terms
+        alpha_terms = {
+            term
+            for term in semantic_terms
+            if not term.isdigit()
+        }
+        if alpha_terms:
+            return alpha_terms
+        return self._query_match_terms(semantic_terms)
 
     def _has_query_overlap(
         self,
@@ -352,6 +380,9 @@ class StructuredStoreQueryMixin:
             return True
         for query_term in informative_query_terms:
             for document_term in informative_document_terms:
+                shorter_term = query_term if len(query_term) <= len(document_term) else document_term
+                if len(shorter_term) < 4:
+                    continue
                 if query_term in document_term or document_term in query_term:
                     return True
         return False
@@ -414,10 +445,11 @@ class StructuredStoreQueryMixin:
             ]
             if conversation_matches:
                 return tuple(conversation_matches[: max(1, limit)])
-        query_terms = self._query_match_terms(retrieval_terms(query_text))
+        raw_query_terms = retrieval_terms(query_text)
+        query_terms = self._query_match_terms(raw_query_terms)
         if not query_terms:
             return tuple(selected[: max(1, limit)])
-        semantic_query_terms = self._semantic_query_terms(query_terms)
+        semantic_query_terms = self._semantic_query_terms(raw_query_terms)
         topic_terms_by_id = {
             item.memory_id: tuple(retrieval_terms(self._object_semantic_search_text(item)))
             for item in selected
@@ -446,11 +478,12 @@ class StructuredStoreQueryMixin:
                 if expanded_matches:
                     return tuple(expanded_matches[: max(1, limit)])
                 return tuple(semantic_matches[: max(1, limit)])
+        fallback_query_terms = semantic_query_terms or query_terms
         filtered = [
             item
             for item in selected
             if self._has_query_overlap(
-                query_terms=query_terms,
+                query_terms=fallback_query_terms,
                 document_terms=retrieval_terms(self._object_search_text(item)),
             )
         ]

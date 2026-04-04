@@ -97,6 +97,18 @@ class LongTermTurnExtractorTests(unittest.TestCase):
         self.assertEqual(result.episode.attributes["request_source"], "whatsapp")
         self.assertEqual(result.episode.attributes["input_modality"], "text")
 
+    def test_episode_attributes_include_local_daypart(self) -> None:
+        extractor = make_test_extractor()
+
+        result = extractor.extract_conversation_turn(
+            transcript="Nach dem Frühstück frage ich meist nach dem Wetter.",
+            response="Ich merke mir die Morgenroutine.",
+            occurred_at=datetime(2026, 3, 25, 8, 5, tzinfo=ZoneInfo("Europe/Berlin")),
+            turn_id="turn:morning-weather",
+        )
+
+        self.assertEqual(result.episode.attributes["daypart"], "morning")
+
 
 if __name__ == "__main__":
     unittest.main()

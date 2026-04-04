@@ -2380,6 +2380,33 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertIsNone(context.episodic_context)
 
+    def test_provider_context_ignores_numeric_distractor_topic_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=3,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript="I talked about distractor topic 14 and a routine unrelated to buttons.",
+                response="Twinr answered distractor topic 14 in a calm way.",
+            )
+            service.enqueue_conversation_turn(
+                transcript="I talked about distractor topic 27 and a routine unrelated to buttons.",
+                response="Twinr answered distractor topic 27 in a calm way.",
+            )
+            service.flush(timeout_s=2.0)
+
+            context = service.build_provider_context("Was ist 27 mal 14?")
+            service.shutdown()
+
+        self.assertIsNone(context.episodic_context)
+
     def test_subtext_context_surfaces_personalization_without_explicit_memory_language(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(

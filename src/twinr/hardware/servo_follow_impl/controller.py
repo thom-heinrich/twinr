@@ -179,6 +179,7 @@ class AttentionServoController(ControllerExitOnlyMixin):
                 confidence=checked_confidence,
                 target_center_x=target_center_x,
             )
+        self._refresh_last_physical_pulse_width_from_writer()
         self._refresh_runtime_state_from_store(observed_at=checked_at)
         if self._startup_hold_until_armed and self._continuous_planner is not None:
             self._apply_manual_hold(observed_at=checked_at)
@@ -292,6 +293,7 @@ class AttentionServoController(ControllerExitOnlyMixin):
         released_decision = self._maybe_hold_released_target(
             observed_at=checked_at,
             active=effective_active,
+            visible_target_present=checked_visible_target_present,
             reason=reason,
             confidence=checked_confidence,
             target_center_x=target_center_x,
@@ -324,6 +326,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
             return released_exit_decision
         if self._maybe_release_settled_target(
             observed_at=checked_at,
+            active=effective_active,
+            visible_target_present=checked_visible_target_present,
             target_pulse_width_us=target_pulse_width_us,
             commanded_pulse_width_us=commanded_pulse_width_us,
         ):
@@ -355,7 +359,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
                         observed_at=checked_at,
                     )
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
-                self._last_physical_pulse_width_us = commanded_pulse_width_us
+                if not self._writer_reports_live_position():
+                    self._last_physical_pulse_width_us = commanded_pulse_width_us
                 self._persist_runtime_state(observed_at=checked_at)
             self._last_update_at = checked_at
         except Exception as exc:

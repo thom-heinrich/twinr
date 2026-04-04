@@ -756,6 +756,41 @@ def update_attention_servo_follow(
     if controller is None:
         return
 
+    inactive_decision = AttentionServoDecision(
+        observed_at=observed_at,
+        active=False,
+        reason="ignored_non_authoritative_source",
+        confidence=0.0 if attention_target is None else attention_target.confidence,
+        target_center_x=None if attention_target is None else attention_target.target_center_x,
+    )
+    if not attention_servo_source_is_authoritative(coordinator, source=source):
+        record_attention_servo_follow_if_changed(
+            coordinator,
+            source=source,
+            observed_at=observed_at,
+            attention_target=attention_target,
+            decision=inactive_decision,
+        )
+        try:
+            record_attention_servo_forensic_tick(
+                coordinator,
+                source=source,
+                observed_at=observed_at,
+                camera_snapshot=camera_snapshot,
+                attention_target=attention_target,
+                attention_target_debug=attention_target_debug,
+                decision=inactive_decision,
+            )
+        except Exception as exc:
+            _record_fault_safe(
+                coordinator,
+                event="proactive_attention_servo_forensic_tick_failed",
+                message="Failed to record one forensic attention-servo tick for a non-authoritative source.",
+                error=exc,
+                data={"observed_at": observed_at, "source": source},
+            )
+        return
+
     block_reason = _camera_attention_block_reason(
         coordinator,
         observed_at=observed_at,
@@ -799,40 +834,6 @@ def update_attention_servo_follow(
             )
         return
 
-    inactive_decision = AttentionServoDecision(
-        observed_at=observed_at,
-        active=False,
-        reason="ignored_non_authoritative_source",
-        confidence=0.0 if attention_target is None else attention_target.confidence,
-        target_center_x=None if attention_target is None else attention_target.target_center_x,
-    )
-    if not attention_servo_source_is_authoritative(coordinator, source=source):
-        record_attention_servo_follow_if_changed(
-            coordinator,
-            source=source,
-            observed_at=observed_at,
-            attention_target=attention_target,
-            decision=inactive_decision,
-        )
-        try:
-            record_attention_servo_forensic_tick(
-                coordinator,
-                source=source,
-                observed_at=observed_at,
-                camera_snapshot=camera_snapshot,
-                attention_target=attention_target,
-                attention_target_debug=attention_target_debug,
-                decision=inactive_decision,
-            )
-        except Exception as exc:
-            _record_fault_safe(
-                coordinator,
-                event="proactive_attention_servo_forensic_tick_failed",
-                message="Failed to record one forensic attention-servo tick for a non-authoritative source.",
-                error=exc,
-                data={"observed_at": observed_at, "source": source},
-            )
-        return
     try:
         decision = controller.update(
             observed_at=observed_at,
