@@ -6,7 +6,7 @@
 *TWINR* is an AI Agent for senior citizens; fully open-source, aiming to make AI accessible to people who would really profit of it. 
 *TWINR is heavy WIP, but already working if you do some tinkering. I would love to have new contributors*
 
-![twinr-prototype-nice](twinr-prototype-nice.png)
+![twinr-prototype-nice](twinr-product-image.png)
 (You can find the completely unedited picture here --> twinr-prototype.jpeg)
 
 **WHY**
@@ -55,10 +55,6 @@ Twinr is not just a voice wrapper. This repo spans embodied interaction, multimo
 - Integrated autonomous indoor drone based on Crazyflie for wellbeing checks and other supportive tasks
 
 ---
-
-![twinr-design](twinr_design.jpeg)
-
-*This is how I imagine TWINR to look in the second or third iteration*
 
 **PROTOTYPE ASSETS**
 
