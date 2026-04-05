@@ -1,6 +1,5 @@
 """Mutation, snapshot-write, and review flows for structured memory state."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 

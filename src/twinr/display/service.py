@@ -49,9 +49,15 @@ from twinr.display.render_state import DisplayRenderStateStore
 from twinr.display.reserve_bus import resolve_display_reserve_bus
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
 from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
+from twinr.display.status_forensics import (
+    DisplayStatusForensics,
+    DisplaySystemStatusDecision,
+    build_display_status_forensics,
+    build_system_status_decision,
+)
+from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.health import (
     TwinrSystemHealth,
-    assess_memory_pressure_status,
     collect_system_health,
 )
 
@@ -80,6 +86,8 @@ _IDLE_POLL_MAX_S = 1.0
 _ACTIVE_STATUS_SNAPSHOT_STALE_AFTER_S = 20.0
 _WAVESHARE_MAINTENANCE_REFRESH_S = 23 * 60 * 60
 _TELEMETRY_TOKEN_MAX_LEN = 48
+_SYSTEM_STATUS_WARN_RECOVERY_HOLD_S = 5 * 60.0
+_SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S = 10 * 60.0
 _UNSET = object()
 
 _LOGGER = logging.getLogger(__name__)
@@ -148,6 +156,7 @@ class TwinrStatusDisplayLoop:
     respeaker_hci_store: DisplayReSpeakerHciStore | None = None
     debug_signal_store: DisplayDebugSignalStore | None = None
     render_state_store: DisplayRenderStateStore | None = None
+    event_store: TwinrOpsEventStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -174,6 +183,10 @@ class TwinrStatusDisplayLoop:
     _systemd_watchdog_interval_s: float | None = field(default=None, init=False, repr=False)
     _last_systemd_watchdog_at: float = field(default=0.0, init=False, repr=False)
     _systemd_ready_sent: bool = field(default=False, init=False, repr=False)
+    _last_status_forensics: DisplayStatusForensics | None = field(default=None, init=False, repr=False)
+    _visible_system_status_decision: DisplaySystemStatusDecision | None = field(default=None, init=False, repr=False)
+    _pending_system_recovery_from_status: str | None = field(default=None, init=False, repr=False)
+    _pending_system_recovery_since_monotonic_s: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._systemd_notify_socket = self._resolve_systemd_notify_socket()
@@ -205,6 +218,7 @@ class TwinrStatusDisplayLoop:
             respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
             debug_signal_store=DisplayDebugSignalStore.from_config(config),
             render_state_store=DisplayRenderStateStore.from_config(config),
+            event_store=TwinrOpsEventStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -226,12 +240,14 @@ class TwinrStatusDisplayLoop:
                 status = self._effective_runtime_status(snapshot, stale=snapshot_stale)
                 health = self._current_health(snapshot)
                 internet_ok = self._internet_ok()
+                system_decision = self._system_status_decision(snapshot, health)
                 headline, details = self._build_status_content(
                     snapshot,
                     status=status,
                     stale=snapshot_stale,
                     health=health,
                     internet_ok=internet_ok,
+                    system_decision=system_decision,
                 )
                 state_fields = self._build_state_fields(
                     snapshot,
@@ -239,6 +255,7 @@ class TwinrStatusDisplayLoop:
                     stale=snapshot_stale,
                     health=health,
                     internet_ok=internet_ok,
+                    system_decision=system_decision,
                 )
                 log_sections = self._build_log_sections(
                     snapshot,
@@ -246,6 +263,7 @@ class TwinrStatusDisplayLoop:
                     stale=snapshot_stale,
                     health=health,
                     internet_ok=internet_ok,
+                    system_decision=system_decision,
                 )
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue(snapshot=snapshot)
@@ -269,6 +287,15 @@ class TwinrStatusDisplayLoop:
                     service_connect_cue=service_connect_cue,
                     presentation_cue=presentation_cue,
                     debug_signals=debug_signals,
+                )
+                status_forensics = self._status_forensics_from_fields(
+                    snapshot=snapshot,
+                    health=health,
+                    status=status,
+                    headline=headline,
+                    state_fields=state_fields,
+                    snapshot_stale=snapshot_stale,
+                    system_decision=system_decision,
                 )
 
                 if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
@@ -303,7 +330,9 @@ class TwinrStatusDisplayLoop:
                             snapshot=snapshot,
                             snapshot_stale=snapshot_stale,
                             health=health,
+                            status_forensics=status_forensics,
                         )
+                        self._emit_status_forensics_transition(status_forensics)
                         self._write_heartbeat(status, phase="idle", force=True)
                         if not self._systemd_ready_sent:
                             self._systemd_notify("READY=1")
@@ -339,6 +368,7 @@ class TwinrStatusDisplayLoop:
         stale: bool = False,
         health: TwinrSystemHealth | None | object = _UNSET,
         internet_ok: bool | None | object = _UNSET,
+        system_decision: DisplaySystemStatusDecision | None = None,
     ) -> tuple[str, tuple[str, ...]]:
         status = status or self._snapshot_status(snapshot)
         note = "Status veraltet" if stale else None
@@ -351,7 +381,12 @@ class TwinrStatusDisplayLoop:
         )
         details = self._detail_lines(
             note,
-            *self._health_detail_values(snapshot, health=health, internet_ok=internet_ok),
+            *self._health_detail_values(
+                snapshot,
+                health=health,
+                internet_ok=internet_ok,
+                system_decision=system_decision,
+            ),
         )
         if status == "waiting":
             return "Waiting", details
@@ -400,11 +435,12 @@ class TwinrStatusDisplayLoop:
         *,
         health: TwinrSystemHealth | None,
         internet_ok: bool | None,
+        system_decision: DisplaySystemStatusDecision | None = None,
     ) -> tuple[str, str, str, str]:
         return (
             self._internet_footer_label(internet_ok),
             self._ai_footer_label(snapshot, health, internet_ok),
-            self._system_footer_label(snapshot, health),
+            self._system_footer_label(snapshot, health, system_decision=system_decision),
             f"Zeit {self._clock_text()}",
         )
 
@@ -416,6 +452,7 @@ class TwinrStatusDisplayLoop:
         stale: bool = False,
         health: TwinrSystemHealth | None | object = _UNSET,
         internet_ok: bool | None | object = _UNSET,
+        system_decision: DisplaySystemStatusDecision | None = None,
     ) -> tuple[tuple[str, str], ...]:
         status = status or self._snapshot_status(snapshot)
         note = "Status veraltet" if stale else None
@@ -430,7 +467,7 @@ class TwinrStatusDisplayLoop:
             ("Status", self._runtime_state_value(snapshot, status=status, stale=stale)),
             ("Internet", self._internet_state_value(internet_ok)),
             ("AI", self._ai_state_value(snapshot, health, internet_ok)),
-            ("System", self._system_state_value(snapshot, health)),
+            ("System", self._system_state_value(snapshot, health, system_decision=system_decision)),
         ]
         state_fields.extend(self._respeaker_state_fields())
         state_fields.append(("Zeit", self._clock_text()))
@@ -460,6 +497,7 @@ class TwinrStatusDisplayLoop:
         stale: bool = False,
         health: TwinrSystemHealth | None | object = _UNSET,
         internet_ok: bool | None | object = _UNSET,
+        system_decision: DisplaySystemStatusDecision | None = None,
     ) -> LogSections:
         if self._display_layout() != "debug_log":
             return ()
@@ -473,7 +511,7 @@ class TwinrStatusDisplayLoop:
             runtime_status=self._runtime_state_value(snapshot, status=status, stale=stale),
             internet_state=self._internet_state_value(internet_ok),
             ai_state=self._ai_state_value(snapshot, health, internet_ok),
-            system_state=self._system_state_value(snapshot, health),
+            system_state=self._system_state_value(snapshot, health, system_decision=system_decision),
             clock_text=self._clock_text(),
             health=health,
             stale=stale,
@@ -667,36 +705,105 @@ class TwinrStatusDisplayLoop:
             return "Achtung"
         return "ok"
 
-    def _system_footer_label(self, snapshot: RuntimeSnapshot | None, health: TwinrSystemHealth | None) -> str:
-        return f"System {self._system_state_value(snapshot, health)}"
+    def _system_footer_label(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+        *,
+        system_decision: DisplaySystemStatusDecision | None = None,
+    ) -> str:
+        return f"System {self._system_state_value(snapshot, health, system_decision=system_decision)}"
 
-    def _system_state_value(self, snapshot: RuntimeSnapshot | None, health: TwinrSystemHealth | None) -> str:
-        snapshot_status = self._snapshot_status(snapshot)
-        snapshot_error = self._snapshot_error_message(snapshot)
-        runtime_error = self._compact_text(getattr(health, "runtime_error", None))
-        if snapshot_status == "error" or snapshot_error or runtime_error:
-            return "Fehler"
-        if health is None:
-            return "?"
+    def _system_state_value(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+        *,
+        system_decision: DisplaySystemStatusDecision | None = None,
+    ) -> str:
+        return self._resolve_system_status_decision(
+            snapshot,
+            health,
+            system_decision=system_decision,
+        ).label
 
-        health_status = self._compact_text(getattr(health, "status", None)).lower()
-        cpu_temperature_c = getattr(health, "cpu_temperature_c", None)
-        temperature_warn = cpu_temperature_c is not None and cpu_temperature_c >= 72
-        if health_status == "fail":
-            return "Fehler"
-        if not self._service_running(health, "conversation_loop"):
-            return "Achtung"
-        memory_status = assess_memory_pressure_status(
-            memory_available_mb=getattr(health, "memory_available_mb", None),
-            memory_used_percent=getattr(health, "memory_used_percent", None),
-        )
-        if memory_status in {"warn", "fail"}:
-            return "Achtung"
-        if getattr(health, "disk_used_percent", None) is not None and health.disk_used_percent >= 85:
-            return "Achtung"
-        if health_status == "warn" and not temperature_warn:
-            return "Achtung"
-        return "ok"
+    def _resolve_system_status_decision(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+        *,
+        system_decision: DisplaySystemStatusDecision | None = None,
+    ) -> DisplaySystemStatusDecision:
+        if system_decision is not None:
+            return system_decision
+        return self._system_status_decision(snapshot, health)
+
+    def _system_status_decision(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+    ) -> DisplaySystemStatusDecision:
+        raw_decision = build_system_status_decision(snapshot, health)
+        return self._stabilize_system_status_decision(raw_decision)
+
+    def _stabilize_system_status_decision(
+        self,
+        raw_decision: DisplaySystemStatusDecision,
+    ) -> DisplaySystemStatusDecision:
+        """Keep visible operator severity calm by holding recoveries until they stay stable."""
+
+        visible_decision = self._visible_system_status_decision
+        if visible_decision is None:
+            self._visible_system_status_decision = raw_decision
+            self._clear_pending_system_recovery()
+            return raw_decision
+
+        visible_severity = self._system_status_severity(visible_decision.status)
+        raw_severity = self._system_status_severity(raw_decision.status)
+        if raw_severity >= visible_severity:
+            self._visible_system_status_decision = raw_decision
+            self._clear_pending_system_recovery()
+            return raw_decision
+
+        hold_s = self._system_status_recovery_hold_s(visible_decision.status)
+        if hold_s <= 0.0:
+            self._visible_system_status_decision = raw_decision
+            self._clear_pending_system_recovery()
+            return raw_decision
+
+        now_monotonic = time.monotonic()
+        if self._pending_system_recovery_from_status != visible_decision.status:
+            self._pending_system_recovery_from_status = visible_decision.status
+            self._pending_system_recovery_since_monotonic_s = now_monotonic
+            return visible_decision
+
+        recovery_age_s = now_monotonic - self._pending_system_recovery_since_monotonic_s
+        if recovery_age_s < hold_s:
+            return visible_decision
+
+        self._visible_system_status_decision = raw_decision
+        self._clear_pending_system_recovery()
+        return raw_decision
+
+    def _clear_pending_system_recovery(self) -> None:
+        self._pending_system_recovery_from_status = None
+        self._pending_system_recovery_since_monotonic_s = 0.0
+
+    def _system_status_severity(self, status: str | None) -> int:
+        normalized = (self._compact_text(status).lower() if status is not None else "") or ""
+        if normalized == "error":
+            return 2
+        if normalized in {"warn", "unknown"}:
+            return 1
+        return 0
+
+    def _system_status_recovery_hold_s(self, status: str | None) -> float:
+        normalized = (self._compact_text(status).lower() if status is not None else "") or ""
+        if normalized == "error":
+            return _SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S
+        if normalized == "warn":
+            return _SYSTEM_STATUS_WARN_RECOVERY_HOLD_S
+        return 0.0
 
     def _internet_footer_label(self, internet_ok: bool | None) -> str:
         return f"Internet {self._internet_state_value(internet_ok)}"
@@ -735,15 +842,6 @@ class TwinrStatusDisplayLoop:
             return f"{raw_status.title()} (stale)"
         return base
 
-    def _service_running(self, health: TwinrSystemHealth | None, key: str) -> bool:
-        if health is None:
-            return False
-        services = getattr(health, "services", ()) or ()
-        for service in services:
-            if getattr(service, "key", None) == key:
-                return bool(getattr(service, "running", False))
-        return True
-
     def _save_render_state(
         self,
         *,
@@ -754,6 +852,7 @@ class TwinrStatusDisplayLoop:
         snapshot: RuntimeSnapshot | None,
         snapshot_stale: bool,
         health: TwinrSystemHealth | None,
+        status_forensics: DisplayStatusForensics | None,
     ) -> None:
         store = self.render_state_store
         if store is None:
@@ -770,6 +869,9 @@ class TwinrStatusDisplayLoop:
                 snapshot_stale=snapshot_stale,
                 snapshot_error=self._snapshot_error_message(snapshot),
                 runtime_error=self._compact_text(getattr(health, "runtime_error", None)),
+                operator_status=None if status_forensics is None else status_forensics.operator_status,
+                operator_reason_codes=() if status_forensics is None else status_forensics.reason_codes,
+                operator_reason_detail=None if status_forensics is None else status_forensics.reason_detail,
             )
         except Exception as exc:
             self._emit_error("display_render_state_save_failed", exc)
@@ -982,7 +1084,7 @@ class TwinrStatusDisplayLoop:
             return base_interval
         if presentation_cue is not None:
             return base_interval
-        if ticker_text:
+        if ticker_text and self._supports_periodic_status_repaint():
             return base_interval
         if normalized_status == "waiting" and self._supports_idle_waiting_animation():
             return base_interval
@@ -1014,7 +1116,7 @@ class TwinrStatusDisplayLoop:
     def _display_animation_frame(self, status: str) -> int:
         if self._display_layout() != "default":
             return 0
-        if self._compact_text(status).lower() == "waiting" and not self._supports_idle_waiting_animation():
+        if not self._supports_status_animation(status):
             return 0
         return self._animation_frame(status)
 
@@ -1037,6 +1139,59 @@ class TwinrStatusDisplayLoop:
         except Exception as exc:
             self._emit_error("display_idle_waiting_animation_capability_failed", exc)
             return False
+
+    def _supports_status_animation(self, status: str) -> bool:
+        capability = cast(
+            Callable[[str], object] | None,
+            getattr(self.display, "supports_status_animation", None),
+        )
+        if callable(capability):
+            try:
+                # Pylint does not narrow the getattr()-resolved optional capability
+                # through callable(); runtime already guards that contract above.
+                # pylint: disable=not-callable
+                return bool(capability(status))
+            except Exception as exc:
+                self._emit_error("display_status_animation_capability_failed", exc)
+                return False
+        if self._compact_text(status).lower() == "waiting":
+            return self._supports_idle_waiting_animation()
+        return self._display_layout() == "default"
+
+    def _supports_periodic_status_repaint(self) -> bool:
+        capability = cast(
+            Callable[[], object] | None,
+            getattr(self.display, "supports_periodic_status_repaint", None),
+        )
+        if callable(capability):
+            try:
+                # Pylint does not narrow the getattr()-resolved optional capability
+                # through callable(); runtime already guards that contract above.
+                # pylint: disable=not-callable
+                return bool(capability())
+            except Exception as exc:
+                self._emit_error("display_periodic_status_repaint_capability_failed", exc)
+                return False
+        return True
+
+    def _signature_details(self, details: tuple[str, ...]) -> tuple[str, ...]:
+        if self._supports_periodic_status_repaint():
+            return details
+        return tuple("Zeit" if detail.startswith("Zeit ") else detail for detail in details)
+
+    def _signature_state_fields(
+        self,
+        state_fields: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[str, str], ...]:
+        if self._supports_periodic_status_repaint():
+            return state_fields
+        normalized_fields: list[tuple[str, str]] = []
+        for label, value in state_fields:
+            if label == "Zeit":
+                normalized_fields.append((label, "periodic_hidden"))
+                continue
+            normalized_fields.append((label, value))
+        return tuple(normalized_fields)
 
     def _render_signature(
         self,
@@ -1066,13 +1221,14 @@ class TwinrStatusDisplayLoop:
         ).signature()
         presentation_signature = presentation_cue.signature() if presentation_cue is not None else None
         presentation_bucket = presentation_cue.transition_bucket() if presentation_cue is not None else None
+        ticker_signature = ticker_text if self._supports_periodic_status_repaint() else None
         return (
             layout_mode,
             status,
             headline,
-            ticker_text,
-            details,
-            state_fields,
+            ticker_signature,
+            self._signature_details(details),
+            self._signature_state_fields(state_fields),
             log_sections,
             animation_frame,
             cue_signature,
@@ -1184,6 +1340,54 @@ class TwinrStatusDisplayLoop:
         layout_mode = self._display_layout()
         presentation_signature = presentation_cue.telemetry_signature() if presentation_cue is not None else None
         return (layout_mode, status, presentation_signature)
+
+    def _status_forensics_from_fields(
+        self,
+        *,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+        status: str,
+        headline: str,
+        state_fields: tuple[tuple[str, str], ...],
+        snapshot_stale: bool,
+        system_decision: DisplaySystemStatusDecision | None = None,
+    ) -> DisplayStatusForensics:
+        return build_display_status_forensics(
+            snapshot=snapshot,
+            health=health,
+            runtime_status=status,
+            headline=headline,
+            system_label=self._state_field_value(state_fields, "System"),
+            ai_label=self._state_field_value(state_fields, "AI"),
+            internet_label=self._state_field_value(state_fields, "Internet"),
+            snapshot_stale=snapshot_stale,
+            system_decision=system_decision,
+        )
+
+    def _state_field_value(self, state_fields: tuple[tuple[str, str], ...], label: str) -> str:
+        for current_label, value in state_fields:
+            if current_label == label:
+                return self._compact_text(value)
+        return ""
+
+    def _emit_status_forensics_transition(self, current: DisplayStatusForensics) -> None:
+        previous = self._last_status_forensics
+        if previous is not None and previous.transition_signature() == current.transition_signature():
+            return
+        self._last_status_forensics = current
+        self._safe_emit(current.telemetry_line(previous))
+        store = self.event_store
+        if store is None:
+            return
+        try:
+            store.append(
+                event="display_operator_status_transition",
+                message=current.event_message(previous),
+                level=current.event_level(),
+                data=current.event_data(previous),
+            )
+        except Exception:
+            _LOGGER.warning("Failed to append display operator status transition event.", exc_info=True)
 
     def _active_face_cue(self, *, snapshot: RuntimeSnapshot | None = None) -> DisplayFaceCue | None:
         if self._display_layout() != "default":

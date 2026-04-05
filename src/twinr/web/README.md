@@ -12,7 +12,7 @@ templates and CSS that power the operator dashboard.
 - enforce the portal's fail-closed local-only default plus the managed-sign-in LAN mode that activates only when `TWINR_WEB_ALLOW_REMOTE=1`, including first-login password change for the permanent Pi web service
 - keep state-changing form requests fail-closed while still accepting trusted same-origin browser posts behind an HTTPS reverse proxy
 - render the ops health page with the persisted remote-memory watchdog state
-- render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
+- render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, streaming-loop memory-owner attribution, LLM, events, hardware, and raw local artifacts
 - render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
 - run the interactive `/ops/debug` Conversation Lab tab that sends a real text turn through Twinr's provider/tool/memory path and persists human-readable routing, tool, retrieval, and memory-write traces
 - render Conversation Lab retrieval traces from the actual tool-facing long-term context built during the real turn instead of launching a second independent operator-memory search just to paint the panel

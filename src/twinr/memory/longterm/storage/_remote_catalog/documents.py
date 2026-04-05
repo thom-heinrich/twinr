@@ -1045,15 +1045,22 @@ class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
         self,
         payload: Mapping[str, object],
     ) -> bool:
-        """Return whether a cached object payload came from a lossy compat projection."""
+        """Return whether a cached object payload came from a lossy compat projection.
+
+        ``remote_catalog_entry_compatibility`` marks payloads reconstructed from
+        the current catalog entry projection. For objects/archive those
+        projections are now the intended fresh-reader source of truth during
+        projection-complete writes, so they must remain eligible for reuse even
+        when no exact item ``document_id`` is available yet. The truly lossy
+        shape is the older metadata-only recovery path, which lacks the
+        selection projection and still requires a later exact document read to
+        recover richer fields.
+        """
 
         raw_attributes = payload.get("attributes")
         if not isinstance(raw_attributes, Mapping):
             return False
-        return bool(
-            raw_attributes.get("remote_catalog_entry_compatibility")
-            or raw_attributes.get("legacy_remote_catalog_metadata_only")
-        )
+        return bool(raw_attributes.get("legacy_remote_catalog_metadata_only"))
 
     def _build_compat_object_payload_from_metadata(
         self,

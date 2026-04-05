@@ -15,6 +15,7 @@ from twinr.hardware.camera_ai.mediapipe_runtime import (
     MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR,
     MediaPipeTaskRuntime,
 )
+from twinr.hardware.camera_ai.native_heap import NativeHeapTrimmer
 from twinr.hardware.camera_ai.fine_hand_gestures import (
     combine_builtin_and_custom_gesture_choice as _combine_builtin_and_custom_gesture_choice,
     combine_task_specific_custom_gesture_choice as _combine_task_specific_custom_gesture_choice,
@@ -73,6 +74,72 @@ class _FakeImageArray:
 
 
 class MediaPipeVisionTests(unittest.TestCase):
+    def test_native_heap_trimmer_respects_interval(self) -> None:
+        trim_calls: list[int] = []
+        now = {"value": 0.0}
+
+        trimmer = NativeHeapTrimmer(
+            interval_s=1.0,
+            trim_fn=lambda pad: trim_calls.append(pad) or 1,
+            monotonic_fn=lambda: now["value"],
+        )
+
+        self.assertTrue(trimmer.maybe_trim())
+        now["value"] = 0.4
+        self.assertFalse(trimmer.maybe_trim())
+        now["value"] = 1.1
+        self.assertTrue(trimmer.maybe_trim())
+
+        self.assertEqual(trim_calls, [0, 0])
+        self.assertEqual(
+            trimmer.snapshot(),
+            {
+                "native_heap_trim_interval_s": 1.0,
+                "native_heap_trim_supported": True,
+                "native_heap_trim_attempt_count": 2,
+                "native_heap_trim_reclaimed_count": 2,
+                "native_heap_trim_skipped_count": 1,
+                "native_heap_trim_last_attempt_mono_s": 1.1,
+                "native_heap_trim_last_result": 1,
+            },
+        )
+
+    def test_runtime_gesture_wrappers_trim_native_heap(self) -> None:
+        runtime = MediaPipeTaskRuntime(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                native_heap_trim_interval_s=1.0,
+            )
+        )
+        trim_calls: list[str] = []
+        runtime._gesture_native_heap_trimmer = SimpleNamespace(  # pylint: disable=protected-access
+            maybe_trim=lambda: trim_calls.append("trim"),
+            snapshot=lambda: {"native_heap_trim_attempt_count": len(trim_calls)},
+        )
+        recognizer = SimpleNamespace(
+            recognize=lambda image: ("image", image),
+            recognize_for_video=lambda image, timestamp_ms: ("video", image, timestamp_ms),
+            recognize_async=lambda image, timestamp_ms: trim_calls.append(f"async:{timestamp_ms}"),
+        )
+
+        self.assertEqual(
+            runtime.gesture_recognize_image(recognizer, image="roi"),
+            ("image", "roi"),
+        )
+        self.assertEqual(
+            runtime.gesture_recognize_for_video(recognizer, image="frame", timestamp_ms=7),
+            ("video", "frame", 7),
+        )
+        runtime.gesture_recognize_async(recognizer, image="frame", timestamp_ms=9)
+
+        self.assertEqual(trim_calls, ["trim", "trim", "async:9", "trim"])
+        self.assertEqual(
+            runtime.gesture_native_heap_snapshot(),
+            {"native_heap_trim_attempt_count": 4},
+        )
+
     def test_runtime_reuses_live_recognizer_when_callbacks_share_cache_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "gesture.task"

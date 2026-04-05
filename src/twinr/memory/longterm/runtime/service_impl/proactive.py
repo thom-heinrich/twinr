@@ -1,4 +1,3 @@
-# mypy: disable-error-code=attr-defined
 """Proactive-planning entry points for the long-term runtime service."""
 
 from __future__ import annotations

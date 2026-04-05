@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,has-type,assignment"
 # CHANGELOG: 2026-03-29
 # BUG-1: Recompute pending utterance timing after buffer trims so `active_ms`,
 #        `trailing_silence_ms`, and `speech_active` never drift away from the
@@ -25,6 +24,9 @@
 # IMP-4: Add an optional semantic endpoint hook so newer 2026-style turn-state
 #        predictors can override fixed trailing-silence endpointing without
 #        changing this mixin's public API.
+# IMP-5: Default per-frame speech-probability side channels to the classifier's
+#        natural 0.5 speech-likely boundary so the host can trust edge speech
+#        evidence even when no explicit threshold override is configured.
 """Frame buffering, utterance assembly, and candidate scanning helpers."""
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ class VoiceSessionScannerMixin:
         )
 
     def _remote_asr_speech_probability_threshold(self) -> float | None:
-        """Return an optional neural-VAD threshold if the runtime exposes one."""
+        """Return the neural-VAD threshold for per-frame speech probabilities."""
 
         raw_threshold = getattr(self, "remote_asr_speech_probability_threshold", None)
         if raw_threshold is None:
@@ -73,11 +75,11 @@ class VoiceSessionScannerMixin:
                 None,
             )
         if raw_threshold is None:
-            return None
+            return 0.5
         try:
             threshold = float(raw_threshold)
         except (TypeError, ValueError):
-            return None
+            return 0.5
         return min(1.0, max(0.0, threshold))
 
     def _remote_asr_speech_continue_probability_threshold(self) -> float | None:
@@ -246,7 +248,7 @@ class VoiceSessionScannerMixin:
             if normalized[index : index + expected_chunk_bytes]
         )
 
-    def _remember_frame(self, pcm_bytes: bytes) -> None:
+    def _remember_frame(self, pcm_bytes: bytes, *, speech_probability: float | None = None) -> None:
         """Append one PCM chunk into the bounded recent-history buffer."""
 
         for fragment in self._bounded_ingress_pcm_fragments(pcm_bytes):
@@ -260,6 +262,7 @@ class VoiceSessionScannerMixin:
                     pcm_bytes=fragment,
                     rms=_pcm16_rms(fragment),
                     duration_ms=max(1, duration_ms),
+                    speech_probability=speech_probability,
                 )
             )
 

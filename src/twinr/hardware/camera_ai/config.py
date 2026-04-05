@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path, PurePath
+from typing import cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -80,6 +82,9 @@ _MIN_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES = 1  # AUDIT-FIX(#13): Always keep at 
 _MAX_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES = 128  # AUDIT-FIX(#13): Prevent unbounded artifact growth from QA capture.
 _MIN_ROI_CANDIDATES = 1  # AUDIT-FIX(#11): Keep ROI fan-out bounded on the Pi.
 _MAX_ROI_CANDIDATES = 6  # AUDIT-FIX(#11): Bound per-frame MediaPipe hand ROI work.
+_ALLOWED_MEDIAPIPE_LIVE_GESTURE_MODES = frozenset({"video", "live_stream"})
+_DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S = 1.0
+_MAX_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +134,7 @@ class AICameraAdapterConfig:
     primary_person_upper_body_ratio: float = 0.78
     wrist_roi_scale: float = 0.34
     live_pending_result_timeout_s: float = 1.0
+    mediapipe_native_heap_trim_interval_s: float = _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -442,6 +448,24 @@ class AICameraAdapterConfig:
         )
         object.__setattr__(
             self,
+            "mediapipe_native_heap_trim_interval_s",
+            _coerce_bounded_float(
+                self.mediapipe_native_heap_trim_interval_s,
+                default=_coerce_bounded_float(
+                    os.getenv(
+                        "TWINR_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S",
+                        _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                    ),
+                    default=_DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                    minimum=0.0,
+                    maximum=_MAX_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                ),
+                minimum=0.0,
+                maximum=_MAX_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+            ),
+        )
+        object.__setattr__(
+            self,
             "pose_refresh_s",
             _coerce_bounded_float(
                 self.pose_refresh_s,
@@ -651,6 +675,17 @@ class AICameraAdapterConfig:
                 "proactive_local_camera_wrist_roi_scale",
                 0.34,
             ),
+            mediapipe_native_heap_trim_interval_s=cast(
+                float,
+                _safe_getattr(
+                    config,
+                    "proactive_local_camera_mediapipe_native_heap_trim_interval_s",
+                    os.getenv(
+                        "TWINR_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S",
+                        _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                    ),
+                ),
+            ),
             sequence_window_s=_safe_getattr(
                 config,
                 "proactive_local_camera_sequence_window_s",
@@ -689,6 +724,8 @@ class MediaPipeVisionConfig:
     primary_person_upper_body_ratio: float = 0.78
     wrist_roi_scale: float = 0.34
     live_pending_result_timeout_s: float = 1.0
+    live_gesture_mode: str = "video"
+    native_heap_trim_interval_s: float = _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -843,6 +880,33 @@ class MediaPipeVisionConfig:
                 maximum=5.0,
             ),
         )
+        object.__setattr__(
+            self,
+            "live_gesture_mode",
+            _coerce_choice(
+                self.live_gesture_mode,
+                default=os.getenv("TWINR_MEDIAPIPE_LIVE_GESTURE_MODE", "video"),
+                allowed=_ALLOWED_MEDIAPIPE_LIVE_GESTURE_MODES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "native_heap_trim_interval_s",
+            _coerce_bounded_float(
+                self.native_heap_trim_interval_s,
+                default=_coerce_bounded_float(
+                    os.getenv(
+                        "TWINR_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S",
+                        _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                    ),
+                    default=_DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                    minimum=0.0,
+                    maximum=_MAX_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                ),
+                minimum=0.0,
+                maximum=_MAX_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+            ),
+        )
 
     @classmethod
     def from_ai_camera_config(cls, config: object) -> "MediaPipeVisionConfig":
@@ -920,6 +984,30 @@ class MediaPipeVisionConfig:
             primary_person_upper_body_ratio=_safe_getattr(config, "primary_person_upper_body_ratio", 0.78),
             wrist_roi_scale=_safe_getattr(config, "wrist_roi_scale", 0.34),
             live_pending_result_timeout_s=_safe_getattr(config, "live_pending_result_timeout_s", 1.0),
+            live_gesture_mode=_safe_getattr(
+                config,
+                "mediapipe_live_gesture_mode",
+                _safe_getattr(
+                    config,
+                    "live_gesture_mode",
+                    os.getenv("TWINR_MEDIAPIPE_LIVE_GESTURE_MODE", "video"),
+                ),
+            ),
+            native_heap_trim_interval_s=cast(
+                float,
+                _safe_getattr(
+                    config,
+                    "mediapipe_native_heap_trim_interval_s",
+                    _safe_getattr(
+                        config,
+                        "native_heap_trim_interval_s",
+                        os.getenv(
+                            "TWINR_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S",
+                            _DEFAULT_MEDIAPIPE_NATIVE_HEAP_TRIM_INTERVAL_S,
+                        ),
+                    ),
+                ),
+            ),
         )
 
 

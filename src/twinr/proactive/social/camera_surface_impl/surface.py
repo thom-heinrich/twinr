@@ -1,4 +1,3 @@
-# mypy: disable-error-code=assignment
 # CHANGELOG: 2026-03-29
 # BUG-1: Enforced monotonic observation timestamps; stale frames are dropped and duplicate timestamps are micro-stepped.
 # BUG-2: Missing sparse fields no longer collapse to False/0/() and no longer flap debounced state or stable object tracking.

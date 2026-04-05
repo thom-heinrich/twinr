@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined"
 # CHANGELOG: 2026-03-28
 # BUG-1: build_scene accepted helper_text but discarded it entirely. The default panel now
 #        renders helper_text/headline fallbacks whenever no reserve cue owns the panel.

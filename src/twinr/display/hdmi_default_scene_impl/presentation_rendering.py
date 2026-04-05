@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 # CHANGELOG: 2026-03-28
 # BUG-1: Fixed portrait / EXIF-oriented images rendering sideways by applying EXIF transpose before resize.
 # BUG-2: Fixed valid inline data-URL images never rendering in presentation image blocks; they now fall back after local-path load fails.

@@ -19,7 +19,6 @@
 # IMP-2: Added played-audio estimation, interruption telemetry, and safer follow-up
 #        finalization when transport-level truncation is unavailable.
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

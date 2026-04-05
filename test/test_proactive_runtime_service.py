@@ -5,7 +5,6 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-# mypy: ignore-errors
 
 # pylint: disable=no-member
 

@@ -68,6 +68,18 @@ conversion tooling is available. The runtime loaders automatically prefer
 `model.ort` over `model.onnx` so Pi startups avoid re-optimizing large graphs
 on-device.
 
+When two-stage route and user-intent bundles omit explicit shared-encoder
+metadata, the runtime now falls back to content-based source-model/tokenizer
+dedupe so identical encoder artifacts are still loaded only once on the Pi. If
+those bundles also ship ORT sidecars, the shared encoder now keeps one ORT
+artifact instead of falling back to the shared ONNX source, so Pi startups do
+not re-optimize the same large graph on-device.
+
+The live streaming runtime now also defers the optional user-intent ORT
+validation session during idle startup. On the Pi this avoids holding a giant
+validation-only session in `waiting` before the first real transcript; the
+actual ORT model still validates when the shared encoder is first used.
+
 ## Usage
 
 ```python

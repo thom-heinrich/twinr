@@ -27,7 +27,6 @@ display helper calls must remain compatible with the legacy implementation.
 #        new snapshot fields participate in changed-only recording without
 #        manual tuple maintenance in this mixin.
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

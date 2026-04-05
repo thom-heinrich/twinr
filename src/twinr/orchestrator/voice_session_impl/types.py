@@ -29,6 +29,7 @@ class _RecentFrame:
     pcm_bytes: bytes
     rms: int
     duration_ms: int
+    speech_probability: float | None = None
 
 
 @dataclass(slots=True)

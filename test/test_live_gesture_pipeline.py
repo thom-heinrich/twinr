@@ -63,6 +63,7 @@ class _StubRecognizer:
         self._async_delay_s = max(0.0, float(async_delay_s))
         self._threads: list[threading.Thread] = []
         self.async_call_count = 0
+        self.video_call_count = 0
 
     def _next(self):
         return self._results.pop(0) if len(self._results) > 1 else self._results[0]
@@ -85,6 +86,10 @@ class _StubRecognizer:
         thread.start()
 
     def recognize(self, image):
+        return self._next()
+
+    def recognize_for_video(self, image, timestamp_ms: int):
+        self.video_call_count += 1
         return self._next()
 
     def wait(self) -> None:
@@ -118,6 +123,7 @@ class _StubRuntime:
         self.live_reset_count = 0
         self.live_builtin_submit_count = 0
         self.live_custom_submit_count = 0
+        self.native_heap_trim_attempt_count = 0
 
     def load_runtime(self):
         return {}
@@ -141,6 +147,11 @@ class _StubRuntime:
         self.live_builtin_submit_count = self._builtin.async_call_count
         return self._builtin
 
+    def ensure_gesture_recognizer(self, runtime):
+        if self._builtin is None:
+            self._builtin = _StubRecognizer(None, self._builtin_results)
+        return self._builtin
+
     def ensure_live_custom_gesture_recognizer(self, runtime, *, result_callback):
         if self._custom is None:
             self._custom = _StubRecognizer(
@@ -153,6 +164,11 @@ class _StubRuntime:
         self.live_custom_submit_count = self._custom.async_call_count
         return self._custom
 
+    def ensure_custom_gesture_recognizer(self, runtime):
+        if self._custom is None:
+            self._custom = _StubRecognizer(None, self._custom_results)
+        return self._custom
+
     def ensure_roi_gesture_recognizer(self, runtime):
         if self._roi_builtin is None:
             self._roi_builtin = _StubRecognizer(None, self._roi_builtin_results)
@@ -162,6 +178,29 @@ class _StubRuntime:
         if self._roi_custom is None:
             self._roi_custom = _StubRecognizer(None, self._roi_custom_results)
         return self._roi_custom
+
+    def gesture_recognize_image(self, recognizer, *, image):
+        self.native_heap_trim_attempt_count += 1
+        return recognizer.recognize(image)
+
+    def gesture_recognize_for_video(self, recognizer, *, image, timestamp_ms: int):
+        self.native_heap_trim_attempt_count += 1
+        return recognizer.recognize_for_video(image, timestamp_ms)
+
+    def gesture_recognize_async(self, recognizer, *, image, timestamp_ms: int) -> None:
+        self.native_heap_trim_attempt_count += 1
+        recognizer.recognize_async(image, timestamp_ms)
+
+    def gesture_native_heap_snapshot(self) -> dict[str, object]:
+        return {
+            "native_heap_trim_interval_s": 1.0,
+            "native_heap_trim_supported": True,
+            "native_heap_trim_attempt_count": self.native_heap_trim_attempt_count,
+            "native_heap_trim_reclaimed_count": 0,
+            "native_heap_trim_skipped_count": 0,
+            "native_heap_trim_last_attempt_mono_s": None,
+            "native_heap_trim_last_result": None,
+        }
 
     def close(self) -> None:
         for recognizer in (self._builtin, self._custom):
@@ -355,6 +394,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -405,6 +445,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -454,6 +495,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -478,6 +520,32 @@ class LiveGesturePipelineTests(unittest.TestCase):
         debug_snapshot = pipeline.debug_snapshot()
         self.assertTrue(debug_snapshot["live_custom_enabled"])
 
+    def test_observe_video_mode_reports_native_heap_trim_stats(self) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+            )
+        )
+        runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("thumbs_up", 0.88)]],
+                    hand_landmarks=[[_Landmark(0.45), _Landmark(0.49)]],
+                )
+            ]
+        )
+        pipeline._runtime = runtime
+
+        observation = pipeline.observe(frame_rgb="frame", observed_at=10.0)
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        debug_snapshot = pipeline.debug_snapshot()
+        self.assertEqual(debug_snapshot["live_stage_mode"], "video")
+        self.assertEqual(debug_snapshot["native_heap_trim_interval_s"], 1.0)
+        self.assertEqual(debug_snapshot["native_heap_trim_attempt_count"], 1)
+
     def test_observe_waits_briefly_for_delayed_same_frame_custom_live_result(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -485,6 +553,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -522,6 +591,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 pose_model_path="pose.task",
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
+                live_gesture_mode="live_stream",
             )
         )
         runtime = _StubRuntime(
@@ -558,6 +628,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 live_pending_result_timeout_s=0.25,
+                live_gesture_mode="live_stream",
             )
         )
         runtime = _StubRuntime(
@@ -595,6 +666,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -644,6 +716,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -888,6 +961,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -926,6 +1000,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -1135,6 +1210,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(
@@ -1192,6 +1268,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
                 hand_landmarker_model_path="hand.task",
                 gesture_model_path="gesture.task",
                 custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
             )
         )
         pipeline._runtime = _StubRuntime(

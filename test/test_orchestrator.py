@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
@@ -35,7 +36,12 @@ from twinr.orchestrator.remote_asr_service import (
     RemoteAsrHttpService,
     remote_asr_url_targets_local_orchestrator,
 )
-from twinr.orchestrator.server import EdgeOrchestratorServer, create_app as create_orchestrator_app
+from twinr.orchestrator.server import (
+    EdgeOrchestratorServer,
+    _VoiceIngressQueue,
+    _get_voice_ingress_queue_maxsize,
+    create_app as create_orchestrator_app,
+)
 from twinr.orchestrator.session import EdgeOrchestratorSession, RemoteToolBridge
 from twinr.orchestrator.voice_activation import (
     DEFAULT_VOICE_ACTIVATION_PHRASES,
@@ -1137,6 +1143,7 @@ class OrchestratorClientTests(unittest.TestCase):
         frame = OrchestratorVoiceAudioFrame(
             sequence=7,
             pcm_bytes=b"\x01\x00" * 160,
+            speech_probability=0.73,
             runtime_state=OrchestratorVoiceRuntimeStateEvent(
                 state="waiting",
                 detail="idle",
@@ -1160,6 +1167,7 @@ class OrchestratorClientTests(unittest.TestCase):
 
         self.assertEqual(decoded.sequence, 7)
         self.assertEqual(decoded.pcm_bytes, b"\x01\x00" * 160)
+        self.assertEqual(decoded.speech_probability, 0.73)
         self.assertIsNotNone(decoded.runtime_state)
         self.assertEqual(decoded.runtime_state.state, "waiting")
         self.assertEqual(decoded.runtime_state.detail, "idle")
@@ -1317,6 +1325,68 @@ class OrchestratorClientTests(unittest.TestCase):
 
         self.assertTrue(any(getattr(event, "backend", "") == "remote_asr" for event in events))
         self.assertTrue(any(getattr(event, "remaining_text", "") == "schau mal im web" for event in events))
+
+
+class OrchestratorVoiceIngressQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_queue_drops_oldest_audio_to_admit_control_message(self) -> None:
+        queue = _VoiceIngressQueue(maxsize=2)
+
+        self.assertTrue(
+            await queue.put(
+                OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=b"\x00\x00" * 160).to_payload()
+            )
+        )
+        self.assertTrue(
+            await queue.put(
+                OrchestratorVoiceAudioFrame(sequence=2, pcm_bytes=b"\x01\x00" * 160).to_payload()
+            )
+        )
+
+        accepted = await queue.put(
+            OrchestratorVoiceRuntimeStateEvent(
+                state="waiting",
+                detail="refresh",
+                follow_up_allowed=False,
+            ).to_payload()
+        )
+
+        self.assertTrue(accepted)
+        first = await queue.get()
+        second = await queue.get()
+        self.assertEqual(first["type"], "voice_audio_frame")
+        self.assertEqual(first["sequence"], 2)
+        self.assertEqual(second["type"], "voice_runtime_state")
+        self.assertEqual(second["detail"], "refresh")
+
+    async def test_full_queue_without_audio_still_rejects_new_control_message(self) -> None:
+        queue = _VoiceIngressQueue(maxsize=1)
+        self.assertTrue(
+            await queue.put(
+                OrchestratorVoiceRuntimeStateEvent(
+                    state="waiting",
+                    detail="initial",
+                    follow_up_allowed=False,
+                ).to_payload()
+            )
+        )
+
+        accepted = await queue.put(
+            OrchestratorVoiceRuntimeStateEvent(
+                state="listening",
+                detail="next",
+                follow_up_allowed=False,
+            ).to_payload()
+        )
+
+        self.assertFalse(accepted)
+        only_item = await queue.get()
+        self.assertEqual(only_item["type"], "voice_runtime_state")
+        self.assertEqual(only_item["detail"], "initial")
+
+    def test_voice_ingress_queue_default_covers_real_transcription_spikes(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORCHESTRATOR_VOICE_INGRESS_QUEUE_MAXSIZE", None)
+            self.assertEqual(_get_voice_ingress_queue_maxsize(TwinrConfig()), 160)
 
     def test_voice_client_close_tolerates_receiver_thread_starting_late(self) -> None:
         class _FakeSocket:
@@ -3507,6 +3577,166 @@ class OrchestratorVoiceSessionTests(unittest.TestCase):
         self.assertEqual(third, [])
         self.assertEqual(wake_phrase_spotter.calls, 0)
         self.assertEqual(entries, [])
+
+    def test_voice_session_remote_asr_stage1_ignores_loud_noise_when_edge_marks_non_speech(self) -> None:
+        class _FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+            def step(self, seconds: float) -> None:
+                self.value += seconds
+
+        class _CountingRejectingWakePhraseSpotter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def detect(self, capture):
+                del capture
+                self.calls += 1
+                return VoiceActivationMatch(
+                    detected=False,
+                    transcript="noise",
+                    normalized_transcript="noise",
+                    backend="remote_asr",
+                )
+
+        with TemporaryDirectory() as temp_dir:
+            clock = _FakeClock()
+            wake_phrase_spotter = _CountingRejectingWakePhraseSpotter()
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=10,
+                voice_orchestrator_remote_asr_url="http://127.0.0.1:18090",
+                voice_orchestrator_remote_asr_min_wake_duration_ms=100,
+                voice_orchestrator_wake_candidate_window_ms=100,
+                voice_orchestrator_wake_postroll_ms=100,
+                voice_orchestrator_wake_tail_max_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+            )
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(transcribe=lambda *args, **kwargs: "ignored"),
+                wake_phrase_spotter=wake_phrase_spotter,
+                monotonic_fn=clock,
+            )
+
+            session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            first = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=0,
+                    pcm_bytes=_pcm_frame(2000),
+                    speech_probability=0.05,
+                )
+            )
+            clock.step(1.0)
+            second = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=1,
+                    pcm_bytes=_pcm_frame(2000),
+                    speech_probability=0.04,
+                )
+            )
+            third = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=2,
+                    pcm_bytes=_pcm_frame(0),
+                    speech_probability=0.0,
+                )
+            )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(third, [])
+        self.assertEqual(wake_phrase_spotter.calls, 0)
+
+    def test_voice_session_remote_asr_stage1_accepts_quiet_speech_from_edge_probability(self) -> None:
+        class _FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+            def step(self, seconds: float) -> None:
+                self.value += seconds
+
+        with TemporaryDirectory() as temp_dir:
+            clock = _FakeClock()
+            wake_phrase_spotter = _MinDurationWakePhraseSpotter(min_duration_ms=100)
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                audio_speech_threshold=1500,
+                voice_orchestrator_remote_asr_url="http://127.0.0.1:18090",
+                voice_orchestrator_remote_asr_min_wake_duration_ms=100,
+                voice_orchestrator_wake_candidate_window_ms=100,
+                voice_orchestrator_wake_postroll_ms=100,
+                voice_orchestrator_wake_tail_max_ms=100,
+                voice_orchestrator_wake_tail_endpoint_silence_ms=100,
+                voice_orchestrator_candidate_cooldown_s=0.0,
+            )
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(transcribe=lambda *args, **kwargs: "ignored"),
+                wake_phrase_spotter=wake_phrase_spotter,
+                monotonic_fn=clock,
+            )
+
+            session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            first = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=0,
+                    pcm_bytes=_pcm_frame(200),
+                    speech_probability=0.92,
+                )
+            )
+            clock.step(0.1)
+            second = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=1,
+                    pcm_bytes=_pcm_frame(200),
+                    speech_probability=0.91,
+                )
+            )
+            events = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(
+                    sequence=2,
+                    pcm_bytes=_pcm_frame(0),
+                    speech_probability=0.0,
+                )
+            )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(events[0]["type"], "wake_confirmed")
+        self.assertTrue(wake_phrase_spotter.capture_durations_ms)
+        self.assertGreaterEqual(wake_phrase_spotter.capture_durations_ms[0], 200)
 
     def test_voice_session_remote_asr_stage1_counts_quiet_follow_through_after_strong_onset(self) -> None:
         class _FakeClock:

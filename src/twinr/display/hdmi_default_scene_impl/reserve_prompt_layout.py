@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 # CHANGELOG: 2026-03-28
 # BUG-1: Height fitting no longer measures helper text with the headline font metrics; mixed bold/regular font metrics now fit correctly.
 # BUG-2: Truncation is no longer attempted only at the minimum font size; the largest truncated layout is now selected when a full fit is impossible.

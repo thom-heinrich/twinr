@@ -152,7 +152,10 @@ The messy mixed-corpus runner persists the latest result to
 question than the individual suites: whether the same retrieval quality still
 holds once synthetic graph clutter, multimodal routines, and unified
 multi-source conflicts all coexist in one remote namespace and are then read
-back by a fresh runtime.
+back by a fresh runtime. During the scored writer/fresh-reader phases it
+deliberately disables optional query-rewrite and subtext-compiler LLM lanes and
+does not persist materialized provider-answer fronts, so the benchmark isolates
+remote memory quality instead of auxiliary cache/LLM latency.
 
 The unified-retrieval profiles expose two operational tiers:
 - `core`: 3 high-signal cases for bounded live writer/fresh-reader acceptance.

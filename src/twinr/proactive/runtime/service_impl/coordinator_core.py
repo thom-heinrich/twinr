@@ -17,7 +17,6 @@ closed decisions must remain compatible with the legacy
 ``twinr.proactive.runtime.service`` module.
 """
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

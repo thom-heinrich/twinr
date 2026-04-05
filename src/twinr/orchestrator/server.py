@@ -195,12 +195,17 @@ class _VoiceIngressQueue:
                 return False
 
             if len(self._items) >= self._maxsize:
-                if str(payload.get("type", "") or "") == "voice_audio_frame":
-                    if not self._drop_oldest_audio_frame_locked():
-                        return False
+                dropped_audio = self._drop_oldest_audio_frame_locked()
+                if not dropped_audio:
+                    return False
+                payload_type = str(payload.get("type", "") or "")
+                if payload_type == "voice_audio_frame":
                     logger.warning("Shedding stale voice_audio_frame due to voice ingress backpressure")
                 else:
-                    return False
+                    logger.warning(
+                        "Dropping stale voice_audio_frame to admit %s during voice ingress backpressure",
+                        payload_type or "unknown_message",
+                    )
 
             self._items.append(payload)
             self._condition.notify()
@@ -1090,8 +1095,11 @@ def _get_voice_ingress_queue_maxsize(config: TwinrConfig) -> int:
 
     raw = getattr(config, "orchestrator_voice_ingress_queue_maxsize", None)
     if raw is None:
-        raw = os.getenv("ORCHESTRATOR_VOICE_INGRESS_QUEUE_MAXSIZE", "32")
-    return _coerce_positive_int(raw, default=32)
+        # 32 frames only buffers about 3.2s at the productive 100 ms cadence,
+        # which is too small for real same-host transcription spikes and lets
+        # stale audio backlog escalate into avoidable websocket churn.
+        raw = os.getenv("ORCHESTRATOR_VOICE_INGRESS_QUEUE_MAXSIZE", "160")
+    return _coerce_positive_int(raw, default=160)
 
 
 def _get_turn_shutdown_grace_seconds(config: TwinrConfig) -> float:

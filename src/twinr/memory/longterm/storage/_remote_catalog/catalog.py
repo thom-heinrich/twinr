@@ -21,6 +21,8 @@ from .shared import (
     _RemoteCollectionDefinition,
 )
 
+_URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS = frozenset({"graph_edges", "graph_nodes"})
+
 
 class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
     def probe_catalog_payload_result(
@@ -317,7 +319,42 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
             payload.get("schema") == definition.catalog_schema
             and payload.get("version") == _CATALOG_VERSION
             and (items_count <= 0 or bool(segments))
+            and self._segment_refs_support_current_read_contract(
+                definition=definition,
+                segments=segments,
+            )
         )
+
+    def _segment_refs_support_current_read_contract(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        segments: object,
+    ) -> bool:
+        """Return whether one segmented head is readable for fresh processes.
+
+        Structured current heads (`objects/conflicts/archive/midterm` and the
+        prompt/context collections that share this catalog adapter) hydrate
+        segment payloads through exact-id batch reads. A non-empty head that
+        advertises segment refs without stable `document_id`s is therefore not
+        a supported current contract, even if the schema/version fields look
+        fine. Projection-only graph heads keep their existing URI-first
+        contract because readers can rebuild from the current-head projection.
+        """
+
+        if not isinstance(segments, list):
+            return False
+        require_document_id = definition.snapshot_kind not in _URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS
+        for raw_segment in segments:
+            if not isinstance(raw_segment, Mapping):
+                return False
+            if self._normalize_segment_index(raw_segment.get("segment_index")) is None:
+                return False
+            if not self._normalize_text(raw_segment.get("uri")):
+                return False
+            if require_document_id and not self._normalize_text(raw_segment.get("document_id")):
+                return False
+        return True
 
     def _is_legacy_catalog_payload(
         self,
@@ -364,6 +401,17 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
     def catalog_available(self, *, snapshot_kind: str) -> bool:
         """Return whether the current remote snapshot is already a fine-grained catalog."""
 
+        probe_status, probe_payload = self.probe_catalog_payload_result(
+            snapshot_kind=snapshot_kind,
+            fast_fail=True,
+        )
+        if probe_status == "not_found":
+            return False
+        if isinstance(probe_payload, Mapping):
+            return self.is_catalog_payload(
+                snapshot_kind=snapshot_kind,
+                payload=probe_payload,
+            )
         return self.is_catalog_payload(
             snapshot_kind=snapshot_kind,
             payload=self.load_catalog_payload(snapshot_kind=snapshot_kind),

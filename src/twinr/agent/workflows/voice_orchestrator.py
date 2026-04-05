@@ -13,6 +13,9 @@
 # self-healing on busy / transiently missing devices.
 # BUG-4: Detect "arecord stays alive but never yields a first frame" capture
 # stalls and route them through bounded XVF3800 recovery instead of hanging.
+# BUG-5: Detect mid-stream "arecord stays alive but stops yielding bytes" stalls
+# too, so the Pi cannot sit forever on one healthy websocket with zero live
+# microphone audio after the first few frames.
 # SEC-1: BREAKING: ws:// is now rejected for non-loopback orchestrator endpoints
 # unless explicitly allowed via config.voice_orchestrator_allow_insecure_ws.
 # Raw senior-home microphone audio and shared secret transport must not traverse
@@ -52,16 +55,18 @@ import shutil
 import subprocess
 from threading import Event, Lock, RLock, Thread, current_thread
 import time
-from typing import Callable
+from typing import Callable, SupportsFloat, SupportsIndex, SupportsInt, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.respeaker_duplex_keepalive import build_respeaker_duplex_keepalive
+from twinr.agent.workflows.voice_frame_speech import EdgeVoiceFrameSpeechAnnotator
 from twinr.hardware.audio import resolve_capture_device
 from twinr.hardware.audio_env import build_audio_subprocess_env_for_mode
 from twinr.hardware.respeaker_capture_recovery import recover_stalled_respeaker_capture
+from twinr.ops.streaming_memory_probe import StreamingMemoryProbe
 from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
@@ -93,6 +98,16 @@ class _QueuedAudioFrame:
 
     pcm_bytes: bytes
     captured_at_monotonic: float
+
+
+class _CaptureStreamStalledError(RuntimeError):
+    """Signal that arecord stayed alive but stopped producing readable bytes."""
+
+    def __init__(self, *, stalled_ms: int) -> None:
+        self.stalled_ms = max(0, int(stalled_ms))
+        super().__init__(
+            f"Voice orchestrator capture stalled after {self.stalled_ms} ms without bytes"
+        )
 
 
 class EdgeVoiceOrchestrator:
@@ -175,6 +190,14 @@ class EdgeVoiceOrchestrator:
                 self._select_timeout_s * 8.0,
             ),
         )
+        self._ongoing_frame_timeout_s = self._coerce_positive_float(
+            self._config_value(
+                "voice_orchestrator_ongoing_frame_timeout_s",
+                "TWINR_VOICE_ONGOING_FRAME_TIMEOUT_S",
+            ),
+            default=self._first_frame_timeout_s,
+            minimum=max(self._select_timeout_s * 2.0, self._chunk_ms / 1000.0),
+        )
         self._ws_reconnect_base_s = self._coerce_positive_float(
             self._config_value("voice_orchestrator_reconnect_base_s", "TWINR_VOICE_WS_RECONNECT_BASE_S"),
             default=self._DEFAULT_WS_RECONNECT_BASE_S,
@@ -208,6 +231,10 @@ class EdgeVoiceOrchestrator:
         )
 
         self._session_id = f"voice-{uuid4().hex[:12]}"
+        self._frame_speech_annotator = EdgeVoiceFrameSpeechAnnotator(
+            sample_rate=self._sample_rate,
+            channels=self._channels,
+        )
         self._stop_event = Event()
         self._paused = Event()
         self._lifecycle_lock = RLock()
@@ -241,6 +268,18 @@ class EdgeVoiceOrchestrator:
         self._skipped_frame_count = 0
         self._queue_drop_count = 0
         self._queue_high_watermark = 0
+        self._capture_memory_probe = StreamingMemoryProbe.from_config(
+            config,
+            label="voice_orchestrator.capture_loop",
+            owner_label="voice_orchestrator.capture_loop",
+            owner_detail="Voice orchestrator capture loop is actively reading audio frames.",
+        )
+        self._sender_memory_probe = StreamingMemoryProbe.from_config(
+            config,
+            label="voice_orchestrator.sender_loop",
+            owner_label="voice_orchestrator.sender_loop",
+            owner_detail="Voice orchestrator sender loop is actively transporting queued audio frames.",
+        )
 
         self._recent_remote_audio_buffer_ms = max(
             4000,
@@ -260,6 +299,18 @@ class EdgeVoiceOrchestrator:
                 self._duplex_keepalive.handle_playback_activity
             )
 
+    @staticmethod
+    def _record_memory_probe(
+        probe: StreamingMemoryProbe,
+        *,
+        force: bool = False,
+        owner_detail: str | None = None,
+    ) -> None:
+        try:
+            probe.maybe_record(force=force, owner_detail=owner_detail)
+        except Exception:
+            return
+
     def _config_value(self, attr_name: str, env_name: str | None = None) -> object | None:
         value = getattr(self.config, attr_name, None)
         if value not in (None, ""):
@@ -273,7 +324,8 @@ class EdgeVoiceOrchestrator:
     @staticmethod
     def _coerce_positive_int(value: object | None, *, default: int, minimum: int = 1) -> int:
         try:
-            parsed = int(value) if value not in (None, "") else int(default)
+            candidate = value if value not in (None, "") else default
+            parsed = int(cast(SupportsInt | SupportsIndex | str | bytes | bytearray, candidate))
         except (TypeError, ValueError):
             parsed = int(default)
         return max(int(minimum), parsed)
@@ -281,7 +333,10 @@ class EdgeVoiceOrchestrator:
     @staticmethod
     def _coerce_positive_float(value: object | None, *, default: float, minimum: float = 0.001) -> float:
         try:
-            parsed = float(value) if value not in (None, "") else float(default)
+            candidate = value if value not in (None, "") else default
+            parsed = float(
+                cast(SupportsFloat | SupportsIndex | str | bytes | bytearray, candidate)
+            )
         except (TypeError, ValueError):
             parsed = float(default)
         return max(float(minimum), parsed)
@@ -427,6 +482,7 @@ class EdgeVoiceOrchestrator:
             self._queue_drop_count = 0
             self._queue_high_watermark = 0
             self._sender_queue = queue.Queue(maxsize=self._transport_queue_frames)
+            self._frame_speech_annotator.reset()
             with self._recent_remote_frames_lock:
                 self._recent_remote_frames.clear()
             if self._duplex_keepalive is not None:
@@ -450,6 +506,16 @@ class EdgeVoiceOrchestrator:
             self._thread = capture_thread
             sender_thread.start()
             capture_thread.start()
+            self._record_memory_probe(
+                self._sender_memory_probe,
+                force=True,
+                owner_detail="Voice orchestrator sender thread started.",
+            )
+            self._record_memory_probe(
+                self._capture_memory_probe,
+                force=True,
+                owner_detail="Voice orchestrator capture thread started.",
+            )
         return self
 
     def close(self) -> None:
@@ -474,6 +540,7 @@ class EdgeVoiceOrchestrator:
             sender_thread.join(timeout=max(1.0, self._ws_reconnect_max_s))
 
         self._close_client()
+        self._frame_speech_annotator.reset()
 
         self._flush_sent_frame_bucket()
         with self._lifecycle_lock:
@@ -865,6 +932,7 @@ class EdgeVoiceOrchestrator:
                 if queued_frame is None:
                     break
                 self._send_queued_frame(queued_frame)
+                self._record_memory_probe(self._sender_memory_probe)
         finally:
             if self._sender_thread is current_thread():
                 with self._lifecycle_lock:
@@ -927,6 +995,7 @@ class EdgeVoiceOrchestrator:
         sent_any_frame = False
         capture_recovery_attempted = False
         first_frame_deadline_at: float | None = None
+        last_capture_activity_at: float | None = None
 
         try:
             while not self._stop_event.is_set():
@@ -949,7 +1018,13 @@ class EdgeVoiceOrchestrator:
                         sent_any_frame = False
                         capture_recovery_attempted = False
                         first_frame_deadline_at = time.monotonic() + self._first_frame_timeout_s
+                        last_capture_activity_at = None
                         self._capture_restart_failures = 0
+                        self._record_memory_probe(
+                            self._capture_memory_probe,
+                            force=True,
+                            owner_detail="Voice orchestrator capture process started or restarted.",
+                        )
 
                     if process.stdout is None or process.stderr is None:
                         raise RuntimeError("Voice orchestrator capture did not expose stdout/stderr")
@@ -969,6 +1044,10 @@ class EdgeVoiceOrchestrator:
                     if stdout_fd not in ready:
                         if process.poll() is not None:
                             raise RuntimeError(self._process_error_message(process))
+                        self._raise_for_capture_activity_timeout(
+                            sent_any_frame=sent_any_frame,
+                            last_capture_activity_at=last_capture_activity_at,
+                        )
                         if self._first_frame_timed_out(
                             sent_any_frame=sent_any_frame,
                             first_frame_deadline_at=first_frame_deadline_at,
@@ -980,6 +1059,10 @@ class EdgeVoiceOrchestrator:
                     if not pcm_chunk:
                         if process.poll() is not None:
                             raise RuntimeError(self._process_error_message(process))
+                        self._raise_for_capture_activity_timeout(
+                            sent_any_frame=sent_any_frame,
+                            last_capture_activity_at=last_capture_activity_at,
+                        )
                         if self._first_frame_timed_out(
                             sent_any_frame=sent_any_frame,
                             first_frame_deadline_at=first_frame_deadline_at,
@@ -987,6 +1070,7 @@ class EdgeVoiceOrchestrator:
                             raise RuntimeError("Voice orchestrator capture produced no first frame before timeout")
                         continue
 
+                    last_capture_activity_at = time.monotonic()
                     pending_pcm.extend(pcm_chunk)
                     while len(pending_pcm) >= self._frame_bytes:
                         frame_bytes = bytes(pending_pcm[: self._frame_bytes])
@@ -994,6 +1078,7 @@ class EdgeVoiceOrchestrator:
                         self._enqueue_frame(frame_bytes)
                         sent_any_frame = True
                         first_frame_deadline_at = None
+                    self._record_memory_probe(self._capture_memory_probe)
                 except Exception as exc:
                     if self._stop_event.is_set():
                         break
@@ -1004,10 +1089,13 @@ class EdgeVoiceOrchestrator:
                         level="WARN",
                         details={
                             "error_type": type(exc).__name__,
+                            "error_message": self._sanitize_emit_value(exc),
                             "sent_any_frame": sent_any_frame,
                             "capture_recovery_attempted": capture_recovery_attempted,
                         },
                     )
+                    if isinstance(exc, _CaptureStreamStalledError):
+                        self._emit_status("voice_orchestrator_capture_stalled_ms", exc.stalled_ms)
 
                     if process is not None:
                         stale_process = process
@@ -1018,7 +1106,14 @@ class EdgeVoiceOrchestrator:
                                 self._process = None
 
                     recovered = False
-                    if not sent_any_frame and not capture_recovery_attempted:
+                    should_attempt_respeaker_recovery = (
+                        not capture_recovery_attempted
+                        and (
+                            not sent_any_frame
+                            or isinstance(exc, _CaptureStreamStalledError)
+                        )
+                    )
+                    if should_attempt_respeaker_recovery:
                         capture_recovery_attempted = True
                         recovered = self._recover_transient_respeaker_capture()
 
@@ -1035,6 +1130,14 @@ class EdgeVoiceOrchestrator:
                     if self._capture_restart_failures == 1 or self._capture_restart_failures % 5 == 0:
                         self._emit_status("voice_orchestrator_capture_failed", type(exc).__name__)
                     self._emit_status("voice_orchestrator_capture_retrying_in_ms", int(retry_delay_s * 1000))
+                    self._record_memory_probe(
+                        self._capture_memory_probe,
+                        force=True,
+                        owner_detail=(
+                            "Voice orchestrator capture loop hit an exception and is retrying "
+                            f"after {int(retry_delay_s * 1000)} ms."
+                        ),
+                    )
 
                     self._stop_event.wait(retry_delay_s)
 
@@ -1109,6 +1212,7 @@ class EdgeVoiceOrchestrator:
         try:
             with self._state_lock:
                 latest_runtime_state = self._last_runtime_state
+            speech_evidence = self._frame_speech_annotator.classify_frame(pcm_bytes)
 
             with self._transport_send_lock:
                 self._client.send_audio_frame(
@@ -1116,6 +1220,7 @@ class EdgeVoiceOrchestrator:
                         sequence=self._sequence,
                         pcm_bytes=pcm_bytes,
                         runtime_state=latest_runtime_state,
+                        speech_probability=speech_evidence.speech_probability,
                     )
                 )
 
@@ -1325,6 +1430,7 @@ class EdgeVoiceOrchestrator:
                 "capture_buffer_frames": self._capture_buffer_frames,
                 "select_timeout_s": self._select_timeout_s,
                 "first_frame_timeout_s": self._first_frame_timeout_s,
+                "ongoing_frame_timeout_s": self._ongoing_frame_timeout_s,
             },
         )
         self._emit_status("voice_orchestrator_capture", "started")
@@ -1339,6 +1445,21 @@ class EdgeVoiceOrchestrator:
         if sent_any_frame or first_frame_deadline_at is None:
             return False
         return time.monotonic() >= first_frame_deadline_at
+
+    def _raise_for_capture_activity_timeout(
+        self,
+        *,
+        sent_any_frame: bool,
+        last_capture_activity_at: float | None,
+    ) -> None:
+        """Abort one live capture when bytes stop arriving mid-stream."""
+
+        if not sent_any_frame or last_capture_activity_at is None:
+            return
+        stalled_s = time.monotonic() - last_capture_activity_at
+        if stalled_s < self._ongoing_frame_timeout_s:
+            return
+        raise _CaptureStreamStalledError(stalled_ms=int(round(stalled_s * 1000.0)))
 
     def _read_stdout_chunk(self, stdout_fd: int, read_size: int) -> bytes:
         try:

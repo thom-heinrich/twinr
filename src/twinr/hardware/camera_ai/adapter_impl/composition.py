@@ -6,7 +6,6 @@
 # IMP-1: Add lightweight temporal smoothing and hysteresis for single-person live-stream observations, aligned with 2026 edge-CV practice.
 # IMP-2: Sanitize bounded probabilities/tri-state booleans and preserve richer model provenance for downstream telemetry and debugging.
 
-# mypy: disable-error-code="attr-defined,has-type"
 """Observation composition, health, and face-anchor helpers."""
 
 from __future__ import annotations

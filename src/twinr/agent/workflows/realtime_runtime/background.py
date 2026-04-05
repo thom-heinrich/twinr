@@ -1,6 +1,5 @@
 """Compatibility wrapper for realtime background delivery helpers."""
 
-# mypy: ignore-errors
 
 ##REFACTOR: 2026-03-27##
 from __future__ import annotations

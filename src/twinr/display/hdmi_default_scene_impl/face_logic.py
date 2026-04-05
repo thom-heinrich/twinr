@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 # CHANGELOG: 2026-03-28
 # BUG-1: _face_offset now resolves cues through the same _effective_face_cue pipeline as _eye_state, removing head/eye desync when cues are filtered or rewritten upstream.
 # BUG-2: Blink generation is no longer tied to the 6/12-frame motion loops; the previous implementation could blink unrealistically often when animation_frame is a real render-frame counter.

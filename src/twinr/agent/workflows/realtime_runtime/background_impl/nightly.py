@@ -1,6 +1,5 @@
 """Nightly orchestration hook for the realtime background loop."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

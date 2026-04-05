@@ -8,11 +8,13 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+from typing import Any, cast
 
 from PIL import Image, ImageChops
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import twinr.display.hdmi_wayland as hdmi_wayland_module
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.debug_signals import DisplayDebugSignal
@@ -1518,6 +1520,9 @@ class FakeQtConstants:
     FramelessWindowHint = 0x02
     WindowStaysOnTopHint = 0x04
     AlignCenter = 0x08
+    WA_OpaquePaintEvent = 0x10
+    WA_NoSystemBackground = 0x20
+    BlankCursor = 0x40
 
 
 class FakeQApplication:
@@ -1616,6 +1621,9 @@ class FakeQImage:
         self.stride = stride
         self.image_format = image_format
 
+    def isNull(self) -> bool:
+        return False
+
 
 class FakeQPixmap:
     from_image_calls: list[FakeQImage] = []
@@ -1629,6 +1637,114 @@ class FakeQPixmap:
             "stride": image.stride,
             "format": image.image_format,
         }
+
+
+class FakeNativeQColor:
+    def __init__(self, red: int, green: int, blue: int) -> None:
+        self.rgb = (red, green, blue)
+
+
+class FakeNativeQCursor:
+    def __init__(self, shape: int) -> None:
+        self.shape = shape
+
+
+class FakeNativeQPainter:
+    def __init__(self, widget: object) -> None:
+        self.widget = cast(Any, widget)
+
+    def fillRect(self, *args: object) -> None:
+        self.widget.fill_rect_calls.append(args)
+
+    def drawImage(self, *args: object) -> None:
+        self.widget.draw_image_calls.append(args)
+
+
+class FakeNativeScreenGeometry:
+    def __init__(self, width: int, height: int) -> None:
+        self._width = width
+        self._height = height
+
+    def width(self) -> int:
+        return self._width
+
+    def height(self) -> int:
+        return self._height
+
+
+class FakeNativeScreen:
+    def __init__(self, *, name: str = "HDMI-A-1", width: int = 800, height: int = 480, dpr: float = 1.0) -> None:
+        self._name = name
+        self._geometry = FakeNativeScreenGeometry(width, height)
+        self._dpr = dpr
+
+    def name(self) -> str:
+        return self._name
+
+    def geometry(self) -> FakeNativeScreenGeometry:
+        return self._geometry
+
+    def devicePixelRatio(self) -> float:
+        return self._dpr
+
+
+class FakeNativeQRasterWindow:
+    def __init__(self, _parent: object = None) -> None:
+        self.object_name = ""
+        self.title = ""
+        self.flags: object | None = None
+        self.cursor: object | None = None
+        self.screen_value: object | None = FakeNativeScreen()
+        self.resize_calls: list[tuple[int, int]] = []
+        self.update_calls = 0
+        self.fullscreen_calls = 0
+        self.visible = False
+        self.fill_rect_calls: list[tuple[object, object]] = []
+        self.draw_image_calls: list[tuple[object, object]] = []
+        self._width = 0
+        self._height = 0
+
+    def setObjectName(self, value: str) -> None:
+        self.object_name = value
+
+    def setTitle(self, value: str) -> None:
+        self.title = value
+
+    def setFlags(self, flags: object) -> None:
+        self.flags = flags
+
+    def setCursor(self, cursor: object) -> None:
+        self.cursor = cursor
+
+    def setScreen(self, screen: object) -> None:
+        self.screen_value = screen
+
+    def resize(self, width: int, height: int) -> None:
+        self.resize_calls.append((width, height))
+        self._width = width
+        self._height = height
+
+    def update(self) -> None:
+        self.update_calls += 1
+
+    def isVisible(self) -> bool:
+        return self.visible
+
+    def isExposed(self) -> bool:
+        return self.visible
+
+    def showFullScreen(self) -> None:
+        self.fullscreen_calls += 1
+        self.visible = True
+
+    def width(self) -> int:
+        return self._width
+
+    def height(self) -> int:
+        return self._height
+
+    def screen(self) -> object | None:
+        return self.screen_value
 
 
 def _fake_pyqt_modules() -> dict[str, object]:
@@ -1659,6 +1775,37 @@ class HdmiWaylandDisplayTests(unittest.TestCase):
             adapter = create_display_adapter(config)
 
         self.assertIs(adapter, sentinel)
+
+    def test_hdmi_wayland_disables_idle_waiting_animation(self) -> None:
+        display = HdmiWaylandDisplay(
+            width=320,
+            height=240,
+            wayland_display="wayland-0",
+            wayland_runtime_dir="/run/user/1000",
+        )
+
+        self.assertFalse(display.supports_idle_waiting_animation())
+
+    def test_hdmi_wayland_disables_active_status_animation(self) -> None:
+        display = HdmiWaylandDisplay(
+            width=320,
+            height=240,
+            wayland_display="wayland-0",
+            wayland_runtime_dir="/run/user/1000",
+        )
+
+        self.assertFalse(display.supports_status_animation("processing"))
+        self.assertFalse(display.supports_status_animation("answering"))
+
+    def test_hdmi_wayland_disables_periodic_status_repaint(self) -> None:
+        display = HdmiWaylandDisplay(
+            width=320,
+            height=240,
+            wayland_display="wayland-0",
+            wayland_runtime_dir="/run/user/1000",
+        )
+
+        self.assertFalse(display.supports_periodic_status_repaint())
 
     def test_show_status_renders_into_fullscreen_wayland_surface(self) -> None:
         emitted: list[str] = []
@@ -1712,6 +1859,147 @@ class HdmiWaylandDisplayTests(unittest.TestCase):
         self.assertEqual(first_image.stride, 1280)
         self.assertTrue(any("display_wayland=ready" in line for line in emitted))
         self.assertTrue(any("platform=wayland" in line for line in emitted))
+
+    def test_native_wayland_window_draws_qimage_without_creating_qpixmaps(self) -> None:
+        FakeQPixmap.from_image_calls = []
+        qt_core = types.SimpleNamespace(Qt=FakeQtConstants)
+        qt_gui = types.SimpleNamespace(
+            QImage=FakeQImage,
+            QPixmap=FakeQPixmap,
+            QPainter=FakeNativeQPainter,
+            QColor=FakeNativeQColor,
+            QCursor=FakeNativeQCursor,
+            QRasterWindow=FakeNativeQRasterWindow,
+        )
+        qt_widgets = types.SimpleNamespace()
+        window_class = hdmi_wayland_module._build_wayland_window_class(qt_core, qt_gui, qt_widgets)
+        window = window_class(320, 240)
+        first_frame = bytes([1]) * (320 * 240 * 4)
+        second_frame = bytes([2]) * (320 * 240 * 4)
+
+        window.set_frame(first_frame, 320, 240)
+        window.paintEvent(None)
+        window.set_frame(second_frame, 320, 240)
+        window.paintEvent(None)
+        window.clear_frame()
+        window.paintEvent(None)
+
+        self.assertEqual(FakeQPixmap.from_image_calls, [])
+        self.assertEqual(window.update_calls, 3)
+        self.assertEqual(window.fullscreen_calls, 0)
+        self.assertEqual(len(window.draw_image_calls), 2)
+        first_left, first_top, first_image = window.draw_image_calls[0]
+        second_left, second_top, second_image = window.draw_image_calls[1]
+        self.assertEqual((first_left, first_top), (0, 0))
+        self.assertEqual((second_left, second_top), (0, 0))
+        self.assertEqual(first_image.payload, first_frame)
+        self.assertEqual(second_image.payload, second_frame)
+        self.assertEqual(window.object_name, "TwinrWaylandDisplay")
+        self.assertEqual(window.title, "Twinr")
+        self.assertEqual(window.resize_calls, [(320, 240)])
+        self.assertEqual(window.frame_telemetry(), "window_kind=qrasterwindow window_px=320x240 screen=HDMI-A-1 screen_px=800x480 dpr=1.000 exposed=false")
+
+    def test_show_image_records_first_frame_subphases_and_replaces_repeated_render_phase(self) -> None:
+        class _FakeWindow:
+            def __init__(self) -> None:
+                self.ensure_visible_calls = 0
+                self.frames: list[tuple[bytes, int, int]] = []
+
+            def ensure_visible(self) -> None:
+                self.ensure_visible_calls += 1
+
+            def set_frame(self, rgba_bytes: bytes, width: int, height: int) -> None:
+                self.frames.append((rgba_bytes, width, height))
+
+            def frame_telemetry(self) -> str:
+                return "window_kind=qrasterwindow window_px=2x2 frame_px=2x2"
+
+        class _FakeMetrics:
+            def __init__(self, anonymous_kb: int) -> None:
+                self._anonymous_kb = anonymous_kb
+
+            def preferred_anonymous_kb(self) -> int:
+                return self._anonymous_kb
+
+        render_phase_calls: list[dict[str, object]] = []
+        first_frame_calls: list[dict[str, object]] = []
+        tick_calls: list[str] = []
+        anonymous_samples = iter((256 * 1024, 256 * 1024))
+
+        class _FakeStore:
+            def __init__(self, path: Path) -> None:
+                self.path = path
+
+            def record_phase(
+                self,
+                *,
+                label: str,
+                owner_label: str | None = None,
+                owner_detail: str | None = None,
+                replace: bool = False,
+            ) -> object:
+                render_phase_calls.append(
+                    {
+                        "label": label,
+                        "owner_label": owner_label,
+                        "owner_detail": owner_detail,
+                        "replace": replace,
+                    }
+                )
+                return types.SimpleNamespace(
+                    current_metrics=_FakeMetrics(next(anonymous_samples))
+                )
+
+        display = HdmiWaylandDisplay(
+            width=2,
+            height=2,
+            wayland_display="wayland-0",
+            wayland_runtime_dir="/run/user/1000",
+            memory_snapshot_path=Path("/tmp/streaming_memory_segments.json"),
+        )
+        fake_window = _FakeWindow()
+        first_image = Image.new("RGBA", (2, 2), (1, 2, 3, 255))
+        second_image = Image.new("RGBA", (2, 2), (4, 5, 6, 255))
+
+        with mock.patch.object(HdmiWaylandDisplay, "_load_qt", return_value=(object(), object(), object())):
+            with mock.patch.object(HdmiWaylandDisplay, "_ensure_qt_window", return_value=fake_window):
+                with mock.patch("twinr.display.hdmi_wayland._supports_native_raster_window", return_value=True):
+                    with mock.patch(
+                        "twinr.display.hdmi_wayland._record_memory_phase_for_path",
+                        side_effect=lambda path, *, label, owner_label=None, owner_detail=None, replace=False: first_frame_calls.append(
+                            {
+                                "label": label,
+                                "owner_label": owner_label,
+                                "owner_detail": owner_detail,
+                                "replace": replace,
+                            }
+                        ),
+                    ):
+                        with mock.patch("twinr.ops.process_memory.StreamingMemoryAttributionStore", _FakeStore):
+                            with mock.patch.object(HdmiWaylandDisplay, "tick", side_effect=lambda: tick_calls.append("tick")):
+                                display.show_image(first_image)
+                                display.show_image(second_image)
+
+        self.assertEqual(fake_window.ensure_visible_calls, 2)
+        self.assertEqual(len(fake_window.frames), 2)
+        self.assertEqual(tick_calls, ["tick", "tick"])
+        self.assertEqual(
+            [call["label"] for call in first_frame_calls],
+            [
+                "display.hdmi_wayland.first_frame.rgba_bytes_ready",
+                "display.hdmi_wayland.first_frame.window_visible",
+                "display.hdmi_wayland.first_frame.frame_uploaded",
+            ],
+        )
+        self.assertTrue(all(bool(call["replace"]) for call in first_frame_calls))
+        native_calls = [
+            call
+            for call in render_phase_calls
+            if call["label"] == "display.hdmi_wayland.native_window_frame_presented"
+        ]
+        self.assertEqual(len(native_calls), 2)
+        self.assertTrue(all(bool(call["replace"]) for call in native_calls))
+        self.assertIn("frame_px=2x2", str(native_calls[0]["owner_detail"]))
 
     def test_resolve_wayland_socket_prefers_configured_runtime_dir(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):

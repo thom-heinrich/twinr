@@ -1,4 +1,3 @@
-# mypy: disable-error-code=attr-defined
 """Ingress and analysis entry points for the long-term runtime service."""
 
 from __future__ import annotations

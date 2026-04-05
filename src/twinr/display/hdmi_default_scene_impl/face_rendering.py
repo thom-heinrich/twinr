@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 # CHANGELOG: 2026-03-28
 # BUG-1: Guard external eye-state payloads against missing keys / non-numeric values that could crash HDMI rendering.
 # BUG-2: Fix silent misrendering from truthy string booleans (e.g. "False") in blink/lid flags.

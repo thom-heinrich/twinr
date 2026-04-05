@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 # CHANGELOG: 2026-03-28
 # BUG-1: Signal pills could exceed the available row width and render outside the header on narrow boxes or long labels.
 # BUG-2: Header and ticker text could overflow their bounding boxes because width budgeting was not clamped end-to-end.

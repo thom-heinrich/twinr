@@ -26,8 +26,10 @@ services, and checks that they came back healthy.
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -37,7 +39,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol, Sequence, cast
 
 from twinr.ops.deploy_progress import ProgressCallback, emit_deploy_progress, progress_span
 from twinr.ops.pi_repo_mirror import (
@@ -51,6 +53,7 @@ from twinr.ops.pi_runtime_deploy_remote import (
     PiRemoteRepoAttestationResult,
     PiSyncedFileResult,
     PiSystemdServiceState,
+    RetentionCanaryProbeError,
     attest_remote_repo_entries as _attest_remote_repo_entries,
     install_browser_automation_runtime_support as _install_browser_automation_runtime_support,
     install_editable_package as _install_editable_package,
@@ -63,10 +66,16 @@ from twinr.ops.pi_runtime_deploy_remote import (
     run_env_contract_probe as _run_env_contract_probe,
     run_retention_canary_probe as _run_retention_canary_probe,
     sync_authoritative_file as _sync_authoritative_file,
+    wait_for_remote_watchdog_ready as _wait_for_remote_watchdog_ready,
     verify_ops_artifact_permissions as _verify_ops_artifact_permissions,
     verify_runtime_state_permissions as _verify_runtime_state_permissions,
     verify_python_import_contract as _verify_python_import_contract,
     wait_for_services as _wait_for_services,
+)
+from twinr.ops.retention_canary_host_recovery import (
+    diagnose_retention_canary_host_contention as _diagnose_retention_canary_host_contention,
+    retention_canary_host_recovery_eligible as _retention_canary_host_recovery_eligible,
+    stabilize_retention_canary_host as _stabilize_retention_canary_host,
 )
 from twinr.ops.self_coding_pi import load_pi_connection_settings
 
@@ -107,7 +116,7 @@ _PI_RUNTIME_IMPORT_MODULES: tuple[str, ...] = (
     "twinr.memory.longterm.storage._remote_current_records",
     "twinr.memory.longterm.runtime.health",
 )
-_PI_RUNTIME_ATTRIBUTE_CONTRACTS: dict[str, tuple[str, ...]] = {
+_PI_RUNTIME_ATTRIBUTE_CONTRACTS: dict[str, Sequence[str]] = {
     "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
         "observe_attention_stream",
         "observe_attention_from_frame_stream",
@@ -177,6 +186,14 @@ _VERIFY_FATAL_MARKERS: tuple[str, ...] = (
 )
 _REMOTE_ROOT_REBASED_ENV_KEYS: frozenset[str] = frozenset({"TWINR_WORKFLOW_TRACE_DIR"})
 _RETENTION_CANARY_HEARTBEAT_S = 5.0
+_DEFAULT_RETENTION_CANARY_TIMEOUT_S = 900.0
+_RETENTION_CANARY_HOST_RECOVERY_PROBE_TIMEOUT_S = 10.0
+_RETENTION_CANARY_HOST_RECOVERY_SSH_TIMEOUT_S = 180.0
+_RETENTION_CANARY_HOST_RECOVERY_SETTLE_S = 8.0
+_RETENTION_CANARY_HOST_RECOVERY_REPAIR_WAIT_READY_S = 120.0
+_RETENTION_CANARY_HOST_RECOVERY_REPAIR_POLL_INTERVAL_S = 3.0
+_RETENTION_CANARY_POST_REPAIR_WATCHDOG_WAIT_S = 180.0
+_RETENTION_CANARY_POST_REPAIR_WATCHDOG_POLL_INTERVAL_S = 5.0
 
 
 class _MirrorWatchdog(Protocol):
@@ -222,6 +239,12 @@ class PiRuntimeDeployError(RuntimeError):
         self.phase = phase
 
 
+def _utc_now_iso() -> str:
+    """Return the current UTC wall time in the persisted ISO format."""
+
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def deploy_pi_runtime(
     *,
     project_root: str | Path,
@@ -233,6 +256,7 @@ def deploy_pi_runtime(
     remote_env_path: str | None = None,
     timeout_s: float = 180.0,
     service_wait_s: float = 30.0,
+    retention_canary_timeout_s: float = _DEFAULT_RETENTION_CANARY_TIMEOUT_S,
     sync_env: bool = True,
     install_editable: bool = True,
     install_with_deps: bool = False,
@@ -264,6 +288,10 @@ def deploy_pi_runtime(
         remote_env_path: Optional target env path on the Pi.
         timeout_s: Per-subprocess timeout in seconds.
         service_wait_s: Maximum wait time for restarted services to become healthy.
+        retention_canary_timeout_s: Dedicated upper bound for the live
+            retention-canary remote command. This is intentionally separate
+            from ``timeout_s`` because the real canary may legitimately outlive
+            normal per-SSH deploy steps on the Pi.
         sync_env: Whether to overwrite the Pi runtime env file from the leading repo.
         install_editable: Whether to refresh the editable Twinr install in the Pi venv.
         install_with_deps: Whether the editable refresh should also resolve and
@@ -307,6 +335,8 @@ def deploy_pi_runtime(
         raise ValueError("timeout_s must be greater than zero")
     if service_wait_s <= 0:
         raise ValueError("service_wait_s must be greater than zero")
+    if retention_canary_timeout_s <= 0:
+        raise ValueError("retention_canary_timeout_s must be greater than zero")
 
     started = time.monotonic()
     resolved_root = Path(project_root).resolve()
@@ -400,9 +430,12 @@ def deploy_pi_runtime(
                 progress_callback=progress_callback,
             )
             if mirror_watchdog is not None:
-                watchdog = _retarget_mirror_watchdog_project_root(
-                    mirror_watchdog,
-                    project_root=repo_snapshot_root,
+                watchdog = cast(
+                    _MirrorWatchdog,
+                    _retarget_mirror_watchdog_project_root(
+                        mirror_watchdog,
+                        project_root=repo_snapshot_root,
+                    ),
                 )
             else:
                 watchdog = PiRepoMirrorWatchdog.from_env(
@@ -631,10 +664,12 @@ def deploy_pi_runtime(
                 retention_canary_result = _run_phase(
                     "retention_canary",
                     lambda: _run_retention_canary_with_progress(
+                        project_root=resolved_root,
                         remote=remote,
                         remote_root=resolved_remote_root,
                         env_path=env_target,
                         probe_id=f"deploy_retention_canary_{time.time_ns()}",
+                        command_timeout_s=retention_canary_timeout_s,
                         progress_callback=progress_callback,
                     ),
                     progress_callback=progress_callback,
@@ -1103,10 +1138,12 @@ def _rebase_repo_owned_env_path(
 
 def _run_retention_canary_with_progress(
     *,
+    project_root: Path,
     remote: _PiRemoteExecutor,
     remote_root: str,
     env_path: str,
     probe_id: str,
+    command_timeout_s: float,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, object]:
     """Run the retention canary while emitting heartbeat progress for long waits."""
@@ -1116,11 +1153,14 @@ def _run_retention_canary_with_progress(
 
     def _worker() -> None:
         try:
-            result_box["value"] = _run_retention_canary_probe(
+            result_box["value"] = _run_retention_canary_probe_with_host_recovery(
+                project_root=project_root,
                 remote=remote,
                 remote_root=remote_root,
                 env_path=env_path,
                 probe_id=probe_id,
+                command_timeout_s=command_timeout_s,
+                progress_callback=progress_callback,
             )
         except BaseException as exc:  # pragma: no cover - propagated after the worker joins.
             error_box["error"] = exc
@@ -1167,6 +1207,222 @@ def _run_retention_canary_with_progress(
         detail=str(result.get("report_path") or probe_id),
         elapsed_s=time.monotonic() - started,
         extra={"ready": bool(result.get("ready")), "status": str(result.get("status", ""))},
+    )
+    return result
+
+
+def _run_retention_canary_probe_with_host_recovery(
+    *,
+    project_root: Path,
+    remote: _PiRemoteExecutor,
+    remote_root: str,
+    env_path: str,
+    probe_id: str,
+    command_timeout_s: float,
+    progress_callback: ProgressCallback | None,
+) -> dict[str, object]:
+    """Run one canary and recover once when proven host contention is the blocker."""
+
+    try:
+        return _run_retention_canary_probe(
+            remote=remote,
+            remote_root=remote_root,
+            env_path=env_path,
+            probe_id=probe_id,
+            command_timeout_s=command_timeout_s,
+        )
+    except RetentionCanaryProbeError as exc:
+        initial_payload = dict(exc.payload or {})
+        diagnosis = _diagnose_failed_retention_canary_host_contention(
+            project_root=project_root,
+            progress_callback=progress_callback,
+        )
+        if isinstance(diagnosis, dict) and diagnosis:
+            initial_payload["host_contention_diagnosis"] = diagnosis
+        if not _retention_canary_host_recovery_eligible(
+            canary_payload=initial_payload,
+            diagnosis=diagnosis,
+        ):
+            raise RetentionCanaryProbeError(str(exc), payload=initial_payload) from exc
+        stabilization = _stabilize_failed_retention_canary_host(
+            project_root=project_root,
+            progress_callback=progress_callback,
+            diagnosis=diagnosis,
+        )
+        recovery_payload: dict[str, object] = {
+            "attempted": True,
+            "initial_failure": initial_payload,
+            "diagnosis_before": diagnosis,
+            "stabilization": stabilization,
+        }
+        if not bool(stabilization.get("ok")):
+            recovery_payload["retry_skipped"] = "stabilization_not_ok"
+            initial_payload["host_contention_recovery"] = recovery_payload
+            raise RetentionCanaryProbeError(str(exc), payload=initial_payload) from exc
+        if bool(stabilization.get("backend_repair")):
+            watchdog_readiness = _wait_for_post_repair_watchdog_readiness(
+                remote=remote,
+                remote_root=remote_root,
+                env_path=env_path,
+                progress_callback=progress_callback,
+                min_sample_captured_at=_utc_now_iso(),
+            )
+            recovery_payload["post_repair_watchdog_readiness"] = watchdog_readiness
+            if not bool(watchdog_readiness.get("ready")):
+                recovery_payload["retry_skipped"] = "post_repair_watchdog_not_ready"
+                initial_payload["host_contention_recovery"] = recovery_payload
+                raise RetentionCanaryProbeError(
+                    "retention canary recovery repaired the backend, but the Pi watchdog did not "
+                    "publish a fresh ready sample after that repair.",
+                    payload=initial_payload,
+                ) from exc
+        retry_probe_id = f"{probe_id}_after_host_stabilization"
+        try:
+            retry_payload = _run_retention_canary_probe(
+                remote=remote,
+                remote_root=remote_root,
+                env_path=env_path,
+                probe_id=retry_probe_id,
+                command_timeout_s=command_timeout_s,
+            )
+        except RetentionCanaryProbeError as retry_exc:
+            failed_retry_payload = dict(retry_exc.payload or {})
+            recovery_payload["retry_probe_id"] = retry_probe_id
+            failed_retry_payload["host_contention_recovery"] = recovery_payload
+            raise RetentionCanaryProbeError(str(retry_exc), payload=failed_retry_payload) from retry_exc
+        retry_payload = dict(retry_payload)
+        recovery_payload["retry_probe_id"] = retry_probe_id
+        retry_payload["host_contention_recovery"] = recovery_payload
+        return retry_payload
+
+
+def _diagnose_failed_retention_canary_host_contention(
+    *,
+    project_root: Path,
+    progress_callback: ProgressCallback | None,
+) -> dict[str, object] | None:
+    """Return one bounded host-contention diagnosis for a failed canary."""
+
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="start",
+        step="host_contention_diagnosis",
+        detail=str(project_root / ".env.chonkydb"),
+    )
+    try:
+        diagnosis = _diagnose_retention_canary_host_contention(
+            project_root=project_root,
+            probe_timeout_s=_RETENTION_CANARY_HOST_RECOVERY_PROBE_TIMEOUT_S,
+            ssh_timeout_s=_RETENTION_CANARY_HOST_RECOVERY_SSH_TIMEOUT_S,
+        )
+    except Exception as exc:  # pragma: no cover - defensive deploy telemetry.
+        emit_deploy_progress(
+            progress_callback,
+            phase="retention_canary",
+            event="error",
+            step="host_contention_diagnosis",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="end",
+        step="host_contention_diagnosis",
+        detail="contention_detected" if diagnosis.get("contention_detected") else "contention_not_detected",
+        extra={
+            "available": bool(diagnosis.get("available")),
+            "signals": diagnosis.get("contention_signals"),
+        },
+    )
+    return diagnosis
+
+
+def _stabilize_failed_retention_canary_host(
+    *,
+    project_root: Path,
+    progress_callback: ProgressCallback | None,
+    diagnosis: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Run one bounded host-recovery attempt for retention-canary recovery."""
+
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="start",
+        step="host_contention_stabilization",
+        detail=str(project_root / ".env.chonkydb"),
+    )
+    result = _stabilize_retention_canary_host(
+        project_root=project_root,
+        probe_timeout_s=_RETENTION_CANARY_HOST_RECOVERY_PROBE_TIMEOUT_S,
+        ssh_timeout_s=_RETENTION_CANARY_HOST_RECOVERY_SSH_TIMEOUT_S,
+        settle_s=_RETENTION_CANARY_HOST_RECOVERY_SETTLE_S,
+        repair_wait_ready_s=_RETENTION_CANARY_HOST_RECOVERY_REPAIR_WAIT_READY_S,
+        repair_poll_interval_s=_RETENTION_CANARY_HOST_RECOVERY_REPAIR_POLL_INTERVAL_S,
+        diagnosis=diagnosis,
+    )
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="end",
+        step="host_contention_stabilization",
+        detail=str(result.get("diagnosis") or ""),
+        extra={
+            "ok": bool(result.get("ok")),
+            "backend_repair": bool(result.get("backend_repair")),
+        },
+    )
+    return result
+
+
+def _wait_for_post_repair_watchdog_readiness(
+    *,
+    remote: _PiRemoteExecutor,
+    remote_root: str,
+    env_path: str,
+    progress_callback: ProgressCallback | None,
+    min_sample_captured_at: str,
+) -> dict[str, object]:
+    """Wait until the Pi watchdog republishes a fresh ready sample."""
+
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="start",
+        step="post_repair_watchdog_readiness",
+        detail=min_sample_captured_at,
+    )
+    try:
+        result = _wait_for_remote_watchdog_ready(
+            remote=remote,
+            remote_root=remote_root,
+            env_path=env_path,
+            min_sample_captured_at=min_sample_captured_at,
+            wait_timeout_s=_RETENTION_CANARY_POST_REPAIR_WATCHDOG_WAIT_S,
+            poll_interval_s=_RETENTION_CANARY_POST_REPAIR_WATCHDOG_POLL_INTERVAL_S,
+        )
+    except Exception as exc:
+        emit_deploy_progress(
+            progress_callback,
+            phase="retention_canary",
+            event="error",
+            step="post_repair_watchdog_readiness",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    emit_deploy_progress(
+        progress_callback,
+        phase="retention_canary",
+        event="end",
+        step="post_repair_watchdog_readiness",
+        detail=str(result.get("detail") or ""),
+        extra={
+            "ready": bool(result.get("ready")),
+            "sample_captured_at": result.get("sample_captured_at"),
+            "sample_fresh_after_gate": result.get("sample_fresh_after_gate"),
+        },
     )
     return result
 

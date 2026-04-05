@@ -1,6 +1,5 @@
 """Snapshot IO, validation, and remote mirroring for structured memory state."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 
@@ -714,7 +713,7 @@ class StructuredStoreSnapshotMixin:
                 elif snapshot_kind in {"objects", "archive"}:
                     resolved_payload = self._resolve_sharded_snapshot_payload(
                         snapshot_kind=snapshot_kind,
-                        payload=raw_payload,
+                        payload=dict(raw_payload) if isinstance(raw_payload, Mapping) else None,
                     )
                     candidate = resolved_payload if resolved_payload is not None else raw_payload
                     self._maybe_migrate_remote_catalog(
@@ -922,12 +921,17 @@ class StructuredStoreSnapshotMixin:
                 raise LongTermRemoteUnavailableError(
                     detail or f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
                 )
+            if head_status == "invalid":
+                repair_invalid_head = getattr(remote_catalog, "repair_invalid_current_head_from_segment_uris", None)
+                if callable(repair_invalid_head):
+                    repair_invalid_head(snapshot_kind=snapshot_kind)
+                    return True
             if self._remote_is_required() and head_status in {"invalid", "unavailable"}:
                 raise LongTermRemoteUnavailableError(
                     f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
                 )
             local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
-            payload = local_payload if local_payload is not None else dict(empty_payload)
+            payload: dict[str, object] = local_payload if local_payload is not None else dict(empty_payload)
             self._persist_snapshot_payload(
                 snapshot_kind=snapshot_kind,
                 local_path=local_path,
@@ -936,11 +940,14 @@ class StructuredStoreSnapshotMixin:
             return True
         if self._remote_snapshot_exists_via_probe(snapshot_kind=snapshot_kind):
             return False
-        payload = self._load_remote_snapshot_payload(snapshot_kind=snapshot_kind, compatibility_only=True)
+        remote_payload: dict[str, object] | None = self._load_remote_snapshot_payload(
+            snapshot_kind=snapshot_kind,
+            compatibility_only=True,
+        )
         local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
-        if payload is None:
-            payload = self._load_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
-        if payload is None:
+        if remote_payload is None:
+            remote_payload = self._load_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+        if remote_payload is None:
             if self._remote_is_required():
                 if local_payload is None:
                     self._persist_snapshot_payload(
@@ -961,7 +968,7 @@ class StructuredStoreSnapshotMixin:
                 payload=empty_payload,
             )
             return True
-        if self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=payload):
+        if self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=remote_payload):
             return False
         raise ValueError(f"Remote structured snapshot {snapshot_kind!r} has an invalid schema.")
 
@@ -994,6 +1001,11 @@ class StructuredStoreSnapshotMixin:
                 head_payload = head_probe(snapshot_kind=snapshot_kind)
             if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
                 return False
+            if head_status == "invalid":
+                repair_invalid_head = getattr(remote_catalog, "repair_invalid_current_head_from_segment_uris", None)
+                if callable(repair_invalid_head):
+                    repair_invalid_head(snapshot_kind=snapshot_kind)
+                    return True
             if head_status in {"invalid", "unavailable"}:
                 raise LongTermRemoteUnavailableError(
                     f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
@@ -1089,7 +1101,7 @@ class StructuredStoreSnapshotMixin:
         if not callable(load_snapshot):
             return None
         try:
-            parameters = inspect.signature(load_snapshot).parameters
+            parameters: Mapping[str, inspect.Parameter] = inspect.signature(load_snapshot).parameters
         except (TypeError, ValueError):
             parameters = {}
         kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
@@ -1113,7 +1125,7 @@ class StructuredStoreSnapshotMixin:
         if not callable(probe_loader):
             return None
         try:
-            parameters = inspect.signature(probe_loader).parameters
+            parameters: Mapping[str, inspect.Parameter] = inspect.signature(probe_loader).parameters
         except (TypeError, ValueError):
             parameters = {}
         kwargs: dict[str, object] = {
@@ -1248,7 +1260,7 @@ class StructuredStoreSnapshotMixin:
         self,
         *,
         snapshot_kind: str,
-        payload: dict[str, object] | None,
+        payload: Mapping[str, object] | None,
     ) -> dict[str, object] | None:
         if payload is None:
             return None
@@ -1376,6 +1388,7 @@ class StructuredStoreSnapshotMixin:
                     item_id_getter=lambda item: self._remote_item_id_for_payload(snapshot_kind=snapshot_kind, payload=item),
                     metadata_builder=lambda item: self._remote_item_metadata(snapshot_kind=snapshot_kind, payload=item),
                     content_builder=lambda item: self._remote_item_search_text(snapshot_kind=snapshot_kind, payload=item),
+                    replace_invalid_current_head=True,
                     skip_async_document_id_wait=True,
                 )
                 if isinstance(payload.get(_SNAPSHOT_WRITTEN_AT_KEY), str):

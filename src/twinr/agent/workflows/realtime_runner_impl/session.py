@@ -9,7 +9,6 @@
 
 """Session and trigger orchestration for the realtime workflow loop."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 
@@ -38,6 +37,7 @@ from twinr.agent.workflows.voice_turn_latency import (
 )
 from twinr.hardware.audio import AmbientAudioSampler
 from twinr.hardware.buttons import ButtonAction
+from twinr.ops.streaming_memory_probe import StreamingMemoryProbe
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 from twinr.proactive import SocialTriggerDecision
@@ -119,6 +119,48 @@ class TwinrRealtimeSessionMixin:
             minimum=0.0,
             maximum=1.0,
         )
+
+    def _streaming_memory_probe(
+        self,
+        key: str,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+    ) -> StreamingMemoryProbe:
+        probes = getattr(self, "_streaming_memory_probes", None)
+        if not isinstance(probes, dict):
+            probes = {}
+            self._streaming_memory_probes = probes
+        probe = probes.get(key)
+        if not isinstance(probe, StreamingMemoryProbe):
+            probe = StreamingMemoryProbe.from_config(
+                getattr(self, "config", None),
+                label=label,
+                owner_label=owner_label,
+                owner_detail=owner_detail,
+            )
+            probes[key] = probe
+        return probe
+
+    def _record_streaming_memory_probe(
+        self,
+        key: str,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+        force: bool = False,
+    ) -> None:
+        try:
+            self._streaming_memory_probe(
+                key,
+                label=label,
+                owner_label=owner_label,
+                owner_detail=owner_detail,
+            ).maybe_record(force=force)
+        except Exception:
+            return
 
     def _required_remote_refresh_min_interval_seconds(self) -> float:
         return self._float_config(
@@ -396,14 +438,44 @@ class TwinrRealtimeSessionMixin:
         if self.print_lane.is_busy():
             return False
         if self._maybe_deliver_due_reminder():
+            self._record_streaming_memory_probe(
+                "housekeeping.reminders",
+                label="realtime_housekeeping.reminders",
+                owner_label="realtime_housekeeping.reminders",
+                owner_detail="Realtime housekeeping delivered a due reminder.",
+            )
             return True
         if self._maybe_run_due_automation():
+            self._record_streaming_memory_probe(
+                "housekeeping.automation",
+                label="realtime_housekeeping.automation",
+                owner_label="realtime_housekeeping.automation",
+                owner_detail="Realtime housekeeping ran a due automation cycle.",
+            )
             return True
         if self._maybe_run_sensor_automation():
+            self._record_streaming_memory_probe(
+                "housekeeping.sensor_automation",
+                label="realtime_housekeeping.sensor_automation",
+                owner_label="realtime_housekeeping.sensor_automation",
+                owner_detail="Realtime housekeeping ran sensor-triggered automation work.",
+            )
             return True
         if self._maybe_run_long_term_memory_proactive():
+            self._record_streaming_memory_probe(
+                "housekeeping.long_term_proactive",
+                label="realtime_housekeeping.long_term_proactive",
+                owner_label="realtime_housekeeping.long_term_proactive",
+                owner_detail="Realtime housekeeping ran long-term-memory proactive work.",
+            )
             return True
         if self._maybe_run_nightly_orchestration():
+            self._record_streaming_memory_probe(
+                "housekeeping.nightly",
+                label="realtime_housekeeping.nightly",
+                owner_label="realtime_housekeeping.nightly",
+                owner_detail="Realtime housekeeping ran nightly orchestration work.",
+            )
             return True
         return False
 

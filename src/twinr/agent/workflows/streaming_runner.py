@@ -24,7 +24,7 @@ import stat
 import tempfile
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.follow_up_context import (
@@ -67,6 +67,7 @@ from twinr.agent.workflows.streaming_turn_coordinator import (
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
 from twinr.agent.workflows.voice_turn_latency import emit_voice_turn_latency_breakdown
 from twinr.hardware.audio import SilenceDetectedRecorder
+from twinr.ops.process_memory import record_streaming_memory_phase_best_effort
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import (
     OpenAIBackend,
@@ -124,6 +125,23 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         }
     )
 
+    @staticmethod
+    def _record_constructor_memory_phase(
+        config: TwinrConfig,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+    ) -> None:
+        """Attach one best-effort constructor checkpoint to the streaming PID snapshot."""
+
+        record_streaming_memory_phase_best_effort(
+            config,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+        )
+
     def __init__(
         self,
         config: TwinrConfig,
@@ -144,6 +162,12 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._supervisor_cache_prewarmed = False
         self._first_word_cache_prewarmed = False
 
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.constructor_entered",
+            owner_label="streaming_loop.hardware_loop.constructor",
+            owner_detail="TwinrStreamingHardwareLoop constructor entered before runtime dependency resolution.",
+        )
         resolved_dependencies = self._resolve_runtime_dependencies(
             config=config,
             tool_agent_provider=tool_agent_provider,
@@ -156,6 +180,12 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._managed_components = resolved_dependencies.managed_components
         if resolved_tool_agent is None:
             raise ValueError("TwinrStreamingHardwareLoop requires a tool-capable agent provider")
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.dependencies_resolved",
+            owner_label="streaming_loop.hardware_loop.dependencies",
+            owner_detail="TwinrStreamingHardwareLoop resolved its runtime dependency bundle and managed-component map.",
+        )
 
         super().__init__(
             config,
@@ -169,11 +199,23 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             verification_stt_provider=verifier_provider,
             **kwargs,
         )
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.super_init_ready",
+            owner_label="streaming_loop.hardware_loop.super_init",
+            owner_detail="TwinrStreamingHardwareLoop finished the shared realtime bootstrap super().__init__ path.",
+        )
         self.tool_agent_provider = resolved_tool_agent
         self.verification_stt_provider = verifier_provider
         tool_schemas = self._build_runtime_tool_schemas()
         self.streaming_turn_loop = streaming_turn_loop or self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
+        )
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.turn_loop_ready",
+            owner_label="streaming_loop.hardware_loop.turn_loop",
+            owner_detail="TwinrStreamingHardwareLoop built the streaming turn loop and runtime tool schemas.",
         )
         self.first_word_provider: FirstWordProvider | None = getattr(self, "first_word_provider", None)
         self._streaming_capture = StreamingCaptureController(self)
@@ -181,6 +223,12 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._streaming_lane_planner = StreamingLanePlanner(self)
         self._streaming_semantic_router = StreamingSemanticRouterRuntime(self)
         self._schedule_speculative_warmups()
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.streaming_features_ready",
+            owner_label="streaming_loop.hardware_loop.streaming_features",
+            owner_detail="TwinrStreamingHardwareLoop finished capture/speculation/lane/router startup and scheduled speculative warmups.",
+        )
         self._trace_event(
             "streaming_workflow_initialized",
             kind="run_start",
@@ -785,6 +833,9 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         with self._speculation_lock:
             self._streaming_speculation.maybe_start_supervisor_decision(text)
 
+    def _maybe_start_local_semantic_router_warmup(self, text: str) -> None:
+        self._streaming_semantic_router.maybe_start_warmup(text)
+
     def _maybe_start_speculative_long_term_context(
         self,
         text: str,
@@ -797,8 +848,12 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         prewarm_provider_context = getattr(long_term_memory, "prewarm_provider_context", None)
         if not callable(prewarm_provider_context):
             return
+        prewarm_provider_context_fn = cast(Callable[..., object], prewarm_provider_context)
+        # Pylint does not narrow through the callable() guard on this getattr()-resolved hook.
+        # The runtime contract here is intentional and already checked above.
+        # pylint: disable=not-callable
         try:
-            scheduled = prewarm_provider_context(
+            scheduled = prewarm_provider_context_fn(
                 text,
                 rewrite_query=final_transcript,
                 sticky=False,
@@ -815,6 +870,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 },
             )
             return
+        # pylint: enable=not-callable
         self._trace_event(
             "streaming_speculative_longterm_context_requested",
             kind="cache",

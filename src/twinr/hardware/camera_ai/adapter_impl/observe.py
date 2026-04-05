@@ -9,7 +9,6 @@
 # IMP-2: Public entrypoints now attach richer fast-path degradation detail so operators can distinguish local-camera, helper-frame, and RGB-degraded outcomes.
 # IMP-3: Failure cleanup and health propagation are centralized to match 2026 edge-AI graceful-degradation expectations on resource-constrained embodied systems.
 
-# mypy: disable-error-code=attr-defined
 """Public observation entrypoints for the local AI-camera adapter."""
 
 from __future__ import annotations

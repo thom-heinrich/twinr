@@ -55,14 +55,14 @@ def _default_emit(line: str) -> None:
 
 def _default_lock_factory(config: TwinrConfig, loop_name: str) -> object:
     """Build the loop-instance lock object for a display loop."""
-    from twinr.ops import loop_instance_lock
+    from twinr.ops.locks import loop_instance_lock
 
     return loop_instance_lock(config, loop_name)
 
 
 def _default_lock_owner(config: TwinrConfig, loop_name: str) -> int | None:
     """Return the PID that currently owns the display-loop lock."""
-    from twinr.ops import loop_lock_owner
+    from twinr.ops.locks import loop_lock_owner
 
     return loop_lock_owner(config, loop_name)
 
@@ -81,6 +81,30 @@ def _safe_emit(emit: EmitFn, line: str) -> None:
         return
     try:
         emit(safe_line)
+    except Exception:
+        return
+
+
+def _record_memory_phase(
+    config: TwinrConfig,
+    *,
+    label: str,
+    owner_label: str | None = None,
+    owner_detail: str | None = None,
+    replace: bool = False,
+) -> None:
+    """Best-effort bridge into the shared streaming-memory attribution store."""
+
+    try:
+        from twinr.ops.process_memory import record_streaming_memory_phase
+
+        record_streaming_memory_phase(
+            config,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            replace=replace,
+        )
     except Exception:
         return
 
@@ -338,6 +362,13 @@ def optional_display_companion(
             loop.stop_requested = lambda: stop_event.is_set() or bool(original_stop_requested())
             started_event.set()
             state["status"] = "started"
+            _record_memory_phase(
+                config,
+                label="display_companion.thread_started",
+                owner_label="display_companion.thread",
+                owner_detail="Display companion thread acquired the display-loop lock and entered loop.run().",
+                replace=True,
+            )
             loop.run()
             state["status"] = "stopped"
         finally:

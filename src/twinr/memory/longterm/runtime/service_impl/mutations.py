@@ -1,4 +1,3 @@
-# mypy: disable-error-code=attr-defined
 """Mutation and review entry points for the long-term runtime service."""
 
 from __future__ import annotations

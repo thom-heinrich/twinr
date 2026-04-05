@@ -9,7 +9,6 @@
 # IMP-3: Added bounded rounded-mask image placement and fallback placeholders to keep reserve rendering deterministic on constrained HDMI scenes.
 # BREAKING: Oversized or unsupported inline images are now rejected and render a placeholder instead of being forwarded blindly to downstream decoders.
 
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 """Reserve-panel rendering helpers for the default HDMI scene."""
 
 from __future__ import annotations

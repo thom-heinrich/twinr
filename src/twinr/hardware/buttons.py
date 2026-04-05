@@ -8,6 +8,7 @@
 # IMP-1: CLI fallback is now event-driven via gpiomon when available, replacing high-rate gpioget subprocess polling on Raspberry Pi-class hardware.
 # IMP-2: modern libgpiod requests now configure kernel event buffers and detect sequence gaps so event loss becomes visible and the state cache is re-synced.
 # IMP-3: CLI fallback supports both libgpiod v1.6-style positional chip syntax and v2-style named options for gpioget/gpiomon.
+# BUG-5: gpiomon CLI helpers now inherit a Linux parent-death guard so aborted SSH/sudo runs cannot leave orphan GPIO owners behind.
 
 """Monitor Twinr GPIO buttons across libgpiod and CLI fallback backends.
 
@@ -18,9 +19,12 @@ logic.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import ctypes
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
+import os
 from pathlib import Path
 from queue import Empty, Full, Queue
 from shutil import which
@@ -28,6 +32,7 @@ from threading import Event as ThreadEvent, Lock, Thread
 from typing import Iterator
 import logging
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -69,6 +74,23 @@ _TRUSTED_CLI_TOOL_DIRS = (
     Path("/usr/local/bin"),
     Path("/usr/local/sbin"),
 )
+_PR_SET_PDEATHSIG = 1
+_PARENT_DEATH_SIGNAL = signal.SIGTERM
+
+
+def _load_prctl_libc() -> ctypes.CDLL | None:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    prctl = getattr(libc, "prctl", None)
+    if prctl is None:
+        return None
+    prctl.restype = ctypes.c_int
+    return libc
+
+
+_PRCTL_LIBC = _load_prctl_libc()
 
 
 def _is_trusted_cli_path(path: str) -> bool:
@@ -77,6 +99,26 @@ def _is_trusted_cli_path(path: str) -> bool:
     except OSError:
         return False
     return resolved_parent in _TRUSTED_CLI_TOOL_DIRS
+
+
+def _build_parent_death_signal_preexec(expected_parent_pid: int) -> Callable[[], None] | None:
+    """Return a Linux-only pre-exec hook that terminates the child when its parent dies."""
+
+    if sys.platform != "linux" or _PRCTL_LIBC is None:
+        return None
+
+    def _preexec() -> None:
+        libc = _PRCTL_LIBC
+        if libc is None:  # pragma: no cover - child inherits the ready global.
+            return
+        ctypes.set_errno(0)
+        if libc.prctl(_PR_SET_PDEATHSIG, _PARENT_DEATH_SIGNAL, 0, 0, 0) != 0:
+            errno_value = ctypes.get_errno() or 0
+            raise OSError(errno_value, "prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != expected_parent_pid:
+            os.kill(os.getpid(), _PARENT_DEATH_SIGNAL)
+
+    return _preexec
 
 
 class ButtonAction(StrEnum):
@@ -1202,14 +1244,25 @@ class GpioButtonMonitor:
         return process
 
     def _launch_gpiomon_process(self, command: list[str]) -> subprocess.Popen[str]:
+        parent_death_signal_preexec = _build_parent_death_signal_preexec(os.getpid())
         try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
+            if parent_death_signal_preexec is None:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            else:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    preexec_fn=parent_death_signal_preexec,
+                )
         except OSError as exc:
             raise RuntimeError("Unable to execute gpiomon for GPIO button monitoring") from exc
 

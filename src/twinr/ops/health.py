@@ -1,3 +1,14 @@
+# CHANGELOG: 2026-04-04
+# BUG-1: Fixed memory-health flapping around the low-headroom boundary. A single
+# near-threshold `MemAvailable` sample no longer flips the visible system state
+# between warn/fail; de-escalation now requires both real recovery headroom and
+# a bounded hold period.
+# BUG-2: Memory-health classification now clears fail/warn only after explicit
+# recovery margins, so transient reclaim jitter on a Pi does not oscillate the
+# operator display while the runtime itself stays healthy.
+# BUG-3: Swap saturation now contributes to degraded memory health. A Pi with
+# fully-consumed swap no longer reports `ok` just because `MemAvailable` happens
+# to rebound slightly above the raw warning threshold.
 # CHANGELOG: 2026-03-30
 # BUG-1: Fixed the degraded-mode process probe. The old `pgrep -af` fallback
 # expected a `pid ppid cmd` layout even though `pgrep -af` emits `pid cmd`, and
@@ -41,6 +52,7 @@ import socket
 import subprocess
 import threading
 import time
+from typing import cast
 import warnings
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -48,6 +60,7 @@ from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
+from twinr.ops.process_memory import load_current_streaming_memory_snapshot
 
 try:
     import psutil as _psutil  # type: ignore[import-not-found]  # pylint: disable=import-error
@@ -66,6 +79,12 @@ _MEMORY_WARN_AVAILABLE_MB = 512
 _MEMORY_FAIL_AVAILABLE_MB = 256
 _MEMORY_WARN_USED_PERCENT = 80.0
 _MEMORY_FAIL_USED_PERCENT = 90.0
+_MEMORY_WARN_RECOVERY_AVAILABLE_MB = 640
+_MEMORY_FAIL_RECOVERY_AVAILABLE_MB = 384
+_MEMORY_WARN_RECOVERY_USED_PERCENT = 72.0
+_MEMORY_FAIL_RECOVERY_USED_PERCENT = 84.0
+_MEMORY_RECOVERY_HOLD_SECONDS = 20.0
+_SWAP_WARN_USED_PERCENT = 50.0
 _DISK_WARN_USED_PERCENT = 85.0
 _DISK_FAIL_USED_PERCENT = 95.0
 _CPU_TEMPERATURE_WARN_C = 80.0
@@ -105,9 +124,15 @@ _SERVICE_SPECS = (
     ("runtime_supervisor", "Runtime supervisor", ("--run-runtime-supervisor",)),
     ("display", "Display loop", ("--run-display-loop",)),
 )
+_STATUS_SEVERITY = {
+    None: 0,
+    "warn": 1,
+    "fail": 2,
+}
 _CACHE_LOCK = threading.RLock()
 _PROCESS_CACHE: "_TimedCache | None" = None
 _PI_STATE_CACHE: "_TimedCache | None" = None
+_MEMORY_STATUS_CACHE: "_MemoryPressureHysteresisState | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +167,13 @@ class TwinrSystemHealth:
     swap_total_mb: int | None = None
     swap_used_mb: int | None = None
     swap_used_percent: float | None = None
+    memory_pressure_status: str | None = None
+    memory_owner_label: str | None = None
+    memory_owner_detail: str | None = None
+    memory_owner_rss_mb: int | None = None
+    memory_owner_anonymous_mb: int | None = None
+    memory_owner_rss_delta_mb: int | None = None
+    memory_owner_anonymous_delta_mb: int | None = None
     disk_total_gb: float | None = None
     disk_free_gb: float | None = None
     disk_used_percent: float | None = None
@@ -203,6 +235,13 @@ class _PiThrottledState:
 class _TimedCache:
     captured_monotonic: float
     value: object
+
+
+@dataclass(slots=True)
+class _MemoryPressureHysteresisState:
+    active_status: str | None = None
+    pending_status: str | None = None
+    pending_since_monotonic: float | None = None
 
 
 def collect_system_health(
@@ -267,6 +306,14 @@ def collect_system_health(
 
     pi_state = _read_pi_throttled_state()
     cpu_temperature_c = _read_cpu_temperature_c()
+    (
+        memory_owner_label,
+        memory_owner_detail,
+        memory_owner_rss_mb,
+        memory_owner_anonymous_mb,
+        memory_owner_rss_delta_mb,
+        memory_owner_anonymous_delta_mb,
+    ) = _read_streaming_memory_owner(config)
 
     status = "ok"
     if not recent_errors_ok or not service_probe_ok or not project_root_ok:
@@ -289,6 +336,8 @@ def collect_system_health(
         memory_available_mb=memory_available_mb,
         memory_used_percent=memory_used_percent,
         memory_pressure_full_10s_pct=memory_pressure_full_10s_pct,
+        swap_total_mb=swap_total_mb,
+        swap_used_percent=swap_used_percent,
     )
     if memory_status is not None:
         status = _escalate_status(status, memory_status)
@@ -328,6 +377,13 @@ def collect_system_health(
         swap_total_mb=swap_total_mb,
         swap_used_mb=swap_used_mb,
         swap_used_percent=swap_used_percent,
+        memory_pressure_status=memory_status,
+        memory_owner_label=memory_owner_label,
+        memory_owner_detail=memory_owner_detail,
+        memory_owner_rss_mb=memory_owner_rss_mb,
+        memory_owner_anonymous_mb=memory_owner_anonymous_mb,
+        memory_owner_rss_delta_mb=memory_owner_rss_delta_mb,
+        memory_owner_anonymous_delta_mb=memory_owner_anonymous_delta_mb,
         disk_total_gb=disk_total_gb,
         disk_free_gb=disk_free_gb,
         disk_used_percent=disk_used_percent,
@@ -440,11 +496,59 @@ def _read_memory() -> tuple[int | None, int | None, float | None, int | None, in
     )
 
 
+def _read_streaming_memory_owner(
+    config: TwinrConfig,
+) -> tuple[str | None, str | None, int | None, int | None, int | None, int | None]:
+    """Return the latest live streaming-memory owner summary when available."""
+
+    owner_pid = loop_lock_owner(config, "streaming-loop")
+    owner_pid_int = _normalize_optional_int(owner_pid)
+    if owner_pid_int is None:
+        return (None, None, None, None, None, None)
+    snapshot = load_current_streaming_memory_snapshot(config, expected_pid=owner_pid_int)
+    if snapshot is None:
+        return (None, None, None, None, None, None)
+    current_metrics = snapshot.current_metrics
+    preferred_rss_kb = current_metrics.preferred_rss_kb()
+    preferred_anonymous_kb = current_metrics.preferred_anonymous_kb()
+    return (
+        _normalize_optional_text(snapshot.owner_label),
+        _normalize_optional_text(snapshot.owner_detail),
+        _kb_to_mb(preferred_rss_kb),
+        _kb_to_mb(preferred_anonymous_kb),
+        _kb_to_mb(snapshot.owner_rss_delta_kb),
+        _kb_to_mb(snapshot.owner_anonymous_delta_kb),
+    )
+
+
+def _kb_to_mb(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(round(value / 1024.0)))
+
+
+def _normalize_optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def assess_memory_pressure_status(
     *,
     memory_available_mb: int | None,
     memory_used_percent: float | None,
     memory_pressure_full_10s_pct: float | None = None,
+    swap_total_mb: int | None = None,
+    swap_used_percent: float | None = None,
 ) -> str | None:
     """Classify memory pressure for operator-facing health surfaces.
 
@@ -456,24 +560,149 @@ def assess_memory_pressure_status(
     outrank raw capacity percentages.
     """
 
-    pressure_status = _assess_pressure_status(memory_pressure_full_10s_pct)
-    if pressure_status is not None:
-        return pressure_status
+    candidate_status = _assess_memory_pressure_candidate(
+        memory_available_mb=memory_available_mb,
+        memory_used_percent=memory_used_percent,
+        memory_pressure_full_10s_pct=memory_pressure_full_10s_pct,
+        swap_total_mb=swap_total_mb,
+        swap_used_percent=swap_used_percent,
+    )
+    return _stabilize_memory_pressure_status(
+        candidate_status=candidate_status,
+        memory_available_mb=memory_available_mb,
+        memory_used_percent=memory_used_percent,
+    )
+
+
+def _assess_memory_pressure_candidate(
+    *,
+    memory_available_mb: int | None,
+    memory_used_percent: float | None,
+    memory_pressure_full_10s_pct: float | None = None,
+    swap_total_mb: int | None = None,
+    swap_used_percent: float | None = None,
+) -> str | None:
+    """Return the raw current-sample memory status before hysteresis."""
+
+    candidate_status = _assess_pressure_status(memory_pressure_full_10s_pct)
 
     if memory_available_mb is not None:
         if memory_available_mb <= _MEMORY_FAIL_AVAILABLE_MB:
-            return "fail"
-        if memory_available_mb <= _MEMORY_WARN_AVAILABLE_MB:
-            return "warn"
-        return None
+            candidate_status = _escalate_status(candidate_status or "ok", "fail")
+        elif memory_available_mb <= _MEMORY_WARN_AVAILABLE_MB:
+            candidate_status = _escalate_status(candidate_status or "ok", "warn")
+    elif memory_used_percent is not None:
+        if memory_used_percent >= _MEMORY_FAIL_USED_PERCENT:
+            candidate_status = _escalate_status(candidate_status or "ok", "fail")
+        elif memory_used_percent >= _MEMORY_WARN_USED_PERCENT:
+            candidate_status = _escalate_status(candidate_status or "ok", "warn")
 
-    if memory_used_percent is None:
+    swap_status = _assess_swap_pressure_status(
+        swap_total_mb=swap_total_mb,
+        swap_used_percent=swap_used_percent,
+    )
+    if swap_status is not None:
+        candidate_status = _escalate_status(candidate_status or "ok", swap_status)
+    return candidate_status
+
+
+def _assess_swap_pressure_status(
+    *,
+    swap_total_mb: int | None,
+    swap_used_percent: float | None,
+) -> str | None:
+    """Treat sustained swap saturation as degraded memory health on Pi hosts."""
+
+    if swap_total_mb is None or swap_total_mb <= 0:
         return None
-    if memory_used_percent >= _MEMORY_FAIL_USED_PERCENT:
-        return "fail"
-    if memory_used_percent >= _MEMORY_WARN_USED_PERCENT:
+    if swap_used_percent is None:
+        return None
+    if swap_used_percent >= _SWAP_WARN_USED_PERCENT:
         return "warn"
     return None
+
+
+def _stabilize_memory_pressure_status(
+    *,
+    candidate_status: str | None,
+    memory_available_mb: int | None,
+    memory_used_percent: float | None,
+) -> str | None:
+    """Apply bounded hysteresis so near-threshold memory jitter does not flap."""
+
+    observed_monotonic = time.monotonic()
+    with _CACHE_LOCK:
+        global _MEMORY_STATUS_CACHE  # noqa: PLW0603 - module cache is the shared health stabilizer.
+        state = _MEMORY_STATUS_CACHE
+        if state is None:
+            state = _MemoryPressureHysteresisState()
+            _MEMORY_STATUS_CACHE = state
+
+        active_status = state.active_status
+        if _status_severity(candidate_status) > _status_severity(active_status):
+            state.active_status = candidate_status
+            state.pending_status = None
+            state.pending_since_monotonic = None
+            return state.active_status
+
+        if candidate_status == active_status:
+            state.pending_status = None
+            state.pending_since_monotonic = None
+            return state.active_status
+
+        if not _memory_recovery_margin_satisfied(
+            active_status=active_status,
+            memory_available_mb=memory_available_mb,
+            memory_used_percent=memory_used_percent,
+        ):
+            state.pending_status = None
+            state.pending_since_monotonic = None
+            return state.active_status
+
+        if state.pending_status != candidate_status:
+            state.pending_status = candidate_status
+            state.pending_since_monotonic = observed_monotonic
+            return state.active_status
+
+        pending_since = state.pending_since_monotonic
+        if pending_since is None:
+            state.pending_since_monotonic = observed_monotonic
+            return state.active_status
+
+        if (observed_monotonic - pending_since) < _MEMORY_RECOVERY_HOLD_SECONDS:
+            return state.active_status
+
+        state.active_status = candidate_status
+        state.pending_status = None
+        state.pending_since_monotonic = None
+        return state.active_status
+
+
+def _memory_recovery_margin_satisfied(
+    *,
+    active_status: str | None,
+    memory_available_mb: int | None,
+    memory_used_percent: float | None,
+) -> bool:
+    """Return whether the current sample has enough headroom to clear a prior state."""
+
+    if active_status == "fail":
+        if memory_available_mb is not None:
+            return memory_available_mb >= _MEMORY_FAIL_RECOVERY_AVAILABLE_MB
+        if memory_used_percent is not None:
+            return memory_used_percent <= _MEMORY_FAIL_RECOVERY_USED_PERCENT
+        return False
+    if active_status == "warn":
+        if memory_available_mb is not None:
+            return memory_available_mb >= _MEMORY_WARN_RECOVERY_AVAILABLE_MB
+        if memory_used_percent is not None:
+            return memory_used_percent <= _MEMORY_WARN_RECOVERY_USED_PERCENT
+        return False
+    return True
+
+
+def _status_severity(status: str | None) -> int:
+    return _STATUS_SEVERITY.get(status, 0)
 
 
 def _assess_pressure_status(pressure_avg10_pct: float | None) -> str | None:
@@ -667,7 +896,7 @@ def _get_cached_process_entries() -> tuple[_ProcessEntry, ...] | None:
     with _CACHE_LOCK:
         cache = _PROCESS_CACHE
         if cache is not None and (now - cache.captured_monotonic) <= _PROCESS_CACHE_TTL_SECONDS:
-            return cache.value
+            return cast(tuple[_ProcessEntry, ...], cache.value)
 
     entries = _list_process_entries()
     if entries is None:
@@ -1024,7 +1253,7 @@ def _read_pi_throttled_state() -> _PiThrottledState:
     with _CACHE_LOCK:
         cache = _PI_STATE_CACHE
         if cache is not None and (now - cache.captured_monotonic) <= _PI_STATE_CACHE_TTL_SECONDS:
-            return cache.value
+            return cast(_PiThrottledState, cache.value)
 
     state = _probe_pi_throttled_state()
     with _CACHE_LOCK:

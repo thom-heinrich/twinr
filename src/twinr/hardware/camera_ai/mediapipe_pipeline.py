@@ -566,10 +566,10 @@ class MediaPipeVisionPipeline:
                     ("custom ROI gesture recognizer", self._custom_roi_gesture_recognizer),
                 ):
                     close_method = getattr(task, "close", None)
-                    if close_method is None:
+                    if not callable(close_method):
                         continue
                     try:
-                        close_method()
+                        close_method()  # pylint: disable=not-callable
                     except Exception:
                         logger.exception("Failed to close %s cleanly", task_name)
 
@@ -886,9 +886,10 @@ class MediaPipeVisionPipeline:
         if gesture_recognizer is not None:
             try:
                 builtin_choice = resolve_fine_hand_gesture(
-                    result=gesture_recognizer.recognize_for_video(
-                        image,
-                        timestamp_ms,
+                    result=self._runtime.gesture_recognize_for_video(
+                        gesture_recognizer,
+                        image=image,
+                        timestamp_ms=timestamp_ms,
                     ),
                     category_map=BUILTIN_FINE_GESTURE_MAP,
                     min_score=self.config.builtin_gesture_min_score,
@@ -903,9 +904,10 @@ class MediaPipeVisionPipeline:
         if custom_gesture_recognizer is not None:
             try:
                 custom_choice = resolve_fine_hand_gesture(
-                    result=custom_gesture_recognizer.recognize_for_video(
-                        image,
-                        timestamp_ms,
+                    result=self._runtime.gesture_recognize_for_video(
+                        custom_gesture_recognizer,
+                        image=image,
+                        timestamp_ms=timestamp_ms,
                     ),
                     category_map=CUSTOM_FINE_GESTURE_MAP,
                     min_score=self.config.custom_gesture_min_score,
@@ -960,7 +962,10 @@ class MediaPipeVisionPipeline:
             roi_image = self._build_image(runtime, frame_rgb=prepared_roi_frame)
 
             roi_builtin = resolve_fine_hand_gesture(
-                result=builtin_recognizer.recognize(roi_image),
+                result=self._runtime.gesture_recognize_image(
+                    builtin_recognizer,
+                    image=roi_image,
+                ),
                 category_map=BUILTIN_FINE_GESTURE_MAP,
                 min_score=self.config.builtin_gesture_min_score,
             )
@@ -971,7 +976,10 @@ class MediaPipeVisionPipeline:
             if custom_recognizer is None:
                 continue
             roi_custom = resolve_fine_hand_gesture(
-                result=custom_recognizer.recognize(roi_image),
+                result=self._runtime.gesture_recognize_image(
+                    custom_recognizer,
+                    image=roi_image,
+                ),
                 category_map=CUSTOM_FINE_GESTURE_MAP,
                 min_score=self.config.custom_gesture_min_score,
             )

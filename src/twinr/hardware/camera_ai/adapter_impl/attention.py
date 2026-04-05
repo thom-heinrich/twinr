@@ -6,7 +6,6 @@
 # IMP-1: Added schema-versioned, timestamped, latency-aware telemetry for Pi-4 fast-path tuning and profiling.
 # IMP-2: Fast path now skips unnecessary face-anchor work when no frame or no visible person is present, and surfaces optional richer gaze/head-pose metadata when upstream inference provides it.
 
-# mypy: disable-error-code=attr-defined
 """Fast attention-only helpers for the local AI-camera adapter."""
 
 from __future__ import annotations

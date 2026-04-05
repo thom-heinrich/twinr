@@ -1,6 +1,5 @@
 """Remote-aware selectors for episodic objects, durable objects, and conflicts."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 
@@ -589,9 +588,10 @@ class StructuredStoreRemoteSelectionMixin:
                     return False
                 if recap_query:
                     projection = self._catalog_entry_projection(entry)
+                    raw_projection_attributes = projection.get("attributes")
                     projection_attributes = (
-                        projection.get("attributes")
-                        if isinstance(projection.get("attributes"), Mapping)
+                        dict(raw_projection_attributes)
+                        if isinstance(raw_projection_attributes, Mapping)
                         else None
                     )
                     if projection and projection_attributes is not None:

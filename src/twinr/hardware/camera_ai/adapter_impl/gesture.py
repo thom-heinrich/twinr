@@ -8,7 +8,6 @@
 # IMP-2: Expand workflow telemetry to expose the real target source values used by the adapter, including face-anchor promotion and recent-target cache reuse.
 # IMP-3: Harden live-hand count/confidence extraction so malformed/partial runtime objects do not break observation emission.
 
-# mypy: disable-error-code="attr-defined,arg-type,union-attr"
 """Dedicated live-gesture helpers for the local AI-camera adapter."""
 
 from __future__ import annotations

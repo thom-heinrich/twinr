@@ -16,7 +16,6 @@
 
 """Shared support helpers for realtime background delivery."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

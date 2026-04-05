@@ -16,6 +16,9 @@ contracts used by the Alexa-like hybrid voice path.
 - define the streaming voice websocket contracts for audio frames, runtime-state
   updates, wake confirmations, same-stream transcript commits, follow-up windows,
   and barge-in interrupts
+- accept optional per-frame speech-probability side-channel metadata on voice
+  audio frames so the host scanner can trust Pi speech evidence instead of only
+  raw RMS fallback
 - host the server-side voice session that turns bounded edge audio into wake,
   continuation, and interruption decisions
 - call the thh1986-backed remote ASR service for transcript-first wake
@@ -177,6 +180,11 @@ decode per utterance instead of multiple overlapping synchronous ASR calls on
 consecutive frames. The remote ASR adapter still keeps a narrow retry budget for
 transient `429 stt busy` contention so one brief remote decode spike does
 not immediately drop an utterance candidate.
+The websocket server now also protects that control plane under temporary
+decode stalls by preferring to shed stale queued `voice_audio_frame` messages
+before it rejects newer runtime-state or identity updates; the default voice
+ingress queue budget is sized for real host-side transcription spikes instead
+of only a few seconds of audio at the productive 100 ms frame cadence.
 
 When `TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` points back to the same
 orchestrator host/port, Twinr now mounts the bounded `/v1/transcribe` route in

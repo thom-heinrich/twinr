@@ -29,6 +29,7 @@ from typing import Any, Callable, cast
 import math
 import time
 
+from twinr.ops.streaming_memory_probe import StreamingMemoryProbe
 from twinr.proactive.runtime.service_impl.compat import (
     _DEFAULT_CLOSE_JOIN_TIMEOUT_S,
     _append_ops_event,
@@ -113,6 +114,26 @@ class ProactiveMonitorService:
         self._close_join_timeout_s = _DEFAULT_CLOSE_JOIN_TIMEOUT_S
         self._loop_error_gate = _LoopErrorGate(interval_s=_ERROR_RATE_LIMIT_S)
         self._loop_failure_counts: dict[str, int] = {}
+        runtime = getattr(self.coordinator, "runtime", None)
+        config = getattr(runtime, "config", None)
+        self._tick_memory_probe = StreamingMemoryProbe.from_config(
+            config,
+            label="proactive_monitor.tick",
+            owner_label="proactive_monitor.tick",
+            owner_detail="Proactive monitor coordinator tick is running.",
+        )
+        self._display_attention_memory_probe = StreamingMemoryProbe.from_config(
+            config,
+            label="proactive_monitor.display_attention",
+            owner_label="proactive_monitor.display_attention",
+            owner_detail="Proactive monitor refreshed display attention state.",
+        )
+        self._display_gesture_memory_probe = StreamingMemoryProbe.from_config(
+            config,
+            label="proactive_monitor.display_gesture",
+            owner_label="proactive_monitor.display_gesture",
+            owner_detail="Proactive monitor refreshed display gesture state.",
+        )
 
     @staticmethod
     def _now_ns() -> int:
@@ -163,6 +184,18 @@ class ProactiveMonitorService:
         """Emit one service-local telemetry line safely."""
 
         _safe_emit(self.emit, self._single_line_text(line, max_len=1024))
+
+    @staticmethod
+    def _record_memory_probe(
+        probe: StreamingMemoryProbe,
+        *,
+        force: bool = False,
+        owner_detail: str | None = None,
+    ) -> None:
+        try:
+            probe.maybe_record(force=force, owner_detail=owner_detail)
+        except Exception:
+            return
 
     def _append_ops_event(
         self,
@@ -571,6 +604,7 @@ class ProactiveMonitorService:
                                     )
                                 else:
                                     self._clear_loop_failure("display_attention_refresh")
+                                    self._record_memory_probe(self._display_attention_memory_probe)
                                     attention_base_ns = (
                                         self._now_ns()
                                         if refresh_anchor_ns is None
@@ -599,6 +633,7 @@ class ProactiveMonitorService:
                                     )
                                 else:
                                     self._clear_loop_failure("display_gesture_refresh")
+                                    self._record_memory_probe(self._display_gesture_memory_probe)
                                     gesture_base_ns = (
                                         self._now_ns()
                                         if refresh_anchor_ns is None
@@ -652,6 +687,7 @@ class ProactiveMonitorService:
                     else:
                         did_work = True
                         self._clear_loop_failure("tick")
+                        self._record_memory_probe(self._tick_memory_probe)
                         next_tick_at_ns = self._now_ns() + self._interval_ns(
                             self.poll_interval_s,
                             fallback_s=self.poll_interval_s,

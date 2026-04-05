@@ -64,7 +64,12 @@ def _reexec_repo_python_if_needed() -> None:
 _reexec_repo_python_if_needed()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from twinr.ops.pi_runtime_deploy import DEFAULT_DEPLOY_SERVICES, PiRuntimeDeployError, deploy_pi_runtime  # noqa: E402
+from twinr.ops.pi_runtime_deploy import (  # noqa: E402
+    DEFAULT_DEPLOY_SERVICES,
+    PiRuntimeDeployError,
+    _DEFAULT_RETENTION_CANARY_TIMEOUT_S,
+    deploy_pi_runtime,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,6 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum wait time for restarted services to report healthy.",
     )
     parser.add_argument(
+        "--retention-canary-timeout-s",
+        type=float,
+        default=_DEFAULT_RETENTION_CANARY_TIMEOUT_S,
+        help=(
+            "Dedicated timeout for the live retention-canary command on the Pi. "
+            "This is separate from --timeout-s because the canary can legitimately "
+            "run much longer than ordinary SSH/SCP deploy substeps."
+        ),
+    )
+    parser.add_argument(
         "--skip-env-sync",
         action="store_true",
         help="Keep the existing Pi runtime env file instead of overwriting it from the leading repo.",
@@ -203,6 +218,7 @@ def main() -> int:
             remote_env_path=args.remote_env_path,
             timeout_s=args.timeout_s,
             service_wait_s=args.service_wait_s,
+            retention_canary_timeout_s=args.retention_canary_timeout_s,
             sync_env=not args.skip_env_sync,
             install_editable=not args.skip_editable_install,
             install_with_deps=args.install_with_deps,

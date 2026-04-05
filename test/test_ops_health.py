@@ -12,16 +12,19 @@ from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.display.heartbeat import DisplayHeartbeatStore, build_display_heartbeat
 from twinr.ops import health as health_mod
+from twinr.ops.process_memory import ProcessMemoryMetrics, StreamingMemorySnapshot
 
 
 class OpsHealthTests(unittest.TestCase):
     def setUp(self) -> None:
         health_mod._PROCESS_CACHE = None
         health_mod._PI_STATE_CACHE = None
+        health_mod._MEMORY_STATUS_CACHE = None
 
     def tearDown(self) -> None:
         health_mod._PROCESS_CACHE = None
         health_mod._PI_STATE_CACHE = None
+        health_mod._MEMORY_STATUS_CACHE = None
 
     def collect_health_with_services(
         self,
@@ -33,6 +36,8 @@ class OpsHealthTests(unittest.TestCase):
         memory_total_mb: int = 1024,
         memory_available_mb: int = 900,
         memory_used_percent: float = 12.5,
+        swap_total_mb: int | None = None,
+        swap_used_percent: float | None = None,
     ) -> health_mod.TwinrSystemHealth:
         with mock.patch.object(health_mod, "_captured_at", return_value="2026-03-16T18:20:00Z"):
             with mock.patch.object(health_mod, "_read_recent_error_count", return_value=(0, True)):
@@ -45,9 +50,11 @@ class OpsHealthTests(unittest.TestCase):
                                 memory_total_mb,
                                 memory_available_mb,
                                 memory_used_percent,
-                                None,
-                                None,
-                                None,
+                                swap_total_mb,
+                                None if swap_total_mb is None or swap_used_percent is None else int(
+                                    round((swap_total_mb * swap_used_percent) / 100.0)
+                                ),
+                                swap_used_percent,
                             ),
                         ):
                             with mock.patch.object(health_mod, "_read_disk", return_value=(64.0, 40.0, 22.0)):
@@ -290,6 +297,214 @@ class OpsHealthTests(unittest.TestCase):
             )
 
         self.assertEqual(health.status, "warn")
+
+    def test_collect_system_health_warns_when_swap_is_saturated_despite_memavailable_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            snapshot = RuntimeSnapshot(status="waiting")
+            services = (
+                health_mod.ServiceHealth(
+                    key="web",
+                    label="Web UI",
+                    running=True,
+                    count=1,
+                    detail="pid=111 python --run-web",
+                ),
+                health_mod.ServiceHealth(
+                    key="conversation_loop",
+                    label="Conversation loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 python --run-streaming-loop",
+                ),
+                health_mod.ServiceHealth(
+                    key="display",
+                    label="Display loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 display-companion",
+                ),
+            )
+
+            health = self.collect_health_with_services(
+                config,
+                snapshot=snapshot,
+                services=services,
+                root=root,
+                memory_total_mb=3796,
+                memory_available_mb=545,
+                memory_used_percent=85.6,
+                swap_total_mb=199,
+                swap_used_percent=100.0,
+            )
+
+        self.assertEqual(health.status, "warn")
+
+    def test_collect_system_health_exposes_streaming_memory_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            snapshot = RuntimeSnapshot(status="waiting")
+            services = (
+                health_mod.ServiceHealth(
+                    key="web",
+                    label="Web UI",
+                    running=True,
+                    count=1,
+                    detail="pid=111 python --run-web",
+                ),
+                health_mod.ServiceHealth(
+                    key="conversation_loop",
+                    label="Conversation loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 python --run-streaming-loop",
+                ),
+                health_mod.ServiceHealth(
+                    key="display",
+                    label="Display loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 display-companion",
+                ),
+            )
+            memory_snapshot = StreamingMemorySnapshot(
+                schema_version=1,
+                captured_at="2026-04-05T00:00:00+00:00",
+                pid=123,
+                boot_id="boot-1",
+                pid_start_ticks=456,
+                current_metrics=ProcessMemoryMetrics(
+                    vm_rss_kb=1_900_184,
+                    anonymous_kb=1_807_636,
+                ),
+                owner_label="display_companion.hdmi_wayland.native_window_frame",
+                owner_detail="phase=display.hdmi_wayland.native_window_frame_presented anonymous_delta_mb=1580",
+                owner_rss_delta_kb=1_650_000,
+                owner_anonymous_delta_kb=1_580_000,
+                phases=(),
+            )
+
+            with mock.patch.object(health_mod, "loop_lock_owner", return_value=123):
+                with mock.patch.object(health_mod, "load_current_streaming_memory_snapshot", return_value=memory_snapshot):
+                    health = self.collect_health_with_services(
+                        config,
+                        snapshot=snapshot,
+                        services=services,
+                        root=root,
+                    )
+
+        self.assertEqual(
+            health.memory_owner_label,
+            "display_companion.hdmi_wayland.native_window_frame",
+        )
+        self.assertEqual(
+            health.memory_owner_detail,
+            "phase=display.hdmi_wayland.native_window_frame_presented anonymous_delta_mb=1580",
+        )
+        self.assertEqual(health.memory_owner_rss_mb, 1856)
+        self.assertEqual(health.memory_owner_anonymous_mb, 1765)
+        self.assertEqual(health.memory_owner_rss_delta_mb, 1611)
+        self.assertEqual(health.memory_owner_anonymous_delta_mb, 1543)
+
+    def test_assess_memory_pressure_status_holds_fail_until_recovery_margin_and_hold_time(self) -> None:
+        with mock.patch.object(health_mod.time, "monotonic", side_effect=(10.0, 11.0, 25.0, 46.0)):
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=250,
+                    memory_used_percent=93.0,
+                ),
+                "fail",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=257,
+                    memory_used_percent=89.0,
+                ),
+                "fail",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=390,
+                    memory_used_percent=86.0,
+                ),
+                "fail",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=390,
+                    memory_used_percent=86.0,
+                ),
+                "warn",
+            )
+
+    def test_assess_memory_pressure_status_holds_warn_until_sustained_headroom(self) -> None:
+        with mock.patch.object(health_mod.time, "monotonic", side_effect=(100.0, 110.0, 131.0)):
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=400,
+                    memory_used_percent=78.0,
+                ),
+                "warn",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=700,
+                    memory_used_percent=60.0,
+                ),
+                "warn",
+            )
+            self.assertIsNone(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=700,
+                    memory_used_percent=60.0,
+                )
+            )
+
+    def test_assess_memory_pressure_status_holds_warn_while_swap_remains_saturated(self) -> None:
+        with mock.patch.object(health_mod.time, "monotonic", side_effect=(200.0, 230.0, 251.0, 272.0)):
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=545,
+                    memory_used_percent=85.6,
+                    swap_total_mb=199,
+                    swap_used_percent=100.0,
+                ),
+                "warn",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=900,
+                    memory_used_percent=61.0,
+                    swap_total_mb=199,
+                    swap_used_percent=100.0,
+                ),
+                "warn",
+            )
+            self.assertEqual(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=900,
+                    memory_used_percent=61.0,
+                    swap_total_mb=199,
+                    swap_used_percent=0.0,
+                ),
+                "warn",
+            )
+            self.assertIsNone(
+                health_mod.assess_memory_pressure_status(
+                    memory_available_mb=900,
+                    memory_used_percent=61.0,
+                    swap_total_mb=199,
+                    swap_used_percent=0.0,
+                )
+            )
 
     def test_collect_system_health_marks_stale_display_companion_heartbeat_as_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

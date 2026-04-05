@@ -397,6 +397,32 @@ def _print_direct_cli_banner(config: TwinrConfig, env_path: Path) -> None:
     print(f"runtime_env_file={env_path}")
 
 
+def _record_streaming_memory_phase_best_effort(
+    config: TwinrConfig,
+    *,
+    label: str,
+    owner_label: str | None = None,
+    owner_detail: str | None = None,
+    replace: bool = False,
+    reset: bool = False,
+) -> None:
+    """Persist one streaming-loop memory boundary without breaking runtime boot."""
+
+    try:
+        from twinr.ops.process_memory import record_streaming_memory_phase
+
+        record_streaming_memory_phase(
+            config,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            replace=replace,
+            reset=reset,
+        )
+    except Exception:
+        return
+
+
 def _safe_probe_detail(value: object, *, max_len: int = 240) -> str:
     """Render one bounded single-line detail string for probe-stage output."""
 
@@ -792,19 +818,56 @@ def main() -> int:
             _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
 
             with loop_instance_lock(config, "streaming-loop"):
+                _record_streaming_memory_phase_best_effort(
+                    config,
+                    label="streaming_loop.lock_acquired",
+                    owner_label="streaming_loop.lock",
+                    owner_detail="Baseline after streaming-loop lock acquisition and before companion startup.",
+                    reset=True,
+                )
                 with optional_display_companion(
                     config,
                     enabled=_should_enable_display_companion(config, args.env_file),
                 ):
+                    _record_streaming_memory_phase_best_effort(
+                        config,
+                        label="streaming_loop.display_companion_context_entered",
+                        owner_label="display_companion.context",
+                        owner_detail="Display companion context entered from run-streaming-loop.",
+                    )
                     with optional_respeaker_led_companion(
                         config,
                         enabled=_should_enable_respeaker_led_companion(config, args.env_file),
                     ):
+                        _record_streaming_memory_phase_best_effort(
+                            config,
+                            label="streaming_loop.respeaker_led_context_entered",
+                            owner_label="respeaker_led.context",
+                            owner_detail="ReSpeaker LED companion context entered from run-streaming-loop.",
+                        )
                         runtime = _build_runtime(config)
+                        _record_streaming_memory_phase_best_effort(
+                            config,
+                            label="streaming_loop.runtime_built",
+                            owner_label="streaming_runtime.bootstrap",
+                            owner_detail="Twinr runtime object constructed.",
+                        )
                         _print_runtime_banner(runtime, config, env_path)
                         try:
                             streaming_backend = OpenAIBackend(config=config)
+                            _record_streaming_memory_phase_best_effort(
+                                config,
+                                label="streaming_loop.openai_backend_ready",
+                                owner_label="streaming_backend.openai",
+                                owner_detail="OpenAI streaming backend constructed.",
+                            )
                             provider_bundle = build_streaming_provider_bundle(config, support_backend=streaming_backend)
+                            _record_streaming_memory_phase_best_effort(
+                                config,
+                                label="streaming_loop.provider_bundle_ready",
+                                owner_label="streaming_providers.bundle",
+                                owner_detail="Streaming provider bundle constructed.",
+                            )
                             loop = TwinrStreamingHardwareLoop(
                                 config=config,
                                 runtime=runtime,
@@ -815,8 +878,21 @@ def main() -> int:
                                 tts_provider=provider_bundle.tts,
                                 tool_agent_provider=provider_bundle.tool_agent,
                             )
+                            _record_streaming_memory_phase_best_effort(
+                                config,
+                                label="streaming_loop.hardware_loop_ready",
+                                owner_label="streaming_loop.hardware_runner",
+                                owner_detail="TwinrStreamingHardwareLoop constructed and ready to run.",
+                            )
                             return loop.run(duration_s=args.loop_duration)
                         except Exception as exc:
+                            _record_streaming_memory_phase_best_effort(
+                                config,
+                                label="streaming_loop.startup_exception",
+                                owner_label="streaming_loop.startup_exception",
+                                owner_detail=f"Startup exception before loop.run(): {type(exc).__name__}",
+                                replace=True,
+                            )
                             return hold_runtime_error_state(
                                 runtime=runtime,
                                 error=exc,

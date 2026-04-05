@@ -1,6 +1,5 @@
 """Shared payload parsing, merge helpers, and query text/ranking logic."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 

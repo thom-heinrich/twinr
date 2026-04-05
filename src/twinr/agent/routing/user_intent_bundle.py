@@ -7,6 +7,8 @@
 # IMP-1: Prefer edge-optimized model.ort bundles over model.onnx when both exist.
 # IMP-2: Added safetensors support for classifier tensors and safe NumPy loading with allow_pickle=False.
 # IMP-3: Expose validated model IO metadata, embedding_dim, artifact digests, and integrity status to downstream code.
+# BUG-4: Allow trusted live-runtime callers to defer heavyweight ORT session validation until first use so
+#        Pi idle startup does not retain a giant validation session before the semantic router is needed.
 
 """Load and validate versioned user-intent bundles for the first router stage."""
 
@@ -745,6 +747,22 @@ def _validate_model(
     return model_format, input_names, output_names, resolved_output_name, embedding_dim, external_files
 
 
+def _deferred_runtime_model_contract(
+    model_path: Path,
+    *,
+    metadata: UserIntentBundleMetadata,
+) -> tuple[str, tuple[str, ...], tuple[str, ...], str | None, int | None, tuple[Path, ...]]:
+    """Return a cheap model contract when ORT probing is intentionally deferred.
+
+    Live Pi startup only needs enough metadata to load classifier artifacts and
+    build the bundle object. The actual ORT session will still validate the
+    model on first encoder use.
+    """
+
+    model_format = "ort" if model_path.suffix.lower() == ".ort" else "onnx"
+    return model_format, (), (), metadata.output_name, metadata.embedding_dim, ()
+
+
 def _validate_tokenizer(path: Path, *, metadata: UserIntentBundleMetadata) -> None:
     payload = _load_json_mapping(path, description="tokenizer file")
     if "model" not in payload:
@@ -1030,6 +1048,7 @@ def load_user_intent_bundle(
     require_integrity_manifest: bool = False,
     trusted_ed25519_public_key: str | bytes | None = None,
     max_artifact_bytes: int = _DEFAULT_MAX_ARTIFACT_BYTES,
+    eager_runtime_validation: bool = True,
 ) -> UserIntentBundle:
     root_dir = Path(path).expanduser().resolve(strict=False)
     if not root_dir.exists():
@@ -1114,7 +1133,7 @@ def load_user_intent_bundle(
                 if preferred_kind is None:
                     preferred_kind = _file_storage_kind(bias_path)
             if weights_path is None:
-                weight_candidates = _DEFAULT_WEIGHTS_FILENAMES
+                weight_candidates: tuple[str, ...] = _DEFAULT_WEIGHTS_FILENAMES
                 if preferred_kind == "safetensors":
                     weight_candidates = ("weights.safetensors",)
                 elif preferred_kind == "npy":
@@ -1126,7 +1145,7 @@ def load_user_intent_bundle(
                     default_candidates=weight_candidates,
                 )
             if bias_path is None:
-                bias_candidates = _DEFAULT_BIAS_FILENAMES
+                bias_candidates: tuple[str, ...] = _DEFAULT_BIAS_FILENAMES
                 if preferred_kind == "safetensors":
                     bias_candidates = ("bias.safetensors",)
                 elif preferred_kind == "npy":
@@ -1168,11 +1187,28 @@ def load_user_intent_bundle(
                 f"{weights_path.name}, {bias_path.name}"
             )
 
-    model_format, model_input_names, model_output_names, resolved_output_name, embedding_dim, external_files = _validate_model(
-        model_path,
-        root_dir=root_dir,
-        metadata=metadata,
-    )
+    if not eager_runtime_validation and model_path.suffix.lower() == ".ort":
+        (
+            model_format,
+            model_input_names,
+            model_output_names,
+            resolved_output_name,
+            embedding_dim,
+            external_files,
+        ) = _deferred_runtime_model_contract(model_path, metadata=metadata)
+    else:
+        (
+            model_format,
+            model_input_names,
+            model_output_names,
+            resolved_output_name,
+            embedding_dim,
+            external_files,
+        ) = _validate_model(
+            model_path,
+            root_dir=root_dir,
+            metadata=metadata,
+        )
     embedding_dim = _validate_classifier_artifacts(
         classifier_type=metadata.classifier_type,
         labels_count=len(metadata.labels),

@@ -412,8 +412,8 @@ class RemoteCatalogRefactorParityTests(unittest.TestCase):
                 "scope_search_scope_ref": "longterm:objects:current",
                 "scope_search_namespace": "test-namespace",
                 "scope_search_allowed_doc_ids": None,
-                "metadata_only_source_types": ("legacy_remote_catalog_metadata",),
-                "metadata_only_flag": True,
+                "metadata_only_source_types": ("remote_catalog_entry",),
+                "metadata_only_flag": False,
             },
         )
 

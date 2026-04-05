@@ -4,6 +4,7 @@
 # BUG-3: Enforced monotonically increasing LIVE_STREAM timestamps before recognize_async() to avoid MediaPipe timestamp regressions and silent frame drops.
 # BUG-4: Fixed the logically dead wave path; wave tracking now consumes current-frame open-palm center evidence directly instead of requiring an allowlisted fine-hand label.
 # BUG-5: Live-stream callbacks now carry stable runtime cache keys, so per-frame generation closures no longer force recognizer recreation.
+# BUG-6: All live/ROI/full-frame gesture recognizer calls now route through the shared native-heap trimmer so Pi RSS stays bounded during long MediaPipe runs.
 # SEC-1: Added bounded person-ROI / hand-ROI candidate budgets and full-frame rescue rate limiting to reduce practical CPU-exhaustion and latency-collapse attacks on Raspberry Pi 4.
 # SEC-2: Added generation-guarded callbacks and fail-closed exception handling so late callbacks after close() and recognizer/runtime errors do not corrupt live state or crash the lane.
 # IMP-1: Added bounded per-timestamp snapshot history so fallback reads exact-or-older results but never "future" callbacks from later frames.
@@ -594,17 +595,19 @@ class LiveGesturePipeline:
                 with self._lock:
                     generation = self._callback_generation
 
-                builtin_submitted = self._submit_live_builtin_frame(
-                    runtime=runtime,
-                    image=image,
-                    timestamp_ms=timestamp_ms,
-                    generation=generation,
-                    observed_mono_s=observe_started_mono_s,
-                )
-
-                custom_submitted = False
-                if live_custom_enabled:
-                    custom_submitted = self._submit_live_custom_frame(
+                if self._live_stage_mode() == "video":
+                    builtin_submitted = True
+                    builtin_ready, custom_ready = self._run_video_live_gesture_stage(
+                        runtime=runtime,
+                        image=image,
+                        timestamp_ms=timestamp_ms,
+                        generation=generation,
+                        live_custom_enabled=live_custom_enabled,
+                    )
+                    wait_s = 0.0
+                    custom_submitted = live_custom_enabled
+                else:
+                    builtin_submitted = self._submit_live_builtin_frame(
                         runtime=runtime,
                         image=image,
                         timestamp_ms=timestamp_ms,
@@ -612,11 +615,21 @@ class LiveGesturePipeline:
                         observed_mono_s=observe_started_mono_s,
                     )
 
-                wait_s, builtin_ready, custom_ready = self._await_current_live_results(
-                    timestamp_ms=timestamp_ms,
-                    expect_builtin=builtin_submitted,
-                    expect_custom=live_custom_enabled and custom_submitted,
-                )
+                    custom_submitted = False
+                    if live_custom_enabled:
+                        custom_submitted = self._submit_live_custom_frame(
+                            runtime=runtime,
+                            image=image,
+                            timestamp_ms=timestamp_ms,
+                            generation=generation,
+                            observed_mono_s=observe_started_mono_s,
+                        )
+
+                    wait_s, builtin_ready, custom_ready = self._await_current_live_results(
+                        timestamp_ms=timestamp_ms,
+                        expect_builtin=builtin_submitted,
+                        expect_custom=live_custom_enabled and custom_submitted,
+                    )
 
                 return self._build_observation(
                     runtime=runtime,
@@ -804,6 +817,7 @@ class LiveGesturePipeline:
             "live_hand_box_count": len(current_live_hand_boxes),
             "effective_live_hand_box_count": len(effective_hand_boxes),
             "live_hand_box_source": hand_box_source,
+            "live_stage_mode": self._live_stage_mode(),
             "live_result_age_s": _round_optional_confidence(result_age_s),
             "current_live_result_wait_s": _round_optional_confidence(live_result_wait_s),
             "current_live_builtin_ready": current_live_builtin_ready,
@@ -858,6 +872,7 @@ class LiveGesturePipeline:
                 else "not_needed"
             ),
         }
+        debug_snapshot.update(self._runtime.gesture_native_heap_snapshot())
         debug_snapshot.update(dict(live_submission_debug))
 
         if fine_hand_gesture == AICameraFineHandGesture.NONE:
@@ -1448,20 +1463,23 @@ class LiveGesturePipeline:
         setattr(_callback, MEDIAPIPE_LIVE_CALLBACK_CACHE_KEY_ATTR, self._custom_callback_cache_key)
         return _callback
 
-    def _handle_builtin_result(
-        self,
-        *,
-        result: object,
-        _output_image: object,
-        timestamp_ms: int,
-        generation: int,
-    ) -> None:
+    def _live_stage_mode(self) -> str:
+        """Return which MediaPipe gesture running mode powers the live user-facing lane."""
+
+        configured_mode = str(getattr(self.config, "live_gesture_mode", "video") or "video").strip().lower()
+        if configured_mode == "live_stream":
+            return "live_stream"
+        return "video"
+
+    def _builtin_snapshot_from_result(self, *, result: object, timestamp_ms: int) -> _RecognizerSnapshot:
+        """Convert one built-in recognizer result into the bounded live snapshot format."""
+
         gesture, confidence = resolve_fine_hand_gesture(
             result=result,
             category_map=_LIVE_BUILTIN_FINE_GESTURE_MAP,
             min_score=self.config.builtin_gesture_min_score,
         )
-        snapshot = _RecognizerSnapshot(
+        return _RecognizerSnapshot(
             timestamp_ms=max(1, int(timestamp_ms)),
             gesture=gesture,
             confidence=confidence,
@@ -1472,12 +1490,38 @@ class LiveGesturePipeline:
             ),
             hand_boxes=_extract_hand_boxes(result),
         )
+
+    def _custom_snapshot_from_result(self, *, result: object, timestamp_ms: int) -> _RecognizerSnapshot:
+        """Convert one custom recognizer result into the bounded live snapshot format."""
+
+        gesture, confidence = resolve_fine_hand_gesture(
+            result=result,
+            category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
+            min_score=_live_custom_min_score(self.config),
+        )
+        return _RecognizerSnapshot(
+            timestamp_ms=max(1, int(timestamp_ms)),
+            gesture=gesture,
+            confidence=confidence,
+            hand_count=_count_hand_landmarks(result),
+            open_palm_center_x=None,
+            hand_boxes=_extract_hand_boxes(result),
+        )
+
+    def _remember_builtin_snapshot(
+        self,
+        *,
+        snapshot: _RecognizerSnapshot,
+        generation: int,
+    ) -> bool:
+        """Store one built-in snapshot while honoring close()/generation fences."""
+
         with self._result_condition:
             if generation != self._callback_generation:
-                return
+                return False
             if (
                 self._pending_live_builtin_timestamp_ms is not None
-                and timestamp_ms >= self._pending_live_builtin_timestamp_ms
+                and snapshot.timestamp_ms >= self._pending_live_builtin_timestamp_ms
             ):
                 self._pending_live_builtin_timestamp_ms = None
                 self._pending_live_builtin_submitted_mono_s = None
@@ -1489,34 +1533,22 @@ class LiveGesturePipeline:
             if self._latest_builtin is None or snapshot.timestamp_ms >= self._latest_builtin.timestamp_ms:
                 self._latest_builtin = snapshot
             self._result_condition.notify_all()
+        return True
 
-    def _handle_custom_result(
+    def _remember_custom_snapshot(
         self,
         *,
-        result: object,
-        _output_image: object,
-        timestamp_ms: int,
+        snapshot: _RecognizerSnapshot,
         generation: int,
-    ) -> None:
-        gesture, confidence = resolve_fine_hand_gesture(
-            result=result,
-            category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
-            min_score=_live_custom_min_score(self.config),
-        )
-        snapshot = _RecognizerSnapshot(
-            timestamp_ms=max(1, int(timestamp_ms)),
-            gesture=gesture,
-            confidence=confidence,
-            hand_count=_count_hand_landmarks(result),
-            open_palm_center_x=None,
-            hand_boxes=_extract_hand_boxes(result),
-        )
+    ) -> bool:
+        """Store one custom snapshot while honoring close()/generation fences."""
+
         with self._result_condition:
             if generation != self._callback_generation:
-                return
+                return False
             if (
                 self._pending_live_custom_timestamp_ms is not None
-                and timestamp_ms >= self._pending_live_custom_timestamp_ms
+                and snapshot.timestamp_ms >= self._pending_live_custom_timestamp_ms
             ):
                 self._pending_live_custom_timestamp_ms = None
                 self._pending_live_custom_submitted_mono_s = None
@@ -1528,6 +1560,76 @@ class LiveGesturePipeline:
             if self._latest_custom is None or snapshot.timestamp_ms >= self._latest_custom.timestamp_ms:
                 self._latest_custom = snapshot
             self._result_condition.notify_all()
+        return True
+
+    def _run_video_live_gesture_stage(
+        self,
+        *,
+        runtime: dict[str, Any],
+        image: Any,
+        timestamp_ms: int,
+        generation: int,
+        live_custom_enabled: bool,
+    ) -> tuple[bool, bool | None]:
+        """Run the live gesture stage synchronously via MediaPipe VIDEO mode.
+
+        The productive Pi runtime uses VIDEO mode by default because the
+        upstream LIVE_STREAM recognizer path shows repeatable native RSS growth
+        under sustained Pi capture. We keep the same bounded snapshot contract
+        as the old callback path so downstream arbitration/debug fields stay
+        stable while avoiding the leaking running mode.
+        """
+
+        builtin_recognizer = self._runtime.ensure_gesture_recognizer(runtime)
+        builtin_result = self._runtime.gesture_recognize_for_video(
+            builtin_recognizer,
+            image=image,
+            timestamp_ms=timestamp_ms,
+        )
+        builtin_ready = self._remember_builtin_snapshot(
+            snapshot=self._builtin_snapshot_from_result(result=builtin_result, timestamp_ms=timestamp_ms),
+            generation=generation,
+        )
+
+        custom_ready: bool | None = None
+        if live_custom_enabled:
+            custom_recognizer = self._runtime.ensure_custom_gesture_recognizer(runtime)
+            custom_result = self._runtime.gesture_recognize_for_video(
+                custom_recognizer,
+                image=image,
+                timestamp_ms=timestamp_ms,
+            )
+            custom_ready = self._remember_custom_snapshot(
+                snapshot=self._custom_snapshot_from_result(result=custom_result, timestamp_ms=timestamp_ms),
+                generation=generation,
+            )
+        return builtin_ready, custom_ready
+
+    def _handle_builtin_result(
+        self,
+        *,
+        result: object,
+        _output_image: object,
+        timestamp_ms: int,
+        generation: int,
+    ) -> None:
+        self._remember_builtin_snapshot(
+            snapshot=self._builtin_snapshot_from_result(result=result, timestamp_ms=timestamp_ms),
+            generation=generation,
+        )
+
+    def _handle_custom_result(
+        self,
+        *,
+        result: object,
+        _output_image: object,
+        timestamp_ms: int,
+        generation: int,
+    ) -> None:
+        self._remember_custom_snapshot(
+            snapshot=self._custom_snapshot_from_result(result=result, timestamp_ms=timestamp_ms),
+            generation=generation,
+        )
 
     def _recognize_from_live_hand_rois(
         self,
@@ -1576,7 +1678,10 @@ class LiveGesturePipeline:
                 continue
             try:
                 image = self._runtime.build_image(runtime, frame_rgb=crop)
-                builtin_result = builtin_recognizer.recognize(image)
+                builtin_result = self._runtime.gesture_recognize_image(
+                    builtin_recognizer,
+                    image=image,
+                )
             except Exception as exc:
                 hand_box_debug.append({"hand_box_index": index, "error": _short_exception(exc)})
                 hand_box_options.append(
@@ -1600,7 +1705,10 @@ class LiveGesturePipeline:
             custom_candidate: _GestureChoice = (AICameraFineHandGesture.NONE, None)
             if custom_recognizer is not None:
                 try:
-                    custom_result = custom_recognizer.recognize(image)
+                    custom_result = self._runtime.gesture_recognize_image(
+                        custom_recognizer,
+                        image=image,
+                    )
                     custom_candidate = resolve_fine_hand_gesture(
                         result=custom_result,
                         category_map=_LIVE_CUSTOM_FINE_GESTURE_MAP,
@@ -1817,7 +1925,11 @@ class LiveGesturePipeline:
                 result_callback=self._make_builtin_result_handler(generation),
                 num_hands_override=_LIVE_GESTURE_NUM_HANDS,
             )
-            builtin_recognizer.recognize_async(image, timestamp_ms)
+            self._runtime.gesture_recognize_async(
+                builtin_recognizer,
+                image=image,
+                timestamp_ms=timestamp_ms,
+            )
             return True
         except Exception:
             with self._lock:
@@ -1845,7 +1957,11 @@ class LiveGesturePipeline:
                 runtime,
                 result_callback=self._make_custom_result_handler(generation),
             )
-            custom_recognizer.recognize_async(image, timestamp_ms)
+            self._runtime.gesture_recognize_async(
+                custom_recognizer,
+                image=image,
+                timestamp_ms=timestamp_ms,
+            )
             return True
         except Exception:
             with self._lock:
@@ -2196,7 +2312,10 @@ def _recognize_roi_gesture_candidate_with_context_retry(
 ) -> tuple[_GestureChoice, object | None, bool, _GestureChoice, object | None]:
     try:
         image = runtime_interface.build_image(runtime, frame_rgb=frame_rgb)
-        primary_result = recognizer.recognize(image)
+        primary_result = runtime_interface.gesture_recognize_image(
+            recognizer,
+            image=image,
+        )
     except Exception:
         return (AICameraFineHandGesture.NONE, None), None, False, (AICameraFineHandGesture.NONE, None), None
 
@@ -2210,7 +2329,10 @@ def _recognize_roi_gesture_candidate_with_context_retry(
 
     try:
         context_image = runtime_interface.build_image(runtime, frame_rgb=context_frame_rgb)
-        context_result = recognizer.recognize(context_image)
+        context_result = runtime_interface.gesture_recognize_image(
+            recognizer,
+            image=context_image,
+        )
     except Exception:
         return primary_candidate, primary_result, True, (AICameraFineHandGesture.NONE, None), None
 

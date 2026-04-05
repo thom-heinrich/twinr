@@ -1,4 +1,3 @@
-# mypy: disable-error-code=arg-type
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace

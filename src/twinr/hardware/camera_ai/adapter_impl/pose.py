@@ -1,4 +1,3 @@
-# mypy: disable-error-code=attr-defined
 # CHANGELOG: 2026-03-28
 # BUG-1: Use monotonic frame timestamps for MediaPipe-style pipelines and compatible runtime hooks so NTP / RTC wall-clock jumps do not break ordered video timestamps.
 # BUG-2: Replace brittle PoseNet-only tensor / postprocess assumptions with adaptive decoding that works with legacy PoseNet call signatures and newer IMX500 post-processors such as HigherHRNet / YOLO-pose style adapters.

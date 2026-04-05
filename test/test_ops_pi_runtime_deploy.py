@@ -13,6 +13,7 @@ import tempfile
 import time
 import tomllib
 import unittest
+from typing import Any, Sequence
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -22,6 +23,7 @@ from twinr.ops.pi_runtime_deploy import PiRuntimeDeployError, deploy_pi_runtime
 from twinr.ops.pi_runtime_deploy_remote import (
     PiSystemdServiceState,
     PiRemoteExecutor,
+    RetentionCanaryProbeError,
     install_editable_package,
     verify_python_import_contract,
 )
@@ -59,7 +61,7 @@ _TEST_PI_IMPORT_MODULES = (
     "twinr.memory.longterm.storage._remote_current_records",
     "twinr.memory.longterm.runtime.health",
 )
-_TEST_PI_ATTRIBUTE_CONTRACTS = {
+_TEST_PI_ATTRIBUTE_CONTRACTS: dict[str, Sequence[str]] = {
     "twinr.hardware.camera_ai.adapter_impl.observe:AICameraAdapterObserveMixin": (
         "observe_attention_stream",
         "observe_attention_from_frame_stream",
@@ -89,7 +91,7 @@ def _completed(
     return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-def _load_deploy_pi_runtime_cli_module() -> object:
+def _load_deploy_pi_runtime_cli_module() -> Any:
     spec = importlib.util.spec_from_file_location(
         "test_hardware_ops_deploy_pi_runtime_cli",
         _DEPLOY_PI_RUNTIME_CLI_PATH,
@@ -105,7 +107,7 @@ def _import_contract_stdout(
     modules: tuple[str, ...] = _TEST_PI_IMPORT_MODULES,
     *,
     python_path: str = "/twinr/.venv/bin/python",
-    attribute_contracts: dict[str, tuple[str, ...]] = _TEST_PI_ATTRIBUTE_CONTRACTS,
+    attribute_contracts: dict[str, Sequence[str]] = _TEST_PI_ATTRIBUTE_CONTRACTS,
     validated_attribute_contracts: tuple[str, ...] | None = None,
 ) -> str:
     checked_attribute_contracts = tuple(
@@ -1713,6 +1715,510 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertTrue(any(event.get("event") == "start" for event in remote_probe_events))
         self.assertTrue(any(event.get("event") == "heartbeat" for event in remote_probe_events))
         self.assertTrue(any(event.get("event") == "end" for event in remote_probe_events))
+
+    def test_deploy_passes_dedicated_retention_canary_timeout(self) -> None:
+        captured_command_timeout_s: list[float] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=lambda **kwargs: (
+                    captured_command_timeout_s.append(float(kwargs["command_timeout_s"]))
+                    or {"status": "ok", "ready": True, "report_path": "/twinr/report.json"}
+                ),
+            ):
+                result = deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    mirror_watchdog=mirror,
+                    install_editable=False,
+                    install_systemd_units=False,
+                    verify_env_contract=False,
+                    verify_retention_canary=True,
+                    retention_canary_timeout_s=600.0,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured_command_timeout_s, [600.0])
+
+    def test_deploy_recovers_retention_canary_after_remote_host_stabilization(self) -> None:
+        progress_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            failed_payload = {
+                "status": "failed",
+                "ready": False,
+                "failure_stage": "seed_retention_objects",
+                "error_message": (
+                    "LongTermRemoteUnavailableError: Accepted remote long-term 'objects' write "
+                    "could not be read back: Remote write attestation observed the accepted payload "
+                    "without a stable document id."
+                ),
+                "remote_write_context": {
+                    "operation": "store_records_bulk",
+                    "request_path": "/v1/external/records/bulk",
+                    "request_execution_mode": "async",
+                },
+            }
+            successful_retry_payload = {
+                "status": "ok",
+                "ready": True,
+                "report_path": "/twinr/artifacts/reports/retention_live_canary/retry.json",
+            }
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=[
+                    RetentionCanaryProbeError("retention canary failed", payload=failed_payload),
+                    successful_retry_payload,
+                ],
+            ) as probe_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy._diagnose_retention_canary_host_contention",
+                return_value={
+                    "available": True,
+                    "contention_detected": True,
+                    "contention_signals": ["backend_query_unhealthy", "active_system_conflicts"],
+                },
+            ) as diagnose_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy._stabilize_retention_canary_host",
+                return_value={
+                    "ok": True,
+                    "diagnosis": "public_recovered_after_host_stabilization",
+                },
+            ) as stabilize_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy.time.time_ns",
+                return_value=1,
+            ):
+                result = deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    mirror_watchdog=mirror,
+                    install_editable=False,
+                    install_systemd_units=False,
+                    verify_env_contract=False,
+                    verify_retention_canary=True,
+                    progress_callback=progress_events.append,
+                )
+
+        self.assertTrue(result.ok)
+        assert result.retention_canary is not None
+        self.assertTrue(result.retention_canary["ready"])
+        recovery = result.retention_canary.get("host_contention_recovery")
+        self.assertIsInstance(recovery, dict)
+        assert isinstance(recovery, dict)
+        self.assertEqual(recovery.get("retry_probe_id"), "deploy_retention_canary_1_after_host_stabilization")
+        self.assertEqual(probe_mock.call_count, 2)
+        diagnose_mock.assert_called_once()
+        stabilize_mock.assert_called_once()
+        self.assertEqual(
+            stabilize_mock.call_args.kwargs["diagnosis"]["contention_signals"],
+            ["backend_query_unhealthy", "active_system_conflicts"],
+        )
+        self.assertEqual(stabilize_mock.call_args.kwargs["ssh_timeout_s"], 180.0)
+        retention_events = [
+            event
+            for event in progress_events
+            if event.get("phase") == "retention_canary"
+        ]
+        self.assertTrue(
+            any(event.get("step") == "host_contention_diagnosis" for event in retention_events)
+        )
+        self.assertTrue(
+            any(event.get("step") == "host_contention_stabilization" for event in retention_events)
+        )
+
+    def test_deploy_waits_for_fresh_watchdog_sample_after_backend_repair_before_retry(self) -> None:
+        progress_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            failed_payload = {
+                "status": "failed",
+                "ready": False,
+                "failure_stage": "seed_retention_objects",
+                "error_message": "LongTermRemoteUnavailableError: Failed to persist fine-grained remote long-term memory items.",
+                "root_cause_message": (
+                    "ChonkyDBError: ChonkyDB request failed for POST "
+                    "/v1/external/records/bulk (status=429)"
+                ),
+                "remote_write_context": {
+                    "operation": "store_records_bulk",
+                    "request_path": "/v1/external/records/bulk",
+                    "request_execution_mode": "async",
+                },
+                "exception_chain": [
+                    {
+                        "type": "LongTermRemoteUnavailableError",
+                        "detail": "Failed to persist fine-grained remote long-term memory items.",
+                    },
+                    {
+                        "type": "ChonkyDBError",
+                        "detail": "ChonkyDB request failed for POST /v1/external/records/bulk (status=429)",
+                        "status_code": 429,
+                        "response_json": {
+                            "detail": "queue_saturated",
+                            "error": "queue_saturated",
+                        },
+                    },
+                ],
+            }
+            successful_retry_payload = {
+                "status": "ok",
+                "ready": True,
+                "report_path": "/twinr/artifacts/reports/retention_live_canary/retry.json",
+            }
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=[
+                    RetentionCanaryProbeError("retention canary failed", payload=failed_payload),
+                    successful_retry_payload,
+                ],
+            ) as probe_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy._diagnose_retention_canary_host_contention",
+                return_value={
+                    "available": True,
+                    "contention_detected": True,
+                    "contention_signals": ["public_query_unhealthy", "backend_query_unhealthy"],
+                },
+            ), mock.patch(
+                "twinr.ops.pi_runtime_deploy._stabilize_retention_canary_host",
+                return_value={
+                    "ok": True,
+                    "diagnosis": "public_recovered_after_host_stabilization_and_backend_repair",
+                    "backend_repair": {"ok": True, "action_taken": "restart_backend_service"},
+                },
+            ), mock.patch(
+                "twinr.ops.pi_runtime_deploy._wait_for_remote_watchdog_ready",
+                return_value={
+                    "ready": True,
+                    "detail": "watchdog_ready",
+                    "sample_captured_at": "2026-04-05T13:48:42Z",
+                    "sample_fresh_after_gate": True,
+                },
+            ) as watchdog_wait_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy.time.time_ns",
+                return_value=1,
+            ):
+                result = deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    mirror_watchdog=mirror,
+                    install_editable=False,
+                    install_systemd_units=False,
+                    verify_env_contract=False,
+                    verify_retention_canary=True,
+                    progress_callback=progress_events.append,
+                )
+
+        self.assertTrue(result.ok)
+        assert result.retention_canary is not None
+        recovery = result.retention_canary.get("host_contention_recovery")
+        self.assertIsInstance(recovery, dict)
+        assert isinstance(recovery, dict)
+        self.assertEqual(
+            recovery["post_repair_watchdog_readiness"]["sample_captured_at"],
+            "2026-04-05T13:48:42Z",
+        )
+        self.assertEqual(probe_mock.call_count, 2)
+        watchdog_wait_mock.assert_called_once()
+        wait_kwargs = watchdog_wait_mock.call_args.kwargs
+        self.assertEqual(wait_kwargs["remote_root"], "/twinr")
+        self.assertEqual(wait_kwargs["env_path"], "/twinr/.env")
+        self.assertRegex(wait_kwargs["min_sample_captured_at"], r"^\d{4}-\d{2}-\d{2}T.*Z$")
+        retention_events = [
+            event
+            for event in progress_events
+            if event.get("phase") == "retention_canary"
+        ]
+        self.assertTrue(
+            any(event.get("step") == "post_repair_watchdog_readiness" for event in retention_events)
+        )
+
+    def test_deploy_skips_retry_when_post_repair_watchdog_never_republishes_ready_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            failed_payload = {
+                "status": "failed",
+                "ready": False,
+                "failure_stage": "seed_retention_objects",
+                "error_message": "LongTermRemoteUnavailableError: Failed to persist fine-grained remote long-term memory items.",
+                "root_cause_message": (
+                    "ChonkyDBError: ChonkyDB request failed for POST "
+                    "/v1/external/records/bulk (status=429)"
+                ),
+                "remote_write_context": {
+                    "operation": "store_records_bulk",
+                    "request_path": "/v1/external/records/bulk",
+                    "request_execution_mode": "async",
+                },
+                "exception_chain": [
+                    {
+                        "type": "LongTermRemoteUnavailableError",
+                        "detail": "Failed to persist fine-grained remote long-term memory items.",
+                    },
+                    {
+                        "type": "ChonkyDBError",
+                        "detail": "ChonkyDB request failed for POST /v1/external/records/bulk (status=429)",
+                        "status_code": 429,
+                        "response_json": {
+                            "detail": "queue_saturated",
+                            "error": "queue_saturated",
+                        },
+                    },
+                ],
+            }
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=RetentionCanaryProbeError("retention canary failed", payload=failed_payload),
+            ) as probe_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy._diagnose_retention_canary_host_contention",
+                return_value={
+                    "available": True,
+                    "contention_detected": True,
+                    "contention_signals": ["public_query_unhealthy", "backend_query_unhealthy"],
+                },
+            ), mock.patch(
+                "twinr.ops.pi_runtime_deploy._stabilize_retention_canary_host",
+                return_value={
+                    "ok": True,
+                    "diagnosis": "public_recovered_after_host_stabilization_and_backend_repair",
+                    "backend_repair": {"ok": True, "action_taken": "restart_backend_service"},
+                },
+            ), mock.patch(
+                "twinr.ops.pi_runtime_deploy._wait_for_remote_watchdog_ready",
+                return_value={
+                    "ready": False,
+                    "detail": "watchdog_not_ready",
+                    "sample_captured_at": "2026-04-05T13:46:46Z",
+                    "sample_fresh_after_gate": False,
+                },
+            ):
+                with self.assertRaises(PiRuntimeDeployError) as exc_info:
+                    deploy_pi_runtime(
+                        project_root=root,
+                        pi_env_path=pi_env_path,
+                        services=("twinr-runtime-supervisor",),
+                        subprocess_runner=_runner,
+                        mirror_watchdog=mirror,
+                        install_editable=False,
+                        install_systemd_units=False,
+                        verify_env_contract=False,
+                        verify_retention_canary=True,
+                    )
+
+        self.assertEqual(exc_info.exception.phase, "retention_canary")
+        self.assertEqual(probe_mock.call_count, 1)
+        self.assertIn("fresh ready sample", str(exc_info.exception))
+
+    def test_deploy_skips_host_stabilization_when_retention_failure_is_not_contention_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                '\n'.join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mirror = _FakeMirrorWatchdog()
+
+            failed_payload = {
+                "status": "failed",
+                "ready": False,
+                "failure_stage": "fresh_reader_load_current_state_fine_grained",
+                "error_message": "LongTermRemoteUnavailableError: readback failed on a fresh reader.",
+            }
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                return _completed(command)
+
+            with mock.patch(
+                "twinr.ops.pi_runtime_deploy._run_retention_canary_probe",
+                side_effect=RetentionCanaryProbeError("retention canary failed", payload=failed_payload),
+            ), mock.patch(
+                "twinr.ops.pi_runtime_deploy._diagnose_retention_canary_host_contention",
+                return_value={
+                    "available": True,
+                    "contention_detected": True,
+                    "contention_signals": ["backend_query_unhealthy"],
+                },
+            ) as diagnose_mock, mock.patch(
+                "twinr.ops.pi_runtime_deploy._stabilize_retention_canary_host",
+            ) as stabilize_mock:
+                with self.assertRaises(PiRuntimeDeployError) as exc_info:
+                    deploy_pi_runtime(
+                        project_root=root,
+                        pi_env_path=pi_env_path,
+                        services=("twinr-runtime-supervisor",),
+                        subprocess_runner=_runner,
+                        mirror_watchdog=mirror,
+                        install_editable=False,
+                        install_systemd_units=False,
+                        verify_env_contract=False,
+                        verify_retention_canary=True,
+                    )
+
+        self.assertEqual(exc_info.exception.phase, "retention_canary")
+        diagnose_mock.assert_called_once()
+        stabilize_mock.assert_not_called()
 
     def test_default_deploy_includes_enabled_optional_pi_services(self) -> None:
         commands: list[list[str]] = []

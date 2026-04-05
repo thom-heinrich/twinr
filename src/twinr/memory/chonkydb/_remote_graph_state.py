@@ -9,7 +9,7 @@ import inspect
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from twinr.agent.workflows.forensics import workflow_event
 from twinr.memory.chonkydb.client import ChonkyDBError
@@ -24,6 +24,7 @@ from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphEdgeV1,
 from twinr.text_utils import slugify_identifier
 
 if TYPE_CHECKING:
+    from twinr.memory.longterm.storage._remote_catalog.shared import LongTermRemoteCatalogEntry
     from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
 
@@ -134,8 +135,8 @@ def _looks_like_graph_catalog_payload(
     if not isinstance(segments, list):
         return False
     try:
-        version = int(payload.get("version"))
-        int(payload.get("items_count") or 0)
+        version = int(_normalize_text(payload.get("version")) or "0")
+        int(_normalize_text(payload.get("items_count")) or "0")
     except (TypeError, ValueError):
         return False
     return payload.get("schema") == definition.catalog_schema and version == 3
@@ -162,6 +163,93 @@ def _node_content(node_payload: Mapping[str, object]) -> str:
             elif isinstance(value, (list, tuple)):
                 parts.extend(_normalize_text(item) for item in value if _normalize_text(item))
     return " ".join(part for part in parts if part)
+
+
+def _node_related_contact_fragments(
+    document: TwinrGraphDocumentV1,
+    node_payload: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return one-hop contact fragments that improve person/contact-method recall.
+
+    Query-first graph selection ranks raw node records. Person nodes therefore
+    need some contact-method vocabulary, and contact-method nodes need their
+    owning person label, otherwise queries such as "Anna Becker email address"
+    can incorrectly prefer another Becker person that lacks the requested
+    contact method.
+    """
+
+    node_id = _normalize_text(node_payload.get("id"))
+    node_type = _normalize_text(node_payload.get("type")).lower()
+    if not node_id or not node_type:
+        return ()
+    nodes_by_id = {node.node_id: node for node in document.nodes}
+    fragments: list[str] = []
+    if node_type == "person":
+        for edge in document.edges:
+            if edge.source_node_id != node_id or edge.edge_type != "general_has_contact_method":
+                continue
+            target = nodes_by_id.get(edge.target_node_id)
+            if target is None:
+                continue
+            kind = _normalize_text((edge.attributes or {}).get("kind") or target.node_type).lower()
+            target_label = _normalize_text(target.label)
+            canonical_value = _normalize_text((target.attributes or {}).get("canonical") or target.label)
+            if kind == "email":
+                fragments.extend(("email", "email address"))
+            elif kind == "phone":
+                fragments.extend(("phone", "phone number"))
+            if kind:
+                fragments.append(kind)
+            if target_label:
+                fragments.append(target_label)
+            if canonical_value and canonical_value != target_label:
+                fragments.append(canonical_value)
+    elif node_type in {"email", "phone"}:
+        if node_type == "email":
+            fragments.extend(("email", "email address"))
+        elif node_type == "phone":
+            fragments.extend(("phone", "phone number"))
+        for edge in document.edges:
+            if edge.target_node_id != node_id or edge.edge_type != "general_has_contact_method":
+                continue
+            source = nodes_by_id.get(edge.source_node_id)
+            if source is None:
+                continue
+            source_label = _normalize_text(source.label)
+            if source_label:
+                fragments.append(source_label)
+            aliases = getattr(source, "aliases", ()) or ()
+            for alias in aliases:
+                alias_text = _normalize_text(alias)
+                if alias_text:
+                    fragments.append(alias_text)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for fragment in fragments:
+        normalized = _normalize_text(fragment)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+    return tuple(deduped)
+
+
+def _node_content_for_document(
+    document: TwinrGraphDocumentV1,
+    node_payload: Mapping[str, object],
+) -> str:
+    """Return search text for one graph node plus adjacent contact-method cues."""
+
+    base_content = _node_content(node_payload)
+    related_contact_content = " ".join(_node_related_contact_fragments(document, node_payload))
+    return " ".join(part for part in (base_content, related_contact_content) if part)
+
+
+def _catalog_entry_locator(entry: object) -> tuple[str | None, str | None]:
+    """Extract optional document locator fields from a remote catalog entry."""
+
+    document_id = _normalize_text(getattr(entry, "document_id", None))
+    uri = _normalize_text(getattr(entry, "uri", None))
+    return document_id or None, uri or None
 
 
 def _edge_content(edge_payload: Mapping[str, object]) -> str:
@@ -306,7 +394,7 @@ class TwinrRemoteGraphState:
             item_payloads=(node.to_payload() for node in document.nodes),
             item_id_getter=lambda payload: payload.get("id"),
             metadata_builder=lambda payload, document=document: _node_metadata(document, payload),
-            content_builder=_node_content,
+            content_builder=lambda payload, document=document: _node_content_for_document(document, payload),
             skip_async_document_id_wait=True,
         )
         node_head.update(
@@ -387,11 +475,12 @@ class TwinrRemoteGraphState:
             entry = node_entries.get(node_id)
             payload = self._catalog_entry_projection_payload(entry)
             if payload is None:
+                document_id, uri = _catalog_entry_locator(entry)
                 payload = self._catalog.load_item_payload(
                     snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
                     item_id=node_id,
-                    document_id=None if entry is None else entry.document_id,
-                    uri=None if entry is None else entry.uri,
+                    document_id=document_id,
+                    uri=uri,
                 )
             if payload is None:
                 raise _remote_unavailable_error(
@@ -415,15 +504,17 @@ class TwinrRemoteGraphState:
         edges: list[TwinrGraphEdgeV1] = []
         for entry in edge_entries:
             payload = self._catalog_entry_projection_payload(entry)
+            item_id = _normalize_text(getattr(entry, "item_id", None)) or ""
             if payload is None:
+                document_id, uri = _catalog_entry_locator(entry)
                 payload = self._catalog.load_item_payload(
                     snapshot_kind=_GRAPH_EDGE_SNAPSHOT_KIND,
-                    item_id=entry.item_id,
-                    document_id=entry.document_id,
-                    uri=entry.uri,
+                    item_id=item_id,
+                    document_id=document_id,
+                    uri=uri,
                 )
             if payload is None:
-                LOGGER.warning("Skipping remote graph edge with unreadable payload: %s", entry.item_id)
+                LOGGER.warning("Skipping remote graph edge with unreadable payload: %s", item_id)
                 continue
             try:
                 edge = TwinrGraphEdgeV1.from_payload(payload)
@@ -538,9 +629,9 @@ class TwinrRemoteGraphState:
             for payload in loaded_payloads:
                 if not isinstance(payload, Mapping):
                     continue
-                item_id = self._graph_item_id_from_payload(snapshot_kind=snapshot_kind, payload=payload)
-                if item_id:
-                    loaded_by_item_id[item_id] = dict(payload)
+                resolved_item_id = self._graph_item_id_from_payload(snapshot_kind=snapshot_kind, payload=payload)
+                if resolved_item_id:
+                    loaded_by_item_id[resolved_item_id] = dict(payload)
         return tuple(loaded_by_item_id[item_id] for item_id in ordered_item_ids if item_id in loaded_by_item_id)
 
     def query_current_path(
@@ -732,7 +823,7 @@ class TwinrRemoteGraphState:
                 continue
             edges.append(edge)
 
-        query_plan = {
+        query_plan: dict[str, object] = {
             "schema": "twinr_graph_query_plan_v1",
             "mode": "remote_query_first_subgraph",
             "query_text": clean_query,
@@ -805,7 +896,10 @@ class TwinrRemoteGraphState:
             return (), False
         current_entries_by_item_id = self._current_entries_by_item_id(snapshot_kind=snapshot_kind)
         if current_entries_by_item_id:
-            current_entries = tuple(current_entries_by_item_id.values())
+            current_entries = cast(
+                tuple["LongTermRemoteCatalogEntry", ...],
+                tuple(current_entries_by_item_id.values()),
+            )
             selected_entries = self._catalog._local_search_catalog_entries(  # pylint: disable=protected-access
                 snapshot_kind=snapshot_kind,
                 entries=current_entries,
@@ -1339,7 +1433,7 @@ class TwinrRemoteGraphState:
                 if isinstance(candidate, Mapping) and candidate.get("success") is False:
                     detail = _normalize_text(candidate.get("detail")) or _normalize_text(candidate.get("error"))
                     error_type = _normalize_text(candidate.get("error_type"))
-                    response_json = {
+                    response_json: dict[str, object] = {
                         key: value
                         for key, value in (
                             ("detail", detail or None),
@@ -1534,20 +1628,22 @@ class TwinrRemoteGraphState:
                 "prefer_cached_document_id": False,
                 "prefer_metadata_only": True,
             }
+            parameters: Mapping[str, inspect.Parameter]
             try:
                 parameters = inspect.signature(probe_loader).parameters
             except (TypeError, ValueError):
-                parameters = {}
+                parameters = cast("Mapping[str, inspect.Parameter]", {})
             if "fast_fail" in parameters:
                 probe_kwargs["fast_fail"] = use_probe
             probe = probe_loader(**probe_kwargs)
             payload = getattr(probe, "payload", None)
         else:
             load_snapshot = getattr(remote_state, "load_snapshot")
+            parameters = cast("Mapping[str, inspect.Parameter]", {})
             try:
                 parameters = inspect.signature(load_snapshot).parameters
             except (TypeError, ValueError):
-                parameters = {}
+                parameters = cast("Mapping[str, inspect.Parameter]", {})
             load_kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
             if "prefer_cached_document_id" in parameters:
                 load_kwargs["prefer_cached_document_id"] = False

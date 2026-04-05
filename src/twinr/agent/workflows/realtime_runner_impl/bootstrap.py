@@ -10,7 +10,6 @@
 
 """Bootstrap helpers for the realtime workflow loop."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 
@@ -59,6 +58,7 @@ from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.integrations import build_smart_home_hub_adapter
 from twinr.integrations.smarthome import SmartHomeObservation, SmartHomeSensorWorker
+from twinr.ops.process_memory import record_streaming_memory_phase_best_effort
 from twinr.ops.usage import TwinrUsageStore
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 from twinr.proactive import build_default_proactive_monitor
@@ -99,6 +99,22 @@ _OPENAI_REALTIME_PCM_SAMPLE_RATE = 24_000
 
 class TwinrRealtimeBootstrapMixin:
     """Initialize the realtime loop and its static collaborators."""
+
+    def _record_startup_memory_phase(
+        self,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+    ) -> None:
+        """Attach one best-effort startup checkpoint to the streaming PID snapshot."""
+
+        record_streaming_memory_phase_best_effort(
+            self.config,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+        )
 
     def __init__(
         self,
@@ -173,6 +189,11 @@ class TwinrRealtimeBootstrapMixin:
                 tts=self.tts_provider,
             )
         )
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.core_providers_ready",
+            owner_label="streaming_loop.bootstrap.core_providers",
+            owner_detail="Realtime bootstrap resolved the runtime, primary providers, and print backend.",
+        )
         self.button_monitor = button_monitor or configured_button_monitor(config)
         self.recorder = recorder or SilenceDetectedRecorder(
             device=config.audio_input_device,
@@ -199,6 +220,11 @@ class TwinrRealtimeBootstrapMixin:
             io_lock=self._audio_lock,
         )
         self._prewarm_working_feedback_media("processing")
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.hardware_stack_ready",
+            owner_label="streaming_loop.bootstrap.hardware_stack",
+            owner_detail="Realtime bootstrap built button, audio, printer, camera, and playback stack dependencies.",
+        )
         self._active_turn_stop_lock = Lock()
         self._active_turn_stop_event: Event | None = None
         self._active_turn_stop_reason: str | None = None
@@ -218,6 +244,11 @@ class TwinrRealtimeBootstrapMixin:
         self._runtime_tool_names: tuple[str, ...] = ()
         self._tool_handlers: dict[str, Callable[..., Any]] = {}
         self._refresh_runtime_tool_surface()
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.tool_surface_ready",
+            owner_label="streaming_loop.bootstrap.tool_surface",
+            owner_detail="Realtime bootstrap initialized tool executor state and runtime tool surface handlers.",
+        )
 
         provider_bundle = None
         provider_bundle_error: Exception | None = None
@@ -288,12 +319,22 @@ class TwinrRealtimeBootstrapMixin:
             conversation_closure_evaluator
             or self._build_conversation_closure_evaluator(config)
         )
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.turn_services_ready",
+            owner_label="streaming_loop.bootstrap.turn_services",
+            owner_detail="Realtime bootstrap resolved turn-controller, closure, and verifier service dependencies.",
+        )
 
         if realtime_session is not None:
             self.realtime_session = realtime_session
         else:
             self.realtime_session = self._build_realtime_session()
         self._sync_realtime_session_tool_handlers()
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.realtime_session_ready",
+            owner_label="streaming_loop.bootstrap.realtime_session",
+            owner_detail="Realtime bootstrap constructed and synchronized the realtime session surface.",
+        )
 
         self.turn_guidance_runtime = TurnGuidanceRuntime(self)
         self.follow_up_steering_runtime = FollowUpSteeringRuntime(self)
@@ -356,6 +397,15 @@ class TwinrRealtimeBootstrapMixin:
             if bool(getattr(config, "voice_orchestrator_enabled", False))
             else None
         )
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.voice_orchestrator_ready",
+            owner_label="streaming_loop.bootstrap.voice_orchestrator",
+            owner_detail=(
+                "Realtime bootstrap finished constructing the edge voice orchestrator wrapper."
+                if self.voice_orchestrator is not None
+                else "Realtime bootstrap skipped edge voice orchestrator construction because it is disabled."
+            ),
+        )
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
             config=config,
             runtime=self.runtime,
@@ -369,6 +419,11 @@ class TwinrRealtimeBootstrapMixin:
             observation_handler=self.handle_sensor_observation,
             live_context_handler=self.handle_live_sensor_context,
             emit=self.emit,
+        )
+        self._record_startup_memory_phase(
+            label="streaming_loop.bootstrap.proactive_monitor_ready",
+            owner_label="streaming_loop.bootstrap.proactive_monitor",
+            owner_detail="Realtime bootstrap finished constructing the proactive monitor and its display/camera orchestration surface.",
         )
         self._workflow_active_trace_id: str | None = None
         self._trace_event(

@@ -1,4 +1,3 @@
-# mypy: disable-error-code="assignment,arg-type"
 
 from __future__ import annotations
 

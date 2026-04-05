@@ -52,7 +52,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
 - feed transcript-first interim and endpoint transcripts into long-term-memory materialized provider-answer-front prewarm so the live answer path can consume already-persisted long-term prompt blocks instead of waiting for a fresh synchronous remote rebuild after the user stops speaking
 - let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
-- when the local semantic router is enabled on the Pi, prewarm its ONNX path before the first live turn so weather/tool/memory turns do not spend the user's first reply budget on cold-start model load
+- when the local semantic router is enabled on the Pi, only warm its ONNX path after real transcript activity begins instead of during idle startup, and defer the optional user-intent ORT validation session in the same idle path, so `waiting` does not fault the router heap before the user speaks while still allowing one best-effort turn-near warmup
 - when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
 - when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall straight through to the generic supervisor loop instead of starting another structured-decision roundtrip
@@ -103,7 +103,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_runner_impl/turn_capture.py](./realtime_runner_impl/turn_capture.py) | Turn-controller streaming capture, transcript recovery, and early-snapshot coercion |
 | [realtime_runner_impl/turn_execution.py](./realtime_runner_impl/turn_execution.py) | Single-turn execution, streamed playback/interrupt handling, activation ack caching, and print-lane enqueue helpers |
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
-| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery, first-frame stall healing via host-control reboot, and startup-time reconnect recovery when the gateway appears late |
+| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery, first-frame and mid-stream capture-stall healing, and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
 | [voice_turn_latency.py](./voice_turn_latency.py) | Shared wake/commit/supervisor/remote-memory/TTS stage tracker for per-turn Pi journal timing breakdowns |
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
@@ -213,6 +213,7 @@ streaming_loop.run(duration_s=15)
 The remote/server voice path intentionally keeps a strict split:
 
 - `voice_orchestrator.py` owns edge microphone streaming and server-event dispatch
+- `voice_frame_speech.py` owns the bounded per-frame speech-probability side-channel sent with streamed edge audio and must keep room-audio classification stateless across frames so recurrent VAD state cannot drift on endless ambient streams
 - `voice_orchestrator_runtime.py` owns runtime-side state replay, intent-context refresh, and same-stream transcript handoff into the realtime loop
 - `remote_transcript_commit.py` owns the bounded wait/commit handoff for same-stream remote transcripts
 - `realtime_runner.py` and `streaming_capture.py` must not reopen a second Pi-local listen capture once the voice orchestrator path is active; they have to wait on the same remote stream instead

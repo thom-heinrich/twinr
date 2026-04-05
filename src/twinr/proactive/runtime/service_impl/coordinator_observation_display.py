@@ -16,7 +16,6 @@ and automation-dispatch side effects must remain compatible with the legacy
 observation mixin.
 """
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

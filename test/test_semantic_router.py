@@ -1,4 +1,5 @@
 from collections import Counter
+from dataclasses import replace
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -357,6 +358,49 @@ class SemanticRouterTests(unittest.TestCase):
                 encoder._load_session()
 
         self.assertEqual(call_count, 1)
+
+    def test_user_intent_bundle_can_defer_ort_runtime_validation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = _write_user_intent_bundle(Path(temp_dir))
+            (bundle_dir / "model.ort").write_bytes(b"ort-placeholder")
+            inference_module._PRELOADED_ORT_SESSIONS.clear()
+            call_count = 0
+
+            def fake_inference_session(*_args, **_kwargs):
+                nonlocal call_count
+                call_count += 1
+                raise AssertionError("Deferred runtime validation must not build an ORT session.")
+
+            fake_ort = types.ModuleType("onnxruntime")
+            fake_ort.GraphOptimizationLevel = types.SimpleNamespace(
+                ORT_DISABLE_ALL="disable",
+                ORT_ENABLE_BASIC="basic",
+                ORT_ENABLE_EXTENDED="extended",
+                ORT_ENABLE_ALL="all",
+            )
+            fake_ort.ExecutionMode = types.SimpleNamespace(
+                ORT_SEQUENTIAL="sequential",
+                ORT_PARALLEL="parallel",
+            )
+            fake_ort.SessionOptions = object
+            fake_ort.InferenceSession = fake_inference_session
+
+            with mock.patch(
+                "twinr.agent.routing.user_intent_bundle._get_onnxruntime",
+                return_value=fake_ort,
+            ), mock.patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+                bundle = load_user_intent_bundle(
+                    bundle_dir,
+                    eager_runtime_validation=False,
+                )
+
+        self.assertEqual(call_count, 0)
+        self.assertEqual(bundle.model_format, "ort")
+        self.assertEqual(bundle.model_input_names, ())
+        self.assertEqual(bundle.model_output_names, ())
+        self.assertIsNone(bundle.resolved_output_name)
+        self.assertEqual(bundle.embedding_dim, 4)
+        self.assertEqual(inference_module._PRELOADED_ORT_SESSIONS, {})
 
     def test_local_semantic_router_applies_authority_policy(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -988,6 +1032,58 @@ class SemanticRouterTests(unittest.TestCase):
             router.warmup("vorheizen")
 
         self.assertEqual(shared_encoder.calls, ["vorheizen"])
+
+    def test_two_stage_router_infers_shared_encoder_from_identical_artifacts_without_metadata_fingerprint(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            user_bundle = load_user_intent_bundle(_write_user_intent_bundle(root))
+            route_bundle = load_semantic_router_bundle(_write_bundle(root))
+
+            router = TwoStageLocalSemanticRouter(user_bundle, route_bundle)
+
+        shared_encoder = router.shared_encoder
+        self.assertIsNotNone(router.shared_encoder)
+        self.assertIs(shared_encoder, router.user_intent_router.encoder)
+        self.assertIs(shared_encoder, router.route_router.encoder)
+        assert shared_encoder is not None
+        self.assertFalse(shared_encoder.prefer_ort_model)
+        self.assertEqual(shared_encoder.model_path.name, "model.onnx")
+
+    def test_two_stage_router_prefers_shared_ort_encoder_when_sidecars_exist_for_identical_source_model(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            user_bundle_dir = _write_user_intent_bundle(root)
+            route_bundle_dir = _write_bundle(root)
+            user_bundle = load_user_intent_bundle(user_bundle_dir)
+            route_bundle = load_semantic_router_bundle(route_bundle_dir)
+            (user_bundle_dir / "model.ort").write_bytes(b"user-intent-ort-export")
+            (route_bundle_dir / "model.ort").write_bytes(b"route-ort-export")
+            user_bundle = replace(
+                user_bundle,
+                model_path=(user_bundle_dir / "model.ort").resolve(),
+                model_format="ort",
+            )
+            route_bundle = replace(
+                route_bundle,
+                model_path=(route_bundle_dir / "model.ort").resolve(),
+                runtime_format="ort",
+            )
+
+            router = TwoStageLocalSemanticRouter(user_bundle, route_bundle)
+
+        shared_encoder = router.shared_encoder
+        self.assertIsNotNone(shared_encoder)
+        self.assertIs(shared_encoder, router.user_intent_router.encoder)
+        self.assertIs(shared_encoder, router.route_router.encoder)
+        assert shared_encoder is not None
+        self.assertTrue(shared_encoder.prefer_ort_model)
+        self.assertEqual(shared_encoder.model_path.suffix, ".ort")
+        self.assertEqual(shared_encoder.model_path.name, "model.ort")
+        self.assertEqual(shared_encoder.model_path, (user_bundle_dir / "model.ort").resolve())
 
 
 if __name__ == "__main__":

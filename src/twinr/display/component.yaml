@@ -160,6 +160,13 @@ files:
     role: Optional sidecar thread for the display loop
     exports:
       - optional_display_companion
+  - path: status_forensics.py
+    role: Persistable operator-status cause records that reconcile rendered display state with runtime snapshot and ops health inputs
+    exports:
+      - DisplayStatusForensics
+      - DisplaySystemStatusDecision
+      - build_display_status_forensics
+      - build_system_status_decision
 primary_callers:
   - path: src/twinr/__main__.py
   - path: hardware/display/display_test.py

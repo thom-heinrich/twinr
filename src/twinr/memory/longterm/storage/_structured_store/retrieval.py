@@ -1,6 +1,5 @@
 """Retrieval entrypoints and shared context selection for structured memory."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 

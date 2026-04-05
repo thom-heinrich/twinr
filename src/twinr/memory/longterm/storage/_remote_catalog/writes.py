@@ -45,24 +45,33 @@ from .shared import (
     _ALLOWED_DOC_IDS_RETRIEVE_QUERY,
     LongTermRemoteCatalogEntry,
     _CATALOG_VERSION,
-    _SEGMENT_VERSION,
     _DEFAULT_ASYNC_ATTESTATION_POLL_S,
+    _DEFAULT_REMOTE_READ_TIMEOUT_S,
     _ITEM_VERSION,
     _RemoteCollectionDefinition,
+    _SEGMENT_VERSION,
     _iter_known_item_envelopes,
     _run_timed_workflow_step,
 )
 
 _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES = 16_384
-_GRAPH_PROJECTION_SEGMENT_REQUEST_MAX_BYTES = 32_768
+_SYNC_LARGE_GRAPH_CURRENT_HEAD_WRITE_MAX_BYTES = 131_072
+_GRAPH_PROJECTION_SEGMENT_REQUEST_MAX_BYTES = 16_384
 _GRAPH_SEGMENT_BULK_REQUEST_MAX_BYTES = 131_072
 _SYNC_SMALL_SEGMENT_WRITE_MAX_BYTES = 36_864
-_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
-    {
-        "conflicts",
-    }
-)
-_SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
+_ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_WAIT_TIMEOUT_S = 15.0
+_EXTENDED_ASYNC_CURRENT_HEAD_RETRY_ATTEMPTS = 9
+_EXTENDED_ASYNC_CURRENT_HEAD_MAX_BACKOFF_S = 20.0
+_EXTENDED_ASYNC_POST_SYNC_RESCUE_RETRY_ATTEMPTS = 9
+_EXTENDED_ASYNC_POST_SYNC_RESCUE_MAX_BACKOFF_S = 20.0
+# Default sync writes stay disabled. Fine-grained writes and fixed-URI catalog
+# heads both start async so fresh namespaces do not burn their initial write on
+# the inline lane before the jobs lane can absorb the cold-path work.
+# Projection-complete control-plane writers may still take one tiny sync rescue
+# after a proven async `429`, because they already have a bounded follow-up
+# proof surface and the rescue path inherits the longer flush budget.
+_SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset()
+_SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS = frozenset(
     {
         "archive",
         "conflicts",
@@ -72,6 +81,17 @@ _SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS = frozenset(
         "objects",
     }
 )
+_SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS = frozenset(
+    {
+        "archive",
+        "conflicts",
+        "graph_edges",
+        "graph_nodes",
+        "midterm",
+        "objects",
+    }
+)
+_SYNC_SMALL_PROJECTION_COMPLETE_SEGMENT_SNAPSHOT_KINDS = frozenset()
 _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
     {
         "objects",
@@ -79,6 +99,14 @@ _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
         "archive",
         "graph_edges",
         "graph_nodes",
+        "midterm",
+    }
+)
+_ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
+    {
+        "objects",
+        "conflicts",
+        "archive",
     }
 )
 _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS = frozenset(
@@ -86,6 +114,9 @@ _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS = frozenset(
         "graph_edges",
         "graph_nodes",
     }
+)
+_SYNC_DEFAULT_CURRENT_HEAD_SNAPSHOT_KINDS = frozenset(
+    _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS - _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
 )
 
 
@@ -103,6 +134,158 @@ class _AttestedRecordMatch:
 
 
 class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
+    def repair_invalid_current_head_from_segment_uris(
+        self,
+        *,
+        snapshot_kind: str,
+    ) -> dict[str, object]:
+        """Repair one invalid current head by re-attesting its existing segment URIs.
+
+        Structured current heads can become unreadable when the fixed
+        `.../catalog/current` document is visible but one or more segment refs
+        still lack a stable `document_id`. The segment documents themselves are
+        already authoritative at their versioned URIs, so repairing this case
+        should not rebuild state from local snapshots or stale compatibility
+        blobs. Instead, re-read the advertised segment URIs, recover the exact
+        segment document ids from those envelopes, and republish the same head
+        payload with completed segment refs.
+        """
+
+        definition = self._require_definition(snapshot_kind)
+        if definition.snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS:
+            raise ValueError(f"Projection-only current head repair is not supported for {snapshot_kind!r}.")
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        envelope = self._fetch_catalog_head_envelope(
+            read_client=self._catalog_head_read_client(read_client=read_client),
+            snapshot_kind=snapshot_kind,
+            metadata_only=False,
+        )
+        raw_payload = self._repairable_segmented_catalog_payload_candidate(
+            definition=definition,
+            envelope=envelope,
+        )
+        if raw_payload is None:
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {snapshot_kind!r} current catalog head is invalid and not repairable."
+            )
+        repaired_payload = self._repair_segment_ref_document_ids(
+            definition=definition,
+            payload=raw_payload,
+        )
+        self.persist_catalog_payload(snapshot_kind=snapshot_kind, payload=repaired_payload)
+        self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
+        return repaired_payload
+
+    def _repairable_segmented_catalog_payload_candidate(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        envelope: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Extract one segmented current-head payload even when read-contract invalid."""
+
+        for candidate in self._iter_record_candidates(envelope):
+            if candidate.get("schema") != definition.catalog_schema:
+                continue
+            if candidate.get("version") != _CATALOG_VERSION:
+                continue
+            segments = candidate.get("segments")
+            if not isinstance(segments, list):
+                continue
+            items_count = self._normalize_segment_index(candidate.get("items_count"))
+            if items_count is None:
+                continue
+            if items_count > 0 and not segments:
+                continue
+            return dict(candidate)
+        return None
+
+    def _repair_segment_ref_document_ids(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Rebuild only the missing segment document ids of one current head."""
+
+        segments = payload.get("segments")
+        if not isinstance(segments, list):
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {definition.snapshot_kind!r} current catalog head is missing its segments."
+            )
+        segment_requests: list[tuple[int | None, str | None, str | None]] = []
+        expected_entry_counts: list[int | None] = []
+        for raw_segment in segments:
+            if not isinstance(raw_segment, Mapping):
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote long-term {definition.snapshot_kind!r} current catalog head contains a malformed segment ref."
+                )
+            segment_index = self._normalize_segment_index(raw_segment.get("segment_index"))
+            uri = self._normalize_text(raw_segment.get("uri"))
+            document_id = self._normalize_text(raw_segment.get("document_id"))
+            if segment_index is None or not uri:
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote long-term {definition.snapshot_kind!r} current catalog head contains an unreadable segment ref."
+                )
+            segment_requests.append((segment_index, document_id, uri))
+            expected_entry_counts.append(self._normalize_segment_index(raw_segment.get("entry_count")))
+
+        segment_envelopes = self._load_catalog_segment_payloads(
+            definition=definition,
+            segment_requests=tuple(segment_requests),
+        )
+        if len(segment_envelopes) != len(segment_requests):
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {definition.snapshot_kind!r} current catalog head repair could not reload every segment."
+            )
+
+        repaired_segments: list[dict[str, object]] = []
+        total_entries = 0
+        for raw_segment, expected_entry_count, envelope in zip(segments, expected_entry_counts, segment_envelopes, strict=False):
+            assert isinstance(raw_segment, Mapping)
+            segment_entries = self._extract_segment_entries(
+                definition=definition,
+                payload=envelope,
+            )
+            recovered_document_id = None
+            for candidate_payload, candidate_document_id in self._iter_attestation_candidates(envelope):
+                if candidate_payload.get("schema") != definition.segment_schema:
+                    continue
+                if candidate_payload.get("version") != _SEGMENT_VERSION:
+                    continue
+                if candidate_payload.get("snapshot_kind") != definition.snapshot_kind:
+                    continue
+                if not isinstance(candidate_payload.get("items"), list):
+                    continue
+                recovered_document_id = self._normalize_text(candidate_document_id)
+                break
+            if not recovered_document_id:
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote long-term {definition.snapshot_kind!r} current catalog head repair could not attest a stable segment document id."
+                )
+            if expected_entry_count is not None and len(segment_entries) != expected_entry_count:
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote long-term {definition.snapshot_kind!r} current catalog head repair observed a segment entry-count mismatch."
+                )
+            total_entries += len(segment_entries)
+            repaired_segment = dict(raw_segment)
+            repaired_segment["document_id"] = recovered_document_id
+            repaired_segments.append(repaired_segment)
+
+        items_count = self._normalize_segment_index(payload.get("items_count")) or 0
+        if items_count != total_entries:
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {definition.snapshot_kind!r} current catalog head repair observed an item-count mismatch."
+            )
+        repaired_payload = dict(payload)
+        repaired_payload["segments"] = repaired_segments
+        if not self.is_catalog_payload(snapshot_kind=definition.snapshot_kind, payload=repaired_payload):
+            raise LongTermRemoteUnavailableError(
+                f"Required remote long-term {definition.snapshot_kind!r} current catalog head repair did not produce a readable head."
+            )
+        return repaired_payload
+
     def build_catalog_payload(
         self,
         *,
@@ -541,6 +724,21 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
 
         if not segment_requests:
             return ()
+
+        if len(segment_requests) == 1:
+            segment_index, document_id, uri = segment_requests[0]
+            # A one-segment current head already has the exact segment target.
+            # Sending that through the query-batch lane adds an avoidable
+            # retrieve/top-k roundtrip before the same direct document read we
+            # can perform immediately here.
+            return (
+                self._load_catalog_segment_payload(
+                    definition=definition,
+                    segment_index=segment_index,
+                    document_id=document_id,
+                    uri=uri,
+                ),
+            )
 
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
@@ -1069,12 +1267,12 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         Projection-only graph catalogs still carry large
         `selection_projection` payloads inside one exact-read control-plane
         record. Live ChonkyDB runs continue to return `429 queue_saturated`
-        for graph segment writes in the high-30s KB range even after removing
-        redundant `content` duplication, and the one-item sync rescue path can
-        then hit backend-busy or transport-timeout failures. Keep graph
-        projection segments under a lower fixed ceiling so the normal async
-        path stays below that proven saturation band instead of oscillating
-        around it.
+        for graph projection segment writes even in the mid-20s KB range
+        even after removing redundant `content` duplication, and the one-item
+        sync rescue path can then hit backend-busy or transport-timeout
+        failures. Keep graph projection segments under a lower fixed ceiling
+        so the normal async path stays below that proven saturation band
+        instead of oscillating around it.
         """
 
         budget = self._catalog_segment_max_bytes()
@@ -1213,6 +1411,23 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             async_job_timeout_s = self._remote_async_job_timeout_s(snapshot_kind=snapshot_kind)
             request_payload_kind = self._record_batch_payload_kind(batch=batch)
             access_classification = self._record_batch_access_classification(batch=batch)
+            if self._needs_extended_async_current_head_retry_budget(
+                snapshot_kind=snapshot_kind,
+                batch=batch,
+                request_payload_kind=request_payload_kind,
+            ):
+                retry_attempts = max(retry_attempts, _EXTENDED_ASYNC_CURRENT_HEAD_RETRY_ATTEMPTS)
+            if self._needs_extended_async_post_sync_rescue_retry_budget(
+                snapshot_kind=snapshot_kind,
+                batch=batch,
+                request_payload_kind=request_payload_kind,
+                forced_execution_mode=forced_execution_mode,
+                allow_single_item_sync_rescue=allow_single_item_sync_rescue,
+            ):
+                retry_attempts = max(
+                    retry_attempts,
+                    _EXTENDED_ASYNC_POST_SYNC_RESCUE_RETRY_ATTEMPTS,
+                )
             # Projection-complete callers may defer fine-grained item ids because
             # the catalog metadata already carries the bounded follow-up proof.
             # Immutable control-plane docs still need the jobs endpoint when it
@@ -1229,27 +1444,14 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 request_payload_kind=request_payload_kind,
                 skip_async_document_id_wait=skip_async_document_id_wait,
             )
-            write_transport_timeout_s = self._remote_write_timeout_s()
-            if execution_mode == "async":
-                write_transport_timeout_s = max(
-                    self._remote_flush_timeout_s(),
-                    write_transport_timeout_s or 0.0,
-                )
-            elif self._forced_sync_rescue_needs_flush_timeout(
+            write_transport_timeout_s = self._write_transport_timeout_s(
+                execution_mode=execution_mode,
                 snapshot_kind=snapshot_kind,
                 request_payload_kind=request_payload_kind,
                 forced_execution_mode=forced_execution_mode,
-            ):
-                # Queue-saturated single-item rescue writes only reach this
-                # path after the normal async lane already proved backpressure.
-                # Fresh namespaces can still spend longer than the generic
-                # write timeout warming indexes and committing the accepted
-                # inline write, so the sync rescue lane must inherit the same
-                # end-to-end transport budget as the async path.
-                write_transport_timeout_s = max(
-                    self._remote_flush_timeout_s(),
-                    write_transport_timeout_s or 0.0,
-                )
+                skip_async_document_id_wait=skip_async_document_id_wait,
+                async_job_timeout_s=async_job_timeout_s,
+            )
             effective_write_client = self._client_with_timeout(
                 write_client,
                 timeout_s=write_transport_timeout_s,
@@ -1295,12 +1497,19 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     self._normalize_text(result.get("job_id")) if isinstance(result, Mapping) else None
                 ) and callable(getattr(write_client, "job_status", None))
                 projection_complete_catalog_attestation_optional = (
-                    projection_complete_document_ids_optional
-                    and (
-                        not async_job_resolution_available
-                        or (
-                            fine_grained_job_wait_optional
-                            and async_job_resolution_budget_s < async_job_poll_interval_s
+                    (
+                        skip_async_document_id_wait
+                        and request_payload_kind == "catalog_current_head_record_batch"
+                        and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+                    )
+                    or (
+                        projection_complete_document_ids_optional
+                        and (
+                            not async_job_resolution_available
+                            or (
+                                fine_grained_job_wait_optional
+                                and async_job_resolution_budget_s < async_job_poll_interval_s
+                            )
                         )
                     )
                 )
@@ -1308,32 +1517,44 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     snapshot_kind=snapshot_kind,
                     batch=batch,
                 )
+                skip_projection_complete_job_wait = (
+                    projection_complete_document_ids_optional and not wait_for_async_job_completion
+                )
+                skip_projection_complete_budget_job_wait = (
+                    fine_grained_job_wait_optional
+                    and async_job_resolution_budget_s < async_job_poll_interval_s
+                    and not wait_for_async_job_completion
+                )
+                skip_async_job_document_id_wait = (
+                    not wait_for_async_job_completion
+                    and self._can_skip_async_job_document_id_wait(
+                        snapshot_kind=snapshot_kind,
+                        batch=batch,
+                        document_ids=extracted_document_ids,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                    )
+                )
                 if all(isinstance(value, str) and value for value in extracted_document_ids):
                     async_job_resolution_source = "response"
                 if (
                     not attest_readback
-                    or projection_complete_document_ids_optional
-                    or (
-                        not wait_for_async_job_completion
-                        and self._can_skip_async_job_document_id_wait(
-                            snapshot_kind=snapshot_kind,
-                            batch=batch,
-                            document_ids=extracted_document_ids,
-                        )
-                    )
+                    or skip_projection_complete_job_wait
+                    or skip_async_job_document_id_wait
                     or (wait_for_async_job_completion and not async_job_resolution_available)
-                    or (fine_grained_job_wait_optional and async_job_resolution_budget_s < async_job_poll_interval_s)
+                    or skip_projection_complete_budget_job_wait
                     or not async_job_resolution_available
                 ):
                     job_document_ids = None
                     if async_job_resolution_source is None:
                         if not attest_readback:
                             async_job_resolution_source = "skipped_attestation_disabled"
-                        elif projection_complete_document_ids_optional:
+                        elif skip_projection_complete_job_wait:
+                            async_job_resolution_source = "skipped_projection_complete"
+                        elif skip_async_job_document_id_wait and snapshot_kind == "midterm":
                             async_job_resolution_source = "skipped_projection_complete"
                         elif not async_job_resolution_available:
                             async_job_resolution_source = "unavailable"
-                        elif fine_grained_job_wait_optional and async_job_resolution_budget_s < async_job_poll_interval_s:
+                        elif skip_projection_complete_budget_job_wait:
                             async_job_resolution_source = "skipped_projection_complete"
                         else:
                             async_job_resolution_source = "response"
@@ -1345,6 +1566,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                             result=result,
                             expected=len(batch),
                             snapshot_kind=snapshot_kind,
+                            request_payload_kind=request_payload_kind,
                             require_job_completion=wait_for_async_job_completion,
                         )
                     finally:
@@ -1360,16 +1582,18 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     attestation_mode = "exact_document_ids"
                     readback_required = False
                     resolved_document_ids = extracted_document_ids
-                elif projection_complete_catalog_attestation_optional:
-                    # Projection-complete writers may continue when the jobs
-                    # endpoint is unavailable or the caller explicitly chose a
-                    # too-small visibility budget for item-document polling.
-                    # In that narrow shape the later segment/current-head
-                    # projection is the only bounded proof surface available.
-                    attestation_mode = "deferred_catalog_projection"
-                    readback_required = False
-                    resolved_document_ids = extracted_document_ids
-                elif fine_grained_readback_optional and snapshot_kind == "midterm" and async_job_resolution_available:
+                elif projection_complete_catalog_attestation_optional or fine_grained_readback_optional:
+                    # Projection-complete writers serve fresh readers from the
+                    # later segment/current-head contract, not from the
+                    # transient visibility of each accepted item document. When
+                    # async writes finish without stable document ids, live
+                    # ChonkyDB can still 404 on per-item origin reads even
+                    # though the subsequent catalog projection is the
+                    # authoritative bounded proof surface. In that shape, defer
+                    # attestation to the catalog projection instead of burning
+                    # the write on item-document readback.
+                    if async_job_resolution_source is None:
+                        async_job_resolution_source = "skipped_projection_complete"
                     attestation_mode = "deferred_catalog_projection"
                     readback_required = False
                     resolved_document_ids = extracted_document_ids
@@ -1498,6 +1722,28 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 if (
                     forced_execution_mode is None
                     and execution_mode == "sync"
+                    and self._can_current_head_sync_backpressure_async_fallback(
+                        snapshot_kind=snapshot_kind,
+                        request_payload_kind=request_payload_kind,
+                        batch=batch,
+                        exc=exc,
+                    )
+                ):
+                    return self._store_record_batch_with_retries(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        batch=batch,
+                        batch_index=batch_index,
+                        batch_count=batch_count,
+                        finalize_vector_segments=finalize_vector_segments,
+                        attest_readback=attest_readback,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        forced_execution_mode="async",
+                        allow_single_item_sync_rescue=False,
+                    )
+                if (
+                    forced_execution_mode is None
+                    and execution_mode == "sync"
                     and self._can_current_head_sync_timeout_async_fallback(
                         snapshot_kind=snapshot_kind,
                         request_payload_kind=request_payload_kind,
@@ -1515,6 +1761,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                         attest_readback=attest_readback,
                         skip_async_document_id_wait=skip_async_document_id_wait,
                         forced_execution_mode="async",
+                        allow_single_item_sync_rescue=False,
                     )
                 retry_attempts = retryable_remote_write_attempts(retry_attempts, exc=exc)
                 if should_retry_remote_write_error(exc) and attempt_index + 1 < retry_attempts:
@@ -1523,6 +1770,13 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                         exc,
                         default_backoff_s=retry_backoff_s,
                         attempt_index=attempt_index,
+                        max_backoff_s=self._extended_async_retry_max_backoff_s(
+                            snapshot_kind=snapshot_kind,
+                            batch=batch,
+                            request_payload_kind=request_payload_kind,
+                            forced_execution_mode=forced_execution_mode,
+                            allow_single_item_sync_rescue=allow_single_item_sync_rescue,
+                        ),
                     )
                     if delay_s > 0.0:
                         sleep_with_remote_operation_abort(
@@ -1604,21 +1858,25 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
 
         Large segment docs can still overrun the sync transport budget, so
         retrying them inline would just convert one retryable async `429` into
-        repeated sync/backend-busy failures. Tiny graph projection segments are
-        different: once the segment already collapsed to a single very small
-        record and the backend still says `queue_saturated`, re-submitting the
-        same tiny job to the async queue has no smaller shape left to try.
-        Those specific segments may bypass the queue exactly once through the
-        sync lane. Larger graph segments stay on the async lane and use the
-        normal transient backoff budget instead of forcing the inline path.
+        repeated sync/backend-busy failures. Tiny projection-complete graph,
+        structured-memory, and midterm segments are different: once the segment
+        already collapsed to a single very small record and the backend still
+        says `queue_saturated`, re-submitting the same tiny job to the async
+        queue has no smaller shape left to try. Those specific segments may
+        bypass the queue exactly once through the sync lane. Larger graph
+        segments stay on the async lane and use the normal transient backoff
+        budget instead of forcing the inline path.
         Fine-grained item docs only use this sync bypass when the surrounding
-        snapshot kind has a projection-complete follow-up proof; midterm packet
-        items stay on async because live backpressure there can turn the inline
-        lane into a short timeout without improving durability.
+        snapshot kind has a projection-complete follow-up proof. Midterm packet
+        items now qualify as well because the authoritative current head
+        already carries the full `selection_projection`, the sync rescue uses
+        the longer flush transport budget, and a proven busy/timeout on that
+        rescue still falls back to bounded async retries exactly once.
         """
 
         if len(batch) != 1:
             return False
+        max_sync_request_bytes = _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES
         if request_payload_kind not in {
             "fine_grained_record_batch",
             "catalog_current_head_record_batch",
@@ -1626,7 +1884,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         }:
             return False
         if request_payload_kind == "catalog_segment_record_batch":
-            if snapshot_kind not in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS:
+            if snapshot_kind not in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS:
                 return False
             preview_request = ChonkyDBBulkRecordRequest(
                 items=batch,
@@ -1636,6 +1894,18 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 finalize_vector_segments=True,
             )
             return self._bulk_request_bytes(preview_request) <= _SYNC_SMALL_SEGMENT_WRITE_MAX_BYTES
+        if request_payload_kind == "catalog_current_head_record_batch":
+            # Only current-head writers with the explicit deferred-id contract
+            # may bypass the async queue. Other same-URI heads still need the
+            # normal async retry lane; forcing them into sync on one `429`
+            # recreates the exact live failure where they cannot safely fall
+            # back and die on the short inline transport timeout instead.
+            if snapshot_kind not in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS:
+                return False
+            max_sync_request_bytes = self._current_head_sync_request_max_bytes(
+                snapshot_kind=snapshot_kind,
+                request_payload_kind=request_payload_kind,
+            )
         if request_payload_kind == "fine_grained_record_batch":
             if snapshot_kind not in _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS:
                 return False
@@ -1648,7 +1918,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             client_request_id="preview",
             finalize_vector_segments=True,
         )
-        return self._bulk_request_bytes(preview_request) <= _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES
+        return self._bulk_request_bytes(preview_request) <= max_sync_request_bytes
 
     def _forced_sync_rescue_needs_flush_timeout(
         self,
@@ -1662,13 +1932,93 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         if forced_execution_mode != "sync":
             return False
         if (
+            request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+        ):
+            return True
+        if (
             request_payload_kind == "catalog_segment_record_batch"
-            and snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+            and snapshot_kind in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS
         ):
             return True
         return (
             request_payload_kind == "fine_grained_record_batch"
             and snapshot_kind in _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS
+        )
+
+    def _sync_write_needs_flush_timeout(
+        self,
+        *,
+        execution_mode: str,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        forced_execution_mode: str | None,
+        skip_async_document_id_wait: bool,
+    ) -> bool:
+        """Return whether one sync write needs the longer flush transport budget."""
+
+        if execution_mode != "sync":
+            return False
+        if self._forced_sync_rescue_needs_flush_timeout(
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            forced_execution_mode=forced_execution_mode,
+        ):
+            return True
+        if forced_execution_mode is not None:
+            return False
+        if (
+            request_payload_kind == "catalog_current_head_record_batch"
+            and skip_async_document_id_wait
+            and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+        ):
+            return True
+        return (
+            request_payload_kind == "catalog_segment_record_batch"
+            and skip_async_document_id_wait
+            and snapshot_kind in _SYNC_SMALL_PROJECTION_COMPLETE_SEGMENT_SNAPSHOT_KINDS
+        )
+
+    def _write_transport_timeout_s(
+        self,
+        *,
+        execution_mode: str,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        forced_execution_mode: str | None,
+        skip_async_document_id_wait: bool,
+        async_job_timeout_s: float | None,
+    ) -> float | None:
+        """Return the client transport timeout for one bulk write attempt.
+
+        The HTTP client timeout must never undercut the bounded server-side
+        execution window that Twinr already grants to accepted async jobs for
+        the same snapshot kind. Live `objects/catalog/segment` canary failures
+        proved that one tiny `async -> sync` rescue can legitimately finish
+        after the generic 60 s flush budget yet still well inside the
+        floored 180 s async job budget. Reusing that broader budget on the
+        specific direct-sync control-plane lanes keeps the rescue honest
+        without broadening ordinary write timeouts.
+        """
+
+        write_transport_timeout_s = self._remote_write_timeout_s()
+        if execution_mode == "async":
+            return max(
+                self._remote_flush_timeout_s(),
+                write_transport_timeout_s or 0.0,
+            )
+        if not self._sync_write_needs_flush_timeout(
+            execution_mode=execution_mode,
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            forced_execution_mode=forced_execution_mode,
+            skip_async_document_id_wait=skip_async_document_id_wait,
+        ):
+            return write_transport_timeout_s
+        return max(
+            self._remote_flush_timeout_s(),
+            async_job_timeout_s or 0.0,
+            write_transport_timeout_s or 0.0,
         )
 
     def _can_forced_sync_backpressure_async_fallback(
@@ -1695,7 +2045,12 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             return False
         if (
             request_payload_kind == "catalog_segment_record_batch"
-            and snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+            and snapshot_kind in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS
+        ):
+            return True
+        if (
+            request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
         ):
             return True
         return (
@@ -1725,13 +2080,13 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         if len(batch) != 1:
             return False
         if request_payload_kind == "catalog_current_head_record_batch":
-            if snapshot_kind not in _SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS:
+            if snapshot_kind not in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS:
                 return False
         elif request_payload_kind == "fine_grained_record_batch":
             if snapshot_kind not in _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS:
                 return False
         elif request_payload_kind == "catalog_segment_record_batch":
-            if snapshot_kind not in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS:
+            if snapshot_kind not in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS:
                 return False
         else:
             return False
@@ -1757,7 +2112,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
     ) -> bool:
         """Return whether one tiny current-head sync timeout may retry async."""
 
-        if snapshot_kind not in _SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS:
+        if snapshot_kind not in _SYNC_DEFAULT_CURRENT_HEAD_SNAPSHOT_KINDS:
             return False
         if request_payload_kind != "catalog_current_head_record_batch":
             return False
@@ -1767,6 +2122,35 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             batch=batch,
             exc=exc,
         )
+
+    def _can_current_head_sync_backpressure_async_fallback(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        exc: BaseException,
+    ) -> bool:
+        """Return whether one default sync current-head busy response may retry async.
+
+        Small structured current-head writes still prefer the sync lane when the
+        backend is healthy because the payload is tiny and the projection
+        contract already bounds readback. If that inline lane itself reports
+        temporary backpressure, keeping the rest of the retry budget pinned to
+        sync only hammers the congested path. In that proven shape, fall back
+        once to async and keep the sync rescue disabled so the write cannot
+        ping-pong back to the same busy inline lane.
+        """
+
+        if snapshot_kind not in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS:
+            return False
+        if request_payload_kind != "catalog_current_head_record_batch":
+            return False
+        if snapshot_kind not in _SYNC_DEFAULT_CURRENT_HEAD_SNAPSHOT_KINDS:
+            return False
+        if len(batch) != 1:
+            return False
+        return is_rate_limited_remote_write_error(exc)
 
     def _store_rate_limited_record_subbatches(
         self,
@@ -1834,6 +2218,148 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             return "catalog_current_head_write"
         return "record_bulk_write"
 
+    def _current_head_sync_request_max_bytes(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+    ) -> int:
+        """Return the bounded sync ceiling for one rescued current-head write.
+
+        Projection-only graph heads legitimately carry many segment refs plus
+        topology refs in the authoritative `catalog/current` record. When an
+        async head write already proved `429 queue_saturated`, those larger
+        graph heads may still need one bounded sync rescue around 121 KB.
+        """
+
+        if (
+            request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+        ):
+            return _SYNC_LARGE_GRAPH_CURRENT_HEAD_WRITE_MAX_BYTES
+        return _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES
+
+    def _segment_sync_request_max_bytes(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        skip_async_document_id_wait: bool,
+    ) -> int:
+        """Return the bounded sync ceiling for one direct catalog-segment write.
+
+        Direct sync segment writes stay reserved for explicit graph rescue
+        paths. Structured `objects/conflicts/archive` catalog segments remain
+        async-first; only the matching current-head control-plane write may use
+        sync when the deferred-id contract allows it.
+        """
+
+        if (
+            request_payload_kind == "catalog_segment_record_batch"
+            and skip_async_document_id_wait
+            and snapshot_kind in _SYNC_SMALL_PROJECTION_COMPLETE_SEGMENT_SNAPSHOT_KINDS
+        ):
+            return _SYNC_SMALL_SEGMENT_WRITE_MAX_BYTES
+        return _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES
+
+    def _needs_extended_async_current_head_retry_budget(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        request_payload_kind: str,
+    ) -> bool:
+        """Return whether one async current-head write needs a longer 429 budget.
+
+        Live ChonkyDB can keep its async queue saturated for longer than the
+        generic transient-write budget while accepted cold-path jobs drain. The
+        non-deferred same-URI current-head writers cannot safely use the sync
+        rescue lane, so they need a larger async-only retry window instead of
+        failing before the queue has any realistic chance to clear.
+        """
+
+        return (
+            len(batch) == 1
+            and request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind not in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+        )
+
+    def _current_head_async_retry_max_backoff_s(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        request_payload_kind: str,
+    ) -> float | None:
+        """Return one optional higher backoff cap for async-only current heads."""
+
+        if not self._needs_extended_async_current_head_retry_budget(
+            snapshot_kind=snapshot_kind,
+            batch=batch,
+            request_payload_kind=request_payload_kind,
+        ):
+            return None
+        return _EXTENDED_ASYNC_CURRENT_HEAD_MAX_BACKOFF_S
+
+    def _needs_extended_async_post_sync_rescue_retry_budget(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        request_payload_kind: str,
+        forced_execution_mode: str | None,
+        allow_single_item_sync_rescue: bool,
+    ) -> bool:
+        """Return whether one post-sync-rescue async item needs a longer retry tail."""
+
+        return (
+            forced_execution_mode == "async"
+            and not allow_single_item_sync_rescue
+            and len(batch) == 1
+            and (
+                (
+                    request_payload_kind == "fine_grained_record_batch"
+                    and snapshot_kind in _PROJECTION_COMPLETE_FINE_GRAINED_SNAPSHOT_KINDS
+                )
+                or (
+                    request_payload_kind == "catalog_current_head_record_batch"
+                    and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+                )
+                or (
+                    request_payload_kind == "catalog_segment_record_batch"
+                    and snapshot_kind in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS
+                )
+            )
+        )
+
+    def _extended_async_retry_max_backoff_s(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        request_payload_kind: str,
+        forced_execution_mode: str | None,
+        allow_single_item_sync_rescue: bool,
+    ) -> float | None:
+        """Return one optional higher backoff cap for proven longer async tails."""
+
+        current_head_backoff_s = self._current_head_async_retry_max_backoff_s(
+            snapshot_kind=snapshot_kind,
+            batch=batch,
+            request_payload_kind=request_payload_kind,
+        )
+        if current_head_backoff_s is not None:
+            return current_head_backoff_s
+        if self._needs_extended_async_post_sync_rescue_retry_budget(
+            snapshot_kind=snapshot_kind,
+            batch=batch,
+            request_payload_kind=request_payload_kind,
+            forced_execution_mode=forced_execution_mode,
+            allow_single_item_sync_rescue=allow_single_item_sync_rescue,
+        ):
+            return _EXTENDED_ASYNC_POST_SYNC_RESCUE_MAX_BACKOFF_S
+        return None
+
     def _can_defer_fine_grained_readback_attestation(
         self,
         *,
@@ -1850,11 +2376,12 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         catalog/segment/current-head writes that Twinr actually serves from are
         valid. Objects/conflicts/archive keep the bounded runtime projection on
         catalog entries, so their authoritative proof is the catalog write path,
-        not a URI-only item-document reread. Midterm is narrower: it must still
-        wait for the jobs endpoint when available, but once the job completed
-        without ids and the caller is about to publish a current head with full
-        `selection_projection` payloads, fresh readers can hydrate from that
-        projection without waiting for item-origin visibility.
+        not a URI-only item-document reread. Midterm packet writes with
+        ``skip_async_document_id_wait=True`` use the same projection-complete
+        proof surface: the later current-head payload already carries the full
+        ``selection_projection`` that fresh readers hydrate from, so waiting for
+        per-item origin visibility only burns async-job budget without proving a
+        stronger contract.
         """
 
         if self._record_batch_payload_kind(batch=batch) != "fine_grained_record_batch":
@@ -1871,17 +2398,26 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         snapshot_kind: str,
         batch: tuple[ChonkyDBRecordItem, ...],
         document_ids: tuple[str | None, ...],
+        skip_async_document_id_wait: bool,
     ) -> bool:
         """Return whether one accepted batch may skip async job-status doc-id polling.
 
         Exact document ids from ``job_status(...)`` are useful even for mutable
         current heads: they let same-URI attestation distinguish the newly
         accepted document from older history without trusting the exact-id read
-        alone as authoritative visibility. Only batches that already carry exact
-        ids may skip the jobs endpoint entirely.
+        alone as authoritative visibility. Graph segment/control-plane writes
+        already use projection-complete follow-up proofs, and midterm writes
+        may do the same when the caller explicitly opted into deferred item-id
+        resolution for the projection-complete current head. Midterm item,
+        segment, and current-head payloads all carry enough authoritative state
+        that the bounded readback path can prove visibility directly from the
+        accepted payload, without burning the async jobs budget on exact-id
+        polling first.
         """
 
         if snapshot_kind in {"graph_nodes", "graph_edges"}:
+            return True
+        if snapshot_kind == "midterm" and skip_async_document_id_wait:
             return True
         return all(isinstance(value, str) and value for value in document_ids)
 
@@ -1899,11 +2435,26 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         because the queue is still draining the previously accepted work.
         Graph segment batches therefore use the jobs endpoint as bounded
         back-pressure before Twinr submits the next segment write.
+
+        Large structured snapshot publishes (`objects/conflicts/archive`) can
+        self-induce the same queue flood: `write_snapshot(...)` emits many
+        fine-grained async batches in sequence, and the async jobs lane can
+        still be busy with the accepted earlier batches when the next batch
+        arrives. Those structured fine-grained batches therefore wait for job
+        completion as well, even when batching has already collapsed to
+        single-item requests under the request-byte ceiling.
         """
 
-        if snapshot_kind not in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS:
-            return False
-        return self._record_batch_payload_kind(batch=batch) == "catalog_segment_record_batch"
+        request_payload_kind = self._record_batch_payload_kind(batch=batch)
+        if (
+            snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+            and request_payload_kind == "catalog_segment_record_batch"
+        ):
+            return True
+        return (
+            snapshot_kind in _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_SNAPSHOT_KINDS
+            and request_payload_kind == "fine_grained_record_batch"
+        )
 
     def _bulk_execution_mode(
         self,
@@ -1913,16 +2464,15 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         request_payload_kind: str,
         skip_async_document_id_wait: bool,
     ) -> str:
-        """Choose sync only for tiny one-item current-head control-plane batches.
+        """Choose async by default and reserve sync for proven rescue paths.
 
-        Conflicts stay small enough that the async job overhead can dominate the
-        actual write. Live ChonkyDB evidence also shows a sharp difference
-        between projection-complete current-head and segment writes: the fixed
-        `.../catalog/current` record is still the only control-plane payload
-        worth attempting on the sync `/records/bulk` lane, while segments and
-        fine-grained item docs remain async. If the backend is already busy, the
-        current-head write may still fall back to async through the dedicated
-        timeout recovery path.
+        After the control-plane empty-target-index fix on ChonkyDB, live
+        messy-corpus runs still showed default inline `graph_*/catalog/current`
+        writes blocking for 30-44 seconds even without the earlier
+        vector/fulltext regression. Keep only those graph current heads
+        async-first. Small structured `objects/conflicts/archive/midterm`
+        current heads stay on the existing bounded sync fast path, while graph
+        segment sync remains a narrow rescue-only exception.
         """
 
         if len(batch) != 1:
@@ -1934,12 +2484,25 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         }:
             return "async"
         sync_enabled = snapshot_kind in _SYNC_SMALL_CONTROL_PLANE_SNAPSHOT_KINDS
+        max_sync_request_bytes = _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES
+        segment_sync_request_max_bytes = self._segment_sync_request_max_bytes(
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            skip_async_document_id_wait=skip_async_document_id_wait,
+        )
+        if segment_sync_request_max_bytes > _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES:
+            sync_enabled = True
+            max_sync_request_bytes = segment_sync_request_max_bytes
         if (
             skip_async_document_id_wait
             and request_payload_kind == "catalog_current_head_record_batch"
-            and snapshot_kind in _SYNC_DEFERRED_ID_CONTROL_PLANE_SNAPSHOT_KINDS
+            and snapshot_kind in _SYNC_DEFAULT_CURRENT_HEAD_SNAPSHOT_KINDS
         ):
             sync_enabled = True
+            max_sync_request_bytes = self._current_head_sync_request_max_bytes(
+                snapshot_kind=snapshot_kind,
+                request_payload_kind=request_payload_kind,
+            )
         if not sync_enabled:
             return "async"
         preview_request = ChonkyDBBulkRecordRequest(
@@ -1949,7 +2512,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             client_request_id="preview",
             finalize_vector_segments=True,
         )
-        if self._bulk_request_bytes(preview_request) > _SYNC_SMALL_CONTROL_PLANE_WRITE_MAX_BYTES:
+        if self._bulk_request_bytes(preview_request) > max_sync_request_bytes:
             return "async"
         return "sync"
 
@@ -1995,6 +2558,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         result: object,
         expected: int,
         snapshot_kind: str,
+        request_payload_kind: str,
         require_job_completion: bool = False,
     ) -> tuple[str | None, ...] | None:
         if not isinstance(result, Mapping):
@@ -2007,20 +2571,38 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         if not job_id or not callable(job_status):
             return initial_document_ids if all(isinstance(value, str) and value for value in initial_document_ids) else None
         poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
-        total_timeout_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
+        total_timeout_s = self._async_job_completion_wait_timeout_s(
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            require_job_completion=require_job_completion,
+        )
         deadline = time.monotonic() + total_timeout_s
         while True:
             raise_if_remote_operation_cancelled(operation="Remote catalog async-job wait")
             remaining_timeout_s = deadline - time.monotonic()
             if remaining_timeout_s <= 0.0:
                 break
-            capped_client = clone_client_with_capped_timeout(client, timeout_s=remaining_timeout_s)
+            capped_client = clone_client_with_capped_timeout(
+                client,
+                timeout_s=self._job_status_transport_timeout_s(
+                    snapshot_kind=snapshot_kind,
+                    request_payload_kind=request_payload_kind,
+                    require_job_completion=require_job_completion,
+                    remaining_timeout_s=remaining_timeout_s,
+                ),
+            )
             capped_job_status = getattr(capped_client, "job_status", None)
             try:
                 payload = job_status(job_id) if not callable(capped_job_status) else capped_job_status(job_id)
             except Exception as exc:
                 if not should_fallback_async_job_resolution_error(exc):
                     raise
+                if self._can_fallback_job_status_error_to_uri_attestation(
+                    snapshot_kind=snapshot_kind,
+                    request_payload_kind=request_payload_kind,
+                    require_job_completion=require_job_completion,
+                ):
+                    return None
             else:
                 if isinstance(payload, Mapping):
                     status = self._normalize_text(payload.get("status")).lower()
@@ -2040,6 +2622,14 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                         document_ids = self._extract_document_ids(payload, expected=expected)
                     if all(isinstance(value, str) and value for value in document_ids) and not require_job_completion:
                         return document_ids
+                    if self._can_fallback_pending_job_status_to_uri_attestation(
+                        snapshot_kind=snapshot_kind,
+                        request_payload_kind=request_payload_kind,
+                        require_job_completion=require_job_completion,
+                        status=status,
+                        document_ids=document_ids,
+                    ):
+                        return None
                     if status in {"succeeded", "done"}:
                         if all(isinstance(value, str) and value for value in document_ids):
                             return document_ids
@@ -2055,6 +2645,130 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     operation="Remote catalog async-job wait",
                 )
         return None
+
+    def _can_fallback_job_status_error_to_uri_attestation(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        require_job_completion: bool,
+    ) -> bool:
+        """Return whether one jobs-endpoint error may fall back to URI readback.
+
+        Versioned catalog-segment URI visibility only proves that one accepted
+        payload became readable. It does not prove that the async jobs queue
+        drained enough for the next graph segment write. Completion-required
+        graph segment batches therefore keep polling the jobs lane instead of
+        short-circuiting to URI attestation on the first transport hiccup.
+        """
+
+        if request_payload_kind == "catalog_segment_record_batch":
+            if require_job_completion:
+                return False
+            return snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+        return (
+            not require_job_completion
+            and request_payload_kind == "catalog_current_head_record_batch"
+            and snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+        )
+
+    def _can_fallback_pending_job_status_to_uri_attestation(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        require_job_completion: bool,
+        status: str,
+        document_ids: tuple[str | None, ...],
+    ) -> bool:
+        """Return whether one non-terminal jobs payload may defer to URI readback.
+
+        Versioned catalog-segment URIs are already authoritative visibility
+        proofs. When the jobs endpoint keeps returning ``pending`` without
+        document ids, waiting through the full async-job deadline only delays
+        the stronger same-URI readback attestation that follows anyway.
+        """
+
+        if any(isinstance(value, str) and value for value in document_ids):
+            return False
+        if status in {"done", "succeeded", "failed", "cancelled", "rejected"}:
+            return False
+        return self._can_fallback_job_status_error_to_uri_attestation(
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            require_job_completion=require_job_completion,
+        )
+
+    def _job_status_transport_timeout_s(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        require_job_completion: bool,
+        remaining_timeout_s: float,
+    ) -> float:
+        """Return the per-call HTTP timeout for one jobs-endpoint poll.
+
+        Completion-required graph segment writes still need bounded polling, but
+        the old 1s speculative timeout only made sense when Twinr was willing
+        to abandon jobs polling immediately and trust same-URI visibility. Once
+        completion is the actual backpressure surface, use the normal remote
+        read timeout as the per-poll cap instead.
+        """
+
+        capped_timeout_s = max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, float(remaining_timeout_s))
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            read_timeout_s = float(
+                getattr(
+                    config,
+                    "long_term_memory_remote_read_timeout_s",
+                    _DEFAULT_REMOTE_READ_TIMEOUT_S,
+                )
+            )
+        except (TypeError, ValueError):
+            read_timeout_s = _DEFAULT_REMOTE_READ_TIMEOUT_S
+        read_timeout_cap_s = min(capped_timeout_s, max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, read_timeout_s))
+        if (
+            require_job_completion
+            and request_payload_kind == "catalog_segment_record_batch"
+            and snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+        ):
+            return read_timeout_cap_s
+        if not self._can_fallback_job_status_error_to_uri_attestation(
+            snapshot_kind=snapshot_kind,
+            request_payload_kind=request_payload_kind,
+            require_job_completion=require_job_completion,
+        ):
+            return capped_timeout_s
+        return read_timeout_cap_s
+
+    def _async_job_completion_wait_timeout_s(
+        self,
+        *,
+        snapshot_kind: str,
+        request_payload_kind: str,
+        require_job_completion: bool,
+    ) -> float:
+        """Return the total jobs-wait budget for one accepted async write.
+
+        Projection-complete `objects/conflicts/archive` fine-grained batches
+        only wait on jobs for backpressure, not because later item doc ids are
+        authoritative. Burning the full visibility timeout there can add
+        minutes of dead time per batch and still end in
+        `skipped_projection_complete`. Keep that specific backpressure lane on
+        a much shorter completion budget while leaving the broader visibility
+        window intact for segment/current-head and exact-id attestation paths.
+        """
+
+        total_timeout_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
+        if (
+            require_job_completion
+            and request_payload_kind == "fine_grained_record_batch"
+            and snapshot_kind in _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_SNAPSHOT_KINDS
+        ):
+            return min(total_timeout_s, _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_WAIT_TIMEOUT_S)
+        return total_timeout_s
 
     def _attest_record_readback(
         self,
@@ -2077,6 +2791,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             snapshot_kind=snapshot_kind,
             record_item=record_item,
         )
+        require_document_id = self._attestation_requires_non_null_document_id(record_item)
         last_detail = "Remote write attestation did not observe the accepted payload."
         probe_targets = self._attestation_probe_targets(
             document_id=document_id,
@@ -2110,7 +2825,16 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     expected_payloads=expected_payloads,
                 )
                 if matched_record is not None:
-                    return matched_record.document_id
+                    matched_document_id = self._normalize_text(matched_record.document_id)
+                    if matched_document_id or not require_document_id:
+                        return matched_document_id
+                    # Structured catalog segments are later read through exact-id
+                    # batch queries from the current head. Publishing a head that
+                    # references one visible-but-anonymous segment forces fresh
+                    # readers back onto weaker origin lookups and can leave the
+                    # new segment permanently unreadable under load.
+                    last_detail = "Remote write attestation observed the accepted payload without a stable document id."
+                    continue
                 last_detail = "Remote write attestation read back a different same-uri document."
             remaining_sleep_s = deadline - time.monotonic()
             if remaining_sleep_s <= 0.0:
@@ -2170,6 +2894,30 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             isinstance(metadata_mapping, Mapping)
             and metadata_mapping.get("twinr_catalog_segment_index") is not None
         )
+
+    def _attestation_requires_non_null_document_id(
+        self,
+        record_item: ChonkyDBRecordItem,
+    ) -> bool:
+        """Return whether one attested record must surface a stable document id.
+
+        Structured `objects/conflicts/archive/midterm` catalog segments are
+        later hydrated through exact-id batch queries from the current head.
+        If readback matches only on URI but the backend still omits
+        `document_id`, publishing that segment ref leaves fresh readers with a
+        weaker same-URI fallback that can permanently 404 on live ChonkyDB.
+        Graph projection segments intentionally keep their existing URI-first
+        contract because their current heads already serve the projection data
+        directly.
+        """
+
+        metadata = getattr(record_item, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return False
+        if metadata.get("twinr_catalog_segment_token") is None:
+            return False
+        snapshot_kind = self._normalize_text(metadata.get("twinr_snapshot_kind"))
+        return snapshot_kind not in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
 
     def _attestation_probe_targets(
         self,

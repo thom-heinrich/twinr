@@ -1,5 +1,4 @@
 """Remote snapshot write and attestation helpers for remote state."""
-# mypy: disable-error-code="attr-defined,arg-type"
 
 from __future__ import annotations
 
@@ -13,6 +12,8 @@ from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
 from twinr.memory.longterm.storage._remote_retry import (
     clone_client_with_capped_timeout,
+    exception_chain,
+    is_rate_limited_remote_write_error,
     remote_write_retry_delay_s,
     raise_if_remote_operation_cancelled,
     retryable_remote_write_attempts,
@@ -44,6 +45,9 @@ from .shared import (
     _utcnow_iso,
 )
 
+_SYNC_SMALL_SNAPSHOT_WRITE_MAX_BYTES = 16_384
+_SYNC_DEFERRED_ID_SNAPSHOT_KINDS = frozenset({"midterm"})
+
 
 class LongTermRemoteStateWriteMixin:
     """Write, attest, and bootstrap remote long-term snapshot state."""
@@ -65,7 +69,13 @@ class LongTermRemoteStateWriteMixin:
         self.save_snapshot(snapshot_kind=normalized_snapshot_kind, payload=payload)
         return True
 
-    def save_snapshot(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> None:
+    def save_snapshot(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+        skip_async_document_id_wait: bool = False,
+    ) -> None:
         """Persist one snapshot payload to the remote backend."""
 
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)
@@ -92,6 +102,7 @@ class LongTermRemoteStateWriteMixin:
                     payload=payload_dict,
                     attempts=1,
                     backoff_s=0.0,
+                    skip_async_document_id_wait=skip_async_document_id_wait,
                 )
             except LongTermRemoteUnavailableError:
                 self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
@@ -142,6 +153,7 @@ class LongTermRemoteStateWriteMixin:
                         payload=payload_dict,
                         attempts=1,
                         backoff_s=0.0,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
                     )
                     attested_probe = self._attest_saved_snapshot_readback(
                         read_client,
@@ -201,11 +213,15 @@ class LongTermRemoteStateWriteMixin:
         payload: Mapping[str, object],
         attempts: int | None = None,
         backoff_s: float | None = None,
+        skip_async_document_id_wait: bool = False,
+        forced_execution_mode: str | None = None,
+        allow_single_item_sync_rescue: bool = True,
     ) -> str | None:
         namespace = self.namespace or "twinr_longterm_v1"
         updated_at = _utcnow_iso()
         started = time.monotonic()
         request_correlation_id = f"ltsw-{uuid4().hex[:12]}"
+        execution_mode = forced_execution_mode or "async"
         snapshot_document = {
             "schema": _SNAPSHOT_SCHEMA,
             "namespace": namespace,
@@ -232,7 +248,7 @@ class LongTermRemoteStateWriteMixin:
             content=snapshot_content,
             enable_chunking=False,
             include_insights_in_response=False,
-            execution_mode="async",
+            execution_mode=execution_mode,
         )
         request_bytes = len(json.dumps(record.to_payload(), ensure_ascii=False).encode("utf-8"))
         last_error: Exception | None = None
@@ -245,8 +261,19 @@ class LongTermRemoteStateWriteMixin:
             async_job_wait_ms: float | None = None
             async_job_resolution_source: str | None = None
             attempt_started = time.monotonic()
+            effective_write_client = write_client
+            if self._sync_snapshot_write_needs_flush_timeout(
+                snapshot_kind=snapshot_kind,
+                skip_async_document_id_wait=skip_async_document_id_wait,
+                forced_execution_mode=forced_execution_mode,
+                execution_mode=execution_mode,
+            ):
+                effective_write_client = self._clone_snapshot_write_client_with_timeout(
+                    write_client,
+                    timeout_s=self._remote_flush_timeout_s(),
+                )
             try:
-                result = write_client.store_record(record)
+                result = effective_write_client.store_record(record)
                 store_transport_ms = max(0.0, (time.monotonic() - attempt_started) * 1000.0)
                 failure_detail = _store_result_failure_detail(result)
                 if failure_detail:
@@ -263,6 +290,8 @@ class LongTermRemoteStateWriteMixin:
                 )
                 if resolved_document_id is not None:
                     async_job_resolution_source = "response"
+                elif skip_async_document_id_wait:
+                    async_job_resolution_source = "skipped_projection_complete"
                 elif document_id is None:
                     async_wait_started = time.monotonic()
                     try:
@@ -280,7 +309,7 @@ class LongTermRemoteStateWriteMixin:
                         request_method="POST",
                         request_payload_kind="snapshot_record",
                         request_path="/v1/external/record",
-                        timeout_s=getattr(getattr(write_client, "config", None), "timeout_s", None),
+                        timeout_s=getattr(getattr(effective_write_client, "config", None), "timeout_s", None),
                         namespace=self.namespace,
                         access_classification="legacy_snapshot_write",
                         document_id_hint=resolved_document_id,
@@ -289,7 +318,7 @@ class LongTermRemoteStateWriteMixin:
                         request_item_count=1,
                         request_correlation_id=request_correlation_id,
                         request_bytes=request_bytes,
-                        request_execution_mode="async",
+                        request_execution_mode=execution_mode,
                         async_job_resolution_source=async_job_resolution_source,
                         store_transport_ms=store_transport_ms,
                         async_job_wait_ms=async_job_wait_ms,
@@ -305,6 +334,66 @@ class LongTermRemoteStateWriteMixin:
                 last_error = exc
                 self._note_remote_failure()
                 resolved_attempts = retryable_remote_write_attempts(resolved_attempts, exc=exc)
+                if (
+                    execution_mode == "async"
+                    and allow_single_item_sync_rescue
+                    and is_rate_limited_remote_write_error(exc)
+                    and self._can_rate_limited_snapshot_sync_fallback(
+                        snapshot_kind=snapshot_kind,
+                        request_bytes=request_bytes,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                    )
+                ):
+                    return self._store_snapshot_record(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        payload=payload,
+                        attempts=resolved_attempts,
+                        backoff_s=resolved_backoff_s,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        forced_execution_mode="sync",
+                        allow_single_item_sync_rescue=False,
+                    )
+                if (
+                    not allow_single_item_sync_rescue
+                    and forced_execution_mode == "sync"
+                    and execution_mode == "sync"
+                    and self._can_forced_sync_snapshot_backpressure_async_fallback(
+                        snapshot_kind=snapshot_kind,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        exc=exc,
+                    )
+                ):
+                    return self._store_snapshot_record(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        payload=payload,
+                        attempts=resolved_attempts,
+                        backoff_s=resolved_backoff_s,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        forced_execution_mode="async",
+                        allow_single_item_sync_rescue=False,
+                    )
+                if (
+                    not allow_single_item_sync_rescue
+                    and forced_execution_mode == "sync"
+                    and execution_mode == "sync"
+                    and self._can_forced_sync_snapshot_timeout_async_fallback(
+                        snapshot_kind=snapshot_kind,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        exc=exc,
+                    )
+                ):
+                    return self._store_snapshot_record(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        payload=payload,
+                        attempts=resolved_attempts,
+                        backoff_s=resolved_backoff_s,
+                        skip_async_document_id_wait=skip_async_document_id_wait,
+                        forced_execution_mode="async",
+                        allow_single_item_sync_rescue=False,
+                    )
                 if not should_retry_remote_write_error(exc) or attempt + 1 >= resolved_attempts:
                     break
                 delay_s = remote_write_retry_delay_s(
@@ -329,7 +418,7 @@ class LongTermRemoteStateWriteMixin:
                     request_method="POST",
                     request_payload_kind="snapshot_record",
                     request_path="/v1/external/record",
-                    timeout_s=getattr(getattr(write_client, "config", None), "timeout_s", None),
+                    timeout_s=getattr(getattr(effective_write_client, "config", None), "timeout_s", None),
                     namespace=self.namespace,
                     access_classification="legacy_snapshot_write",
                     uri_hint=record.uri,
@@ -337,7 +426,7 @@ class LongTermRemoteStateWriteMixin:
                     request_item_count=1,
                     request_correlation_id=request_correlation_id,
                     request_bytes=request_bytes,
-                    request_execution_mode="async",
+                    request_execution_mode=execution_mode,
                     store_transport_ms=store_transport_ms,
                     async_job_wait_ms=async_job_wait_ms,
                 ),
@@ -353,6 +442,96 @@ class LongTermRemoteStateWriteMixin:
         raise LongTermRemoteUnavailableError(
             self._remote_failure_detail("write", snapshot_kind, exc=last_error)
         ) from last_error
+
+    @staticmethod
+    def _clone_snapshot_write_client_with_timeout(
+        write_client: ChonkyDBClient,
+        *,
+        timeout_s: float,
+    ) -> ChonkyDBClient:
+        """Clone the snapshot write client to the requested transport timeout."""
+
+        clone_with_timeout = getattr(write_client, "clone_with_timeout", None)
+        if not callable(clone_with_timeout):
+            return write_client
+        try:
+            current_timeout_s = float(getattr(getattr(write_client, "config", None), "timeout_s"))
+            target_timeout_s = max(0.1, float(timeout_s))
+        except (AttributeError, TypeError, ValueError):
+            return write_client
+        if math.isclose(current_timeout_s, target_timeout_s, rel_tol=0.0, abs_tol=1e-9):
+            return write_client
+        return clone_with_timeout(target_timeout_s)
+
+    @staticmethod
+    def _can_rate_limited_snapshot_sync_fallback(
+        *,
+        snapshot_kind: str,
+        request_bytes: int,
+        skip_async_document_id_wait: bool,
+    ) -> bool:
+        """Return whether one tiny deferred-id snapshot write may bypass the async queue once."""
+
+        return (
+            skip_async_document_id_wait
+            and snapshot_kind in _SYNC_DEFERRED_ID_SNAPSHOT_KINDS
+            and request_bytes <= _SYNC_SMALL_SNAPSHOT_WRITE_MAX_BYTES
+        )
+
+    @staticmethod
+    def _sync_snapshot_write_needs_flush_timeout(
+        *,
+        snapshot_kind: str,
+        skip_async_document_id_wait: bool,
+        forced_execution_mode: str | None,
+        execution_mode: str,
+    ) -> bool:
+        """Return whether one sync rescue should inherit the flush transport budget."""
+
+        return (
+            execution_mode == "sync"
+            and forced_execution_mode == "sync"
+            and skip_async_document_id_wait
+            and snapshot_kind in _SYNC_DEFERRED_ID_SNAPSHOT_KINDS
+        )
+
+    @staticmethod
+    def _can_forced_sync_snapshot_backpressure_async_fallback(
+        *,
+        snapshot_kind: str,
+        skip_async_document_id_wait: bool,
+        exc: BaseException,
+    ) -> bool:
+        """Return whether one busy sync rescue may return to bounded async retries."""
+
+        return (
+            skip_async_document_id_wait
+            and snapshot_kind in _SYNC_DEFERRED_ID_SNAPSHOT_KINDS
+            and is_rate_limited_remote_write_error(exc)
+        )
+
+    @staticmethod
+    def _can_forced_sync_snapshot_timeout_async_fallback(
+        *,
+        snapshot_kind: str,
+        skip_async_document_id_wait: bool,
+        exc: BaseException,
+    ) -> bool:
+        """Return whether one timed-out sync rescue may return to bounded async retries."""
+
+        if not skip_async_document_id_wait or snapshot_kind not in _SYNC_DEFERRED_ID_SNAPSHOT_KINDS:
+            return False
+        for item in exception_chain(exc):
+            if isinstance(item, ChonkyDBError):
+                if item.status_code is not None:
+                    continue
+                message = " ".join(str(item).lower().split())
+                if "timed out" in message or "timeout" in message:
+                    return True
+                continue
+            if isinstance(item, (TimeoutError, OSError)):
+                return True
+        return False
 
     def _await_async_store_document_id(
         self,

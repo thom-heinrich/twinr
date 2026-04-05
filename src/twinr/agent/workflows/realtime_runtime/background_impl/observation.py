@@ -13,7 +13,6 @@
 # IMP-2: Use copy-on-write internal merges and clone only when crossing thread boundaries, cutting memory churn on Pi 4.
 # IMP-3: Degrade gracefully when context tracking or person-state derivation fails, instead of killing the background observation path.
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

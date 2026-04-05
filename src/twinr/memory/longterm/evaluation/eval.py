@@ -15,7 +15,11 @@ from tempfile import TemporaryDirectory, mkdtemp
 from typing import Literal
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.chonkydb.personal_graph import (
+    TwinrPersonalGraphStore,
+    _canonical_email,
+    _canonical_phone,
+)
 from twinr.memory.chonkydb.schema import TwinrGraphEdgeV1
 from twinr.memory.context_store import (
     ManagedContextFileStore,
@@ -297,12 +301,16 @@ def run_synthetic_longterm_eval(
             if len(cases) != case_target:
                 raise AssertionError(f"Expected exactly {case_target} eval cases, got {len(cases)}.")
 
-            service.query_rewriter = _StaticQueryRewriter(
-                {
-                    case.query_text: case.canonical_query_text
-                    for case in cases
-                    if case.canonical_query_text
-                }
+            setattr(
+                service,
+                "query_rewriter",
+                _StaticQueryRewriter(
+                    {
+                        case.query_text: case.canonical_query_text
+                        for case in cases
+                        if case.canonical_query_text
+                    }
+                ),
             )
 
             stage = "case execution"
@@ -437,7 +445,7 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
         "Paula", "Theo", "Marta", "Jonas", "Eva", "Nora", "Lukas", "Ines", "David", "Rosa",
         "Milan", "Petra", "Sven", "Helena", "Timo", "Mira", "Frieda", "Lennart", "Ruth", "Ben",
     )
-    family_names = (
+    unique_family_names = (
         "Adler", "Bauer", "Conrad", "Dahl", "Eckert", "Faber", "Graf", "Holm", "Ivers", "Jaeger",
         "Koch", "Lang", "Mohr", "Nolte", "Opitz", "Pape", "Quast", "Reuter", "Simon", "Tesch",
     )
@@ -453,7 +461,7 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
     )
     for index in range(120):
         given_name = first_names[index % len(first_names)]
-        family_name = f"{family_names[index % len(family_names)]}{index:03d}"
+        family_name = f"{unique_family_names[index % len(unique_family_names)]}{index:03d}"
         role = roles[index % len(roles)]
         phone = f"+49 151 {index + 500:07d}"
         email = f"{given_name.lower()}.{family_name.lower()}@example.com"
@@ -719,6 +727,27 @@ def _coerce_tuple(value: object) -> tuple[object, ...]:
         return (value,)
 
 
+def _contact_match_variants(value: object) -> tuple[str, ...]:
+    """Return stable contact-match variants for formatted phone/email values.
+
+    Graph lookup intentionally returns canonical phone/email forms for exact
+    matching. The eval seed fixtures keep human-formatted contact strings. The
+    benchmark should therefore compare normalized contact identities, not
+    brittle whitespace formatting.
+    """
+
+    normalized = " ".join(str(value or "").split()).strip()
+    if not normalized:
+        return ()
+    variants: list[str] = [normalized]
+    canonical_phone = _canonical_phone(normalized)
+    canonical_email = _canonical_email(normalized)
+    for variant in (canonical_phone, canonical_email):
+        if variant and variant not in variants:
+            variants.append(variant)
+    return tuple(variants)
+
+
 def _run_eval_case(
     *,
     service: LongTermMemoryService,
@@ -738,9 +767,18 @@ def _run_eval_case(
         phones = tuple(
             str(phone) for phone in _coerce_tuple(getattr(match, "phones", ()))
         ) if match is not None else ()
-        context_blob = " ".join(part for part in (label, *phones) if part)
-        matched_contains = tuple(text for text in case.expected_contains if text and text in context_blob)
-        missing_contains = tuple(text for text in case.expected_contains if text and text not in context_blob)
+        emails = tuple(
+            str(email) for email in _coerce_tuple(getattr(match, "emails", ()))
+        ) if match is not None else ()
+        observed_values: set[str] = set()
+        for observed in (label, *phones, *emails):
+            observed_values.update(_contact_match_variants(observed))
+        matched_contains = tuple(
+            text
+            for text in case.expected_contains
+            if text and any(variant in observed_values for variant in _contact_match_variants(text))
+        )
+        missing_contains = tuple(text for text in case.expected_contains if text and text not in set(matched_contains))
         options = _coerce_tuple(getattr(result, "options", ()))  # AUDIT-FIX(#8): Tolerate None/non-list option payloads from the contact lookup contract.
         observed_option_count = len(options)
         observed_lookup_status_raw = getattr(result, "status", None)

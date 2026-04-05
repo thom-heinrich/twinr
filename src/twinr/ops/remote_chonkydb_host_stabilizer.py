@@ -47,6 +47,7 @@ from twinr.ops.remote_chonkydb_repair import (
 _DEFAULT_SETTLE_S = 8.0
 _DEFAULT_SSH_TIMEOUT_S = 180.0
 _DEDICATED_DATA_PATH_PROCESS_MIN_ELAPSED_S = 60.0
+_DEFAULT_FOREIGN_HEAVY_PROCESS_MIN_ELAPSED_S = 300.0
 _DEFAULT_CHONKY_PROPERTIES: dict[str, str] = {
     "CPUWeight": "10000",
     "StartupCPUWeight": "10000",
@@ -54,6 +55,7 @@ _DEFAULT_CHONKY_PROPERTIES: dict[str, str] = {
     "StartupIOWeight": "10000",
 }
 _DEFAULT_STALE_PROCESS_MIN_ELAPSED_S = 1800.0
+_REACTIVATED_ACTIVE_STATES = frozenset({"active", "activating", "reloading"})
 _DEFAULT_KILLSWITCH_PATHS = (
     "/home/thh/Desktop/tessairact_local/tessairact/state/systemd_agent/killswitch_codex_traces_pipeline",
     "/home/thh/Desktop/tessairact_local/tessairact/state/systemd_agent/killswitch_user_policy_loop",
@@ -61,6 +63,8 @@ _DEFAULT_KILLSWITCH_PATHS = (
 _DEFAULT_SYSTEM_CONFLICTING_UNITS = (
     "caia-consumer-portal.service",
     "caia-consumer-portal-demo.service",
+    "caia-ccodex-memory-api.service",
+    "caia-chonkycode-api.service",
     "caia-codex-traces-pipeline.service",
     "caia-codex-traces-pipeline.timer",
     "caia-artifacts-stores-backup.service",
@@ -119,7 +123,7 @@ _DEFAULT_USER_CONFLICTING_UNITS = (
     "caia-chonkycode-meta-graph-ssot.timer",
     "ollama-gpu.service",
 )
-_DEFAULT_STALE_PROCESS_RULES = (
+_DEFAULT_STALE_PROCESS_RULES: tuple[dict[str, object], ...] = (
     {
         "label": "code_graph_benchmark_runner",
         "required_substrings": (
@@ -127,7 +131,23 @@ _DEFAULT_STALE_PROCESS_RULES = (
             "run_code_graph_benchmark",
         ),
     },
+    {
+        "label": "chonkycode_artifact_ingest_runner",
+        "minimum_elapsed_s": _DEFAULT_FOREIGN_HEAVY_PROCESS_MIN_ELAPSED_S,
+        "required_substrings": (
+            "-m chonkycode.cli",
+            "artifact-ingest",
+        ),
+    },
+    {
+        "label": "ccodex_memory_locomo_eval_runner",
+        "minimum_elapsed_s": _DEFAULT_FOREIGN_HEAVY_PROCESS_MIN_ELAPSED_S,
+        "required_substrings": (
+            "benchmarks/ccodex_memory/ccodex_memory_locomo_mc10_eval.py",
+        ),
+    },
 )
+_UNMANAGED_CHONKYDB_API_SERVER_MIN_ELAPSED_S = 60.0
 
 
 def build_stale_process_rules(settings: RemoteChonkyDBOpsSettings) -> tuple[dict[str, object], ...]:
@@ -139,7 +159,20 @@ def build_stale_process_rules(settings: RemoteChonkyDBOpsSettings) -> tuple[dict
     stabilizer also matches the derived dedicated data-path substring.
     """
 
-    rules = [dict(rule) for rule in _DEFAULT_STALE_PROCESS_RULES]
+    rules: list[dict[str, object]] = [dict(rule) for rule in _DEFAULT_STALE_PROCESS_RULES]
+    managed_cgroup_markers = _managed_chonkydb_api_cgroup_markers(settings)
+    if managed_cgroup_markers:
+        rules.append(
+            {
+                "label": "unmanaged_chonkydb_api_server_listener",
+                "minimum_elapsed_s": _UNMANAGED_CHONKYDB_API_SERVER_MIN_ELAPSED_S,
+                "required_substrings": (
+                    "tessairact.automations.helpers.launcher --module chonkydb.api.server",
+                ),
+                "excluded_cgroup_substrings": managed_cgroup_markers,
+                "require_listener": True,
+            }
+        )
     data_dir = _dedicated_backend_data_dir(settings.backend_local_base_url)
     if data_dir:
         rules.append(
@@ -150,6 +183,32 @@ def build_stale_process_rules(settings: RemoteChonkyDBOpsSettings) -> tuple[dict
             }
         )
     return tuple(rules)
+
+
+def _managed_chonkydb_api_cgroup_markers(
+    settings: RemoteChonkyDBOpsSettings,
+) -> tuple[str, ...]:
+    """Return the cgroup markers for loopback API servers we intentionally keep.
+
+    The shared thh1986 host can legitimately run more than one ChonkyDB API
+    service under systemd. What we need to kill are the unmanaged strays that
+    bypass service ownership and consume the same host CPU budget. The remote
+    helper therefore excludes these known managed service cgroups before it
+    considers a loopback API listener stale.
+    """
+
+    managed_services = (
+        settings.backend_service,
+        "caia-ccodex-memory-api.service",
+        "caia-chonkycode-api.service",
+    )
+    markers: list[str] = []
+    for service_name in managed_services:
+        normalized_name = str(service_name or "").strip()
+        if not normalized_name:
+            continue
+        markers.append(f"/system.slice/{normalized_name}")
+    return tuple(dict.fromkeys(markers))
 
 
 def _dedicated_backend_data_dir(backend_local_base_url: str) -> str | None:
@@ -266,6 +325,7 @@ import json
 import os
 import pwd
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -341,8 +401,41 @@ for unit in user_units:
 
 
 def _list_process_table() -> tuple[dict[int, dict[str, object]], dict[int, set[int]]]:
+    def _listener_ports_by_pid() -> dict[int, tuple[int, ...]]:
+        completed = subprocess.run(
+            ["ss", "-tlnpH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        listeners: dict[int, set[int]] = {}
+        for raw_line in str(completed.stdout or "").splitlines():
+            line = str(raw_line).strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            local_address = str(parts[3]).strip()
+            users_field = str(parts[-1]).strip()
+            try:
+                port = int(local_address.rsplit(":", 1)[-1])
+            except ValueError:
+                continue
+            for match in re.finditer(r"pid=(\d+)", users_field):
+                listeners.setdefault(int(match.group(1)), set()).add(port)
+        return {pid: tuple(sorted(ports)) for pid, ports in listeners.items()}
+
+    def _read_cgroup(pid: int) -> str:
+        try:
+            with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    listener_ports = _listener_ports_by_pid()
     completed = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,etimes=,args="],
+        ["ps", "-eo", "pid=,ppid=,user=,etimes=,args="],
         capture_output=True,
         text=True,
         check=False,
@@ -353,21 +446,25 @@ def _list_process_table() -> tuple[dict[int, dict[str, object]], dict[int, set[i
         line = str(raw_line).strip()
         if not line:
             continue
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        parts = line.split(None, 4)
+        if len(parts) < 5:
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
-            elapsed_s = int(parts[2])
+            elapsed_s = int(parts[3])
         except ValueError:
             continue
-        args = str(parts[3]).strip()
+        user = str(parts[2]).strip()
+        args = str(parts[4]).strip()
         processes[pid] = {
             "pid": pid,
             "ppid": ppid,
+            "user": user,
             "elapsed_s": elapsed_s,
             "args": args,
+            "cgroup": _read_cgroup(pid),
+            "listener_ports": listener_ports.get(pid, ()),
         }
         children.setdefault(ppid, set()).add(pid)
     return processes, children
@@ -395,8 +492,22 @@ def _collect_stale_process_targets() -> list[dict[str, object]]:
                 for item in rule.get("required_substrings", [])
                 if str(item).strip()
             )
+            excluded_cgroup_substrings = tuple(
+                str(item).strip()
+                for item in rule.get("excluded_cgroup_substrings", [])
+                if str(item).strip()
+            )
+            require_listener = bool(rule.get("require_listener"))
             minimum_elapsed_s = float(rule.get("minimum_elapsed_s", stale_process_min_elapsed_s) or 0.0)
             if elapsed_s < minimum_elapsed_s:
+                continue
+            cgroup = str(process.get("cgroup", "") or "")
+            if excluded_cgroup_substrings and any(
+                marker in cgroup for marker in excluded_cgroup_substrings
+            ):
+                continue
+            listener_ports = tuple(int(item) for item in process.get("listener_ports", ()) if int(item) > 0)
+            if require_listener and not listener_ports:
                 continue
             if required and all(marker in args for marker in required):
                 matched_roots[int(process["pid"])] = {
@@ -565,6 +676,49 @@ class RemoteChonkyDBHostStabilizationResult:
         }
 
 
+def _collect_reactivated_units(
+    states: tuple[RemoteHostUnitState, ...],
+) -> tuple[RemoteHostUnitState, ...]:
+    """Return units that still violate the quiet-host hold after stabilization.
+
+    Conflict units are expected to end the hold pass inactive and not explicitly
+    enabled. Static units are allowed to remain `static`, but any unit that is
+    still `enabled` or currently active is a real hold violation because it can
+    continue to steal CPU/IO from the dedicated 3044 backend.
+    """
+
+    violations: list[RemoteHostUnitState] = []
+    for state in states:
+        if state.active_state in _REACTIVATED_ACTIVE_STATES or state.enabled_state == "enabled":
+            violations.append(state)
+    return tuple(violations)
+
+
+def _merge_stabilization_actions(
+    first: RemoteHostStabilizationAction,
+    second: RemoteHostStabilizationAction | None,
+) -> RemoteHostStabilizationAction:
+    """Merge two stabilization passes into one operator-facing action summary."""
+
+    if second is None:
+        return first
+
+    def _dedupe(values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item for item in values if item))
+
+    process_by_key: dict[tuple[int, str, str], RemoteHostTerminatedProcess] = {}
+    for item in (*first.terminated_processes, *second.terminated_processes):
+        key = (item.pid, item.match_label, item.termination_signal)
+        process_by_key[key] = item
+
+    return RemoteHostStabilizationAction(
+        kill_switch_paths=_dedupe(first.kill_switch_paths + second.kill_switch_paths),
+        disabled_system_units=_dedupe(first.disabled_system_units + second.disabled_system_units),
+        disabled_user_units=_dedupe(first.disabled_user_units + second.disabled_user_units),
+        terminated_processes=tuple(process_by_key.values()),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for remote-host stabilization."""
 
@@ -673,10 +827,6 @@ def stabilize_remote_chonkydb_host(
     )
     if settle_s > 0:
         time.sleep(float(settle_s))
-    public_after = probe_public_host_availability(
-        settings=settings,
-        timeout_s=probe_timeout_s,
-    )
     system_units_after = fetch_remote_unit_states(
         executor=executor,
         units=_DEFAULT_SYSTEM_CONFLICTING_UNITS,
@@ -689,6 +839,41 @@ def stabilize_remote_chonkydb_host(
         scope="user",
         user_unit_owner=settings.ssh.user,
     )
+    system_reactivated = _collect_reactivated_units(system_units_after)
+    user_reactivated = _collect_reactivated_units(user_units_after)
+    recovery_action: RemoteHostStabilizationAction | None = None
+    if system_reactivated or user_reactivated:
+        recovery_action = apply_remote_host_stabilization(
+            executor=executor,
+            backend_service=settings.backend_service,
+            system_units=tuple(item.unit for item in system_reactivated),
+            user_units=tuple(item.unit for item in user_reactivated),
+            user_unit_owner=settings.ssh.user,
+            kill_switch_paths=_DEFAULT_KILLSWITCH_PATHS,
+            property_assignments=_DEFAULT_CHONKY_PROPERTIES,
+            stale_process_rules=build_stale_process_rules(settings),
+            stale_process_min_elapsed_s=_DEFAULT_STALE_PROCESS_MIN_ELAPSED_S,
+        )
+        if settle_s > 0:
+            time.sleep(float(settle_s))
+        system_units_after = fetch_remote_unit_states(
+            executor=executor,
+            units=_DEFAULT_SYSTEM_CONFLICTING_UNITS,
+            scope="system",
+            user_unit_owner=settings.ssh.user,
+        )
+        user_units_after = fetch_remote_unit_states(
+            executor=executor,
+            units=_DEFAULT_USER_CONFLICTING_UNITS,
+            scope="user",
+            user_unit_owner=settings.ssh.user,
+        )
+        system_reactivated = _collect_reactivated_units(system_units_after)
+        user_reactivated = _collect_reactivated_units(user_units_after)
+    public_after = probe_public_host_availability(
+        settings=settings,
+        timeout_s=probe_timeout_s,
+    )
     backend_properties = fetch_remote_service_properties(
         executor=executor,
         service_name=settings.backend_service,
@@ -696,12 +881,15 @@ def stabilize_remote_chonkydb_host(
     )
     elapsed_s = round(time.perf_counter() - started, 3)
     diagnosis = "public_ready_after_host_stabilization"
-    if not public_before.ready and public_after.ready:
+    if system_reactivated or user_reactivated:
+        diagnosis = "conflict_units_reactivated_after_host_stabilization"
+    elif not public_before.ready and public_after.ready:
         diagnosis = "public_recovered_after_host_stabilization"
     elif not public_after.ready:
         diagnosis = "public_still_unhealthy_after_host_stabilization"
+    merged_action = _merge_stabilization_actions(action, recovery_action)
     return RemoteChonkyDBHostStabilizationResult(
-        ok=public_after.ready,
+        ok=public_after.ready and not system_reactivated and not user_reactivated,
         diagnosis=diagnosis,
         elapsed_s=elapsed_s,
         public_before=public_before,
@@ -712,10 +900,10 @@ def stabilize_remote_chonkydb_host(
         system_units_after=system_units_after,
         user_units_before=user_units_before,
         user_units_after=user_units_after,
-        kill_switch_paths=action.kill_switch_paths,
-        disabled_system_units=action.disabled_system_units,
-        disabled_user_units=action.disabled_user_units,
-        terminated_processes=action.terminated_processes,
+        kill_switch_paths=merged_action.kill_switch_paths,
+        disabled_system_units=merged_action.disabled_system_units,
+        disabled_user_units=merged_action.disabled_user_units,
+        terminated_processes=merged_action.terminated_processes,
     )
 
 

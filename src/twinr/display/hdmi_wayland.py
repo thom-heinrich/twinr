@@ -1,3 +1,9 @@
+# CHANGELOG: 2026-04-05
+# BUG-4: Replaced per-frame native-window QPixmap conversion with direct QImage painting so the Pi Wayland display path no longer accumulates multi-GB window-system-managed pixmap memory under continuous updates.
+# BUG-5: Replaced the QWidget-based native raster path with a QRasterWindow-backed Wayland surface and added explicit screen/DPR telemetry so the Pi display companion no longer depends on the heavier widget stack and the first fullscreen present is diagnosable from logs alone.
+# BUG-6: Split the first fullscreen Wayland render into explicit memory-attribution subphases so Pi forensics can distinguish RGBA upload, showFullScreen visibility, frame upload, and Qt event processing instead of blaming one coarse "presented" phase.
+# BUG-7: Disabled HDMI Wayland idle waiting animation because repeated fullscreen waiting rerenders on the Pi still accumulate hundreds of MB of anonymous RSS within seconds even after the QRasterWindow rewrite.
+# BUG-8: Disable all time-driven status animation on hdmi_wayland because active listening/processing/answering repaints still drive Pi RSS into the 0.9-1.6 GB range under the QRasterWindow path, which then stalls live voice turns.
 # CHANGELOG: 2026-03-28
 # BUG-1: close() and tick() now share the same lock as show_image() to remove teardown/render races.
 # BUG-2: tick() no longer swallows every Qt exception; display freezes now fail loudly instead of silently.
@@ -21,7 +27,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.hdmi_fbdev import (
@@ -30,6 +36,7 @@ from twinr.display.hdmi_fbdev import (
     FramebufferGeometry,
     HdmiFramebufferDisplay,
 )
+from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.display.wayland_env import apply_wayland_environment
 from twinr.display.wayland_surface_host import HdmiWaylandSurfaceHost
 
@@ -85,9 +92,202 @@ def _ordered_qt_specs(preferred_api: str) -> tuple[tuple[str, str, str, str], ..
     return tuple(loaded + unloaded)
 
 
+def _record_memory_phase_for_path(
+    path: Path | None,
+    *,
+    label: str,
+    owner_label: str | None = None,
+    owner_detail: str | None = None,
+    replace: bool = False,
+) -> None:
+    """Best-effort bridge into the shared streaming-memory attribution file."""
+
+    if path is None:
+        return
+    try:
+        from twinr.ops.process_memory import StreamingMemoryAttributionStore
+
+        StreamingMemoryAttributionStore(path).record_phase(
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            replace=replace,
+        )
+    except Exception:
+        return
+
+
+def _combine_qt_flags(*flags: Any) -> Any | None:
+    combined: Any | None = None
+    for flag in flags:
+        if flag is None:
+            continue
+        combined = flag if combined is None else (combined | flag)
+    return combined
+
+
+def _screen_device_pixel_ratio(screen: Any | None) -> float:
+    if screen is None:
+        return 1.0
+    ratio_getter = getattr(screen, "devicePixelRatio", None)
+    if ratio_getter is None:
+        return 1.0
+    try:
+        value = float(ratio_getter())
+    except Exception:
+        return 1.0
+    return value if value > 0.0 else 1.0
+
+
+def _screen_geometry_size(screen: Any | None) -> tuple[int, int] | None:
+    if screen is None:
+        return None
+    geometry_getter = getattr(screen, "geometry", None)
+    if geometry_getter is None:
+        return None
+    try:
+        geometry = geometry_getter()
+    except Exception:
+        return None
+    if geometry is None or not hasattr(geometry, "width") or not hasattr(geometry, "height"):
+        return None
+    try:
+        return (max(1, int(geometry.width())), max(1, int(geometry.height())))
+    except Exception:
+        return None
+
+
+def _screen_name(screen: Any | None) -> str | None:
+    if screen is None:
+        return None
+    name_getter = getattr(screen, "name", None)
+    if name_getter is None:
+        return None
+    try:
+        value = name_getter()
+    except Exception:
+        return None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _screen_match_score(*, screen: Any, requested_width: int, requested_height: int) -> float:
+    candidate_sizes: list[tuple[int, int]] = []
+    geometry_size = _screen_geometry_size(screen)
+    if geometry_size is not None:
+        candidate_sizes.append(geometry_size)
+    available_geometry_getter = getattr(screen, "availableGeometry", None)
+    if available_geometry_getter is not None:
+        try:
+            available_geometry = available_geometry_getter()
+        except Exception:
+            available_geometry = None
+        if available_geometry is not None and hasattr(available_geometry, "width") and hasattr(available_geometry, "height"):
+            try:
+                candidate_sizes.append(
+                    (
+                        max(1, int(available_geometry.width())),
+                        max(1, int(available_geometry.height())),
+                    )
+                )
+            except Exception:
+                pass
+    device_pixel_ratio = _screen_device_pixel_ratio(screen)
+    if device_pixel_ratio > 0.0:
+        derived_sizes: list[tuple[int, int]] = []
+        for width, height in candidate_sizes:
+            derived_sizes.append((width, height))
+            derived_sizes.append(
+                (
+                    max(1, int(round(width * device_pixel_ratio))),
+                    max(1, int(round(height * device_pixel_ratio))),
+                )
+            )
+        candidate_sizes = derived_sizes
+    if not candidate_sizes:
+        return float("inf")
+    return min(
+        abs(width - requested_width) + abs(height - requested_height)
+        for width, height in candidate_sizes
+    )
+
+
+def _select_best_screen(app: Any | None, *, requested_size: tuple[int, int]) -> Any | None:
+    if app is None:
+        return None
+    screens_getter = getattr(app, "screens", None)
+    if screens_getter is None:
+        return None
+    try:
+        screens = list(screens_getter())
+    except Exception:
+        return None
+    if not screens:
+        return None
+    if len(screens) == 1:
+        return screens[0]
+    requested_width, requested_height = requested_size
+    best_screen: Any | None = None
+    best_score: float | None = None
+    for screen in screens:
+        score = _screen_match_score(
+            screen=screen,
+            requested_width=requested_width,
+            requested_height=requested_height,
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_screen = screen
+    return best_screen
+
+
+def _logical_window_size(
+    app: Any | None,
+    *,
+    requested_size: tuple[int, int],
+    target_screen: Any | None,
+) -> tuple[int, int]:
+    width, height = requested_size
+    screen = target_screen or _select_best_screen(app, requested_size=requested_size)
+    device_pixel_ratio = _screen_device_pixel_ratio(screen)
+    if device_pixel_ratio <= 0.0:
+        device_pixel_ratio = 1.0
+    return (
+        max(1, int(round(width / device_pixel_ratio))),
+        max(1, int(round(height / device_pixel_ratio))),
+    )
+
+
+def _format_window_telemetry(
+    *,
+    window_kind: str,
+    window_size: tuple[int, int],
+    frame_size: tuple[int, int] | None,
+    screen: Any | None,
+    exposed: bool | None,
+) -> str:
+    parts = [
+        f"window_kind={window_kind}",
+        f"window_px={window_size[0]}x{window_size[1]}",
+    ]
+    if frame_size is not None:
+        parts.append(f"frame_px={frame_size[0]}x{frame_size[1]}")
+    screen_name = _screen_name(screen)
+    if screen_name:
+        parts.append(f"screen={screen_name}")
+    screen_geometry = _screen_geometry_size(screen)
+    if screen_geometry is not None:
+        parts.append(f"screen_px={screen_geometry[0]}x{screen_geometry[1]}")
+    device_pixel_ratio = _screen_device_pixel_ratio(screen)
+    if device_pixel_ratio > 0.0:
+        parts.append(f"dpr={device_pixel_ratio:.3f}")
+    if exposed is not None:
+        parts.append(f"exposed={str(exposed).lower()}")
+    return " ".join(parts)
+
+
 def _build_wayland_window_class(qt_core: Any, qt_gui: Any, qt_widgets: Any) -> type[Any]:
-    QWidget = qt_widgets.QWidget
-    QPixmap = qt_gui.QPixmap
+    QRasterWindow = qt_gui.QRasterWindow
     QImage = qt_gui.QImage
     QPainter = qt_gui.QPainter
     QColor = qt_gui.QColor
@@ -95,26 +295,29 @@ def _build_wayland_window_class(qt_core: Any, qt_gui: Any, qt_widgets: Any) -> t
 
     frameless = _qt_enum(qt_core.Qt, "FramelessWindowHint", "WindowType")
     stays_on_top = _qt_enum(qt_core.Qt, "WindowStaysOnTopHint", "WindowType")
-    opaque_paint = _qt_enum(qt_core.Qt, "WA_OpaquePaintEvent", "WidgetAttribute")
-    no_system_background = _qt_enum(qt_core.Qt, "WA_NoSystemBackground", "WidgetAttribute")
+    window_kind = _qt_enum(qt_core.Qt, "Window", "WindowType")
+    try:
+        no_focus = _qt_enum(qt_core.Qt, "WindowDoesNotAcceptFocus", "WindowType")
+    except AttributeError:
+        no_focus = None
     blank_cursor = _qt_enum(qt_core.Qt, "BlankCursor", "CursorShape")
-    smooth_pixmap_transform = _qt_enum(qt_gui.QPainter, "SmoothPixmapTransform", "RenderHint")
     rgba8888 = _qimage_format_rgba8888(qt_gui)
 
-    class TwinrWaylandRasterWindow(QWidget):
+    class TwinrWaylandRasterWindow(QRasterWindow):  # type: ignore[valid-type,misc]
         def __init__(self, logical_width: int, logical_height: int) -> None:
-            super().__init__(None)
-            self._pixmap = QPixmap()
+            super().__init__()
+            self._image: Any | None = None
             self._upload_bytes: bytes | None = None
             self._background = QColor(0, 0, 0)
+            self._last_frame_size: tuple[int, int] | None = None
             self.setObjectName("TwinrWaylandDisplay")
-            self.setWindowTitle("Twinr")
-            self.setWindowFlag(frameless, True)
-            self.setWindowFlag(stays_on_top, True)
-            self.setAttribute(opaque_paint, True)
-            self.setAttribute(no_system_background, True)
-            self.setAutoFillBackground(False)
-            self.setCursor(QCursor(blank_cursor))
+            if hasattr(self, "setTitle"):
+                self.setTitle("Twinr")
+            combined_flags = _combine_qt_flags(window_kind, frameless, stays_on_top, no_focus)
+            if combined_flags is not None and hasattr(self, "setFlags"):
+                self.setFlags(combined_flags)
+            if blank_cursor is not None and hasattr(self, "setCursor"):
+                self.setCursor(QCursor(blank_cursor))
             self.resize(max(1, logical_width), max(1, logical_height))
 
         def set_frame(self, rgba_bytes: bytes, width: int, height: int) -> None:
@@ -122,41 +325,65 @@ def _build_wayland_window_class(qt_core: Any, qt_gui: Any, qt_widgets: Any) -> t
                 return
             stride = width * 4
             self._upload_bytes = rgba_bytes
-            image = QImage(self._upload_bytes, width, height, stride, rgba8888)
-            self._pixmap = QPixmap.fromImage(image)
+            self._image = QImage(self._upload_bytes, width, height, stride, rgba8888)
+            self._last_frame_size = (width, height)
             self.update()
 
         def clear_frame(self) -> None:
             self._upload_bytes = None
-            self._pixmap = QPixmap()
+            self._image = None
+            self._last_frame_size = None
             self.update()
 
         def ensure_visible(self) -> None:
             if not self.isVisible():
                 self.showFullScreen()
-            self.raise_()
-            self.activateWindow()
 
         def paintEvent(self, event: Any) -> None:  # pragma: no cover - requires Qt runtime
+            del event
             painter = QPainter(self)
-            painter.fillRect(self.rect(), self._background)
-            if not self._pixmap.isNull():
-                painter.setRenderHint(smooth_pixmap_transform, False)
-                painter.drawPixmap(self.rect(), self._pixmap)
+            painter.fillRect(0, 0, self.width(), self.height(), self._background)
+            image = self._image
+            if image is not None:
+                painter.drawImage(0, 0, image)
+
+        def frame_telemetry(self) -> str:
+            screen_getter = cast(Callable[[], object] | None, getattr(self, "screen", None))
+            screen = None
+            if screen_getter is not None:
+                try:
+                    screen = screen_getter()
+                except Exception:
+                    screen = None
+            is_exposed_getter = cast(
+                Callable[[], object] | None,
+                getattr(self, "isExposed", None),
+            )
+            exposed: bool | None = None
+            if is_exposed_getter is not None:
+                try:
+                    exposed = bool(is_exposed_getter())
+                except Exception:
+                    exposed = None
+            return _format_window_telemetry(
+                window_kind="qrasterwindow",
+                window_size=(max(1, int(self.width())), max(1, int(self.height()))),
+                frame_size=self._last_frame_size,
+                screen=screen,
+                exposed=exposed,
+            )
 
     return TwinrWaylandRasterWindow
 
 
 def _supports_native_raster_window(qt_gui: Any, qt_widgets: Any) -> bool:
-    widget_cls = getattr(qt_widgets, "QWidget", None)
-    if widget_cls is None:
+    del qt_widgets
+    raster_window_cls = getattr(qt_gui, "QRasterWindow", None)
+    if raster_window_cls is None:
         return False
     if any(getattr(qt_gui, name, None) is None for name in ("QPainter", "QColor", "QCursor")):
         return False
-    return all(
-        hasattr(widget_cls, attribute)
-        for attribute in ("setWindowFlag", "setAttribute", "setAutoFillBackground", "setCursor")
-    )
+    return hasattr(raster_window_cls, "paintEvent")
 
 
 @dataclass(slots=True)
@@ -167,6 +394,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
     wayland_display: str = "wayland-0"
     wayland_runtime_dir: str | None = None
     qt_api: str = "auto"
+    memory_snapshot_path: Path | None = None
     _qt_binding_name: str | None = field(default=None, init=False, repr=False)
     _qt_modules: tuple[Any, Any, Any] | None = field(default=None, init=False, repr=False)
     _qt_app: Any | None = field(default=None, init=False, repr=False)
@@ -179,6 +407,8 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
     _owns_qt_app: bool = field(default=False, init=False, repr=False)
     _qt_thread_ident: int | None = field(default=None, init=False, repr=False)
     _surface_host: Any | None = field(default=None, init=False, repr=False)
+    _memory_first_frame_recorded: bool = field(default=False, init=False, repr=False)
+    _memory_last_growth_anonymous_kb: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.framebuffer_path = Path(self.framebuffer_path).expanduser()
@@ -217,10 +447,11 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             width=max(1, int(getattr(config, "display_width", 0) or 800)),
             height=max(1, int(getattr(config, "display_height", 0) or 480)),
             rotation_degrees=int(getattr(config, "display_rotation_degrees", 0) or 0),
-            layout_mode=getattr(config, "display_layout", None),
+            layout_mode=getattr(config, "display_layout", None) or "default",
             wayland_display=getattr(config, "display_wayland_display", "wayland-0") or "wayland-0",
             wayland_runtime_dir=getattr(config, "display_wayland_runtime_dir", None),
             qt_api=getattr(config, "display_qt_api", "auto") or "auto",
+            memory_snapshot_path=resolve_ops_paths_for_config(config).ops_store_root / "streaming_memory_segments.json",
             emit=emit,
         )
 
@@ -241,14 +472,53 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             )
         return self._geometry
 
+    def supports_idle_waiting_animation(self) -> bool:
+        """Keep the Wayland idle waiting face static on the Pi.
+
+        Fresh Pi evidence on 2026-04-05 showed the first frame upload staying
+        near ~246 MB anonymous RSS, but repeated fullscreen `waiting` rerenders
+        on the same backend still drove the process to ~931 MB anonymous RSS
+        within roughly 23 seconds. Until the lower-level Wayland/Qt retention
+        path is fully eliminated, the correct backend-level policy is to avoid
+        idle waiting animation entirely on hdmi_wayland.
+        """
+
+        return False
+
+    def supports_status_animation(self, status: str) -> bool:
+        """Disable time-driven status animation on the Wayland backend.
+
+        Pi measurements on April 5, 2026 showed that the retained Qt/Wayland
+        path still accumulates large anonymous RSS under repeated fullscreen
+        repaints, not only for idle waiting but also during active voice states.
+        Keep the status frame static until the lower-level retention path is
+        eliminated.
+        """
+
+        del status
+        return False
+
+    def supports_periodic_status_repaint(self) -> bool:
+        """Disable minute/ticker-driven repaint churn on the Wayland backend.
+
+        After disabling explicit status animation, Pi evidence still showed the
+        retained Qt/Wayland path accumulating anonymous RSS across otherwise
+        semantic-noop default-layout rerenders such as footer clock updates.
+        Keep those time-driven repaint triggers disabled until the lower-level
+        retention path is eliminated.
+        """
+
+        return False
+
     def show_image(self, image: object) -> None:
         """Blit one prepared frame into the fullscreen Wayland window."""
 
-        with self._lock:
+        with cast(Any, self._lock):
             self._assert_gui_thread("HdmiWaylandDisplay.show_image")
             prepared = self._prepare_image(image)
             width, height = prepared.size
             rgba_bytes = prepared.tobytes("raw", "RGBA")
+            first_render = not self._memory_first_frame_recorded
             qt_core, qt_gui, qt_widgets = self._load_qt()
             if self._qt_image_bytes == rgba_bytes and self._last_frame_size == (width, height):
                 self.tick()
@@ -267,6 +537,12 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                     size=(width, height),
                     socket_path=socket_path,
                 )
+                self._record_render_memory_phase(
+                    label="display.hdmi_wayland.surface_host_frame_presented",
+                    owner_label="display_companion.hdmi_wayland.surface_host_frame",
+                    owner_detail="Fallback Qt raster surface converted and presented one Wayland frame.",
+                    replace=not self._memory_first_frame_recorded,
+                )
                 self._qt_app = host.app
                 self._qt_window = host.window
                 self._qt_image_label = host.image_label
@@ -275,18 +551,64 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                 self.tick()
                 return
             window = self._ensure_qt_window()
+            if first_render:
+                self._record_first_render_phase(
+                    label="display.hdmi_wayland.first_frame.rgba_bytes_ready",
+                    owner_label="display_companion.hdmi_wayland.first_frame.rgba_bytes",
+                    owner_detail=(
+                        "Prepared one RGBA byte buffer for the first fullscreen Qt upload. "
+                        f"frame_px={width}x{height} bytes={len(rgba_bytes)}"
+                    ),
+                )
             window.ensure_visible()
+            if first_render:
+                self._record_first_render_phase(
+                    label="display.hdmi_wayland.first_frame.window_visible",
+                    owner_label="display_companion.hdmi_wayland.first_frame.window_visible",
+                    owner_detail=(
+                        "Requested the first fullscreen Qt window presentation before the first "
+                        "frame upload."
+                    ),
+                )
 
             window.set_frame(rgba_bytes, width, height)
+            if first_render:
+                self._record_first_render_phase(
+                    label="display.hdmi_wayland.first_frame.frame_uploaded",
+                    owner_label="display_companion.hdmi_wayland.first_frame.frame_uploaded",
+                    owner_detail=(
+                        "Uploaded the first RGBA frame into the QRasterWindow backing image "
+                        "before Qt event processing."
+                    ),
+                )
             self._qt_image_label = None
             self._qt_image_bytes = rgba_bytes
             self._last_frame_size = (width, height)
             self.tick()
+            render_window_detail = cast(
+                Callable[[], object] | None,
+                getattr(window, "frame_telemetry", None),
+            )
+            window_detail = ""
+            if render_window_detail is not None:
+                try:
+                    window_detail = str(render_window_detail() or "").strip()
+                except Exception:
+                    window_detail = ""
+            owner_detail = "Qt QRasterWindow presented one fullscreen Wayland frame."
+            if window_detail:
+                owner_detail = f"{owner_detail} {window_detail}"
+            self._record_render_memory_phase(
+                label="display.hdmi_wayland.native_window_frame_presented",
+                owner_label="display_companion.hdmi_wayland.native_window_frame",
+                owner_detail=owner_detail,
+                replace=True,
+            )
 
     def tick(self) -> None:
         """Keep the Wayland event queue responsive between rerenders."""
 
-        with self._lock:
+        with cast(Any, self._lock):
             app = self._qt_app
             if app is None:
                 return
@@ -301,7 +623,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
         """Release the Wayland window cleanly."""
 
         error: Exception | None = None
-        with self._lock:
+        with cast(Any, self._lock):
             if self._qt_app is not None or self._qt_window is not None:
                 self._assert_gui_thread("HdmiWaylandDisplay.close")
             try:
@@ -343,10 +665,41 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
         window = self._qt_window
         if window is None:
             window = self._qt_window_class(self.width, self.height)
+            app = self._qt_app
+            target_screen = _select_best_screen(app, requested_size=(self.width, self.height))
+            if target_screen is not None and hasattr(window, "setScreen"):
+                try:
+                    window.setScreen(target_screen)
+                except Exception:
+                    pass
+            logical_width, logical_height = _logical_window_size(
+                app,
+                requested_size=(self.width, self.height),
+                target_screen=target_screen,
+            )
+            if hasattr(window, "resize"):
+                try:
+                    window.resize(logical_width, logical_height)
+                except Exception:
+                    pass
             self._qt_window = window
             self._surface_host = window
+            ready_detail = _format_window_telemetry(
+                window_kind="qrasterwindow",
+                window_size=(logical_width, logical_height),
+                frame_size=(self.width, self.height),
+                screen=target_screen,
+                exposed=None,
+            )
             self._emit_message(
-                f"hdmi_wayland ready via {self._qt_binding_name or 'qt'} on {socket_path}"
+                f"hdmi_wayland ready via {self._qt_binding_name or 'qt'} on {socket_path} {ready_detail}"
+            )
+            _record_memory_phase_for_path(
+                self.memory_snapshot_path,
+                label="display.hdmi_wayland.window_ready",
+                owner_label="display_companion.hdmi_wayland.window",
+                owner_detail=f"Qt QRasterWindow was created and bound to the fullscreen display surface. {ready_detail}",
+                replace=True,
             )
         return window
 
@@ -390,6 +743,13 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             )
 
         self._qt_app = app
+        _record_memory_phase_for_path(
+            self.memory_snapshot_path,
+            label="display.hdmi_wayland.qt_app_ready",
+            owner_label="display_companion.hdmi_wayland.qt_app",
+            owner_detail="QApplication is ready for the HDMI Wayland backend.",
+            replace=True,
+        )
         return app
 
     def _load_qt(self) -> tuple[Any, Any, Any]:
@@ -410,6 +770,13 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
 
             self._qt_binding_name = binding_name
             self._qt_modules = (qt_core, qt_gui, qt_widgets)
+            _record_memory_phase_for_path(
+                self.memory_snapshot_path,
+                label="display.hdmi_wayland.qt_modules_loaded",
+                owner_label="display_companion.hdmi_wayland.qt_import",
+                owner_detail=f"Qt binding {binding_name} imported for the HDMI Wayland backend.",
+                replace=True,
+            )
             return self._qt_modules
 
         raise RuntimeError(
@@ -482,3 +849,65 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             emit(message)
         except Exception:
             return
+
+    def _record_render_memory_phase(
+        self,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+        replace: bool,
+    ) -> None:
+        """Record the first rendered frame and later large anonymous-growth checkpoints."""
+
+        path = self.memory_snapshot_path
+        if path is None:
+            return
+        from twinr.ops.process_memory import StreamingMemoryAttributionStore
+
+        snapshot = StreamingMemoryAttributionStore(path).record_phase(
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            replace=replace,
+        )
+        if snapshot is None:
+            return
+        self._memory_first_frame_recorded = True
+        current_anonymous_kb = snapshot.current_metrics.preferred_anonymous_kb()
+        if current_anonymous_kb is None:
+            return
+        previous_checkpoint = self._memory_last_growth_anonymous_kb
+        if previous_checkpoint is None:
+            self._memory_last_growth_anonymous_kb = current_anonymous_kb
+            return
+        growth_kb = current_anonymous_kb - previous_checkpoint
+        if growth_kb < 128 * 1024:
+            return
+        self._memory_last_growth_anonymous_kb = current_anonymous_kb
+        StreamingMemoryAttributionStore(path).record_phase(
+            label=f"{label}.growth_checkpoint",
+            owner_label=owner_label,
+            owner_detail=(
+                f"{owner_detail} Anonymous growth checkpoint recorded after an additional "
+                f"{int(round(growth_kb / 1024.0))} MB."
+            ),
+            replace=True,
+        )
+
+    def _record_first_render_phase(
+        self,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+    ) -> None:
+        """Persist one first-render boundary so Pi forensics can localize display growth."""
+
+        _record_memory_phase_for_path(
+            self.memory_snapshot_path,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            replace=True,
+        )

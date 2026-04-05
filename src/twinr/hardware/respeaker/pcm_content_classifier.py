@@ -35,12 +35,13 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import math
 import os
 from pathlib import Path
 import threading
 import time
-from typing import Iterable
+from typing import Iterable, SupportsIndex, SupportsInt, cast
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -67,6 +68,10 @@ _DEFAULT_MODEL_CANDIDATES = (
     "/usr/local/share/twinr/silero_vad_v6_16k.onnx",
     "/usr/local/share/twinr/silero_vad_16k.onnx",
 )
+_OPENWAKEWORD_MODEL_RELATIVE_PATH = ("resources", "models", "silero_vad.onnx")
+_STATEFUL_SILERO_CHUNK_SIZE = 512
+_LSTM_SILERO_CHUNK_SIZE = 480
+_STATEFUL_SILERO_CONTEXT_SIZE = 64
 
 _REFERENCE_ALIGN_DOWNSAMPLE = 4
 _REFERENCE_ALIGN_MAX_LAG_MS = 120
@@ -173,10 +178,28 @@ class _SileroOnnxBackend:
             providers=["CPUExecutionProvider"],
             sess_options=opts,
         )
+        self._context_name: str | None = None
         inputs = self._session.get_inputs()
-        self._input_name = inputs[0].name
-        self._state_name = inputs[1].name
-        self._sr_name = inputs[2].name
+        input_names = {str(getattr(item, "name", "")) for item in inputs}
+        self._lstm_state_layout = {"input", "sr", "h", "c"}.issubset(input_names)
+        if self._lstm_state_layout:
+            h_input = next(item for item in inputs if getattr(item, "name", "") == "h")
+            c_input = next(item for item in inputs if getattr(item, "name", "") == "c")
+            self._input_name = "input"
+            self._state_name = "h"
+            self._context_name = "c"
+            self._sr_name = "sr"
+            self._state_shape = _coerce_onnx_tensor_shape(getattr(h_input, "shape", None), default=(2, 1, 64))
+            self._context_shape = _coerce_onnx_tensor_shape(getattr(c_input, "shape", None), default=(2, 1, 64))
+            self._chunk_size = _LSTM_SILERO_CHUNK_SIZE
+        else:
+            self._input_name = inputs[0].name
+            self._state_name = inputs[1].name
+            self._sr_name = inputs[2].name
+            self._context_name = None
+            self._state_shape = _coerce_onnx_tensor_shape(getattr(inputs[1], "shape", None), default=(2, 1, 128))
+            self._context_shape = (1, _STATEFUL_SILERO_CONTEXT_SIZE)
+            self._chunk_size = _STATEFUL_SILERO_CHUNK_SIZE
         self._lock = threading.RLock()
         self._states: OrderedDict[str, _OnnxStreamState] = OrderedDict()
 
@@ -186,7 +209,6 @@ class _SileroOnnxBackend:
                 self.clear_stream(stream_key)
             return None
 
-        chunk_size, context_size = 512, 64
         if samples.shape[0] > int(_TARGET_SAMPLE_RATE * _MAX_WINDOW_SECONDS):
             samples = samples[-int(_TARGET_SAMPLE_RATE * _MAX_WINDOW_SECONDS):]
 
@@ -203,10 +225,11 @@ class _SileroOnnxBackend:
                     context = entry.context.copy()
 
         if state is None:
-            state = np.zeros((2, 1, 128), dtype=np.float32)
+            state = np.zeros(self._state_shape, dtype=np.float32)
         if context is None:
-            context = np.zeros((1, context_size), dtype=np.float32)
+            context = np.zeros(self._context_shape, dtype=np.float32)
 
+        chunk_size = self._chunk_size
         padded_length = int(math.ceil(samples.shape[0] / chunk_size) * chunk_size)
         if padded_length != samples.shape[0]:
             samples = np.pad(samples, (0, padded_length - samples.shape[0]))
@@ -214,20 +237,29 @@ class _SileroOnnxBackend:
         probabilities: list[float] = []
         for start in range(0, samples.shape[0], chunk_size):
             chunk = samples[start:start + chunk_size]
-            x = np.concatenate((context, chunk[np.newaxis, :]), axis=1).astype(np.float32, copy=False)
             ort_inputs = {
-                self._input_name: x,
                 self._state_name: state,
                 self._sr_name: np.asarray(_TARGET_SAMPLE_RATE, dtype=np.int64),
             }
+            if self._lstm_state_layout:
+                x = chunk[np.newaxis, :].astype(np.float32, copy=False)
+                if self._context_name is not None:
+                    ort_inputs[self._context_name] = context
+            else:
+                x = np.concatenate((context, chunk[np.newaxis, :]), axis=1).astype(np.float32, copy=False)
+            ort_inputs[self._input_name] = x
             try:
-                out, state = self._session.run(None, ort_inputs)
+                ort_outputs = self._session.run(None, ort_inputs)
             except Exception:
                 if stream_key is not None and end_of_stream:
                     self.clear_stream(stream_key)
                 return None
+            if self._lstm_state_layout:
+                out, state, context = ort_outputs[:3]
+            else:
+                out, state = ort_outputs[:2]
+                context = x[:, -_STATEFUL_SILERO_CONTEXT_SIZE:]
             probabilities.append(float(np.asarray(out, dtype=np.float32).reshape(-1)[0]))
-            context = x[:, -context_size:]
 
         if stream_key is not None and not end_of_stream:
             with self._lock:
@@ -737,6 +769,10 @@ def _resolve_model_path(model_path: str | os.PathLike[str] | None) -> Path | Non
         if candidate.is_file():
             return candidate.resolve()
 
+    openwakeword_candidate = _resolve_openwakeword_model_path()
+    if openwakeword_candidate is not None:
+        return openwakeword_candidate
+
     for candidate_str in _DEFAULT_MODEL_CANDIDATES:
         candidate = Path(candidate_str)
         if candidate.is_file():
@@ -744,12 +780,45 @@ def _resolve_model_path(model_path: str | os.PathLike[str] | None) -> Path | Non
     return None
 
 
+def _resolve_openwakeword_model_path() -> Path | None:
+    """Return the bundled openWakeWord Silero model when that package is installed."""
+
+    try:
+        spec = importlib.util.find_spec("openwakeword")
+    except (ImportError, AttributeError, ValueError):
+        return None
+    origin = getattr(spec, "origin", None)
+    if not origin:
+        return None
+    package_root = Path(origin).resolve().parent
+    candidate = package_root.joinpath(*_OPENWAKEWORD_MODEL_RELATIVE_PATH)
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def _coerce_onnx_tensor_shape(shape: object, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Normalize one ONNX tensor shape, replacing symbolic dims with unit extents."""
+
+    if not isinstance(shape, (list, tuple)):
+        return default
+    normalized: list[int] = []
+    for index, raw_dim in enumerate(shape):
+        if index >= len(default):
+            break
+        if isinstance(raw_dim, int) and raw_dim > 0:
+            normalized.append(raw_dim)
+        else:
+            normalized.append(1)
+    if len(normalized) != len(default):
+        return default
+    return tuple(normalized)
+
+
 def _coerce_positive_int(value: object) -> int | None:
     """Return one positive integer or None when malformed."""
     if isinstance(value, bool):
         return None
     try:
-        normalized = int(value)
+        normalized = int(cast(SupportsInt | SupportsIndex | str | bytes | bytearray, value))
     except (TypeError, ValueError, OverflowError):
         return None
     return normalized if normalized > 0 else None

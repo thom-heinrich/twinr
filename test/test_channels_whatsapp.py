@@ -1,4 +1,3 @@
-# mypy: disable-error-code="arg-type,assignment,attr-defined,method-assign,index"
 import os
 from pathlib import Path
 from threading import Event

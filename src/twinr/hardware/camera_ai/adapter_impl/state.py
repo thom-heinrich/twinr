@@ -10,7 +10,6 @@
 # IMP-2: Added low-cost frontier association gates (track ID, IoU, relative center distance, area ratio) suited to Pi 4 live-stream pipelines.
 # IMP-3: Extended error classification for common libcamera/Picamera2 timeout/dequeue/request-starvation failures.
 
-# mypy: disable-error-code="attr-defined,assignment,var-annotated"
 """Cache, timing, and error helpers for the local AI-camera adapter."""
 
 from __future__ import annotations

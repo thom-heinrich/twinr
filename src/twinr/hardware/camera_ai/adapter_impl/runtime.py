@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,assignment,has-type,return-value"
 # CHANGELOG: 2026-03-28
 # BUG-1: Serialize lazy pipeline init/teardown to prevent duplicate MediaPipe/gesture pipeline construction, leaked Pi-side resources, and inconsistent state under concurrent callers.
 # BUG-2: Make pose/motion cache cleanup best-effort too, so secondary cleanup errors never mask the primary capture/runtime failure.

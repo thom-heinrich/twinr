@@ -1,5 +1,4 @@
 """Shared constants, helper functions, and public value types for remote state."""
-# mypy: disable-error-code=arg-type,call-overload
 
 from __future__ import annotations
 
@@ -120,6 +119,8 @@ def _coerce_int(
 ) -> int:
     """Coerce numeric config to an integer inside inclusive bounds."""
 
+    if not isinstance(value, (bool, int, float, str)):
+        return default
     try:
         parsed = int(value)
     except (TypeError, ValueError):

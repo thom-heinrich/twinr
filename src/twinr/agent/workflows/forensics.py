@@ -435,7 +435,10 @@ def _exception_summary_from_parts(
     allow_raw_text: bool,
 ) -> dict[str, object]:
     try:
-        formatted_stack = traceback.format_exception(exc_type, exc_value, exc_traceback)[-_MAX_STACK_LINES:]
+        if isinstance(exc_value, BaseException):
+            formatted_stack = traceback.format_exception(exc_value)[-_MAX_STACK_LINES:]
+        else:
+            formatted_stack = [_bounded_text(exc_value)]
     except Exception:
         formatted_stack = [_bounded_text(exc_value)]
     return {
@@ -685,10 +688,11 @@ def capture_thread_snapshot(
     extracted = traceback.extract_stack(frame, limit=max(1, int(max_frames)))
     bounded_stack: list[dict[str, object]] = []
     for entry in extracted[-max(1, int(max_frames)) :]:
+        line_no = entry.lineno if isinstance(entry.lineno, int) else 0
         bounded_stack.append(
             {
                 "file": _bounded_text(entry.filename),
-                "line": int(entry.lineno),
+                "line": line_no,
                 "func": _bounded_text(entry.name),
             }
         )
@@ -1440,6 +1444,22 @@ class WorkflowForensics:
             return 0.0
         return duration_ms
 
+    def _summary_duration_ms(self, item: Mapping[str, object]) -> float:
+        raw_duration = item.get("duration_ms")
+        if raw_duration is None:
+            return 0.0
+        if isinstance(raw_duration, bool):
+            return 1.0 if raw_duration else 0.0
+        if not isinstance(raw_duration, (int, float, str, bytes, bytearray)):
+            return 0.0
+        try:
+            duration_ms = float(raw_duration)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(duration_ms):
+            return 0.0
+        return duration_ms
+
     def _should_flush_sidecars(self) -> bool:
         with self._stats_lock:
             return self._event_count == 1 or self._event_count % _SUMMARY_FLUSH_INTERVAL == 0
@@ -1489,7 +1509,7 @@ class WorkflowForensics:
             "exception_counts": exception_counts,
             "slowest_spans": sorted(
                 span_durations_ms,
-                key=lambda item: float(item.get("duration_ms", 0.0)),
+                key=self._summary_duration_ms,
                 reverse=True,
             )[:16],
             "queue_dropped": queue_dropped,
@@ -1711,8 +1731,11 @@ class WorkflowForensics:
             sys.stderr.flush()
         except Exception:
             try:
-                sys.__stderr__.write(f"{message}\n")
-                sys.__stderr__.flush()
+                fallback_stderr = sys.__stderr__
+                if fallback_stderr is None:
+                    return
+                fallback_stderr.write(f"{message}\n")
+                fallback_stderr.flush()
             except Exception:
                 _LOGGER.warning("Workflow forensics failed to write to stderr fallback.", exc_info=True)
 

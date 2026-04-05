@@ -22,6 +22,9 @@ rollouts fail predictably instead of silently mis-parsing malformed messages.
 #        client/server decoders for resilient realtime session management.
 # IMP-2: Add timing/sample-offset and embedding-space metadata for micro-turn
 #        orchestration, semantic turn-taking, and safe speaker-model upgrades.
+# IMP-3: Carry optional per-frame speech-probability side-channel metadata so
+#        the host-side utterance scanner can use Pi speech evidence instead of
+#        raw RMS fallback when the edge provides it.
 
 from __future__ import annotations
 
@@ -923,6 +926,7 @@ class OrchestratorVoiceAudioFrame:
     runtime_state: OrchestratorVoiceRuntimeStateEvent | None = None
     start_sample: int | None = None
     stream_ended: bool = False
+    speech_probability: float | None = None
     event_id: str | None = None
     sent_at_unix_ms: int | None = None
 
@@ -938,6 +942,7 @@ class OrchestratorVoiceAudioFrame:
         _validate_pcm_bytes(self.pcm_bytes, allow_empty=self.stream_ended)
         if self.start_sample is not None and self.start_sample < 0:
             raise VoiceContractError("start_sample must be non-negative")
+        _validate_ratio(self.speech_probability, field="speech_probability")
         if self.runtime_state is not None:
             self.runtime_state.validate()
         _validate_short_text(self.event_id, field="event_id", max_length=MAX_EVENT_ID_LENGTH)
@@ -958,6 +963,8 @@ class OrchestratorVoiceAudioFrame:
             payload["start_sample"] = self.start_sample
         if self.stream_ended:
             payload["stream_ended"] = True
+        if self.speech_probability is not None:
+            payload["speech_probability"] = self.speech_probability
         return _with_common_metadata(
             payload,
             event_id=self.event_id,
@@ -987,6 +994,7 @@ class OrchestratorVoiceAudioFrame:
             ),
             start_sample=_coerce_optional_non_negative_int(payload_dict.get("start_sample")),
             stream_ended=stream_ended,
+            speech_probability=_coerce_optional_ratio(payload_dict.get("speech_probability")),
             event_id=event_id,
             sent_at_unix_ms=sent_at_unix_ms,
         )

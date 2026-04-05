@@ -1,4 +1,3 @@
-# mypy: disable-error-code="assignment"
 """Primary implementation class for the decomposed AI-camera adapter."""
 
 from __future__ import annotations

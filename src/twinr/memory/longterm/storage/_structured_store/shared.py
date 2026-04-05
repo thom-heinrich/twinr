@@ -68,7 +68,7 @@ _NON_SEMANTIC_ATTRIBUTE_KEYS = frozenset(
 _LOG = logging.getLogger(__name__)
 
 
-def _normalize_text(value: str | None) -> str:
+def _normalize_text(value: object | None) -> str:
     """Collapse arbitrary text-like input to normalized single-spaced text."""
 
     return " ".join(str(value or "").split()).strip()

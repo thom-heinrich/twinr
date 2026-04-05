@@ -9,6 +9,7 @@ from twinr.ops.remote_chonkydb_host_stabilizer import (
     RemoteHostStabilizationAction,
     RemoteHostTerminatedProcess,
     RemoteHostUnitState,
+    _REMOTE_STABILIZE_HOST_CODE,
     apply_remote_host_stabilization,
     build_stale_process_rules,
     build_parser,
@@ -51,6 +52,39 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         rules = build_stale_process_rules(_SETTINGS)
 
         self.assertEqual(rules[0]["label"], "code_graph_benchmark_runner")
+        artifact_ingest_rule = next(
+            rule for rule in rules if rule["label"] == "chonkycode_artifact_ingest_runner"
+        )
+        self.assertEqual(
+            artifact_ingest_rule["required_substrings"],
+            ("-m chonkycode.cli", "artifact-ingest"),
+        )
+        self.assertEqual(artifact_ingest_rule["minimum_elapsed_s"], 300.0)
+        locomo_eval_rule = next(
+            rule for rule in rules if rule["label"] == "ccodex_memory_locomo_eval_runner"
+        )
+        self.assertEqual(
+            locomo_eval_rule["required_substrings"],
+            ("benchmarks/ccodex_memory/ccodex_memory_locomo_mc10_eval.py",),
+        )
+        self.assertEqual(locomo_eval_rule["minimum_elapsed_s"], 300.0)
+        unmanaged_api_rule = next(
+            rule for rule in rules if rule["label"] == "unmanaged_chonkydb_api_server_listener"
+        )
+        self.assertEqual(
+            unmanaged_api_rule["required_substrings"],
+            ("tessairact.automations.helpers.launcher --module chonkydb.api.server",),
+        )
+        self.assertEqual(
+            unmanaged_api_rule["excluded_cgroup_substrings"],
+            (
+                "/system.slice/caia-twinr-chonkydb-alt.service",
+                "/system.slice/caia-ccodex-memory-api.service",
+                "/system.slice/caia-chonkycode-api.service",
+            ),
+        )
+        self.assertTrue(unmanaged_api_rule["require_listener"])
+        self.assertEqual(unmanaged_api_rule["minimum_elapsed_s"], 60.0)
         data_rule = next(rule for rule in rules if rule["label"] == "dedicated_backend_data_path_writer")
         self.assertEqual(
             data_rule["required_substrings"],
@@ -194,6 +228,14 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
             mock_states.call_args_list[0].kwargs["units"],
         )
         self.assertIn(
+            "caia-ccodex-memory-api.service",
+            mock_states.call_args_list[0].kwargs["units"],
+        )
+        self.assertIn(
+            "caia-chonkycode-api.service",
+            mock_states.call_args_list[0].kwargs["units"],
+        )
+        self.assertIn(
             "caia-chonky-transformer.timer",
             mock_states.call_args_list[0].kwargs["units"],
         )
@@ -211,6 +253,14 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         )
         self.assertIn(
             "caia-consumer-portal-demo.service",
+            mock_apply.call_args.kwargs["system_units"],
+        )
+        self.assertIn(
+            "caia-ccodex-memory-api.service",
+            mock_apply.call_args.kwargs["system_units"],
+        )
+        self.assertIn(
+            "caia-chonkycode-api.service",
             mock_apply.call_args.kwargs["system_units"],
         )
         self.assertIn(
@@ -237,10 +287,43 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         self.assertEqual(mock_apply.call_args.kwargs["stale_process_min_elapsed_s"], 1800.0)
         self.assertTrue(
             any(
+                rule["label"] == "chonkycode_artifact_ingest_runner"
+                and rule["minimum_elapsed_s"] == 300.0
+                and rule["required_substrings"] == ("-m chonkycode.cli", "artifact-ingest")
+                for rule in mock_apply.call_args.kwargs["stale_process_rules"]
+            )
+        )
+        self.assertTrue(
+            any(
+                rule["label"] == "ccodex_memory_locomo_eval_runner"
+                and rule["minimum_elapsed_s"] == 300.0
+                and rule["required_substrings"]
+                == ("benchmarks/ccodex_memory/ccodex_memory_locomo_mc10_eval.py",)
+                for rule in mock_apply.call_args.kwargs["stale_process_rules"]
+            )
+        )
+        self.assertTrue(
+            any(
                 rule["label"] == "dedicated_backend_data_path_writer"
                 and rule["minimum_elapsed_s"] == 60.0
                 and rule["required_substrings"]
                 == ("/home/thh/tessairact/state/offload/chonkydb/twinr_dedicated_3044/data",)
+                for rule in mock_apply.call_args.kwargs["stale_process_rules"]
+            )
+        )
+        self.assertTrue(
+            any(
+                rule["label"] == "unmanaged_chonkydb_api_server_listener"
+                and rule["minimum_elapsed_s"] == 60.0
+                and rule["required_substrings"]
+                == ("tessairact.automations.helpers.launcher --module chonkydb.api.server",)
+                and rule["excluded_cgroup_substrings"]
+                == (
+                    "/system.slice/caia-twinr-chonkydb-alt.service",
+                    "/system.slice/caia-ccodex-memory-api.service",
+                    "/system.slice/caia-chonkycode-api.service",
+                )
+                and rule["require_listener"] is True
                 for rule in mock_apply.call_args.kwargs["stale_process_rules"]
             )
         )
@@ -315,6 +398,10 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         )
         self.assertTrue(mock_run.call_args.kwargs["use_sudo"])
 
+    def test_remote_helper_imports_regex_for_listener_pid_matching(self) -> None:
+        self.assertIn("import re", _REMOTE_STABILIZE_HOST_CODE)
+        self.assertIn("re.finditer", _REMOTE_STABILIZE_HOST_CODE)
+
     def test_fetch_remote_unit_states_converts_remote_payload(self) -> None:
         with patch(
             "twinr.ops.remote_chonkydb_host_stabilizer._run_remote_python_json",
@@ -367,6 +454,227 @@ class RemoteChonkyDBHostStabilizerTests(unittest.TestCase):
         self.assertEqual(mock_probe.call_count, 1)
         self.assertEqual(mock_probe.call_args.kwargs["settings"], _SETTINGS)
         self.assertEqual(mock_probe.call_args.kwargs["timeout_s"], 20.0)
+
+    def test_stabilize_remote_host_retries_units_that_reactivate_after_first_pass(self) -> None:
+        system_before_state = (
+            RemoteHostUnitState(
+                scope="system",
+                unit="caia-chonkycode-api.service",
+                enabled_state="enabled",
+                load_state="loaded",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
+        )
+        user_before_state = (
+            RemoteHostUnitState(
+                scope="user",
+                unit="ollama-gpu.service",
+                enabled_state="enabled",
+                load_state="loaded",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
+        )
+        system_after_first = (
+            RemoteHostUnitState(
+                scope="system",
+                unit="caia-chonkycode-api.service",
+                enabled_state="enabled",
+                load_state="loaded",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
+        )
+        user_after_first = (
+            RemoteHostUnitState(
+                scope="user",
+                unit="ollama-gpu.service",
+                enabled_state="disabled",
+                load_state="loaded",
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+            ),
+        )
+        system_after_second = (
+            RemoteHostUnitState(
+                scope="system",
+                unit="caia-chonkycode-api.service",
+                enabled_state="disabled",
+                load_state="loaded",
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+            ),
+        )
+        user_after_second = user_after_first
+        with patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.probe_public_host_availability",
+            side_effect=[
+                ChonkyDBHttpProbeResult(
+                    label="public",
+                    ok=False,
+                    status_code=503,
+                    ready=False,
+                    detail="slow",
+                ),
+                ChonkyDBHttpProbeResult(
+                    label="public",
+                    ok=True,
+                    status_code=200,
+                    ready=True,
+                    detail="ready",
+                ),
+            ],
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.fetch_remote_unit_states",
+            side_effect=[
+                system_before_state,
+                user_before_state,
+                system_after_first,
+                user_after_first,
+                system_after_second,
+                user_after_second,
+            ],
+        ) as mock_states, patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.apply_remote_host_stabilization",
+            side_effect=[
+                RemoteHostStabilizationAction(
+                    kill_switch_paths=("/tmp/kill_a",),
+                    disabled_system_units=("caia-chonkycode-api.service",),
+                    disabled_user_units=("ollama-gpu.service",),
+                    terminated_processes=(),
+                ),
+                RemoteHostStabilizationAction(
+                    kill_switch_paths=("/tmp/kill_a",),
+                    disabled_system_units=("caia-chonkycode-api.service",),
+                    disabled_user_units=(),
+                    terminated_processes=(),
+                ),
+            ],
+        ) as mock_apply, patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.fetch_remote_service_properties",
+            return_value={
+                "CPUWeight": "10000",
+                "StartupCPUWeight": "10000",
+                "IOWeight": "10000",
+                "StartupIOWeight": "10000",
+            },
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.time.sleep",
+        ):
+            result = stabilize_remote_chonkydb_host(
+                settings=_SETTINGS,
+                probe_timeout_s=20.0,
+                ssh_timeout_s=60.0,
+                settle_s=1.0,
+                executor=object(),  # type: ignore[arg-type]
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.diagnosis, "public_recovered_after_host_stabilization")
+        self.assertEqual(mock_apply.call_count, 2)
+        self.assertEqual(mock_states.call_count, 6)
+        self.assertEqual(
+            mock_apply.call_args_list[1].kwargs["system_units"],
+            ("caia-chonkycode-api.service",),
+        )
+        self.assertEqual(mock_apply.call_args_list[1].kwargs["user_units"], ())
+
+    def test_stabilize_remote_host_fails_closed_when_conflict_units_reactivate_twice(self) -> None:
+        system_before_state = (
+            RemoteHostUnitState(
+                scope="system",
+                unit="caia-consumer-portal.service",
+                enabled_state="enabled",
+                load_state="loaded",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
+        )
+        user_before_state: tuple[RemoteHostUnitState, ...] = ()
+        system_after_first = (
+            RemoteHostUnitState(
+                scope="system",
+                unit="caia-consumer-portal.service",
+                enabled_state="enabled",
+                load_state="loaded",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
+        )
+        system_after_second = system_after_first
+        with patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.probe_public_host_availability",
+            side_effect=[
+                ChonkyDBHttpProbeResult(
+                    label="public",
+                    ok=True,
+                    status_code=200,
+                    ready=True,
+                    detail="ready",
+                ),
+                ChonkyDBHttpProbeResult(
+                    label="public",
+                    ok=True,
+                    status_code=200,
+                    ready=True,
+                    detail="ready",
+                ),
+            ],
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.fetch_remote_unit_states",
+            side_effect=[
+                system_before_state,
+                user_before_state,
+                system_after_first,
+                user_before_state,
+                system_after_second,
+                user_before_state,
+            ],
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.apply_remote_host_stabilization",
+            side_effect=[
+                RemoteHostStabilizationAction(
+                    kill_switch_paths=("/tmp/kill_a",),
+                    disabled_system_units=("caia-consumer-portal.service",),
+                    disabled_user_units=(),
+                    terminated_processes=(),
+                ),
+                RemoteHostStabilizationAction(
+                    kill_switch_paths=("/tmp/kill_a",),
+                    disabled_system_units=("caia-consumer-portal.service",),
+                    disabled_user_units=(),
+                    terminated_processes=(),
+                ),
+            ],
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.fetch_remote_service_properties",
+            return_value={
+                "CPUWeight": "10000",
+                "StartupCPUWeight": "10000",
+                "IOWeight": "10000",
+                "StartupIOWeight": "10000",
+            },
+        ), patch(
+            "twinr.ops.remote_chonkydb_host_stabilizer.time.sleep",
+        ):
+            result = stabilize_remote_chonkydb_host(
+                settings=_SETTINGS,
+                probe_timeout_s=20.0,
+                ssh_timeout_s=60.0,
+                settle_s=1.0,
+                executor=object(),  # type: ignore[arg-type]
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnosis, "conflict_units_reactivated_after_host_stabilization")
 
 
 if __name__ == "__main__":

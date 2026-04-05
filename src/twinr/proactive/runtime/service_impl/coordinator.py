@@ -4,7 +4,6 @@ The wrapper module ``twinr.proactive.runtime.service`` re-exports this class
 unchanged; no caller migration is required.
 """
 
-# mypy: ignore-errors
 
 from twinr.proactive.runtime.service_impl.coordinator_core import (
     ProactiveCoordinatorCoreMixin,

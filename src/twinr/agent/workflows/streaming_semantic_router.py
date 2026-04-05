@@ -12,6 +12,8 @@
 #        Raspberry Pi 4 from oversized or control-character-heavy inputs.
 # IMP-1: Add a small TTL/LRU resolution cache for repeated streaming transcripts.
 # IMP-2: Add policy-gated abstention, optional model-dir root validation, and richer traces.
+# BUG-6: Defer heavyweight user-intent ORT probing during idle streaming-runtime startup so the Pi
+#        does not retain the router's validation session before the first real transcript.
 
 """Bridge local semantic router decisions into the streaming workflow path."""
 
@@ -27,6 +29,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
+from typing import Iterable, SupportsFloat, SupportsIndex, cast
 
 from twinr.agent.base_agent.contracts import FirstWordReply, SupervisorDecision
 from twinr.agent.tools.prompting import build_local_route_first_word_instructions
@@ -38,6 +41,7 @@ from twinr.agent.routing import (
     load_semantic_router_bundle,
     load_user_intent_bundle,
 )
+from twinr.ops.process_memory import record_streaming_memory_phase_best_effort
 
 
 SUPPORTED_HANDOFF_LABELS: tuple[str, ...] = ("web", "memory", "tool")
@@ -94,8 +98,10 @@ class StreamingSemanticRouterRuntime:
     def __init__(self, loop) -> None:
         self._loop = loop
         self._state_lock = threading.RLock()
+        self._warmup_lock = threading.RLock()
         self._router: LocalSemanticRouter | TwoStageLocalSemanticRouter | None = None
         self._router_epoch = 0
+        self._warmed_router_epoch = -1
         self._instance_scope_token = _short_hash(f"runtime:{time.time_ns()}:{id(loop)}")
         self._resolution_cache: OrderedDict[tuple[object, ...], _ResolutionCacheEntry] = OrderedDict()
         build_result = self._build_router_candidate(self._runtime_policy())
@@ -134,6 +140,10 @@ class StreamingSemanticRouterRuntime:
             router_epoch = self._router_epoch
         if router is None:
             return None
+        if self._warmup_enabled(policy):
+            wait_for_warmup = getattr(self._loop, "_wait_for_speculative_warmup", None)
+            if callable(wait_for_warmup):
+                wait_for_warmup("local_semantic_router")
 
         if policy.trace_enabled and normalization["truncated"]:
             self._trace_event(
@@ -265,6 +275,38 @@ class StreamingSemanticRouterRuntime:
             )
         return resolution
 
+    def maybe_start_warmup(self, transcript: str) -> None:
+        """Schedule one best-effort router warmup only after real transcript activity."""
+
+        policy = self._runtime_policy()
+        if not self._warmup_enabled(policy):
+            return
+        cleaned, _ = _normalize_transcript(transcript, policy.max_transcript_chars)
+        with self._state_lock:
+            router = self._router
+            router_epoch = self._router_epoch
+        if router is None:
+            return
+        with self._warmup_lock:
+            if self._warmed_router_epoch == router_epoch:
+                return
+        schedule_warmup = getattr(self._loop, "_schedule_speculative_warmup", None)
+        if not callable(schedule_warmup):
+            self._warmup_router_if_needed(
+                router,
+                router_epoch,
+                transcript=cleaned,
+            )
+            return
+        schedule_warmup(
+            "local_semantic_router",
+            lambda: self._warmup_router_if_needed(
+                router,
+                router_epoch,
+                transcript=cleaned,
+            ),
+        )
+
     def _build_router_candidate(self, policy: _RuntimePolicy) -> _RouterBuildResult:
         """Load the configured local semantic router bundle, if enabled."""
 
@@ -314,7 +356,10 @@ class StreamingSemanticRouterRuntime:
                     kind="user_intent_model",
                 )
                 self._trace_if_world_writable(user_intent_model_dir, kind="user_intent_model")
-                user_intent_bundle = load_user_intent_bundle(user_intent_model_dir)
+                user_intent_bundle = load_user_intent_bundle(
+                    user_intent_model_dir,
+                    eager_runtime_validation=False,
+                )
                 router = TwoStageLocalSemanticRouter(user_intent_bundle, bundle)
                 two_stage = True
             except Exception as exc:
@@ -333,8 +378,6 @@ class StreamingSemanticRouterRuntime:
                 router = LocalSemanticRouter(bundle)
         else:
             router = LocalSemanticRouter(bundle)
-
-        self._maybe_warmup_router(router)
 
         self._trace_event(
             "streaming_local_semantic_router_ready",
@@ -358,7 +401,7 @@ class StreamingSemanticRouterRuntime:
             user_intent_model_dir=str(user_intent_model_dir) if user_intent_model_dir is not None else None,
             model_id=getattr(getattr(bundle, "metadata", None), "model_id", None),
             authoritative_labels=tuple(
-                _safe_labels(getattr(getattr(bundle, "metadata", None), "authoritative_labels", None))
+                _safe_labels(getattr(getattr(bundle, "metadata", None), "authoritative_labels", None)) or ()
             ),
             two_stage=two_stage,
         )
@@ -372,15 +415,18 @@ class StreamingSemanticRouterRuntime:
         if build_result.status == "ready":
             self._router = build_result.router
             self._router_epoch += 1
+            self._warmed_router_epoch = -1
             self._resolution_cache.clear()
             return True
         if build_result.status == "disabled":
             self._router = None
             self._router_epoch += 1
+            self._warmed_router_epoch = -1
             self._resolution_cache.clear()
             return True
         if initial:
             self._router = None
+            self._warmed_router_epoch = -1
         return False
 
     def _build_bridge_reply(
@@ -610,35 +656,77 @@ class StreamingSemanticRouterRuntime:
                 details={"kind": kind, "path": str(path)},
             )
 
-    def _maybe_warmup_router(self, router: LocalSemanticRouter | TwoStageLocalSemanticRouter) -> None:
-        warmup_enabled = bool(getattr(self._loop.config, "local_semantic_router_warmup_enabled", False))
-        if not warmup_enabled:
+    def _warmup_enabled(self, policy: _RuntimePolicy | None = None) -> bool:
+        effective_policy = self._runtime_policy() if policy is None else policy
+        if effective_policy.mode == "off":
+            return False
+        return bool(getattr(self._loop.config, "local_semantic_router_warmup_enabled", False))
+
+    def _warmup_probe_text(self, transcript: str) -> tuple[str, str]:
+        cleaned_transcript = str(transcript or "").strip()
+        if cleaned_transcript:
+            return (cleaned_transcript, "transcript")
+        configured_probe = str(
+            getattr(self._loop.config, "local_semantic_router_warmup_probe", "") or ""
+        ).strip()
+        if configured_probe:
+            return (configured_probe, "config_probe")
+        return ("warmup", "default_probe")
+
+    def _warmup_router_if_needed(
+        self,
+        router: LocalSemanticRouter | TwoStageLocalSemanticRouter,
+        router_epoch: int,
+        *,
+        transcript: str,
+    ) -> None:
+        if not self._warmup_enabled():
             return
-        warmup_probe = str(getattr(self._loop.config, "local_semantic_router_warmup_probe", "") or "").strip()
-        try:
-            warmup = getattr(router, "warmup", None)
-            if callable(warmup):
-                warmup()
-                self._trace_event(
-                    "streaming_local_semantic_router_warmup",
-                    kind="cache",
-                    details={"method": "router.warmup"},
-                )
+        with self._warmup_lock:
+            if self._warmed_router_epoch == router_epoch:
                 return
-            if warmup_probe:
-                router.classify(warmup_probe)
+            warmup_probe, probe_source = self._warmup_probe_text(transcript)
+            try:
+                warmup = getattr(router, "warmup", None)
+                if callable(warmup):
+                    warmup(warmup_probe)
+                    method = "router.warmup"
+                else:
+                    router.classify(warmup_probe)
+                    method = "classify_probe"
+                record_streaming_memory_phase_best_effort(
+                    self._loop.config,
+                    label="streaming_loop.semantic_router.lazy_warmup",
+                    owner_label="streaming_loop.semantic_router.onnx_warmup",
+                    owner_detail=(
+                        "Streaming semantic router warmed its ONNX path after transcript activity "
+                        "instead of during idle startup."
+                    ),
+                    replace=True,
+                )
+                with self._state_lock:
+                    if self._router is router and self._router_epoch == router_epoch:
+                        self._warmed_router_epoch = router_epoch
                 self._trace_event(
                     "streaming_local_semantic_router_warmup",
                     kind="cache",
-                    details={"method": "classify_probe", "probe": _text_summary(warmup_probe)},
+                    details={
+                        "method": method,
+                        "probe_source": probe_source,
+                        "phase": "deferred",
+                        "probe": _text_summary(warmup_probe),
+                    },
                 )
-        except Exception as exc:
-            self._trace_event(
-                "streaming_local_semantic_router_warmup_failed",
-                kind="exception",
-                level="WARN",
-                details={"error_type": type(exc).__name__},
-            )
+            except Exception as exc:
+                self._trace_event(
+                    "streaming_local_semantic_router_warmup_failed",
+                    kind="exception",
+                    level="WARN",
+                    details={
+                        "error_type": type(exc).__name__,
+                        "phase": "deferred",
+                    },
+                )
 
     def _trace_event(
         self,
@@ -881,7 +969,7 @@ def _safe_labels(value: object) -> list[str] | None:
         items = [value]
     else:
         try:
-            items = list(value)
+            items = [str(item) for item in cast(Iterable[object], value)]
         except TypeError:
             return None
     cleaned = [str(item).strip() for item in items if str(item).strip()]
@@ -906,7 +994,7 @@ def _normalized_label(value: object) -> str:
 
 def _finite_float(value: object) -> float | None:
     try:
-        number = float(value)
+        number = float(cast(SupportsFloat | SupportsIndex | str | bytes | bytearray, value))
     except (TypeError, ValueError):
         return None
     if not math.isfinite(number):
@@ -930,7 +1018,7 @@ def _float_fragment(value: object) -> str:
 
 def _coerce_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
     try:
-        number = int(value)
+        number = int(cast(SupportsIndex | str | bytes | bytearray, value))
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))

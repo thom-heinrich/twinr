@@ -292,22 +292,24 @@ class EdgeOrchestratorVoiceSessionImpl(
             return events
 
         sequence = self._coerce_sequence(frame.sequence)
+        speech_probability = frame.speech_probability
         for part_index, chunk in enumerate(self._iter_bounded_pcm_chunks(pcm_bytes)):
             chunk_events, should_stop = self._process_pcm_chunk(
                 sequence=self._sequence_for_subchunk(sequence, part_index),
                 pcm_bytes=chunk,
+                speech_probability=speech_probability,
             )
             events.extend(chunk_events)
             if should_stop:
                 break
 
         return events
-
     def _process_pcm_chunk(
         self,
         *,
         sequence: int,
         pcm_bytes: bytes,
+        speech_probability: float | None,
     ) -> tuple[list[dict[str, Any]], bool]:
         events: list[dict[str, Any]] = []
 
@@ -315,7 +317,7 @@ class EdgeOrchestratorVoiceSessionImpl(
         if self._received_frame_bucket.should_flush():
             self._flush_received_frame_bucket()
 
-        self._remember_frame(pcm_bytes)
+        self._remember_frame(pcm_bytes, speech_probability=speech_probability)
 
         if self._state == "speaking" and not self._barge_in_sent:
             barge_in_event = self._maybe_detect_barge_in_candidate()

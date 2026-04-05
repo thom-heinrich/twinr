@@ -26,7 +26,10 @@ from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPrese
 from twinr.display.render_state import DisplayRenderStateStore
 from twinr.display.service import TwinrStatusDisplayLoop
 from twinr.display.service_connect_cues import DisplayServiceConnectCue, DisplayServiceConnectCueStore
+from twinr.display.status_forensics import build_system_status_decision
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.ops import health as health_mod
+from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 
 
@@ -89,6 +92,19 @@ class FakeDisplay:
 class IdleAnimatedDisplay(FakeDisplay):
     def supports_idle_waiting_animation(self) -> bool:
         return True
+
+    def supports_status_animation(self, status: str) -> bool:
+        del status
+        return True
+
+
+class StaticAnimatedDisplay(FakeDisplay):
+    def supports_status_animation(self, status: str) -> bool:
+        del status
+        return False
+
+    def supports_periodic_status_repaint(self) -> bool:
+        return False
 
 
 class FakeDebugLogBuilder:
@@ -171,6 +187,12 @@ class FakeReSpeakerHciStore:
 
 
 class DisplayServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        health_mod._MEMORY_STATUS_CACHE = None
+
+    def tearDown(self) -> None:
+        health_mod._MEMORY_STATUS_CACHE = None
+
     def make_clock(self, hour: int = 12, minute: int = 34):
         return lambda: datetime(2026, 3, 13, hour, minute)
 
@@ -197,6 +219,11 @@ class DisplayServiceTests(unittest.TestCase):
         conversation_running: bool = True,
         memory_available_mb: int | None = 900,
         memory_used_percent: float | None = 42.0,
+        swap_total_mb: int | None = None,
+        swap_used_percent: float | None = None,
+        memory_pressure_status: str | None = None,
+        memory_owner_label: str | None = None,
+        memory_owner_detail: str | None = None,
         disk_used_percent: float | None = 34.0,
     ) -> TwinrSystemHealth:
         return TwinrSystemHealth(
@@ -206,6 +233,11 @@ class DisplayServiceTests(unittest.TestCase):
             cpu_temperature_c=cpu_temperature_c,
             memory_available_mb=memory_available_mb,
             memory_used_percent=memory_used_percent,
+            swap_total_mb=swap_total_mb,
+            swap_used_percent=swap_used_percent,
+            memory_pressure_status=memory_pressure_status,
+            memory_owner_label=memory_owner_label,
+            memory_owner_detail=memory_owner_detail,
             disk_used_percent=disk_used_percent,
             runtime_error=runtime_error,
             services=(
@@ -403,6 +435,9 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertEqual(render_state.health_status, "warn")
         self.assertEqual(render_state.snapshot_status, "waiting")
         self.assertFalse(render_state.snapshot_stale)
+        self.assertEqual(render_state.operator_status, "warn")
+        self.assertEqual(render_state.operator_reason_codes, ("health_status_warn",))
+        self.assertEqual(render_state.operator_reason_detail, "System health reported warn.")
         self.assertEqual(
             tuple((item.label, item.value) for item in render_state.state_fields),
             (
@@ -413,6 +448,250 @@ class DisplayServiceTests(unittest.TestCase):
                 ("Zeit", "12:34"),
             ),
         )
+
+    def test_display_loop_emits_initial_operator_status_transition_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            event_store = TwinrOpsEventStore.from_config(config)
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=FakeDisplay(),
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(
+                    status="warn",
+                    conversation_running=False,
+                ),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                event_store=event_store,
+            )
+
+            loop.run(max_cycles=1)
+            events = [
+                entry
+                for entry in event_store.tail(limit=10)
+                if entry.get("event") == "display_operator_status_transition"
+            ]
+
+        self.assertEqual(len(events), 1)
+        data = events[0]["data"]
+        self.assertIsNone(data["previous_status"])
+        self.assertEqual(data["status"], "warn")
+        self.assertEqual(tuple(data["reason_codes"]), ("conversation_loop_unhealthy", "health_status_warn"))
+        self.assertEqual(data["reason_detail"], "missing")
+        self.assertEqual(data["operator_label"], "Achtung")
+        self.assertEqual(data["runtime_status"], "waiting")
+        self.assertEqual(data["snapshot_status"], "waiting")
+
+    def test_display_loop_emits_operator_status_transition_when_cause_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            event_store = TwinrOpsEventStore.from_config(config)
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=FakeDisplay(),
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(
+                    status="warn",
+                    conversation_running=False,
+                ),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                event_store=event_store,
+            )
+
+            with mock.patch.object(display_service_mod.time, "monotonic", return_value=100.0):
+                loop.run(max_cycles=1)
+            loop.health_collector = lambda _config, *, snapshot=None: self.make_health(status="ok")
+            loop._cached_health = None
+            loop._cached_health_at = 0.0
+            loop._cached_health_error = None
+            loop._cached_health_status = None
+            loop._pending_health_future = None
+            with mock.patch.object(display_service_mod.time, "monotonic", return_value=101.0):
+                loop.run(max_cycles=1)
+            loop._cached_health = None
+            loop._cached_health_at = 0.0
+            loop._cached_health_error = None
+            loop._cached_health_status = None
+            loop._pending_health_future = None
+            with mock.patch.object(
+                display_service_mod.time,
+                "monotonic",
+                return_value=101.0 + display_service_mod._SYSTEM_STATUS_WARN_RECOVERY_HOLD_S + 1.0,
+            ):
+                loop.run(max_cycles=1)
+            events = [
+                entry
+                for entry in event_store.tail(limit=10)
+                if entry.get("event") == "display_operator_status_transition"
+            ]
+
+        self.assertEqual(len(events), 2)
+        transition = events[-1]["data"]
+        self.assertEqual(transition["previous_status"], "warn")
+        self.assertEqual(transition["status"], "ok")
+        self.assertEqual(tuple(transition["previous_reason_codes"]), ("conversation_loop_unhealthy", "health_status_warn"))
+        self.assertEqual(tuple(transition["reason_codes"]), ())
+        self.assertIsNone(transition["reason_detail"])
+
+    def test_system_state_holds_error_until_recovery_stabilizes(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            clock=self.make_clock(),
+        )
+        snapshot = RuntimeSnapshot(status="waiting")
+
+        first = loop._system_state_value(snapshot, self.make_health(status="fail"))
+        with mock.patch.object(display_service_mod.time, "monotonic", return_value=101.0):
+            second = loop._system_state_value(snapshot, self.make_health(status="ok"))
+        with mock.patch.object(
+            display_service_mod.time,
+            "monotonic",
+            return_value=101.0 + display_service_mod._SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S + 1.0,
+        ):
+            third = loop._system_state_value(snapshot, self.make_health(status="ok"))
+
+        self.assertEqual(first, "Fehler")
+        self.assertEqual(second, "Fehler")
+        self.assertEqual(third, "ok")
+
+    def test_system_state_keeps_recent_error_visible_across_lower_severity_bounces(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            clock=self.make_clock(),
+        )
+        snapshot = RuntimeSnapshot(status="waiting")
+
+        first = loop._system_state_value(snapshot, self.make_health(status="fail"))
+        with mock.patch.object(display_service_mod.time, "monotonic", return_value=101.0):
+            second = loop._system_state_value(snapshot, self.make_health(status="ok"))
+        with mock.patch.object(display_service_mod.time, "monotonic", return_value=150.0):
+            third = loop._system_state_value(
+                snapshot,
+                self.make_health(status="warn", memory_pressure_status="warn"),
+            )
+        with mock.patch.object(
+            display_service_mod.time,
+            "monotonic",
+            return_value=101.0 + display_service_mod._SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S + 1.0,
+        ):
+            fourth = loop._system_state_value(
+                snapshot,
+                self.make_health(status="warn", memory_pressure_status="warn"),
+            )
+
+        self.assertEqual(first, "Fehler")
+        self.assertEqual(second, "Fehler")
+        self.assertEqual(third, "Fehler")
+        self.assertEqual(fourth, "Achtung")
+
+    def test_system_state_holds_warn_until_ok_stabilizes(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            clock=self.make_clock(),
+        )
+        snapshot = RuntimeSnapshot(status="waiting")
+
+        first = loop._system_state_value(snapshot, self.make_health(status="warn", conversation_running=False))
+        with mock.patch.object(display_service_mod.time, "monotonic", return_value=101.0):
+            second = loop._system_state_value(snapshot, self.make_health(status="ok"))
+        with mock.patch.object(
+            display_service_mod.time,
+            "monotonic",
+            return_value=101.0 + display_service_mod._SYSTEM_STATUS_WARN_RECOVERY_HOLD_S + 1.0,
+        ):
+            third = loop._system_state_value(snapshot, self.make_health(status="ok"))
+
+        self.assertEqual(first, "Achtung")
+        self.assertEqual(second, "Achtung")
+        self.assertEqual(third, "ok")
+
+    def test_display_loop_does_not_repeat_operator_status_transition_when_state_is_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            event_store = TwinrOpsEventStore.from_config(config)
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=FakeDisplay(),
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(status="ok"),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                event_store=event_store,
+            )
+
+            loop.run(max_cycles=2)
+            events = [
+                entry
+                for entry in event_store.tail(limit=10)
+                if entry.get("event") == "display_operator_status_transition"
+            ]
+
+        self.assertEqual(len(events), 1)
 
     def test_display_loop_ticks_visible_surface_between_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -832,6 +1111,24 @@ class DisplayServiceTests(unittest.TestCase):
 
         self.assertEqual(system_value, "ok")
 
+    def test_memory_pressure_forensics_prefers_owner_detail(self) -> None:
+        health = self.make_health(
+            status="warn",
+            memory_available_mb=350,
+            memory_used_percent=82.0,
+            memory_pressure_status="warn",
+            memory_owner_label="display_companion.hdmi_wayland.native_window_frame",
+            memory_owner_detail="phase=display.hdmi_wayland.native_window_frame_presented anonymous_delta_mb=1580",
+        )
+
+        decision = build_system_status_decision(RuntimeSnapshot(status="waiting"), health)
+
+        self.assertEqual(decision.reason_codes[:1], ("memory_pressure_warn",))
+        self.assertEqual(
+            decision.reason_detail,
+            "phase=display.hdmi_wayland.native_window_frame_presented anonymous_delta_mb=1580",
+        )
+
     def test_waiting_animation_frame_changes_over_time(self) -> None:
         loop = TwinrStatusDisplayLoop(
             config=TwinrConfig(display_poll_interval_s=0.0),
@@ -892,6 +1189,79 @@ class DisplayServiceTests(unittest.TestCase):
             time.monotonic = original_monotonic
 
         self.assertNotEqual(first, second)
+
+    def test_default_layout_suppresses_processing_animation_frame_for_static_backends(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, display_driver="hdmi_wayland"),
+            display=StaticAnimatedDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+        )
+
+        original_monotonic = time.monotonic
+        try:
+            time.monotonic = lambda: 0.0
+            first = loop._display_animation_frame("processing")
+            time.monotonic = lambda: 4.5
+            second = loop._display_animation_frame("processing")
+        finally:
+            time.monotonic = original_monotonic
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+
+    def test_default_layout_signature_ignores_periodic_footer_churn_for_static_backends(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, display_driver="hdmi_wayland"),
+            display=StaticAnimatedDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+        )
+
+        first_signature = loop._render_signature(
+            status="error",
+            headline="Error",
+            ticker_text="Ticker eins",
+            details=("Internet ok", "AI ok", "System Fehler", "Zeit 12:34"),
+            state_fields=(
+                ("Status", "Error"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "Fehler"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            face_cue=None,
+            emoji_cue=None,
+            ambient_impulse_cue=None,
+            service_connect_cue=None,
+            presentation_cue=None,
+        )
+        second_signature = loop._render_signature(
+            status="error",
+            headline="Error",
+            ticker_text="Ticker zwei",
+            details=("Internet ok", "AI ok", "System Fehler", "Zeit 12:35"),
+            state_fields=(
+                ("Status", "Error"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "Fehler"),
+                ("Zeit", "12:35"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            face_cue=None,
+            emoji_cue=None,
+            ambient_impulse_cue=None,
+            service_connect_cue=None,
+            presentation_cue=None,
+        )
+
+        self.assertEqual(first_signature, second_signature)
 
     def test_display_status_telemetry_suppresses_duplicate_idle_lines(self) -> None:
         emit_lines: list[str] = []

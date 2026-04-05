@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from twinr.agent.base_agent import RuntimeSnapshot, TwinrConfig
 from twinr.agent.workflows.required_remote_snapshot import RequiredRemoteWatchdogAssessment
@@ -227,10 +226,12 @@ def _overview_cards(
 def _runtime_rows(*, snapshot: RuntimeSnapshot, health: TwinrSystemHealth) -> tuple[dict[str, object], ...]:
     memory_state = getattr(snapshot, "memory_state", None)
     open_loops = tuple(getattr(memory_state, "open_loops", ()) or ())
-    return (
+    rows = [
         _detail_item("Runtime status", _title_case(snapshot.status or "unknown"), status=_status_class(snapshot.status)),
         _detail_item("Snapshot updated", snapshot.updated_at or "—", copy=True),
         _detail_item("Runtime error", health.runtime_error or snapshot.error_message or "—", copy=True, wide=True),
+        _detail_item("Memory owner", health.memory_owner_label or "—", copy=True),
+        _detail_item("Memory owner detail", health.memory_owner_detail or "—", copy=True, wide=True),
         _detail_item("Last transcript", snapshot.last_transcript or "—", copy=True, wide=True),
         _detail_item("Last response", snapshot.last_response or "—", copy=True, wide=True),
         _detail_item("Memory turns", str(getattr(snapshot, "memory_count", 0))),
@@ -238,7 +239,8 @@ def _runtime_rows(*, snapshot: RuntimeSnapshot, health: TwinrSystemHealth) -> tu
         _detail_item("Ledger items", str(len(getattr(snapshot, "memory_ledger", ()) or ()))),
         _detail_item("Search memories", str(len(getattr(snapshot, "memory_search_results", ()) or ()))),
         _detail_item("Open loops", ", ".join(open_loops) if open_loops else "—", copy=True),
-    )
+    ]
+    return tuple(rows)
 
 
 def _service_rows(services: tuple[ServiceHealth, ...]) -> tuple[dict[str, object], ...]:

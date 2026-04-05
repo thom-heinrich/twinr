@@ -7,7 +7,6 @@
 # IMP-2: Spoken prompts are now duration-budgeted and trimmed for low-latency, interruption-tolerant delivery on constrained devices.
 """Proactive social-trigger delivery helpers for the realtime background loop."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

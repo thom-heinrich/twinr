@@ -4,7 +4,7 @@ import sys
 import time
 from typing import Any, cast
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -81,6 +81,8 @@ class ButtonHelperTests(unittest.TestCase):
 
         self.assertIsNotNone(pressed)
         self.assertIsNotNone(released)
+        pressed = cast(Any, pressed)
+        released = cast(Any, released)
         self.assertEqual(pressed.name, "yellow")
         self.assertEqual(pressed.action, ButtonAction.PRESSED)
         self.assertEqual(released.action, ButtonAction.RELEASED)
@@ -259,6 +261,49 @@ class ButtonHelperTests(unittest.TestCase):
                 "27",
             ],
         )
+
+    def test_parent_death_signal_preexec_sets_prctl_and_self_terminates_after_reparent(self) -> None:
+        fake_libc = Mock()
+        fake_libc.prctl = Mock(return_value=0)
+
+        with patch.object(buttons_module, "_PRCTL_LIBC", fake_libc):
+            with patch.object(buttons_module.sys, "platform", "linux"):
+                        with patch("twinr.hardware.buttons.os.getppid", return_value=1):
+                            with patch("twinr.hardware.buttons.os.getpid", return_value=555):
+                                with patch("twinr.hardware.buttons.os.kill") as kill:
+                                    preexec = buttons_module._build_parent_death_signal_preexec(123)
+                                    self.assertIsNotNone(preexec)
+                                    preexec = cast(Any, preexec)
+                                    preexec()
+
+        fake_libc.prctl.assert_called_once_with(
+            buttons_module._PR_SET_PDEATHSIG,
+            buttons_module._PARENT_DEATH_SIGNAL,
+            0,
+            0,
+            0,
+        )
+        kill.assert_called_once_with(555, buttons_module._PARENT_DEATH_SIGNAL)
+
+    def test_launch_gpiomon_process_installs_parent_death_guard_when_supported(self) -> None:
+        monitor = GpioButtonMonitor(
+            "gpiochip0",
+            bindings=(ButtonBinding(name="green", line_offset=17),),
+        )
+        fake_process = Mock()
+        fake_process.poll.return_value = None
+
+        with patch("twinr.hardware.buttons.time.sleep", return_value=None):
+            with patch(
+                "twinr.hardware.buttons._build_parent_death_signal_preexec",
+                return_value=cast(Any, object()),
+            ) as build_guard:
+                with patch("twinr.hardware.buttons.subprocess.Popen", return_value=fake_process) as popen:
+                    process = monitor._launch_gpiomon_process(["/usr/bin/gpiomon", "gpiochip0", "17"])
+
+        self.assertIs(process, fake_process)
+        build_guard.assert_called_once()
+        self.assertIs(popen.call_args.kwargs["preexec_fn"], build_guard.return_value)
 
     def test_snapshot_values_uses_cached_state_while_gpiomon_backend_owns_lines(self) -> None:
         monitor = GpioButtonMonitor(

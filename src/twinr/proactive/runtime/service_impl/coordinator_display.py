@@ -19,7 +19,6 @@ while downstream attention/gesture semantics now come from the shared runtime
 perception orchestrator instead of lane-local temporal truth.
 """
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

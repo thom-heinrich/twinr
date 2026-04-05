@@ -222,7 +222,11 @@ class LongTermRemoteMidtermState:
         remote_state = self.remote_state
         if remote_state is None or not remote_state.enabled:
             return
-        remote_state.save_snapshot(snapshot_kind=_MIDTERM_SNAPSHOT_KIND, payload=dict(payload))
+        remote_state.save_snapshot(
+            snapshot_kind=_MIDTERM_SNAPSHOT_KIND,
+            payload=dict(payload),
+            skip_async_document_id_wait=True,
+        )
 
     def load_packets(self) -> tuple[LongTermMidtermPacketV1, ...]:
         if not self.enabled():

@@ -8,6 +8,7 @@ owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
   - Sample config, device, and host health for Twinr's local web UI and support workflows, including ReSpeaker runtime, host-control readiness, and conservative direction/interruption facts
+  - Persist process-local streaming-loop memory attribution so health surfaces can name the concrete heavy owner path behind Pi memory pressure
   - Validate the Pi-side OpenAI env contract so acceptance probes can trust `/twinr/.env` directly
   - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
   - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
@@ -110,11 +111,20 @@ files:
   - path: venv_bridged_system_cleanup.py
     role: Detect direct dependencies whose preserved venv copy should yield to an acceptable bridged Pi system distribution during deploy healing
   - path: health.py
-    role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract
+    role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract and live streaming-loop memory-owner attribution
     exports:
       - ServiceHealth
       - TwinrSystemHealth
       - collect_system_health
+  - path: process_memory.py
+    role: Procfs-backed streaming-loop memory attribution snapshot keyed to the live owner PID/start-time so health and debug surfaces can report the concrete heavy subsystem behind memory pressure
+    exports:
+      - ProcessMemoryMetrics
+      - StreamingMemoryAttributionStore
+      - StreamingMemoryPhase
+      - StreamingMemorySnapshot
+      - load_current_streaming_memory_snapshot
+      - record_streaming_memory_phase
   - path: remote_memory_watchdog.py
     role: Rolling remote-memory watchdog, structured probe recorder, and startup bootstrap artifact writer
     exports:

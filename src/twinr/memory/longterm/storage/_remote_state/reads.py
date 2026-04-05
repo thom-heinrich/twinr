@@ -1,5 +1,4 @@
 """Remote snapshot read and probe helpers for remote state."""
-# mypy: disable-error-code=attr-defined,no-redef
 
 from __future__ import annotations
 
@@ -64,14 +63,14 @@ class LongTermRemoteStateReadMixin:
         except LongTermRemoteUnavailableError as exc:
             if self.required:
                 raise
-            local_payload = None
+            fallback_local_payload: dict[str, object] | None = None
             if local_path is not None:
-                local_payload = self._load_local_snapshot(
+                fallback_local_payload = self._load_local_snapshot(
                     local_path,
                     snapshot_kind=normalized_snapshot_kind,
                 )
-            if local_payload is not None:
-                return local_payload
+            if fallback_local_payload is not None:
+                return fallback_local_payload
             if self.required:
                 raise
             _LOGGER.warning(
@@ -790,14 +789,12 @@ class LongTermRemoteStateReadMixin:
         content-bearing request only when needed.
         """
 
-        selector = {
-            "document_id": document_id,
-            "origin_uri": None if document_id else self._snapshot_uri(snapshot_kind),
-        }
+        origin_uri = None if document_id else self._snapshot_uri(snapshot_kind)
         if prefer_metadata_only:
             try:
                 payload = client.fetch_full_document(
-                    **selector,
+                    document_id=document_id,
+                    origin_uri=origin_uri,
                     include_content=False,
                     max_content_chars=self._METADATA_ONLY_MAX_CONTENT_CHARS,
                 )
@@ -810,7 +807,8 @@ class LongTermRemoteStateReadMixin:
                     if candidate is not None:
                         return payload
         return client.fetch_full_document(
-            **selector,
+            document_id=document_id,
+            origin_uri=origin_uri,
             include_content=True,
             max_content_chars=self._max_content_chars(local_path=local_path),
         )

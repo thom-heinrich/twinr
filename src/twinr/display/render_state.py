@@ -20,6 +20,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 
 _DISPLAY_RENDER_STATE_RELATIVE_PATH = Path("artifacts") / "stores" / "ops" / "display_render_state.json"
+_SCHEMA_VERSION = 2
 _DEFAULT_FILE_MODE = 0o600
 _MAX_ARTIFACT_BYTES = 64 * 1024
 _MAX_STATUS_CHARS = 32
@@ -31,6 +32,10 @@ _MAX_STATE_FIELDS = 12
 _MAX_FIELD_LABEL_CHARS = 32
 _MAX_FIELD_VALUE_CHARS = 96
 _MAX_ERROR_CHARS = 240
+_MAX_OPERATOR_STATUS_CHARS = 16
+_MAX_REASON_CODES = 8
+_MAX_REASON_CODE_CHARS = 48
+_MAX_REASON_DETAIL_CHARS = 240
 
 
 def _utc_now() -> datetime:
@@ -108,10 +113,13 @@ class DisplayRenderStateSnapshot:
     snapshot_stale: bool = False
     snapshot_error: str | None = None
     runtime_error: str | None = None
+    operator_status: str | None = None
+    operator_reason_codes: tuple[str, ...] = ()
+    operator_reason_detail: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": _SCHEMA_VERSION,
             "rendered_at": self.rendered_at,
             "layout": self.layout,
             "runtime_status": self.runtime_status,
@@ -123,6 +131,9 @@ class DisplayRenderStateSnapshot:
             "snapshot_stale": self.snapshot_stale,
             "snapshot_error": self.snapshot_error,
             "runtime_error": self.runtime_error,
+            "operator_status": self.operator_status,
+            "operator_reason_codes": list(self.operator_reason_codes),
+            "operator_reason_detail": self.operator_reason_detail,
         }
 
     @classmethod
@@ -138,6 +149,13 @@ class DisplayRenderStateSnapshot:
                     normalized_fields.append(normalized)
         details_raw = payload.get("details")
         details = _normalize_details(details_raw if isinstance(details_raw, list) else ())
+        operator_reason_codes_raw = payload.get("operator_reason_codes")
+        operator_reason_codes: list[str] = []
+        if isinstance(operator_reason_codes_raw, list):
+            for item in operator_reason_codes_raw[:_MAX_REASON_CODES]:
+                normalized_code = _normalize_text(item, max_chars=_MAX_REASON_CODE_CHARS)
+                if normalized_code:
+                    operator_reason_codes.append(normalized_code)
         return cls(
             rendered_at=_normalize_text(payload.get("rendered_at"), max_chars=64, fallback=_utc_now().isoformat())
             or _utc_now().isoformat(),
@@ -156,6 +174,15 @@ class DisplayRenderStateSnapshot:
             snapshot_stale=bool(payload.get("snapshot_stale", False)),
             snapshot_error=_normalize_text(payload.get("snapshot_error"), max_chars=_MAX_ERROR_CHARS),
             runtime_error=_normalize_text(payload.get("runtime_error"), max_chars=_MAX_ERROR_CHARS),
+            operator_status=_normalize_text(
+                payload.get("operator_status"),
+                max_chars=_MAX_OPERATOR_STATUS_CHARS,
+            ),
+            operator_reason_codes=tuple(operator_reason_codes),
+            operator_reason_detail=_normalize_text(
+                payload.get("operator_reason_detail"),
+                max_chars=_MAX_REASON_DETAIL_CHARS,
+            ),
         )
 
 
@@ -196,6 +223,9 @@ class DisplayRenderStateStore:
         snapshot_stale: bool,
         snapshot_error: str | None,
         runtime_error: str | None,
+        operator_status: str | None,
+        operator_reason_codes: tuple[str, ...],
+        operator_reason_detail: str | None,
     ) -> DisplayRenderStateSnapshot:
         normalized_fields: list[DisplayRenderStateField] = []
         for label, value in state_fields[:_MAX_STATE_FIELDS]:
@@ -214,6 +244,16 @@ class DisplayRenderStateStore:
             snapshot_stale=bool(snapshot_stale),
             snapshot_error=_normalize_text(snapshot_error, max_chars=_MAX_ERROR_CHARS),
             runtime_error=_normalize_text(runtime_error, max_chars=_MAX_ERROR_CHARS),
+            operator_status=_normalize_text(operator_status, max_chars=_MAX_OPERATOR_STATUS_CHARS),
+            operator_reason_codes=tuple(
+                normalized
+                for normalized in (
+                    _normalize_text(value, max_chars=_MAX_REASON_CODE_CHARS)
+                    for value in operator_reason_codes[:_MAX_REASON_CODES]
+                )
+                if normalized
+            ),
+            operator_reason_detail=_normalize_text(operator_reason_detail, max_chars=_MAX_REASON_DETAIL_CHARS),
         )
         payload = json.dumps(snapshot.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"

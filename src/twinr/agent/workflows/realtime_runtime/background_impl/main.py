@@ -1,6 +1,5 @@
 """Compose the realtime background mixin from focused helper mixins."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

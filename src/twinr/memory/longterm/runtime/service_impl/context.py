@@ -1,4 +1,3 @@
-# mypy: disable-error-code=attr-defined
 """Provider-context assembly for the long-term runtime service."""
 
 from __future__ import annotations

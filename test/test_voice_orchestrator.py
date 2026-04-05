@@ -2,7 +2,8 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from threading import Event, Lock, Thread
 import time
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest import mock
 import sys
 import unittest
@@ -15,7 +16,10 @@ from twinr.agent.workflows.respeaker_duplex_keepalive import (
     build_respeaker_duplex_keepalive,
     respeaker_duplex_keepalive_supported,
 )
-from twinr.agent.workflows.voice_orchestrator import EdgeVoiceOrchestrator
+from twinr.agent.workflows.voice_orchestrator import (
+    EdgeVoiceOrchestrator,
+    _CaptureStreamStalledError,
+)
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceFollowUpClosedEvent,
@@ -103,7 +107,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             on_barge_in_interrupt=lambda: True,
         )
         fake_client = _FakeVoiceClient()
-        orchestrator._client = fake_client
+        orchestrator._client = cast(Any, fake_client)
         return orchestrator, fake_client, lines, committed
 
     def test_generic_voice_device_alias_resolves_to_specific_capture_device(self) -> None:
@@ -150,6 +154,24 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         )
 
         self.assertEqual(orchestrator._device, "sysdefault:CARD=Array")
+
+    def test_send_frame_attaches_speech_probability_side_channel(self) -> None:
+        orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
+        orchestrator._connected = True
+        orchestrator._frame_speech_annotator = cast(
+            Any,
+            SimpleNamespace(
+                classify_frame=lambda pcm_bytes, stream_ended=False: SimpleNamespace(
+                    speech_probability=0.81
+                )
+            ),
+        )
+
+        sent = orchestrator._send_frame_now(b"\x01\x00" * 1600)
+
+        self.assertTrue(sent)
+        self.assertEqual(len(fake_client.audio_frames), 1)
+        self.assertEqual(fake_client.audio_frames[0].speech_probability, 0.81)
 
     def test_respeaker_duplex_keepalive_supports_twinr_owned_playback_pcm(self) -> None:
         self.assertTrue(
@@ -554,7 +576,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                     self.runtime_states.append(event)
 
         fake_client = _ConcurrentRuntimeStateClient()
-        orchestrator._client = fake_client
+        orchestrator._client = cast(Any, fake_client)
         orchestrator.seed_runtime_state(state="waiting", detail="idle")
 
         orchestrator._connect_client()
@@ -599,7 +621,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             on_barge_in_interrupt=lambda: True,
         )
         fake_client = _FakeVoiceClient()
-        orchestrator._client = fake_client
+        orchestrator._client = cast(Any, fake_client)
         orchestrator._duplex_keepalive = keepalive
 
         with (
@@ -790,6 +812,59 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         recover_capture.assert_called_once()
         self.assertEqual(start_process.call_count, 2)
         self.assertEqual(len(sent_frames), 1)
+        self.assertIn("voice_orchestrator_capture_recovered=respeaker_recovery", lines)
+
+    def test_capture_loop_recovers_when_mid_stream_bytes_stop_arriving(self) -> None:
+        orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
+        stalled_process = _FakeCaptureProcess()
+        recovered_process = _FakeCaptureProcess()
+        sent_frames: list[bytes] = []
+        select_call_count = 0
+
+        def fake_select(read_fds, _write_fds, _error_fds, _timeout):
+            nonlocal select_call_count
+            select_call_count += 1
+            if select_call_count == 1:
+                return [read_fds[0]], [], []
+            if select_call_count in (2, 3):
+                return [], [], []
+            return [read_fds[0]], [], []
+
+        def fake_enqueue_frame(frame: bytes) -> None:
+            sent_frames.append(frame)
+            if len(sent_frames) >= 2:
+                orchestrator._stop_event.set()
+
+        with (
+            mock.patch.object(
+                orchestrator,
+                "_start_process",
+                side_effect=[stalled_process, recovered_process],
+            ) as start_process,
+            mock.patch.object(orchestrator, "_first_frame_timed_out", return_value=False),
+            mock.patch.object(
+                orchestrator,
+                "_raise_for_capture_activity_timeout",
+                side_effect=[None, _CaptureStreamStalledError(stalled_ms=1600), None],
+            ) as raise_for_stall,
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.recover_stalled_respeaker_capture",
+                return_value=True,
+            ) as recover_capture,
+            mock.patch("twinr.agent.workflows.voice_orchestrator.select.select", side_effect=fake_select),
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.os.read",
+                return_value=b"\x01\x00" * (orchestrator._frame_bytes // 2),
+            ),
+            mock.patch.object(orchestrator, "_drain_stderr"),
+            mock.patch.object(orchestrator, "_enqueue_frame", side_effect=fake_enqueue_frame),
+        ):
+            orchestrator._capture_loop()
+
+        self.assertEqual(raise_for_stall.call_count, 2)
+        recover_capture.assert_called_once()
+        self.assertEqual(start_process.call_count, 2)
+        self.assertEqual(len(sent_frames), 2)
         self.assertIn("voice_orchestrator_capture_recovered=respeaker_recovery", lines)
 
     def test_start_process_uses_sanitized_audio_env(self) -> None:

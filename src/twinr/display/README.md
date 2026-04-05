@@ -24,6 +24,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   `state_fields`, headline, and health verdict so "display says ERROR" can be
   proven from exactly what the panel rendered instead of inferred from separate
   runtime/health stores
+- append one central operator-status transition event with before/after state
+  and bounded decision reasons into the shared ops event stream so recurring
+  `ok`/`warn`/`error` flapping can be proven from one authoritative history
 - expose one shared heartbeat contract for display writes, ops companion-health
   assessment, and runtime-supervisor progress checks so those three paths
   evaluate the same signal instead of drifting apart
@@ -117,9 +120,10 @@ authoritative display heartbeat lives separately under
 always refresh it even when the vendor directory is root-owned.
 The last successfully rendered bounded display state now also lives under
 `artifacts/stores/ops/display_render_state.json`; that artifact mirrors the
-actual `state_fields` and computed `health.status` used for the last successful
-frame so operator claims like "the display says ERROR" can be checked against a
-single authoritative display-side record.
+actual `state_fields`, computed `health.status`, and normalized operator-status
+reason payload used for the last successful frame so operator claims like
+"the display says ERROR" can be checked against a single authoritative
+display-side record.
 
 For the Waveshare default face layout, Twinr keeps the `waiting` state static
 instead of animating it on a timer. That idle motion produced unnecessary
@@ -320,7 +324,28 @@ The visible Wayland window is also split away from image rendering now.
 environment wiring, while `wayland_surface_host.py` owns the actual Qt
 fullscreen surface. That keeps Wayland-only presentation capabilities isolated
 from the generic framebuffer renderer instead of mixing browser or window-host
-logic into `hdmi_fbdev.py`.
+logic into `hdmi_fbdev.py`. The native `hdmi_wayland` window now paints the
+current frame through a dedicated `QRasterWindow`/`QImage` path instead of the
+older QWidget-based raster surface and per-frame `QPixmap` conversion, because
+the Pi production path showed multi-gigabyte anonymous RSS growth on the first
+native fullscreen present and needed screen/DPR-aware Wayland telemetry at the
+actual raster-window boundary. The first native render is now also split into
+bounded memory-attribution subphases under `streaming_memory_segments.json`
+(`first_frame.rgba_bytes_ready`, `first_frame.window_visible`,
+`first_frame.frame_uploaded`, then `native_window_frame_presented`) so Pi
+forensics can tell whether the RSS jump happens during RGBA byte creation,
+fullscreen visibility, backing-image upload, or Qt event processing instead of
+collapsing everything into one coarse display owner line.
+After a clean Pi restart on 5 April 2026 those subphases showed the first frame
+staying around ~246 MB anonymous RSS, while repeated fullscreen rerenders later
+still drove the process into the ~0.9-1.6 GB range on the Pi. Because of that,
+`hdmi_wayland` now keeps all time-driven status animation disabled, including
+idle `waiting` and active `listening`/`processing`/`answering` states, until
+the underlying Wayland/Qt retention path is removed completely. The same
+backend now also suppresses periodic default-layout repaint churn from footer
+clock and ticker-only changes, because Pi evidence after the animation fix
+still showed anonymous RSS rising across otherwise semantic-noop minute/ticker
+rerenders.
 
 External HDMI face triggers flow through `face_cues.py`. The runtime display
 loop loads one optional cue artifact and merges it only into the `default`
@@ -558,6 +583,7 @@ The current default scene set covers:
 | [wayland_env.py](./wayland_env.py) | Resolve and export Wayland socket/runtime details |
 | [wayland_surface_host.py](./wayland_surface_host.py) | Native Wayland/Qt surface host kept separate from rendering and scene composition |
 | [service.py](./service.py) | Snapshot-driven status loop |
+| [status_forensics.py](./status_forensics.py) | Build central operator-status cause records and transition payloads for ops forensics |
 | [visual_qc.py](./visual_qc.py) | Screenshot-backed HDMI visual-QC runner and report-artefact builder |
 | [layouts.py](./layouts.py) | Status-card layout composition |
 | [waveshare_v2.py](./waveshare_v2.py) | Panel adapter and rendering |
@@ -597,6 +623,18 @@ requested/actual model and compact output-budget trace there as well, so
 operators can see at a glance whether a live search stayed on the primary
 budget or escalated to the retry budget. The legacy env value `debug_face` is
 kept as a compatibility alias and normalizes to `debug_log`.
+
+When the host drops into `memory_pressure_warn`, the display-side status
+forensics now prefer the live streaming-loop memory-owner detail written by
+`ops/process_memory.py`. That keeps the persisted render-state and transition
+events anchored to the concrete owner path (for example the HDMI Wayland
+surface/frame phase) instead of only repeating generic free-memory numbers.
+
+The visible `System` operator state is also deliberately de-escalation-stable
+now: `ERROR` and `WARN` still surface immediately, but recoveries only clear on
+the panel after a bounded stable hold window. That keeps short watchdog/DNS/
+memory jitters from bouncing the operator card between `ERROR`, `WARN`, and
+`OK` every few minutes.
 
 ## See also
 

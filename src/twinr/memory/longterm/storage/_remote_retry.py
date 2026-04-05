@@ -141,22 +141,26 @@ def remote_write_retry_delay_s(
     *,
     default_backoff_s: float,
     attempt_index: int,
+    max_backoff_s: float | None = None,
 ) -> float:
     """Return the bounded sleep before retrying one transient remote write."""
 
     configured_backoff_s = max(0.0, float(default_backoff_s))
+    capped_max_backoff_s = _MAX_TRANSIENT_WRITE_BACKOFF_S
+    if max_backoff_s is not None:
+        capped_max_backoff_s = max(0.0, float(max_backoff_s))
     for item in exception_chain(exc):
         if not isinstance(item, ChonkyDBError):
             continue
         retry_after_s = item.retry_after_seconds()
         if retry_after_s is not None:
-            return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, max(configured_backoff_s, retry_after_s))
+            return min(capped_max_backoff_s, max(configured_backoff_s, retry_after_s))
     if is_transient_backend_unavailable_write_error(exc):
         base_delay_s = max(configured_backoff_s, 1.0)
-        return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, base_delay_s * (2 ** max(0, attempt_index)))
+        return min(capped_max_backoff_s, base_delay_s * (2 ** max(0, attempt_index)))
     if is_rate_limited_remote_write_error(exc):
         base_delay_s = max(configured_backoff_s, 1.0)
-        return min(_MAX_TRANSIENT_WRITE_BACKOFF_S, base_delay_s * (2 ** max(0, attempt_index)))
+        return min(capped_max_backoff_s, base_delay_s * (2 ** max(0, attempt_index)))
     return configured_backoff_s
 
 

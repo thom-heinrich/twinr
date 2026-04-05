@@ -11,7 +11,6 @@
 
 """Reminder and automation helpers for the realtime background loop."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

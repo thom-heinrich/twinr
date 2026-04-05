@@ -5,7 +5,6 @@
 # IMP-1: Added local RGBA supersampled ornament compositing for higher-quality edges on Pillow-backed HDMI canvases.
 # IMP-2: Added typed ornament normalization, progress clamping, theme color hooks, and cutout-color override hooks.
 
-# mypy: disable-error-code="attr-defined,call-overload,arg-type"
 """Ambient ornament rendering helpers for the default HDMI scene."""
 
 from __future__ import annotations

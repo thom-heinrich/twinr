@@ -18,13 +18,16 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event, Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import base64
 import logging
 import mimetypes
 import os
 import re
 import stat
+
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.config import TwinrConfig
 
 from ..core.instructions import (
     STT_MODEL_FALLBACKS,
@@ -159,6 +162,15 @@ class _ClosableIterator(Iterator[Any]):
 
 class OpenAISpeechMixin:
     """Provide STT and TTS helpers for OpenAI-backed Twinr runtimes."""
+
+    if TYPE_CHECKING:
+        config: TwinrConfig
+        _client: Any
+        _call_with_model_fallback: Callable[
+            [str, Sequence[str], Callable[[str], Any]],
+            tuple[Any, str],
+        ]
+        _is_model_access_error: Callable[[Exception], bool]
 
     def transcribe(
         self,
@@ -1125,6 +1137,7 @@ class OpenAISpeechMixin:
 
         if normalized_content_type is None:
             return
+        normalized_content_type_lower = normalized_content_type.lower()
         if normalized_content_type_lower == "application/octet-stream":
             return
         if "/" not in normalized_content_type_lower:

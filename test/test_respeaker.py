@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -31,7 +32,12 @@ from twinr.hardware.respeaker import (
 )
 from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.hardware.respeaker.ambient_classification import classify_respeaker_ambient_audio
-from twinr.hardware.respeaker.pcm_content_classifier import classify_pcm_speech_likeness
+from twinr.hardware.respeaker import pcm_content_classifier as pcm_content_classifier_module
+from twinr.hardware.respeaker.pcm_content_classifier import (
+    _SileroOnnxBackend,
+    _resolve_model_path,
+    classify_pcm_speech_likeness,
+)
 from twinr.hardware.respeaker.models import (
     ReSpeakerCaptureDevice,
     ReSpeakerDirectionSnapshot,
@@ -131,6 +137,84 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertTrue(config_targets_respeaker("plughw:CARD=Array,DEV=0"))
         self.assertTrue(config_targets_respeaker("alsa_input.usb-Seeed_Studio_reSpeaker_XVF3800_4-Mic_Array-00.mono-fallback"))
         self.assertFalse(config_targets_respeaker("default", "hw:CARD=Headphones"))
+
+    def test_resolve_model_path_discovers_openwakeword_bundled_silero_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            package_root = Path(tempdir) / "openwakeword"
+            model_path = package_root / "resources" / "models" / "silero_vad.onnx"
+            model_path.parent.mkdir(parents=True)
+            model_path.write_bytes(b"fake")
+            init_path = package_root / "__init__.py"
+            init_path.write_text("# fake openwakeword package\n", encoding="utf-8")
+
+            with patch.dict("os.environ", {}, clear=False):
+                with patch.object(pcm_content_classifier_module, "_DEFAULT_MODEL_CANDIDATES", ()):
+                    with patch("twinr.hardware.respeaker.pcm_content_classifier.importlib.util.find_spec") as find_spec:
+                        find_spec.return_value = SimpleNamespace(origin=str(init_path))
+                        resolved = _resolve_model_path(None)
+
+        self.assertEqual(resolved, model_path.resolve())
+
+    def test_silero_backend_supports_openwakeword_h_c_state_layout(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, np.ndarray]] = []
+
+            def get_inputs(self):
+                return [
+                    SimpleNamespace(name="input", shape=["batch", "sequence"]),
+                    SimpleNamespace(name="sr", shape=[]),
+                    SimpleNamespace(name="h", shape=[2, "batch", 64]),
+                    SimpleNamespace(name="c", shape=[2, "batch", 64]),
+                ]
+
+            def run(self, _outputs, ort_inputs):
+                self.calls.append(ort_inputs)
+                probability = np.asarray([[0.82]], dtype=np.float32)
+                next_h = np.full((2, 1, 64), 1.0, dtype=np.float32)
+                next_c = np.full((2, 1, 64), 2.0, dtype=np.float32)
+                return [probability, next_h, next_c]
+
+        class FakeSessionOptions:
+            def __init__(self) -> None:
+                self.inter_op_num_threads = 0
+                self.intra_op_num_threads = 0
+                self.log_severity_level = 0
+                self.graph_optimization_level = None
+
+        fake_session = FakeSession()
+        fake_ort = SimpleNamespace(
+            SessionOptions=FakeSessionOptions,
+            GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_ALL="all"),
+            InferenceSession=lambda *_args, **_kwargs: fake_session,
+        )
+
+        with patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+            backend = _SileroOnnxBackend(Path("/tmp/fake_silero_vad.onnx"))
+            first = backend.score_window(
+                np.linspace(-1.0, 1.0, 960, dtype=np.float32),
+                stream_key="voice-stream",
+                end_of_stream=False,
+            )
+            second = backend.score_window(
+                np.linspace(-0.5, 0.5, 480, dtype=np.float32),
+                stream_key="voice-stream",
+                end_of_stream=True,
+            )
+
+        self.assertAlmostEqual(first or 0.0, 0.82, places=6)
+        self.assertAlmostEqual(second or 0.0, 0.82, places=6)
+        self.assertEqual(len(fake_session.calls), 3)
+        first_call = fake_session.calls[0]
+        second_call = fake_session.calls[1]
+        third_call = fake_session.calls[2]
+        self.assertEqual(first_call["input"].shape, (1, 480))
+        self.assertTrue(np.allclose(first_call["h"], 0.0))
+        self.assertTrue(np.allclose(first_call["c"], 0.0))
+        self.assertTrue(np.allclose(second_call["h"], 1.0))
+        self.assertTrue(np.allclose(second_call["c"], 2.0))
+        self.assertTrue(np.allclose(third_call["h"], 1.0))
+        self.assertTrue(np.allclose(third_call["c"], 2.0))
 
     def test_probe_detects_audio_ready_runtime(self) -> None:
         def fake_run(command, *, capture_output: bool, text: bool, check: bool, timeout: float, env, encoding: str, errors: str):

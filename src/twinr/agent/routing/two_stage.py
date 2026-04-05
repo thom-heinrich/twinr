@@ -18,6 +18,9 @@
 #        act/hold-style safety thresholds without another API break.
 # IMP-3: Added stricter metadata/artifact validation, clearer dimension mismatch errors, and more
 #        accurate latency accounting for the local user-intent stage.
+# BUG-3: Shared two-stage encoders now keep using one ORT sidecar when both bundles share the same
+#        source ONNX/tokenizer pair, avoiding Pi startup memory spikes from falling back to ONNX
+#        re-optimization just because separately exported ORT files differ byte-for-byte.
 
 """Run the user-centered stage and backend route stage on one shared embedding."""
 
@@ -25,6 +28,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
+import hashlib
 from pathlib import Path
 import math
 import os
@@ -99,12 +104,99 @@ def _dedupe_preserve_order(labels: Iterable[str] | str) -> tuple[str, ...]:
     return tuple(ordered)
 
 
-def _resolved_path_identity(value: Any) -> str:
-    path_str = os.fspath(value)
-    candidate = Path(path_str).expanduser()
-    if candidate.exists():
-        return str(candidate.resolve())
-    return str(candidate)
+@lru_cache(maxsize=128)
+def _sha256_file(path_str: str) -> str:
+    """Return one cached SHA-256 digest for a local artifact path."""
+
+    digest = hashlib.sha256()
+    with Path(path_str).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_existing_path(value: Any) -> Path:
+    """Resolve one bundle artifact path that is expected to exist already."""
+
+    return Path(os.fspath(value)).expanduser().resolve(strict=True)
+
+
+def _canonical_shared_encoder_model_path(value: Any) -> Path:
+    """Prefer the source ONNX path when an ORT sidecar was exported separately.
+
+    Two-stage router bundles can carry distinct `model.ort` exports for route and
+    user-intent stages even when both were built from the exact same `model.onnx`.
+    Falling back to the shared ONNX source lets the runtime prove equivalence and
+    reuse one encoder instead of loading duplicate heavyweight sessions.
+    """
+
+    candidate = _resolve_existing_path(value)
+    if candidate.suffix.lower() == ".ort":
+        onnx_candidate = candidate.with_suffix(".onnx")
+        if onnx_candidate.is_file():
+            return onnx_candidate.resolve(strict=True)
+    return candidate
+
+
+def _shared_encoder_runtime_model_path(
+    user_intent_bundle: UserIntentBundle,
+    route_bundle: SemanticRouterBundle,
+) -> Path | None:
+    """Return one preferred shared runtime model artifact when ORT is available.
+
+    The two-stage router only needs one encoder session once the source ONNX and
+    tokenizer are proven identical. In that case we prefer an already exported
+    ORT artifact to avoid CPU-side ONNX graph optimization on the Pi.
+    """
+
+    for bundle in (user_intent_bundle, route_bundle):
+        candidate = _resolve_existing_path(bundle.model_path)
+        if candidate.suffix.lower() == ".ort":
+            return candidate
+    return None
+
+
+def _artifact_content_identity(value: Any) -> tuple[str, int, str]:
+    """Describe one artifact by size plus SHA-256 content identity."""
+
+    candidate = _resolve_existing_path(value)
+    resolved = str(candidate)
+    return ("sha256", int(candidate.stat().st_size), _sha256_file(resolved))
+
+
+def _bundle_encoder_explicit_identity(
+    bundle: UserIntentBundle | SemanticRouterBundle,
+) -> tuple[str, str] | None:
+    """Return the declared shared-encoder identity when metadata provides one."""
+
+    metadata = bundle.metadata
+    explicit_fingerprint = _get_metadata_value(
+        metadata,
+        "encoder_fingerprint",
+        "shared_encoder_fingerprint",
+        "embedding_space_id",
+        default=None,
+    )
+    if explicit_fingerprint is None:
+        return None
+    return ("fingerprint", str(explicit_fingerprint))
+
+
+def _bundle_encoder_content_identity(
+    bundle: UserIntentBundle | SemanticRouterBundle,
+) -> tuple[object, ...]:
+    """Infer one shared-encoder identity from actual source artifacts.
+
+    This fallback is intentionally content-based so legacy two-stage bundles
+    without `shared_encoder_fingerprint` metadata can still dedupe identical
+    ONNX/tokenizer pairs on Raspberry Pi deployments.
+    """
+
+    return (
+        "content",
+        _artifact_content_identity(_canonical_shared_encoder_model_path(bundle.model_path)),
+        _artifact_content_identity(bundle.tokenizer_path),
+    )
 
 
 def _get_metadata_value(metadata: Any, *names: str, default: Any = None) -> Any:
@@ -184,21 +276,12 @@ def _load_npy_float32(path_like: os.PathLike[str] | str, *, label: str) -> np.nd
 
 def _encoder_compatibility_key(bundle: UserIntentBundle | SemanticRouterBundle) -> tuple[Any, ...]:
     metadata = bundle.metadata
-    explicit_fingerprint = _get_metadata_value(
-        metadata,
-        "encoder_fingerprint",
-        "shared_encoder_fingerprint",
-        "embedding_space_id",
-        default=None,
-    )
-    if explicit_fingerprint is not None:
-        encoder_identity = ("fingerprint", str(explicit_fingerprint))
+    explicit_identity = _bundle_encoder_explicit_identity(bundle)
+    encoder_identity: tuple[object, ...]
+    if explicit_identity is None:
+        encoder_identity = _bundle_encoder_content_identity(bundle)
     else:
-        encoder_identity = (
-            "artifacts",
-            _resolved_path_identity(bundle.model_path),
-            _resolved_path_identity(bundle.tokenizer_path),
-        )
+        encoder_identity = explicit_identity
     return (
         encoder_identity,
         getattr(metadata, "max_length", None),
@@ -688,13 +771,39 @@ def _build_shared_encoder(
         return None
 
     user_metadata = user_intent_bundle.metadata
+    shared_model_path = _resolve_existing_path(user_intent_bundle.model_path)
+    shared_tokenizer_path = _resolve_existing_path(user_intent_bundle.tokenizer_path)
+    prefer_ort_model = True
+
+    if (
+        _bundle_encoder_explicit_identity(user_intent_bundle) is None
+        and _bundle_encoder_explicit_identity(route_bundle) is None
+    ):
+        user_source_model_path = _canonical_shared_encoder_model_path(user_intent_bundle.model_path)
+        route_source_model_path = _canonical_shared_encoder_model_path(route_bundle.model_path)
+        user_source_tokenizer_path = _resolve_existing_path(user_intent_bundle.tokenizer_path)
+        route_source_tokenizer_path = _resolve_existing_path(route_bundle.tokenizer_path)
+        if (
+            _artifact_content_identity(user_source_model_path)
+            == _artifact_content_identity(route_source_model_path)
+            and _artifact_content_identity(user_source_tokenizer_path)
+            == _artifact_content_identity(route_source_tokenizer_path)
+        ):
+            shared_model_path = (
+                _shared_encoder_runtime_model_path(user_intent_bundle, route_bundle)
+                or user_source_model_path
+            )
+            shared_tokenizer_path = user_source_tokenizer_path
+            prefer_ort_model = shared_model_path.suffix.lower() != ".onnx"
+
     return OnnxSentenceEncoder(
-        model_path=user_intent_bundle.model_path,
-        tokenizer_path=user_intent_bundle.tokenizer_path,
+        model_path=shared_model_path,
+        tokenizer_path=shared_tokenizer_path,
         max_length=user_metadata.max_length,
         pooling=user_metadata.pooling,
         output_name=user_metadata.output_name,
         normalize_embeddings=user_metadata.normalize_embeddings,
+        prefer_ort_model=prefer_ort_model,
     )
 
 

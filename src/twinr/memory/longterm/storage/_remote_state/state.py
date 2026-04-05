@@ -1,9 +1,9 @@
 """State, cache, hint, and local-fallback helpers for remote state."""
-# mypy: disable-error-code=attr-defined,call-arg,arg-type
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections.abc import Mapping
 import json
 import math
 import os
@@ -11,8 +11,9 @@ from pathlib import Path
 import stat
 import threading
 import time
-from typing import Iterator, Self
+from typing import Any, Iterator, Self, cast
 
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError, chonkydb_data_path
 from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
 
@@ -71,7 +72,7 @@ _STATUS_PROBE_LIVENESS_HTTP_CODES = frozenset({400, 404})
 class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-methods,no-member
     """Support methods shared by remote-state read and write paths."""
 
-    config: object
+    config: TwinrConfig
     read_client: ChonkyDBClient | None
     write_client: ChonkyDBClient | None
     namespace: str | None
@@ -95,17 +96,18 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         self._load_persisted_document_id_hints()
 
     @classmethod
-    def from_config(cls, config) -> Self:
+    def from_config(cls, config: TwinrConfig) -> Self:
         """Build a remote snapshot adapter from Twinr configuration."""
 
+        factory = cast(Any, cls)
         namespace = _remote_namespace_for_config(config)
         if not (config.long_term_memory_enabled and config.long_term_memory_mode == "remote_primary"):
-            return cls(config=config, namespace=namespace)
+            return factory(config=config, namespace=namespace)
 
         base_url = _strip_text(config.chonkydb_base_url)
         api_key = _strip_text(config.chonkydb_api_key)
         if not (base_url and api_key):
-            return cls(config=config, namespace=namespace)
+            return factory(config=config, namespace=namespace)
 
         try:
             read_client = ChonkyDBClient(
@@ -139,8 +141,8 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
                 "Failed to initialize ChonkyDB clients: %s",
                 _redact_secrets(f"{type(exc).__name__}: {exc}", secrets=(api_key,)),
             )
-            return cls(config=config, namespace=namespace)
-        return cls(
+            return factory(config=config, namespace=namespace)
+        return factory(
             config=config,
             read_client=read_client,
             write_client=write_client,
@@ -229,9 +231,12 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
                 return False
             if not math.isfinite(resolved_timeout_s) or resolved_timeout_s <= 0.0:
                 return False
-            probe_client = clone_client_with_capped_timeout(
-                probe_client,
-                timeout_s=resolved_timeout_s,
+            probe_client = cast(
+                ChonkyDBClient,
+                clone_client_with_capped_timeout(
+                    probe_client,
+                    timeout_s=resolved_timeout_s,
+                ),
             )
         try:
             probe_client.fetch_full_document(
@@ -451,7 +456,7 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         self,
         *,
         snapshot_kind: str,
-        payload: object,
+        payload: Mapping[str, object] | None,
         document_id: str | None,
     ) -> None:
         ttl_s = self._remote_read_cache_ttl_s()

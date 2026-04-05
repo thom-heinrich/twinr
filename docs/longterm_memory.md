@@ -254,6 +254,11 @@ It also runs both phases:
 That makes restart regressions visible with explicit case-level deltas instead
 of only one blended score.
 
+During the scored phases the harness disables optional query-rewrite and
+subtext-compiler LLM lanes and skips materialized provider-answer-front
+persisting, because the goal is to measure ChonkyDB-backed memory recall and
+precision rather than auxiliary rewrite/cache latency.
+
 Covered dimensions in the shared corpus:
 
 - exact contact lookup

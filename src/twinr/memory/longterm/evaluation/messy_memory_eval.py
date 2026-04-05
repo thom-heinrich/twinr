@@ -11,17 +11,24 @@ restart.
 
 from __future__ import annotations
 
-from contextlib import ExitStack
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 
-from twinr.agent.base_agent import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+from twinr.memory.longterm.core.models import (
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermMidtermPacketV1,
+)
 from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     UnifiedRetrievalGoldsetCaseResult,
     ensure_unified_retrieval_remote_ready,
@@ -33,6 +40,7 @@ from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
 from twinr.memory.longterm.evaluation.eval import (
     LongTermEvalCaseResult,
     LongTermEvalSummary,
+    _StaticQueryRewriter,
     _ContactSeed,
     _EpisodeSeed,
     _PlanSeed,
@@ -63,15 +71,40 @@ from twinr.memory.longterm.evaluation.unified_retrieval_benchmark import (
     UnifiedRetrievalBenchmarkSummary,
     benchmark_unified_retrieval_cases,
 )
+from twinr.memory.longterm.ingestion.extract import LongTermTurnExtractor
+from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
+from twinr.memory.longterm.storage._structured_store.snapshots import StructuredStoreCurrentState
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _OPS_ARTIFACT_NAME = "messy_memory_eval.json"
 _REPORT_DIR_NAME = "messy_memory_eval"
 _DEFAULT_UNIFIED_CASE_PROFILE = "expanded"
 _UNIFIED_CASE_TIMEOUT_S = 180.0
 _UNIFIED_CASE_POLL_INTERVAL_S = 2.0
+_MAX_ERROR_TEXT_CHARS = 240
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedMessyCorpus:
+    """Hold one locally materialized messy corpus before remote publication."""
+
+    contacts: tuple[_ContactSeed, ...]
+    preferences: tuple[_PreferenceSeed, ...]
+    preference_memory_count: int
+    plans: tuple[_PlanSeed, ...]
+    episodes: tuple[_EpisodeSeed, ...]
+    multimodal_events: int
+    multimodal_episodic_turns: int
+    unified_episodic_objects: int
+    unified_durable_objects: int
+    unified_conflict_count: int
+    unified_midterm_packets: int
+    graph_document: object
+    current_state: StructuredStoreCurrentState
+    midterm_packets: tuple[LongTermMidtermPacketV1, ...]
 
 
 def _utc_now_iso() -> str:
@@ -99,6 +132,67 @@ def _flatten_suite_case_id(*, suite: str, case_id: str) -> str:
     """Build one stable cross-suite case identifier."""
 
     return f"{suite}:{' '.join(str(case_id).split()).strip()}"
+
+
+def _exception_chain(exc: BaseException | None) -> tuple[BaseException, ...]:
+    """Return the bounded causal chain for one failure."""
+
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current = exc
+    while isinstance(current, BaseException) and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _clip_text(value: object, *, limit: int = _MAX_ERROR_TEXT_CHARS) -> str | None:
+    """Return one bounded string representation for failure artifacts."""
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _json_safe_mapping(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Return one JSON-serializable copy of a mapping payload."""
+
+    if not isinstance(value, Mapping):
+        return None
+    return json.loads(json.dumps(dict(value), ensure_ascii=False))
+
+
+def _exception_remote_write_context(exc: BaseException | None) -> dict[str, object] | None:
+    """Extract the first attached remote-write context from one failure chain."""
+
+    for item in _exception_chain(exc):
+        context = extract_remote_write_context(item)
+        if isinstance(context, dict) and context:
+            return dict(context)
+    return None
+
+
+def _exception_chain_payload(exc: BaseException | None) -> tuple[dict[str, object], ...]:
+    """Return a bounded structured exception chain for the messy-eval artifact."""
+
+    payloads: list[dict[str, object]] = []
+    for item in _exception_chain(exc):
+        payload: dict[str, object] = {"type": type(item).__name__}
+        detail = _clip_text(item)
+        if detail is not None:
+            payload["detail"] = detail
+        if isinstance(item, ChonkyDBError):
+            if item.status_code is not None:
+                payload["status_code"] = int(item.status_code)
+            response_json = _json_safe_mapping(item.response_json if isinstance(item.response_json, Mapping) else None)
+            if response_json:
+                payload["response_json"] = response_json
+        payloads.append(payload)
+    return tuple(payloads)
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +457,9 @@ class MessyMemoryEvalResult:
     artifact_path: str | None = None
     report_path: str | None = None
     error_message: str | None = None
+    error_remote_write_context: dict[str, object] | None = None
+    error_exception_chain: tuple[dict[str, object], ...] = ()
+    failure_temp_roots_preserved: bool = False
     schema_version: int = _SCHEMA_VERSION
 
     @property
@@ -420,6 +517,13 @@ class MessyMemoryEvalResult:
             "artifact_path": self.artifact_path,
             "report_path": self.report_path,
             "error_message": self.error_message,
+            "error_remote_write_context": (
+                dict(self.error_remote_write_context)
+                if isinstance(self.error_remote_write_context, dict)
+                else None
+            ),
+            "error_exception_chain": [dict(item) for item in self.error_exception_chain],
+            "failure_temp_roots_preserved": self.failure_temp_roots_preserved,
             "schema_version": self.schema_version,
             "executed": self.executed,
             "ready": self.ready,
@@ -462,6 +566,11 @@ def write_messy_memory_eval_artifacts(
 
 def _seed_messy_corpus(
     service: LongTermMemoryService,
+    *,
+    base_config: TwinrConfig,
+    base_project_root: Path,
+    local_seed_root: Path,
+    remote_namespace: str,
 ) -> tuple[
     MessyMemoryEvalSeedStats,
     tuple[_ContactSeed, ...],
@@ -469,30 +578,247 @@ def _seed_messy_corpus(
     tuple[_PlanSeed, ...],
     tuple[_EpisodeSeed, ...],
 ]:
-    """Seed one shared mixed corpus and return the fixtures needed for evaluation."""
+    """Materialize the mixed corpus locally, then publish the final state remotely."""
 
-    contacts, preference_items, preference_memory_count, plans = _seed_synthetic_graph_locally_then_sync_remote(
-        service.graph_store
+    materialized = _materialize_messy_corpus_locally(
+        base_config=base_config,
+        base_project_root=base_project_root,
+        runtime_root=local_seed_root,
+        remote_namespace=remote_namespace,
     )
-    episodes = tuple(_seed_episodes(service))
-    multimodal_seed_stats = _seed_multimodal_store(service)
-    unified_seed_stats = seed_unified_retrieval_fixture(service)
-    graph_document = service.graph_store.load_document()
+    _publish_materialized_messy_corpus(service=service, materialized=materialized)
     seed_stats = MessyMemoryEvalSeedStats(
-        synthetic_contacts=len(contacts),
-        synthetic_preferences=preference_memory_count,
-        synthetic_plans=len(plans),
-        synthetic_episodic_turns=len(episodes),
-        multimodal_events=multimodal_seed_stats.multimodal_events,
-        multimodal_episodic_turns=multimodal_seed_stats.episodic_turns,
-        unified_episodic_objects=unified_seed_stats.episodic_objects,
-        unified_durable_objects=unified_seed_stats.durable_objects,
-        unified_conflict_count=unified_seed_stats.conflict_count,
-        unified_midterm_packets=unified_seed_stats.midterm_packets,
-        combined_graph_nodes=len(graph_document.nodes),
-        combined_graph_edges=len(graph_document.edges),
+        synthetic_contacts=len(materialized.contacts),
+        synthetic_preferences=materialized.preference_memory_count,
+        synthetic_plans=len(materialized.plans),
+        synthetic_episodic_turns=len(materialized.episodes),
+        multimodal_events=materialized.multimodal_events,
+        multimodal_episodic_turns=materialized.multimodal_episodic_turns,
+        unified_episodic_objects=materialized.unified_episodic_objects,
+        unified_durable_objects=materialized.unified_durable_objects,
+        unified_conflict_count=materialized.unified_conflict_count,
+        unified_midterm_packets=materialized.unified_midterm_packets,
+        combined_graph_nodes=len(getattr(materialized.graph_document, "nodes", ())),
+        combined_graph_edges=len(getattr(materialized.graph_document, "edges", ())),
     )
-    return seed_stats, contacts, preference_items, plans, episodes
+    return (
+        seed_stats,
+        materialized.contacts,
+        materialized.preferences,
+        materialized.plans,
+        materialized.episodes,
+    )
+
+
+def _build_local_seed_config(
+    *,
+    base_config: TwinrConfig,
+    base_project_root: Path,
+    runtime_root: Path,
+    remote_namespace: str,
+) -> TwinrConfig:
+    """Return one isolated local-first config for fixture materialization.
+
+    The messy evaluation measures retrieval quality, not remote ingest
+    throughput. Materialize the mixed corpus against a local store first, then
+    publish the final graph/object/midterm state once into the live namespace.
+    """
+
+    isolated = _build_isolated_config(
+        base_config=base_config,
+        base_project_root=base_project_root,
+        runtime_root=runtime_root,
+        remote_namespace=f"{remote_namespace}_local_seed",
+        background_store_turns=False,
+    )
+    return replace(
+        isolated,
+        long_term_memory_mode="local_first",
+        long_term_memory_remote_required=False,
+        chonkydb_base_url=None,
+        chonkydb_api_key=None,
+    )
+
+
+def _build_eval_runtime_config(
+    *,
+    base_config: TwinrConfig,
+    base_project_root: Path,
+    runtime_root: Path,
+    remote_namespace: str,
+) -> TwinrConfig:
+    """Return one isolated remote config that isolates retrieval scoring.
+
+    The messy goldset is supposed to measure ChonkyDB-backed recall/precision,
+    not optional LLM rewrite/compiler latency. Disable those auxiliary lanes in
+    the eval runtime and let the harness inject deterministic canonical query
+    rewrites from the fixed goldset cases instead.
+    """
+
+    isolated = _build_isolated_config(
+        base_config=base_config,
+        base_project_root=base_project_root,
+        runtime_root=runtime_root,
+        remote_namespace=remote_namespace,
+        background_store_turns=False,
+    )
+    return replace(
+        isolated,
+        long_term_memory_query_rewrite_enabled=False,
+        long_term_memory_subtext_compiler_enabled=False,
+    )
+
+
+def _prepare_local_seed_service(service: LongTermMemoryService) -> None:
+    """Disable remote-only or benchmark-irrelevant extras during local seeding."""
+
+    extractor = getattr(service, "extractor", None)
+    if extractor is not None and hasattr(extractor, "program"):
+        try:
+            setattr(extractor, "program", None)
+        except (FrozenInstanceError, TypeError, AttributeError):
+            if is_dataclass(extractor) and isinstance(extractor, LongTermTurnExtractor):
+                setattr(service, "extractor", replace(extractor, program=None))
+            else:
+                raise
+    reflector = getattr(service, "reflector", None)
+    if reflector is not None and (
+        hasattr(reflector, "program") or hasattr(reflector, "midterm_packet_limit")
+    ):
+        try:
+            if hasattr(reflector, "program"):
+                setattr(reflector, "program", None)
+            if hasattr(reflector, "midterm_packet_limit"):
+                setattr(reflector, "midterm_packet_limit", 0)
+        except (FrozenInstanceError, TypeError, AttributeError):
+            if is_dataclass(reflector) and isinstance(reflector, LongTermMemoryReflector):
+                setattr(
+                    service,
+                    "reflector",
+                    replace(
+                        reflector,
+                        program=None,
+                        midterm_packet_limit=0,
+                    ),
+                )
+            else:
+                raise
+    if hasattr(service, "personality_learning"):
+        setattr(service, "personality_learning", None)
+
+
+def _prepare_eval_phase_service(
+    service: LongTermMemoryService,
+    *,
+    synthetic_cases,
+    multimodal_cases,
+) -> None:
+    """Remove benchmark-irrelevant cache/LLM lanes before case scoring.
+
+    Fixed goldset queries already carry canonical rewrites. Running the live
+    query rewriter, materialized provider-answer front, and prepared-context
+    front during scoring mutates the remote namespace and can stall the eval on
+    auxiliary OpenAI/cache work that is not part of the ChonkyDB retrieval
+    contract being measured.
+    """
+
+    canonical_queries: dict[str, str] = {}
+    for case in (*tuple(synthetic_cases), *tuple(multimodal_cases)):
+        raw_query = " ".join(str(getattr(case, "query_text", "") or "").split()).strip()
+        canonical_query = " ".join(str(getattr(case, "canonical_query_text", "") or "").split()).strip()
+        if raw_query and canonical_query:
+            canonical_queries[raw_query] = canonical_query
+    setattr(service, "query_rewriter", _StaticQueryRewriter(canonical_queries))
+    if hasattr(service, "prepared_context_front"):
+        setattr(service, "prepared_context_front", None)
+    if hasattr(service, "provider_answer_front"):
+        setattr(service, "provider_answer_front", None)
+
+
+def _materialize_messy_corpus_locally(
+    *,
+    base_config: TwinrConfig,
+    base_project_root: Path,
+    runtime_root: Path,
+    remote_namespace: str,
+) -> _MaterializedMessyCorpus:
+    """Build the full messy corpus locally and return the final persisted state."""
+
+    local_service: LongTermMemoryService | None = None
+    local_config = _build_local_seed_config(
+        base_config=base_config,
+        base_project_root=base_project_root,
+        runtime_root=runtime_root,
+        remote_namespace=remote_namespace,
+    )
+    try:
+        local_service = LongTermMemoryService.from_config(local_config)
+        _prepare_local_seed_service(local_service)
+        contacts, preference_items, preference_memory_count, plans = _seed_synthetic_graph_locally_then_sync_remote(
+            local_service.graph_store
+        )
+        episodes = tuple(_seed_episodes(local_service))
+        multimodal_seed_stats = _seed_multimodal_store(local_service)
+        composed_current_state = local_service.object_store.load_current_state_fine_grained_for_write()
+        composed_midterm_packets = tuple(local_service.midterm_store.load_packets())
+        unified_seed_stats = seed_unified_retrieval_fixture(local_service)
+        unified_current_state = local_service.object_store.load_current_state_fine_grained_for_write()
+        unified_midterm_packets = tuple(local_service.midterm_store.load_packets())
+        merged_current_state = _merge_structured_current_states(
+            composed_current_state,
+            unified_current_state,
+        )
+        merged_midterm_packets = _merge_midterm_packets(
+            composed_midterm_packets,
+            unified_midterm_packets,
+        )
+        local_service.object_store.write_snapshot(
+            objects=merged_current_state.objects,
+            conflicts=merged_current_state.conflicts,
+            archived_objects=merged_current_state.archived_objects,
+        )
+        local_service.midterm_store.save_packets(packets=merged_midterm_packets)
+        return _MaterializedMessyCorpus(
+            contacts=contacts,
+            preferences=preference_items,
+            preference_memory_count=preference_memory_count,
+            plans=plans,
+            episodes=episodes,
+            multimodal_events=multimodal_seed_stats.multimodal_events,
+            multimodal_episodic_turns=multimodal_seed_stats.episodic_turns,
+            unified_episodic_objects=unified_seed_stats.episodic_objects,
+            unified_durable_objects=unified_seed_stats.durable_objects,
+            unified_conflict_count=unified_seed_stats.conflict_count,
+            unified_midterm_packets=unified_seed_stats.midterm_packets,
+            graph_document=local_service.graph_store.load_document(),
+            current_state=merged_current_state,
+            midterm_packets=merged_midterm_packets,
+        )
+    finally:
+        _shutdown_service(local_service)
+
+
+def _publish_materialized_messy_corpus(
+    *,
+    service: LongTermMemoryService,
+    materialized: _MaterializedMessyCorpus,
+) -> None:
+    """Publish one locally materialized messy corpus into the remote namespace."""
+
+    remote_graph = getattr(service.graph_store, "_remote_graph", None)
+    enabled_method = getattr(remote_graph, "enabled", None)
+    persist_method = getattr(remote_graph, "persist_document", None)
+    if callable(enabled_method) and enabled_method() and callable(persist_method):
+        persist_method(document=materialized.graph_document)
+    current_state = materialized.current_state
+    service.object_store.write_snapshot(
+        objects=tuple(getattr(current_state, "objects", ())),
+        conflicts=tuple(getattr(current_state, "conflicts", ())),
+        archived_objects=tuple(getattr(current_state, "archived_objects", ())),
+    )
+    service.midterm_store.save_packets(
+        packets=tuple(materialized.midterm_packets),
+    )
 
 
 def _seed_synthetic_graph_locally_then_sync_remote(
@@ -525,10 +851,76 @@ def _seed_synthetic_graph_locally_then_sync_remote(
     preference_items = tuple(preferences)
     plans = tuple(_seed_plans(local_graph_store, list(contacts)))
     remote_graph = getattr(graph_store, "_remote_graph", None)
-    if callable(getattr(remote_graph, "enabled", None)) and remote_graph.enabled():
+    enabled_method = getattr(remote_graph, "enabled", None)
+    persist_method = getattr(remote_graph, "persist_document", None)
+    if callable(enabled_method) and enabled_method() and callable(persist_method):
         document = local_graph_store.load_document()
-        remote_graph.persist_document(document=document)
+        persist_method(document=document)
     return contacts, preference_items, preference_memory_count, plans
+
+
+def _merge_structured_current_states(
+    existing: StructuredStoreCurrentState,
+    overlay: StructuredStoreCurrentState,
+) -> StructuredStoreCurrentState:
+    """Merge standalone fixture snapshots so later seeds do not erase earlier ones.
+
+    The mixed-corpus harness composes multiple goldsets inside one namespace.
+    Some standalone fixtures still seed via full `write_snapshot(...)` calls,
+    which are correct in isolation but would otherwise drop already seeded
+    episodic and multimodal objects when composed here.
+    """
+
+    return StructuredStoreCurrentState(
+        objects=_merge_memory_objects(existing.objects, overlay.objects),
+        conflicts=_merge_memory_conflicts(existing.conflicts, overlay.conflicts),
+        archived_objects=_merge_memory_objects(existing.archived_objects, overlay.archived_objects),
+    )
+
+
+def _merge_memory_objects(
+    *groups: tuple[LongTermMemoryObjectV1, ...],
+) -> tuple[LongTermMemoryObjectV1, ...]:
+    """Merge structured memory objects by `memory_id`, keeping later overlays."""
+
+    merged: dict[str, LongTermMemoryObjectV1] = {}
+    for group in groups:
+        for item in group:
+            memory_id = " ".join(item.memory_id.split()).strip()
+            if memory_id:
+                merged[memory_id] = item
+    return tuple(sorted(merged.values(), key=lambda row: row.memory_id))
+
+
+def _merge_memory_conflicts(
+    *groups: tuple[LongTermMemoryConflictV1, ...],
+) -> tuple[LongTermMemoryConflictV1, ...]:
+    """Merge structured conflicts by slot/candidate identity, keeping later overlays."""
+
+    merged: dict[tuple[str, str], LongTermMemoryConflictV1] = {}
+    for group in groups:
+        for item in group:
+            key = (
+                " ".join(item.slot_key.split()).strip(),
+                " ".join(item.candidate_memory_id.split()).strip(),
+            )
+            if key[0] and key[1]:
+                merged[key] = item
+    return tuple(sorted(merged.values(), key=lambda row: (row.slot_key, row.candidate_memory_id)))
+
+
+def _merge_midterm_packets(
+    *groups: tuple[LongTermMidtermPacketV1, ...],
+) -> tuple[LongTermMidtermPacketV1, ...]:
+    """Merge midterm packets by packet id so composed fixtures preserve prior packets."""
+
+    merged: dict[str, LongTermMidtermPacketV1] = {}
+    for group in groups:
+        for packet in group:
+            packet_id = " ".join(str(getattr(packet, "packet_id", "") or "").split()).strip()
+            if packet_id:
+                merged[packet_id] = packet
+    return tuple(sorted(merged.values(), key=lambda row: row.packet_id))
 
 
 def _run_phase(
@@ -551,6 +943,12 @@ def _run_phase(
             episodes=list(episodes),
         )
     )
+    multimodal_cases = _build_multimodal_eval_cases()
+    _prepare_eval_phase_service(
+        service,
+        synthetic_cases=synthetic_cases,
+        multimodal_cases=multimodal_cases,
+    )
     synthetic_results = tuple(
         _run_eval_case_safely(
             service=service,
@@ -559,7 +957,6 @@ def _run_phase(
         )
         for case in synthetic_cases
     )
-    multimodal_cases = _build_multimodal_eval_cases()
     multimodal_results = tuple(_run_case(service, case) for case in multimodal_cases)
     unified_cases = unified_retrieval_goldset_cases(profile=unified_case_profile)
     unified_results = wait_for_unified_retrieval_cases(
@@ -608,12 +1005,12 @@ def _case_status_map(phase: MessyMemoryPhaseResult) -> dict[str, bool]:
     """Return one cross-suite pass/fail lookup for phase comparison."""
 
     status: dict[str, bool] = {}
-    for item in phase.synthetic_case_results:
-        status[_flatten_suite_case_id(suite="synthetic", case_id=item.case_id)] = item.passed
-    for item in phase.multimodal_case_results:
-        status[_flatten_suite_case_id(suite="multimodal", case_id=item.case_id)] = item.passed
-    for item in phase.unified_case_results:
-        status[_flatten_suite_case_id(suite="unified", case_id=item.case_id)] = item.passed
+    for synthetic_item in phase.synthetic_case_results:
+        status[_flatten_suite_case_id(suite="synthetic", case_id=synthetic_item.case_id)] = synthetic_item.passed
+    for multimodal_item in phase.multimodal_case_results:
+        status[_flatten_suite_case_id(suite="multimodal", case_id=multimodal_item.case_id)] = multimodal_item.passed
+    for unified_item in phase.unified_case_results:
+        status[_flatten_suite_case_id(suite="unified", case_id=unified_item.case_id)] = unified_item.passed
     return status
 
 
@@ -683,82 +1080,94 @@ def run_messy_memory_eval(
     )
     writer_service: LongTermMemoryService | None = None
     fresh_reader_service: LongTermMemoryService | None = None
+    writer_root: Path | None = None
+    fresh_reader_root: Path | None = None
 
     try:
         if not base_config.chonkydb_base_url or not base_config.chonkydb_api_key:
             raise RuntimeError("ChonkyDB credentials are required for messy memory evaluation.")
-        with ExitStack() as stack:
-            writer_temp_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix=f"{effective_probe_id}_writer_"))
-            fresh_reader_temp_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix=f"{effective_probe_id}_reader_"))
-            writer_root = Path(writer_temp_dir).resolve(strict=False)
-            fresh_reader_root = Path(fresh_reader_temp_dir).resolve(strict=False)
-            result = replace(
-                result,
-                writer_root=str(writer_root),
-                fresh_reader_root=str(fresh_reader_root),
-            )
-            writer_config = _build_isolated_config(
-                base_config=base_config,
-                base_project_root=base_project_root,
-                runtime_root=writer_root,
-                remote_namespace=runtime_namespace,
-                background_store_turns=False,
-            )
-            fresh_reader_config = _build_isolated_config(
-                base_config=base_config,
-                base_project_root=base_project_root,
-                runtime_root=fresh_reader_root,
-                remote_namespace=runtime_namespace,
-                background_store_turns=False,
-            )
-            writer_service = LongTermMemoryService.from_config(writer_config)
-            fresh_reader_service = LongTermMemoryService.from_config(fresh_reader_config)
-            ensure_unified_retrieval_remote_ready(writer_service)
-            ensure_unified_retrieval_remote_ready(fresh_reader_service)
-            seed_stats, contacts, preferences, plans, episodes = _seed_messy_corpus(writer_service)
-            writer_phase, writer_analysis = _run_phase(
-                service=writer_service,
-                phase="writer",
-                unified_case_profile=unified_case_profile,
-                contacts=contacts,
-                preferences=preferences,
-                plans=plans,
-                episodes=episodes,
-            )
-            fresh_reader_phase, fresh_reader_analysis = _run_phase(
-                service=fresh_reader_service,
-                phase="fresh_reader",
-                unified_case_profile=unified_case_profile,
-                contacts=contacts,
-                preferences=preferences,
-                plans=plans,
-                episodes=episodes,
-            )
-            restart_summary = _build_restart_summary(
-                writer_phase=writer_phase,
-                fresh_reader_phase=fresh_reader_phase,
-            )
-            result = replace(
-                result,
-                status="ok",
-                finished_at=_utc_now_iso(),
-                seed_stats=seed_stats,
-                writer_phase=writer_phase,
-                fresh_reader_phase=fresh_reader_phase,
-                writer_unified_analysis=writer_analysis,
-                fresh_reader_unified_analysis=fresh_reader_analysis,
-                restart_summary=restart_summary,
-            )
+        writer_root = Path(tempfile.mkdtemp(prefix=f"{effective_probe_id}_writer_")).resolve(strict=False)
+        fresh_reader_root = Path(tempfile.mkdtemp(prefix=f"{effective_probe_id}_reader_")).resolve(strict=False)
+        result = replace(
+            result,
+            writer_root=str(writer_root),
+            fresh_reader_root=str(fresh_reader_root),
+        )
+        writer_config = _build_eval_runtime_config(
+            base_config=base_config,
+            base_project_root=base_project_root,
+            runtime_root=writer_root,
+            remote_namespace=runtime_namespace,
+        )
+        fresh_reader_config = _build_eval_runtime_config(
+            base_config=base_config,
+            base_project_root=base_project_root,
+            runtime_root=fresh_reader_root,
+            remote_namespace=runtime_namespace,
+        )
+        writer_service = LongTermMemoryService.from_config(writer_config)
+        fresh_reader_service = LongTermMemoryService.from_config(fresh_reader_config)
+        ensure_unified_retrieval_remote_ready(writer_service)
+        ensure_unified_retrieval_remote_ready(fresh_reader_service)
+        seed_stats, contacts, preferences, plans, episodes = _seed_messy_corpus(
+            writer_service,
+            base_config=base_config,
+            base_project_root=base_project_root,
+            local_seed_root=writer_root / "_local_seed_materialize",
+            remote_namespace=runtime_namespace,
+        )
+        writer_phase, writer_analysis = _run_phase(
+            service=writer_service,
+            phase="writer",
+            unified_case_profile=unified_case_profile,
+            contacts=contacts,
+            preferences=preferences,
+            plans=plans,
+            episodes=episodes,
+        )
+        fresh_reader_phase, fresh_reader_analysis = _run_phase(
+            service=fresh_reader_service,
+            phase="fresh_reader",
+            unified_case_profile=unified_case_profile,
+            contacts=contacts,
+            preferences=preferences,
+            plans=plans,
+            episodes=episodes,
+        )
+        restart_summary = _build_restart_summary(
+            writer_phase=writer_phase,
+            fresh_reader_phase=fresh_reader_phase,
+        )
+        result = replace(
+            result,
+            status="ok",
+            finished_at=_utc_now_iso(),
+            seed_stats=seed_stats,
+            writer_phase=writer_phase,
+            fresh_reader_phase=fresh_reader_phase,
+            writer_unified_analysis=writer_analysis,
+            fresh_reader_unified_analysis=fresh_reader_analysis,
+            restart_summary=restart_summary,
+        )
     except Exception as exc:
         result = replace(
             result,
             status="failed",
             finished_at=_utc_now_iso(),
             error_message=f"{type(exc).__name__}: {exc}",
+            error_remote_write_context=_exception_remote_write_context(exc),
+            error_exception_chain=_exception_chain_payload(exc),
+            failure_temp_roots_preserved=any(
+                root is not None and root.exists() for root in (writer_root, fresh_reader_root)
+            ),
         )
     finally:
         _shutdown_service(writer_service)
         _shutdown_service(fresh_reader_service)
+        if result.status == "ok":
+            for root in (writer_root, fresh_reader_root):
+                if root is not None:
+                    shutil.rmtree(root, ignore_errors=True)
 
     if write_artifacts:
         result = write_messy_memory_eval_artifacts(result, project_root=base_project_root)

@@ -2,6 +2,7 @@
 # BUG-1: Live recognizer caches now rebuild when the callback or num_hands override changes, preventing silent dispatch to stale callbacks or wrong multi-hand settings.
 # BUG-2: Cached task instances now rebuild when model files or effective config values change, preventing stale models/thresholds in long-lived processes.
 # BUG-3: Stable live callback cache keys now reuse recognizers across observe() ticks while still hot-swapping the active Python callback target.
+# BUG-4: Long-lived Pi gesture inference now routes through one native-heap trimmer so glibc-retained MediaPipe/TFLite pages do not balloon RSS indefinitely.
 # SEC-1: Model assets are size-capped before read and, on old BaseOptions fallbacks, are exposed through verified in-memory compatibility files instead of reopening the original path.
 # IMP-1: Live-stream callbacks now default to a latest-wins background dispatcher so slow Python callbacks do not stall MediaPipe live streams.
 # IMP-2: Model assets are cached and reused across IMAGE/VIDEO/LIVE_STREAM task instances, avoiding repeated SD-card reads and duplicate memory churn on Raspberry Pi.
@@ -25,6 +26,7 @@ import traceback
 
 from .config import MediaPipeVisionConfig
 from .fine_hand_gestures import builtin_gesture_category_denylist
+from .native_heap import NativeHeapTrimmer
 
 _MEDIAPIPE_IMAGE_DTYPES = {"uint8", "uint16", "float32"}
 _DEFAULT_MAX_MODEL_ASSET_BYTES = 128 * 1024 * 1024
@@ -234,6 +236,9 @@ class MediaPipeTaskRuntime:
         self._model_asset_cache: dict[str, _ModelAssetRecord] = {}
         self._live_callback_proxies: dict[str, _MutableLiveCallbackProxy] = {}
         self._live_callback_dispatchers: dict[str, _LatestWinsCallbackDispatcher] = {}
+        self._gesture_native_heap_trimmer = NativeHeapTrimmer(
+            interval_s=self.config.native_heap_trim_interval_s
+        )
 
     def close(self) -> None:
         """Close active MediaPipe task instances when supported."""
@@ -321,6 +326,35 @@ class MediaPipeTaskRuntime:
         reserved_timestamp_ms = self._coerce_reserved_timestamp_ms(timestamp_ms)
         with self._lock:
             self._last_timestamp_ms = max(self._last_timestamp_ms, reserved_timestamp_ms)
+
+    def gesture_recognize_image(self, recognizer: Any, *, image: Any) -> Any:
+        """Run one IMAGE-mode gesture inference and then maybe trim native heap."""
+
+        try:
+            return recognizer.recognize(image)
+        finally:
+            self._gesture_native_heap_trimmer.maybe_trim()
+
+    def gesture_recognize_for_video(self, recognizer: Any, *, image: Any, timestamp_ms: int) -> Any:
+        """Run one VIDEO-mode gesture inference and then maybe trim native heap."""
+
+        try:
+            return recognizer.recognize_for_video(image, timestamp_ms)
+        finally:
+            self._gesture_native_heap_trimmer.maybe_trim()
+
+    def gesture_recognize_async(self, recognizer: Any, *, image: Any, timestamp_ms: int) -> None:
+        """Submit one LIVE_STREAM gesture inference and then maybe trim native heap."""
+
+        try:
+            recognizer.recognize_async(image, timestamp_ms)
+        finally:
+            self._gesture_native_heap_trimmer.maybe_trim()
+
+    def gesture_native_heap_snapshot(self) -> dict[str, object]:
+        """Expose native-heap trim state for pipeline forensics and Pi acceptance."""
+
+        return self._gesture_native_heap_trimmer.snapshot()
 
     def ensure_pose_landmarker(self, runtime: dict[str, Any]) -> Any:
         """Reuse or create the configured pose landmarker."""

@@ -25,7 +25,6 @@ This version adds bounded serialization, monotonic timing, and degraded-mode
 fallbacks so modality dropouts do not collapse the automation loop.
 """
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

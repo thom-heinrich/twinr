@@ -1,6 +1,5 @@
 """Compose the refactored realtime workflow loop from focused mixins."""
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

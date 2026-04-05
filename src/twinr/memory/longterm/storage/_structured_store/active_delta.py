@@ -22,6 +22,7 @@ from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTerm
 from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogEntry
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
+from ._typing import StructuredStoreMixinBase
 from .shared import (
     _ARCHIVE_STORE_SCHEMA,
     _ARCHIVE_STORE_VERSION,
@@ -43,7 +44,7 @@ class StructuredStoreActiveWorkingSet:
     archived_objects: tuple[LongTermMemoryObjectV1, ...]
 
 
-class StructuredStoreActiveDeltaMixin:
+class StructuredStoreActiveDeltaMixin(StructuredStoreMixinBase):
     """Own active-path selective loads and delta-style current-head commits."""
 
     def load_active_working_set(
@@ -213,8 +214,8 @@ class StructuredStoreActiveDeltaMixin:
                         objects_by_id[item.memory_id] = item
                 for slot_key in normalized_conflict_delete_slots:
                     conflicts_by_slot.pop(slot_key, None)
-                for item in conflict_items:
-                    conflicts_by_slot[item.slot_key] = item
+                for conflict_item in conflict_items:
+                    conflicts_by_slot[conflict_item.slot_key] = conflict_item
                 for memory_id in normalized_archive_delete_ids:
                     archived_by_id.pop(memory_id, None)
                 for item in archive_upserts:
@@ -337,7 +338,7 @@ class StructuredStoreActiveDeltaMixin:
                 operation="write",
             )
             record_items: list[ChonkyDBRecordItem] = []
-            staged: list[tuple[str, dict[str, object], Mapping[str, object]]] = []
+            staged: list[tuple[str, dict[str, object], dict[str, object]]] = []
             for item_id, raw_payload in upsert_payloads.items():
                 normalized_item_id = _normalize_text(item_id)
                 if not normalized_item_id:
@@ -458,7 +459,7 @@ class StructuredStoreActiveDeltaMixin:
                 raise
             probe_kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
             try:
-                parameters = inspect.signature(probe_catalog_payload_result).parameters
+                parameters: Mapping[str, inspect.Parameter] = inspect.signature(probe_catalog_payload_result).parameters
             except (TypeError, ValueError):
                 parameters = {}
             if "fast_fail" in parameters:

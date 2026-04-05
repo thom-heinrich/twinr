@@ -25,7 +25,7 @@ instead of treating them as supported operating modes.
 - the development-host operator script that stabilizes the dedicated Twinr ChonkyDB host when shared-host system units, user-session units, or non-Twinr workers directly pointed at the dedicated backend reclaim CPU/I/O from it
 - the development-host operator script that force-repairs unreadable prompt-memory and managed-context `catalog/current` heads on one explicit remote namespace when those heads themselves have become unreadable blank documents
 - the development-machine watchdog that mirrors the authoritative repo into `/twinr` without deleting Pi-local runtime state
-- the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, runs the bounded live retention canary, and verifies the Pi acceptance runtime
+- the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, runs the bounded live retention canary, diagnoses proven dedicated-backend host contention on failure, applies one bounded host-stabilization pass first, re-diagnoses when that pass still leaves the public surface unhealthy, escalates once into guarded dedicated-backend repair when the backend itself still remains unhealthy afterwards, retries the canary once, and verifies the Pi acceptance runtime
 
 `hardware/ops` does **not** own:
 - the watchdog implementation itself; that lives in `src/twinr/ops`
@@ -48,9 +48,9 @@ instead of treating them as supported operating modes.
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
 | [repair_remote_chonkydb.py](./repair_remote_chonkydb.py) | Diagnose the public ChonkyDB URL against the dedicated backend host and optionally repair the backend service without blind restarts |
-| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service` plus CPU-hungry `caia-consumer-portal*.service` backends, bounded-kill direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path when they bypass systemd, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
+| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service`, CPU-hungry `caia-consumer-portal*.service` backends, `caia-ccodex-memory-api.service`, and sibling ChonkyDB services that starve the dedicated Twinr backend, bounded-kill direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path when they bypass systemd, bounded-kill proven long-running user-session `chonkycode.cli artifact-ingest` and `ccodex_memory_locomo_mc10_eval.py` workloads when they starve the dedicated backend, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
 | [repair_remote_prompt_current_heads.py](./repair_remote_prompt_current_heads.py) | Force-publish canonical empty prompt-memory / managed-context current heads on one explicit remote namespace when the old heads are unreadable |
-| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default, optionally first-rollout a disabled Pi unit, and verify post-restart health |
+| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default on its own dedicated timeout budget, diagnose shared-host ChonkyDB contention on canary failure, apply one bounded host-stabilization pass first, re-diagnose when failed stabilization still leaves the public surface unhealthy, escalate once into guarded dedicated-backend repair when the backend still remains unhealthy afterwards, then retry the canary once, keep the recovery SSH budget aligned with the host stabilizer/repair window, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
 | [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
 
@@ -170,12 +170,20 @@ always-on `caia-consumer-portal.service` and
 `caia-consumer-portal-demo.service` uvicorn backends when they reclaim CPU,
 bounded-kills direct non-systemd writers against the dedicated
 `twinr_dedicated_<port>/data` store path when they keep the backend locked,
+bounded-kills proven long-running user-session `chonkycode.cli artifact-ingest`
+and `ccodex_memory_locomo_mc10_eval.py` workloads when they starve the
+dedicated backend,
 raises
 `caia-twinr-chonkydb-alt.service` CPU/IO priority, and then re-probes the
 public current-scope query surface with the same empty-scope-safe
 `404 document_not_found` semantics used by `repair_remote_chonkydb.py`, so
 operators can see whether the host slowdown actually cleared without
-misclassifying a fresh empty namespace as down.
+misclassifying a fresh empty namespace as down. The stabilizer now also
+verifies that its held conflict units actually stay `inactive`/not `enabled`;
+if they rebound during the first systemd reload wave it performs one bounded
+recovery pass on just those violators and otherwise returns the explicit
+fail-closed diagnosis
+`conflict_units_reactivated_after_host_stabilization`.
 If the backend stays healthy but prompt-context reads time out on one broken
 blank `catalog/current` document, open an SSH tunnel to the backend loopback
 and run `repair_remote_prompt_current_heads.py` against that explicit namespace.
@@ -296,6 +304,7 @@ Pi settings changed:
 ```bash
 python3 hardware/ops/deploy_pi_runtime.py
 python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
+python3 hardware/ops/deploy_pi_runtime.py --retention-canary-timeout-s 900 --live-text "Antworte nur mit: ok."
 python3 hardware/ops/deploy_pi_runtime.py --rollout-service twinr-whatsapp-channel
 python3 hardware/ops/deploy_pi_runtime.py --skip-env-sync --service twinr-runtime-supervisor
 ```
@@ -319,6 +328,7 @@ By default the deploy command:
 - restarts `twinr-remote-memory-watchdog.service`, `twinr-runtime-supervisor.service`, and `twinr-web.service`
 - also picks up any additional repo-backed Pi runtime unit that is already enabled on the Pi, such as `twinr-whatsapp-channel.service`
 - verifies that those services are active again, runs the bounded Pi env-contract probe, and then runs the bounded live retention canary unless `--skip-retention-canary` was requested
+- keeps the retention-canary timeout separate from the generic `--timeout-s` SSH/SCP budget, so long but healthy Pi-side retention proofs do not get cut off by ordinary deploy transport limits
 - re-bases repo-owned workflow-trace env paths such as `TWINR_WORKFLOW_TRACE_DIR=/home/thh/twinr/...` onto the active Pi checkout root during env sync, so `/twinr` does not inherit stale leading-repo absolute paths
 - emits nested `retention_canary` progress events while the fresh-namespace probe is still running, so long remote-memory canary runs do not look like a silent deploy hang
 

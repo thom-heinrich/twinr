@@ -31,7 +31,7 @@ import shlex
 import subprocess
 import tempfile
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from twinr.ops.deploy_progress import ProgressCallback, progress_span
 from twinr.ops.pi_repo_mirror import PiRepoMirrorEntryDigest
@@ -140,7 +140,12 @@ class PiRemoteExecutor:
 
         return f"{self.settings.user}@{self.settings.host}"
 
-    def run_ssh(self, script: str) -> subprocess.CompletedProcess[str]:
+    def run_ssh(
+        self,
+        script: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run one remote bash script over SSH and capture UTF-8 text output."""
 
         return self._run_local(
@@ -150,10 +155,17 @@ class PiRemoteExecutor:
                 *self._ssh_common_args(for_scp=False),
                 self.remote_spec,
                 "bash -lc " + shlex.quote("set -euo pipefail; " + script),
-            ]
+            ],
+            timeout_s=timeout_s,
         )
 
-    def run_scp(self, local_path: Path, remote_path: str) -> subprocess.CompletedProcess[str]:
+    def run_scp(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Copy one local file to the Pi over SCP."""
 
         return self._run_local(
@@ -163,17 +175,26 @@ class PiRemoteExecutor:
                 *self._ssh_common_args(for_scp=True),
                 str(local_path),
                 f"{self.remote_spec}:{remote_path}",
-            ]
+            ],
+            timeout_s=timeout_s,
         )
 
-    def _run_local(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run_local(
+        self,
+        args: list[str],
+        *,
+        timeout_s: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        effective_timeout_s = self.timeout_s if timeout_s is None else float(timeout_s)
+        if effective_timeout_s <= 0:
+            raise ValueError("timeout_s must be greater than zero")
         kwargs = {
             "check": False,
             "capture_output": True,
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
-            "timeout": self.timeout_s,
+            "timeout": effective_timeout_s,
         }
         password = str(self.settings.password)
         try:
@@ -291,6 +312,19 @@ class PiRemoteExecutor:
         return Path(str(raw_path)).expanduser()
 
 
+class RetentionCanaryProbeError(RuntimeError):
+    """Carry the structured canary payload when the remote proof fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.payload = dict(payload) if isinstance(payload, Mapping) else None
+
+
 def sync_authoritative_file(
     *,
     remote: PiRemoteExecutor,
@@ -385,7 +419,7 @@ def attest_remote_repo_entries(
             elapsed_s=0.0,
         )
 
-    payload = {
+    payload: dict[str, object] = {
         "entries": [
             {
                 "relative_path": entry.relative_path,
@@ -506,11 +540,13 @@ def attest_remote_repo_entries(
     sampled_missing_paths_raw = payload.get("sampled_missing_paths", ())
     sampled_mismatch_details_raw = payload.get("sampled_mismatch_details", ())
     result = PiRemoteRepoAttestationResult(
-        verified_entry_count=max(0, int(payload.get("verified_entry_count", 0) or 0)),
-        verified_file_count=max(0, int(payload.get("verified_file_count", 0) or 0)),
-        verified_symlink_count=max(0, int(payload.get("verified_symlink_count", 0) or 0)),
-        missing_count=max(0, int(payload.get("missing_count", 0) or 0)),
-        mismatch_count=max(0, int(payload.get("mismatch_count", 0) or 0)),
+        verified_entry_count=max(0, int(str(payload.get("verified_entry_count", 0) or 0).strip())),
+        verified_file_count=max(0, int(str(payload.get("verified_file_count", 0) or 0).strip())),
+        verified_symlink_count=max(
+            0, int(str(payload.get("verified_symlink_count", 0) or 0).strip())
+        ),
+        missing_count=max(0, int(str(payload.get("missing_count", 0) or 0).strip())),
+        mismatch_count=max(0, int(str(payload.get("mismatch_count", 0) or 0).strip())),
         sampled_missing_paths=(
             tuple(str(path).strip() for path in sampled_missing_paths_raw if str(path).strip())
             if isinstance(sampled_missing_paths_raw, list)
@@ -521,7 +557,7 @@ def attest_remote_repo_entries(
             if isinstance(sampled_mismatch_details_raw, list)
             else ()
         ),
-        elapsed_s=max(0.0, float(payload.get("elapsed_s", 0.0) or 0.0)),
+        elapsed_s=max(0.0, float(str(payload.get("elapsed_s", 0.0) or 0.0).strip())),
     )
     if result.missing_count or result.mismatch_count:
         detail_parts: list[str] = []
@@ -1992,16 +2028,121 @@ def run_env_contract_probe(
     return json.loads((completed.stdout or "").strip() or "{}")
 
 
+def wait_for_remote_watchdog_ready(
+    *,
+    remote: PiRemoteExecutor,
+    remote_root: str,
+    env_path: str,
+    min_sample_captured_at: str | None = None,
+    wait_timeout_s: float = 180.0,
+    poll_interval_s: float = 5.0,
+) -> dict[str, object]:
+    """Wait until the Pi watchdog publishes one fresh ready sample.
+
+    The retention-canary retry after a backend repair must not start from a
+    stale pre-repair watchdog artifact. This helper evaluates the same local
+    watchdog artifact contract the runtime supervisor uses and optionally
+    requires that the ready sample was captured after a specific UTC boundary.
+    """
+
+    effective_wait_timeout_s = float(wait_timeout_s)
+    effective_poll_interval_s = float(poll_interval_s)
+    if effective_wait_timeout_s <= 0:
+        raise ValueError("wait_timeout_s must be greater than zero")
+    if effective_poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be greater than zero")
+    remote_python = f"{remote_root}/.venv/bin/python"
+    remote_timeout_s = effective_wait_timeout_s + max(30.0, effective_poll_interval_s * 2.0)
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "export PYTHONPATH="
+            + shlex.quote(f"{remote_root}/src")
+            + ':${PYTHONPATH:-""}',
+            shlex.quote(remote_python) + " - <<'PY'",
+            "from datetime import datetime, timezone",
+            "import json",
+            "import time",
+            "from twinr.agent.base_agent.config import TwinrConfig",
+            "from twinr.agent.workflows.required_remote_snapshot import assess_required_remote_watchdog_snapshot",
+            "from twinr.ops.remote_memory_watchdog_state import RemoteMemoryWatchdogStore",
+            f"env_path = {env_path!r}",
+            f"min_sample_captured_at = {min_sample_captured_at!r}",
+            f"wait_timeout_s = {effective_wait_timeout_s!r}",
+            f"poll_interval_s = {effective_poll_interval_s!r}",
+            "",
+            "def _parse_utc(value: str | None) -> datetime | None:",
+            "    text = str(value or '').strip()",
+            "    if not text:",
+            "        return None",
+            "    try:",
+            "        return datetime.fromisoformat(text.replace('Z', '+00:00'))",
+            "    except ValueError:",
+            "        return None",
+            "",
+            "config = TwinrConfig.from_env(env_path)",
+            "store = RemoteMemoryWatchdogStore.from_config(config)",
+            "gate_timestamp = _parse_utc(min_sample_captured_at)",
+            "deadline = time.monotonic() + wait_timeout_s",
+            "last_payload: dict[str, object] | None = None",
+            "while True:",
+            "    assessment = assess_required_remote_watchdog_snapshot(config, store=store)",
+            "    snapshot = store.load()",
+            "    sample_captured_at = None",
+            "    if snapshot is not None and getattr(snapshot, 'current', None) is not None:",
+            "        sample_captured_at = getattr(snapshot.current, 'captured_at', None)",
+            "    parsed_sample_captured_at = _parse_utc(sample_captured_at)",
+            "    sample_fresh_after_gate = gate_timestamp is None or (",
+            "        parsed_sample_captured_at is not None and parsed_sample_captured_at >= gate_timestamp",
+            "    )",
+            "    last_payload = {",
+            "        'ready': bool(assessment.ready and sample_fresh_after_gate),",
+            "        'assessment_ready': bool(assessment.ready),",
+            "        'detail': assessment.detail,",
+            "        'artifact_path': assessment.artifact_path,",
+            "        'sample_status': assessment.sample_status,",
+            "        'sample_ready': assessment.sample_ready,",
+            "        'sample_age_s': assessment.sample_age_s,",
+            "        'sample_latency_ms': assessment.sample_latency_ms,",
+            "        'sample_captured_at': sample_captured_at,",
+            "        'min_sample_captured_at': min_sample_captured_at,",
+            "        'sample_fresh_after_gate': sample_fresh_after_gate,",
+            "        'snapshot_updated_at': assessment.snapshot_updated_at,",
+            "        'snapshot_stale': assessment.snapshot_stale,",
+            "        'heartbeat_age_s': assessment.heartbeat_age_s,",
+            "        'heartbeat_updated_at': assessment.heartbeat_updated_at,",
+            "        'probe_inflight': assessment.probe_inflight,",
+            "        'probe_age_s': assessment.probe_age_s,",
+            "    }",
+            "    if bool(last_payload['ready']):",
+            "        print(json.dumps(last_payload, ensure_ascii=False))",
+            "        break",
+            "    if time.monotonic() >= deadline:",
+            "        print(json.dumps(last_payload, ensure_ascii=False))",
+            "        break",
+            "    time.sleep(max(0.1, poll_interval_s))",
+            "PY",
+        )
+    )
+    completed = remote.run_ssh(script, timeout_s=remote_timeout_s)
+    payload = json.loads((completed.stdout or "").strip() or "{}")
+    return payload if isinstance(payload, dict) else {}
+
+
 def run_retention_canary_probe(
     *,
     remote: PiRemoteExecutor,
     remote_root: str,
     env_path: str,
     probe_id: str,
+    command_timeout_s: float | None = None,
 ) -> dict[str, object]:
     """Run the bounded live retention canary and parse its JSON result."""
 
     remote_python = f"{remote_root}/.venv/bin/python"
+    effective_command_timeout_s = remote.timeout_s if command_timeout_s is None else float(command_timeout_s)
+    if effective_command_timeout_s <= 0:
+        raise ValueError("command_timeout_s must be greater than zero")
     command = " ".join(
         (
             shlex.quote(remote_python),
@@ -2023,7 +2164,8 @@ def run_retention_canary_probe(
                     "printf '__TWINR_RETENTION_EXIT_STATUS__=%s\\n' \"$retention_status\"",
                     "printf '%s\\n' \"$retention_output\"",
                 )
-            )
+            ),
+            timeout_s=effective_command_timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
         payload = _wait_for_remote_retention_canary_report(
@@ -2033,9 +2175,10 @@ def run_retention_canary_probe(
         )
         if isinstance(payload, dict) and payload:
             if not bool(payload.get("ready")):
-                raise RuntimeError(
+                raise RetentionCanaryProbeError(
                     "retention canary timed out waiting for stdout but completed on the Pi: "
-                    + _summarize_retention_canary_failure_payload(payload)
+                    + _summarize_retention_canary_failure_payload(payload),
+                    payload=payload,
                 ) from exc
             return payload
         raise RuntimeError(
@@ -2054,9 +2197,10 @@ def run_retention_canary_probe(
         )
         if isinstance(report_payload, dict) and report_payload:
             if not bool(report_payload.get("ready")):
-                raise RuntimeError(
+                raise RetentionCanaryProbeError(
                     "retention canary exited without inline JSON but produced a Pi report: "
-                    + _summarize_retention_canary_failure_payload(report_payload)
+                    + _summarize_retention_canary_failure_payload(report_payload),
+                    payload=report_payload,
                 )
             return report_payload
         raw_detail = summarize_text(raw_output) if raw_output.strip() else "no stdout/stderr payload"
@@ -2065,7 +2209,10 @@ def run_retention_canary_probe(
             f"probe_id={probe_id} exit_status={exit_status} detail={raw_detail}"
         )
     if not bool(payload.get("ready")):
-        raise RuntimeError("retention canary failed: " + _summarize_retention_canary_failure_payload(payload))
+        raise RetentionCanaryProbeError(
+            "retention canary failed: " + _summarize_retention_canary_failure_payload(payload),
+            payload=payload,
+        )
     return payload
 
 
@@ -2247,6 +2394,7 @@ __all__ = [
     "PiSystemdServiceState",
     "PiVenvSystemSiteBridgeResult",
     "PiVenvScriptRepairResult",
+    "RetentionCanaryProbeError",
     "attest_remote_repo_entries",
     "install_browser_automation_runtime_support",
     "install_editable_package",
@@ -2262,6 +2410,7 @@ __all__ = [
     "restart_services",
     "run_env_contract_probe",
     "run_retention_canary_probe",
+    "wait_for_remote_watchdog_ready",
     "repair_venv_python_shebangs",
     "sshpass_env",
     "summarize_output",

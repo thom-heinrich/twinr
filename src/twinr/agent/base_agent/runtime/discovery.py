@@ -11,7 +11,6 @@
 
 """Expose runtime helpers for Twinr's guided user-discovery flow."""
 
-# mypy: disable-error-code=attr-defined
 
 from __future__ import annotations
 

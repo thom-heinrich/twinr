@@ -138,6 +138,7 @@ class StreamingCaptureController:
             details=self._transcript_trace_details(normalized),
         )
         if normalized:
+            loop._maybe_start_local_semantic_router_warmup(normalized)
             loop._maybe_start_speculative_first_word(normalized)
             loop._maybe_start_speculative_supervisor_decision(normalized)
             loop._maybe_start_speculative_long_term_context(normalized, final_transcript=False)
@@ -158,6 +159,7 @@ class StreamingCaptureController:
             },
         )
         if transcript:
+            loop._maybe_start_local_semantic_router_warmup(transcript)
             loop._maybe_start_speculative_first_word(transcript)
             loop._maybe_start_speculative_supervisor_decision(transcript)
             loop._maybe_start_speculative_long_term_context(transcript, final_transcript=True)

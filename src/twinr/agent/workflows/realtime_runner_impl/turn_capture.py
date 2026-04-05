@@ -18,7 +18,6 @@
 # IMP-3: Added safer transcript telemetry and transcript-stability helpers tuned for modern
 #        voice-agent streaming pipelines.
 
-# mypy: ignore-errors
 
 from __future__ import annotations
 

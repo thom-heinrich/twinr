@@ -1,4 +1,3 @@
-# mypy: disable-error-code="attr-defined,has-type,assignment"
 # CHANGELOG: 2026-03-29
 # BUG-1: Fallback to raw-audio wake detection when transcript matching raises, instead of silently dropping a valid wake event.
 # BUG-2: Accept structured/None transcription payloads and normalize blank transcripts to None, avoiding false backend errors and empty-string downstream behavior.
