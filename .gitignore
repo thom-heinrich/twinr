@@ -54,14 +54,6 @@ cache*/
 .git_guard*
 .tmp_*
 
-# Private keys and certificates
-*.pem
-*.key
-*.p12
-*.pfx
-credentials.json
-service-account*.json
-
 # OS files
 .DS_Store
 Thumbs.db
