@@ -530,6 +530,38 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["issues"], [])
 
+    def test_scan_push_reports_actionable_error_when_remote_oid_is_missing_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as remote_dir:
+            repo_root = Path(temp_dir)
+            remote_root = Path(remote_dir)
+            subprocess.run(["git", "init", "--bare", "-q", str(remote_root)], check=True, text=True, capture_output=True)
+            self._init_repo(repo_root)
+            self._commit_file(repo_root, "notes.txt", "baseline\n", "base")
+            _run_git(repo_root, "remote", "add", "origin", str(remote_root))
+
+            local_oid = _run_git(repo_root, "rev-parse", "HEAD").stdout.strip()
+            unknown_remote_oid = "3bdf8c1727e64ec42cd49073fc4b3c591abf1c58"
+            updates_path = repo_root / "pre_push_updates.txt"
+            updates_path.write_text(
+                f"refs/heads/main {local_oid} refs/heads/main {unknown_remote_oid}\n",
+                encoding="utf-8",
+            )
+
+            exit_code, payload, _ = self._run_cli(
+                repo_root,
+                "scan-push",
+                "--remote",
+                "origin",
+                "--stdin-file",
+                str(updates_path),
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"], "git_error")
+            self.assertIn("not present locally", payload["detail"])
+            self.assertIn("git fetch origin refs/heads/main", payload["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

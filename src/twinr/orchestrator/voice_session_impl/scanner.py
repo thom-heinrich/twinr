@@ -27,6 +27,9 @@
 # IMP-5: Default per-frame speech-probability side channels to the classifier's
 #        natural 0.5 speech-likely boundary so the host can trust edge speech
 #        evidence even when no explicit threshold override is configured.
+# BUG-5: Preserve the full bounded contiguous nonzero onset before the first
+#        attested speech frame; clipping quiet multi-frame wake onsets could
+#        erase the wakeword completely from stage-one and same-stream scans.
 """Frame buffering, utterance assembly, and candidate scanning helpers."""
 
 from __future__ import annotations

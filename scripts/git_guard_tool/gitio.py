@@ -42,6 +42,19 @@ def _run_git(repo_root: Path, args: list[str], *, input_text: str | None = None)
     return completed.stdout
 
 
+def _git_object_exists(repo_root: Path, oid: str) -> bool:
+    completed = subprocess.run(
+        ["git", "cat-file", "-e", f"{oid}^{{commit}}"],
+        cwd=repo_root,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    return completed.returncode == 0
+
+
 def resolve_repo_root(explicit_repo_root: str | None = None) -> Path:
     """Resolve the git toplevel that should be scanned."""
 
@@ -184,6 +197,12 @@ def _collect_outgoing_commits(repo_root: Path, remote: str, updates: tuple[PrePu
         if update.local_oid == _ZERO_OID:
             continue
         if update.remote_oid != _ZERO_OID:
+            if not _git_object_exists(repo_root, update.remote_oid):
+                raise GitGuardGitError(
+                    "remote ref "
+                    f"{update.remote_ref} points to {update.remote_oid}, which is not present locally; "
+                    f"run `git fetch {remote} {update.remote_ref}` and integrate that remote commit before pushing"
+                )
             rev_list = _run_git(repo_root, ["rev-list", "--reverse", f"{update.remote_oid}..{update.local_oid}"])
         else:
             rev_list = _run_git(
